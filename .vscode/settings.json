@@ -1,0 +1,24 @@
+{
+  "rust-analyzer.cargo.features": [
+    "provider-openai",
+    "provider-anthropic",
+    "provider-deepseek",
+    "provider-gemini",
+    "provider-llamacpp",
+    "provider-vllm",
+    "provider-lmstudio",
+    "plugin-mcp",
+    "plugin-sandbox",
+    "plugin-memory",
+    "plugin-guardrails",
+    "plugin-subagent",
+    "plugin-hitl",
+    "plugin-web-search",
+    "plugin-skills",
+    "plugin-telemetry",
+    "plugin-speculative",
+    "plugin-session-log",
+    "plugin-entity-extraction",
+    "plugin-prompt-cache"
+  ]
+}

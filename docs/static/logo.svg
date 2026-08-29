@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32"
+     role="img" aria-labelledby="cuca-logo-title cuca-logo-desc">
+  <title id="cuca-logo-title">CUCA</title>
+  <desc id="cuca-logo-desc">An open ring shaped like the letter C, with a filled dot at its centre
+  and a short bar leaving through the gap on the right: one client watching, one stream
+  emerging.</desc>
+  <path d="M22.88 6.17 A 12 12 0 1 0 22.88 25.83"
+        fill="none" stroke="hsl(240 5% 55%)" stroke-width="3" stroke-linecap="round"/>
+  <circle cx="16" cy="16" r="3.4" fill="hsl(30 92% 48%)"/>
+  <path d="M25.5 16 H 30" fill="none" stroke="hsl(30 92% 48%)" stroke-width="3"
+        stroke-linecap="round"/>
+</svg>

@@ -1,0 +1,89 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+  clippy:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["--no-default-features --features provider-openai", "--all-features"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
+  no_provider:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - run: if cargo check --no-default-features; then echo "expected provider selection to fail"; exit 1; fi
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        features: ["--no-default-features --features provider-openai", "--all-features"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test ${{ matrix.features }}
+  doc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --no-deps --all-features
+  plugin_solo:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        plugin:
+          - plugin-mcp
+          - plugin-sandbox
+          - plugin-memory
+          - plugin-entity-extraction
+          - plugin-guardrails
+          - plugin-subagent
+          - plugin-hitl
+          - plugin-web-search
+          - plugin-skills
+          - plugin-telemetry
+          - plugin-speculative
+          - plugin-session-log
+          - plugin-prompt-cache
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --no-default-features --features provider-openai,${{ matrix.plugin }}
+  plugin_layering:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Reverse-edge check
+        run: |
+          # A hit below means a foundational plugin's source references a derived plugin in code
+          # form (a reverse edge in the plugin dependency graph), which compiles undetected in both
+          # the solo and all-features builds.
+          if grep -rnE 'plugins::entity_extraction|plugin-entity-extraction' src/plugins/memory/; then
+            echo "layering violation: plugin-memory must stay ignorant of plugin-entity-extraction"
+            exit 1
+          fi
+          if grep -rnE 'cfg\(feature = "plugin-speculative"|crate::orchestrator' src/plugins/; then
+            echo "layering violation: no plugin module may cfg-gate on or import the speculative orchestrator"
+            exit 1
+          fi

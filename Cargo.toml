@@ -1,0 +1,138 @@
+[package]
+name = "cuca"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.98"
+description = "Compact Universal Client for Agents: an asynchronous LLM client that parses multi-modal SSE streams into typed blocks behind one unified request/response abstraction."
+repository = "https://github.com/nassor/cuca"
+homepage = "https://nassor.github.io/cuca/"
+license = "Apache-2.0"
+authors = ["Nassor Frazier-Silva <nassor@gmail.com>"]
+
+# docs.rs builds with default features; default = [] would trip the lib.rs
+# no-provider compile_error, so the docs build enables everything. CI already
+# validates the --all-features build point.
+[package.metadata.docs.rs]
+all-features = true
+
+# The provider gate in lib.rs fails the plain lib build cargo performs for the
+# doctest pass, and this crate has no doctests, so that pass is disabled.
+[lib]
+doctest = false
+
+# Dependency/feature split:
+# - Core (unconditional): bytes, futures-core, memchr, serde, serde_json. They define
+#   the public wire types, SSE parser, and response stream contract.
+# - Network and runtime dependencies are optional. Every provider enables reqwest and
+#   tokio-stream; plugins enable tokio and/or reqwest only when their implementation
+#   directly needs them.
+# - Cross-feature sharing is intentional: base64 (provider-anthropic + plugin-sandbox),
+#   tracing (plugin-guardrails + plugin-telemetry), and reqwest/rustls (providers +
+#   plugin-web-search). reqwest is built with default-features = false; HTTPS users
+#   explicitly enable its rustls backend.
+# - opentelemetry_sdk is optional under plugin-telemetry (used only by that plugin's tests).
+# - jsonschema is built with default-features = false: guardrails.rs only compiles inline
+#   (in-document) schemas via validator_for/iter_errors and needs no $ref retrieval
+#   (no resolve-http/resolve-file).
+# - The URL_SAFE engine is base64::engine::general_purpose::URL_SAFE_NO_PAD (base64 is
+#   enabled with no cargo features).
+# rmcp 3.x: the client SDK (`client`) and the client transports stdio
+# (`transport-child-process`) and Streamable HTTP (`transport-streamable-http-client-reqwest`)
+# are opt-in features. WebSocket is not implemented in rmcp 3.x, so
+# `McpTransport::WebSocket` maps to `PluginError::NotSupported` in the plugin.
+[features]
+default = []
+# Explicit model provider adapters. At least one is required by lib.rs.
+provider-openai = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+provider-anthropic = ["dep:reqwest", "dep:tokio-stream", "dep:sha2", "dep:getrandom", "dep:base64", "reqwest/rustls"]
+provider-gemini = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+provider-deepseek = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+provider-llamacpp = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+provider-vllm = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+# Essential agentic & infrastructural capability plugins.
+plugin-mcp = ["dep:rmcp", "dep:tokio"]
+# plugin-sandbox: enables wasmtime's `wat` feature so the tests pass WAT text, and reuses
+# the optional base64 for the `wasm` tool-call argument decoding.
+plugin-sandbox = ["dep:wasmtime", "dep:base64", "wasmtime/wat"]
+plugin-memory = ["dep:tiktoken-rs"]
+plugin-entity-extraction = ["plugin-memory"]
+plugin-guardrails = ["dep:jsonschema", "dep:tracing"]
+plugin-subagent = ["dep:tokio"]
+plugin-hitl = ["dep:tokio"]
+# Self-contained HTTPS: reqwest is built with default-features = false, so this feature
+# enables the TLS backend itself (no provider feature needed for HTTPS web search).
+plugin-web-search = ["dep:reqwest", "dep:tokio", "reqwest/rustls"]
+# Reusable agent skills: SKILL.md instructions + skill/skill_read/skill_search tools (agentskills.io).
+plugin-skills = []
+plugin-telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing"]
+plugin-speculative = ["dep:tokio", "dep:tokio-stream"]
+plugin-session-log = []
+# Client-owned local response cache; deterministic effective-request digesting
+# via the existing optional sha2 dependency (provider-anthropic enables sha2
+# independently for its own request signing).
+plugin-prompt-cache = ["dep:sha2"]
+
+[dependencies]
+bytes = "1"
+futures-core = "0.3"
+memchr = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "stream", "form"] }
+tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time", "macros", "sync", "process"] }
+tokio-stream = { version = "0.1", optional = true }
+# Optional (dep:) dependencies, compiled only when their feature is enabled.
+sha2 = { version = "0.11", optional = true }
+getrandom = { version = "0.4", optional = true }
+base64 = { version = "0.23", optional = true }
+# rmcp 3.x default features compile the server SDK; the client SDK (`client`) and the
+# client stdio (`transport-child-process`) / Streamable HTTP
+# (`transport-streamable-http-client-reqwest`) transports are opt-in features
+# (see the header note above).
+rmcp = { version = "3", optional = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+wasmtime = { version = "48", optional = true }
+tiktoken-rs = { version = "0.12", optional = true }
+jsonschema = { version = "0.52", optional = true, default-features = false }
+opentelemetry = { version = "0.32", optional = true }
+# `testing` provides InMemoryMetricExporter; `metrics` is its signal feature.
+# The plain `PeriodicReader` runs its export loop on a dedicated OS thread (no Tokio
+# runtime needed), so the telemetry tests stay on the current-thread Tokio flavor.
+opentelemetry_sdk = { version = "0.32", optional = true, features = ["metrics", "testing"] }
+tracing = { version = "0.1", optional = true }
+
+# Test-only deps for the integration suite: `ctor` runs the `--mcp-echo-server`
+# interceptor in tests/plugin_mcp.rs before libtest's main (that test binary
+# re-executes itself as the MCP echo server — no external script fixture). The
+# test binary's rmcp *server* usage (tool macros + `serve(stdio())`) comes from
+# the plugin-mcp-gated main dependency: rmcp's default features already include
+# the server SDK (`server`) and tool macros (`macros`); this entry only adds the
+# `transport-io` feature (`tokio/io-std`) that `rmcp::transport::stdio()`
+# needs, unified with the main dep's features for test builds only.
+[dev-dependencies]
+ctor = "1.0.13"
+rmcp = { version = "3", features = ["transport-io"] }
+tokio = { version = "1", features = ["rt", "time", "macros", "sync", "net", "io-util", "process", "io-std"] }
+tokio-stream = "0.1"
+# `schemars` is re-exported by rmcp, but the `JsonSchema` derive expansion
+# references the `schemars` crate by name, so the test crate needs it as a
+# direct dev-dependency to derive the `echo` tool's inputSchema.
+schemars = "1"
+
+# Documented demos (see examples/): each streams from llama.cpp's local
+# OpenAI-compatible chat route, so they build only when the llama.cpp provider
+# adapter is enabled.
+[[example]]
+name = "llamacpp_gemma"
+path = "examples/llamacpp_gemma.rs"
+required-features = ["provider-llamacpp"]
+
+[[example]]
+name = "stream_all_blocks"
+path = "examples/stream_all_blocks.rs"
+required-features = ["provider-llamacpp"]
+
+[[example]]
+name = "custom_plugin"
+path = "examples/custom_plugin.rs"
+required-features = ["provider-llamacpp"]

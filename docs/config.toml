@@ -1,0 +1,165 @@
+base_url = "https://nassor.github.io/cuca"
+title = "CUCA Documentation"
+description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, seven provider adapters."
+default_language = "en"
+compile_sass = false
+build_search_index = false
+generate_feeds = false
+
+# Output to docs/public so a GitHub Pages workflow can upload it.
+output_dir = "public"
+
+# Pretty URLs (default true): /world.md -> /world/
+[markdown]
+render_emoji = false
+
+# Class mode keeps the inline `style` attribute off `<pre>`, so the site's own
+# light/dark rules and the `data-theme` toggle still paint the code frame.
+# Zola writes a `giallo.css` for the theme below; no page links it, because the
+# Prism `.token.*` rules in `styles.css` colour the tokens. The section exists
+# so a fence annotation such as ```rust,name=The build script reaches the page
+# as `data-name`, which `script.js` renders as the frame caption.
+[markdown.highlighting]
+theme = "ayu-dark"
+style = "class"
+
+[extra]
+# `github_repo` is read by `base.html`, for the header icon and the sidebar note.
+github_repo = "https://github.com/nassor/cuca"
+# `docs_rs` is declared but deliberately not linked from any template: docs.rs
+# builds from a crates.io release, and `cuca-core` is not published, so the URL
+# would 404 today. `crates_io` is omitted for the same reason.
+docs_rs = "https://docs.rs/cuca-core"
+
+# The reading order, declared once. `base.html` renders the sidebar, the
+# breadcrumb and the previous/next pager from this list, so all three agree.
+# A group collapses in the sidebar, so a hub item keeps its children here
+# rather than hiding them behind the hub page alone.
+[[extra.nav]]
+label = "Quick start"
+[[extra.nav.items]]
+title = "What CUCA is"
+path = "/"
+[[extra.nav.items]]
+title = "Stream a first reply"
+path = "@/quick-start/first-stream.md"
+[[extra.nav.items]]
+title = "After the first run"
+path = "@/quick-start/after-the-first-run.md"
+
+[[extra.nav]]
+label = "Core concepts"
+[[extra.nav.items]]
+title = "The unified request and stream"
+path = "@/concepts/unified-request.md"
+[[extra.nav.items]]
+title = "The SSE parser"
+path = "@/concepts/sse-parser.md"
+[[extra.nav.items]]
+title = "Everything is a plugin"
+path = "@/concepts/plugin-layering.md"
+[[extra.nav.items]]
+title = "Speculative fast/slow routing"
+path = "@/concepts/speculative-routing.md"
+[[extra.nav.items]]
+title = "Memory discipline"
+path = "@/concepts/memory-discipline.md"
+
+[[extra.nav]]
+label = "Providers"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/providers/_index.md"
+[[extra.nav.items.children]]
+title = "OpenAI"
+path = "@/providers/openai.md"
+[[extra.nav.items.children]]
+title = "Anthropic"
+path = "@/providers/anthropic.md"
+[[extra.nav.items.children]]
+title = "Google Gemini"
+path = "@/providers/gemini.md"
+[[extra.nav.items.children]]
+title = "DeepSeek"
+path = "@/providers/deepseek.md"
+[[extra.nav.items.children]]
+title = "llama.cpp"
+path = "@/providers/llamacpp.md"
+[[extra.nav.items.children]]
+title = "vLLM"
+path = "@/providers/vllm.md"
+[[extra.nav.items.children]]
+title = "LM Studio"
+path = "@/providers/lmstudio.md"
+
+[[extra.nav]]
+label = "Plugins"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/plugins/_index.md"
+[[extra.nav.items.children]]
+title = "MCP"
+path = "@/plugins/mcp.md"
+[[extra.nav.items.children]]
+title = "Sandbox"
+path = "@/plugins/sandbox.md"
+[[extra.nav.items.children]]
+title = "Memory"
+path = "@/plugins/memory.md"
+[[extra.nav.items.children]]
+title = "Entity extraction"
+path = "@/plugins/entity-extraction.md"
+[[extra.nav.items.children]]
+title = "Guardrails"
+path = "@/plugins/guardrails.md"
+[[extra.nav.items.children]]
+title = "Subagent"
+path = "@/plugins/subagent.md"
+[[extra.nav.items.children]]
+title = "Human approval"
+path = "@/plugins/hitl.md"
+[[extra.nav.items.children]]
+title = "Web search"
+path = "@/plugins/web-search.md"
+[[extra.nav.items.children]]
+title = "Skills"
+path = "@/plugins/skills.md"
+[[extra.nav.items.children]]
+title = "Telemetry"
+path = "@/plugins/telemetry.md"
+[[extra.nav.items.children]]
+title = "Speculative"
+path = "@/plugins/speculative.md"
+[[extra.nav.items.children]]
+title = "Session log"
+path = "@/plugins/session-log.md"
+[[extra.nav.items.children]]
+title = "Prompt cache"
+path = "@/plugins/prompt-cache.md"
+
+[[extra.nav]]
+label = "How-to guides"
+[[extra.nav.items]]
+title = "Point the client at another OpenAI-compatible server"
+path = "@/guides/other-openai-server.md"
+[[extra.nav.items]]
+title = "Write a custom plugin"
+path = "@/guides/custom-plugin.md"
+[[extra.nav.items]]
+title = "Run the live integration suite"
+path = "@/guides/integration-tests.md"
+
+[[extra.nav]]
+label = "Reference"
+[[extra.nav.items]]
+title = "The feature matrix"
+path = "@/reference/features.md"
+[[extra.nav.items]]
+title = "Error types"
+path = "@/reference/errors.md"
+[[extra.nav.items]]
+title = "Environment variables"
+path = "@/reference/environment.md"
+[[extra.nav.items]]
+title = "The public API surface"
+path = "@/reference/public-api.md"
