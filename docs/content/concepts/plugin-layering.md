@@ -79,8 +79,11 @@ compiler therefore rejects `register_plugin` on them. That refusal is the point.
 
 A cache lookup has to happen after `on_request` has finished mutating the
 request, because the digest must cover the request that will actually be sent.
-It also has to bypass the rest of the pipeline on a hit. No hook fires in that
-position, so `CucaClient` calls the cache itself.
+It also has to bypass most of the rest of the pipeline on a hit: provider
+dispatch, `execute_local_tool` and `on_stream_chunk` are all skipped, while
+`on_response_complete` still fires once so a session log or a metrics exporter
+records the replayed turn. No hook fires in the lookup position, so
+`CucaClient` calls the cache itself.
 
 Entity extraction produces a graph delta that has no effect until the
 application merges it into a `MemoryPlugin`. There is no moment in a turn where

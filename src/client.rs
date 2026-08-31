@@ -12,7 +12,8 @@
 //! 3. Under `plugin-prompt-cache` with a configured cache: the digest of the
 //!    now-effective request is looked up. A hit returns a [`CacheHitStream`]
 //!    that replays the stored blocks and never reaches provider dispatch,
-//!    `execute_local_tool`, or `on_stream_chunk`. A miss falls through to
+//!    `execute_local_tool`, or `on_stream_chunk`, but still runs every
+//!    `on_response_complete` hook exactly once. A miss falls through to
 //!    dispatch below and is written back after a fully successful stream.
 //! 4. The provider's `dispatch_*` method, an `impl CucaClient` block living in
 //!    that provider's module, produces an [`AgentResponseStream`], or a
