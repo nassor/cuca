@@ -27,9 +27,9 @@ doctest = false
 #   tokio-stream; plugins enable tokio and/or reqwest only when their implementation
 #   directly needs them.
 # - Cross-feature sharing is intentional: base64 (provider-anthropic + plugin-sandbox),
-#   tracing (plugin-guardrails + plugin-telemetry), and reqwest/rustls (providers +
-#   plugin-web-search). reqwest is built with default-features = false; HTTPS users
-#   explicitly enable its rustls backend.
+#   tracing (plugin-guardrails + plugin-telemetry), tiktoken-rs (plugin-memory +
+#   plugin-cost), and reqwest/rustls (providers + plugin-web-search). reqwest is built
+#   with default-features = false; HTTPS users explicitly enable its rustls backend.
 # - opentelemetry_sdk is optional under plugin-telemetry (used only by that plugin's tests).
 # - jsonschema is built with default-features = false: guardrails.rs only compiles inline
 #   (in-document) schemas via validator_for/iter_errors and needs no $ref retrieval
@@ -78,6 +78,11 @@ plugin-session-log = ["dep:postcard"]
 # via the existing optional sha2 dependency (provider-anthropic enables sha2
 # independently for its own request signing) over postcard-encoded digest input.
 plugin-prompt-cache = ["dep:sha2", "dep:postcard"]
+# plugin-cost: token/currency ledger with a hard budget cap. Shares the optional
+# tiktoken-rs dependency with plugin-memory (same joint-ownership shape as sha2 for
+# provider-anthropic + plugin-prompt-cache and postcard for plugin-session-log +
+# plugin-prompt-cache); this is a shared *dependency*, not a feature edge to plugin-memory.
+plugin-cost = ["dep:tiktoken-rs"]
 
 [dependencies]
 bytes = "1"
@@ -143,3 +148,10 @@ required-features = ["provider-llamacpp"]
 name = "custom_plugin"
 path = "examples/custom_plugin.rs"
 required-features = ["provider-llamacpp"]
+
+# cost_otel additionally needs the two plugin features the core bridge is
+# gated on: `OtelCostObserver` only exists when both are enabled.
+[[example]]
+name = "cost_otel"
+path = "examples/cost_otel.rs"
+required-features = ["provider-llamacpp", "plugin-cost", "plugin-telemetry"]

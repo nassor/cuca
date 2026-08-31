@@ -1,14 +1,15 @@
 //! Cross-plugin combination tests: behavior that exists only when two plugin
 //! features are co-enabled.
 //!
-//! One file rather than one test per owning plugin file. Three of the five
+//! One file rather than one test per owning plugin file. Six of the eight
 //! surfaces below (`memory + prompt-cache`, `speculative + prompt-cache`,
-//! `memory + prompt-cache` export) are *core-mediated*: they have no derived
-//! plugin to belong to, and AGENTS.md deliberately puts two-plugin workflows in
-//! core (`CucaExport::from_live`). Keeping the tests together mirrors that and
-//! gives one place to audit cross-plugin coupling; each module is gated on
-//! exactly the features its surface needs, so no test relies on a peer being
-//! co-enabled by accident.
+//! `memory + prompt-cache` export, `cost + prompt-cache`, `cost + memory`,
+//! `cost + telemetry`) are *core-mediated*: they have no derived plugin to
+//! belong to, and AGENTS.md deliberately puts two-plugin workflows in core
+//! (`CucaExport::from_live`, `OtelCostObserver`). Keeping the tests together
+//! mirrors that and gives one place to audit cross-plugin coupling; each
+//! module is gated on exactly the features its surface needs, so no test
+//! relies on a peer being co-enabled by accident.
 //!
 //! Only two tests here need the live server. Dispatch counts, cache-entry
 //! counts, hook-invocation counts, and session records cannot be asserted
@@ -29,6 +30,16 @@
 //!    only way terminal hooks run over an orchestrator turn
 //!    (`src/client.rs` ~576-600).
 //! 5. `memory + prompt-cache` export coordinator: `CucaExport::from_live`.
+//! 6. `cost + prompt-cache` (client-mediated): a local cache hit skips provider
+//!    dispatch but still runs every `on_response_complete` hook, so the ledger
+//!    keeps charging and reads as gross, pre-cache spend.
+//! 7. `cost + memory` (hook order is observable in the estimate): memory's
+//!    graph injection is inside the cost estimate only when memory is
+//!    registered first. Neither plugin requires a position; the number differs.
+//! 8. `cost + telemetry` (core-mediated bridge): `OtelCostObserver` records
+//!    every `CostUsage` reading to the same meter provider
+//!    `OpenTelemetryPlugin` reports on, so one export batch carries both the
+//!    cost gauges and the request counter.
 #![cfg(feature = "provider-llamacpp")]
 
 mod common;
@@ -1425,6 +1436,397 @@ mod export_round_trip {
             replay_dispatches.load(Ordering::SeqCst),
             1,
             "an expired entry must miss and dispatch"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 6: cost + prompt-cache (a local cache hit is still charged)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-cost", feature = "plugin-prompt-cache"))]
+mod cost_with_prompt_cache {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crate::common;
+    use cuca::plugin::CucaPlugin;
+    use cuca::{
+        CostConfig, CostPlugin, CucaClient, ModelRates, PricingTable, PromptCache,
+        PromptCacheConfig, UnifiedRequest,
+    };
+
+    const MODEL: &str = "combo-cost-model";
+
+    fn cache() -> Arc<PromptCache> {
+        Arc::new(
+            PromptCache::new(
+                PromptCacheConfig::new(16, Duration::from_secs(60)).expect("config must build"),
+            )
+            .expect("cache must build"),
+        )
+    }
+
+    /// A cost plugin that prices `MODEL`, so a charged turn is visible in
+    /// currency as well as in tokens.
+    fn priced_cost() -> Arc<CostPlugin> {
+        Arc::new(
+            CostPlugin::new(CostConfig {
+                pricing: PricingTable::new().with_model(
+                    MODEL,
+                    ModelRates {
+                        input_micros_per_mtok: 3_000_000,
+                        output_micros_per_mtok: 15_000_000,
+                        ..Default::default()
+                    },
+                ),
+                ..Default::default()
+            })
+            .expect("cost plugin must build"),
+        )
+    }
+
+    fn client_at(addr: &str, cache: &Arc<PromptCache>, cost: &Arc<CostPlugin>) -> CucaClient {
+        common::llamacpp_builder(addr.to_string())
+            .with_prompt_cache_service(Arc::clone(cache))
+            .register_plugin(Arc::clone(cost) as Arc<dyn CucaPlugin>)
+            .build()
+            .expect("client build must succeed")
+    }
+
+    fn request() -> UnifiedRequest {
+        UnifiedRequest::new(MODEL)
+            .add_system_message("primary instruction")
+            .add_user_message("hi")
+    }
+
+    async fn run(client: &CucaClient) {
+        common::drain_timeout(
+            client
+                .generate_stream(request())
+                .await
+                .expect("generate_stream must start"),
+            10,
+        )
+        .await;
+    }
+
+    /// The ledger is *gross* spend: a replayed cache hit runs every
+    /// `on_request` and `on_response_complete` hook, so two identical turns are
+    /// charged twice while the provider is dispatched once. The plugin has no
+    /// way to tell a replay from a real dispatch, and looking one up would be a
+    /// runtime peer lookup AGENTS.md forbids. This test pins the documented
+    /// behavior so a future change to it is loud.
+    #[tokio::test]
+    async fn a_cache_hit_skips_dispatch_but_still_charges_the_ledger() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let cache = cache();
+        let cost = priced_cost();
+        let client = client_at(&format!("http://{addr}/v1"), &cache, &cost);
+
+        run(&client).await;
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "the first turn must miss and dispatch"
+        );
+        let first = cost.usage().expect("ledger lock must not be poisoned");
+        assert_eq!(first.turns, 1);
+        assert!(first.prompt_tokens > 0 && first.spent_micros > 0);
+
+        run(&client).await;
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "the identical turn must be served from the local cache"
+        );
+
+        let second = cost.usage().expect("ledger lock must not be poisoned");
+        assert_eq!(
+            second.turns, 2,
+            "the replayed response still runs on_response_complete"
+        );
+        assert_eq!(
+            second.prompt_tokens,
+            first.prompt_tokens * 2,
+            "on_request charges the cached turn too"
+        );
+        assert_eq!(second.completion_tokens, first.completion_tokens * 2);
+        assert_eq!(
+            second.spent_micros,
+            first.spent_micros * 2,
+            "the ledger reads as gross, pre-cache spend"
+        );
+
+        let breakdown = cost.breakdown().expect("ledger lock must not be poisoned");
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].0, MODEL);
+        assert_eq!(breakdown[0].1.turns, 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 7: cost + memory (hook order is observable in the estimate)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-cost", feature = "plugin-memory"))]
+mod cost_with_memory {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::common;
+    use cuca::plugin::CucaPlugin;
+    use cuca::{
+        CostConfig, CostPlugin, CucaClient, GraphContextConfig, GraphNode, MemoryConfig,
+        MemoryGraph, MemoryPlugin, MergePolicy, UnifiedRequest,
+    };
+
+    const MODEL: &str = "combo-order-model";
+
+    /// Memory with graph injection enabled and one node in its graph, so every
+    /// `on_request` renders a graph system message into the prompt.
+    fn memory_with_graph_context() -> Arc<MemoryPlugin> {
+        let plugin = MemoryPlugin::new(MemoryConfig {
+            graph_context: Some(GraphContextConfig::default()),
+            ..Default::default()
+        })
+        .expect("memory plugin must build");
+        let mut graph = MemoryGraph::new();
+        graph.upsert_node(GraphNode {
+            id: "alice".into(),
+            labels: vec!["person".into()],
+            properties: serde_json::Map::new(),
+        });
+        plugin
+            .merge_graph(graph, MergePolicy::Keep)
+            .expect("seed merge must not fail");
+        Arc::new(plugin)
+    }
+
+    fn cost() -> Arc<CostPlugin> {
+        Arc::new(CostPlugin::new(CostConfig::default()).expect("cost plugin must build"))
+    }
+
+    fn client_at(addr: &str, plugins: Vec<Arc<dyn CucaPlugin>>) -> CucaClient {
+        let mut builder = common::llamacpp_builder(addr.to_string());
+        for plugin in plugins {
+            builder = builder.register_plugin(plugin);
+        }
+        builder.build().expect("client build must succeed")
+    }
+
+    fn request() -> UnifiedRequest {
+        UnifiedRequest::new(MODEL)
+            .add_system_message("primary instruction")
+            .add_user_message("hi")
+    }
+
+    async fn run(client: &CucaClient) {
+        common::drain_timeout(
+            client
+                .generate_stream(request())
+                .await
+                .expect("generate_stream must start"),
+            10,
+        )
+        .await;
+    }
+
+    /// `on_request` hooks run in registration order over one shared
+    /// `UnifiedRequest`, so the prompt the cost plugin estimates depends on
+    /// where it sits: after memory it prices the injected graph message, before
+    /// memory it prices the caller's request untouched. Neither plugin requires
+    /// a position, and neither looks the other up; only the number differs.
+    #[tokio::test]
+    async fn memory_graph_injection_is_inside_the_estimate_only_when_memory_runs_first() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let addr = format!("http://{addr}/v1");
+
+        // The estimate of the caller's own request, before any injection.
+        let baseline = cost()
+            .estimate_request_tokens(&request())
+            .expect("encoder lock must not be poisoned");
+        assert!(baseline > 0);
+
+        let after_memory = cost();
+        run(&client_at(
+            &addr,
+            vec![
+                memory_with_graph_context() as Arc<dyn CucaPlugin>,
+                Arc::clone(&after_memory) as Arc<dyn CucaPlugin>,
+            ],
+        ))
+        .await;
+        let with_injection = after_memory
+            .usage()
+            .expect("ledger lock must not be poisoned")
+            .prompt_tokens;
+
+        let before_memory = cost();
+        run(&client_at(
+            &addr,
+            vec![
+                Arc::clone(&before_memory) as Arc<dyn CucaPlugin>,
+                memory_with_graph_context() as Arc<dyn CucaPlugin>,
+            ],
+        ))
+        .await;
+        let without_injection = before_memory
+            .usage()
+            .expect("ledger lock must not be poisoned")
+            .prompt_tokens;
+
+        assert_eq!(
+            without_injection, baseline,
+            "registered first, the cost plugin never sees memory's injection"
+        );
+        assert!(
+            with_injection > baseline,
+            "registered after memory, the cost plugin prices the injected graph \
+             message too: {with_injection} must exceed {baseline}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 8: cost + telemetry (the core bridge feeds the ledger to OTel)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
+mod cost_with_telemetry {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use crate::common;
+    use cuca::plugin::CucaPlugin;
+    use cuca::{
+        CostConfig, CostPlugin, CucaClient, ModelRates, OpenTelemetryPlugin, OtelCostObserver,
+        PricingTable, UnifiedRequest,
+    };
+    use opentelemetry_sdk::metrics::data::{
+        AggregatedMetrics, Metric, MetricData, ResourceMetrics,
+    };
+    use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
+
+    const MODEL: &str = "combo-otel-cost-model";
+
+    /// One meter provider for both the bridge and the telemetry plugin, with
+    /// an in-memory exporter so the test can flush and read the batch back.
+    fn provider_with_exporter() -> (SdkMeterProvider, InMemoryMetricExporter) {
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone()).build();
+        let provider = SdkMeterProvider::builder().with_reader(reader).build();
+        (provider, exporter)
+    }
+
+    fn exported_metric<'a>(metrics: &'a [ResourceMetrics], name: &str) -> &'a Metric {
+        metrics
+            .iter()
+            .flat_map(|rm| rm.scope_metrics())
+            .flat_map(|sm| sm.metrics())
+            .find(|m| m.name() == name)
+            .unwrap_or_else(|| panic!("metric `{name}` missing from export"))
+    }
+
+    fn gauge_value(metrics: &[ResourceMetrics], name: &str) -> u64 {
+        let AggregatedMetrics::U64(MetricData::Gauge(gauge)) =
+            exported_metric(metrics, name).data()
+        else {
+            panic!("`{name}` must export a Gauge<u64>");
+        };
+        gauge
+            .data_points()
+            .map(|dp| dp.value())
+            .next()
+            .unwrap_or_else(|| panic!("`{name}` must carry a data point"))
+    }
+
+    fn counter_total(metrics: &[ResourceMetrics], name: &str) -> u64 {
+        let AggregatedMetrics::U64(MetricData::Sum(sum)) = exported_metric(metrics, name).data()
+        else {
+            panic!("`{name}` must export a Sum<u64>");
+        };
+        sum.data_points().map(|dp| dp.value()).sum()
+    }
+
+    /// A priced ledger with the bridge attached as its only observer.
+    fn cost_with_bridge(provider: &SdkMeterProvider) -> Arc<CostPlugin> {
+        Arc::new(
+            CostPlugin::new(CostConfig {
+                pricing: PricingTable::new().with_model(
+                    MODEL,
+                    ModelRates {
+                        input_micros_per_mtok: 3_000_000,
+                        output_micros_per_mtok: 15_000_000,
+                        ..Default::default()
+                    },
+                ),
+                observers: vec![Arc::new(OtelCostObserver::new(provider))],
+                ..Default::default()
+            })
+            .expect("cost plugin must build"),
+        )
+    }
+
+    /// The caller wires the bridge, not the crate: the two plugins never look
+    /// each other up, they only share the meter provider handed to both.
+    #[tokio::test]
+    async fn one_turn_moves_the_cost_gauges_on_the_shared_meter_provider() {
+        let (provider, exporter) = provider_with_exporter();
+        let cost = cost_with_bridge(&provider);
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+
+        let client: CucaClient = common::llamacpp_builder(format!("http://{addr}/v1"))
+            .register_plugin(Arc::clone(&cost) as Arc<dyn CucaPlugin>)
+            .register_plugin(Arc::new(OpenTelemetryPlugin::new(&provider)))
+            .build()
+            .expect("client build must succeed");
+
+        common::drain_timeout(
+            client
+                .generate_stream(
+                    UnifiedRequest::new(MODEL)
+                        .add_system_message("You are concise.")
+                        .add_user_message("hi"),
+                )
+                .await
+                .expect("generate_stream must start"),
+            10,
+        )
+        .await;
+        assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+
+        let usage = cost.usage().expect("ledger lock must not be poisoned");
+        assert_eq!(usage.turns, 1);
+        assert!(usage.prompt_tokens > 0 && usage.spent_micros > 0);
+
+        provider.force_flush().expect("force_flush must succeed");
+        let metrics = exporter
+            .get_finished_metrics()
+            .expect("get_finished_metrics must succeed");
+
+        assert_eq!(
+            gauge_value(&metrics, "cuca_cost_prompt_tokens"),
+            usage.prompt_tokens,
+            "the bridge exports the ledger's own prompt-token total"
+        );
+        assert_eq!(
+            gauge_value(&metrics, "cuca_cost_completion_tokens"),
+            usage.completion_tokens
+        );
+        assert_eq!(
+            gauge_value(&metrics, "cuca_cost_spent_micros"),
+            usage.spent_micros
+        );
+        assert_eq!(gauge_value(&metrics, "cuca_cost_turns"), 1);
+        assert_eq!(
+            counter_total(&metrics, "cuca_requests_total"),
+            1,
+            "the telemetry plugin's own instrument shares the batch"
         );
     }
 }

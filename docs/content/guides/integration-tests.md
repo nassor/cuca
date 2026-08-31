@@ -36,7 +36,7 @@ Leave it running. To target something else, set `CUCA_BASE_URL` in step 2.
 Every plugin feature, plus the provider every test file requires:
 
 ```bash,name=Runs the same on all three platforms
-cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-prompt-cache" -- --nocapture --test-threads=1
+cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-prompt-cache plugin-cost" -- --nocapture --test-threads=1
 ```
 
 Both trailing flags earn their place. `--nocapture` is what makes the skip lines
@@ -104,11 +104,11 @@ cargo test --test plugin_guardrails --features provider-llamacpp,plugin-guardrai
 ```
 
 `plugin_combinations.rs` is the exception. Its crate gate is only
-`provider-llamacpp`, and each of its five submodules adds its own gate, so a run
-that compiles all five needs the union:
+`provider-llamacpp`, and each of its eight submodules adds its own gate, so a run
+that compiles all eight needs the union:
 
 ```bash,name=Runs the same on all three platforms
-cargo test --test plugin_combinations --features provider-llamacpp,plugin-entity-extraction,plugin-memory,plugin-prompt-cache,plugin-speculative,plugin-session-log -- --nocapture
+cargo test --test plugin_combinations --features provider-llamacpp,plugin-entity-extraction,plugin-memory,plugin-prompt-cache,plugin-speculative,plugin-session-log,plugin-cost,plugin-telemetry -- --nocapture
 ```
 
 A shorter feature list here does not fail. It compiles fewer submodules and
@@ -135,6 +135,6 @@ That is what CI's `plugin_solo` job does, and it needs no server at all:
 cargo check --all-targets --no-default-features --features provider-openai,plugin-hitl
 ```
 
-Swap the plugin feature to check another. Thirteen runs cover the set.
+Swap the plugin feature to check another. Fourteen runs cover the set.
 
 Next page: [The feature matrix](@/reference/features.md).

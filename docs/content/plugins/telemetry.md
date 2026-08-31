@@ -40,6 +40,23 @@ The token counter is a coarse approximation: one increment per streamed block, n
 
 `tracing::info!` events under target `cuca::telemetry` on request dispatch (`model`, `provider`) and on response completion (`duration`, `prompt_tokens`, `completion_tokens`).
 
+## Cost bridge
+
+`OtelCostObserver`, compiled only when `plugin-cost` is also enabled, records the cost ledger to the same `"cuca_client"` meter. It is built from a `&dyn opentelemetry::metrics::MeterProvider`, attaches through `CostConfig::observers` ([Cost accounting](@/plugins/cost.md)), and lives in core, at `cuca::cost_otel`, because neither plugin may name the other. Its ten instruments are `Gauge<u64>`, recorded with no attributes on every `on_request` charge and every `on_response_complete` commit, one per `CostUsage` field. Gauges rather than counters: a reading is a cumulative snapshot, and the observer seam carries no deltas.
+
+| Instrument | `CostUsage` field |
+|---|---|
+| `cuca_cost_spent_micros` | `spent_micros` |
+| `cuca_cost_prompt_tokens` | `prompt_tokens` |
+| `cuca_cost_completion_tokens` | `completion_tokens` |
+| `cuca_cost_cache_read_tokens` | `cache_read_tokens` |
+| `cuca_cost_cache_write_tokens` | `cache_write_tokens` |
+| `cuca_cost_turns` | `turns` |
+| `cuca_cost_unpriced_turns` | `unpriced_turns` |
+| `cuca_cost_overflow_turns` | `overflow_turns` |
+| `cuca_cost_untokenized_image_blocks` | `untokenized_image_blocks` |
+| `cuca_cost_near_cap` | `near_cap`, as `1` or `0` |
+
 ## Capacity
 
 No growth cap. Accumulation and export are the caller's OpenTelemetry meter provider's responsibility; no default meter provider is installed by this plugin.

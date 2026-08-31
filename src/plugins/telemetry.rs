@@ -6,6 +6,11 @@
 //! on request dispatch and response completion. No default meter provider is
 //! installed here: callers pass their own `&MeterProvider`, so the plugin
 //! composes with any exporter pipeline.
+//!
+//! With `plugin-cost` co-enabled,
+//! [`OtelCostObserver`](crate::cost_otel::OtelCostObserver) records the cost
+//! ledger to the same `"cuca_client"` meter; it lives in core rather than
+//! here, because a plugin must not name a peer.
 
 use crate::error::PluginError;
 use crate::plugin::CucaPlugin;

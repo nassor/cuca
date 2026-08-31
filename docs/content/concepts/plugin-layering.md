@@ -13,10 +13,10 @@ weight = 3
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You are adding a capability and need to know which attachment point it belongs to, or why <code>register_plugin</code> refuses one of the thirteen</dd>
+<dd>You are adding a capability and need to know which attachment point it belongs to, or why <code>register_plugin</code> refuses one of the fourteen</dd>
 </dl>
 
-Thirteen `plugin-*` features. Ten of them implement `CucaPlugin` and register on
+Fourteen `plugin-*` features. Eleven of them implement `CucaPlugin` and register on
 the builder. Two of them are compile errors if you try. One replaces the
 dispatch stage outright.
 
@@ -28,7 +28,7 @@ the right moment without being told to?
 
 | Tier | Mechanism | The pipeline can | Members |
 |---|---|---|---|
-| Hook plugin | `register_plugin(Arc<dyn CucaPlugin>)` | drive it: hooks fire at fixed points, in registration order | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log` |
+| Hook plugin | `register_plugin(Arc<dyn CucaPlugin>)` | drive it: hooks fire at fixed points, in registration order | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost` |
 | Explicit-call capability | direct method calls on the type | not drive it: the caller decides when and applies the result | `plugin-prompt-cache`, `plugin-entity-extraction` |
 | Pipeline replacement | `with_orchestrator(ModelOrchestrator)` | not host it: it owns the dispatch stage | `plugin-speculative` |
 

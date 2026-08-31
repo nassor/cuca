@@ -31,7 +31,7 @@ Choose by when your code needs to run, not by what it does.
 | act once on the finished turn | `on_response_complete` | `&UnifiedResponse`; errors here are logged, not propagated |
 
 If none of those moments is right for your capability, it probably should not be
-a `CucaPlugin` at all. Two of the crate's own thirteen features are not, and the
+a `CucaPlugin` at all. Two of the crate's own fourteen features are not, and the
 reasoning is in [Everything is a plugin](@/concepts/plugin-layering.md).
 
 ## Step 2: note that every hook takes `&self`

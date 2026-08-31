@@ -65,6 +65,7 @@ jobs:
           - plugin-speculative
           - plugin-session-log
           - plugin-prompt-cache
+          - plugin-cost
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -87,3 +88,7 @@ jobs:
             echo "layering violation: no plugin module may cfg-gate on or import the speculative orchestrator"
             exit 1
           fi
+          # plugin-cost is foundational with no derived dependant, so the directory-wide check
+          # above already covers src/plugins/cost.rs; there is no dedicated grep leg for it yet.
+          # A leg of the form `grep -rn 'plugin-<derived>' src/plugins/cost.rs` becomes required
+          # the first time a plugin declares plugin-<derived> = ["plugin-cost", ...].

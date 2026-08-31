@@ -390,7 +390,7 @@ impl MemoryPlugin {
     /// `max_tokens` and `max_fraction` set) or the encoder cannot be loaded.
     pub fn new(config: MemoryConfig) -> Result<Self, PluginError> {
         config.validate()?;
-        let encoder = Self::load_encoder(&config.encoder_name)?;
+        let encoder = crate::tokenize::load_encoder(&config.encoder_name)?;
         Ok(Self {
             config,
             summarizer: None,
@@ -411,37 +411,13 @@ impl MemoryPlugin {
         store: Arc<dyn VectorStore>,
     ) -> Result<Self, PluginError> {
         config.validate()?;
-        let encoder = Self::load_encoder(&config.encoder_name)?;
+        let encoder = crate::tokenize::load_encoder(&config.encoder_name)?;
         Ok(Self {
             config,
             summarizer: Some(summarizer),
             store: Some(store),
             encoder: Mutex::new(encoder),
             graph: Mutex::new(MemoryGraph::new()),
-        })
-    }
-
-    /// Load the tiktoken encoder for `encoder_name`.
-    ///
-    /// tiktoken-rs 0.12 exposes the base encoders through typed helpers
-    /// (`cl100k_base()`, `o200k_base()`, …) and model names through
-    /// `bpe_for_model` (e.g. `"gpt-4o"`); `bpe_for_model` alone does
-    /// NOT accept base encoder names like `"cl100k_base"`. Resolve base names
-    /// first, then fall back to the model-name lookup (`bpe_for_model` returns
-    /// a `&'static CoreBPE` singleton, so it is cloned into the owned value).
-    fn load_encoder(encoder_name: &str) -> Result<tiktoken_rs::CoreBPE, PluginError> {
-        let encoder = match encoder_name {
-            "r50k_base" => tiktoken_rs::r50k_base(),
-            "p50k_base" => tiktoken_rs::p50k_base(),
-            "p50k_edit" => tiktoken_rs::p50k_edit(),
-            "cl100k_base" => tiktoken_rs::cl100k_base(),
-            "o200k_base" => tiktoken_rs::o200k_base(),
-            other => tiktoken_rs::bpe_for_model(other).cloned(),
-        };
-        encoder.map_err(|e| {
-            PluginError::Internal(format!(
-                "failed to load tiktoken encoder '{encoder_name}': {e}"
-            ))
         })
     }
 
@@ -1511,7 +1487,7 @@ mod tests {
             },
             summarizer: Some(Arc::new(FakeSummarizer)),
             store: None,
-            encoder: Mutex::new(MemoryPlugin::load_encoder("cl100k_base").unwrap()),
+            encoder: Mutex::new(crate::tokenize::load_encoder("cl100k_base").unwrap()),
             graph: Mutex::new(MemoryGraph::new()),
         };
         let mut messages = vec![

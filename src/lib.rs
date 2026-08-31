@@ -45,15 +45,26 @@ pub(crate) mod provider;
 #[cfg(any(feature = "plugin-session-log", feature = "plugin-prompt-cache"))]
 pub(crate) mod canonical;
 
+/// tiktoken-rs encoder resolution shared by the token-counting plugins.
+#[cfg(any(feature = "plugin-memory", feature = "plugin-cost"))]
+pub(crate) mod tokenize;
+
 /// Versioned canonical `cuca-export` envelope for memory-graph and
 /// local-response-cache state.
 #[cfg(any(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
 pub mod export;
 
+/// The cost ledger to OpenTelemetry bridge: a ready-made `CostObserver` that
+/// records each reading to the caller's meter provider.
+#[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
+pub mod cost_otel;
+
 /// Speculative fast/slow model pairing and deterministic complexity routing.
 #[cfg(feature = "plugin-speculative")]
 pub mod orchestrator;
 pub use crate::client::{CucaClient, CucaClientBuilder};
+#[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
+pub use crate::cost_otel::OtelCostObserver;
 pub use crate::error::{CucaError, PluginError};
 #[cfg(any(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
 pub use crate::export::{
@@ -71,6 +82,11 @@ pub use crate::plugins::entity_extraction::{
 pub use crate::orchestrator::{
     ClientPool, Complexity, ComplexityEvaluator, DraftValidator, JsonToolDraftValidator,
     ModelOrchestrator, SwappableModelPair, TurnExecutor,
+};
+#[cfg(feature = "plugin-cost")]
+pub use crate::plugins::cost::{
+    CostConfig, CostEntry, CostObserver, CostPlugin, CostUsage, ModelRates, PricingResolver,
+    PricingTable, UnpricedModelPolicy,
 };
 #[cfg(feature = "plugin-guardrails")]
 pub use crate::plugins::guardrails::JsonGuardrailPlugin;

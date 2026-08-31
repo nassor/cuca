@@ -52,3 +52,8 @@ pub mod web_search;
 /// digesting and bounded LRU/TTL eviction.
 #[cfg(feature = "plugin-prompt-cache")]
 pub mod prompt_cache;
+
+/// Cumulative token/currency ledger with a hard budget cap enforced before
+/// provider dispatch.
+#[cfg(feature = "plugin-cost")]
+pub mod cost;

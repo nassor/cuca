@@ -136,6 +136,9 @@ path = "@/plugins/session-log.md"
 [[extra.nav.items.children]]
 title = "Prompt cache"
 path = "@/plugins/prompt-cache.md"
+[[extra.nav.items.children]]
+title = "Cost accounting"
+path = "@/plugins/cost.md"
 
 [[extra.nav]]
 label = "How-to guides"

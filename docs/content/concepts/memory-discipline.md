@@ -25,7 +25,8 @@ way at the limit, and the difference is not an inconsistency.
 
 ## Evict or refuse
 
-Two policies, chosen per structure:
+Three policies, chosen per structure: evict the oldest entry, refuse the call,
+or fold overflow into one bucket.
 
 | Structure | Bound | At-cap policy | Usage gauge |
 |---|---|---|---|
@@ -35,6 +36,7 @@ Two policies, chosen per structure:
 | Subagent pending registry | `DEFAULT_MAX_PENDING`, `1024` | refuse the spawn with `PluginError::Internal` | `pending_len()` |
 | Human-approval audit log | `DEFAULT_MAX_AUDIT_ENTRIES`, `65_536` | refuse the gated call with `PluginError::Internal` | `audit_len()` |
 | In-memory session records | `DEFAULT_MAX_RECORDS`, `65_536` | refuse the append or fork with `PluginError::Internal` | `len()`, against `max_records()` |
+| Cost per-model breakdown | `CostConfig::max_tracked_models`, caller-set (default 64) | fold into one overflow bucket; totals stay exact, only attribution degrades | `usage()`, `breakdown()` |
 
 The split is one question: if this entry disappears, does anything become
 wrong, or only slower?

@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twenty features, all opt-in: seven providers, thirteen plugins, one cross-plugin edge</dd>
+<dd>Twenty-one features, all opt-in: seven providers, fourteen plugins, one cross-plugin edge</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -57,6 +57,7 @@ that `cargo check --no-default-features` fails.
 | `plugin-speculative` | `dep:tokio`, `dep:tokio-stream` |
 | `plugin-session-log` | `dep:postcard` |
 | `plugin-prompt-cache` | `dep:sha2`, `dep:postcard` |
+| `plugin-cost` | `dep:tiktoken-rs` |
 
 `plugin-entity-extraction = ["plugin-memory"]` is the only feature edge between
 two plugins.
@@ -86,7 +87,7 @@ wire types, the SSE parser and the response stream contract.
 | `base64` | `0.23` | none | `provider-anthropic`, `plugin-sandbox` |
 | `rmcp` | `3` | `client`, `transport-child-process`, `transport-streamable-http-client-reqwest` | `plugin-mcp` |
 | `wasmtime` | `48` | default, plus `wat` | `plugin-sandbox` |
-| `tiktoken-rs` | `0.12` | default | `plugin-memory` |
+| `tiktoken-rs` | `0.12` | default | `plugin-memory`, `plugin-cost` |
 | `jsonschema` | `0.52` | `default-features = false` | `plugin-guardrails` |
 | `opentelemetry` | `0.32` | default | `plugin-telemetry` |
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
@@ -135,13 +136,15 @@ the provider gate rejects, and the crate has no doctests.
 
 ## Example targets
 
-All three require `provider-llamacpp`.
+All four require `provider-llamacpp`; `cost_otel` needs two plugin features on
+top, because the bridge it demonstrates is gated on both.
 
-| Example | Path |
-|---|---|
-| `llamacpp_gemma` | `examples/llamacpp_gemma.rs` |
-| `stream_all_blocks` | `examples/stream_all_blocks.rs` |
-| `custom_plugin` | `examples/custom_plugin.rs` |
+| Example | Path | Additional required features |
+|---|---|---|
+| `llamacpp_gemma` | `examples/llamacpp_gemma.rs` | none |
+| `stream_all_blocks` | `examples/stream_all_blocks.rs` | none |
+| `custom_plugin` | `examples/custom_plugin.rs` | none |
+| `cost_otel` | `examples/cost_otel.rs` | `plugin-cost`, `plugin-telemetry` |
 
 ## Feature combinations CI verifies
 
@@ -150,7 +153,7 @@ All three require `provider-llamacpp`.
 | `clippy`, `test` | `--no-default-features --features provider-openai`, and `--all-features` |
 | `no_provider` | `--no-default-features`, asserted to fail |
 | `doc` | `--all-features` |
-| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the thirteen plugin features |
+| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the fourteen plugin features |
 | `plugin_layering` | greps asserting `src/plugins/memory/` never references entity extraction, and no file under `src/plugins/` gates on `plugin-speculative` or imports `crate::orchestrator` |
 
 Next page: [Error types](@/reference/errors.md).

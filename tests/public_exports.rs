@@ -156,6 +156,107 @@ mod memory_surface {
     }
 }
 
+#[cfg(feature = "plugin-cost")]
+mod cost_surface {
+    use std::sync::Arc;
+
+    use cuca::{
+        CostConfig, CostEntry, CostObserver, CostPlugin, CostUsage, ModelRates, PluginError,
+        PricingResolver, PricingTable, UnpricedModelPolicy,
+    };
+
+    /// A caller-side live rate source.
+    struct FixedRates;
+
+    impl PricingResolver for FixedRates {
+        fn resolve_rates(&self, _model: &str) -> Option<ModelRates> {
+            Some(ModelRates {
+                input_micros_per_mtok: 1,
+                output_micros_per_mtok: 2,
+                cache_read_micros_per_mtok: 3,
+                cache_write_micros_per_mtok: 4,
+            })
+        }
+    }
+
+    /// A caller-side reporting gauge.
+    struct Recorder;
+
+    impl CostObserver for Recorder {
+        fn observe(&self, _usage: &CostUsage) -> Result<(), PluginError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn cost_config_plugin_and_seams_are_root_exported() {
+        let pricing = PricingTable::new().with_model(
+            "gpt-4o",
+            ModelRates {
+                input_micros_per_mtok: 2_500_000,
+                output_micros_per_mtok: 10_000_000,
+                cache_read_micros_per_mtok: 1_250_000,
+                cache_write_micros_per_mtok: 0,
+            },
+        );
+        assert_eq!(pricing.len(), 1);
+        assert!(!pricing.is_empty());
+
+        let plugin = CostPlugin::new(CostConfig {
+            pricing,
+            pricing_resolver: Some(Arc::new(FixedRates)),
+            max_total_tokens: Some(1_000_000),
+            max_total_micros: Some(50_000_000),
+            warn_fraction: Some(0.8),
+            observers: vec![Arc::new(Recorder)],
+            ..Default::default()
+        })
+        .expect("plugin must build");
+
+        let usage: CostUsage = plugin.usage().expect("usage read must succeed");
+        assert_eq!(usage.total_tokens(), 0);
+        assert_eq!(usage.max_total_tokens, Some(1_000_000));
+
+        let breakdown: Vec<(String, CostEntry)> =
+            plugin.breakdown().expect("breakdown read must succeed");
+        assert!(breakdown.is_empty());
+
+        assert!(matches!(
+            UnpricedModelPolicy::Reject,
+            UnpricedModelPolicy::Reject
+        ));
+    }
+}
+
+#[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
+mod cost_otel_bridge_surface {
+    use std::sync::Arc;
+
+    use cuca::{CostConfig, CostObserver, CostPlugin, CostUsage, OtelCostObserver};
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+    /// The bridge is reachable from the crate root, builds from a plain
+    /// `&dyn MeterProvider`, and drops straight into `CostConfig::observers`.
+    #[test]
+    fn otel_cost_observer_is_root_exported_under_both_features() {
+        let provider = SdkMeterProvider::builder().build();
+        let observer = OtelCostObserver::new(&provider);
+
+        let usage: CostUsage = CostPlugin::new(CostConfig::default())
+            .expect("plugin must build")
+            .usage()
+            .expect("usage read must succeed");
+        observer.observe(&usage).expect("recording is infallible");
+
+        let plugin = CostPlugin::new(CostConfig {
+            observers: vec![Arc::new(OtelCostObserver::new(&provider))],
+            ..Default::default()
+        })
+        .expect("plugin must build with the bridge attached");
+        assert_eq!(plugin.usage().expect("usage read must succeed").turns, 0);
+    }
+}
+
 #[cfg(any(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
 mod export_surface {
     use cuca::{

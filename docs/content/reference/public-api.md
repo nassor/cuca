@@ -9,7 +9,7 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Eleven modules and roughly ninety re-exported items, grouped by the feature that gates them</dd>
+<dd>Twelve modules and roughly ninety re-exported items, grouped by the feature that gates them</dd>
 <dt>You need</dt>
 <dd>Nothing; this page mirrors <code>src/lib.rs</code></dd>
 <dt>Read this if</dt>
@@ -33,6 +33,7 @@ anywhere in the crate.
 | `client` | `pub` | none | the builder, the client, and the plugin-instrumented stream pipeline |
 | `provider` | `pub(crate)` | none | provider adapter layer; not part of the public surface |
 | `export` | `pub` | `plugin-memory` or `plugin-prompt-cache` | the versioned `cuca-export` envelope |
+| `cost_otel` | `pub` | `plugin-cost` and `plugin-telemetry` | the cost ledger to OpenTelemetry bridge |
 | `orchestrator` | `pub` | `plugin-speculative` | speculative fast/slow pairing and complexity routing |
 
 ## Ungated re-exports
@@ -61,6 +62,7 @@ Types reachable through `cuca::types` rather than the crate root:
 
 | Gate | Items |
 |---|---|
+| `plugin-cost` | `CostConfig`, `CostEntry`, `CostObserver`, `CostPlugin`, `CostUsage`, `ModelRates`, `PricingResolver`, `PricingTable`, `UnpricedModelPolicy` |
 | `plugin-guardrails` | `JsonGuardrailPlugin` |
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |
 | `plugin-mcp` | `McpPlugin`, `McpTransport` |
@@ -75,6 +77,7 @@ Types reachable through `cuca::types` rather than the crate root:
 | `plugin-telemetry` | `OpenTelemetryPlugin` |
 | `plugin-web-search` | `SearchResult`, `WebSearchConfig`, `WebSearchPlugin`, `WebSearchProvider` |
 | `plugin-memory` or `plugin-prompt-cache` | `CUCA_EXPORT_FORMAT`, `CUCA_EXPORT_VERSION`, `CucaExport`, `CucaExportError`, `CucaImportReport`, `GraphExportSection`, `PromptCacheExportSection` |
+| `plugin-cost` and `plugin-telemetry` | `OtelCostObserver` |
 
 `PoolTurnExecutor` is `pub` inside `crate::orchestrator` but is not re-exported
 at the crate root.
@@ -135,6 +138,7 @@ wins. `with_prompt_cache_service` takes precedence over
 types it names, so a removed or renamed re-export fails compilation rather than
 silently disappearing. Its own gate is
 `any(provider-openai, provider-llamacpp)`, with nested modules gated on
-`plugin-prompt-cache`, `plugin-memory`, and the two combinations of them.
+`plugin-prompt-cache`, `plugin-memory`, `plugin-cost`, the two combinations of
+prompt-cache and memory, and the combination of cost and telemetry.
 
 Next page: [What CUCA is](@/_index.md), back at the top.
