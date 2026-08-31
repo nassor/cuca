@@ -5,8 +5,7 @@
 //! discovers its tools (`tools/list`) and executes them as normalized
 //! [`ToolCall`](crate::types::MessageContentBlock::ToolCall) →
 //! [`ToolResult`](crate::types::MessageContentBlock::ToolResult) exchanges in
-//! the stream pipeline. `McpPlugin::connect_stdio("github-mcp-server").await?`
-//! matches the spec's API-reference usage.
+//! the stream pipeline.
 //!
 //! # Protocol: MCP 2026-07-28 (stateless)
 //!
@@ -55,13 +54,12 @@
 //! thread such as the pipeline's `poll_next`.
 //!
 //! Pause semantics: the stream pipeline **pauses** until the tool executes
-//! (the model's stream stops producing blocks while the tool runs): the same
-//! pause as the spec's background-oneshot pattern. That is by design,
-//! not a caveat: the hook blocks whatever thread calls it, but the worker owns
-//! its runtime exclusively, so the blocked thread never has to make progress
-//! on it. Async callers (and tests) use [`McpPlugin::call_tool`], which awaits
-//! the same channel via a `spawn_blocking` wait instead of blocking the
-//! caller.
+//! (the model's stream stops producing blocks while the tool runs). That is by
+//! design, not a caveat: the hook blocks whatever thread calls it, but the
+//! worker owns its runtime exclusively, so the blocked thread never has to
+//! make progress on it. Async callers (and tests) use
+//! [`McpPlugin::call_tool`], which awaits the same channel via a
+//! `spawn_blocking` wait instead of blocking the caller.
 //!
 //! # API mapping to rmcp 3.x
 //!
@@ -141,8 +139,8 @@ struct ToolRequest {
 /// [`StreamableHttp`](Self::StreamableHttp) uses
 /// `rmcp::transport::StreamableHttpClientTransport` (the 2026-07-28
 /// Streamable HTTP binding; the old HTTP+SSE transport is gone).
-/// [`WebSocket`](Self::WebSocket) is declared for surface parity with the spec, but rmcp 3.x has no WebSocket client transport, so connecting it
-/// yields [`PluginError::NotSupported`].
+/// [`WebSocket`](Self::WebSocket) has no rmcp 3.x client transport, so
+/// connecting it yields [`PluginError::NotSupported`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum McpTransport {
     /// Spawn the server executable as a child process and speak MCP over
@@ -155,8 +153,8 @@ pub enum McpTransport {
     },
     /// A `ws://`/`wss://` endpoint.
     ///
-    /// Not connectable with rmcp 3.x (no WebSocket client transport is
-    /// implemented); retained so the transport surface matches the spec.
+    /// Not connectable with rmcp 3.x: no WebSocket client transport is
+    /// implemented.
     WebSocket {
         /// The endpoint URL.
         url: String,
@@ -195,8 +193,7 @@ pub struct McpPlugin {
 impl McpPlugin {
     /// Connect to an MCP server spawned as a child process over stdio.
     ///
-    /// Convenience for [`Self::connect`] with [`McpTransport::stdio`]; matches
-    /// the spec's API-reference usage:
+    /// Convenience for [`Self::connect`] with [`McpTransport::stdio`]:
     ///
     /// ```ignore
     /// let plugin = McpPlugin::connect_stdio("github-mcp-server").await?;
@@ -357,7 +354,8 @@ impl McpPlugin {
     ///
     /// Sends the request over the unbounded std channel (never blocks) and
     /// waits on the reply with a plain std `recv()`. Because the client never
-    /// runs on the caller's executor, the wait parks only the calling thread, legal even on a runtime worker thread such as the pipeline's
+    /// runs on the caller's executor, the wait parks only the calling thread,
+    /// legal even on a runtime worker thread such as the pipeline's
     /// `poll_next` (std blocking carries no tokio runtime guard; see module
     /// docs). The stream pipeline pauses for the duration.
     fn call_tool_sync(&self, name: &str, arguments: Value) -> Result<String, PluginError> {
@@ -377,7 +375,7 @@ impl McpPlugin {
 }
 
 impl CucaPlugin for McpPlugin {
-    /// Stable plugin name: `"mcp-connector"` (spec-fixed).
+    /// Stable plugin name.
     fn name(&self) -> &'static str {
         "mcp-connector"
     }
@@ -615,7 +613,8 @@ fn json_type_name(value: &Value) -> &'static str {
 #[cfg(all(test, feature = "plugin-mcp"))]
 mod tests {
     // In-memory server recipe (rmcp 3.x): rmcp ships no dedicated in-memory
-    // test transport, so the suite pairs `tokio::io::duplex` byte streams: one end feeds the plugin's worker client, the other a `ServerHandler`
+    // test transport, so the suite pairs `tokio::io::duplex` byte streams: one
+    // end feeds the plugin's worker client, the other a `ServerHandler`
     // served with `serve_server` on its own OS thread/runtime. JSON-RPC
     // framing is rmcp's `AsyncRwTransport` codec on both ends; no external
     // process, no network. The server speaks the stateless 2026-07-28
@@ -713,8 +712,8 @@ mod tests {
                     .to_owned()
             };
             // MRTR exercise path: `get_weather` with city "ELICIT" answers with
-            // `resultType: "input_required"` carrying one elicitation request, the 2026-07-28 Multi Round-Trip Requests contract. The
-            // connector
+            // `resultType: "input_required"` carrying one elicitation request,
+            // the 2026-07-28 Multi Round-Trip Requests contract. The connector
             // has no elicitation UI, so the client must surface a distinct
             // NotSupported error instead of a fabricated "complete" result.
             if request.name.as_ref() == "get_weather" && arg("city") == "ELICIT" {
@@ -923,8 +922,8 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn connect_stdio_spec_api_shape_compiles_and_errors_on_missing_binary() {
-        // Compile-time proof of the spec's API-reference usage
+    async fn connect_stdio_documented_shape_compiles_and_errors_on_missing_binary() {
+        // Compile-time proof of the documented `connect_stdio` shape
         // (`McpPlugin::connect_stdio("github-mcp-server").await?`): the
         // runtime half spawns a child process that cannot exist, so the
         // connection must fail with a spawn/IO error rather than hang.

@@ -1,7 +1,7 @@
 //! Real-time web search and live retrieval plugin.
 //!
-//! [`WebSearchPlugin`] hooks live search endpoints, Firecrawl, Tavily, or the DeepSeek Web Search endpoint, into
-//! the agent's stream pipeline. It resolves
+//! [`WebSearchPlugin`] hooks live search endpoints (Firecrawl, Tavily, or the
+//! DeepSeek Web Search endpoint) into the agent's stream pipeline. It resolves
 //! model-issued `web_search` and `web_extract` tool calls to normalized
 //! [`ToolResult`](crate::types::MessageContentBlock::ToolResult) blocks so the
 //! model can query live documentation, specs, and indexes during inference.
@@ -11,7 +11,7 @@
 //! [`CucaPlugin::on_stream_chunk`] is synchronous, but the HTTP calls behind
 //! [`WebSearchPlugin::search`] / [`WebSearchPlugin::extract_page`] are async.
 //! Blocking the caller's executor to wait on a runtime-managed future would
-//! deadlock a current-thread tokio runtime, so unlike the MCP plugin, which
+//! deadlock a current-thread tokio runtime. Unlike the MCP plugin, which
 //! keeps a long-lived worker thread alive across calls, this plugin has no
 //! persistent connection to keep warm. Each tool call therefore spawns a
 //! **short-lived dedicated OS thread** ([`std::thread::spawn`]) that builds its
@@ -21,13 +21,12 @@
 //! std blocking `recv()`.
 //!
 //! Pause semantics: the stream pipeline **pauses** while the search runs (the
-//! model's stream stops producing blocks until the tool result is emitted): the same documented pause as the MCP and HITL plugins. The
-//! per-call cost
-//! is bounded by
-//! the search latency plus one thread-spawn; the thread is dropped when the
-//! call completes. Because the wait uses std primitives (no tokio
-//! `blocking_send`/`blocking_recv`, which panic inside any runtime), the hook
-//! may block even on a runtime worker thread such as the pipeline's
+//! model's stream stops producing blocks until the tool result is emitted),
+//! the same documented pause as the MCP and HITL plugins. The per-call cost
+//! is bounded by the search latency plus one thread-spawn; the thread is
+//! dropped when the call completes. Because the wait uses std primitives (no
+//! tokio `blocking_send`/`blocking_recv`, which panic inside any runtime), the
+//! hook may block even on a runtime worker thread such as the pipeline's
 //! `poll_next`. This is safe here precisely because no persistent state must
 //! outlive the call: the per-call thread exclusively owns its runtime.
 
@@ -79,8 +78,7 @@ impl Default for WebSearchConfig {
     fn default() -> Self {
         WebSearchConfig {
             // Firecrawl is the default because it is the only provider that
-            // also supports page extraction, but the empty api_key means the
-            // caller must still configure a key before live use.
+            // also supports page extraction.
             provider: WebSearchProvider::Firecrawl,
             api_key: String::new(),
             base_url: None,
@@ -160,8 +158,6 @@ impl WebSearchPlugin {
             ),
             WebSearchProvider::Tavily => (
                 format!("{base}/search"),
-                // Tavily authenticates via the api_key field in the body, not
-                // an Authorization header.
                 Vec::new(),
                 json!({
                     "api_key": self.config.api_key,

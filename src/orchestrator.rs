@@ -101,10 +101,9 @@ use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMe
 /// complexity: a fast, low-latency routing model and a slow, high-capacity
 /// model, each on its own provider endpoint.
 ///
-/// The fields mirror the spec verbatim. `latency_threshold_ms` is the ceiling
-/// under which the fast tier is expected to respond; when it is exceeded, or a
-/// tool step errors, the orchestrator may fall back to the slow tier when
-/// `fallback_on_tool_error` is set.
+/// `latency_threshold_ms` is the ceiling under which the fast tier is expected
+/// to respond; when it is exceeded, or a tool step errors, the orchestrator
+/// may fall back to the slow tier when `fallback_on_tool_error` is set.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct SwappableModelPair {
     /// Provider endpoint serving the fast tier.
@@ -132,7 +131,7 @@ pub struct SwappableModelPair {
 /// `(provider, base_url)` an application actually talks to (two for a
 /// [`SwappableModelPair`] on two endpoints, one when both tiers share a
 /// backend), reused by every later turn. Repeated requests never add entries.
-/// A caller that mints endpoints per request — a per-tenant base URL, say —
+/// A caller that mints endpoints per request (a per-tenant base URL, say)
 /// owns that bound and should build a client per tenant instead of routing it
 /// through one shared pool. [`Self::len`] is the O(1) usage gauge.
 pub struct ClientPool {
@@ -171,8 +170,8 @@ impl ClientPool {
             .lock()
             .map_err(|_| CucaError::Config("client pool lock poisoned".into()))?;
         // One owned key for both the probe and the insert: `ProviderEndpoint`
-        // and `base_url` are heap-backed, so building it twice allocated the
-        // same key twice on every miss.
+        // and `base_url` are heap-backed, so building it twice would allocate
+        // the same key twice on every miss.
         let key = (provider.clone(), base_url.to_string());
         if let Some(client) = clients.get(&key) {
             return Ok(client.clone());
@@ -399,8 +398,6 @@ impl DraftValidator for JsonToolDraftValidator {
                 Ok(())
             }
             MessageContentBlock::Text(text) => {
-                // Loose check: text that parses as JSON must be an object;
-                // anything that fails to parse is ordinary prose and passes.
                 match serde_json::from_str::<serde_json::Value>(text) {
                     Ok(serde_json::Value::Object(_)) => Ok(()),
                     Ok(_) => Err("text block is valid JSON but not a JSON object".into()),

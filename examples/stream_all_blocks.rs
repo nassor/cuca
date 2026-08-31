@@ -70,8 +70,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage 3: start the stream.
     let mut stream = client.generate_stream(request).await?;
 
-    // Stage 4: match on every block variant. Text goes to stdout; everything
-    // else is annotated on stderr so the text reply stays clean.
+    // Stage 4: match on every block variant, keeping the text reply clean of
+    // the other annotations.
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(MessageContentBlock::Text(text)) => {

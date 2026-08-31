@@ -56,8 +56,8 @@
 //!
 //! # Telemetry note
 //!
-//! `tracing` is not a dependency of this feature, so the spec's diagnostic
-//! event (`execution_time_ms`, `memory_bytes_used`) is exposed through
+//! `tracing` is not a dependency of this feature, so the run diagnostic
+//! (`execution_time_ms`, `memory_bytes_used`) is exposed through
 //! [`SandboxPlugin::last_diagnostic`] rather than emitted as structured
 //! telemetry. Emitting it belongs to `plugin-telemetry` when both features
 //! are enabled; wiring that up is a known gap, deliberately not papered over
@@ -199,9 +199,7 @@ impl SandboxPlugin {
                 PluginError::Internal(format!("failed to define write_out import: {e}"))
             })?;
 
-        // Epoch interruption applies during instantiation too. Arm a fresh
-        // one-tick deadline while holding the global window lock, preventing a
-        // prior run's epoch increment from interrupting this fresh store.
+        // Epoch interruption applies during instantiation too.
         let _run_guard = RUN_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -246,9 +244,7 @@ impl SandboxPlugin {
             })?;
 
         // Instantiation and input setup completed before the ticker starts, so
-        // the timeout below bounds only guest execution. The lock acquired
-        // above remains held through ticker join, preventing cross-run epoch
-        // interruption.
+        // the timeout below bounds only guest execution.
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let ticker_engine = engine.clone();
         let timeout = self.config.timeout_ms;
@@ -291,8 +287,7 @@ impl SandboxPlugin {
     /// memory_bytes_used)`.
     ///
     /// Runs that ended in a [`PluginError`] produce no metrics, so they do not
-    /// overwrite the last successful diagnostic. Structured emission of this
-    /// event is out of scope for this feature (no `tracing` dependency). See the module docs'
+    /// overwrite the last successful diagnostic. See the module docs'
     /// telemetry note.
     pub fn last_diagnostic(&self) -> Option<(u64, usize)> {
         *self
@@ -363,7 +358,7 @@ fn trap_message(error: &wasmtime::Error) -> String {
 }
 
 impl CucaPlugin for SandboxPlugin {
-    /// Stable plugin name: `"wasm-sandbox"` (spec-fixed).
+    /// Stable plugin name: `"wasm-sandbox"`.
     fn name(&self) -> &'static str {
         "wasm-sandbox"
     }

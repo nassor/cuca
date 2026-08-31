@@ -7,7 +7,7 @@
 //!
 //! # Field-usage contract
 //!
-//! Downstream plans rely on specific fields here:
+//! Downstream consumers rely on specific fields here:
 //! - `req.model` and `req.provider` are read by `plugin-telemetry`.
 //! - `request.provider` is overwritten by `CucaClient::generate_stream`
 //!   with `self.selected_provider` before `on_request` hooks run, so

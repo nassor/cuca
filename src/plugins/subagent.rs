@@ -1,8 +1,9 @@
 //! Child subagent delegation and Git worktree isolation.
 //!
-//! [`SubagentPlugin`] turns two tool calls emitted by the parent model, `spawn_subagent` and `collect_subagent`, into asynchronous child
-//! subagent runs with restricted tool scopes and, optionally, isolated Git
-//! worktrees, then aggregates each child's summary back to the parent stream.
+//! [`SubagentPlugin`] turns two tool calls emitted by the parent model,
+//! `spawn_subagent` and `collect_subagent`, into asynchronous child subagent
+//! runs with restricted tool scopes and, optionally, isolated Git worktrees,
+//! then aggregates each child's summary back to the parent stream.
 //!
 //! # Delegation plumbing vs. the agent brain
 //!
@@ -10,8 +11,8 @@
 //! execution is delegated to the caller-supplied [`SubagentRunner`] seam
 //! (a real deployment wraps an external agent process/CLI; tests inject canned
 //! runners). Each spawned child is executed by `runner.spawn(spec)` on a
-//! background tokio task, so the plugin-level spawn is **non-blocking**: only [`SubagentPlugin::collect`] blocks, when the parent
-//! asks for a child's
+//! background tokio task, so the plugin-level spawn is **non-blocking**: only
+//! [`SubagentPlugin::collect`] blocks, when the parent asks for a child's
 //! finished summary.
 //!
 //! # Async fan-out design
@@ -20,8 +21,8 @@
 //! receiver under that id, and `tokio::spawn`s a task that awaits
 //! `runner.spawn(spec)` and delivers the [`SubagentResult`] through the
 //! channel. The delivery channel is **`std::sync::mpsc`** rather than a tokio
-//! oneshot: [`SubagentPlugin::collect`] is synchronous
-//! and `std::sync::mpsc::Receiver::recv()` blocks safely on any thread with no
+//! oneshot: [`SubagentPlugin::collect`] is synchronous and
+//! `std::sync::mpsc::Receiver::recv()` blocks safely on any thread with no
 //! runtime guard: tokio's `blocking_recv` instead panics when called from
 //! inside a runtime, which is exactly the context `on_stream_chunk` runs in.
 //! The std primitive parks only the caller's thread, leaving the spawned task
@@ -29,8 +30,7 @@
 //!
 //! Pause semantics: `collect` pauses the stream pipeline until the child
 //! finishes. This is the same background-oneshot pause the MCP connector
-//! documents.
-//! The structural caveat is identical: the blocking call must never
+//! documents. The structural caveat is identical: the blocking call must never
 //! run on a thread that itself has to make progress on the blocked child's
 //! runtime, which is safe here because the child runs on tokio's own worker
 //! threads, independent of whatever thread calls `collect`.
@@ -48,11 +48,12 @@
 //!
 //! # Diagnostic metric
 //!
-//! The spec's diagnostic (`child subagent spawns`: `parent_session_id`,
-//! `worktree_path`) is exposed through [`SubagentPlugin::spawns`], an append-only log of every spawn, alongside the scalar
-//! [`SubagentPlugin::spawn_count`]. `tracing` is not a dependency of this
-//! feature, so this is an accessor rather than emitted structured telemetry:
-//! emitting it belongs to `plugin-telemetry` when both features are enabled.
+//! The spawn diagnostic (`parent_session_id`, `worktree_path`) is exposed
+//! through [`SubagentPlugin::spawns`], a rolling log of recent spawns,
+//! alongside the scalar [`SubagentPlugin::spawn_count`]. `tracing` is not a
+//! dependency of this feature, so this is an accessor rather than emitted
+//! structured telemetry: emitting it belongs to `plugin-telemetry` when both
+//! features are enabled.
 
 use std::collections::{HashMap, VecDeque};
 use std::future::Future;
@@ -96,7 +97,8 @@ pub struct WorktreeConfig {
 /// The outcome of a finished child subagent run.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubagentResult {
-    /// The child's unique spawn id (matches the id [`SubagentPlugin::spawn_subagent`] returned).
+    /// The child's unique spawn id (matches the id
+    /// [`SubagentPlugin::spawn_subagent`] returned).
     pub subagent_id: String,
     /// The child's aggregated summary, surfaced to the parent.
     pub summary: String,
@@ -136,7 +138,7 @@ pub trait SubagentRunner: Send + Sync {
 ///   drains it.
 /// - The diagnostic spawn log keeps the most recent
 ///   [`Self::MAX_SPAWN_LOG`] entries, dropping the oldest at the cap. It is a
-///   rolling sample for the spawn metric, not an audit trail — the durable
+///   rolling sample for the spawn metric, not an audit trail: the durable
 ///   record of a child run is the child's own [`SubagentResult`].
 pub struct SubagentPlugin {
     runner: Arc<dyn SubagentRunner>,
@@ -224,8 +226,7 @@ impl SubagentPlugin {
                 message: "task must be non-empty".into(),
             });
         }
-        // Prepare the worktree synchronously so the child runs in a ready cwd;
-        // a non-git cwd or failed add surfaces here as NotSupported.
+        // Prepare the worktree synchronously so the child runs in a ready cwd.
         let worktree_path = match &spec.worktree {
             Some(config) => Some(Self::prepare_worktree(config)?),
             None => None,
@@ -248,7 +249,6 @@ impl SubagentPlugin {
             id
         };
         {
-            // Rolling window: the oldest sample leaves at the cap.
             let mut log = self.spawn_log.lock().unwrap_or_else(|p| p.into_inner());
             while log.len() >= Self::MAX_SPAWN_LOG {
                 log.pop_front();
@@ -446,7 +446,7 @@ fn spec_from_args(arguments: &serde_json::Value) -> Result<SubagentSpec, PluginE
         .and_then(|v| v.as_str())
         .map(str::to_owned)
         .unwrap_or_default();
-    // Default to an empty scope (unrestricted); ignore non-string entries.
+    // Non-string entries are ignored.
     let tool_scope = obj
         .get("tool_scope")
         .and_then(|v| v.as_array())
@@ -594,9 +594,9 @@ mod tests {
         let plugin = Arc::new(SubagentPlugin::new(Arc::new(runner)));
         // Empty scope means unrestricted; spawn must be accepted. `collect`
         // blocks on a std mpsc receiver while the result task runs on the
-        // tokio runtime, so the interaction runs on the blocking pool, on a current-thread runtime (this crate never enables
-        // `rt-multi-thread`) the runtime worker must stay free to poll the
-        // spawned task.
+        // tokio runtime, so the interaction runs on the blocking pool: on a
+        // current-thread runtime (this crate never enables `rt-multi-thread`)
+        // the runtime worker must stay free to poll the spawned task.
         let res = tokio::task::spawn_blocking(move || {
             let id = plugin
                 .spawn_subagent(spec("do work", vec![]))

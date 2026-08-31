@@ -203,8 +203,8 @@ impl PromptCache {
     ///
     /// # Errors
     ///
-    /// Infallible today — `config` is already validated by
-    /// [`PromptCacheConfig::new`] — but the `Result` is part of the published
+    /// Infallible today: `config` is already validated by
+    /// [`PromptCacheConfig::new`]. The `Result` is part of the published
     /// signature so a future construction-time check stays non-breaking.
     pub fn new(config: PromptCacheConfig) -> Result<Self, PromptCacheError> {
         Ok(Self::with_clock(config, Arc::new(SystemClock)))
@@ -1369,7 +1369,7 @@ mod tests {
     fn snapshot_at_ranks_are_contiguous_when_an_entry_is_resident_but_expired() {
         // Regression test: `snapshot_at` must not derive exported `lru_rank`
         // values from positions in the UNPRUNED `lru_order` while filtering
-        // expired entries out of the exported set — that produces
+        // expired entries out of the exported set. That produces
         // non-contiguous ranks that `validate_snapshot` (and therefore
         // `replace_snapshot_at`) rejects. Build three entries so that the
         // oldest is resident-but-expired (no `insert`/`lookup` call has run

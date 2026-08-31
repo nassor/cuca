@@ -14,18 +14,17 @@
 //!
 //! # In-test rmcp echo server (test-binary re-execution)
 //!
-//! The MCP echo server is no longer an external script fixture: each test spawns
+//! The MCP echo server is not an external process fixture. Each test spawns
 //! **this test binary itself** ([`std::env::current_exe`]) with the single
 //! argument `--mcp-echo-server`, and a [`ctor`] constructor runs *before*
 //! libtest's `main`, spots the flag via `args_os` (no UTF-8 panics), and
 //! serves the rmcp stdio echo server defined in [`mcp_echo_server`]. The
 //! child runs its own current-thread tokio runtime, built inside the
 //! interceptor with I/O and timers enabled (`enable_all`, the same flavor
-//! the plugin's worker uses), blocks on the rmcp serve future, and
-//! `std::process::exit(0)`s once stdin reaches EOF — the same stdio shutdown
-//! rule the script fixture followed. The plugin still talks to a genuine
-//! child process over real pipes, so the worker-thread / sync-hook /
-//! io-driver binding rationale above is unchanged.
+//! the plugin's worker uses), blocks on the rmcp serve future, and calls
+//! `std::process::exit(0)` once stdin reaches EOF. The plugin still talks to
+//! a genuine child process over real pipes, so the worker-thread, sync-hook,
+//! and io-driver binding rationale above still applies.
 
 #![cfg(all(feature = "provider-llamacpp", feature = "plugin-mcp"))]
 
@@ -193,12 +192,12 @@ async fn live_stream_chunk_executes_the_real_mcp_tool() {
 
 /// The in-test MCP stdio echo server.
 ///
-/// Replicates the `echo` tool of the former external script fixture: one tool
-/// named `echo`, description "Echo the given text back verbatim", inputSchema
-/// `{ type: "object", properties: { text: { type: "string" } }, required:
-/// ["text"] }`. The rmcp server framework answers `server/discover`,
-/// `tools/list`, `ping`, and method-not-found itself; only the tool is defined
-/// here. Served over stdio; the process exits when stdin reaches EOF.
+/// Defines one tool named `echo`, description "Echo the given text back
+/// verbatim", inputSchema `{ type: "object", properties: { text: { type:
+/// "string" } }, required: ["text"] }`. The rmcp server framework answers
+/// `server/discover`, `tools/list`, `ping`, and method-not-found itself; only
+/// the tool is defined here. Served over stdio; the process exits when stdin
+/// reaches EOF.
 mod mcp_echo_server {
     use rmcp::handler::server::wrapper::Parameters;
     use rmcp::schemars::JsonSchema;

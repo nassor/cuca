@@ -1,13 +1,13 @@
 //! Zero-allocation SSE stream parser engine.
 //!
-//! # Design deviation from the spec signature
+//! # Why the parser returns frames, not blocks
 //!
-//! The spec signature is `feed_chunk(...) -> Vec<MessageContentBlock>`. This
-//! parser intentionally returns `Vec<SseEvent>` instead: it stays
-//! protocol-pure and does not interpret vendor JSON shapes. Translating a
-//! normalized frame into `MessageContentBlock` is provider-specific
-//! (Anthropic `content_block_delta` vs OpenAI `choices[0].delta` vs Gemini
-//! parts) and lives in the per-provider adapters on top of this engine.
+//! `feed_chunk` returns `Vec<SseEvent>`, not `Vec<MessageContentBlock>`: the
+//! parser stays protocol-pure and does not interpret vendor JSON shapes.
+//! Translating a normalized frame into `MessageContentBlock` is
+//! provider-specific (Anthropic `content_block_delta` vs OpenAI
+//! `choices[0].delta` vs Gemini parts) and lives in the per-provider adapters
+//! on top of this engine.
 //! Keeping the parser single-purpose makes the zero-allocation state machine
 //! independently testable.
 //!
@@ -34,8 +34,8 @@
 //!   Last-Event-ID reconnection semantics.
 //! - Completed frames are parsed from buffer slices. The per-frame
 //!   allocations are exactly: the `data` `String`, the `event` `String` (the
-//!   `"message"` default is also owned), and — only for a stream that carries
-//!   `id:` fields — the `SseEvent` `id` `String`. An `id`-bearing frame
+//!   `"message"` default is also owned), and, only for a stream that carries
+//!   `id:` fields, the `SseEvent` `id` `String`. An `id`-bearing frame
 //!   allocates twice for that field (one owned copy for the event, one for the
 //!   parser's persisted `last_event_id`); a frame that inherits the id
 //!   allocates once. Both are forced by the owned `Option<String>` on the
@@ -56,8 +56,8 @@
 //!
 //! # Error path
 //!
-//! `feed_chunk` returns `Result<_, CucaError>` per spec, which does not name
-//! the error source. UTF-8 is the only recoverable-fatal condition here: a
+//! `feed_chunk` returns `Result<_, CucaError>`, which does not name the error
+//! source. UTF-8 is the only recoverable-fatal condition here: a
 //! completed frame whose `data`/`event`/`id` bytes are not valid UTF-8 yields
 //! `Err(CucaError::SseParse(..))`. Partial (unterminated) lines are never
 //! validated until the frame they belong to is completed by a blank line.
@@ -150,7 +150,7 @@ impl SseStreamParser {
 
     /// The current capacity of the internal reusable buffer.
     ///
-    /// `new()` initializes this to at least 8192 bytes per spec.
+    /// `new()` initializes this to at least 8192 bytes.
     pub fn capacity(&self) -> usize {
         self.buffer.capacity()
     }
@@ -447,7 +447,7 @@ mod tests {
         assert!(parser.capacity() >= 8192);
     }
 
-    /// A line without a colon is ignored per spec.
+    /// A line without a colon is ignored.
     #[test]
     fn line_without_colon_ignored() {
         let mut parser = SseStreamParser::new();

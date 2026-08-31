@@ -364,9 +364,7 @@ pub async fn gemini_stream(
 /// Stream adapter: reqwest byte stream -> SSE parser -> block translator.
 ///
 /// Yields at most one block per poll; the byte stream ending terminates the
-/// stream once the current chunk's blocks are drained. (Gemini sends no
-/// `[DONE]` marker, the final frame carries only `usageMetadata` and translates to no
-/// blocks, so end-of-stream is the only terminator.)
+/// stream once the current chunk's blocks are drained.
 struct GeminiStream {
     inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
     parser: SseStreamParser,

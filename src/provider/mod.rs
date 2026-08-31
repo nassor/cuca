@@ -4,6 +4,7 @@
 //! behind its `#[cfg(feature = "...")]` gate. The adapter modules own the
 //! `dispatch_*` methods on [`crate::client::CucaClient`] (`impl CucaClient`
 //! blocks), which `generate_stream` calls under the matching feature.
+
 /// Shared Anthropic Messages-API protocol module: auth,
 /// request-body translation, and SSE parsing. Serves the `provider-anthropic`
 /// dispatch and is reused by the DeepSeek bridge.

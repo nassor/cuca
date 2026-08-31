@@ -322,8 +322,8 @@ impl ChatCompletionTranslator {
     /// flushed calls are drained one per subsequent call. Text deltas become
     /// [`MessageContentBlock::Text`], `reasoning_content` becomes
     /// [`MessageContentBlock::Thinking`], and a tool call is emitted once its
-    /// argument fragment accumulates to valid JSON, or at `finish_reason`/`[DONE]`, whichever comes first. OpenAI error
-    /// bodies
+    /// argument fragment accumulates to valid JSON, or at
+    /// `finish_reason`/`[DONE]`, whichever comes first. OpenAI error bodies
     /// (`{"error":{"message":...}}`) yield [`CucaError::Provider`].
     pub fn translate(&mut self, payload: &str) -> Result<Option<MessageContentBlock>, CucaError> {
         // [DONE] terminates the stream; check it before draining pending so the

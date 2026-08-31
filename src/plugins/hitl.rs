@@ -8,13 +8,13 @@
 //!
 //! # Pause semantics and the sync channel seam
 //!
-//! Per the spec the pipeline "pauses ... and waits for interactive approval",
-//! so the hook blocks on the injected [`ApprovalChannel`]. The trait is
+//! The pipeline pauses at a gated call and waits for interactive approval, so
+//! the hook blocks on the injected [`ApprovalChannel`]. The trait is
 //! deliberately synchronous: [`ApprovalChannel::request_approval`] parks the
-//! calling thread until an approver decides, matching the spec's pause
-//! semantics. A real deployment bridges this to an async UI (e.g. a oneshot
-//! populated by a UI task); the crate ships the [`OneshotApprovalChannel`]
-//! seam for exactly that programmatic/UI-driven case.
+//! calling thread until an approver decides. A real deployment bridges this to
+//! an async UI (e.g. a oneshot populated by a UI task); the crate ships the
+//! [`OneshotApprovalChannel`] seam for exactly that programmatic/UI-driven
+//! case.
 //!
 //! # Failure-closed default
 //!
@@ -23,8 +23,9 @@
 //!
 //! # Audit trail
 //!
-//! Every gated decision is recorded with the spec's audit attributes (`action_requested`, `approver_id`, `status`) plus a monotonic wall-clock
-//! timestamp in [`HitlAuditEntry`], readable via [`HitlPlugin::audit_log`].
+//! Every gated decision is recorded with `action_requested`, `approver_id`,
+//! and `status`, plus a wall-clock timestamp in [`HitlAuditEntry`], readable
+//! via [`HitlPlugin::audit_log`].
 //! Durable/persisted storage of this log belongs to the session-log plugin when
 //! co-registered (out of scope here).
 
@@ -104,7 +105,6 @@ pub fn classify_tool_call(name: &str) -> Risk {
     if HIGH_KEYWORDS.iter().any(|k| n.contains(k)) {
         return Risk::High;
     }
-    // Read-only and unknown tools stream through ungated.
     Risk::Low
 }
 
@@ -132,9 +132,9 @@ pub enum ApprovalDecision {
 
 /// Seam that resolves an [`ApprovalRequest`] to an [`ApprovalDecision`].
 ///
-/// Synchronous by design: the pipeline "pauses ... and waits for interactive
-/// approval", so [`Self::request_approval`] blocks the calling thread until an
-/// approver decides. Implementations bridge to async UI, e.g. a
+/// Synchronous by design: the pipeline pauses at a gated call and waits for
+/// interactive approval, so [`Self::request_approval`] blocks the calling
+/// thread until an approver decides. Implementations bridge to async UI, e.g. a
 /// [`OneshotApprovalChannel`] populated by a UI task. `Send + Sync` lets the
 /// channel be shared across `await` points in the async client pipeline.
 pub trait ApprovalChannel: Send + Sync {
@@ -242,7 +242,7 @@ pub struct HitlAuditEntry {
 /// an approval audit trail, and dropping rulings would quietly erase the
 /// record of who allowed what. A gated call whose ruling cannot be recorded is
 /// therefore refused, matching the module's failure-closed default. Drain the
-/// log through [`Self::audit_log`] — or offload it to the session-log plugin —
+/// log through [`Self::audit_log`], or offload it to the session-log plugin,
 /// before the cap. [`Self::audit_len`] is the O(1) usage gauge.
 pub struct HitlPlugin {
     channel: Arc<dyn ApprovalChannel>,
@@ -371,11 +371,7 @@ impl CucaPlugin for HitlPlugin {
             detail,
         };
         match self.channel.request_approval(&req) {
-            ApprovalDecision::Approved => {
-                // Approved: the call streams through exactly as the model
-                // emitted it.
-                self.record_audit(&req, "approved")
-            }
+            ApprovalDecision::Approved => self.record_audit(&req, "approved"),
             ApprovalDecision::Denied => {
                 self.record_audit(&req, "denied")?;
                 // `req` is dead once its ruling is recorded, so its owned id

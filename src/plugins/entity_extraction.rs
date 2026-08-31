@@ -6,8 +6,8 @@
 //! the accepted candidate into a graph delta. Validation is total: an unknown
 //! table, a missing required property, a type mismatch, an undeclared property
 //! on a table with `allow_model_properties = false`, or a relationship endpoint
-//! that no accepted entity satisfies all return
-//! [`PluginError::Validation`] instead of a partially accepted delta.
+//! that no accepted entity satisfies all return [`PluginError::Validation`]
+//! instead of a partially accepted delta.
 //!
 //! # Hard dependency on `plugin-memory`
 //!
@@ -132,7 +132,7 @@ pub struct EntityReference {
     /// Entity table the endpoint points at; must equal the relationship
     /// table's declared `from_table`/`to_table`.
     pub table: String,
-    /// Exactly the table's `identity_columns` and their values — no more, no
+    /// Exactly the table's `identity_columns` and their values: no more, no
     /// fewer.
     pub identity: serde_json::Map<String, serde_json::Value>,
 }
@@ -248,12 +248,12 @@ impl EntityExtractionPlugin {
     ///
     /// # Errors
     ///
-    /// [`PluginError::Validation`] — validation is total, so nothing is
-    /// accepted partially — for an unknown table, a missing required property,
-    /// a property whose JSON shape does not match its column, an undeclared
-    /// property on a table with `allow_model_properties = false`, a
+    /// [`PluginError::Validation`] for an unknown table, a missing required
+    /// property, a property whose JSON shape does not match its column, an
+    /// undeclared property on a table with `allow_model_properties = false`, a
     /// relationship endpoint that does not carry exactly its table's identity
     /// columns, or an endpoint no accepted entity of this candidate satisfies.
+    /// Validation is total: nothing is accepted partially.
     pub fn validate_candidate(
         &self,
         candidate: EntityExtractionCandidate,

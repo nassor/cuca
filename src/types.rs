@@ -74,10 +74,10 @@ pub enum MessageRole {
 /// plain text, images, chain-of-thought, tool invocations, and tool results;
 /// provider adapters translate them to each vendor's own wire shape.
 //
-// spec deviation: the spec derives only Debug/Clone here; the serde repr is an
-// addition, adjacently tagged (`type` + `value`) rather than internally tagged
-// because internal tagging cannot represent the newtype String variant `Text`:
-// session logging serializes Text blocks, so every variant must round-trip.
+// The serde repr is adjacently tagged (`type` + `value`) rather than
+// internally tagged because internal tagging cannot represent the newtype
+// String variant `Text`: session logging serializes Text blocks, so every
+// variant must round-trip.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum MessageContentBlock {

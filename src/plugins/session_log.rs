@@ -1,18 +1,18 @@
 //! Append-only session trajectory store.
 //!
 //! [`SessionLogPlugin`] implements the [`SessionStorePlugin`] contract on the
-//! [`SessionEvent`] model: every interaction class, system instructions, reasoning, outputs, tool
-//! executions (with stdout/stderr/exit codes when a block carries them),
-//! latency, token usage, and model swaps, is
-//! recorded as one append-only [`SessionRecord`] per session.
+//! [`SessionEvent`] model: every interaction class, system instructions,
+//! reasoning, outputs, tool executions (with stdout/stderr/exit codes when a
+//! block carries them), latency, token usage, and model swaps, is recorded as
+//! one append-only [`SessionRecord`] per session.
 //!
 //! # Append-only paradigm
 //!
 //! Records are only ever *added* to a session's trajectory; nothing is rewritten
 //! or removed. Each session's records carry a 0-based `sequence` assigned by the
 //! store on append, so replay order is the append order. [`SessionBackend`] is
-//! the storage seam; this module ships a capped in-memory [`InMemoryBackend`] and an
-//! append-only framed file backend [`FileBackend`].
+//! the storage seam; this module ships a capped in-memory [`InMemoryBackend`]
+//! and an append-only framed file backend [`FileBackend`].
 //!
 //! # Per-session sequencing
 //!
@@ -773,7 +773,6 @@ impl SessionBackend for FileBackend {
         // check and the write below cannot interleave with another append.
         let mut scratch = self.scratch.lock().unwrap_or_else(|p| p.into_inner());
 
-        // append(true) never truncates; existing frames always survive.
         let mut file = std::fs::OpenOptions::new()
             .append(true)
             .create(true)

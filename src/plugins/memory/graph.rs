@@ -31,13 +31,13 @@
 //!    existing node.
 //! 2. **Relationship-id uniqueness**: no two relationships share an id; an
 //!    insert collision is an upsert, and a merge collision is resolved by
-//!    deterministic renaming — data is never dropped.
+//!    deterministic renaming; data is never dropped.
 //! 3. **Adjacency completeness**: the adjacency and position indexes mirror
 //!    the relationship store exactly.
 //! 4. **Merge never loses data**: after a merge every incoming node and
 //!    relationship is present, under its original or renamed id.
 //! 5. **Determinism**: no observable behavior depends on `HashMap` iteration
-//!    order — every query result is by-id or sorted, and [`MemoryGraph::render`]
+//!    order: every query result is by-id or sorted, and [`MemoryGraph::render`]
 //!    output is byte-deterministic for a given graph.
 //!
 //! # Complexity
@@ -55,7 +55,6 @@
 //!   limit is not smaller than its collection). `merge` is O(n + m + c log c)
 //!   where c is the number of colliding relationship ids (see
 //!   [`MemoryGraph::merge`]).
-
 //!
 //! # Example
 //!
@@ -159,7 +158,7 @@ pub struct MergeReport {
 
 /// A complete, deterministic, lossless snapshot of a [`MemoryGraph`].
 ///
-/// Contains exactly the graph's nodes and relationships — no adjacency
+/// Contains exactly the graph's nodes and relationships: no adjacency
 /// vectors, position maps, capacities, traversal caches, or other derived
 /// indexes. [`MemoryGraph::snapshot`] sorts nodes by [`GraphNode::id`] and
 /// relationships by [`GraphRelationship::id`], so equivalent graphs built in
@@ -252,7 +251,7 @@ impl MemoryGraph {
     ///
     /// Upsert by id: a replaced relationship is re-indexed in the adjacency
     /// even when its `from`/`to` changed. Both endpoints must already exist as
-    /// nodes — add nodes before their relationships.
+    /// nodes. Add nodes before their relationships.
     ///
     /// # Errors
     ///
@@ -272,8 +271,6 @@ impl MemoryGraph {
             )));
         }
         let id = rel.id.clone();
-        // Upsert by id: drop any previous relationship with this id first so
-        // the adjacency index is rebuilt even when from/to changed.
         self.remove_relationship(&id);
         let from = rel.from.clone();
         let to = rel.to.clone();
@@ -297,7 +294,7 @@ impl MemoryGraph {
         self.relationships.get(id)
     }
 
-    /// Iterate all nodes. Order is unspecified — use [`Self::render`] or
+    /// Iterate all nodes. Order is unspecified; use [`Self::render`] or
     /// [`Self::subgraph`] for deterministic output.
     pub fn nodes(&self) -> impl Iterator<Item = &GraphNode> {
         self.nodes.values()
@@ -352,8 +349,8 @@ impl MemoryGraph {
     /// overwrite. All checks run before any insertion, and the reconstructed
     /// graph is returned only after all six collections are rebuilt through
     /// [`Self::add_relationship`], which rechecks the endpoint invariant.
-    /// Nothing the caller owns — least of all a live graph awaiting
-    /// replacement — is touched on any error.
+    /// Nothing the caller owns, including a live graph awaiting replacement,
+    /// is touched on any error.
     ///
     /// Import is a replacement, not a merge: relationship ids are preserved,
     /// so parallel edges stay separate and self-loops stay self-loops.
@@ -694,13 +691,12 @@ impl MemoryGraph {
     /// number of colliding relationship ids (sorted for a deterministic rename
     /// mapping). On top of that, the rename probe set is built from every
     /// pre-merge relationship id in *both* graphs, so it costs
-    /// `O(|self.relationships| + m)` — a term in the receiving graph's
+    /// `O(|self.relationships| + m)`: a term in the receiving graph's
     /// existing size, paid even when nothing collides. Capacity is
     /// pre-reserved, so no rehash occurs.
     pub fn merge(&mut self, other: MemoryGraph, policy: MergePolicy) -> MergeReport {
         let mut report = MergeReport::default();
 
-        // Pre-reserve union-size capacity so no rehash happens below.
         self.nodes.reserve(other.nodes.len());
         self.relationships.reserve(other.relationships.len());
         self.outgoing.reserve(other.outgoing.len());
@@ -708,7 +704,7 @@ impl MemoryGraph {
         self.outgoing_positions.reserve(other.relationships.len());
         self.incoming_positions.reserve(other.relationships.len());
 
-        // Pass 1 — nodes: union per policy, order-independent.
+        // Pass 1: nodes union per policy, order-independent.
         for (id, node) in other.nodes {
             match self.nodes.entry(id) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -727,7 +723,7 @@ impl MemoryGraph {
             }
         }
 
-        // Pass 2a — deterministic rename resolution for relationship-id
+        // Pass 2a: deterministic rename resolution for relationship-id
         // collisions. `taken` is seeded with EVERY pre-merge relationship id
         // from both graphs: a rename must also avoid every incoming id that
         // survives the merge, otherwise it could land on a surviving incoming
@@ -758,7 +754,7 @@ impl MemoryGraph {
             rename.insert(orig.clone(), candidate);
         }
 
-        // Pass 2b — relationships, moved in. Endpoints exist by invariant 1
+        // Pass 2b: relationships, moved in. Endpoints exist by invariant 1
         // plus the node union never dropping ids.
         for (orig_id, mut rel) in other.relationships {
             let final_id = match rename.get(&orig_id) {
@@ -790,7 +786,7 @@ impl MemoryGraph {
 
     /// Deterministic, compact, LLM-readable listing of the graph.
     ///
-    /// Format (see `dev-docs/memory-graph-design.md` §9): the first line is
+    /// Format: the first line is
     /// exactly `CUCA graph memory: {n} nodes, {m} relationships` (prefix
     /// [`GRAPH_RENDER_MARKER`]); then node lines sorted by id (up to
     /// `max_nodes`), each `node {id}:` with ` labels=[a, b]` and ` props={json}`
@@ -1412,7 +1408,7 @@ mod tests {
     #[test]
     fn merge_rename_collision_between_incoming_relationships() {
         // Both incoming `x` and `x-2` collide: sorted-origin processing fixes
-        // the mapping — incoming `x` -> `x-3`, incoming `x-2` -> `x-2-2`.
+        // the mapping: incoming `x` -> `x-3`, incoming `x-2` -> `x-2-2`.
         let mut g1 = MemoryGraph::new();
         g1.upsert_node(node("a"));
         g1.upsert_node(node("b"));
@@ -1612,7 +1608,10 @@ mod tests {
                         rel r1: b -[works_on]-> a weight=1\n\
                         rel r2: a -[knows]-> b weight=0.5 props={\"since\":2020}\n";
         let rendered = g.render(16, 32);
-        assert_eq!(rendered, expected, "exact byte format per design §9");
+        assert_eq!(
+            rendered, expected,
+            "exact byte format per MemoryGraph::render"
+        );
         assert_eq!(g.render(16, 32), rendered, "byte-identical across calls");
     }
 

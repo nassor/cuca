@@ -1,7 +1,7 @@
 //! Shared Anthropic Messages-API protocol module.
 //!
 //! Implements the Anthropic Claude adapter's protocol layer behind the
-//! `any(provider-anthropic, provider-deepseek)` gate so DeepSeek
+//! `any(provider-anthropic, provider-deepseek)` gate so the DeepSeek
 //! bridge can reuse the same translation pieces: auth + request headers
 //! ([`headers`]), OAuth 2.0 PKCE helpers (gated to `provider-anthropic`, which
 //! pulls in the optional `sha2`/`getrandom`/`base64` deps), Messages-API body
@@ -11,10 +11,10 @@
 //!
 //! # Block-sequential translation design
 //!
-//! Anthropic emits content blocks strictly sequentially, a block's `content_block_delta` events always follow its
-//! `content_block_start` and precede its `content_block_stop`, so the `index`
-//! carried on delta events
-//! is never needed. [`AnthropicTranslator`] tracks at most one block in flight
+//! Anthropic emits content blocks strictly sequentially: a block's
+//! `content_block_delta` events always follow its `content_block_start` and
+//! precede its `content_block_stop`, so the `index` carried on delta events is
+//! never needed. [`AnthropicTranslator`] tracks at most one block in flight
 //! with plain `Option` accumulators (one each for the tool-call input
 //! fragment, the thinking text, and the thinking signature).
 
@@ -1733,7 +1733,7 @@ data: {"type":"message_stop"}"#,
         assert_eq!(req.prompt_cache, PromptCacheDirective::Disabled);
         let body = build_anthropic_request(&req).unwrap();
 
-        // Joined scalar system, exactly as before prompt caching existed.
+        // Joined scalar system form.
         assert_eq!(body["system"], json!("policy a\npolicy b"));
         assert!(
             !serde_json::to_string(&body)

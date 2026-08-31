@@ -1,4 +1,4 @@
-//! LM Studio provider dispatch .
+//! LM Studio provider dispatch.
 //!
 //! Routes `provider-lmstudio` requests through the shared
 //! [`openai_compat`](crate::provider::openai_compat) adapter: LM Studio serves
@@ -20,10 +20,7 @@ use crate::request::UnifiedRequest;
 /// (`http://127.0.0.1:1234/v1`); any configured value passes through
 /// unchanged. The default carries the `/v1` suffix because
 /// [`openai_compat_stream`] appends `/chat/completions` to the base URL, so
-/// the full request path becomes `/v1/chat/completions`. (The spec's provider
-/// table lists the bare host `http://127.0.0.1:1234` without `/v1`, an
-/// inconsistency with the OpenAI/DeepSeek table rows, which include `/v1`;
-/// documented here rather than silently "fixed".)
+/// the full request path becomes `/v1/chat/completions`.
 pub(crate) fn resolve_base_url(client_base: &str) -> String {
     if client_base.is_empty() {
         "http://127.0.0.1:1234/v1".into()
@@ -46,7 +43,7 @@ impl CucaClient {
     ) -> Result<ProviderDispatch, CucaError> {
         let cfg = OpenAiCompatConfig {
             base_url: resolve_base_url(self.base_url()),
-            api_key: self.api_key().map(str::to_string), // LM Studio: optional header
+            api_key: self.api_key().map(str::to_string),
             model: req.model.clone(),
         };
         openai_compat_stream(self.http_client(), &cfg, req).await

@@ -1,16 +1,11 @@
 //! OpenTelemetry metrics and structured-log plugin.
 //!
 //! [`OpenTelemetryPlugin`] wires the [`CucaPlugin`] hooks to three OTel
-//! instruments on a caller-supplied meter provider, a request counter, a latency histogram, and a streamed-token
-//! counter, and emits `tracing` logs
+//! instruments on a caller-supplied meter provider: a request counter, a
+//! latency histogram, and a streamed-token counter. It emits `tracing` logs
 //! on request dispatch and response completion. No default meter provider is
-//! installed here: callers pass their own `&MeterProvider` (per the spec's
-//! `new` signature), so the plugin composes with any exporter pipeline.
-//!
-//! spec adaptation: the spec sketch's `.init()` terminal on instrument builders
-//! does not exist in the opentelemetry 0.32 API: the builders terminate with
-//! `.build()`. Instrument names, descriptions, and the `"cuca_client"` meter
-//! name are unchanged.
+//! installed here: callers pass their own `&MeterProvider`, so the plugin
+//! composes with any exporter pipeline.
 
 use crate::error::PluginError;
 use crate::plugin::CucaPlugin;
@@ -26,11 +21,11 @@ use crate::types::MessageContentBlock;
 pub struct OpenTelemetryPlugin {
     /// Meter the three instruments below were built from.
     ///
-    /// Retained per the spec's `new` signature so the plugin owns the meter
-    /// handle for its whole lifetime; the hooks only touch the instruments.
+    /// Retained so the plugin owns the meter handle for its whole lifetime;
+    /// the hooks only touch the instruments.
     #[expect(
         dead_code,
-        reason = "spec-mandated retained handle; the hooks read the instruments, never the meter"
+        reason = "retained handle; the hooks read the instruments, never the meter"
     )]
     meter: opentelemetry::metrics::Meter,
     /// Monotonic counter of dispatched unified LLM requests.
@@ -92,9 +87,9 @@ impl CucaPlugin for OpenTelemetryPlugin {
     }
 
     fn on_stream_chunk(&self, _chunk: &mut MessageContentBlock) -> Result<(), PluginError> {
-        // Spec-verbatim per-block count: one token per streamed content block is
-        // a coarse approximation of the true token count (a block may span many
-        // tokens, or a partial one mid-stream).
+        // One token per streamed content block is a coarse approximation of
+        // the true token count: a block may span many tokens, or a partial one
+        // mid-stream.
         self.token_counter.add(1, &[]);
         Ok(())
     }
@@ -263,7 +258,7 @@ mod tests {
     }
 
     #[test]
-    fn name_is_spec_value_and_plugin_is_send_sync() {
+    fn name_is_stable_and_plugin_is_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
         assert_send_sync::<OpenTelemetryPlugin>();
 

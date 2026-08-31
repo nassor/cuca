@@ -84,7 +84,7 @@ impl ResponseMetadataHandle {
     /// propagating an error: see the type-level "poisoned lock" note.
     ///
     /// Called by the Anthropic SSE stream translator once it decodes
-    /// `message_start` usage — so by `provider-anthropic` and by
+    /// `message_start` usage, so by `provider-anthropic` and by
     /// `provider-deepseek`, whose bridge reuses that translator. Every other
     /// adapter builds [`Self::empty`] and never calls this, so a build with
     /// neither feature never calls it either.
@@ -506,13 +506,12 @@ impl CucaClient {
     /// [`ModelOrchestrator::execute_adaptive_turn`] and the provider dispatch
     /// arms below are bypassed. The orchestrator's own stream carries its
     /// own instrumentation and never runs this client's top-level
-    /// `on_stream_chunk`/`on_response_complete` hooks — with one asymmetry:
+    /// `on_stream_chunk`/`on_response_complete` hooks, with one asymmetry:
     /// under `plugin-prompt-cache` with a cache actually configured, a miss
     /// wraps the orchestrator stream in the same `PluginStream` every other
     /// dispatch arm uses, so terminal hooks and the cache write run for that
     /// turn; with no cache configured (or the feature compiled out), the
-    /// orchestrator stream is returned unwrapped, exactly as it was before
-    /// this cache feature existed.
+    /// orchestrator stream is returned unwrapped.
     ///
     /// # Errors
     ///
@@ -591,20 +590,18 @@ impl CucaClient {
         #[cfg(feature = "plugin-speculative")]
         if let Some(orchestrator) = &self.orchestrator {
             // Configured-cache/no-cache asymmetry: the orchestrator path
-            // never ran top-level per-chunk/terminal plugin hooks even
-            // before this cache feature existed — `OrchestratorStream`
-            // carries its own instrumentation (draft validation, fallback,
-            // session events), and the pool clients backing its tier
-            // executors are built without plugins. With no cache configured
-            // (or `plugin-prompt-cache` not compiled in), that remains true:
-            // the orchestrator stream below is returned unwrapped, exactly
-            // as before this feature existed. With a cache actually
-            // configured, a miss (`cache_write.is_some()`) needs a
-            // completion point to write the entry at, so it wraps the
-            // stream in the same `PluginStream` instrumentation every other
-            // dispatch arm uses — for this path that is the *first* time
-            // top-level `on_stream_chunk`/`on_response_complete` hooks run
-            // over an orchestrator turn, not a second time.
+            // never runs top-level per-chunk/terminal plugin hooks.
+            // `OrchestratorStream` carries its own instrumentation (draft
+            // validation, fallback, session events), and the pool clients
+            // backing its tier executors are built without plugins. With no
+            // cache configured (or `plugin-prompt-cache` not compiled in),
+            // the orchestrator stream below is returned unwrapped. With a
+            // cache actually configured, a miss (`cache_write.is_some()`)
+            // needs a completion point to write the entry at, so it wraps
+            // the stream in the same `PluginStream` instrumentation every
+            // other dispatch arm uses: for this path that is the *first*
+            // time top-level `on_stream_chunk`/`on_response_complete` hooks
+            // run over an orchestrator turn, not a second time.
             #[cfg(feature = "plugin-prompt-cache")]
             if cache_write.is_some() {
                 let model = request.model.clone();
@@ -972,9 +969,9 @@ impl Stream for PluginStream {
 /// first end-of-stream transition invokes every terminal `on_response_complete`
 /// hook exactly once against a clone of the stored response whose
 /// `duration_secs` is replaced with the elapsed time since this stream was
-/// constructed (every other field — `model`, `provider`, `content`,
-/// `prompt_tokens`, `completion_tokens`, `finish_reason`,
-/// `prompt_cache_usage` — is the stored value, unchanged). Terminal hook
+/// constructed (every other field is the stored value, unchanged: `model`,
+/// `provider`, `content`, `prompt_tokens`, `completion_tokens`,
+/// `finish_reason`, `prompt_cache_usage`). Terminal hook
 /// errors are swallowed/logged exactly as [`PluginStream`] does, and a
 /// `done` guard prevents a duplicate completion if a consumer polls again
 /// after `None`.
@@ -1312,7 +1309,7 @@ mod tests {
         assert!(matches!(err, CucaError::Config(_)));
     }
 
-    /// Cache lookup/miss-write pipeline semantics (Task 9 Steps 1 and 6).
+    /// Cache lookup/miss-write pipeline semantics.
     #[cfg(feature = "plugin-prompt-cache")]
     mod prompt_cache_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1408,7 +1405,7 @@ mod tests {
             )
         }
 
-        // --- Step 1: cache-hit hook semantics ---
+        // --- cache-hit hook semantics ---
 
         #[tokio::test]
         async fn cache_hit_bypasses_dispatch_and_runs_only_request_and_terminal_hooks() {
@@ -1489,7 +1486,7 @@ mod tests {
             );
         }
 
-        // --- Step 6: miss / no-partial-write ---
+        // --- miss / no-partial-write ---
 
         fn miss_request() -> UnifiedRequest {
             UnifiedRequest::new("m").add_user_message("hi")
@@ -1675,7 +1672,7 @@ mod tests {
             );
         }
 
-        // --- Step 8: orchestrator miss gets instrumented + cache write ---
+        // --- orchestrator miss gets instrumented + cache write ---
 
         /// A [`crate::orchestrator::TurnExecutor`] that returns one canned
         /// text block, so the orchestrator path can be exercised without
@@ -1695,13 +1692,11 @@ mod tests {
             }
         }
 
-        /// Preserving orchestrator behavior (Task 9 Step 8): a cache miss on
-        /// a client with both an orchestrator and a configured cache is now
-        /// wrapped in the same `PluginStream` instrumentation every other
-        /// dispatch arm uses, so terminal hooks fire and a complete entry is
-        /// written — unlike the cache-off/unconfigured case (proven
-        /// unchanged by the full `orchestrator::tests` suite passing
-        /// unmodified under both `plugin-prompt-cache` off and on-but-unused).
+        /// A cache miss on a client with both an orchestrator and a
+        /// configured cache is wrapped in the same `PluginStream`
+        /// instrumentation every other dispatch arm uses, so terminal hooks
+        /// fire and a complete entry is written. The cache-off and
+        /// unconfigured cases stay unwrapped.
         #[cfg(feature = "plugin-speculative")]
         #[tokio::test]
         async fn orchestrator_miss_gets_instrumented_and_writes_cache_entry() {
@@ -1754,7 +1749,7 @@ mod tests {
             assert_eq!(
                 counters.on_response_complete.load(Ordering::SeqCst),
                 1,
-                "the miss must now be instrumented: terminal hook fires"
+                "the miss must be instrumented: terminal hook fires"
             );
             let completed = rx.try_recv().expect("terminal hook must have fired");
             assert_eq!(completed.content, blocks);

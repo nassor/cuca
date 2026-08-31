@@ -1,8 +1,8 @@
 //! Reusable agent skills (agentskills.io `SKILL.md` format).
 //!
-//! [`SkillsPlugin`] implements the "agent skills" concept, reusable instructions that teach an agent how to perform specific
-//! tasks, discovered during a conversation via tools, to CUCA's
-//! everything-is-a-plugin
+//! [`SkillsPlugin`] implements the "agent skills" concept (reusable
+//! instructions that teach an agent how to perform specific tasks, discovered
+//! during a conversation via tools) in CUCA's everything-is-a-plugin
 //! architecture. Skills are plain `SKILL.md` documents: YAML-ish frontmatter
 //! with required `name:`/`description:` keys, an instructions body, and an
 //! optional `references/` directory of bundled files. They are loaded either
@@ -112,7 +112,6 @@ impl Skill {
                     match key.trim() {
                         "name" => name = Some(value.to_string()),
                         "description" => description = Some(value.to_string()),
-                        // `license`, `allowed-tools`, etc. are parsed and ignored.
                         _ => {}
                     }
                 }
@@ -223,8 +222,7 @@ impl SkillsPlugin {
     /// Directory loading reads `<dir>/<subdir>/SKILL.md` for every direct
     /// subdirectory that contains one; subdirectories without a `SKILL.md` are
     /// skipped silently. Duplicate names are resolved with inline skills
-    /// winning, and the final list is sorted
-    /// by name.
+    /// winning, and the final list is sorted by name.
     ///
     /// # Errors
     ///
@@ -333,8 +331,6 @@ impl SkillsPlugin {
             })?;
             let path = entry.path();
             if !path.is_dir() || !path.join("SKILL.md").is_file() {
-                // Subdirectories without a SKILL.md (and plain files) are
-                // skipped silently.
                 continue;
             }
             skills.push(Skill::from_skill_md(&path)?);

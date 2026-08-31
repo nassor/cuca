@@ -314,16 +314,16 @@ impl CucaExport {
     /// staging seam (duplicate ids, non-finite weights, endpoint existence,
     /// full adjacency rebuild)
     /// and the cache through its staging seam (key shape, digest match,
-    /// timestamp order, rank uniqueness, duplicate keys — including duplicates
-    /// among already-expired entries — then expiration filtering and capacity
+    /// timestamp order, rank uniqueness, duplicate keys, including duplicates
+    /// among already-expired entries, then expiration filtering and capacity
     /// trimming against `now_unix_ms`). No live lock is acquired in this
     /// phase, so every validation failure returns before anything is swapped.
     ///
     /// Phase 2 commits the staged values in fixed graph-then-cache order, one
     /// lock hold each. A commit can only fail on a poisoned mutex; the graph
     /// is swapped first, so a poisoned cache mutex is reported as
-    /// [`CucaExportError::State`] after the graph has already been replaced —
-    /// a poisoned lock already means a previous holder panicked mid-update.
+    /// [`CucaExportError::State`] after the graph has already been replaced.
+    /// A poisoned lock already means a previous holder panicked mid-update.
     ///
     /// The import is a wholesale replacement of both components, never a
     /// merge.

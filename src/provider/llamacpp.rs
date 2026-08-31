@@ -1,10 +1,9 @@
 //! llama.cpp provider adapter.
 //!
-//! llama-server exposes two API styles ("Native / OpenAI" per the spec's
-//! provider table): an OpenAI-compatible `/v1/chat/completions` route and the
-//! native `/completion` route with raw-token SSE frames
-//! (`{"content": "tok", "stop": false}`). This module implements both: the
-//! chat route reuses the shared
+//! llama-server exposes two API styles: an OpenAI-compatible
+//! `/v1/chat/completions` route and the native `/completion` route with
+//! raw-token SSE frames (`{"content": "tok", "stop": false}`). This module
+//! implements both: the chat route reuses the shared
 //! [`openai_compat`](crate::provider::openai_compat) building blocks
 //! ([`ChatCompletionTranslator`], [`translate_sse`]), and the native route
 //! translates frames with [`CompletionTranslator`].
@@ -46,10 +45,9 @@ pub enum LlamaRoute {
 
 /// llama.cpp adapter configuration.
 ///
-/// Fields mirror the llama-server body parameters the spec's provider table
-/// exposes (thread affinity, flash attention, GPU offload). An empty
-/// `base_url`/`model` defers to the
-/// client's base URL and the request's model at dispatch time.
+/// Fields mirror the llama-server body parameters this adapter sends (thread
+/// affinity, flash attention, GPU offload). An empty `base_url`/`model`
+/// defers to the client's base URL and the request's model at dispatch time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LlamaCppConfig {
     /// Base URL of the llama-server; defaults to `http://127.0.0.1:8080` when

@@ -111,7 +111,7 @@ pub fn pair_candidate(person: &str, company: &str) -> EntityExtractionCandidate 
 
 /// The extraction the adapter asks the served model for: a flat people list.
 /// Keeping the wire shape independent of (and much smaller than) the schema is
-/// deliberate — small local models are unreliable at deep nested JSON, and
+/// deliberate: small local models are unreliable at deep nested JSON, and
 /// mapping a flat reply into schema rows is exactly the application-side work
 /// the explicit-call contract expects of the adapter.
 const WIRE_SHAPE: &str = r#"{"people":[{"name":"...","employer":"...","title":"..."}]}"#;

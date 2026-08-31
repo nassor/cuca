@@ -1,5 +1,5 @@
 //! CUCA: Compact Universal Client for Agents.
-//! Unified, zero-default, everything-is-a-plugin async LLM client (see dev-docs spec).
+//! Unified, zero-default, everything-is-a-plugin async LLM client.
 
 #![forbid(unsafe_code)]
 #[cfg(not(any(

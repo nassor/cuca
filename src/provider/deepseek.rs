@@ -24,7 +24,7 @@ use crate::request::{PromptCacheDirective, UnifiedRequest};
 
 /// Map a Claude-style model id to its DeepSeek counterpart for the bridge.
 ///
-/// Spec: `claude-opus` -> `deepseek-v4-pro`; `claude-sonnet` and
+/// `claude-opus` -> `deepseek-v4-pro`; `claude-sonnet` and
 /// `claude-haiku` -> `deepseek-v4-flash`; anything else passes through
 /// unchanged.
 pub fn translate_bridge_model(model: &str) -> String {
@@ -105,9 +105,7 @@ impl CucaClient {
                 })?
                 .to_string();
             let auth = AnthropicAuth::ApiKey(key);
-            // Stage the model translation and the unsupported prompt-cache
-            // directive before anthropic_stream builds the body; the bridge URL
-            // is used as-is (no `/v1` suffix logic).
+            // The bridge URL is used as-is: no `/v1` suffix logic.
             let bridged = bridge_unified_request(req);
             anthropic_stream(self.http_client(), &base, &auth, bridged).await
         } else {
@@ -267,8 +265,9 @@ mod tests {
     }
 
     /// The bridge reuses the Anthropic protocol module, but module sharing is
-    /// not support: the bridge body carries no `cache_control` and the request
-    /// asks for no beta header, even with out-of-range breakpoints.
+    /// not prompt-cache support: the bridge body carries no `cache_control`
+    /// and the request asks for no beta header, even with out-of-range
+    /// breakpoints.
     #[test]
     fn bridge_request_never_emits_cache_control_or_betas() {
         let req = ephemeral_request("claude-sonnet");

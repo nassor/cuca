@@ -194,7 +194,7 @@ mod extraction_into_memory_context {
     }
 
     /// An empty extraction degrades to nothing: no delta, no graph, and no
-    /// marker message injected — rather than an empty render in every prompt.
+    /// marker message injected, instead of an empty render in every prompt.
     #[test]
     fn empty_extraction_leaves_no_graph_context() {
         let report = extraction_plugin()

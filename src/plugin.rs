@@ -7,13 +7,13 @@
 //!
 //! # Design notes
 //!
-//! The default hook bodies return `Ok(())` and ignore their inputs, which
-//! deviates slightly from the spec's bare signatures. The spec's own plugins
-//! (telemetry, guardrails) implement only subsets of the hooks, so the defaults
-//! keep partial implementations ergonomic; behavior is identical whenever a
-//! hook is overridden.
+//! The default hook bodies return `Ok(())` and ignore their inputs. The
+//! telemetry and guardrails plugins implement only subsets of the hooks, so
+//! the defaults keep partial implementations ergonomic; behavior is identical
+//! whenever a hook is overridden.
 //!
-//! `Send + Sync` is a supertrait per the spec so the plugin list, `Vec<Arc<dyn CucaPlugin>>`, can be shared across `await` points in the
+//! `Send + Sync` is a supertrait so the plugin list,
+//! `Vec<Arc<dyn CucaPlugin>>`, can be shared across `await` points in the
 //! async client pipeline.
 
 use crate::error::PluginError;

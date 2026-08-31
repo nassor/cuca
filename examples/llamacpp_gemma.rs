@@ -56,15 +56,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
     let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
 
-    // Stage 1: build the client. The llama.cpp adapter (feature
-    // `provider-llamacpp`) defaults to its chat route and to port 8080, so
-    // the base URL above is passed explicitly to reach port 1234; no API key.
+    // Stage 1: build the client. The base URL override and no-API-key
+    // behavior are explained in the module docs.
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::LlamaCpp)
         .with_base_url(base_url)
         .build()?;
 
-    // Stage 2: build the request: model tag, system prompt, and the question.
+    // Stage 2: build the request.
     let request = UnifiedRequest::new(model)
         .add_system_message("You are concise.")
         .add_user_message("Explain CUCA in one sentence.");

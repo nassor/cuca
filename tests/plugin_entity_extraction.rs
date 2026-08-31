@@ -13,9 +13,9 @@
 //! a small JSON extraction, maps the reply into an
 //! [`EntityExtractionCandidate`], and validates it through the plugin. The
 //! adapter only ever proposes rows that satisfy
-//! [`common::extraction::org_schema`] — it dedups by identity and drops
-//! non-string values — so an `Err` from `extract` *after* a candidate was
-//! built means the validation contract broke, not that the model was
+//! [`common::extraction::org_schema`]: it dedups by identity and drops
+//! non-string values. An `Err` from `extract` *after* a candidate was built
+//! therefore means the validation contract broke, not that the model was
 //! unhelpful. A model that never produces parseable JSON yields no candidate
 //! at all and is reported as a model-quality skip.
 #![cfg(all(feature = "provider-llamacpp", feature = "plugin-entity-extraction"))]

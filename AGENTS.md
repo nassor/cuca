@@ -4,7 +4,7 @@
 
 CUCA (**Compact Universal Client for Agents**) is a high-performance, asynchronous Rust client library intended to sit between autonomous agent orchestrators and LLM backends: an ultra-low-overhead runtime that monitors, parses, and dispatches multi-modal SSE streams. Tagline: *"Legendary vigilant witch; small footprint that constantly watches for responses."*
 
-Current state: **implemented**. The unified client (`CucaClient`/`CucaClientBuilder`), the zero-allocation SSE parser, seven provider adapters, thirteen feature-gated plugins, and the speculative fast/slow orchestrator are all implemented. `dev-docs/CUCA Rust Library Specification.md` remains the design authority for future work.
+Current state: **implemented**. The unified client (`CucaClient`/`CucaClientBuilder`), the zero-allocation SSE parser, seven provider adapters, thirteen feature-gated plugins, and the speculative fast/slow orchestrator are all implemented.
 
 ## Architecture & Data Flow
 
@@ -26,7 +26,6 @@ Data flow: builder selects provider → `UnifiedRequest` passes through register
 | `tests/` | Live llama.cpp integration suite: shared harness in `common/`, one file per plugin, MCP stdio echo server embedded in `plugin_mcp.rs` (test-binary re-execution). |
 | `docs/` | Zola documentation site: `content/` pages, `templates/`, `static/`, and the `[[extra.nav]]` reading order in `config.toml`. Build output `docs/public/` and the regenerated `docs/static/giallo.css` are gitignored. |
 | `rust-toolchain.toml` | Pinned toolchain 1.98.0. |
-| `dev-docs/` | Architecture specification: design authority. Gitignored. |
 | `target/` | Build output. Gitignored. |
 
 `examples/` holds documented, runnable demos gated on provider features via `required-features`, and `.github/workflows/ci.yml` runs fmt, clippy, test, doc, and the plugin-layering checks (see Runtime/Tooling Preferences). `tests/` holds the integration suite; no `benches/` directory exists.
@@ -59,8 +58,8 @@ site page versus `README.md` versus a `///` is defined in
 
 Follow Rust defaults plus the conventions below:
 
-- **Naming**: snake_case functions/variables, CamelCase types (spec: `CucaClient`, `CucaPlugin`, `UnifiedRequest`, `MessageContentBlock`); plugin names are `&'static str` (e.g. `"opentelemetry-observability"`).
-- **Error handling**: spec defines `CucaError` + `PluginError`; plugins return `Result<(), PluginError>`, client methods `Result<AgentResponseStream, CucaError>`. Avoid `unwrap`/`panic` in library code.
+- **Naming**: snake_case functions/variables, CamelCase types (`CucaClient`, `CucaPlugin`, `UnifiedRequest`, `MessageContentBlock`); plugin names are `&'static str` (e.g. `"opentelemetry-observability"`).
+- **Error handling**: `CucaError` + `PluginError`; plugins return `Result<(), PluginError>`, client methods `Result<AgentResponseStream, CucaError>`. Avoid `unwrap`/`panic` in library code.
 - **Async:** provider and async plugins use Tokio; the public stream contract is `futures_core::Stream` and yields `Result<MessageContentBlock, CucaError>`.
 - **Feature gating:** `default = []`; `lib.rs` requires at least one `provider-*` feature. Provider and plugin code MUST be `#[cfg(feature = "…")]`-gated, and each non-core dependency MUST be enabled only by its owning feature via `dep:`. Cross-plugin feature and code edges additionally obey *Plugin layering* below.
 - **Dependency injection**: providers via builder (`CucaClient::builder().with_provider(…).register_plugin(Arc<dyn CucaPlugin>)`); plugins as `Arc<dyn CucaPlugin>` (Send + Sync).
@@ -98,11 +97,10 @@ Memory size is a first-order concern: every structure that grows with traffic sh
 
 | Path | Why it matters |
 | --- | --- |
-| `dev-docs/CUCA Rust Library Specification.md` | Complete architecture spec: provider protocol translation, SSE parser, plugin feature matrix, API reference, 3-phase roadmap. Design authority; read before designing anything. |
 | `src/lib.rs` | Crate root: public re-exports of the client, request/response contracts, errors, and the feature-gated plugin and orchestrator surfaces. The implementation lives in the module tree (`client`, `request`, `types`, `error`, `sse`, `session`, `plugin`, `plugins/`, `provider/`, `orchestrator`). |
 | `Cargo.toml` | Package manifest for `cuca` (v0.1.0, edition 2024, rust-version 1.98): crates.io publish metadata (description, repository, homepage, docs.rs all-features build), the 20-feature matrix (7 providers + 13 plugins), no default provider, the one cross-plugin feature edge (`plugin-entity-extraction = ["plugin-memory"]`), minimal core dependencies, feature-owned transport/runtime dependencies, and dev-deps. |
 | `README.md` | Public-facing claims (zero-default providers, unified abstraction, zero-allocation engine, plugin architecture); keep in sync as implementation lands. |
-| `.gitignore` | Ignores `/target`, `/dev-docs`, `/.agents`, `/graphify*`, `/.omp`, `/docs/public`, and `/docs/static/giallo.css`. |
+| `.gitignore` | Ignores `/target`, `/.agents`, `/graphify*`, `/.omp`, `/docs/public`, and `/docs/static/giallo.css`. |
 
 ## Runtime/Tooling Preferences
 

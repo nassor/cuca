@@ -72,8 +72,8 @@
 //! # Graph memory
 //!
 //! The plugin also owns an in-memory working graph ([`MemoryGraph`], in
-//! [`graph`]) — nodes with labels/properties and directed weighted
-//! relationships — as explicit, machine-readable long-term context. When
+//! [`graph`]) as explicit, machine-readable long-term context: nodes with
+//! labels/properties and directed weighted relationships. When
 //! [`MemoryConfig::graph_context`] is set, `on_request` renders the graph via
 //! [`MemoryGraph::render`] into a system message placed right after the first
 //! System message. Injection is idempotent: the message starts with the
@@ -463,8 +463,7 @@ impl MemoryPlugin {
         let mut total = 0usize;
         for msg in messages {
             let text = joined_text(msg);
-            // Fast serialized form: role label + joined text content. One
-            // allocation per message; skips image/tool metadata.
+            // One allocation per message.
             let serialized = format!("{} {}", role_label(msg.role), text);
             total += encoder.encode_ordinary(&serialized).len();
         }
@@ -527,7 +526,7 @@ impl MemoryPlugin {
     ///
     /// The graph-core merge moves nodes and relationships out of `other` (no
     /// clones), pre-reserves capacity, and resolves relationship-id collisions
-    /// by deterministic renaming — the merge never drops data. The `Mutex` is
+    /// by deterministic renaming; the merge never drops data. The `Mutex` is
     /// held for the whole merge, so concurrent requests observe either the
     /// pre- or post-merge graph, never a partial one.
     ///
@@ -604,7 +603,7 @@ impl MemoryPlugin {
     ///
     /// Staging seam for the combined export coordinator: it validates every
     /// component before any component commits, and the staged graph exposes
-    /// only [`MemoryGraph`]'s public API — never the plugin's or the graph's
+    /// only [`MemoryGraph`]'s public API, never the plugin's or the graph's
     /// private collections.
     ///
     /// # Errors
@@ -966,8 +965,6 @@ impl MemoryPlugin {
             if drop_set.len() >= drop_count {
                 break;
             }
-            // The first System message (primary instruction) and the most
-            // recent User message always survive.
             if Some(i) == first_system || Some(i) == recent_user {
                 continue;
             }
@@ -1044,11 +1041,10 @@ impl CucaPlugin for MemoryPlugin {
         for observer in &self.config.observers {
             observer.observe(&usage)?;
         }
-        // Near-limit warning: inject once per conversation (idempotent via the
-        // marker scan; never inject twice). The scan avoids `joined_text`: the
-        // marker is injected as a single `Text` block, so scanning blocks in
-        // place skips the `Vec<&str>` plus joined `String` that `joined_text`
-        // would allocate for every message on every request.
+        // The marker scan avoids `joined_text`: the marker is injected as a
+        // single `Text` block, so scanning blocks in place skips the
+        // `Vec<&str>` plus joined `String` that `joined_text` would allocate
+        // for every message on every request.
         if let Some(warn_fraction) = self.config.warn_fraction
             && (used as f32 / window as f32) >= warn_fraction
             && !req.messages.iter().any(|m| {
@@ -1067,12 +1063,8 @@ impl CucaPlugin for MemoryPlugin {
         if self.over_budget(&req.messages, used, &budget) {
             self.compress_inner(&mut req.messages, &budget)?;
         }
-        // Graph context: render the working graph into a system message right
-        // after the first System message. Idempotent via GRAPH_RENDER_MARKER
-        // (replaced in place, never duplicated); removed when the graph is
-        // empty. Runs after compression so compaction strategies (which may
-        // drop System messages after the first) cannot delete it, and so its
-        // bounded token cost is not counted against this request's usage.
+        // Graph context, after compression: see the module docs' "Graph
+        // memory" section.
         if let Some(cfg) = &self.config.graph_context {
             let render = {
                 let guard = self.graph()?;

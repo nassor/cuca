@@ -10,10 +10,10 @@
 //! allowing further retries (the documented self-correcting-loop bound).
 //!
 //! Every retry injection also emits a `tracing::warn!` structural event
-//! (`target: "cuca::guardrails"`) mirroring the spec's `SchemaRetryEvent`
-//! fields: `schema_name`, `error_type`, `attempt_count`. Full OTel metric
-//! emission remains plugin-telemetry's concern; the plugin only records the most
-//! recent event tuple for test assertions (see [`JsonGuardrailPlugin::last_retry_event`]).
+//! (`target: "cuca::guardrails"`) carrying `schema_name`, `error_type`, and
+//! `attempt_count`. Full OTel metric emission remains plugin-telemetry's
+//! concern; the plugin only records the most recent event tuple for test
+//! assertions (see [`JsonGuardrailPlugin::last_retry_event`]).
 //!
 //! Schemas are keyed by tool name; the reserved `"response"` key (when
 //! registered) guards model text responses that look like JSON objects. A tool
@@ -72,8 +72,8 @@ struct AttemptCounters {
 impl JsonGuardrailPlugin {
     /// Loads a JSON Schema document from `schema_path`.
     ///
-    /// Per the spec example, `./schemas/tools.json` holds a JSON object mapping
-    /// tool name -> JSON Schema. Each value is compiled into a validator.
+    /// The document holds a JSON object mapping tool name -> JSON Schema. Each
+    /// value is compiled into a validator.
     ///
     /// The file-loading path uses a bounded retry default of 3
     /// (`max_attempts = 3`); callers wanting an explicit bound use
@@ -157,7 +157,6 @@ impl JsonGuardrailPlugin {
     /// with one human-readable issue string per schema violation.
     pub fn validate(&self, tool_name: &str, value: &serde_json::Value) -> Result<(), Vec<String>> {
         let Some(validator) = self.schemas.get(tool_name) else {
-            // No schema for this tool: nothing to enforce, so pass through.
             return Ok(());
         };
         let issues: Vec<String> = validator
@@ -173,7 +172,7 @@ impl JsonGuardrailPlugin {
 
     /// Most recent `(schema_name, error_type, attempt_count)` retry event.
     ///
-    /// Test-support accessor: lets tests assert the emitted `SchemaRetryEvent`
+    /// Test-support accessor: lets tests assert the emitted retry event
     /// without installing a tracing subscriber. `None` until the first retry
     /// injection.
     pub fn last_retry_event(&self) -> Option<(String, String, u32)> {
@@ -185,9 +184,8 @@ impl JsonGuardrailPlugin {
 }
 
 impl CucaPlugin for JsonGuardrailPlugin {
-    /// Stable plugin name. Documented alongside the spec's telemetry name style
-    /// (`"opentelemetry-observability"`): `"json-guardrails"` is the fixed
-    /// identifier clients use to address this plugin.
+    /// Stable plugin name: `"json-guardrails"` is the fixed identifier clients
+    /// use to address this plugin.
     fn name(&self) -> &'static str {
         "json-guardrails"
     }
@@ -313,7 +311,6 @@ mod tests {
             arguments: serde_json::json!({ "city": "Berlin" }),
         };
         plugin.on_stream_chunk(&mut block).unwrap();
-        // Still the original ToolCall, not replaced.
         assert!(matches!(
             block,
             MessageContentBlock::ToolCall { ref name, .. } if name == "get_weather"
@@ -614,7 +611,6 @@ mod tests {
             MessageContentBlock::ToolResult { ref output, .. } if output.contains("guardrail_exhausted")
         ));
 
-        // Clean up the temp file.
         let _ = std::fs::remove_file(&path);
     }
 }

@@ -67,14 +67,11 @@ impl CucaPlugin for BlockCounterPlugin {
     }
 
     fn on_stream_chunk(&self, _chunk: &mut MessageContentBlock) -> Result<(), PluginError> {
-        // Called once per normalized block, in registration order.
         self.blocks.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
     fn on_response_complete(&self, res: &UnifiedResponse) -> Result<(), PluginError> {
-        // Called exactly once when the stream ends, with the aggregated
-        // response: model, wall-clock duration, token usage, content blocks.
         println!(
             "[example-block-counter] model={} duration={:.2}s completion_tokens={} blocks={}",
             res.model,
@@ -108,12 +105,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_system_message("You are concise.")
         .add_user_message("Explain CUCA in one sentence.");
 
-    // Stage 3: start the stream. `on_request` runs before dispatch; the
-    // provider adapter then streams normalized blocks.
+    // Stage 3: start the stream.
     let mut stream = client.generate_stream(request).await?;
 
-    // Stage 4: drain the stream. `on_stream_chunk` runs per block; the plugin's
-    // summary prints from `on_response_complete` once the stream ends.
+    // Stage 4: drain the stream; the plugin's summary prints from
+    // `on_response_complete` once the stream ends.
     while let Some(chunk) = stream.next().await {
         if let Ok(MessageContentBlock::Text(text)) = chunk {
             print!("{text}");
