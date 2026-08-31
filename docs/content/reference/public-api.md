@@ -68,7 +68,7 @@ Types reachable through `cuca::types` rather than the crate root:
 | `plugin-entity-extraction` | `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionModel`, `EntityExtractionPlugin`, `EntityExtractionReport`, `EntityExtractionSchema`, `EntityReference`, `EntityTable`, `PropertyColumn`, `PropertyType`, `RelationshipTable` |
 | `plugin-prompt-cache` | `PromptCache`, `PromptCacheConfig`, `PromptCacheEntry`, `PromptCacheError`, `PromptCacheImportReport`, `PromptCacheSnapshot` |
 | `plugin-sandbox` | `SandboxConfig`, `SandboxPlugin`, `SandboxResult` |
-| `plugin-session-log` | `InMemoryBackend`, `JsonFileBackend`, `SessionBackend`, `SessionLogPlugin` |
+| `plugin-session-log` | `FileBackend`, `InMemoryBackend`, `SessionBackend`, `SessionLogPlugin` |
 | `plugin-skills` | `Skill`, `SkillsConfig`, `SkillsPlugin` |
 | `plugin-speculative` | `ClientPool`, `Complexity`, `ComplexityEvaluator`, `DraftValidator`, `JsonToolDraftValidator`, `ModelOrchestrator`, `SwappableModelPair`, `TurnExecutor` |
 | `plugin-subagent` | `SubagentPlugin`, `SubagentResult`, `SubagentRunner`, `SubagentSpec`, `WorktreeConfig` |

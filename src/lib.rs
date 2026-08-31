@@ -40,6 +40,11 @@ pub mod client;
 /// Provider adapter layer: per-provider dispatch implementations.
 pub(crate) mod provider;
 
+/// Canonical JSON encoding for `serde_json::Value` leaves carried inside
+/// postcard-encoded storage records and digest input.
+#[cfg(any(feature = "plugin-session-log", feature = "plugin-prompt-cache"))]
+pub(crate) mod canonical;
+
 /// Versioned canonical `cuca-export` envelope for memory-graph and
 /// local-response-cache state.
 #[cfg(any(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
@@ -91,7 +96,7 @@ pub use crate::plugins::prompt_cache::{
 pub use crate::plugins::sandbox::{SandboxConfig, SandboxPlugin, SandboxResult};
 #[cfg(feature = "plugin-session-log")]
 pub use crate::plugins::session_log::{
-    InMemoryBackend, JsonFileBackend, SessionBackend, SessionLogPlugin,
+    FileBackend, InMemoryBackend, SessionBackend, SessionLogPlugin,
 };
 #[cfg(feature = "plugin-skills")]
 pub use crate::plugins::skills::{Skill, SkillsConfig, SkillsPlugin};

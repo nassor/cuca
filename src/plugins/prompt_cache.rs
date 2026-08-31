@@ -2,7 +2,7 @@
 //!
 //! [`PromptCache`] is a bounded, TTL-and-LRU-evicting cache of complete
 //! `UnifiedRequest` -> `UnifiedResponse` pairs, keyed by the lowercase
-//! SHA-256 hex digest of the canonicalized effective request
+//! SHA-256 hex digest of the effective request
 //! ([`digest_request`]). It is a plain client-level service (see
 //! `CucaClient`), never a `CucaPlugin`: callers compute the lookup key
 //! themselves (after provider selection and every `on_request` hook runs)
@@ -17,6 +17,17 @@
 //! substitute a deterministic clock). LRU order is tracked independently of
 //! hash-map iteration order via an oldest-first key list (`lru_order`), so
 //! eviction and exported ranks are reproducible across runs.
+//!
+//! # Digest input
+//!
+//! The digest hashes the postcard encoding of a borrowed view of the
+//! request, and postcard writes its bytes straight into SHA-256, so the digest
+//! allocates no input buffer. Every `serde_json::Value` leaf is encoded as
+//! canonical JSON text instead of native postcard: a `Value` serializes
+//! untagged, so `false`, `0`, `""`, `[]`, and `{}` would otherwise share one
+//! encoding and distinct requests would share one cache key. The view
+//! destructures the request exhaustively, so a field added to
+//! `UnifiedRequest` fails to compile rather than dropping out of the key.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -25,6 +36,7 @@ use std::time::Duration;
 use sha2::{Digest, Sha256};
 
 use crate::request::{UnifiedRequest, UnifiedResponse};
+use crate::types::{MessageContentBlock, MessageRole, ToolDefinition, UnifiedMessage};
 
 /// Error returned by [`PromptCache`] and [`PromptCacheConfig`] operations.
 #[derive(Debug, Clone)]
@@ -559,24 +571,219 @@ fn is_lowercase_sha256_hex(s: &str) -> bool {
             .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
 }
 
-/// Compute the lowercase SHA-256 hex digest of the canonical JSON form of the
-/// complete effective request.
+/// Borrowed digest view of [`MessageContentBlock`].
+///
+/// Externally tagged and borrowing every field. The `arguments` leaf becomes
+/// canonical JSON text, which is what keeps the digest input injective: a
+/// `serde_json::Value` encoded natively into postcard is untagged, so `false`,
+/// `0`, `""`, `[]`, and `{}` all collapse to the same byte.
+#[derive(serde::Serialize)]
+enum BlockDigest<'a> {
+    Text(&'a str),
+    ImageBase64 {
+        media_type: &'a str,
+        data: &'a str,
+    },
+    Thinking {
+        reasoning: &'a str,
+        signature: Option<&'a str>,
+    },
+    ToolCall {
+        id: &'a str,
+        name: &'a str,
+        arguments: crate::canonical::CanonicalValue<'a>,
+    },
+    ToolResult {
+        tool_call_id: &'a str,
+        output: &'a str,
+    },
+}
+
+impl<'a> From<&'a MessageContentBlock> for BlockDigest<'a> {
+    /// Exhaustive by construction: a new [`MessageContentBlock`] variant fails
+    /// to compile here instead of silently dropping out of the digest.
+    fn from(block: &'a MessageContentBlock) -> Self {
+        match block {
+            MessageContentBlock::Text(text) => Self::Text(text),
+            MessageContentBlock::ImageBase64 { media_type, data } => {
+                Self::ImageBase64 { media_type, data }
+            }
+            MessageContentBlock::Thinking {
+                reasoning,
+                signature,
+            } => Self::Thinking {
+                reasoning,
+                signature: signature.as_deref(),
+            },
+            MessageContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Self::ToolCall {
+                id,
+                name,
+                arguments: crate::canonical::CanonicalValue(arguments),
+            },
+            MessageContentBlock::ToolResult {
+                tool_call_id,
+                output,
+            } => Self::ToolResult {
+                tool_call_id,
+                output,
+            },
+        }
+    }
+}
+
+/// Borrowed digest view of [`UnifiedMessage`].
+#[derive(serde::Serialize)]
+struct MessageDigest<'a> {
+    role: &'a MessageRole,
+    content: Vec<BlockDigest<'a>>,
+    name: Option<&'a str>,
+    tool_call_id: Option<&'a str>,
+}
+
+impl<'a> From<&'a UnifiedMessage> for MessageDigest<'a> {
+    /// Destructures exhaustively: a new [`UnifiedMessage`] field fails to
+    /// compile here instead of silently dropping out of the digest.
+    fn from(message: &'a UnifiedMessage) -> Self {
+        let UnifiedMessage {
+            role,
+            content,
+            name,
+            tool_call_id,
+        } = message;
+        Self {
+            role,
+            content: content.iter().map(BlockDigest::from).collect(),
+            name: name.as_deref(),
+            tool_call_id: tool_call_id.as_deref(),
+        }
+    }
+}
+
+/// Borrowed digest view of [`ToolDefinition`].
+#[derive(serde::Serialize)]
+struct ToolDigest<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: crate::canonical::CanonicalValue<'a>,
+}
+
+impl<'a> From<&'a ToolDefinition> for ToolDigest<'a> {
+    /// Destructures exhaustively: a new [`ToolDefinition`] field fails to
+    /// compile here instead of silently dropping out of the digest.
+    fn from(tool: &'a ToolDefinition) -> Self {
+        let ToolDefinition {
+            name,
+            description,
+            input_schema,
+        } = tool;
+        Self {
+            name,
+            description,
+            input_schema: crate::canonical::CanonicalValue(input_schema),
+        }
+    }
+}
+
+/// Borrowed digest view of the complete effective [`UnifiedRequest`].
+///
+/// Only the two `serde_json::Value`-bearing paths are wrapped; every other
+/// field is serialized straight from the live request. `thinking` needs no
+/// wrapper because postcard *serialization* handles a tagged enum, and
+/// [`ThinkingConfig`](crate::request::ThinkingConfig) carries no `Value`.
+#[derive(serde::Serialize)]
+struct RequestDigest<'a> {
+    model: &'a str,
+    provider: &'a crate::types::ProviderEndpoint,
+    messages: Vec<MessageDigest<'a>>,
+    temperature: Option<f32>,
+    max_tokens: Option<u32>,
+    stream: bool,
+    thinking: Option<&'a crate::request::ThinkingConfig>,
+    tools: Vec<ToolDigest<'a>>,
+    prompt_cache: &'a crate::request::PromptCacheDirective,
+}
+
+impl<'a> From<&'a UnifiedRequest> for RequestDigest<'a> {
+    /// Destructures exhaustively: a new [`UnifiedRequest`] field fails to
+    /// compile here instead of silently dropping out of the cache key.
+    fn from(request: &'a UnifiedRequest) -> Self {
+        let UnifiedRequest {
+            model,
+            provider,
+            messages,
+            temperature,
+            max_tokens,
+            stream,
+            thinking,
+            tools,
+            prompt_cache,
+        } = request;
+        Self {
+            model,
+            provider,
+            messages: messages.iter().map(MessageDigest::from).collect(),
+            temperature: *temperature,
+            max_tokens: *max_tokens,
+            stream: *stream,
+            thinking: thinking.as_ref(),
+            tools: tools.iter().map(ToolDigest::from).collect(),
+            prompt_cache,
+        }
+    }
+}
+
+/// postcard storage flavor hashing bytes as they are produced.
+///
+/// The digest never materializes its own input buffer: postcard writes into
+/// SHA-256 directly.
+struct Sha256Flavor(Sha256);
+
+impl postcard::ser_flavors::Flavor for Sha256Flavor {
+    type Output = [u8; 32];
+
+    #[inline]
+    fn try_push(&mut self, byte: u8) -> postcard::Result<()> {
+        self.0.update([byte]);
+        Ok(())
+    }
+
+    #[inline]
+    fn try_extend(&mut self, data: &[u8]) -> postcard::Result<()> {
+        self.0.update(data);
+        Ok(())
+    }
+
+    fn finalize(self) -> postcard::Result<Self::Output> {
+        Ok(self.0.finalize().into())
+    }
+}
+
+/// Compute the lowercase SHA-256 hex digest of the complete effective request.
 ///
 /// "Effective" means the request exactly as it will cross the wire: after
-/// provider selection and every `on_request` hook. Canonicalization
-/// recursively sorts JSON object keys and preserves array order and scalar
-/// values, so semantically identical requests digest identically regardless
-/// of struct field-declaration or hash-map iteration order. `UnifiedRequest`
-/// never carries client credentials, bearer tokens, base URLs, or HTTP
-/// clients (those live on `CucaClient`), so the digest never depends on them.
+/// provider selection and every `on_request` hook. The hashed bytes are the
+/// postcard encoding of the request, with every `serde_json::Value` leaf
+/// encoded as canonical JSON text: object keys are sorted recursively and
+/// array order is preserved, so semantically identical requests digest
+/// identically regardless of struct field-declaration or map iteration order.
+/// `UnifiedRequest` never carries client credentials, bearer tokens, base
+/// URLs, or HTTP clients (those live on `CucaClient`), so the digest never
+/// depends on them.
+///
+/// The digest input format is not stable across crate versions: keys computed
+/// by a different version do not match, so an imported
+/// [`PromptCacheSnapshot`] from another version never produces a hit and ages
+/// out by TTL and LRU.
 ///
 /// # Errors
 ///
 /// [`PromptCacheError::Validation`] for a non-finite `temperature`
-/// (`NaN`/`inf`), which is rejected rather than silently digested
-/// (`serde_json` would otherwise encode it as JSON `null`, colliding with
-/// an absent temperature); [`PromptCacheError::Json`] when the request
-/// cannot be serialized.
+/// (`NaN`/`inf`), which is rejected rather than silently digested;
+/// [`PromptCacheError::Json`] when the request cannot be encoded.
 pub fn digest_request(request: &UnifiedRequest) -> Result<String, PromptCacheError> {
     if let Some(t) = request.temperature
         && !t.is_finite()
@@ -586,36 +793,12 @@ pub fn digest_request(request: &UnifiedRequest) -> Result<String, PromptCacheErr
             message: "temperature must be finite".to_string(),
         });
     }
-    let value = serde_json::to_value(request).map_err(|e| PromptCacheError::Json(e.to_string()))?;
-    let canonical = canonicalize_json(value);
-    let bytes =
-        serde_json::to_vec(&canonical).map_err(|e| PromptCacheError::Json(e.to_string()))?;
-    let digest = Sha256::digest(&bytes);
+    let digest = postcard::serialize_with_flavor::<_, Sha256Flavor, [u8; 32]>(
+        &RequestDigest::from(request),
+        Sha256Flavor(Sha256::new()),
+    )
+    .map_err(|e| PromptCacheError::Json(e.to_string()))?;
     Ok(to_lower_hex(&digest))
-}
-
-/// Recursively rebuild `value` with every object's keys sorted; arrays and
-/// scalars are preserved as-is (array order is significant, object key order
-/// is not).
-fn canonicalize_json(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries: Vec<(String, serde_json::Value)> = map
-                .into_iter()
-                .map(|(k, v)| (k, canonicalize_json(v)))
-                .collect();
-            entries.sort_by(|a, b| a.0.cmp(&b.0));
-            let mut sorted = serde_json::Map::with_capacity(entries.len());
-            for (k, v) in entries {
-                sorted.insert(k, v);
-            }
-            serde_json::Value::Object(sorted)
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(canonicalize_json).collect())
-        }
-        other => other,
-    }
 }
 
 /// Format `bytes` as lowercase hex, independent of any `GenericArray`
@@ -839,6 +1022,113 @@ mod tests {
 
         let request = sample_request("model-a").set_temperature(f32::INFINITY);
         assert!(digest_request(&request).is_err());
+    }
+
+    /// A `serde_json::Value` encoded natively into postcard is untagged, so
+    /// `false`, `0`, `""`, `[]`, and `{}` all become the same byte. Encoding
+    /// each leaf as canonical JSON text is what keeps these requests apart.
+    #[test]
+    fn digest_separates_scalar_and_empty_container_tool_arguments() {
+        let arguments = [
+            serde_json::json!(null),
+            serde_json::json!(false),
+            serde_json::json!(true),
+            serde_json::json!(0),
+            serde_json::json!(1),
+            serde_json::json!(""),
+            serde_json::json!("0"),
+            serde_json::json!([]),
+            serde_json::json!({}),
+        ];
+
+        // Once through a message block, once through a tool definition:
+        // both are `Value` leaves reachable from a request.
+        let mut from_messages = HashSet::new();
+        let mut from_tools = HashSet::new();
+        for value in &arguments {
+            let mut request = sample_request("model-a");
+            request.messages.push(UnifiedMessage {
+                role: MessageRole::Assistant,
+                content: vec![MessageContentBlock::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "run".to_string(),
+                    arguments: value.clone(),
+                }],
+                name: None,
+                tool_call_id: None,
+            });
+            assert!(
+                from_messages.insert(digest_request(&request).unwrap()),
+                "tool-call arguments {value} collided with another payload"
+            );
+
+            let tooled = sample_request("model-a").add_tool(ToolDefinition {
+                name: "run".to_string(),
+                description: "d".to_string(),
+                input_schema: value.clone(),
+            });
+            assert!(
+                from_tools.insert(digest_request(&tooled).unwrap()),
+                "input_schema {value} collided with another payload"
+            );
+        }
+        assert_eq!(from_messages.len(), arguments.len());
+        assert_eq!(from_tools.len(), arguments.len());
+    }
+
+    #[test]
+    fn digest_ignores_key_order_inside_tool_call_arguments() {
+        let block = |arguments: serde_json::Value| {
+            let mut request = sample_request("model-a");
+            request.messages.push(UnifiedMessage {
+                role: MessageRole::Assistant,
+                content: vec![MessageContentBlock::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "run".to_string(),
+                    arguments,
+                }],
+                name: None,
+                tool_call_id: None,
+            });
+            digest_request(&request).unwrap()
+        };
+
+        let forward: serde_json::Value =
+            serde_json::from_str(r#"{"a":1,"z":{"m":0,"b":[1,2]}}"#).unwrap();
+        let reversed: serde_json::Value =
+            serde_json::from_str(r#"{"z":{"b":[1,2],"m":0},"a":1}"#).unwrap();
+        assert_eq!(block(forward), block(reversed));
+
+        // Array order inside the value stays significant.
+        assert_ne!(
+            block(serde_json::json!({ "a": [1, 2] })),
+            block(serde_json::json!({ "a": [2, 1] }))
+        );
+    }
+
+    /// Pins the digest input format. A change here is a cache-key change for
+    /// every caller, so it must be deliberate: update this expectation only
+    /// together with a documented format change.
+    #[test]
+    fn digest_of_a_fixed_request_is_stable() {
+        let mut request = UnifiedRequest::new("model-a");
+        request.provider = ProviderEndpoint::OpenAi;
+        request.stream = false;
+        request = request
+            .add_system_message("be concise")
+            .add_user_message("hello")
+            .add_tool(ToolDefinition {
+                name: "run".to_string(),
+                description: "d".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+            });
+
+        let digest = digest_request(&request).unwrap();
+        assert!(is_lowercase_sha256_hex(&digest), "{digest}");
+        assert_eq!(
+            digest,
+            "3aeb50cda5633431ed74604ec827993c4c9bf05a78582c6e42bfc4d9da308121"
+        );
     }
 
     // --- config validation ---

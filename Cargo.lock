@@ -542,6 +542,7 @@ dependencies = [
  "memchr",
  "opentelemetry",
  "opentelemetry_sdk",
+ "postcard",
  "reqwest",
  "rmcp",
  "schemars",

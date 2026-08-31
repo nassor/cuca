@@ -18,7 +18,7 @@ weight = 12
 
 ## Entry types
 
-`SessionLogPlugin`, `SessionBackend`, `InMemoryBackend`, `JsonFileBackend`.
+`SessionLogPlugin`, `SessionBackend`, `InMemoryBackend`, `FileBackend`.
 
 ## `CucaPlugin` and `SessionStorePlugin`
 
@@ -35,9 +35,11 @@ Each stored `SessionRecord` carries `session_id`, a 0-based `sequence` assigned 
 | Backend | Storage | Growth |
 |---|---|---|
 | `InMemoryBackend` | `HashMap<session_id, Vec<SessionRecord>>` | Capped, see below |
-| `JsonFileBackend` | One file per session, `{dir}/{session_id}.jsonl`, one JSON record per line, opened with `append(true)` | Disk-bound |
+| `FileBackend` | One file per session, `{dir}/{session_id}.cslog`, one COBS-framed postcard record per append, opened with `append(true)` | Disk-bound |
 
-`JsonFileBackend` rejects session ids containing `/` or `\` with `PluginError::Validation` rather than mapping them into a subdirectory.
+Each `.cslog` file starts with the 8-byte magic `CUCASLOG` and a one-byte format version, written once when the file is created. `replay` rejects an unknown magic or version with `PluginError::Validation`, and rejects a session whose only file is a legacy `{session_id}.jsonl` rather than replaying it as empty.
+
+`FileBackend` rejects session ids containing `/` or `\` with `PluginError::Validation` rather than mapping them into a subdirectory.
 
 ## Capacity
 
@@ -46,6 +48,14 @@ Each stored `SessionRecord` carries `session_id`, a 0-based `sequence` assigned 
 | Bound | `InMemoryBackend::DEFAULT_MAX_RECORDS`, 65536 records in total across sessions |
 | At-cap policy | `append` and `fork` fail rather than evict; this is an audit log, and dropping a record would corrupt replay and forking |
 | Usage gauge | `InMemoryBackend::len()` against `max_records()` |
+
+`FileBackend` frames every record through one reusable buffer.
+
+| | |
+|---|---|
+| Bound | 64 KiB of retained scratch capacity |
+| At-cap policy | The buffer is released and shrunk back to the bound after any larger record; no record is refused or truncated |
+| Usage gauge | `FileBackend::scratch_capacity()` |
 
 `SessionLogPlugin` also keeps two small per-session bookkeeping maps (next sequence, recorded message count); these are deliberately uncapped, since evicting an entry would restart that session's sequence numbering.
 

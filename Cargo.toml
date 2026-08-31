@@ -34,6 +34,10 @@ doctest = false
 # - jsonschema is built with default-features = false: guardrails.rs only compiles inline
 #   (in-document) schemas via validator_for/iter_errors and needs no $ref retrieval
 #   (no resolve-http/resolve-file).
+# - postcard is built with default-features = false plus use-std: its default
+#   `heapless-cas` feature pulls in heapless, which this crate never uses, while
+#   `use-std` supplies the std Vec/COBS helpers and flavors. It is owned jointly by
+#   plugin-session-log (framed record storage) and plugin-prompt-cache (digest input).
 # - The URL_SAFE engine is base64::engine::general_purpose::URL_SAFE_NO_PAD (base64 is
 #   enabled with no cargo features).
 # rmcp 3.x: the client SDK (`client`) and the client transports stdio
@@ -67,11 +71,13 @@ plugin-web-search = ["dep:reqwest", "dep:tokio", "reqwest/rustls"]
 plugin-skills = []
 plugin-telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing"]
 plugin-speculative = ["dep:tokio", "dep:tokio-stream"]
-plugin-session-log = []
+# plugin-session-log: postcard encodes each stored record; the session log is the
+# only postcard *decode* path in the crate.
+plugin-session-log = ["dep:postcard"]
 # Client-owned local response cache; deterministic effective-request digesting
 # via the existing optional sha2 dependency (provider-anthropic enables sha2
-# independently for its own request signing).
-plugin-prompt-cache = ["dep:sha2"]
+# independently for its own request signing) over postcard-encoded digest input.
+plugin-prompt-cache = ["dep:sha2", "dep:postcard"]
 
 [dependencies]
 bytes = "1"
@@ -86,6 +92,7 @@ tokio-stream = { version = "0.1", optional = true }
 sha2 = { version = "0.11", optional = true }
 getrandom = { version = "0.4", optional = true }
 base64 = { version = "0.23", optional = true }
+postcard = { version = "1", optional = true, default-features = false, features = ["use-std"] }
 # rmcp 3.x default features compile the server SDK; the client SDK (`client`) and the
 # client stdio (`transport-child-process`) / Streamable HTTP
 # (`transport-streamable-http-client-reqwest`) transports are opt-in features

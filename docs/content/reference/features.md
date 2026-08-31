@@ -55,8 +55,8 @@ that `cargo check --no-default-features` fails.
 | `plugin-skills` | nothing |
 | `plugin-telemetry` | `dep:opentelemetry`, `dep:opentelemetry_sdk`, `dep:tracing` |
 | `plugin-speculative` | `dep:tokio`, `dep:tokio-stream` |
-| `plugin-session-log` | nothing |
-| `plugin-prompt-cache` | `dep:sha2` |
+| `plugin-session-log` | `dep:postcard` |
+| `plugin-prompt-cache` | `dep:sha2`, `dep:postcard` |
 
 `plugin-entity-extraction = ["plugin-memory"]` is the only feature edge between
 two plugins.
@@ -91,12 +91,16 @@ wire types, the SSE parser and the response stream contract.
 | `opentelemetry` | `0.32` | default | `plugin-telemetry` |
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
 | `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry` |
+| `postcard` | `1` | `use-std`; `default-features = false` | `plugin-session-log`, `plugin-prompt-cache` |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only
 through the `reqwest/rustls` entry that every provider feature and
 `plugin-web-search` carries. `jsonschema` is declared with
 `default-features = false` because guardrails compiles inline schemas only and
-needs no `$ref` retrieval.
+needs no `$ref` retrieval. `postcard` is declared with
+`default-features = false` because its default `heapless-cas` feature pulls in
+`heapless`, which this crate never uses; `use-std` supplies the std buffer and
+COBS helpers.
 
 ## Feature-conditional modules
 

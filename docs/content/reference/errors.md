@@ -78,9 +78,9 @@ always `None`.
 
 | Variant | Raised by |
 |---|---|
-| `Validation` | schema validation, malformed tool arguments, a zero cap passed to a `with_max_*` constructor, a `execute_local_tool` result whose id does not match its call |
+| `Validation` | schema validation, malformed tool arguments, a zero cap passed to a `with_max_*` constructor, a `execute_local_tool` result whose id does not match its call, a `.cslog` file with an unknown magic, format version, or torn record frame, a session whose only file is a legacy `.jsonl` |
 | `NotSupported` | `McpTransport::WebSocket`, `WebSearchPlugin::extract_page` on a non-Firecrawl provider, an unknown subagent id, a failed worktree preparation |
-| `Io` | file and directory access in `plugin-skills` and `JsonFileBackend`, and every `From<std::io::Error>` conversion |
+| `Io` | file and directory access in `plugin-skills` and `FileBackend`, record framing failures in `FileBackend`, and every `From<std::io::Error>` conversion |
 | `Internal` | a full cap that refuses rather than evicts, a closed channel, a non-2xx HTTP reply inside a plugin, a panicked worker thread |
 | `HookFailure` | available through the `hook` constructor; no bundled plugin raises it |
 
