@@ -1,6 +1,6 @@
 +++
 title = "Plugins"
-description = "Sixteen plugin features across three attachment points: twelve hook plugins, three explicit-call capabilities, one pipeline replacement."
+description = "Seventeen plugin features across three attachment points: twelve hook plugins, four explicit-call capabilities, one pipeline replacement."
 template = "section.html"
 sort_by = "weight"
 
@@ -10,14 +10,14 @@ kicker = "Reference"
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Sixteen <code>plugin-*</code> features; twelve implement <code>CucaPlugin</code>, three are called directly, one replaces the dispatch stage</dd>
+<dd>Seventeen <code>plugin-*</code> features; twelve implement <code>CucaPlugin</code>, four are called directly, one replaces the dispatch stage</dd>
 <dt>You need</dt>
 <dd>The plugin features you want, named explicitly; none is enabled by default</dd>
 <dt>Read this if</dt>
 <dd>You need a plugin's feature flag, entry type, hooks, config defaults or caps</dd>
 </dl>
 
-## The sixteen features
+## The seventeen features
 
 | Feature | Entry type | Attachment | Hooks overridden |
 |---|---|---|---|
@@ -33,6 +33,7 @@ kicker = "Reference"
 | [`plugin-telemetry`](@/plugins/telemetry.md) | `OpenTelemetryPlugin` | `register_plugin` | `on_request`, `on_stream_chunk`, `on_response_complete` |
 | [`plugin-speculative`](@/plugins/speculative.md) | `ModelOrchestrator` | `with_orchestrator` | none; replaces the dispatch stage |
 | [`plugin-session-log`](@/plugins/session-log.md) | `SessionLogPlugin` | `register_plugin` | `on_request`, `on_stream_chunk`, `on_response_complete` |
+| [`plugin-replay`](@/plugins/replay.md) | `SessionReplay` | direct calls only | none; not a `CucaPlugin` |
 | [`plugin-prompt-cache`](@/plugins/prompt-cache.md) | `PromptCache` | `with_prompt_cache_config` or `with_prompt_cache_service` | none; not a `CucaPlugin` |
 | [`plugin-cost`](@/plugins/cost.md) | `CostPlugin` | `register_plugin` | `on_request`, `on_response_complete` |
 | [`plugin-rate-limit`](@/plugins/rate-limit.md) | `RateLimiter` | direct calls only | none; not a `CucaPlugin` |
@@ -84,18 +85,20 @@ evicting, is [Memory discipline](@/concepts/memory-discipline.md).
 | `plugin-memory` | the working graph has no internal cap | the caller owns the bound | `snapshot()` |
 | `plugin-speculative` | `ClientPool` is uncapped, bounded by configuration | no eviction | `ClientPool::len()` |
 
-## The one cross-plugin edge
+## The cross-plugin edges
 
-Plugins are peers. `Cargo.toml` declares exactly one feature edge between two of
-them, and it points one way:
+Plugins are peers. `Cargo.toml` declares exactly two feature edges between
+them, and both point one way:
 
-```toml,name=The only plugin-to-plugin feature edge in Cargo.toml
+```toml,name=The two plugin-to-plugin feature edges in Cargo.toml
 plugin-entity-extraction = ["plugin-memory"]
+plugin-replay = ["plugin-session-log"]
 ```
 
-`plugin-memory` compiles and runs with no knowledge that entity extraction
-exists. CI enforces the direction with two greps: nothing under
-`src/plugins/memory/` may reference entity extraction, and no file under
+`plugin-memory` and `plugin-session-log` compile and run with no knowledge
+that their derived peer exists. CI enforces the direction with three greps:
+nothing under `src/plugins/memory/` may reference entity extraction, nothing
+in `src/plugins/session_log.rs` may reference replay, and no file under
 `src/plugins/` may gate on `plugin-speculative` or import `crate::orchestrator`.
 
 ## Shared optional dependencies

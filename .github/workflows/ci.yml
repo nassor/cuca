@@ -64,6 +64,7 @@ jobs:
           - plugin-telemetry
           - plugin-speculative
           - plugin-session-log
+          - plugin-replay
           - plugin-prompt-cache
           - plugin-rate-limit
           - plugin-cost
@@ -88,6 +89,10 @@ jobs:
           fi
           if grep -rnE 'cfg\(feature = "plugin-speculative"|crate::orchestrator' src/plugins/; then
             echo "layering violation: no plugin module may cfg-gate on or import the speculative orchestrator"
+            exit 1
+          fi
+          if grep -rnE 'plugins::replay|plugin-replay' src/plugins/session_log.rs; then
+            echo "layering violation: plugin-session-log must stay ignorant of plugin-replay"
             exit 1
           fi
           # plugin-cost is foundational with no derived dependant, so the directory-wide check

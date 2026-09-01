@@ -37,6 +37,10 @@ pub mod subagent;
 /// Human-in-the-loop approval interceptors for high-risk tool calls.
 #[cfg(feature = "plugin-hitl")]
 pub mod hitl;
+/// Deterministic re-materialization of a recorded session trajectory as an
+/// `AgentResponseStream`, with no provider dispatch.
+#[cfg(feature = "plugin-replay")]
+pub mod replay;
 /// Append-only session trajectory store and forking.
 #[cfg(feature = "plugin-session-log")]
 pub mod session_log;

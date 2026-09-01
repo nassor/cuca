@@ -1,7 +1,7 @@
 //! Cross-plugin combination tests: behavior that exists only when two plugin
 //! features are co-enabled.
 //!
-//! One file rather than one test per owning plugin file. Seven of the eleven
+//! One file rather than one test per owning plugin file. Seven of the thirteen
 //! surfaces below (`memory + prompt-cache`, `speculative + prompt-cache`,
 //! `memory + prompt-cache` export, `cost + prompt-cache`, `cost + memory`,
 //! `cost + telemetry`, `redaction + prompt-cache`) are *core-mediated*: they
@@ -52,6 +52,14 @@
 //!     digested from the post-hook request, so enabling redaction changes every
 //!     key, and two requests differing only inside a redacted secret collapse
 //!     onto one entry.
+//! 12. `replay + speculative` (caller-mediated): a recorded
+//!     `SessionEvent::ModelSwap` replays as a `ReplayNote`, never as a block.
+//!     Both plugins are derived on `plugin-session-log`, so they may only meet
+//!     in a caller; the orchestrator is built here, in the test crate.
+//! 13. `replay + prompt-cache` (two independent provider-free paths): a cache
+//!     hit replays the stored blocks and the session-log record of the
+//!     dispatched turn replays to the same sequence, pinning the two against
+//!     each other.
 #![cfg(feature = "provider-llamacpp")]
 
 mod common;
@@ -2142,6 +2150,262 @@ mod redaction_changes_cache_keys {
                 .entries
                 .len(),
             1
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 12: replay + speculative (a recorded swap replays as a note)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-replay", feature = "plugin-speculative"))]
+mod replay_speculative {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use cuca::plugin::{CucaPlugin, SessionStorePlugin};
+    use cuca::request::AgentResponseStream;
+    use cuca::types::{MessageContentBlock, ProviderEndpoint};
+    use cuca::{
+        ClientPool, CucaError, ModelOrchestrator, ReplayNote, SessionLogPlugin, SessionReplay,
+        SwappableModelPair, TurnExecutor, UnifiedRequest, UnifiedResponse,
+    };
+    use tokio_stream::StreamExt;
+
+    const SESSION: &str = "replay-swap-session";
+
+    /// A tier that answers immediately with canned blocks.
+    ///
+    /// Local to this module rather than shared with
+    /// `speculative_records_model_swaps`: this surface needs no live tier, so a
+    /// canned pair on both sides keeps the test fully in process.
+    struct CannedExecutor {
+        tier: &'static str,
+        blocks: Vec<MessageContentBlock>,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl TurnExecutor for CannedExecutor {
+        fn tier_name(&self) -> &'static str {
+            self.tier
+        }
+
+        fn execute(&self, _request: UnifiedRequest) -> Result<AgentResponseStream, CucaError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let items: Vec<Result<MessageContentBlock, CucaError>> =
+                self.blocks.iter().cloned().map(Ok).collect();
+            Ok(Box::pin(tokio_stream::iter(items)))
+        }
+    }
+
+    /// A draft the orchestrator's tool validator rejects (empty tool call id).
+    fn invalid_draft() -> MessageContentBlock {
+        MessageContentBlock::ToolCall {
+            id: String::new(),
+            name: "noop".into(),
+            arguments: serde_json::json!({}),
+        }
+    }
+
+    /// A recorded model swap replays as a [`ReplayNote::ModelSwap`], never as a
+    /// block, so the replayed block sequence is exactly the served content.
+    ///
+    /// The orchestrator is constructed **from the test crate**: replay and the
+    /// orchestrator are both derived on `plugin-session-log`, so a
+    /// derived-to-derived code edge would be a layering violation and CI greps
+    /// `src/plugins/` for it. They only ever meet in a caller, like here.
+    #[tokio::test]
+    async fn model_swap_records_replay_as_notes_not_blocks() {
+        let served = MessageContentBlock::Text("slow answer".into());
+        let slow_calls = Arc::new(AtomicUsize::new(0));
+        let store = Arc::new(SessionLogPlugin::new_in_memory().with_session_id(SESSION));
+
+        let orchestrator = ModelOrchestrator::with_executors(
+            SwappableModelPair {
+                fast_provider: ProviderEndpoint::LlamaCpp,
+                fast_model_id: "fast-tier-id".into(),
+                slow_provider: ProviderEndpoint::LlamaCpp,
+                slow_model_id: "slow-tier-id".into(),
+                latency_threshold_ms: 60_000,
+                fallback_on_tool_error: true,
+            },
+            Arc::new(ClientPool::default()),
+            Arc::new(CannedExecutor {
+                tier: "fast",
+                blocks: vec![invalid_draft()],
+                calls: Arc::new(AtomicUsize::new(0)),
+            }),
+            Arc::new(CannedExecutor {
+                tier: "slow",
+                blocks: vec![served.clone()],
+                calls: Arc::clone(&slow_calls),
+            }),
+        )
+        .with_session_store(Arc::clone(&store) as Arc<dyn SessionStorePlugin>, SESSION);
+
+        let mut stream = orchestrator
+            .execute_adaptive_turn(UnifiedRequest::new("combo-replay-model").add_user_message("hi"))
+            .await
+            .expect("orchestrated turn must start");
+        let mut blocks = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while let Some(item) = stream.next().await {
+                blocks.push(item.expect("stream item must be Ok"));
+            }
+        })
+        .await
+        .expect("the canned turn must finish within 10s");
+        assert_eq!(slow_calls.load(Ordering::SeqCst), 1, "the swap must fire");
+        assert_eq!(blocks, vec![served.clone()]);
+
+        // The client's plugin pipeline is what records blocks and accounting;
+        // the orchestrator only recorded the swap. Drive the same hooks here.
+        for mut block in blocks.clone() {
+            store
+                .on_stream_chunk(&mut block)
+                .expect("on_stream_chunk must return Ok(())");
+        }
+        store
+            .on_response_complete(&UnifiedResponse {
+                model: "slow-tier-id".into(),
+                provider: ProviderEndpoint::LlamaCpp,
+                duration_secs: 0.25,
+                prompt_tokens: 7,
+                completion_tokens: 3,
+                finish_reason: Some("stop".into()),
+                content: blocks.clone(),
+                prompt_cache_usage: None,
+            })
+            .expect("on_response_complete must return Ok(())");
+
+        let trajectory = SessionReplay::new(Arc::clone(store.backend()))
+            .load(SESSION)
+            .expect("the recorded session must replay");
+        assert_eq!(trajectory.len(), 1, "one terminator, one turn");
+        let turn = trajectory.turn(0).expect("the turn must be there");
+        assert_eq!(
+            turn.notes(),
+            [ReplayNote::ModelSwap {
+                from: "fast-tier-id".to_string(),
+                to: "slow-tier-id".to_string(),
+                reason: "fallback_validation".to_string(),
+            }],
+            "the swap must be visible as a note"
+        );
+        assert_eq!(
+            turn.blocks(),
+            [served],
+            "blocks() holds only content: the swap and the rejected draft are absent"
+        );
+        assert!(turn.is_complete());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 13: replay + prompt-cache (two provider-free replay paths agree)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-replay", feature = "plugin-prompt-cache"))]
+mod replay_agrees_with_a_cache_hit {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crate::common;
+    use cuca::plugin::CucaPlugin;
+    use cuca::{
+        CucaClient, PromptCache, PromptCacheConfig, SessionLogPlugin, SessionReplay, UnifiedRequest,
+    };
+
+    const SESSION: &str = "replay-cache-session";
+
+    fn request() -> UnifiedRequest {
+        UnifiedRequest::new("combo-replay-model")
+            .add_system_message("primary instruction")
+            .add_user_message("hi")
+    }
+
+    async fn drain(client: &CucaClient) -> Vec<cuca::types::MessageContentBlock> {
+        common::drain_timeout(
+            client
+                .generate_stream(request())
+                .await
+                .expect("generate_stream must start"),
+            10,
+        )
+        .await
+    }
+
+    /// The crate has two independent "stream without a provider" paths: the
+    /// prompt cache's stored-block replay and this feature's trajectory replay.
+    /// They must agree block for block, or one of them is wrong.
+    #[tokio::test]
+    async fn replay_of_a_cache_hit_session_matches_the_live_session() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let cache = Arc::new(
+            PromptCache::new(
+                PromptCacheConfig::new(4, Duration::from_secs(60)).expect("config must build"),
+            )
+            .expect("cache must build"),
+        );
+        let store = Arc::new(SessionLogPlugin::new_in_memory().with_session_id(SESSION));
+        let client = common::llamacpp_builder(format!("http://{addr}/v1"))
+            .with_prompt_cache_service(Arc::clone(&cache))
+            .register_plugin(Arc::clone(&store) as Arc<dyn CucaPlugin>)
+            .build()
+            .expect("client build must succeed");
+
+        let dispatched = drain(&client).await;
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "the first turn must miss and dispatch"
+        );
+        assert!(
+            !dispatched.is_empty(),
+            "the canned server streams one block"
+        );
+
+        let from_cache = drain(&client).await;
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "the identical turn must be served from the local cache"
+        );
+        assert_eq!(
+            from_cache, dispatched,
+            "the cache replays the stored blocks verbatim"
+        );
+
+        // The third path: no client, no cache, no provider — just the records.
+        let trajectory = SessionReplay::new(Arc::clone(store.backend()))
+            .load(SESSION)
+            .expect("the recorded session must replay");
+        assert_eq!(trajectory.len(), 2, "both turns ran the terminal hooks");
+        assert_eq!(
+            trajectory
+                .turn(0)
+                .expect("the dispatched turn must be there")
+                .blocks(),
+            dispatched.as_slice(),
+            "the trajectory replay must agree with the cache replay"
+        );
+        assert!(
+            trajectory
+                .turn(1)
+                .expect("the cached turn must be there")
+                .blocks()
+                .is_empty(),
+            "a cache hit runs no on_stream_chunk hook, so its turn records no block"
+        );
+        assert!(
+            trajectory
+                .turn(1)
+                .expect("the cached turn must be there")
+                .is_complete(),
+            "a cache hit still runs on_response_complete, so its turn is terminated"
         );
     }
 }

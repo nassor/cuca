@@ -134,6 +134,9 @@ path = "@/plugins/speculative.md"
 title = "Session log"
 path = "@/plugins/session-log.md"
 [[extra.nav.items.children]]
+title = "Replay"
+path = "@/plugins/replay.md"
+[[extra.nav.items.children]]
 title = "Prompt cache"
 path = "@/plugins/prompt-cache.md"
 [[extra.nav.items.children]]

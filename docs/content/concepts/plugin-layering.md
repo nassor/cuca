@@ -1,6 +1,6 @@
 +++
 title = "Everything is a plugin"
-description = "Three attachment points, one hook order, and why three capabilities are forbidden from implementing CucaPlugin at all."
+description = "Three attachment points, one hook order, and why four capabilities are forbidden from implementing CucaPlugin at all."
 template = "page.html"
 weight = 3
 +++
@@ -13,11 +13,11 @@ weight = 3
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You are adding a capability and need to know which attachment point it belongs to, or why <code>register_plugin</code> refuses one of the sixteen</dd>
+<dd>You are adding a capability and need to know which attachment point it belongs to, or why <code>register_plugin</code> refuses one of the seventeen</dd>
 </dl>
 
-Sixteen `plugin-*` features. Twelve of them implement `CucaPlugin` and register on
-the builder. Three of them are compile errors if you try. One replaces the
+Seventeen `plugin-*` features. Twelve of them implement `CucaPlugin` and register on
+the builder. Four of them are compile errors if you try. One replaces the
 dispatch stage outright.
 
 That is not an inconsistency, it is the layering. A capability's attachment
@@ -29,7 +29,7 @@ the right moment without being told to?
 | Tier | Mechanism | The pipeline can | Members |
 |---|---|---|---|
 | Hook plugin | `register_plugin(Arc<dyn CucaPlugin>)` | drive it: hooks fire at fixed points, in registration order | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost`, `plugin-redaction` |
-| Explicit-call capability | direct method calls on the type | not drive it: the caller decides when and applies the result | `plugin-prompt-cache`, `plugin-entity-extraction`, `plugin-rate-limit` |
+| Explicit-call capability | direct method calls on the type | not drive it: the caller decides when and applies the result | `plugin-prompt-cache`, `plugin-entity-extraction`, `plugin-replay`, `plugin-rate-limit` |
 | Pipeline replacement | `with_orchestrator(ModelOrchestrator)` | not host it: it owns the dispatch stage | `plugin-speculative` |
 
 `plugin-session-log` sits in the first tier twice: it implements `CucaPlugin`
@@ -72,9 +72,9 @@ The asymmetry in that last line is the only place the pipeline swallows an
 error, and it is deliberate: a telemetry export that fails must not retroactively
 break a turn the caller already consumed.
 
-## Why three capabilities may not be plugins
+## Why four capabilities may not be plugins
 
-`PromptCache`, `EntityExtractionPlugin`, and `RateLimiter` do not implement `CucaPlugin`, and the compiler therefore rejects `register_plugin` on them. That refusal is the point.
+`PromptCache`, `EntityExtractionPlugin`, `SessionReplay`, and `RateLimiter` do not implement `CucaPlugin`, and the compiler therefore rejects `register_plugin` on them. That refusal is the point.
 
 A cache lookup has to happen after `on_request` has finished mutating the
 request, because the digest must cover the request that will actually be sent.
@@ -89,9 +89,17 @@ application merges it into a `MemoryPlugin`. There is no moment in a turn where
 "apply this delta" is the obviously correct action, so the decision stays with
 the caller.
 
+`SessionReplay` refuses for a third reason: it drives a recorded session
+instead of observing a live one. There is no live request to mutate
+(`on_request`), no arriving chunk to annotate (`on_stream_chunk`), and no hook
+signature can return a stream, which is the entire shape of what replay
+produces. Its work is caller-triggered backend reads, at a moment with no
+relation to any request in flight, so `SessionReplay::load` and its streaming
+methods are called directly instead.
+
 `RateLimiter` cannot be a plugin either, for a different reason: `on_request` is synchronous, so a hook could only reject a request, never pace it, and pacing is the entire capability. Acquiring a concurrency permit in a hook and releasing it in `on_response_complete` would also leak the permit on a dispatch error, an early stream drop, or the orchestrator's unwrapped stream — three real exits that never reach a terminal hook. An RAII permit whose `Drop` runs on every one of those exits is what closes the gap.
 
-All three could have been given a `CucaPlugin` impl with empty hook bodies and a
+All four could have been given a `CucaPlugin` impl with empty hook bodies and a
 comment saying "call the methods directly". That would compile, register
 successfully, and do nothing, which is worse than not compiling. An inert
 registration is a bug that looks like configuration.
@@ -111,16 +119,18 @@ re-enter the orchestrator. See
 
 ## What the layering forbids
 
-Plugins are peers, not a dependency graph, and the build enforces that. There is
-exactly one cross-plugin feature edge in `Cargo.toml`:
+Plugins are peers, not a dependency graph, and the build enforces that. There are
+exactly two cross-plugin feature edges in `Cargo.toml`:
 
-```toml,name=The only plugin-to-plugin feature edge in Cargo.toml
+```toml,name=The two plugin-to-plugin feature edges in Cargo.toml
 plugin-entity-extraction = ["plugin-memory"]
+plugin-replay = ["plugin-session-log"]
 ```
 
-It points one way. `plugin-memory` compiles and works with no knowledge that
-entity extraction exists, and CI greps `src/plugins/memory/` to keep it that
-way. A second grep asserts that no file under `src/plugins/` gates on
+Both point one way. `plugin-memory` and `plugin-session-log` compile and work
+with no knowledge that their derived peers exist, and CI greps
+`src/plugins/memory/` and `src/plugins/session_log.rs` to keep it that way. A
+third grep asserts that no file under `src/plugins/` gates on
 `plugin-speculative` or imports `crate::orchestrator`, which is what keeps the
 third tier from leaking into the first.
 

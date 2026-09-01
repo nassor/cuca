@@ -75,6 +75,10 @@ plugin-speculative = ["dep:tokio", "dep:tokio-stream"]
 # plugin-session-log: postcard encodes each stored record; the session log is the
 # only postcard *decode* path in the crate.
 plugin-session-log = ["dep:postcard"]
+# plugin-replay: deterministic re-materialization of a recorded trajectory as an
+# AgentResponseStream. Reads through plugin-session-log's `SessionBackend` seam;
+# adds no dependency of its own.
+plugin-replay = ["plugin-session-log"]
 # Client-owned local response cache; deterministic effective-request digesting
 # via the existing optional sha2 dependency (provider-anthropic enables sha2
 # independently for its own request signing) over postcard-encoded digest input.
@@ -178,3 +182,11 @@ required-features = ["provider-llamacpp", "plugin-rate-limit"]
 name = "redaction"
 path = "examples/redaction.rs"
 required-features = ["provider-llamacpp", "plugin-redaction"]
+
+# replay additionally needs the plugin feature the replay capability lives
+# behind: `SessionReplay` only exists when `plugin-replay` is enabled, and that
+# feature pulls in `plugin-session-log` for the recording half of the demo.
+[[example]]
+name = "replay"
+path = "examples/replay.rs"
+required-features = ["provider-llamacpp", "plugin-replay"]

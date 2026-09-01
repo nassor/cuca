@@ -17,7 +17,7 @@ CUCA is an asynchronous Rust library for LLM backends. It parses multi-modal SSE
 - **Explicit provider selection.** `default = []`; compilation fails until you enable at least one `provider-*` feature. Pick `provider-openai` (also for OpenAI-compatible endpoints such as Ollama via a base-URL override), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm`, or `provider-lmstudio`.
 - **Lean dependency boundary.** The core carries wire types and the SSE parser. HTTP, Tokio stream adapters, provider SDK support, and plugin dependencies compile only when their owning provider or plugin feature is enabled.
 - **Optional per-request thinking.** One effort level, `minimal` to `xhigh`, maps onto each provider's native controls: OpenAI-compatible `reasoning_effort`, Anthropic budget and adaptive modes, Gemini budgets and levels, DeepSeek thinking mode. Providers without a knob ignore it.
-- **Everything is a plugin.** MCP connectors, WASM sandboxing, memory compression and in-memory graph memory, output guardrails, subagent delegation, human approval, web search, skills, telemetry, session logging, local response caching, token and cost accounting with budget caps, client-side rate limiting, outbound PII and secret redaction, speculative fast/slow routing, and schema-guided entity extraction are compile-time feature flags.
+- **Everything is a plugin.** MCP connectors, WASM sandboxing, memory compression and in-memory graph memory, output guardrails, subagent delegation, human approval, web search, skills, telemetry, session logging, deterministic session replay, local response caching, token and cost accounting with budget caps, client-side rate limiting, outbound PII and secret redaction, speculative fast/slow routing, and schema-guided entity extraction are compile-time feature flags.
 
 ## Quick start
 
@@ -129,7 +129,7 @@ Prerequisites: an OpenAI-compatible server (llama.cpp's `llama-server` serves th
 Runs the same on Linux, macOS and Windows (PowerShell):
 
 ```
-cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-prompt-cache plugin-cost plugin-rate-limit plugin-redaction" -- --nocapture --test-threads=1
+cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-replay plugin-prompt-cache plugin-cost plugin-rate-limit plugin-redaction" -- --nocapture --test-threads=1
 ```
 
 Environment variables:

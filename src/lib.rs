@@ -115,6 +115,11 @@ pub use crate::plugins::rate_limit::{
 };
 #[cfg(feature = "plugin-redaction")]
 pub use crate::plugins::redaction::{Redacted, RedactionConfig, RedactionPlugin, RedactionRule};
+#[cfg(feature = "plugin-replay")]
+pub use crate::plugins::replay::{
+    ReplayCompletion, ReplayConfig, ReplayNote, ReplayTrajectory, ReplayTurn, ReplayUsage,
+    SessionReplay,
+};
 #[cfg(feature = "plugin-sandbox")]
 pub use crate::plugins::sandbox::{SandboxConfig, SandboxPlugin, SandboxResult};
 #[cfg(feature = "plugin-session-log")]

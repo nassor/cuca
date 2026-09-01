@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twenty-three features, all opt-in: seven providers, sixteen plugins, one cross-plugin edge</dd>
+<dd>Twenty-four features, all opt-in: seven providers, seventeen plugins, two cross-plugin edges</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -56,13 +56,15 @@ that `cargo check --no-default-features` fails.
 | `plugin-telemetry` | `dep:opentelemetry`, `dep:opentelemetry_sdk`, `dep:tracing` |
 | `plugin-speculative` | `dep:tokio`, `dep:tokio-stream` |
 | `plugin-session-log` | `dep:postcard` |
+| `plugin-replay` | `plugin-session-log` |
 | `plugin-prompt-cache` | `dep:sha2`, `dep:postcard` |
 | `plugin-cost` | `dep:tiktoken-rs` |
 | `plugin-rate-limit` | `dep:tokio` |
 | `plugin-redaction` | `dep:tracing` |
 
-`plugin-entity-extraction = ["plugin-memory"]` is the only feature edge between
-two plugins.
+`plugin-entity-extraction = ["plugin-memory"]` and
+`plugin-replay = ["plugin-session-log"]` are the two feature edges between
+plugins.
 
 ## Unconditional dependencies
 
@@ -157,7 +159,7 @@ need one or more plugin features on top, because what they demonstrate is gated 
 | `clippy`, `test` | `--no-default-features --features provider-openai`, and `--all-features` |
 | `no_provider` | `--no-default-features`, asserted to fail |
 | `doc` | `--all-features` |
-| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the sixteen plugin features |
-| `plugin_layering` | greps asserting `src/plugins/memory/` never references entity extraction, and no file under `src/plugins/` gates on `plugin-speculative` or imports `crate::orchestrator` |
+| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the seventeen plugin features |
+| `plugin_layering` | greps asserting `src/plugins/memory/` never references entity extraction, `src/plugins/session_log.rs` never references replay, and no file under `src/plugins/` gates on `plugin-speculative` or imports `crate::orchestrator` |
 
 Next page: [Error types](@/reference/errors.md).

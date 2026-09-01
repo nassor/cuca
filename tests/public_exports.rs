@@ -450,3 +450,107 @@ mod export_surface {
         );
     }
 }
+
+#[cfg(feature = "plugin-replay")]
+mod replay_surface {
+    use std::sync::Arc;
+
+    use cuca::{
+        AgentResponseStream, InMemoryBackend, ReplayCompletion, ReplayConfig, ReplayNote,
+        ReplayTrajectory, ReplayTurn, ReplayUsage, SessionEvent, SessionRecord, SessionReplay,
+    };
+
+    #[test]
+    fn replay_config_and_service_are_root_exported() {
+        let config = ReplayConfig::new(64, 8, Some(0.5)).expect("a valid configuration must build");
+        assert_eq!(config.max_records, 64);
+        assert_eq!(config.max_turn_blocks, 8);
+
+        let replay = SessionReplay::with_config(Arc::new(InMemoryBackend::new()), config)
+            .expect("replay must build");
+        assert_eq!(replay.config(), &config);
+        assert!(
+            replay
+                .load("never-recorded")
+                .expect("an unknown session loads as empty")
+                .is_empty()
+        );
+    }
+
+    /// The trajectory DTOs are nameable by callers inspecting a replay.
+    #[test]
+    fn replay_trajectory_types_are_root_exported() {
+        let backend = InMemoryBackend::new();
+        for (sequence, event) in [
+            SessionEvent::Output {
+                text: "hi".to_string(),
+            },
+            SessionEvent::ModelSwap {
+                from: "fast".to_string(),
+                to: "slow".to_string(),
+                reason: "latency_threshold".to_string(),
+            },
+            SessionEvent::Latency { duration_ms: 250 },
+            SessionEvent::TokenUsage {
+                prompt_tokens: 4,
+                completion_tokens: 2,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            cuca::SessionBackend::append(
+                &backend,
+                &SessionRecord::at("s", sequence as u64, 1, event),
+            )
+            .expect("append must succeed");
+        }
+
+        let trajectory: ReplayTrajectory = SessionReplay::new(Arc::new(backend))
+            .load("s")
+            .expect("replay must load");
+        let usage: ReplayUsage = trajectory.usage();
+        assert_eq!(usage.turns, 1);
+
+        let turn: &ReplayTurn = trajectory.turn(0).expect("the single turn must be there");
+        let completion: &ReplayCompletion = turn.completion().expect("the turn is complete");
+        assert_eq!(completion.duration_ms, 250);
+
+        match turn.notes() {
+            [ReplayNote::ModelSwap { from, to, reason }] => {
+                assert_eq!(
+                    (from.as_str(), to.as_str(), reason.as_str()),
+                    ("fast", "slow", "latency_threshold")
+                );
+            }
+            other => panic!("expected exactly one ReplayNote::ModelSwap, got {other:?}"),
+        }
+    }
+
+    /// A replayed stream *is* the public stream contract: the alias accepts it
+    /// with no adapter, which is what makes replay a drop-in for a provider
+    /// turn.
+    #[test]
+    fn replay_stream_is_an_agent_response_stream() {
+        let backend = InMemoryBackend::new();
+        cuca::SessionBackend::append(
+            &backend,
+            &SessionRecord::at(
+                "s",
+                0,
+                1,
+                SessionEvent::Output {
+                    text: "hi".to_string(),
+                },
+            ),
+        )
+        .expect("append must succeed");
+
+        let trajectory = SessionReplay::new(Arc::new(backend))
+            .load("s")
+            .expect("replay must load");
+        let _stream: AgentResponseStream = trajectory
+            .into_stream()
+            .expect("a non-empty replay streams");
+    }
+}
