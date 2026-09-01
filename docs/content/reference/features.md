@@ -136,7 +136,7 @@ plugin feature.
 
 | Field | Value |
 |---|---|
-| Package name | `cuca-core` |
+| Package name | `cuca` |
 | Version | `0.2.0` |
 | Edition | `2024` |
 | `rust-version` | `1.98` |
