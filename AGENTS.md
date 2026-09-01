@@ -98,7 +98,7 @@ Memory size is a first-order concern: every structure that grows with traffic sh
 | Path | Why it matters |
 | --- | --- |
 | `src/lib.rs` | Crate root: public re-exports of the client, request/response contracts, errors, and the feature-gated plugin and service surfaces. The implementation lives in the module tree (`client`, `request`, `types`, `error`, `sse`, `session`, `plugin`, `plugins/`, `services/`, `provider/`). |
-| `Cargo.toml` | Package manifest for `cuca` (v0.1.0, edition 2024, rust-version 1.98): crates.io publish metadata (description, repository, homepage, docs.rs all-features build), the 24-feature matrix (7 providers + 12 plugins + 5 services), no default provider, the two hard service feature edges (`service-entity-extraction = ["plugin-memory"]`, `service-replay = ["plugin-session-log"]`), minimal core dependencies, feature-owned transport/runtime dependencies, and dev-deps. |
+| `Cargo.toml` | Package manifest for `cuca` (v0.2.0, edition 2024, rust-version 1.98): crates.io publish metadata (description, repository, homepage, docs.rs all-features build), the 24-feature matrix (7 providers + 12 plugins + 5 services), no default provider, the two hard service feature edges (`service-entity-extraction = ["plugin-memory"]`, `service-replay = ["plugin-session-log"]`), minimal core dependencies, feature-owned transport/runtime dependencies, and dev-deps. |
 | `README.md` | Public-facing claims (zero-default providers, unified abstraction, zero-allocation engine, plugin/service architecture); keep in sync as implementation lands. |
 | `.gitignore` | Ignores `/target`, `/.agents`, `/graphify*`, `/.omp`, `/docs/public`, and `/docs/static/giallo.css`. |
 

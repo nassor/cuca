@@ -1,6 +1,6 @@
 [package]
 name = "cuca"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Compact Universal Client for Agents: an asynchronous LLM client that parses multi-modal SSE streams into typed blocks behind one unified request/response abstraction."
