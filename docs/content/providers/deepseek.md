@@ -16,6 +16,33 @@ weight = 4
 <dd>You are routing requests through <code>ProviderEndpoint::DeepSeek</code>, on either its native route or the Anthropic bridge.</dd>
 </dl>
 
+The smallest streaming turn: the `DeepSeek` variant and an API key. The default
+base URL selects the native route.
+
+```rust,name=A first stream through the DeepSeek adapter
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::DeepSeek)
+    .with_api_key(std::env::var("DEEPSEEK_API_KEY")?)
+    .build()?;
+
+let mut stream = client
+    .generate_stream(UnifiedRequest::new("deepseek-v4-flash").add_user_message("Say hello."))
+    .await?;
+while let Some(block) = stream.next().await {
+    if let MessageContentBlock::Text(text) = block? {
+        print!("{text}");
+    }
+}
+```
+
+```text,name=Expected output; exact wording varies by model
+Hello! How can I help you today?
+```
+
 ## Endpoint
 
 | Fact | Value |

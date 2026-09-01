@@ -16,6 +16,33 @@ weight = 1
 <dd>You are routing requests through <code>ProviderEndpoint::OpenAi</code>, or you landed here from another OpenAI-compatible provider's page.</dd>
 </dl>
 
+The smallest streaming turn: the `OpenAi` variant, an API key, and every other
+builder default.
+
+```rust,name=A first stream through the OpenAI adapter
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::OpenAi)
+    .with_api_key(std::env::var("OPENAI_API_KEY")?)
+    .build()?;
+
+let mut stream = client
+    .generate_stream(UnifiedRequest::new("gpt-4o-mini").add_user_message("Say hello."))
+    .await?;
+while let Some(block) = stream.next().await {
+    if let MessageContentBlock::Text(text) = block? {
+        print!("{text}");
+    }
+}
+```
+
+```text,name=Expected output; exact wording varies by model
+Hello! How can I help you today?
+```
+
 ## Endpoint
 
 | Fact | Value |

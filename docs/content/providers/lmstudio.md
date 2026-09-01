@@ -16,6 +16,33 @@ weight = 7
 <dd>You are routing requests through <code>ProviderEndpoint::LmStudio</code>.</dd>
 </dl>
 
+The smallest streaming turn: the `LmStudio` variant against the default local
+endpoint; no API key. The model id is the one the server reports under
+`GET {base}/models`.
+
+```rust,name=A first stream through the LM Studio adapter
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LmStudio)
+    .build()?;
+
+let mut stream = client
+    .generate_stream(UnifiedRequest::new("google/gemma-4-e4b").add_user_message("Say hello."))
+    .await?;
+while let Some(block) = stream.next().await {
+    if let MessageContentBlock::Text(text) = block? {
+        print!("{text}");
+    }
+}
+```
+
+```text,name=Expected output; exact wording varies by model
+Hello! How can I help you today?
+```
+
 ## Endpoint
 
 | Fact | Value |

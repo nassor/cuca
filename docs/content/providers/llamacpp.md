@@ -16,6 +16,33 @@ weight = 5
 <dd>You are routing requests through <code>ProviderEndpoint::LlamaCpp</code>, or choosing between the chat and completion routes.</dd>
 </dl>
 
+The smallest streaming turn: the `LlamaCpp` variant and an explicit base URL
+for a server on port 1234; no API key. The adapter's own default is port 8080.
+
+```rust,name=A first stream through the llama.cpp adapter
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .build()?;
+
+let mut stream = client
+    .generate_stream(UnifiedRequest::new("google/gemma-4-e4b").add_user_message("Say hello."))
+    .await?;
+while let Some(block) = stream.next().await {
+    if let MessageContentBlock::Text(text) = block? {
+        print!("{text}");
+    }
+}
+```
+
+```text,name=Expected output; exact wording varies by model
+Hello! How can I help you today?
+```
+
 ## Endpoint
 
 | Fact | Value |

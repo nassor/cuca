@@ -16,6 +16,33 @@ weight = 3
 <dd>You are routing requests through <code>ProviderEndpoint::GoogleGemini</code> or handling tool calls against Gemini.</dd>
 </dl>
 
+The smallest streaming turn: the `GoogleGemini` variant and the required API
+key.
+
+```rust,name=A first stream through the Gemini adapter
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::GoogleGemini)
+    .with_api_key(std::env::var("GEMINI_API_KEY")?)
+    .build()?;
+
+let mut stream = client
+    .generate_stream(UnifiedRequest::new("gemini-2.5-flash").add_user_message("Say hello."))
+    .await?;
+while let Some(block) = stream.next().await {
+    if let MessageContentBlock::Text(text) = block? {
+        print!("{text}");
+    }
+}
+```
+
+```text,name=Expected output; exact wording varies by model
+Hello! How can I help you today?
+```
+
 ## Endpoint
 
 | Fact | Value |
