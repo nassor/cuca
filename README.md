@@ -17,7 +17,7 @@ CUCA is an asynchronous Rust library for LLM backends. It parses multi-modal SSE
 - **Explicit provider selection.** `default = []`; compilation fails until you enable at least one `provider-*` feature. Pick `provider-openai` (also for OpenAI-compatible endpoints such as Ollama via a base-URL override), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm`, or `provider-lmstudio`.
 - **Lean dependency boundary.** The core carries wire types and the SSE parser. HTTP, Tokio stream adapters, provider SDK support, and plugin dependencies compile only when their owning provider or plugin feature is enabled.
 - **Optional per-request thinking.** One effort level, `minimal` to `xhigh`, maps onto each provider's native controls: OpenAI-compatible `reasoning_effort`, Anthropic budget and adaptive modes, Gemini budgets and levels, DeepSeek thinking mode. Providers without a knob ignore it.
-- **Everything is a plugin.** MCP connectors, WASM sandboxing, memory compression and in-memory graph memory, output guardrails, subagent delegation, human approval, web search, skills, telemetry, session logging, local response caching, token and cost accounting with budget caps, speculative fast/slow routing, and schema-guided entity extraction are compile-time feature flags.
+- **Everything is a plugin.** MCP connectors, WASM sandboxing, memory compression and in-memory graph memory, output guardrails, subagent delegation, human approval, web search, skills, telemetry, session logging, local response caching, token and cost accounting with budget caps, client-side rate limiting, outbound PII and secret redaction, speculative fast/slow routing, and schema-guided entity extraction are compile-time feature flags.
 
 ## Quick start
 
@@ -118,7 +118,7 @@ Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShel
 - Enable only the provider features you use.
 - The same demo works against any OpenAI-compatible endpoint, such as Ollama, vLLM, or a remote gateway, by switching to `provider-openai` and setting the base URL in `with_base_url` and the model name in `UnifiedRequest::new`; Ollama serves this protocol at `http://localhost:11434/v1` once `ollama serve` is running with a model pulled.
 - LM Studio speaks the same protocol through its own dedicated adapter, `provider-lmstudio`, which already defaults to LM Studio's local server at `http://127.0.0.1:1234/v1`.
-- The repository's `examples/` folder demonstrates the same pattern in four flavors: `cargo run --example llamacpp_gemma --features provider-llamacpp` (plain reply), `stream_all_blocks` (every block type), `custom_plugin` (a counting plugin), and `cost_otel` (a priced turn exported to OpenTelemetry, which also needs `plugin-cost,plugin-telemetry`). The examples read `CUCA_BASE_URL` and `CUCA_MODEL` from the environment (defaults target a local llama.cpp server), e.g. `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example llamacpp_gemma --features provider-llamacpp` to point at a vLLM server instead.
+- The repository's `examples/` folder demonstrates the same pattern in five flavors: `cargo run --example llamacpp_gemma --features provider-llamacpp` (plain reply), `stream_all_blocks` (every block type), `custom_plugin` (a counting plugin), `cost_otel` (a priced turn exported to OpenTelemetry, which also needs `plugin-cost,plugin-telemetry`), and `rate_limit` (a paced fan-out of turns through one client-side limiter, which also needs `plugin-rate-limit`). The examples read `CUCA_BASE_URL` and `CUCA_MODEL` from the environment (defaults target a local llama.cpp server), e.g. `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example llamacpp_gemma --features provider-llamacpp` to point at a vLLM server instead.
 
 ### Integration tests (live llama.cpp)
 
@@ -129,7 +129,7 @@ Prerequisites: an OpenAI-compatible server (llama.cpp's `llama-server` serves th
 Runs the same on Linux, macOS and Windows (PowerShell):
 
 ```
-cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-prompt-cache plugin-cost" -- --nocapture --test-threads=1
+cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-prompt-cache plugin-cost plugin-rate-limit plugin-redaction" -- --nocapture --test-threads=1
 ```
 
 Environment variables:

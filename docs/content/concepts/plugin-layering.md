@@ -1,6 +1,6 @@
 +++
 title = "Everything is a plugin"
-description = "Three attachment points, one hook order, and why two capabilities are forbidden from implementing CucaPlugin at all."
+description = "Three attachment points, one hook order, and why three capabilities are forbidden from implementing CucaPlugin at all."
 template = "page.html"
 weight = 3
 +++
@@ -13,11 +13,11 @@ weight = 3
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You are adding a capability and need to know which attachment point it belongs to, or why <code>register_plugin</code> refuses one of the fourteen</dd>
+<dd>You are adding a capability and need to know which attachment point it belongs to, or why <code>register_plugin</code> refuses one of the sixteen</dd>
 </dl>
 
-Fourteen `plugin-*` features. Eleven of them implement `CucaPlugin` and register on
-the builder. Two of them are compile errors if you try. One replaces the
+Sixteen `plugin-*` features. Twelve of them implement `CucaPlugin` and register on
+the builder. Three of them are compile errors if you try. One replaces the
 dispatch stage outright.
 
 That is not an inconsistency, it is the layering. A capability's attachment
@@ -28,8 +28,8 @@ the right moment without being told to?
 
 | Tier | Mechanism | The pipeline can | Members |
 |---|---|---|---|
-| Hook plugin | `register_plugin(Arc<dyn CucaPlugin>)` | drive it: hooks fire at fixed points, in registration order | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost` |
-| Explicit-call capability | direct method calls on the type | not drive it: the caller decides when and applies the result | `plugin-prompt-cache`, `plugin-entity-extraction` |
+| Hook plugin | `register_plugin(Arc<dyn CucaPlugin>)` | drive it: hooks fire at fixed points, in registration order | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost`, `plugin-redaction` |
+| Explicit-call capability | direct method calls on the type | not drive it: the caller decides when and applies the result | `plugin-prompt-cache`, `plugin-entity-extraction`, `plugin-rate-limit` |
 | Pipeline replacement | `with_orchestrator(ModelOrchestrator)` | not host it: it owns the dispatch stage | `plugin-speculative` |
 
 `plugin-session-log` sits in the first tier twice: it implements `CucaPlugin`
@@ -72,10 +72,9 @@ The asymmetry in that last line is the only place the pipeline swallows an
 error, and it is deliberate: a telemetry export that fails must not retroactively
 break a turn the caller already consumed.
 
-## Why two capabilities may not be plugins
+## Why three capabilities may not be plugins
 
-`PromptCache` and `EntityExtractionPlugin` do not implement `CucaPlugin`, and the
-compiler therefore rejects `register_plugin` on them. That refusal is the point.
+`PromptCache`, `EntityExtractionPlugin`, and `RateLimiter` do not implement `CucaPlugin`, and the compiler therefore rejects `register_plugin` on them. That refusal is the point.
 
 A cache lookup has to happen after `on_request` has finished mutating the
 request, because the digest must cover the request that will actually be sent.
@@ -90,7 +89,9 @@ application merges it into a `MemoryPlugin`. There is no moment in a turn where
 "apply this delta" is the obviously correct action, so the decision stays with
 the caller.
 
-Both could have been given a `CucaPlugin` impl with empty hook bodies and a
+`RateLimiter` cannot be a plugin either, for a different reason: `on_request` is synchronous, so a hook could only reject a request, never pace it, and pacing is the entire capability. Acquiring a concurrency permit in a hook and releasing it in `on_response_complete` would also leak the permit on a dispatch error, an early stream drop, or the orchestrator's unwrapped stream — three real exits that never reach a terminal hook. An RAII permit whose `Drop` runs on every one of those exits is what closes the gap.
+
+All three could have been given a `CucaPlugin` impl with empty hook bodies and a
 comment saying "call the methods directly". That would compile, register
 successfully, and do nothing, which is worse than not compiling. An inert
 registration is a bug that looks like configuration.

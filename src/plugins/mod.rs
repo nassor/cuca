@@ -53,6 +53,15 @@ pub mod web_search;
 #[cfg(feature = "plugin-prompt-cache")]
 pub mod prompt_cache;
 
+/// Client-side outbound throttle: an integer token bucket over request rate
+/// plus a hard cap on concurrently in-flight turns.
+#[cfg(feature = "plugin-rate-limit")]
+pub mod rate_limit;
+
+/// Outbound PII/secret scrubbing over every text-bearing request field.
+#[cfg(feature = "plugin-redaction")]
+pub mod redaction;
+
 /// Cumulative token/currency ledger with a hard budget cap enforced before
 /// provider dispatch.
 #[cfg(feature = "plugin-cost")]

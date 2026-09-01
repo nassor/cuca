@@ -137,6 +137,12 @@ path = "@/plugins/session-log.md"
 title = "Prompt cache"
 path = "@/plugins/prompt-cache.md"
 [[extra.nav.items.children]]
+title = "Rate limit"
+path = "@/plugins/rate-limit.md"
+[[extra.nav.items.children]]
+title = "Redaction"
+path = "@/plugins/redaction.md"
+[[extra.nav.items.children]]
 title = "Cost accounting"
 path = "@/plugins/cost.md"
 

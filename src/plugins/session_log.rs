@@ -61,6 +61,12 @@
 //! When both `plugin-speculative` and `plugin-session-log` are enabled, the
 //! orchestrator calls [`SessionStorePlugin::append_log`] to record
 //! [`SessionEvent::ModelSwap`] events against the registered store plugin.
+//!
+//! # What a record contains
+//!
+//! `on_request` records the request as it stands when *this* plugin's hook
+//! runs, so the store records whatever earlier `on_request` hooks have already
+//! made of the request; `on_stream_chunk` records inbound blocks verbatim.
 
 use std::collections::HashMap;
 use std::io::Write;

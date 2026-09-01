@@ -1,11 +1,12 @@
 //! Cross-plugin combination tests: behavior that exists only when two plugin
 //! features are co-enabled.
 //!
-//! One file rather than one test per owning plugin file. Six of the eight
+//! One file rather than one test per owning plugin file. Seven of the eleven
 //! surfaces below (`memory + prompt-cache`, `speculative + prompt-cache`,
 //! `memory + prompt-cache` export, `cost + prompt-cache`, `cost + memory`,
-//! `cost + telemetry`) are *core-mediated*: they have no derived plugin to
-//! belong to, and AGENTS.md deliberately puts two-plugin workflows in core
+//! `cost + telemetry`, `redaction + prompt-cache`) are *core-mediated*: they
+//! have no derived plugin to belong to, and AGENTS.md deliberately puts
+//! two-plugin workflows in core
 //! (`CucaExport::from_live`, `OtelCostObserver`). Keeping the tests together
 //! mirrors that and gives one place to audit cross-plugin coupling; each
 //! module is gated on exactly the features its surface needs, so no test
@@ -40,6 +41,17 @@
 //!    every `CostUsage` reading to the same meter provider
 //!    `OpenTelemetryPlugin` reports on, so one export batch carries both the
 //!    cost gauges and the request counter.
+//! 9. `rate-limit + prompt-cache` (caller-mediated): the caller acquires its
+//!    permit before `generate_stream` can short-circuit on the cache, so a
+//!    cache hit still spends a limiter token.
+//! 10. `redaction + session-log` (hook order is observable in the trajectory):
+//!     the store records whatever earlier `on_request` hooks made of the
+//!     request, so registering redaction first persists scrubbed content and
+//!     registering it after persists the raw value. Neither order is required.
+//! 11. `redaction + prompt-cache` (core-mediated hook order): the key is
+//!     digested from the post-hook request, so enabling redaction changes every
+//!     key, and two requests differing only inside a redacted secret collapse
+//!     onto one entry.
 #![cfg(feature = "provider-llamacpp")]
 
 mod common;
@@ -1827,6 +1839,309 @@ mod cost_with_telemetry {
             counter_total(&metrics, "cuca_requests_total"),
             1,
             "the telemetry plugin's own instrument shares the batch"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 9: rate-limit + prompt-cache (a cache hit still spends a token)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-rate-limit", feature = "plugin-prompt-cache"))]
+mod rate_limit_with_prompt_cache {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crate::common;
+    use cuca::{
+        CucaClient, PromptCache, PromptCacheConfig, RateLimitConfig, RateLimiter, UnifiedRequest,
+    };
+
+    const MODEL: &str = "combo-rate-limit-model";
+
+    fn client_at(addr: &str) -> CucaClient {
+        let cache = Arc::new(
+            PromptCache::new(
+                PromptCacheConfig::new(16, Duration::from_secs(60)).expect("config must build"),
+            )
+            .expect("cache must build"),
+        );
+        common::llamacpp_builder(addr.to_string())
+            .with_prompt_cache_service(cache)
+            .build()
+            .expect("client build must succeed")
+    }
+
+    /// The limiter is caller-driven, so it cannot know that `generate_stream`
+    /// will short-circuit on a local cache hit: the permit is already acquired
+    /// and its token already spent. The over-count is conservative (it never
+    /// over-admits) and is pinned here so a future core-wired variant flips a
+    /// failing test instead of changing behavior silently.
+    #[tokio::test]
+    async fn caller_side_permit_is_spent_even_on_a_cache_hit() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let client = client_at(&format!("http://{addr}/v1"));
+        let limiter = RateLimiter::new(
+            RateLimitConfig::new(8, Duration::from_secs(60), 2, 8).expect("config must validate"),
+        )
+        .expect("limiter must build");
+        let before = limiter.usage().expect("usage must read").available_tokens;
+
+        for _ in 0..2 {
+            let permit = limiter.acquire().await.expect("permit must be granted");
+            let stream = client
+                .generate_stream(UnifiedRequest::new(MODEL).add_user_message("hi"))
+                .await
+                .expect("generate_stream must start");
+            common::drain_timeout(stream, 10).await;
+            drop(permit);
+        }
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "the identical second turn must be served from the local cache"
+        );
+        assert_eq!(
+            limiter.usage().expect("usage must read").available_tokens,
+            before - 2,
+            "both turns spent a token, including the one the cache served"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 10: redaction + session-log (order decides what gets persisted)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-redaction", feature = "plugin-session-log"))]
+mod redaction_order_decides_what_is_logged {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+
+    use crate::common;
+    use cuca::plugin::{CucaPlugin, SessionStorePlugin};
+    use cuca::types::MessageContentBlock;
+    use cuca::{
+        RedactionConfig, RedactionPlugin, RedactionRule, SessionEvent, SessionLogPlugin,
+        UnifiedRequest,
+    };
+
+    /// The fake secret both orders carry into the request.
+    const SECRET: &str = "sk-live-4242";
+    const MODEL: &str = "combo-model";
+
+    fn redaction() -> Arc<RedactionPlugin> {
+        Arc::new(
+            RedactionPlugin::new(
+                RedactionConfig::new(vec![RedactionRule::Literal {
+                    kind: "api-key".to_string(),
+                    value: SECRET.to_string(),
+                }])
+                .expect("policy must build"),
+            )
+            .expect("plugin must build"),
+        )
+    }
+
+    /// Every `SystemPrompt`/`Message` text the store recorded, joined.
+    ///
+    /// Inbound `Output`/`Reasoning` records are excluded on purpose: those come
+    /// from `on_stream_chunk`, which redaction deliberately does not implement,
+    /// so model-output records are unscrubbed at *either* order.
+    fn requested_text(store: &SessionLogPlugin) -> String {
+        store
+            .replay_session("default")
+            .expect("replay must succeed")
+            .iter()
+            .filter_map(|record| match &record.event {
+                SessionEvent::SystemPrompt { text } => Some(text.clone()),
+                SessionEvent::Message { content, .. } => Some(
+                    content
+                        .iter()
+                        .filter_map(|block| match block {
+                            MessageContentBlock::Text(text) => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                ),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Drive one turn through a client that registers the two plugins in the
+    /// requested order, and return what the store recorded on `on_request`.
+    async fn recorded_with(redaction_first: bool) -> String {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let store = Arc::new(SessionLogPlugin::new_in_memory());
+        let scrubber = redaction() as Arc<dyn CucaPlugin>;
+        let logger = Arc::clone(&store) as Arc<dyn CucaPlugin>;
+        let ordered = if redaction_first {
+            vec![scrubber, logger]
+        } else {
+            vec![logger, scrubber]
+        };
+
+        let mut builder = common::llamacpp_builder(format!("http://{addr}/v1"));
+        for plugin in ordered {
+            builder = builder.register_plugin(plugin);
+        }
+        let client = builder.build().expect("client build must succeed");
+        common::drain_timeout(
+            client
+                .generate_stream(
+                    UnifiedRequest::new(MODEL)
+                        .add_system_message(format!("system {SECRET}"))
+                        .add_user_message(format!("user {SECRET}")),
+                )
+                .await
+                .expect("generate_stream must start"),
+            10,
+        )
+        .await;
+
+        requested_text(&store)
+    }
+
+    /// Registered first, redaction decides what the trajectory persists.
+    #[tokio::test]
+    async fn redaction_before_the_store_records_scrubbed_content() {
+        let recorded = recorded_with(true).await;
+
+        assert!(
+            recorded.contains("[REDACTED:api-key]"),
+            "the store must persist the replacement token; got {recorded:?}"
+        );
+        assert!(
+            !recorded.contains(SECRET),
+            "the raw secret must not reach the trajectory; got {recorded:?}"
+        );
+    }
+
+    /// Registered after, the store persists the raw value — to disk, with a
+    /// file backend, whose append-only format never rewrites an existing frame.
+    /// Documented, never enforced: neither plugin requires a position.
+    #[tokio::test]
+    async fn redaction_after_the_store_records_the_raw_value() {
+        let recorded = recorded_with(false).await;
+
+        assert!(
+            recorded.contains(SECRET),
+            "the store ran first, so it recorded the unscrubbed request; got {recorded:?}"
+        );
+        assert!(
+            !recorded.contains("[REDACTED:api-key]"),
+            "nothing had rewritten the request yet; got {recorded:?}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 11: redaction + prompt-cache (redaction is inside the cache key)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "plugin-redaction", feature = "plugin-prompt-cache"))]
+mod redaction_changes_cache_keys {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crate::common;
+    use cuca::plugin::CucaPlugin;
+    use cuca::plugins::prompt_cache::digest_request;
+    use cuca::{
+        PromptCache, PromptCacheConfig, RedactionConfig, RedactionPlugin, RedactionRule,
+        UnifiedRequest,
+    };
+
+    const MODEL: &str = "combo-model";
+
+    /// A prefixed rule, so two *distinct* secrets collapse onto one token and
+    /// the key-convergence effect is observable.
+    fn redaction() -> Arc<RedactionPlugin> {
+        Arc::new(
+            RedactionPlugin::new(
+                RedactionConfig::new(vec![RedactionRule::Prefixed {
+                    kind: "api-key".to_string(),
+                    prefix: "sk-".to_string(),
+                    min_len: 4,
+                    max_len: 32,
+                }])
+                .expect("policy must build"),
+            )
+            .expect("plugin must build"),
+        )
+    }
+
+    fn request(secret: &str) -> UnifiedRequest {
+        UnifiedRequest::new(MODEL).add_user_message(format!("deploy with {secret}"))
+    }
+
+    /// The digest is taken from the request *after* every `on_request` hook, so
+    /// enabling redaction changes every cache key: a snapshot imported from a
+    /// pre-redaction run is rejected as a digest mismatch rather than served.
+    #[test]
+    fn the_post_hook_digest_differs_with_and_without_redaction() {
+        let plugin = redaction();
+        let raw = request("sk-live-4242");
+        let mut scrubbed = raw.clone();
+        plugin.on_request(&mut scrubbed).expect("hook must succeed");
+
+        assert_ne!(
+            digest_request(&raw).expect("digest must succeed"),
+            digest_request(&scrubbed).expect("digest must succeed"),
+            "the scrubbed request must key differently from the raw one"
+        );
+    }
+
+    /// Two requests differing only inside a fully redacted secret converge onto
+    /// one key. Accepted on purpose: the provider saw neither secret, so the
+    /// response cannot depend on which one it was.
+    #[tokio::test]
+    async fn requests_differing_only_in_the_secret_share_one_entry() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let cache = Arc::new(
+            PromptCache::new(
+                PromptCacheConfig::new(16, Duration::from_secs(60)).expect("config must build"),
+            )
+            .expect("cache must build"),
+        );
+        let client = common::llamacpp_builder(format!("http://{addr}/v1"))
+            .with_prompt_cache_service(Arc::clone(&cache))
+            .register_plugin(redaction() as Arc<dyn CucaPlugin>)
+            .build()
+            .expect("client build must succeed");
+
+        for secret in ["sk-live-4242", "sk-live-9999"] {
+            common::drain_timeout(
+                client
+                    .generate_stream(request(secret))
+                    .await
+                    .expect("generate_stream must start"),
+                10,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "both secrets scrub to the same token, hence to the same cache key"
+        );
+        assert_eq!(
+            cache
+                .snapshot()
+                .expect("snapshot must succeed")
+                .entries
+                .len(),
+            1
         );
     }
 }

@@ -65,7 +65,9 @@ jobs:
           - plugin-speculative
           - plugin-session-log
           - plugin-prompt-cache
+          - plugin-rate-limit
           - plugin-cost
+          - plugin-redaction
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

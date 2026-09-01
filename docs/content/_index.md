@@ -1,6 +1,6 @@
 +++
 title = "What CUCA is"
-description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, seven provider adapters, fourteen plugins."
+description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, seven provider adapters, sixteen plugins."
 template = "section.html"
 sort_by = "weight"
 
@@ -41,7 +41,7 @@ loopback. What each provider actually does with the request is
 
 ## Nothing compiles by default
 
-`default = []`. The crate declares seven `provider-*` features and fourteen
+`default = []`. The crate declares seven `provider-*` features and sixteen
 `plugin-*` features, and `src/lib.rs` stops the build with a `compile_error!`
 until at least one `provider-*` feature is enabled:
 
@@ -64,7 +64,7 @@ their dependencies and the single cross-plugin edge is
   live.
 - [Providers](@/providers/_index.md): seven adapters, each with its default base
   URL, auth header, route and behavior.
-- [Plugins](@/plugins/_index.md): fourteen capabilities, each with its feature
+- [Plugins](@/plugins/_index.md): sixteen capabilities, each with its feature
   flag, entry type, hooks, config defaults and caps.
 - [How-to guides](@/guides/other-openai-server.md): point the client somewhere
   else, write a plugin, run the live suite.

@@ -108,6 +108,13 @@ pub use crate::plugins::prompt_cache::{
     PromptCache, PromptCacheConfig, PromptCacheEntry, PromptCacheError, PromptCacheImportReport,
     PromptCacheSnapshot,
 };
+#[cfg(feature = "plugin-rate-limit")]
+pub use crate::plugins::rate_limit::{
+    RateLimitConfig, RateLimitError, RateLimitObserver, RateLimitPermit, RateLimitUsage,
+    RateLimiter,
+};
+#[cfg(feature = "plugin-redaction")]
+pub use crate::plugins::redaction::{Redacted, RedactionConfig, RedactionPlugin, RedactionRule};
 #[cfg(feature = "plugin-sandbox")]
 pub use crate::plugins::sandbox::{SandboxConfig, SandboxPlugin, SandboxResult};
 #[cfg(feature = "plugin-session-log")]

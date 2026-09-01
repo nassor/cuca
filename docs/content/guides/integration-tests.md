@@ -9,7 +9,7 @@ weight = 3
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Fifteen test binaries share one <code>llama-server</code>; server-dependent tests skip when it is unreachable unless you tell them not to</dd>
+<dd>Seventeen test binaries share one <code>llama-server</code>; server-dependent tests skip when it is unreachable unless you tell them not to</dd>
 <dt>You need</dt>
 <dd><code>llama-server</code> on port 1234 with a model loaded, per <a href="@/quick-start/first-stream.md">Stream a first reply</a> step 2</dd>
 <dt>Read this if</dt>
@@ -36,7 +36,7 @@ Leave it running. To target something else, set `CUCA_BASE_URL` in step 2.
 Every plugin feature, plus the provider every test file requires:
 
 ```bash,name=Runs the same on all three platforms
-cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-prompt-cache plugin-cost" -- --nocapture --test-threads=1
+cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-prompt-cache plugin-cost plugin-rate-limit plugin-redaction" -- --nocapture --test-threads=1
 ```
 
 Both trailing flags earn their place. `--nocapture` is what makes the skip lines
@@ -67,9 +67,9 @@ Two test files never need the server and never skip:
 | `tests/plugin_prompt_cache.rs` | drives in-process mock SSE servers on ephemeral loopback ports |
 | `tests/public_exports.rs` | asserts the re-export surface; constructs types and never dispatches |
 
-Four more are partial. `plugin_mcp.rs`, `plugin_speculative.rs`,
-`plugin_subagent.rs` and `plugin_combinations.rs` each hold both mock-backed
-tests and live ones, so a subset runs with no server up.
+Five more are partial. `plugin_mcp.rs`, `plugin_speculative.rs`,
+`plugin_subagent.rs`, `plugin_combinations.rs` and `plugin_rate_limit.rs` each
+hold both mock-backed tests and live ones, so a subset runs with no server up.
 
 ## Step 4: make a skip fail instead
 
@@ -104,11 +104,11 @@ cargo test --test plugin_guardrails --features provider-llamacpp,plugin-guardrai
 ```
 
 `plugin_combinations.rs` is the exception. Its crate gate is only
-`provider-llamacpp`, and each of its eight submodules adds its own gate, so a run
-that compiles all eight needs the union:
+`provider-llamacpp`, and each of its nine submodules adds its own gate, so a run
+that compiles all nine needs the union:
 
 ```bash,name=Runs the same on all three platforms
-cargo test --test plugin_combinations --features provider-llamacpp,plugin-entity-extraction,plugin-memory,plugin-prompt-cache,plugin-speculative,plugin-session-log,plugin-cost,plugin-telemetry -- --nocapture
+cargo test --test plugin_combinations --features provider-llamacpp,plugin-entity-extraction,plugin-memory,plugin-prompt-cache,plugin-speculative,plugin-session-log,plugin-cost,plugin-telemetry,plugin-rate-limit -- --nocapture
 ```
 
 A shorter feature list here does not fail. It compiles fewer submodules and
@@ -135,6 +135,6 @@ That is what CI's `plugin_solo` job does, and it needs no server at all:
 cargo check --all-targets --no-default-features --features provider-openai,plugin-hitl
 ```
 
-Swap the plugin feature to check another. Fourteen runs cover the set.
+Swap the plugin feature to check another. Sixteen runs cover the set.
 
 Next page: [The feature matrix](@/reference/features.md).

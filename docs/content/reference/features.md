@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twenty-one features, all opt-in: seven providers, fourteen plugins, one cross-plugin edge</dd>
+<dd>Twenty-three features, all opt-in: seven providers, sixteen plugins, one cross-plugin edge</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -58,6 +58,8 @@ that `cargo check --no-default-features` fails.
 | `plugin-session-log` | `dep:postcard` |
 | `plugin-prompt-cache` | `dep:sha2`, `dep:postcard` |
 | `plugin-cost` | `dep:tiktoken-rs` |
+| `plugin-rate-limit` | `dep:tokio` |
+| `plugin-redaction` | `dep:tracing` |
 
 `plugin-entity-extraction = ["plugin-memory"]` is the only feature edge between
 two plugins.
@@ -80,7 +82,7 @@ wire types, the SSE parser and the response stream contract.
 | Crate | Version requirement | Declared features | Owned by |
 |---|---|---|---|
 | `reqwest` | `0.13` | `json`, `stream`, `form`; `default-features = false` | all seven `provider-*`, `plugin-web-search` |
-| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; `default-features = false` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-speculative` |
+| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; `default-features = false` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-speculative`, `plugin-rate-limit` |
 | `tokio-stream` | `0.1` | default | all seven `provider-*`, `plugin-speculative` |
 | `sha2` | `0.11` | default | `provider-anthropic`, `plugin-prompt-cache` |
 | `getrandom` | `0.4` | default | `provider-anthropic` |
@@ -91,7 +93,7 @@ wire types, the SSE parser and the response stream contract.
 | `jsonschema` | `0.52` | `default-features = false` | `plugin-guardrails` |
 | `opentelemetry` | `0.32` | default | `plugin-telemetry` |
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
-| `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry` |
+| `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
 | `postcard` | `1` | `use-std`; `default-features = false` | `plugin-session-log`, `plugin-prompt-cache` |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only
@@ -136,8 +138,8 @@ the provider gate rejects, and the crate has no doctests.
 
 ## Example targets
 
-All four require `provider-llamacpp`; `cost_otel` needs two plugin features on
-top, because the bridge it demonstrates is gated on both.
+All six require `provider-llamacpp`; `cost_otel`, `rate_limit`, and `redaction` each
+need one or more plugin features on top, because what they demonstrate is gated on them.
 
 | Example | Path | Additional required features |
 |---|---|---|
@@ -145,6 +147,8 @@ top, because the bridge it demonstrates is gated on both.
 | `stream_all_blocks` | `examples/stream_all_blocks.rs` | none |
 | `custom_plugin` | `examples/custom_plugin.rs` | none |
 | `cost_otel` | `examples/cost_otel.rs` | `plugin-cost`, `plugin-telemetry` |
+| `rate_limit` | `examples/rate_limit.rs` | `plugin-rate-limit` |
+| `redaction` | `examples/redaction.rs` | `plugin-redaction` |
 
 ## Feature combinations CI verifies
 
@@ -153,7 +157,7 @@ top, because the bridge it demonstrates is gated on both.
 | `clippy`, `test` | `--no-default-features --features provider-openai`, and `--all-features` |
 | `no_provider` | `--no-default-features`, asserted to fail |
 | `doc` | `--all-features` |
-| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the fourteen plugin features |
+| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the sixteen plugin features |
 | `plugin_layering` | greps asserting `src/plugins/memory/` never references entity extraction, and no file under `src/plugins/` gates on `plugin-speculative` or imports `crate::orchestrator` |
 
 Next page: [Error types](@/reference/errors.md).

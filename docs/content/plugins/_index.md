@@ -1,6 +1,6 @@
 +++
 title = "Plugins"
-description = "Fourteen plugin features across three attachment points: eleven hook plugins, two explicit-call capabilities, one pipeline replacement."
+description = "Sixteen plugin features across three attachment points: twelve hook plugins, three explicit-call capabilities, one pipeline replacement."
 template = "section.html"
 sort_by = "weight"
 
@@ -10,14 +10,14 @@ kicker = "Reference"
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Fourteen <code>plugin-*</code> features; eleven implement <code>CucaPlugin</code>, two are called directly, one replaces the dispatch stage</dd>
+<dd>Sixteen <code>plugin-*</code> features; twelve implement <code>CucaPlugin</code>, three are called directly, one replaces the dispatch stage</dd>
 <dt>You need</dt>
 <dd>The plugin features you want, named explicitly; none is enabled by default</dd>
 <dt>Read this if</dt>
 <dd>You need a plugin's feature flag, entry type, hooks, config defaults or caps</dd>
 </dl>
 
-## The fourteen features
+## The sixteen features
 
 | Feature | Entry type | Attachment | Hooks overridden |
 |---|---|---|---|
@@ -35,6 +35,8 @@ kicker = "Reference"
 | [`plugin-session-log`](@/plugins/session-log.md) | `SessionLogPlugin` | `register_plugin` | `on_request`, `on_stream_chunk`, `on_response_complete` |
 | [`plugin-prompt-cache`](@/plugins/prompt-cache.md) | `PromptCache` | `with_prompt_cache_config` or `with_prompt_cache_service` | none; not a `CucaPlugin` |
 | [`plugin-cost`](@/plugins/cost.md) | `CostPlugin` | `register_plugin` | `on_request`, `on_response_complete` |
+| [`plugin-rate-limit`](@/plugins/rate-limit.md) | `RateLimiter` | direct calls only | none; not a `CucaPlugin` |
+| [`plugin-redaction`](@/plugins/redaction.md) | `RedactionPlugin` | `register_plugin` | `on_request` |
 
 `plugin-session-log` also implements `SessionStorePlugin`, which adds
 `append_log`, `replay_session` and `fork_session`.
@@ -74,6 +76,9 @@ evicting, is [Memory discipline](@/concepts/memory-discipline.md).
 | `plugin-session-log` | `InMemoryBackend::DEFAULT_MAX_RECORDS`, `65_536` | refuse the append or fork | `len()`, against `max_records()` |
 | `plugin-prompt-cache` | `PromptCacheConfig::capacity`, caller-set | evict least recently used | `len()`, against `capacity()` |
 | `plugin-cost` | `CostConfig::max_tracked_models`, caller-set (default 64) | fold into one overflow bucket; totals stay exact | `usage()`, `breakdown()` |
+| `plugin-rate-limit` | `RateLimitConfig::max_concurrent`, caller-set | callers wait for a free permit | `RateLimitUsage::in_flight` |
+| `plugin-rate-limit` | `RateLimitConfig::max_waiters`, caller-set | reject the acquire (`QueueFull`), never queue further | `RateLimitUsage::waiting` |
+| `plugin-redaction` | `RedactionConfig::MAX_RULES`, `256` rules, each pattern `MAX_PATTERN_BYTES` (512), each `kind` `MAX_KIND_BYTES` (32); per-call match buffer capped at `max_matches_per_text` (≤ `MAX_MATCHES_PER_TEXT`, 4096) | reject an over-cap or empty policy at construction; refuse (`PluginError::HookFailure`) a string over the per-call match cap instead of truncating | `rule_count()`, `match_cap()` |
 | `plugin-sandbox` | per call: 64 MiB memory, 1000000 instructions, 5000 ms, 8 MiB output | trap that call | none; nothing accumulates |
 | `plugin-mcp`, `plugin-skills`, `plugin-telemetry`, `plugin-web-search` | no traffic-growing structure | not applicable | none |
 | `plugin-memory` | the working graph has no internal cap | the caller owns the bound | `snapshot()` |
@@ -101,8 +106,8 @@ than accidentally:
 | Crate | Enabled by |
 |---|---|
 | `reqwest` with `rustls` | all seven `provider-*` features, and `plugin-web-search` |
-| `tokio` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-speculative` |
-| `tracing` | `plugin-guardrails`, `plugin-telemetry` |
+| `tokio` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-speculative`, `plugin-rate-limit` |
+| `tracing` | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
 | `base64` | `provider-anthropic`, `plugin-sandbox` |
 | `sha2` | `provider-anthropic`, `plugin-prompt-cache` |
 | `tiktoken-rs` | `plugin-memory`, `plugin-cost` |
