@@ -1,8 +1,8 @@
 +++
 title = "Rate limit"
-description = "The client-side outbound throttle: an integer token bucket over request rate plus a concurrency cap, and why it is an explicit-call capability instead of a CucaPlugin."
+description = "The client-side outbound throttle: an integer token bucket over request rate plus a concurrency cap, and why it is a service rather than a CucaPlugin."
 template = "page.html"
-weight = 15
+weight = 5
 +++
 
 # Rate limit
@@ -11,7 +11,7 @@ weight = 15
 <dt>In one line</dt>
 <dd>An integer token bucket over request rate plus a hard concurrency cap, so a caller fanning out over <code>generate_stream</code> stays inside a provider's quota.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-rate-limit</code> feature.</dd>
+<dd>The <code>service-rate-limit</code> feature.</dd>
 <dt>Read this if</dt>
 <dd>You are calling <code>RateLimiter::acquire</code> or <code>try_acquire</code> around <code>CucaClient::generate_stream</code>.</dd>
 </dl>
@@ -71,7 +71,7 @@ drop(permit);
 `examples/rate_limit.rs` runs the hand-off for real: six turns share one client and one `Arc<RateLimiter>` sized at three requests per two seconds with `max_concurrent = 2` and `max_waiters = 8`. Each turn prints its admission time and a `usage()` reading, a peak `in_flight`/`waiting` line follows the fan-out, and the run ends by draining the bucket with `try_acquire` until it reports `Exhausted` with a `retry_after`.
 
 ```bash,name=Runs the same on all three platforms
-cargo run --example rate_limit --features "provider-llamacpp plugin-rate-limit"
+cargo run --example rate_limit --features "provider-llamacpp service-rate-limit"
 ```
 
 ## Errors
@@ -116,7 +116,7 @@ impl CucaPlugin for RejectOnBusy {
 }
 ```
 
-This spends a token and immediately drops the permit, so it never holds a concurrency slot across the turn; it can only fail a request, never pace one. That is exactly why `RateLimiter` itself does not ship this shape: a partial hook implementation that silently dropped the concurrency half of the capability would be exactly the silent no-op [Everything is a plugin](@/concepts/plugin-layering.md) rules out.
+This spends a token and immediately drops the permit, so it never holds a concurrency slot across the turn; it can only fail a request, never pace one. That is exactly why `RateLimiter` itself does not ship this shape: a partial hook implementation that silently dropped the concurrency half of the capability would be exactly the silent no-op [Plugins and services](@/concepts/plugin-layering.md) rules out.
 
 ## No server feedback
 

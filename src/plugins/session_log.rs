@@ -58,9 +58,10 @@
 //!
 //! # Model-swap contract
 //!
-//! When both `plugin-speculative` and `plugin-session-log` are enabled, the
-//! orchestrator calls [`SessionStorePlugin::append_log`] to record
-//! [`SessionEvent::ModelSwap`] events against the registered store plugin.
+//! [`SessionEvent::ModelSwap`] reaches this store the way every other record
+//! does: through [`SessionStorePlugin::append_log`], called by whoever holds
+//! the store handle. This plugin does not know, and must not name, which
+//! capability that caller is.
 //!
 //! # What a record contains
 //!

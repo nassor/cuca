@@ -56,7 +56,7 @@ path = "@/concepts/unified-request.md"
 title = "The SSE parser"
 path = "@/concepts/sse-parser.md"
 [[extra.nav.items]]
-title = "Everything is a plugin"
+title = "Plugins and services"
 path = "@/concepts/plugin-layering.md"
 [[extra.nav.items]]
 title = "Speculative fast/slow routing"
@@ -107,9 +107,6 @@ path = "@/plugins/sandbox.md"
 title = "Memory"
 path = "@/plugins/memory.md"
 [[extra.nav.items.children]]
-title = "Entity extraction"
-path = "@/plugins/entity-extraction.md"
-[[extra.nav.items.children]]
 title = "Guardrails"
 path = "@/plugins/guardrails.md"
 [[extra.nav.items.children]]
@@ -128,26 +125,35 @@ path = "@/plugins/skills.md"
 title = "Telemetry"
 path = "@/plugins/telemetry.md"
 [[extra.nav.items.children]]
-title = "Speculative"
-path = "@/plugins/speculative.md"
-[[extra.nav.items.children]]
 title = "Session log"
 path = "@/plugins/session-log.md"
-[[extra.nav.items.children]]
-title = "Replay"
-path = "@/plugins/replay.md"
-[[extra.nav.items.children]]
-title = "Prompt cache"
-path = "@/plugins/prompt-cache.md"
-[[extra.nav.items.children]]
-title = "Rate limit"
-path = "@/plugins/rate-limit.md"
 [[extra.nav.items.children]]
 title = "Redaction"
 path = "@/plugins/redaction.md"
 [[extra.nav.items.children]]
 title = "Cost accounting"
 path = "@/plugins/cost.md"
+
+[[extra.nav]]
+label = "Services"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/services/_index.md"
+[[extra.nav.items.children]]
+title = "Entity extraction"
+path = "@/services/entity-extraction.md"
+[[extra.nav.items.children]]
+title = "Speculative"
+path = "@/services/speculative.md"
+[[extra.nav.items.children]]
+title = "Prompt cache"
+path = "@/services/prompt-cache.md"
+[[extra.nav.items.children]]
+title = "Replay"
+path = "@/services/replay.md"
+[[extra.nav.items.children]]
+title = "Rate limit"
+path = "@/services/rate-limit.md"
 
 [[extra.nav]]
 label = "How-to guides"

@@ -30,11 +30,11 @@ anywhere in the crate.
 | `sse` | `pub` | none | the SSE stream parser engine |
 | `plugin` | `pub` | none | the plugin trait layer |
 | `plugins` | `pub` | none | plugin implementations, one gated submodule per `plugin-*` feature |
+| `services` | `pub` | none | service implementations, one gated submodule per `service-*` feature |
 | `client` | `pub` | none | the builder, the client, and the plugin-instrumented stream pipeline |
 | `provider` | `pub(crate)` | none | provider adapter layer; not part of the public surface |
-| `export` | `pub` | `plugin-memory` or `plugin-prompt-cache` | the versioned `cuca-export` envelope |
+| `export` | `pub` | `plugin-memory` or `service-prompt-cache` | the versioned `cuca-export` envelope |
 | `cost_otel` | `pub` | `plugin-cost` and `plugin-telemetry` | the cost ledger to OpenTelemetry bridge |
-| `orchestrator` | `pub` | `plugin-speculative` | speculative fast/slow pairing and complexity routing |
 
 ## Ungated re-exports
 
@@ -48,7 +48,7 @@ Available in every build that compiles at all.
 | Session | `SessionEvent`, `SessionRecord` |
 
 `PromptCacheBreakpoint`, `PromptCacheDirective` and `PromptCacheUsage` are
-ungated even though `plugin-prompt-cache` is not: they are fields of
+ungated even though `service-prompt-cache` is not: they are fields of
 `UnifiedRequest` and `UnifiedResponse`, so they exist wherever those do. The
 cache itself is gated.
 
@@ -67,20 +67,21 @@ Types reachable through `cuca::types` rather than the crate root:
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |
 | `plugin-mcp` | `McpPlugin`, `McpTransport` |
 | `plugin-memory` | `Budget`, `CompactionStrategy`, `CompressionAction`, `CompressionReport`, `ContextUsage`, `ContextUsageObserver`, `ContextWindowResolver`, `GraphContextConfig`, `GraphDirection`, `GraphImportReport`, `GraphNode`, `GraphRelationship`, `GraphSnapshot`, `MemoryConfig`, `MemoryGraph`, `MemoryPlugin`, `MergePolicy`, `MergeReport`, `Summarizer`, `VectorStore` |
-| `plugin-entity-extraction` | `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionModel`, `EntityExtractionPlugin`, `EntityExtractionReport`, `EntityExtractionSchema`, `EntityReference`, `EntityTable`, `PropertyColumn`, `PropertyType`, `RelationshipTable` |
-| `plugin-prompt-cache` | `PromptCache`, `PromptCacheConfig`, `PromptCacheEntry`, `PromptCacheError`, `PromptCacheImportReport`, `PromptCacheSnapshot` |
+| `service-entity-extraction` | `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionModel`, `EntityExtractor`, `EntityExtractionReport`, `EntityExtractionSchema`, `EntityReference`, `EntityTable`, `PropertyColumn`, `PropertyType`, `RelationshipTable` |
+| `service-prompt-cache` | `PromptCache`, `PromptCacheConfig`, `PromptCacheEntry`, `PromptCacheError`, `PromptCacheImportReport`, `PromptCacheSnapshot` |
 | `plugin-sandbox` | `SandboxConfig`, `SandboxPlugin`, `SandboxResult` |
 | `plugin-session-log` | `FileBackend`, `InMemoryBackend`, `SessionBackend`, `SessionLogPlugin` |
 | `plugin-skills` | `Skill`, `SkillsConfig`, `SkillsPlugin` |
-| `plugin-speculative` | `ClientPool`, `Complexity`, `ComplexityEvaluator`, `DraftValidator`, `JsonToolDraftValidator`, `ModelOrchestrator`, `SwappableModelPair`, `TurnExecutor` |
+| `service-speculative` | `ClientPool`, `Complexity`, `ComplexityEvaluator`, `DraftValidator`, `JsonToolDraftValidator`, `ModelOrchestrator`, `SwappableModelPair`, `TurnExecutor` |
 | `plugin-subagent` | `SubagentPlugin`, `SubagentResult`, `SubagentRunner`, `SubagentSpec`, `WorktreeConfig` |
 | `plugin-telemetry` | `OpenTelemetryPlugin` |
 | `plugin-web-search` | `SearchResult`, `WebSearchConfig`, `WebSearchPlugin`, `WebSearchProvider` |
-| `plugin-memory` or `plugin-prompt-cache` | `CUCA_EXPORT_FORMAT`, `CUCA_EXPORT_VERSION`, `CucaExport`, `CucaExportError`, `CucaImportReport`, `GraphExportSection`, `PromptCacheExportSection` |
+| `service-rate-limit` | `RateLimiter`, `RateLimitConfig`, `RateLimitPermit`, `RateLimitUsage`, `RateLimitObserver`, `RateLimitError` |
+| `plugin-memory` or `service-prompt-cache` | `CUCA_EXPORT_FORMAT`, `CUCA_EXPORT_VERSION`, `CucaExport`, `CucaExportError`, `CucaImportReport`, `GraphExportSection`, `PromptCacheExportSection` |
 | `plugin-cost` and `plugin-telemetry` | `OtelCostObserver` |
 
-`PoolTurnExecutor` is `pub` inside `crate::orchestrator` but is not re-exported
-at the crate root.
+`PoolTurnExecutor` is `pub` inside `crate::services::orchestrator` but is not
+re-exported at the crate root.
 
 ## The export envelope constants
 
@@ -103,9 +104,9 @@ at the crate root.
 | `with_bearer_token` | `provider-anthropic` |
 | `with_anthropic_oauth` | `provider-anthropic` |
 | `register_plugin` | none |
-| `with_orchestrator` | `plugin-speculative` |
-| `with_prompt_cache_config` | `plugin-prompt-cache` |
-| `with_prompt_cache_service` | `plugin-prompt-cache` |
+| `with_orchestrator` | `service-speculative` |
+| `with_prompt_cache_config` | `service-prompt-cache` |
+| `with_prompt_cache_service` | `service-prompt-cache` |
 | `build` | none |
 
 `with_provider` is required; `build` fails without it. `with_bearer_token` and
@@ -126,10 +127,10 @@ wins. `with_prompt_cache_service` takes precedence over
 | `bearer_token` | `provider-anthropic` |
 | `oauth_config` | `provider-anthropic` |
 | `llamacpp_config` | `provider-llamacpp` |
-| `orchestrator` | `plugin-speculative` |
-| `prompt_cache` | `plugin-prompt-cache` |
-| `prompt_cache_snapshot` | `plugin-prompt-cache` |
-| `replace_prompt_cache_snapshot` | `plugin-prompt-cache` |
+| `orchestrator` | `service-speculative` |
+| `prompt_cache` | `service-prompt-cache` |
+| `prompt_cache_snapshot` | `service-prompt-cache` |
+| `replace_prompt_cache_snapshot` | `service-prompt-cache` |
 | `http_client` | any of the seven `provider-*` features |
 
 ## The re-export contract is tested
@@ -138,7 +139,7 @@ wins. `with_prompt_cache_service` takes precedence over
 types it names, so a removed or renamed re-export fails compilation rather than
 silently disappearing. Its own gate is
 `any(provider-openai, provider-llamacpp)`, with nested modules gated on
-`plugin-prompt-cache`, `plugin-memory`, `plugin-cost`, the two combinations of
+`service-prompt-cache`, `plugin-memory`, `plugin-cost`, the two combinations of
 prompt-cache and memory, and the combination of cost and telemetry.
 
 Next page: [What CUCA is](@/_index.md), back at the top.

@@ -1,31 +1,31 @@
 //! Integration tests for schema-guided entity extraction
-//! (`plugin-entity-extraction`).
+//! (`service-entity-extraction`).
 //!
 //! The deterministic tests drive the explicit-call contract with canned
 //! [`EntityExtractionModel`] adapters: `extract` hands the caller's source and
-//! the plugin's own schema to the model, propagates the model's own error
+//! the extractor's own schema to the model, propagates the model's own error
 //! unchanged, and returns a delta that is inert until the application applies
 //! it to a [`MemoryPlugin`] (the mandatory hand-off documented in
-//! `src/plugins/entity_extraction.rs`). None of them touch the network.
+//! `src/services/entity_extraction.rs`). None of them touch the network.
 //!
 //! The live test wires the shared adapter in `tests/common/extraction.rs` to
 //! llama.cpp through this crate's own `CucaClient`, asks the served model for
 //! a small JSON extraction, maps the reply into an
-//! [`EntityExtractionCandidate`], and validates it through the plugin. The
+//! [`EntityExtractionCandidate`], and validates it through the extractor. The
 //! adapter only ever proposes rows that satisfy
 //! [`common::extraction::org_schema`]: it dedups by identity and drops
 //! non-string values. An `Err` from `extract` *after* a candidate was built
 //! therefore means the validation contract broke, not that the model was
 //! unhelpful. A model that never produces parseable JSON yields no candidate
 //! at all and is reported as a model-quality skip.
-#![cfg(all(feature = "provider-llamacpp", feature = "plugin-entity-extraction"))]
+#![cfg(all(feature = "provider-llamacpp", feature = "service-entity-extraction"))]
 
 mod common;
 
 use std::pin::Pin;
 use std::sync::Mutex;
 
-use common::extraction::{LiveExtractionModel, SOURCE, extraction_plugin, pair_candidate};
+use common::extraction::{LiveExtractionModel, SOURCE, org_extractor, pair_candidate};
 use cuca::{
     EntityExtractionCandidate, EntityExtractionModel, EntityExtractionSchema, MemoryConfig,
     MemoryPlugin, MergePolicy, PluginError,
@@ -75,9 +75,9 @@ impl EntityExtractionModel for CannedModel {
 }
 
 #[tokio::test]
-async fn extract_hands_the_source_and_the_plugins_schema_to_the_model() {
+async fn extract_hands_the_source_and_the_extractors_schema_to_the_model() {
     let model = CannedModel::ok(pair_candidate("Ada", "Analytical Engines"));
-    let report = extraction_plugin()
+    let report = org_extractor()
         .extract("Ada works at Analytical Engines.", &model)
         .await
         .expect("a schema-conformant candidate must be accepted");
@@ -93,7 +93,7 @@ async fn extract_hands_the_source_and_the_plugins_schema_to_the_model() {
             "Ada works at Analytical Engines.".to_string(),
             "org-chart".to_string()
         )],
-        "extract must pass the caller's source and the plugin's own schema, once"
+        "extract must pass the caller's source and the extractor's own schema, once"
     );
 }
 
@@ -104,7 +104,7 @@ async fn extract_hands_the_source_and_the_plugins_schema_to_the_model() {
 async fn report_delta_is_inert_until_the_caller_merges_it() {
     let memory = memory();
     let model = CannedModel::ok(pair_candidate("Ada", "Analytical Engines"));
-    let report = extraction_plugin()
+    let report = org_extractor()
         .extract("Ada works at Analytical Engines.", &model)
         .await
         .expect("candidate must be accepted");
@@ -176,11 +176,11 @@ async fn report_delta_is_inert_until_the_caller_merges_it() {
 /// stays distinct.
 #[test]
 fn derived_node_ids_are_stable_and_scoped_to_table_and_identity() {
-    let plugin = extraction_plugin();
-    let first = plugin
+    let extractor = org_extractor();
+    let first = extractor
         .validate_candidate(pair_candidate("Ada", "Analytical Engines"))
         .expect("candidate must be accepted");
-    let again = plugin
+    let again = extractor
         .validate_candidate(pair_candidate("Ada", "Analytical Engines"))
         .expect("candidate must be accepted");
     assert_eq!(
@@ -189,7 +189,7 @@ fn derived_node_ids_are_stable_and_scoped_to_table_and_identity() {
         "identical candidates must derive identical graph state"
     );
 
-    let renamed = plugin
+    let renamed = extractor
         .validate_candidate(pair_candidate("Grace", "Analytical Engines"))
         .expect("candidate must be accepted");
     let ada = first.delta.snapshot();
@@ -218,7 +218,7 @@ fn derived_node_ids_are_stable_and_scoped_to_table_and_identity() {
     );
 
     // Same identity value, different table: the ids must not collide.
-    let homonym = plugin
+    let homonym = extractor
         .validate_candidate(pair_candidate("Ada", "Ada"))
         .expect("candidate must be accepted");
     let homonym = homonym.delta.snapshot();
@@ -236,9 +236,9 @@ fn derived_node_ids_are_stable_and_scoped_to_table_and_identity() {
 #[test]
 fn re_merging_an_extraction_keeps_nodes_and_renames_the_duplicate_edge() {
     let memory = memory();
-    let plugin = extraction_plugin();
+    let extractor = org_extractor();
     let delta = || {
-        plugin
+        extractor
             .validate_candidate(pair_candidate("Ada", "Analytical Engines"))
             .expect("candidate must be accepted")
             .delta
@@ -296,7 +296,7 @@ async fn extract_rejects_a_broken_candidate_and_leaves_memory_untouched() {
         .insert("salary".into(), serde_json::json!(1));
     let model = CannedModel::ok(broken);
 
-    let error = extraction_plugin()
+    let error = org_extractor()
         .extract("Ada works at Analytical Engines.", &model)
         .await
         .expect_err("an undeclared property on a strict table must be rejected");
@@ -320,9 +320,9 @@ async fn extract_rejects_a_broken_candidate_and_leaves_memory_untouched() {
     );
 
     // The same schema still accepts a well-formed candidate afterwards: the
-    // rejection is per-candidate, not a poisoned plugin.
+    // rejection is per-candidate, not a poisoned extractor.
     let good = CannedModel::ok(pair_candidate("Ada", "Analytical Engines"));
-    let report = extraction_plugin()
+    let report = org_extractor()
         .extract("Ada works at Analytical Engines.", &good)
         .await
         .expect("a valid candidate must still be accepted after a rejection");
@@ -337,7 +337,7 @@ async fn extract_rejects_a_relationship_with_an_unextracted_endpoint() {
     candidate.entities.pop();
     let model = CannedModel::ok(candidate);
 
-    let error = extraction_plugin()
+    let error = org_extractor()
         .extract("Ada works at Analytical Engines.", &model)
         .await
         .expect_err("a dangling endpoint must be rejected");
@@ -352,7 +352,7 @@ async fn extract_rejects_a_relationship_with_an_unextracted_endpoint() {
 #[tokio::test]
 async fn extract_propagates_the_models_error_unchanged() {
     let model = CannedModel::err(PluginError::Internal("adapter transport failed".into()));
-    let error = extraction_plugin()
+    let error = org_extractor()
         .extract("anything", &model)
         .await
         .expect_err("the model's error must propagate");
@@ -362,7 +362,7 @@ async fn extract_propagates_the_models_error_unchanged() {
     }
 }
 
-/// End-to-end: llama.cpp produces an extraction, the plugin validates it into
+/// End-to-end: llama.cpp produces an extraction, the extractor validates it into
 /// a schema-typed delta, and the application hands the delta to a
 /// `MemoryPlugin`.
 #[tokio::test]
@@ -372,10 +372,10 @@ async fn live_extraction_validates_into_a_delta_and_merges_into_memory() {
         return;
     }
     let model = LiveExtractionModel::new(common::live_model());
-    let plugin = extraction_plugin();
+    let extractor = org_extractor();
     let memory = memory();
 
-    let report = match plugin.extract(SOURCE, &model).await {
+    let report = match extractor.extract(SOURCE, &model).await {
         Ok(report) => report,
         Err(error) if model.produced_no_candidate() => {
             eprintln!(
@@ -387,7 +387,7 @@ async fn live_extraction_validates_into_a_delta_and_merges_into_memory() {
             return;
         }
         Err(error) => panic!(
-            "the plugin rejected an adapter-built, schema-conformant candidate: {error:?}\n\
+            "the extractor rejected an adapter-built, schema-conformant candidate: {error:?}\n\
              candidate: {:?}\nraw replies:\n{}",
             model.candidate(),
             model.diagnostics()
@@ -454,7 +454,7 @@ async fn live_extraction_validates_into_a_delta_and_merges_into_memory() {
     // Re-validating the model's own candidate is deterministic.
     let candidate = model.candidate().expect("a candidate was produced");
     assert_eq!(
-        plugin
+        extractor
             .validate_candidate(candidate)
             .expect("re-validation must succeed")
             .delta

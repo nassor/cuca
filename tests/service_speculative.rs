@@ -1,12 +1,12 @@
 //! Integration tests for the speculative fast/slow orchestrator
-//! (`plugin-speculative`).
+//! (`service-speculative`).
 //!
 //! Deterministic tests cover the complexity router, the draft validator, and
 //! the endpoint a pool-backed tier turn dispatches to; the live test runs a
 //! full orchestrated turn (complexity routing, fast-tier draft, validation,
 //! latency guard) against llama.cpp.
 
-#![cfg(all(feature = "provider-llamacpp", feature = "plugin-speculative"))]
+#![cfg(all(feature = "provider-llamacpp", feature = "service-speculative"))]
 
 mod common;
 

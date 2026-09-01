@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twenty-four features, all opt-in: seven providers, seventeen plugins, two cross-plugin edges</dd>
+<dd>Twenty-four features, all opt-in: seven providers, twelve plugins, five services</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -47,24 +47,34 @@ that `cargo check --no-default-features` fails.
 | `plugin-mcp` | `dep:rmcp`, `dep:tokio` |
 | `plugin-sandbox` | `dep:wasmtime`, `dep:base64`, `wasmtime/wat` |
 | `plugin-memory` | `dep:tiktoken-rs` |
-| `plugin-entity-extraction` | `plugin-memory` |
 | `plugin-guardrails` | `dep:jsonschema`, `dep:tracing` |
 | `plugin-subagent` | `dep:tokio` |
 | `plugin-hitl` | `dep:tokio` |
 | `plugin-web-search` | `dep:reqwest`, `dep:tokio`, `reqwest/rustls` |
 | `plugin-skills` | nothing |
 | `plugin-telemetry` | `dep:opentelemetry`, `dep:opentelemetry_sdk`, `dep:tracing` |
-| `plugin-speculative` | `dep:tokio`, `dep:tokio-stream` |
 | `plugin-session-log` | `dep:postcard` |
-| `plugin-replay` | `plugin-session-log` |
-| `plugin-prompt-cache` | `dep:sha2`, `dep:postcard` |
 | `plugin-cost` | `dep:tiktoken-rs` |
-| `plugin-rate-limit` | `dep:tokio` |
 | `plugin-redaction` | `dep:tracing` |
 
-`plugin-entity-extraction = ["plugin-memory"]` and
-`plugin-replay = ["plugin-session-log"]` are the two feature edges between
-plugins.
+No plugin depends on another plugin: the tier is flat.
+
+## Service features
+
+| Feature | Enables |
+|---|---|
+| `service-entity-extraction` | `plugin-memory` |
+| `service-speculative` | `dep:tokio`, `dep:tokio-stream` |
+| `service-replay` | `plugin-session-log` |
+| `service-prompt-cache` | `dep:sha2`, `dep:postcard` |
+| `service-rate-limit` | `dep:tokio` |
+
+`service-entity-extraction = ["plugin-memory"]` and
+`service-replay = ["plugin-session-log"]` are the two hard feature edges,
+both service to plugin. `service-speculative` adds a third, documented-optional
+edge to `plugin-session-log`. `service-prompt-cache` and `service-rate-limit`
+declare no plugin dependency at all. A plugin must never depend on, or name, a
+service.
 
 ## Unconditional dependencies
 
@@ -84,9 +94,9 @@ wire types, the SSE parser and the response stream contract.
 | Crate | Version requirement | Declared features | Owned by |
 |---|---|---|---|
 | `reqwest` | `0.13` | `json`, `stream`, `form`; `default-features = false` | all seven `provider-*`, `plugin-web-search` |
-| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; `default-features = false` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-speculative`, `plugin-rate-limit` |
-| `tokio-stream` | `0.1` | default | all seven `provider-*`, `plugin-speculative` |
-| `sha2` | `0.11` | default | `provider-anthropic`, `plugin-prompt-cache` |
+| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; `default-features = false` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit` |
+| `tokio-stream` | `0.1` | default | all seven `provider-*`, `service-speculative` |
+| `sha2` | `0.11` | default | `provider-anthropic`, `service-prompt-cache` |
 | `getrandom` | `0.4` | default | `provider-anthropic` |
 | `base64` | `0.23` | none | `provider-anthropic`, `plugin-sandbox` |
 | `rmcp` | `3` | `client`, `transport-child-process`, `transport-streamable-http-client-reqwest` | `plugin-mcp` |
@@ -96,7 +106,7 @@ wire types, the SSE parser and the response stream contract.
 | `opentelemetry` | `0.32` | default | `plugin-telemetry` |
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
 | `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
-| `postcard` | `1` | `use-std`; `default-features = false` | `plugin-session-log`, `plugin-prompt-cache` |
+| `postcard` | `1` | `use-std`; `default-features = false` | `plugin-session-log`, `service-prompt-cache` |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only
 through the `reqwest/rustls` entry that every provider feature and
@@ -111,16 +121,16 @@ COBS helpers.
 
 | Module | Gate |
 |---|---|
-| `export` | `plugin-memory` or `plugin-prompt-cache` |
-| `orchestrator` | `plugin-speculative` |
+| `export` | `plugin-memory` or `service-prompt-cache` |
+| `services` | any of the five `service-*` features |
 
 Every other public module compiles unconditionally: `types`, `error`, `request`,
 `session`, `sse`, `plugin`, `plugins`, `client`. The `plugins` module is always
 present; its submodules are individually gated, so it is empty in a build with no
 plugin feature.
 
-`plugin-speculative` has no submodule under `src/plugins/`. Its entire
-implementation is `src/orchestrator.rs`.
+`services` is empty in a build with no service feature enabled, the same way
+`plugins` is empty with no plugin feature enabled.
 
 ## Crate metadata
 
@@ -141,7 +151,7 @@ the provider gate rejects, and the crate has no doctests.
 ## Example targets
 
 All six require `provider-llamacpp`; `cost_otel`, `rate_limit`, and `redaction` each
-need one or more plugin features on top, because what they demonstrate is gated on them.
+need one or more plugin or service features on top, because what they demonstrate is gated on them.
 
 | Example | Path | Additional required features |
 |---|---|---|
@@ -149,7 +159,7 @@ need one or more plugin features on top, because what they demonstrate is gated 
 | `stream_all_blocks` | `examples/stream_all_blocks.rs` | none |
 | `custom_plugin` | `examples/custom_plugin.rs` | none |
 | `cost_otel` | `examples/cost_otel.rs` | `plugin-cost`, `plugin-telemetry` |
-| `rate_limit` | `examples/rate_limit.rs` | `plugin-rate-limit` |
+| `rate_limit` | `examples/rate_limit.rs` | `service-rate-limit` |
 | `redaction` | `examples/redaction.rs` | `plugin-redaction` |
 
 ## Feature combinations CI verifies
@@ -159,7 +169,8 @@ need one or more plugin features on top, because what they demonstrate is gated 
 | `clippy`, `test` | `--no-default-features --features provider-openai`, and `--all-features` |
 | `no_provider` | `--no-default-features`, asserted to fail |
 | `doc` | `--all-features` |
-| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the seventeen plugin features |
-| `plugin_layering` | greps asserting `src/plugins/memory/` never references entity extraction, `src/plugins/session_log.rs` never references replay, and no file under `src/plugins/` gates on `plugin-speculative` or imports `crate::orchestrator` |
+| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the twelve plugin features |
+| `service_solo` | `--no-default-features --features provider-openai,<service>`, once per each of the five service features |
+| `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, references `crate::services`, or imports one of the `plugins::` paths the five moved modules left behind |
 
 Next page: [Error types](@/reference/errors.md).

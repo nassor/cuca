@@ -1,4 +1,4 @@
-//! Integration tests for the deterministic replay capability (`plugin-replay`).
+//! Integration tests for the deterministic replay capability (`service-replay`).
 //!
 //! The deterministic tests record a trajectory through the session-log plugin's
 //! [`CucaPlugin`] hooks over a temp-directory `FileBackend`, then replay it
@@ -7,10 +7,10 @@
 //! record a real llama.cpp turn and assert the replayed stream and the rebuilt
 //! `UnifiedResponse` match what the provider produced.
 //!
-//! `SessionReplay` is never registered on a client: it is an explicit-call
-//! capability and implements no hook, so every entry point below is a plain
-//! method call (AGENTS.md *Explicit-call capabilities*).
-#![cfg(all(feature = "provider-llamacpp", feature = "plugin-replay"))]
+//! `SessionReplay` is never registered on a client: it is a service, not a
+//! plugin, and implements no hook, so every entry point below is a plain method
+//! call (the tier contract lives in `src/services/mod.rs`).
+#![cfg(all(feature = "provider-llamacpp", feature = "service-replay"))]
 
 mod common;
 

@@ -24,8 +24,8 @@ doctest = false
 # - Core (unconditional): bytes, futures-core, memchr, serde, serde_json. They define
 #   the public wire types, SSE parser, and response stream contract.
 # - Network and runtime dependencies are optional. Every provider enables reqwest and
-#   tokio-stream; plugins enable tokio and/or reqwest only when their implementation
-#   directly needs them.
+#   tokio-stream; plugins and services enable tokio and/or reqwest only when their
+#   implementation directly needs them.
 # - Cross-feature sharing is intentional: base64 (provider-anthropic + plugin-sandbox),
 #   tracing (plugin-guardrails + plugin-telemetry + plugin-redaction), tiktoken-rs
 #   (plugin-memory + plugin-cost), and reqwest/rustls (providers + plugin-web-search).
@@ -38,7 +38,7 @@ doctest = false
 # - postcard is built with default-features = false plus use-std: its default
 #   `heapless-cas` feature pulls in heapless, which this crate never uses, while
 #   `use-std` supplies the std Vec/COBS helpers and flavors. It is owned jointly by
-#   plugin-session-log (framed record storage) and plugin-prompt-cache (digest input).
+#   plugin-session-log (framed record storage) and service-prompt-cache (digest input).
 # - The URL_SAFE engine is base64::engine::general_purpose::URL_SAFE_NO_PAD (base64 is
 #   enabled with no cargo features).
 # rmcp 3.x: the client SDK (`client`) and the client transports stdio
@@ -55,13 +55,14 @@ provider-deepseek = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 provider-llamacpp = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 provider-vllm = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
-# Essential agentic & infrastructural capability plugins.
+# Essential agentic & infrastructural capability plugins: each implements CucaPlugin
+# and runs on the request pipeline. The tier is flat — no plugin feature enables
+# another plugin feature, and none may name a service-* feature.
 plugin-mcp = ["dep:rmcp", "dep:tokio"]
 # plugin-sandbox: enables wasmtime's `wat` feature so the tests pass WAT text, and reuses
 # the optional base64 for the `wasm` tool-call argument decoding.
 plugin-sandbox = ["dep:wasmtime", "dep:base64", "wasmtime/wat"]
 plugin-memory = ["dep:tiktoken-rs"]
-plugin-entity-extraction = ["plugin-memory"]
 plugin-guardrails = ["dep:jsonschema", "dep:tracing"]
 plugin-subagent = ["dep:tokio"]
 plugin-hitl = ["dep:tokio"]
@@ -71,31 +72,44 @@ plugin-web-search = ["dep:reqwest", "dep:tokio", "reqwest/rustls"]
 # Reusable agent skills: SKILL.md instructions + skill/skill_read/skill_search tools (agentskills.io).
 plugin-skills = []
 plugin-telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing"]
-plugin-speculative = ["dep:tokio", "dep:tokio-stream"]
 # plugin-session-log: postcard encodes each stored record; the session log is the
 # only postcard *decode* path in the crate.
 plugin-session-log = ["dep:postcard"]
-# plugin-replay: deterministic re-materialization of a recorded trajectory as an
-# AgentResponseStream. Reads through plugin-session-log's `SessionBackend` seam;
-# adds no dependency of its own.
-plugin-replay = ["plugin-session-log"]
-# Client-owned local response cache; deterministic effective-request digesting
-# via the existing optional sha2 dependency (provider-anthropic enables sha2
-# independently for its own request signing) over postcard-encoded digest input.
-plugin-prompt-cache = ["dep:sha2", "dep:postcard"]
-# Client-side outbound throttling: token bucket + concurrency cap. Reuses the
-# already-optional tokio (`sync` for Semaphore, `time` for sleep/timeout); the
-# async acquire path is the whole point of the capability, so no new crate.
-plugin-rate-limit = ["dep:tokio"]
 # Outbound PII/secret scrubbing over every text-bearing request field. Reuses the
 # optional `tracing` (also owned by plugin-guardrails and plugin-telemetry) for the
 # per-redaction structural event; the matchers are built on the core `memchr`.
 plugin-redaction = ["dep:tracing"]
 # plugin-cost: token/currency ledger with a hard budget cap. Shares the optional
 # tiktoken-rs dependency with plugin-memory (same joint-ownership shape as sha2 for
-# provider-anthropic + plugin-prompt-cache and postcard for plugin-session-log +
-# plugin-prompt-cache); this is a shared *dependency*, not a feature edge to plugin-memory.
+# provider-anthropic + service-prompt-cache and postcard for plugin-session-log +
+# service-prompt-cache); this is a shared *dependency*, not a feature edge to plugin-memory.
 plugin-cost = ["dep:tiktoken-rs"]
+# Explicit-call service capabilities (src/services/): each is driven by direct
+# method calls rather than pipeline hooks, so none of them implements CucaPlugin.
+# Tier order is core < plugins < services: a service feature MAY enable a plugin
+# feature, the reverse edge is forbidden, and no service enables another service.
+# service-entity-extraction: the extraction delta *is* a plugin-memory MemoryGraph,
+# so this feature enables that plugin; it adds no dependency of its own.
+service-entity-extraction = ["plugin-memory"]
+# service-prompt-cache: client-owned local response cache; deterministic
+# effective-request digesting via the existing optional sha2 dependency
+# (provider-anthropic enables sha2 independently for its own request signing) over
+# postcard-encoded digest input.
+service-prompt-cache = ["dep:sha2", "dep:postcard"]
+# service-rate-limit: client-side outbound throttling, a token bucket plus a
+# concurrency cap. Reuses the already-optional tokio (`sync` for Semaphore,
+# `time` for sleep/timeout); the async acquire path is the whole point of the
+# capability, so no new crate.
+service-rate-limit = ["dep:tokio"]
+# service-replay: deterministic re-materialization of a recorded trajectory as an
+# AgentResponseStream. Reads through plugin-session-log's `SessionBackend` seam;
+# adds no dependency of its own.
+service-replay = ["plugin-session-log"]
+# service-speculative: the fast/slow orchestrator. Reuses the already-optional
+# tokio (spawned tier turns, latency deadlines) and tokio-stream. Its edge to
+# plugin-session-log is documented-optional, not a feature edge:
+# ModelOrchestrator::with_session_store is compiled out of existence without it.
+service-speculative = ["dep:tokio", "dep:tokio-stream"]
 
 [dependencies]
 bytes = "1"
@@ -169,12 +183,12 @@ name = "cost_otel"
 path = "examples/cost_otel.rs"
 required-features = ["provider-llamacpp", "plugin-cost", "plugin-telemetry"]
 
-# rate_limit additionally needs the plugin feature the limiter lives behind:
-# `RateLimiter` only exists when `plugin-rate-limit` is enabled.
+# rate_limit additionally needs the service feature the limiter lives behind:
+# `RateLimiter` only exists when `service-rate-limit` is enabled.
 [[example]]
 name = "rate_limit"
 path = "examples/rate_limit.rs"
-required-features = ["provider-llamacpp", "plugin-rate-limit"]
+required-features = ["provider-llamacpp", "service-rate-limit"]
 
 # redaction additionally needs the plugin feature the scrubber lives behind:
 # `RedactionPlugin` only exists when `plugin-redaction` is enabled.
@@ -183,10 +197,10 @@ name = "redaction"
 path = "examples/redaction.rs"
 required-features = ["provider-llamacpp", "plugin-redaction"]
 
-# replay additionally needs the plugin feature the replay capability lives
-# behind: `SessionReplay` only exists when `plugin-replay` is enabled, and that
+# replay additionally needs the service feature the replay capability lives
+# behind: `SessionReplay` only exists when `service-replay` is enabled, and that
 # feature pulls in `plugin-session-log` for the recording half of the demo.
 [[example]]
 name = "replay"
 path = "examples/replay.rs"
-required-features = ["provider-llamacpp", "plugin-replay"]
+required-features = ["provider-llamacpp", "service-replay"]

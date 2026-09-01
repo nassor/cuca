@@ -39,7 +39,7 @@
 //!
 //! When [`SubagentSpec::worktree`] is set, [`SubagentPlugin::spawn_subagent`]
 //! first runs `git worktree add <path> [-b <branch>]` in the current working
-//! directory ([`SubagentPlugin::prepare_worktree`]); a non-git cwd or a failed
+//! directory (the private `prepare_worktree` step); a non-git cwd or a failed
 //! add surfaces as [`PluginError::NotSupported`]. The child then runs with
 //! `cwd` = the worktree path (the runner reads it from `spec.worktree.path`).
 //! Worktree cleanup (removal) is deliberately out of scope: the child's

@@ -1,14 +1,15 @@
-//! Cross-plugin combination tests: behavior that exists only when two plugin
-//! features are co-enabled.
+//! Cross-capability combination tests: behavior that exists only when two
+//! capability features are co-enabled, in either tier (plugin + plugin,
+//! plugin + service, service + service).
 //!
-//! One file rather than one test per owning plugin file. Seven of the thirteen
+//! One file rather than one test per owning module. Seven of the thirteen
 //! surfaces below (`memory + prompt-cache`, `speculative + prompt-cache`,
 //! `memory + prompt-cache` export, `cost + prompt-cache`, `cost + memory`,
 //! `cost + telemetry`, `redaction + prompt-cache`) are *core-mediated*: they
-//! have no derived plugin to belong to, and AGENTS.md deliberately puts
-//! two-plugin workflows in core
+//! have no single owning module to belong to, and AGENTS.md deliberately puts
+//! two-capability workflows in core
 //! (`CucaExport::from_live`, `OtelCostObserver`). Keeping the tests together
-//! mirrors that and gives one place to audit cross-plugin coupling; each
+//! mirrors that and gives one place to audit cross-capability coupling; each
 //! module is gated on exactly the features its surface needs, so no test
 //! relies on a peer being co-enabled by accident.
 //!
@@ -22,7 +23,7 @@
 //!    `merge_graph` → memory's graph-context injection reaches the next prompt.
 //! 2. `memory + prompt-cache` (core-mediated hook order): all `on_request`
 //!    hooks run before the cache key is digested, so memory's injections are
-//!    inside the key (`src/plugins/prompt_cache.rs:5-10`, `src/client.rs`
+//!    inside the key (`src/services/prompt_cache.rs:3-10`, `src/client.rs`
 //!    ~513-529).
 //! 3. `speculative + session-log`: `ModelOrchestrator::with_session_store`
 //!    records `SessionEvent::ModelSwap` on swap.
@@ -54,7 +55,7 @@
 //!     onto one entry.
 //! 12. `replay + speculative` (caller-mediated): a recorded
 //!     `SessionEvent::ModelSwap` replays as a `ReplayNote`, never as a block.
-//!     Both plugins are derived on `plugin-session-log`, so they may only meet
+//!     Both services are derived on `plugin-session-log`, so they may only meet
 //!     in a caller; the orchestrator is built here, in the test crate.
 //! 13. `replay + prompt-cache` (two independent provider-free paths): a cache
 //!     hit replays the stored blocks and the session-log record of the
@@ -68,16 +69,14 @@ mod common;
 // Surface 1: entity-extraction → memory
 // ---------------------------------------------------------------------------
 
-/// `plugin-entity-extraction` enables `plugin-memory` in `Cargo.toml`, so this
+/// `service-entity-extraction` enables `plugin-memory` in `Cargo.toml`, so this
 /// one feature is exactly what the surface needs.
-#[cfg(feature = "plugin-entity-extraction")]
+#[cfg(feature = "service-entity-extraction")]
 mod extraction_into_memory_context {
     use std::sync::{Arc, Mutex};
 
     use crate::common;
-    use crate::common::extraction::{
-        LiveExtractionModel, SOURCE, extraction_plugin, pair_candidate,
-    };
+    use crate::common::extraction::{LiveExtractionModel, SOURCE, org_extractor, pair_candidate};
     use cuca::plugin::CucaPlugin;
     use cuca::types::MessageRole;
     use cuca::{
@@ -120,7 +119,7 @@ mod extraction_into_memory_context {
         .expect("memory plugin must build")
     }
 
-    /// The full loop neither per-plugin file owns: a live extraction becomes a
+    /// The full loop no single-capability file owns: a live extraction becomes a
     /// memory graph, and the memory graph becomes prompt context on the next
     /// request.
     #[tokio::test]
@@ -131,7 +130,7 @@ mod extraction_into_memory_context {
         }
         let model_id = common::live_model();
         let model = LiveExtractionModel::new(model_id.clone());
-        let extractor = extraction_plugin();
+        let extractor = org_extractor();
 
         let report = match extractor.extract(SOURCE, &model).await {
             Ok(report) => report,
@@ -145,7 +144,7 @@ mod extraction_into_memory_context {
                 return;
             }
             Err(error) => panic!(
-                "the plugin rejected an adapter-built, schema-conformant candidate: {error:?}\n\
+                "the extractor rejected an adapter-built, schema-conformant candidate: {error:?}\n\
                  candidate: {:?}",
                 model.candidate()
             ),
@@ -228,7 +227,7 @@ mod extraction_into_memory_context {
     /// marker message injected, instead of an empty render in every prompt.
     #[test]
     fn empty_extraction_leaves_no_graph_context() {
-        let report = extraction_plugin()
+        let report = org_extractor()
             .validate_candidate(EntityExtractionCandidate {
                 entities: Vec::new(),
                 relationships: Vec::new(),
@@ -266,7 +265,7 @@ mod extraction_into_memory_context {
         // absence above is emptiness, not a disabled config.
         memory
             .merge_graph(
-                extraction_plugin()
+                org_extractor()
                     .validate_candidate(pair_candidate("Ada", "Analytical Engines"))
                     .expect("candidate must be accepted")
                     .delta,
@@ -288,7 +287,7 @@ mod extraction_into_memory_context {
 // Surface 2: memory + prompt-cache (hook order is observable in the cache key)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "plugin-memory", feature = "service-prompt-cache"))]
 mod memory_changes_cache_keys {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -506,7 +505,7 @@ mod memory_changes_cache_keys {
 // Surface 3: speculative + session-log
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-speculative", feature = "plugin-session-log"))]
+#[cfg(all(feature = "service-speculative", feature = "plugin-session-log"))]
 mod speculative_records_model_swaps {
     use std::pin::Pin;
     use std::sync::Arc;
@@ -873,7 +872,7 @@ mod speculative_records_model_swaps {
 // Surface 4: speculative + prompt-cache
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-speculative", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "service-speculative", feature = "service-prompt-cache"))]
 mod speculative_with_cache_instrumentation {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1202,7 +1201,7 @@ mod speculative_with_cache_instrumentation {
 // Surface 5: memory + prompt-cache export coordinator
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "plugin-memory", feature = "service-prompt-cache"))]
 mod export_round_trip {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1227,12 +1226,12 @@ mod export_round_trip {
         MemoryPlugin::new(MemoryConfig::default()).expect("memory plugin must build")
     }
 
-    /// Real extracted graph state where `plugin-entity-extraction` is compiled
+    /// Real extracted graph state where `service-entity-extraction` is compiled
     /// in, an equivalent hand-built graph otherwise.
     fn populated_graph() -> GraphSnapshot {
-        #[cfg(feature = "plugin-entity-extraction")]
+        #[cfg(feature = "service-entity-extraction")]
         {
-            common::extraction::extraction_plugin()
+            common::extraction::org_extractor()
                 .validate_candidate(common::extraction::pair_candidate(
                     "Ada",
                     "Analytical Engines",
@@ -1241,7 +1240,7 @@ mod export_round_trip {
                 .delta
                 .snapshot()
         }
-        #[cfg(not(feature = "plugin-entity-extraction"))]
+        #[cfg(not(feature = "service-entity-extraction"))]
         {
             use cuca::{GraphNode, GraphRelationship};
 
@@ -1464,7 +1463,7 @@ mod export_round_trip {
 // Surface 6: cost + prompt-cache (a local cache hit is still charged)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-cost", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "plugin-cost", feature = "service-prompt-cache"))]
 mod cost_with_prompt_cache {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1855,7 +1854,7 @@ mod cost_with_telemetry {
 // Surface 9: rate-limit + prompt-cache (a cache hit still spends a token)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-rate-limit", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "service-rate-limit", feature = "service-prompt-cache"))]
 mod rate_limit_with_prompt_cache {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2054,7 +2053,7 @@ mod redaction_order_decides_what_is_logged {
 // Surface 11: redaction + prompt-cache (redaction is inside the cache key)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-redaction", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "plugin-redaction", feature = "service-prompt-cache"))]
 mod redaction_changes_cache_keys {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2062,7 +2061,7 @@ mod redaction_changes_cache_keys {
 
     use crate::common;
     use cuca::plugin::CucaPlugin;
-    use cuca::plugins::prompt_cache::digest_request;
+    use cuca::services::prompt_cache::digest_request;
     use cuca::{
         PromptCache, PromptCacheConfig, RedactionConfig, RedactionPlugin, RedactionRule,
         UnifiedRequest,
@@ -2158,7 +2157,7 @@ mod redaction_changes_cache_keys {
 // Surface 12: replay + speculative (a recorded swap replays as a note)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-replay", feature = "plugin-speculative"))]
+#[cfg(all(feature = "service-replay", feature = "service-speculative"))]
 mod replay_speculative {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2306,7 +2305,7 @@ mod replay_speculative {
 // Surface 13: replay + prompt-cache (two provider-free replay paths agree)
 // ---------------------------------------------------------------------------
 
-#[cfg(all(feature = "plugin-replay", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "service-replay", feature = "service-prompt-cache"))]
 mod replay_agrees_with_a_cache_hit {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

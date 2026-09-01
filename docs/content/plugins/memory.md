@@ -69,4 +69,4 @@ When `MemoryConfig::graph_context` is set, `on_request` renders the graph into a
 
 ## See also
 
-[Entity extraction](@/plugins/entity-extraction.md) produces graph deltas applied to this plugin's working graph through `merge_graph` or `replace_graph`.
+[Entity extraction](@/services/entity-extraction.md) produces graph deltas applied to this plugin's working graph through `merge_graph` or `replace_graph`.

@@ -2,7 +2,7 @@
 title = "Prompt cache"
 description = "The client-owned local response cache: the digest key, the TTL and LRU cap, and the export snapshot."
 template = "page.html"
-weight = 13
+weight = 3
 +++
 
 # Prompt cache
@@ -11,7 +11,7 @@ weight = 13
 <dt>In one line</dt>
 <dd>Caches complete UnifiedRequest to UnifiedResponse pairs on the client, keyed by a digest of the effective request.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-prompt-cache</code> feature.</dd>
+<dd>The <code>service-prompt-cache</code> feature.</dd>
 <dt>Read this if</dt>
 <dd>You are configuring a client-level cache or exporting and importing its state.</dd>
 </dl>
@@ -41,7 +41,7 @@ A hit replays the stored `content` blocks in order and skips provider dispatch, 
 | `on_response_complete` | runs exactly once |
 | cache write-back | skipped; only a miss writes |
 
-A session log therefore keeps one `ResponseComplete` event per turn whether or not the turn was served from cache, and `plugin-telemetry` records the replay latency. Nothing re-derives per-block state on a replay: `plugin-entity-extraction` is an explicit-call capability and `plugin-memory` implements no completion hook, so no extraction repeats.
+A session log therefore keeps one `ResponseComplete` event per turn whether or not the turn was served from cache, and `plugin-telemetry` records the replay latency. Nothing re-derives per-block state on a replay: `service-entity-extraction` is a separate explicit-call service and `plugin-memory` implements no completion hook, so no extraction repeats.
 
 ## Capacity
 

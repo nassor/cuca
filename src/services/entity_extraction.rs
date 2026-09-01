@@ -1,31 +1,28 @@
-//! Schema-guided entity and relationship extraction (`plugin-entity-extraction`).
+//! Schema-guided entity and relationship extraction (`service-entity-extraction`).
 //!
-//! [`EntityExtractionPlugin`] validates model-produced entity candidates
-//! against an immutable [`EntityExtractionSchema`] (entity tables,
-//! relationship tables, declared property columns, identity columns) and turns
-//! the accepted candidate into a graph delta. Validation is total: an unknown
-//! table, a missing required property, a type mismatch, an undeclared property
-//! on a table with `allow_model_properties = false`, or a relationship endpoint
+//! [`EntityExtractor`] validates model-produced entity candidates against an
+//! immutable [`EntityExtractionSchema`] (entity tables, relationship tables,
+//! declared property columns, identity columns) and turns the accepted
+//! candidate into a graph delta. Validation is total: an unknown table, a
+//! missing required property, a type mismatch, an undeclared property on a
+//! table with `allow_model_properties = false`, or a relationship endpoint
 //! that no accepted entity satisfies all return [`PluginError::Validation`]
 //! instead of a partially accepted delta.
+//!
+//! # Explicit-call contract
+//!
+//! An explicit-call service, never a [`crate::plugin::CucaPlugin`]
+//! ([`crate::services`] owns that contract). Extraction is driven by direct
+//! calls: [`EntityExtractor::extract`] asks an [`EntityExtractionModel`] for a
+//! candidate and validates it, and [`EntityExtractor::validate_candidate`]
+//! validates a candidate the caller already has.
 //!
 //! # Hard dependency on `plugin-memory`
 //!
 //! The delta is a [`MemoryGraph`] built from [`GraphNode`]/[`GraphRelationship`]
 //! values, so this feature enables `plugin-memory`
-//! (`plugin-entity-extraction = ["plugin-memory"]`). The dependency is one-way:
+//! (`service-entity-extraction = ["plugin-memory"]`). The dependency is one-way:
 //! `plugin-memory` never references this module.
-//!
-//! # Explicit-call contract
-//!
-//! [`EntityExtractionPlugin`] is not a [`crate::plugin::CucaPlugin`]: it has no
-//! request/stream hooks, so it cannot be registered on the client builder (as
-//! with `PromptCache`, the compiler rejects the attempt rather than accepting
-//! an inert registration). Extraction is driven by direct calls:
-//! [`EntityExtractionPlugin::extract`] asks an [`EntityExtractionModel`] for a
-//! candidate and validates it, and
-//! [`EntityExtractionPlugin::validate_candidate`] validates a candidate the
-//! caller already has.
 //!
 //! # Mandatory hand-off
 //!
@@ -191,7 +188,7 @@ pub struct EntityExtractionReport {
 pub trait EntityExtractionModel: Send + Sync {
     /// Extract a candidate from `source` under `schema`.
     ///
-    /// The candidate is unvalidated: [`EntityExtractionPlugin`] enforces
+    /// The candidate is unvalidated: [`EntityExtractor`] enforces
     /// `schema` afterwards, so an implementation may return whatever the model
     /// produced.
     ///
@@ -211,11 +208,11 @@ pub trait EntityExtractionModel: Send + Sync {
 /// [`Self::validate_candidate`] and apply the report's delta to a
 /// `MemoryPlugin` (see the module docs).
 #[derive(Debug, Clone, PartialEq)]
-pub struct EntityExtractionPlugin {
+pub struct EntityExtractor {
     schema: EntityExtractionSchema,
 }
 
-impl EntityExtractionPlugin {
+impl EntityExtractor {
     /// Validate and retain an extraction schema.
     ///
     /// # Errors
@@ -797,7 +794,7 @@ fn validation_error(schema: &EntityExtractionSchema, message: impl Into<String>)
     }
 }
 
-#[cfg(all(test, feature = "plugin-entity-extraction"))]
+#[cfg(all(test, feature = "service-entity-extraction"))]
 mod tests {
     use super::*;
     use std::future::Future;
@@ -912,20 +909,20 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn extracts_and_validates_a_supplied_model_candidate() {
         let candidate = works_for_candidate();
-        let plugin = EntityExtractionPlugin::new(work_schema()).unwrap();
+        let extractor = EntityExtractor::new(work_schema()).unwrap();
 
-        let report = plugin
+        let report = extractor
             .extract("Ada works for example.com.", &FixedModel(candidate.clone()))
             .await
             .unwrap();
 
-        assert_eq!(report, plugin.validate_candidate(candidate).unwrap());
+        assert_eq!(report, extractor.validate_candidate(candidate).unwrap());
     }
 
     #[tokio::test(flavor = "current_thread")]
     async fn invalid_model_extraction_leaves_memory_graph_unchanged() {
         let memory = MemoryPlugin::new(MemoryConfig::default()).unwrap();
-        let initial = EntityExtractionPlugin::new(contacts_schema())
+        let initial = EntityExtractor::new(contacts_schema())
             .unwrap()
             .validate_candidate(EntityExtractionCandidate {
                 entities: vec![CandidateEntity {
@@ -947,7 +944,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(contacts_schema())
+            EntityExtractor::new(contacts_schema())
                 .unwrap()
                 .extract("Unknown entity.", &FixedModel(invalid))
                 .await,
@@ -959,7 +956,7 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn merges_valid_model_delta_into_memory_with_keep_policy() {
         let memory = MemoryPlugin::new(MemoryConfig::default()).unwrap();
-        let report = EntityExtractionPlugin::new(work_schema())
+        let report = EntityExtractor::new(work_schema())
             .unwrap()
             .extract(
                 "Ada works for example.com.",
@@ -991,7 +988,7 @@ mod tests {
             &candidate.relationships[0].properties,
         );
 
-        let report = EntityExtractionPlugin::new(work_schema())
+        let report = EntityExtractor::new(work_schema())
             .unwrap()
             .validate_candidate(candidate)
             .unwrap();
@@ -1013,7 +1010,7 @@ mod tests {
 
     #[test]
     fn report_round_trip_preserves_nonempty_graph_delta() {
-        let report = EntityExtractionPlugin::new(work_schema())
+        let report = EntityExtractor::new(work_schema())
             .unwrap()
             .validate_candidate(works_for_candidate())
             .unwrap();
@@ -1035,7 +1032,7 @@ mod tests {
             relationships: vec![],
         };
 
-        let report = EntityExtractionPlugin::new(contacts_schema())
+        let report = EntityExtractor::new(contacts_schema())
             .unwrap()
             .validate_candidate(candidate)
             .unwrap();
@@ -1066,7 +1063,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(contacts_schema())
+            EntityExtractor::new(contacts_schema())
                 .unwrap()
                 .validate_candidate(candidate),
             Err(PluginError::Validation { .. })
@@ -1087,7 +1084,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(contacts_schema())
+            EntityExtractor::new(contacts_schema())
                 .unwrap()
                 .validate_candidate(candidate),
             Err(PluginError::Validation { .. })
@@ -1109,7 +1106,7 @@ mod tests {
             relationships: vec![],
         };
 
-        let report = EntityExtractionPlugin::new(schema)
+        let report = EntityExtractor::new(schema)
             .unwrap()
             .validate_candidate(candidate)
             .unwrap();
@@ -1130,7 +1127,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(contacts_schema())
+            EntityExtractor::new(contacts_schema())
                 .unwrap()
                 .validate_candidate(candidate),
             Err(PluginError::Validation { .. })
@@ -1148,7 +1145,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(contacts_schema())
+            EntityExtractor::new(contacts_schema())
                 .unwrap()
                 .validate_candidate(candidate),
             Err(PluginError::Validation { .. })
@@ -1166,7 +1163,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(contacts_schema())
+            EntityExtractor::new(contacts_schema())
                 .unwrap()
                 .validate_candidate(candidate),
             Err(PluginError::Validation { .. })
@@ -1192,7 +1189,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(contacts_schema())
+            EntityExtractor::new(contacts_schema())
                 .unwrap()
                 .validate_candidate(candidate),
             Err(PluginError::Validation { .. })
@@ -1207,7 +1204,7 @@ mod tests {
             properties(&[("domain", serde_json::json!("example.com"))]);
 
         assert!(matches!(
-            EntityExtractionPlugin::new(work_schema())
+            EntityExtractor::new(work_schema())
                 .unwrap()
                 .validate_candidate(candidate),
             Err(PluginError::Validation { .. })
@@ -1233,7 +1230,7 @@ mod tests {
         };
 
         assert!(matches!(
-            EntityExtractionPlugin::new(schema),
+            EntityExtractor::new(schema),
             Err(PluginError::Validation { .. })
         ));
     }
@@ -1251,7 +1248,7 @@ mod tests {
         });
 
         assert!(matches!(
-            EntityExtractionPlugin::new(schema),
+            EntityExtractor::new(schema),
             Err(PluginError::Validation { .. })
         ));
     }

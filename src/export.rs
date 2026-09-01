@@ -36,7 +36,7 @@
 //!
 //! # Compiled-out components
 //!
-//! A build without `plugin-memory` (or without `plugin-prompt-cache`) still
+//! A build without `plugin-memory` (or without `service-prompt-cache`) still
 //! emits that component's section with the same wire shape and empty arrays,
 //! and refuses to import non-empty data for it: the data is rejected as
 //! [`CucaExportError::Unsupported`] rather than silently discarded.
@@ -125,17 +125,17 @@ pub struct GraphExportSection {
 }
 
 /// The `prompt_cache` section:
-/// [`crate::plugins::prompt_cache::PromptCacheSnapshot`] when
-/// `plugin-prompt-cache` is enabled.
-#[cfg(feature = "plugin-prompt-cache")]
-pub type PromptCacheExportSection = crate::plugins::prompt_cache::PromptCacheSnapshot;
+/// [`crate::services::prompt_cache::PromptCacheSnapshot`] when
+/// `service-prompt-cache` is enabled.
+#[cfg(feature = "service-prompt-cache")]
+pub type PromptCacheExportSection = crate::services::prompt_cache::PromptCacheSnapshot;
 
-/// The `prompt_cache` section in a build without `plugin-prompt-cache`: the
+/// The `prompt_cache` section in a build without `service-prompt-cache`: the
 /// same wire shape, but no typed cache entries.
 ///
 /// `entries` must stay empty. A document with cache data is rejected as
 /// [`CucaExportError::Unsupported`] on both encode and decode.
-#[cfg(not(feature = "plugin-prompt-cache"))]
+#[cfg(not(feature = "service-prompt-cache"))]
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PromptCacheExportSection {
@@ -216,7 +216,7 @@ impl CucaExport {
         if !self.graph.nodes.is_empty() || !self.graph.relationships.is_empty() {
             return Err(CucaExportError::Unsupported { component: "graph" });
         }
-        #[cfg(not(feature = "plugin-prompt-cache"))]
+        #[cfg(not(feature = "service-prompt-cache"))]
         if !self.prompt_cache.entries.is_empty() {
             return Err(CucaExportError::Unsupported {
                 component: "prompt_cache",
@@ -278,13 +278,13 @@ pub struct CucaImportReport {
     pub capacity_evictions: usize,
 }
 
-#[cfg(all(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+#[cfg(all(feature = "plugin-memory", feature = "service-prompt-cache"))]
 impl CucaExport {
     /// Build the combined envelope from live component state.
     ///
     /// Each component is exported through its own accessor
     /// ([`crate::plugins::memory::MemoryPlugin::snapshot`] and
-    /// [`crate::plugins::prompt_cache::PromptCache::snapshot`]), so each holds
+    /// [`crate::services::prompt_cache::PromptCache::snapshot`]), so each holds
     /// its lock only long enough to clone its own state. Expired cache entries
     /// are pruned from the export by the cache itself.
     ///
@@ -296,7 +296,7 @@ impl CucaExport {
     /// export fails.
     pub fn from_live(
         memory: &crate::plugins::memory::MemoryPlugin,
-        cache: &crate::plugins::prompt_cache::PromptCache,
+        cache: &crate::services::prompt_cache::PromptCache,
     ) -> Result<Self, CucaExportError> {
         let graph = memory.snapshot().map_err(|e| CucaExportError::State {
             message: e.to_string(),
@@ -338,7 +338,7 @@ impl CucaExport {
     pub fn import_into(
         &self,
         memory: &crate::plugins::memory::MemoryPlugin,
-        cache: &crate::plugins::prompt_cache::PromptCache,
+        cache: &crate::services::prompt_cache::PromptCache,
         now_unix_ms: u64,
     ) -> Result<CucaImportReport, CucaExportError> {
         use crate::plugins::memory::MemoryPlugin;
@@ -385,9 +385,9 @@ impl CucaExport {
 /// The cache reports a dynamic field path (e.g. `entries[<key>].lru_rank`),
 /// which is folded into the message because [`CucaExportError::Validation`]
 /// carries a static field name.
-#[cfg(all(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
-fn cache_stage_error(error: crate::plugins::prompt_cache::PromptCacheError) -> CucaExportError {
-    use crate::plugins::prompt_cache::PromptCacheError;
+#[cfg(all(feature = "plugin-memory", feature = "service-prompt-cache"))]
+fn cache_stage_error(error: crate::services::prompt_cache::PromptCacheError) -> CucaExportError {
+    use crate::services::prompt_cache::PromptCacheError;
 
     match error {
         PromptCacheError::Validation { field, message } => CucaExportError::Validation {
@@ -672,9 +672,9 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "plugin-prompt-cache"))]
+    #[cfg(not(feature = "service-prompt-cache"))]
     #[test]
-    fn non_empty_cache_section_is_unsupported_without_plugin_prompt_cache() {
+    fn non_empty_cache_section_is_unsupported_without_service_prompt_cache() {
         let json = concat!(
             r#"{"format":"cuca-export","version":1,"#,
             r#""graph":{"nodes":[],"relationships":[]},"#,
@@ -689,7 +689,7 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "plugin-prompt-cache"))]
+    #[cfg(not(feature = "service-prompt-cache"))]
     #[test]
     fn encoding_a_non_empty_compiled_out_cache_section_is_unsupported() {
         let mut export = empty_export();
@@ -749,11 +749,11 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     #[test]
     fn cache_section_round_trips_full_fidelity_entries() {
-        use crate::plugins::prompt_cache::{PromptCacheEntry, PromptCacheSnapshot};
         use crate::request::{UnifiedRequest, UnifiedResponse};
+        use crate::services::prompt_cache::{PromptCacheEntry, PromptCacheSnapshot};
         use crate::types::{MessageContentBlock, ProviderEndpoint};
 
         let request = UnifiedRequest::new("gpt-4o")
@@ -797,7 +797,7 @@ mod tests {
     }
 }
 
-#[cfg(all(test, feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+#[cfg(all(test, feature = "plugin-memory", feature = "service-prompt-cache"))]
 mod coordinator_tests {
     use std::time::Duration;
 
@@ -805,10 +805,10 @@ mod coordinator_tests {
     use crate::plugins::memory::{
         GraphNode, GraphRelationship, GraphSnapshot, MemoryConfig, MemoryPlugin,
     };
-    use crate::plugins::prompt_cache::{
+    use crate::request::{UnifiedRequest, UnifiedResponse};
+    use crate::services::prompt_cache::{
         PromptCache, PromptCacheConfig, PromptCacheEntry, PromptCacheSnapshot, digest_request,
     };
-    use crate::request::{UnifiedRequest, UnifiedResponse};
     use crate::types::{MessageContentBlock, ProviderEndpoint};
 
     const NOW: u64 = 10_000;

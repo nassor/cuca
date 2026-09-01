@@ -1,9 +1,11 @@
-//! The "everything-is-a-plugin" seam: [`CucaPlugin`] and [`SessionStorePlugin`].
+//! The pipeline hook seam: [`CucaPlugin`] and [`SessionStorePlugin`].
 //!
-//! [`CucaPlugin`] is the base hook surface every feature-gated capability
+//! [`CucaPlugin`] is the base hook surface every pipeline-driven capability
 //! implements; [`SessionStorePlugin`] extends it with the append-only session
 //! trajectory operations. Clients hold plugins as `Vec<Arc<dyn CucaPlugin>>`
-//! and invoke the hooks around every request/stream.
+//! and invoke the hooks around every request/stream. A capability driven by
+//! direct method calls instead implements no hook and lives in
+//! [`crate::services`].
 //!
 //! # Design notes
 //!

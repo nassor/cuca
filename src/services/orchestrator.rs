@@ -5,6 +5,15 @@
 //! client registry, and the [`ComplexityEvaluator`] that routes a prompt to a
 //! fast or slow tier.
 //!
+//! An explicit-call service, never a [`crate::plugin::CucaPlugin`]
+//! ([`crate::services`] owns that contract): no pipeline hook can route a turn
+//! across two tiers. Callers either drive
+//! [`ModelOrchestrator::execute_adaptive_turn`] directly or attach the
+//! orchestrator with
+//! [`CucaClientBuilder::with_orchestrator`](crate::CucaClientBuilder::with_orchestrator)
+//! so [`CucaClient::generate_stream`](crate::CucaClient::generate_stream) routes
+//! through it.
+//!
 //! # Tier semantics
 //!
 //! - **Fast tier**: a low-latency routing model used for simple operations
@@ -53,6 +62,15 @@
 //! the remainder of the turn. Every swap (latency or fallback) appends a
 //! `SessionEvent::ModelSwap` record when a session store is registered.
 //!
+//! # Session-log edge (documented-optional)
+//!
+//! `ModelOrchestrator::with_session_store` and the `SessionEvent::ModelSwap`
+//! records it enables exist only under `plugin-session-log`: without that
+//! feature the method is compiled out of existence rather than accepting a
+//! store and silently dropping every swap. `service-speculative` therefore
+//! declares no Cargo edge to it, and the session-log plugin stays ignorant that
+//! this service exists.
+//!
 //! # Recursion guard
 //!
 //! The real [`PoolTurnExecutor`]s execute through pool clients built without
@@ -90,7 +108,7 @@ use tokio_stream::Stream;
 use crate::error::CucaError;
 #[cfg(feature = "plugin-session-log")]
 use crate::plugin::SessionStorePlugin;
-#[cfg(all(test, feature = "plugin-speculative"))]
+#[cfg(all(test, feature = "service-speculative"))]
 use crate::request::PromptCacheDirective;
 use crate::request::{AgentResponseStream, UnifiedRequest};
 #[cfg(feature = "plugin-session-log")]
@@ -966,7 +984,7 @@ fn rejection_message(block: &MessageContentBlock, reason: &str) -> UnifiedMessag
     }
 }
 
-#[cfg(all(test, feature = "plugin-speculative"))]
+#[cfg(all(test, feature = "service-speculative"))]
 mod tests {
     use super::*;
     use crate::client::CucaClient;

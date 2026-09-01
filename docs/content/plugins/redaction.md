@@ -109,7 +109,7 @@ Each omission is a stated decision, not a gap:
 The plugin does not require a registration position relative to any other plugin — but its effect is order-observable at two consuming sites, and both orders are legal:
 
 - **`plugin-session-log`.** `on_request` hooks run in registration order over one shared request. Registering `RedactionPlugin` before `SessionLogPlugin` means the trajectory stores scrubbed content; registering it after means the log persists the raw value — to disk, if `FileBackend` is in use, where the append-only format never rewrites an existing frame. Model-output records are never scrubbed at any order, because `on_stream_chunk` is deferred.
-- **`plugin-prompt-cache`.** The digest is computed from the request after every `on_request` hook, so enabling redaction changes every cache key. A snapshot imported from a pre-redaction run is rejected as a digest mismatch by `PromptCache::replace_snapshot`, not silently mismatched.
+- **`service-prompt-cache`.** The digest is computed from the request after every `on_request` hook, so enabling redaction changes every cache key. A snapshot imported from a pre-redaction run is rejected as a digest mismatch by `PromptCache::replace_snapshot`, not silently mismatched.
 
 ## Bounds
 

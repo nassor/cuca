@@ -9,7 +9,7 @@
 //!    callers cannot mis-route a request by setting it on [`UnifiedRequest`].
 //! 2. `on_request` hooks run, in registration order, and may mutate the request
 //!    (inject context, enforce policies, count tokens).
-//! 3. Under `plugin-prompt-cache` with a configured cache: the digest of the
+//! 3. Under `service-prompt-cache` with a configured cache: the digest of the
 //!    now-effective request is looked up. A hit returns a [`CacheHitStream`]
 //!    that replays the stored blocks and never reaches provider dispatch,
 //!    `execute_local_tool`, or `on_stream_chunk`, but still runs every
@@ -22,7 +22,7 @@
 //!    adapter.
 //! 5. The stream is wrapped in [`PluginStream`], which applies
 //!    `on_stream_chunk` per block and `on_response_complete` exactly once when
-//!    the stream ends, and (under `plugin-prompt-cache`) writes one cache
+//!    the stream ends, and (under `service-prompt-cache`) writes one cache
 //!    entry after a fully successful completion.
 //!
 //! Token accounting: `completion_tokens` counts one token per `Text`, `Thinking`,
@@ -35,19 +35,19 @@ use std::task::{Context, Poll};
 use futures_core::Stream;
 
 use crate::error::{CucaError, PluginError};
-#[cfg(feature = "plugin-speculative")]
-use crate::orchestrator::ModelOrchestrator;
 use crate::plugin::CucaPlugin;
-#[cfg(feature = "plugin-prompt-cache")]
-use crate::plugins::prompt_cache::{
-    PromptCache, PromptCacheConfig, PromptCacheEntry, PromptCacheError, PromptCacheImportReport,
-    PromptCacheSnapshot, digest_request,
-};
 #[cfg(feature = "provider-anthropic")]
 use crate::provider::anthropic::OAuthPkceConfig;
 #[cfg(feature = "provider-llamacpp")]
 use crate::provider::llamacpp::LlamaCppConfig;
 use crate::request::{AgentResponseStream, PromptCacheUsage, UnifiedRequest, UnifiedResponse};
+#[cfg(feature = "service-speculative")]
+use crate::services::orchestrator::ModelOrchestrator;
+#[cfg(feature = "service-prompt-cache")]
+use crate::services::prompt_cache::{
+    PromptCache, PromptCacheConfig, PromptCacheEntry, PromptCacheError, PromptCacheImportReport,
+    PromptCacheSnapshot, digest_request,
+};
 use crate::types::{MessageContentBlock, ProviderEndpoint};
 
 /// Cloneable, mutex-protected carrier for provider-reported metadata that
@@ -63,7 +63,7 @@ use crate::types::{MessageContentBlock, ProviderEndpoint};
 ///
 /// The payload type, [`PromptCacheUsage`], is unconditional (defined in
 /// [`crate::request`] with no feature gate), so this handle compiles and
-/// behaves identically whether or not `plugin-prompt-cache` is enabled.
+/// behaves identically whether or not `service-prompt-cache` is enabled.
 ///
 /// A poisoned lock is treated as "no usage" rather than propagated: metadata
 /// is best-effort and must never turn a successful provider stream into an
@@ -131,7 +131,7 @@ pub(crate) struct ProviderDispatch {
 /// to [`CucaError::Json`]; every other variant (`Config`, `Validation`,
 /// `Lock`) is a configuration/state problem and maps to [`CucaError::Config`]
 /// with the original error's message preserved via `Display`.
-#[cfg(feature = "plugin-prompt-cache")]
+#[cfg(feature = "service-prompt-cache")]
 fn map_prompt_cache_error(err: PromptCacheError) -> CucaError {
     match err {
         PromptCacheError::Json(message) => CucaError::Json { message },
@@ -154,11 +154,11 @@ pub struct CucaClientBuilder {
     plugins: Vec<Arc<dyn CucaPlugin>>,
     #[cfg(feature = "provider-llamacpp")]
     llamacpp_config: Option<LlamaCppConfig>,
-    #[cfg(feature = "plugin-speculative")]
+    #[cfg(feature = "service-speculative")]
     orchestrator: Option<ModelOrchestrator>,
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     prompt_cache_config: Option<PromptCacheConfig>,
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     prompt_cache_service: Option<Arc<PromptCache>>,
 }
 
@@ -176,11 +176,11 @@ impl CucaClientBuilder {
             plugins: Vec::new(),
             #[cfg(feature = "provider-llamacpp")]
             llamacpp_config: None,
-            #[cfg(feature = "plugin-speculative")]
+            #[cfg(feature = "service-speculative")]
             orchestrator: None,
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             prompt_cache_config: None,
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             prompt_cache_service: None,
         }
     }
@@ -252,7 +252,7 @@ impl CucaClientBuilder {
     /// [`Self::with_base_url`] and [`Self::with_api_key`] configure this
     /// client, not those tier clients; the tier endpoint is
     /// [`ModelOrchestrator::with_endpoint`].
-    #[cfg(feature = "plugin-speculative")]
+    #[cfg(feature = "service-speculative")]
     pub fn with_orchestrator(mut self, orchestrator: ModelOrchestrator) -> Self {
         self.orchestrator = Some(orchestrator);
         self
@@ -264,7 +264,7 @@ impl CucaClientBuilder {
     ///
     /// Ignored when [`Self::with_prompt_cache_service`] is also called: an
     /// explicit shared service always wins.
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     pub fn with_prompt_cache_config(mut self, config: PromptCacheConfig) -> Self {
         self.prompt_cache_config = Some(config);
         self
@@ -274,7 +274,7 @@ impl CucaClientBuilder {
     /// (e.g. one shared across multiple clients, or restored from an
     /// imported snapshot). Takes precedence over
     /// [`Self::with_prompt_cache_config`].
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     pub fn with_prompt_cache_service(mut self, service: Arc<PromptCache>) -> Self {
         self.prompt_cache_service = Some(service);
         self
@@ -285,12 +285,12 @@ impl CucaClientBuilder {
     /// # Errors
     ///
     /// Returns [`CucaError::Config`] when no provider was selected, or when
-    /// an explicit `plugin-prompt-cache` configuration fails validation.
+    /// an explicit `service-prompt-cache` configuration fails validation.
     pub fn build(self) -> Result<CucaClient, CucaError> {
         let selected_provider = self.provider.ok_or_else(|| {
             CucaError::Config("no provider selected; call with_provider before build".into())
         })?;
-        #[cfg(feature = "plugin-prompt-cache")]
+        #[cfg(feature = "service-prompt-cache")]
         let prompt_cache = match self.prompt_cache_service {
             Some(service) => Some(service),
             None => match self.prompt_cache_config {
@@ -320,10 +320,10 @@ impl CucaClientBuilder {
             http_client: reqwest::Client::new(),
             #[cfg(feature = "provider-llamacpp")]
             llamacpp_config: self.llamacpp_config,
-            #[cfg(feature = "plugin-speculative")]
+            #[cfg(feature = "service-speculative")]
             orchestrator: self.orchestrator,
             plugins: self.plugins.into(),
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             prompt_cache,
         })
     }
@@ -364,9 +364,9 @@ pub struct CucaClient {
     plugins: Arc<[Arc<dyn CucaPlugin>]>,
     #[cfg(feature = "provider-llamacpp")]
     llamacpp_config: Option<LlamaCppConfig>,
-    #[cfg(feature = "plugin-speculative")]
+    #[cfg(feature = "service-speculative")]
     orchestrator: Option<ModelOrchestrator>,
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     prompt_cache: Option<Arc<PromptCache>>,
 }
 
@@ -416,7 +416,7 @@ impl CucaClient {
 
     /// The speculative fast/slow orchestrator, when one was
     /// attached via [`CucaClientBuilder::with_orchestrator`].
-    #[cfg(feature = "plugin-speculative")]
+    #[cfg(feature = "service-speculative")]
     pub fn orchestrator(&self) -> Option<&ModelOrchestrator> {
         self.orchestrator.as_ref()
     }
@@ -424,7 +424,7 @@ impl CucaClient {
     /// The client-owned local response cache, when one was configured via
     /// [`CucaClientBuilder::with_prompt_cache_config`] or
     /// [`CucaClientBuilder::with_prompt_cache_service`].
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     pub fn prompt_cache(&self) -> Option<Arc<PromptCache>> {
         self.prompt_cache.clone()
     }
@@ -444,7 +444,7 @@ impl CucaClient {
     /// [`CucaError::Config`] when no prompt cache is configured, or when the
     /// cache reports an explicit lock/state error (mapped from
     /// [`PromptCacheError`]).
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     pub fn prompt_cache_snapshot(&self) -> Result<PromptCacheSnapshot, CucaError> {
         let cache = self
             .prompt_cache
@@ -466,7 +466,7 @@ impl CucaClient {
     /// [`CucaError::Config`] when no prompt cache is configured, or when
     /// `snapshot` fails validation or the cache reports an explicit
     /// lock/state error (mapped from [`PromptCacheError`]).
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     pub fn replace_prompt_cache_snapshot(
         &self,
         snapshot: PromptCacheSnapshot,
@@ -508,7 +508,7 @@ impl CucaClient {
     /// arms below are bypassed. The orchestrator's own stream carries its
     /// own instrumentation and never runs this client's top-level
     /// `on_stream_chunk`/`on_response_complete` hooks, with one asymmetry:
-    /// under `plugin-prompt-cache` with a cache actually configured, a miss
+    /// under `service-prompt-cache` with a cache actually configured, a miss
     /// wraps the orchestrator stream in the same `PluginStream` every other
     /// dispatch arm uses, so terminal hooks and the cache write run for that
     /// turn; with no cache configured (or the feature compiled out), the
@@ -534,7 +534,7 @@ impl CucaClient {
         // `on_request` hook). A hit bypasses every dispatch arm below,
         // including the orchestrator; a miss captures a clone of this exact
         // request so a later fully-successful completion can be written back.
-        #[cfg(feature = "plugin-prompt-cache")]
+        #[cfg(feature = "service-prompt-cache")]
         let cache_write: Option<(Arc<PromptCache>, UnifiedRequest)> = match &self.prompt_cache {
             Some(cache) => {
                 let key = digest_request(&request).map_err(map_prompt_cache_error)?;
@@ -546,7 +546,7 @@ impl CucaClient {
             None => None,
         };
         #[cfg(all(
-            feature = "plugin-prompt-cache",
+            feature = "service-prompt-cache",
             not(any(
                 feature = "provider-openai",
                 feature = "provider-anthropic",
@@ -588,14 +588,14 @@ impl CucaClient {
         // executors use pool clients built without `with_orchestrator`, so
         // they dispatch to providers directly and never recurse back into
         // this branch.
-        #[cfg(feature = "plugin-speculative")]
+        #[cfg(feature = "service-speculative")]
         if let Some(orchestrator) = &self.orchestrator {
             // Configured-cache/no-cache asymmetry: the orchestrator path
             // never runs top-level per-chunk/terminal plugin hooks.
             // `OrchestratorStream` carries its own instrumentation (draft
             // validation, fallback, session events), and the pool clients
             // backing its tier executors are built without plugins. With no
-            // cache configured (or `plugin-prompt-cache` not compiled in),
+            // cache configured (or `service-prompt-cache` not compiled in),
             // the orchestrator stream below is returned unwrapped. With a
             // cache actually configured, a miss (`cache_write.is_some()`)
             // needs a completion point to write the entry at, so it wraps
@@ -603,7 +603,7 @@ impl CucaClient {
             // other dispatch arm uses: for this path that is the *first*
             // time top-level `on_stream_chunk`/`on_response_complete` hooks
             // run over an orchestrator turn, not a second time.
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             if cache_write.is_some() {
                 let model = request.model.clone();
                 let dispatch = ProviderDispatch {
@@ -692,7 +692,7 @@ impl CucaClient {
             }
         };
         #[cfg(all(
-            feature = "plugin-prompt-cache",
+            feature = "service-prompt-cache",
             any(
                 feature = "provider-openai",
                 feature = "provider-anthropic",
@@ -705,7 +705,7 @@ impl CucaClient {
         ))]
         return Ok(self.instrument(model, dispatch, cache_write));
         #[cfg(all(
-            not(feature = "plugin-prompt-cache"),
+            not(feature = "service-prompt-cache"),
             any(
                 feature = "provider-openai",
                 feature = "provider-anthropic",
@@ -724,7 +724,7 @@ impl CucaClient {
     /// [`UnifiedResponse`] token/content accounting, and (when `cache_write`
     /// is `Some`) a one-shot cache write after a fully successful completion.
     #[cfg(all(
-        feature = "plugin-prompt-cache",
+        feature = "service-prompt-cache",
         any(
             feature = "provider-openai",
             feature = "provider-anthropic",
@@ -766,7 +766,7 @@ impl CucaClient {
     /// per block, `on_response_complete` once at the end, and the aggregated
     /// [`UnifiedResponse`] token/content accounting.
     #[cfg(all(
-        not(feature = "plugin-prompt-cache"),
+        not(feature = "service-prompt-cache"),
         any(
             feature = "provider-openai",
             feature = "provider-anthropic",
@@ -800,7 +800,7 @@ impl CucaClient {
     /// Build a [`CacheHitStream`] that replays `entry`'s stored response
     /// without dispatching to a provider, running local-tool execution, or
     /// per-chunk hooks.
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     fn instrument_cache_hit(&self, entry: PromptCacheEntry) -> AgentResponseStream {
         let response = entry.response;
         let blocks = response.content.clone().into_iter();
@@ -832,19 +832,19 @@ pub struct PluginStream {
     done: bool,
     /// Present only on a cache miss with a configured cache: the service and
     /// effective request to write back after a fully successful completion.
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     cache_write: Option<CacheWriteSeam>,
     /// Set once any item-level error (inner stream, local-tool, or
     /// per-chunk hook) is observed; gates the cache write so a partially
     /// failed stream never writes an entry even if a consumer keeps polling
     /// past the error to `None`.
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     saw_error: bool,
 }
 
 /// The cache service and effective request a [`PluginStream`] writes back to
 /// after a fully successful completion.
-#[cfg(feature = "plugin-prompt-cache")]
+#[cfg(feature = "service-prompt-cache")]
 struct CacheWriteSeam {
     cache: Arc<PromptCache>,
     request: UnifiedRequest,
@@ -867,7 +867,7 @@ impl Stream for PluginStream {
                                         if tool_call_id == id
                                 );
                                 if !valid_replacement {
-                                    #[cfg(feature = "plugin-prompt-cache")]
+                                    #[cfg(feature = "service-prompt-cache")]
                                     {
                                         this.saw_error = true;
                                     }
@@ -883,7 +883,7 @@ impl Stream for PluginStream {
                             }
                             Ok(None) => {}
                             Err(e) => {
-                                #[cfg(feature = "plugin-prompt-cache")]
+                                #[cfg(feature = "service-prompt-cache")]
                                 {
                                     this.saw_error = true;
                                 }
@@ -897,7 +897,7 @@ impl Stream for PluginStream {
                     if let Err(e) = plugin.on_stream_chunk(&mut chunk) {
                         // First plugin failure wins; the failed block is neither
                         // accumulated nor token-counted, and polling continues.
-                        #[cfg(feature = "plugin-prompt-cache")]
+                        #[cfg(feature = "service-prompt-cache")]
                         {
                             this.saw_error = true;
                         }
@@ -919,7 +919,7 @@ impl Stream for PluginStream {
                 Poll::Ready(Some(Ok(chunk)))
             }
             Poll::Ready(Some(Err(e))) => {
-                #[cfg(feature = "plugin-prompt-cache")]
+                #[cfg(feature = "service-prompt-cache")]
                 {
                     this.saw_error = true;
                 }
@@ -948,7 +948,7 @@ impl Stream for PluginStream {
                     // when a cache was actually configured for this stream.
                     // Advisory: a write failure never fails the primary
                     // stream, which has already finished successfully.
-                    #[cfg(feature = "plugin-prompt-cache")]
+                    #[cfg(feature = "service-prompt-cache")]
                     if !this.saw_error
                         && let Some(seam) = this.cache_write.take()
                     {
@@ -976,7 +976,7 @@ impl Stream for PluginStream {
 /// errors are swallowed/logged exactly as [`PluginStream`] does, and a
 /// `done` guard prevents a duplicate completion if a consumer polls again
 /// after `None`.
-#[cfg(feature = "plugin-prompt-cache")]
+#[cfg(feature = "service-prompt-cache")]
 struct CacheHitStream {
     blocks: std::vec::IntoIter<MessageContentBlock>,
     /// Shared handle on the client's registered plugins; see
@@ -987,7 +987,7 @@ struct CacheHitStream {
     done: bool,
 }
 
-#[cfg(feature = "plugin-prompt-cache")]
+#[cfg(feature = "service-prompt-cache")]
 impl Stream for CacheHitStream {
     type Item = Result<MessageContentBlock, CucaError>;
 
@@ -1074,9 +1074,9 @@ mod tests {
                 content: Vec::new(),
                 prompt_cache_usage: None,
             },
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             cache_write: None,
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             saw_error: false,
             done: false,
         };
@@ -1113,9 +1113,9 @@ mod tests {
                 content: Vec::new(),
                 prompt_cache_usage: None,
             },
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             cache_write: None,
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             saw_error: false,
             done: false,
         };
@@ -1195,9 +1195,9 @@ mod tests {
                 content: Vec::new(),
                 prompt_cache_usage: None,
             },
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             cache_write: None,
-            #[cfg(feature = "plugin-prompt-cache")]
+            #[cfg(feature = "service-prompt-cache")]
             saw_error: false,
             done: false,
         };
@@ -1311,7 +1311,7 @@ mod tests {
     }
 
     /// Cache lookup/miss-write pipeline semantics.
-    #[cfg(feature = "plugin-prompt-cache")]
+    #[cfg(feature = "service-prompt-cache")]
     mod prompt_cache_tests {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::sync::mpsc;
@@ -1320,7 +1320,7 @@ mod tests {
         use tokio_stream::StreamExt;
 
         use super::*;
-        use crate::plugins::prompt_cache::{PromptCache, PromptCacheConfig};
+        use crate::services::prompt_cache::{PromptCache, PromptCacheConfig};
 
         /// Per-hook invocation counters, shared with the test via `Arc`.
         #[derive(Default)]
@@ -1675,14 +1675,14 @@ mod tests {
 
         // --- orchestrator miss gets instrumented + cache write ---
 
-        /// A [`crate::orchestrator::TurnExecutor`] that returns one canned
+        /// A [`crate::services::orchestrator::TurnExecutor`] that returns one canned
         /// text block, so the orchestrator path can be exercised without
         /// real provider dispatch.
-        #[cfg(feature = "plugin-speculative")]
+        #[cfg(feature = "service-speculative")]
         struct CannedExecutor(&'static str);
 
-        #[cfg(feature = "plugin-speculative")]
-        impl crate::orchestrator::TurnExecutor for CannedExecutor {
+        #[cfg(feature = "service-speculative")]
+        impl crate::services::orchestrator::TurnExecutor for CannedExecutor {
             fn tier_name(&self) -> &'static str {
                 self.0
             }
@@ -1698,10 +1698,10 @@ mod tests {
         /// instrumentation every other dispatch arm uses, so terminal hooks
         /// fire and a complete entry is written. The cache-off and
         /// unconfigured cases stay unwrapped.
-        #[cfg(feature = "plugin-speculative")]
+        #[cfg(feature = "service-speculative")]
         #[tokio::test]
         async fn orchestrator_miss_gets_instrumented_and_writes_cache_entry() {
-            let config = crate::orchestrator::SwappableModelPair {
+            let config = crate::services::orchestrator::SwappableModelPair {
                 fast_provider: ProviderEndpoint::OpenAi,
                 fast_model_id: "fast-model".to_string(),
                 slow_provider: ProviderEndpoint::Anthropic,
@@ -1709,8 +1709,8 @@ mod tests {
                 latency_threshold_ms: 5_000,
                 fallback_on_tool_error: false,
             };
-            let pool = Arc::new(crate::orchestrator::ClientPool::default());
-            let orch = crate::orchestrator::ModelOrchestrator::with_executors(
+            let pool = Arc::new(crate::services::orchestrator::ClientPool::default());
+            let orch = crate::services::orchestrator::ModelOrchestrator::with_executors(
                 config,
                 pool,
                 Arc::new(CannedExecutor("fast")),

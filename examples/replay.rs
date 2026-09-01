@@ -18,7 +18,7 @@
 //! # Run
 //!
 //! ```sh
-//! cargo run --example replay --features provider-llamacpp,plugin-replay
+//! cargo run --example replay --features provider-llamacpp,service-replay
 //! ```
 //!
 //! # Configuration
@@ -29,7 +29,7 @@
 //! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
 //! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
 //!
-//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example replay --features provider-llamacpp,plugin-replay`
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example replay --features provider-llamacpp,service-replay`
 //!
 //! # Output
 //!
@@ -71,12 +71,12 @@
 //!
 //! # Why a service and not a plugin hook?
 //!
-//! `SessionReplay` is not a `CucaPlugin`, so it is constructed and called
-//! directly rather than registered on the builder. Replay drives sessions
-//! instead of observing one: there is no live request to mutate, no arriving
-//! chunk to annotate, and no hook signature that can return a stream. Stage 2
-//! below is the reason the rule exists — a "plugin" that only ever runs when
-//! the caller explicitly asks would be a permanent no-op in the pipeline.
+//! `SessionReplay` is a service, not a `CucaPlugin`, so it is constructed and
+//! called directly rather than registered on the builder. Replay drives
+//! sessions instead of observing one: there is no live request to mutate, no
+//! arriving chunk to annotate, and no hook signature that can return a stream.
+//! Stage 2 below is the reason the rule exists — a "plugin" that only ever runs
+//! when the caller explicitly asks would be a permanent no-op in the pipeline.
 //!
 //! Two documented fidelity gaps also show up here: `ImageBase64` blocks are
 //! never recorded, so replay can never emit one, and a `ToolResult`'s

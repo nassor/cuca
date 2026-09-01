@@ -15,9 +15,9 @@ CUCA is an asynchronous Rust library for LLM backends. It parses multi-modal SSE
 ## Design
 
 - **Explicit provider selection.** `default = []`; compilation fails until you enable at least one `provider-*` feature. Pick `provider-openai` (also for OpenAI-compatible endpoints such as Ollama via a base-URL override), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm`, or `provider-lmstudio`.
-- **Lean dependency boundary.** The core carries wire types and the SSE parser. HTTP, Tokio stream adapters, provider SDK support, and plugin dependencies compile only when their owning provider or plugin feature is enabled.
+- **Lean dependency boundary.** The core carries wire types and the SSE parser. HTTP, Tokio stream adapters, provider SDK support, and plugin or service dependencies compile only when their owning feature is enabled.
 - **Optional per-request thinking.** One effort level, `minimal` to `xhigh`, maps onto each provider's native controls: OpenAI-compatible `reasoning_effort`, Anthropic budget and adaptive modes, Gemini budgets and levels, DeepSeek thinking mode. Providers without a knob ignore it.
-- **Everything is a plugin.** MCP connectors, WASM sandboxing, memory compression and in-memory graph memory, output guardrails, subagent delegation, human approval, web search, skills, telemetry, session logging, deterministic session replay, local response caching, token and cost accounting with budget caps, client-side rate limiting, outbound PII and secret redaction, speculative fast/slow routing, and schema-guided entity extraction are compile-time feature flags.
+- **Plugins observe, services are called.** MCP connectors, WASM sandboxing, memory compression and in-memory graph memory, output guardrails, subagent delegation, human approval, web search, skills, telemetry, session logging, token and cost accounting with budget caps, and outbound PII and secret redaction are compile-time plugin features that hook the request/stream pipeline. Local response caching, schema-guided entity extraction, deterministic session replay, speculative fast/slow routing, and client-side rate limiting are compile-time services: explicit-call, client-level capabilities that never implement the plugin trait.
 
 ## Quick start
 
@@ -118,18 +118,18 @@ Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShel
 - Enable only the provider features you use.
 - The same demo works against any OpenAI-compatible endpoint, such as Ollama, vLLM, or a remote gateway, by switching to `provider-openai` and setting the base URL in `with_base_url` and the model name in `UnifiedRequest::new`; Ollama serves this protocol at `http://localhost:11434/v1` once `ollama serve` is running with a model pulled.
 - LM Studio speaks the same protocol through its own dedicated adapter, `provider-lmstudio`, which already defaults to LM Studio's local server at `http://127.0.0.1:1234/v1`.
-- The repository's `examples/` folder demonstrates the same pattern in five flavors: `cargo run --example llamacpp_gemma --features provider-llamacpp` (plain reply), `stream_all_blocks` (every block type), `custom_plugin` (a counting plugin), `cost_otel` (a priced turn exported to OpenTelemetry, which also needs `plugin-cost,plugin-telemetry`), and `rate_limit` (a paced fan-out of turns through one client-side limiter, which also needs `plugin-rate-limit`). The examples read `CUCA_BASE_URL` and `CUCA_MODEL` from the environment (defaults target a local llama.cpp server), e.g. `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example llamacpp_gemma --features provider-llamacpp` to point at a vLLM server instead.
+- The repository's `examples/` folder demonstrates the same pattern in five flavors: `cargo run --example llamacpp_gemma --features provider-llamacpp` (plain reply), `stream_all_blocks` (every block type), `custom_plugin` (a counting plugin), `cost_otel` (a priced turn exported to OpenTelemetry, which also needs `plugin-cost,plugin-telemetry`), and `rate_limit` (a paced fan-out of turns through one client-side limiter, which also needs `service-rate-limit`). The examples read `CUCA_BASE_URL` and `CUCA_MODEL` from the environment (defaults target a local llama.cpp server), e.g. `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example llamacpp_gemma --features provider-llamacpp` to point at a vLLM server instead.
 
 ### Integration tests (live llama.cpp)
 
-The suite in `tests/` runs server-dependent plugins against a live model server: one file per plugin, sharing the harness in `tests/common/mod.rs`. Each file compiles only when its plugin feature is on, on top of `provider-llamacpp`.
+The suite in `tests/` runs server-dependent plugins and services against a live model server: one file per plugin or service, sharing the harness in `tests/common/mod.rs`. Each file compiles only when its own feature is on, on top of `provider-llamacpp`.
 
 Prerequisites: an OpenAI-compatible server (llama.cpp's `llama-server` serves this natively) with a chat model loaded at `http://127.0.0.1:1234`, no API key. The MCP echo server is embedded in `plugin_mcp.rs`: the test binary re-executes itself with `--mcp-echo-server` and serves an rmcp stdio echo server (no Python needed). On WSL2, `127.0.0.1` may not reach a server on the Windows host; set `CUCA_BASE_URL` to the host address, for example `http://172.25.0.1:1234/v1`.
 
 Runs the same on Linux, macOS and Windows (PowerShell):
 
 ```
-cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory plugin-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry plugin-speculative plugin-session-log plugin-replay plugin-prompt-cache plugin-cost plugin-rate-limit plugin-redaction" -- --nocapture --test-threads=1
+cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit plugin-redaction" -- --nocapture --test-threads=1
 ```
 
 Environment variables:
@@ -137,7 +137,7 @@ Environment variables:
 - `CUCA_BASE_URL`: the OpenAI-compatible base URL; defaults to `http://127.0.0.1:1234/v1`.
 - `CUCA_MODEL`: the model id to exercise; defaults to the first id the server reports.
 - `CUCA_REQUIRE_LIVE`: set to `1` to fail when the server is unreachable; otherwise server-dependent tests print `SKIP: llama.cpp not reachable: ...` and pass.
-- `plugin-speculative`'s live orchestrated-turn test does not read `CUCA_BASE_URL`: its tier executors draw clients from a pool with no base URL configured, so `dispatch_llamacpp` falls back to llama.cpp's own default, `http://127.0.0.1:8080`. That test needs a server reachable there, independent of wherever `CUCA_BASE_URL` points the rest of the suite.
+- `service-speculative`'s live orchestrated-turn test does not read `CUCA_BASE_URL`: its tier executors draw clients from a pool with no base URL configured, so `dispatch_llamacpp` falls back to llama.cpp's own default, `http://127.0.0.1:8080`. That test needs a server reachable there, independent of wherever `CUCA_BASE_URL` points the rest of the suite.
 
 ## License
 

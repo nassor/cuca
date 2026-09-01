@@ -1,15 +1,15 @@
 //! Integration coverage for the client-side rate limiter
-//! (`plugin-rate-limit`), driven end-to-end through
+//! (`service-rate-limit`), driven end-to-end through
 //! `CucaClient::generate_stream`.
 //!
 //! Four of the five tests run against the shared in-process SSE mock server
 //! (`common::spawn_counting_sse_server`), the same choice
-//! `tests/plugin_prompt_cache.rs` documents: dispatch counts, concurrency
+//! `tests/service_prompt_cache.rs` documents: dispatch counts, concurrency
 //! peaks, and pacing wall times cannot be asserted against a real model. The
 //! last test is the live llama.cpp smoke and skips when the server is
 //! unreachable.
 
-#![cfg(all(feature = "provider-llamacpp", feature = "plugin-rate-limit"))]
+#![cfg(all(feature = "provider-llamacpp", feature = "service-rate-limit"))]
 
 mod common;
 

@@ -15,7 +15,7 @@
 //! `env.write_out(ptr: i32, len: i32)`:
 //!
 //! * **Input**: the host writes the raw input bytes into the instance memory
-//!   at the fixed scratch offset [`INPUT_PTR`] (1024) *before* calling `run`,
+//!   at the fixed scratch offset `INPUT_PTR` (1024) *before* calling `run`,
 //!   then calls `run(INPUT_PTR, input.len())`. The guest reads
 //!   `memory[ptr..ptr+len]` for its input. A fixed host-chosen scratch address
 //!   (rather than a guest `alloc` export) keeps the guest contract to exactly

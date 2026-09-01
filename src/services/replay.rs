@@ -1,15 +1,13 @@
-//! Deterministic session replay (`plugin-replay`).
+//! Deterministic session replay (`service-replay`).
 //!
 //! [`SessionReplay`] re-materializes a recorded trajectory as the same
 //! [`AgentResponseStream`] of [`MessageContentBlock`]s a live provider turn
 //! produces, with no network call and no provider dispatch: regression
 //! fixtures, offline eval, and single-stepping the exact block sequence a bug
-//! reproduced on. It is deliberately **not** a
-//! [`CucaPlugin`](crate::plugin::CucaPlugin) — replay *drives* sessions instead
-//! of observing a live one, there is no request to mutate, no arriving chunk to
-//! annotate and no live response to summarize, and no hook signature can return
-//! a stream. Registering it is therefore a compile error rather than an inert
-//! no-op, the same shape `PromptCache` and `EntityExtractionPlugin` use.
+//! reproduced on. An explicit-call service, never a
+//! [`CucaPlugin`](crate::plugin::CucaPlugin) ([`crate::services`] owns that
+//! contract) — replay *drives* sessions instead of observing a live one, and no
+//! hook signature can return a stream.
 //!
 //! # Entry points
 //!
@@ -28,9 +26,9 @@
 //!    [`UnifiedResponse`] shape for consumers written against
 //!    `on_response_complete`'s argument type.
 //!
-//! # Derived edge
+//! # Plugin-tier edge
 //!
-//! `plugin-replay = ["plugin-session-log"]`. Replay reads through
+//! `service-replay = ["plugin-session-log"]`. Replay reads through
 //! [`SessionBackend`], the whole read surface it needs; the session-log module
 //! stays ignorant that replay exists, so the dependency direction is one-way.
 //!
@@ -753,7 +751,7 @@ impl Stream for ReplayStream {
     }
 }
 
-#[cfg(all(test, feature = "plugin-replay"))]
+#[cfg(all(test, feature = "service-replay"))]
 mod tests {
     use super::*;
     use crate::plugins::session_log::InMemoryBackend;

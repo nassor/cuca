@@ -50,7 +50,7 @@ Every reading is an estimate. `UnifiedResponse::prompt_tokens` is always `0` and
 
 `on_response_complete` estimates completion tokens from `res.content`, re-prices the prompt portion at the cache read and write rates when `res.prompt_cache_usage` is present, commits the model's bucket, and observes again. An observer `Err` here is logged and never surfaces; a poisoned ledger lock instead surfaces on the plugin's next `on_request`.
 
-A client-level cache hit (`plugin-prompt-cache`) still runs `on_response_complete` against the replayed response, so a cached turn is still charged: the ledger reads as gross, pre-cache spend.
+A client-level cache hit (`service-prompt-cache`) still runs `on_response_complete` against the replayed response, so a cached turn is still charged: the ledger reads as gross, pre-cache spend.
 
 ## Caps
 

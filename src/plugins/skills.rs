@@ -2,8 +2,8 @@
 //!
 //! [`SkillsPlugin`] implements the "agent skills" concept (reusable
 //! instructions that teach an agent how to perform specific tasks, discovered
-//! during a conversation via tools) in CUCA's everything-is-a-plugin
-//! architecture. Skills are plain `SKILL.md` documents: YAML-ish frontmatter
+//! during a conversation via tools) as a pipeline plugin. Skills are plain
+//! `SKILL.md` documents: YAML-ish frontmatter
 //! with required `name:`/`description:` keys, an instructions body, and an
 //! optional `references/` directory of bundled files. They are loaded either
 //! by scanning a directory for `SKILL.md` subdirectories or by providing them

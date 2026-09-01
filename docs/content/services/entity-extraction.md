@@ -2,7 +2,7 @@
 title = "Entity extraction"
 description = "Schema-guided entity and relationship extraction into a graph delta for the memory plugin's working graph."
 template = "page.html"
-weight = 4
+weight = 1
 +++
 
 # Entity extraction
@@ -11,25 +11,25 @@ weight = 4
 <dt>In one line</dt>
 <dd>Validates model-produced entity and relationship candidates against a declared schema and builds a graph delta.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-entity-extraction</code> feature, which enables <code>plugin-memory</code>.</dd>
+<dd>The <code>service-entity-extraction</code> feature, which enables <code>plugin-memory</code>.</dd>
 <dt>Read this if</dt>
-<dd>You are calling <code>EntityExtractionPlugin::extract</code> or applying its report to a working memory graph.</dd>
+<dd>You are calling <code>EntityExtractor::extract</code> or applying its report to a working memory graph.</dd>
 </dl>
 
 ## Feature edge
 
-`plugin-entity-extraction = ["plugin-memory"]` in `Cargo.toml`: enabling this feature enables `plugin-memory` with it. This is the crate's one cross-plugin feature edge.
+`service-entity-extraction = ["plugin-memory"]` in `Cargo.toml`: enabling this feature enables `plugin-memory` with it. This is one of the crate's two hard service feature edges.
 
 ## Entry types
 
-`EntityExtractionPlugin`, `EntityExtractionSchema`, `EntityTable`, `RelationshipTable`, `PropertyColumn`, `PropertyType`, `EntityReference`, `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionReport`, `EntityExtractionModel`.
+`EntityExtractor`, `EntityExtractionSchema`, `EntityTable`, `RelationshipTable`, `PropertyColumn`, `PropertyType`, `EntityReference`, `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionReport`, `EntityExtractionModel`.
 
 ## Not a `CucaPlugin`
 
-`EntityExtractionPlugin` does not implement `CucaPlugin`. It has no request or stream hooks, so registering it with `register_plugin` is a compile error, not an inert no-op. It is driven by direct calls:
+`EntityExtractor` does not implement `CucaPlugin`. It has no request or stream hooks, so registering it with `register_plugin` is a compile error, not an inert no-op. It is driven by direct calls:
 
-- `EntityExtractionPlugin::extract(source, model)` asks an `EntityExtractionModel` for a candidate, then validates it.
-- `EntityExtractionPlugin::validate_candidate(candidate)` validates a candidate the caller already has.
+- `EntityExtractor::extract(source, model)` asks an `EntityExtractionModel` for a candidate, then validates it.
+- `EntityExtractor::validate_candidate(candidate)` validates a candidate the caller already has.
 
 Both return an `EntityExtractionReport { delta, nodes_accepted, relationships_accepted }`. `delta` is a standalone `MemoryGraph`, not a mutation of any live plugin state; the extraction step never touches a [`MemoryPlugin`](@/plugins/memory.md). Applying the delta is the caller's job, through `MemoryPlugin::merge_graph` with a chosen `MergePolicy`, or `MemoryPlugin::replace_graph` for a wholesale replacement. Dropping the report discards the extraction.
 

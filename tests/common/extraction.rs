@@ -1,11 +1,11 @@
 //! Live entity-extraction adapter and its schema, shared by
-//! `tests/plugin_entity_extraction.rs` and `tests/plugin_combinations.rs`.
+//! `tests/service_entity_extraction.rs` and `tests/plugin_combinations.rs`.
 //!
 //! Integration test binaries can only share code through the `common` module
-//! tree, and the adapter is the one non-trivial piece both the per-plugin
+//! tree, and the adapter is the one non-trivial piece both the per-service
 //! suite and the extraction→memory→prompt combination test need.
 //!
-//! Gated on `plugin-entity-extraction` (which enables `plugin-memory` via
+//! Gated on `service-entity-extraction` (which enables `plugin-memory` via
 //! Cargo), so the rest of `common` stays feature-neutral.
 
 use std::pin::Pin;
@@ -15,8 +15,8 @@ use std::time::Duration;
 use cuca::types::MessageContentBlock;
 use cuca::{
     CandidateEntity, CandidateRelationship, CucaClient, EntityExtractionCandidate,
-    EntityExtractionModel, EntityExtractionPlugin, EntityExtractionSchema, EntityReference,
-    EntityTable, PluginError, PropertyColumn, PropertyType, RelationshipTable, UnifiedRequest,
+    EntityExtractionModel, EntityExtractionSchema, EntityExtractor, EntityReference, EntityTable,
+    PluginError, PropertyColumn, PropertyType, RelationshipTable, UnifiedRequest,
 };
 use tokio_stream::StreamExt;
 
@@ -69,9 +69,9 @@ pub fn org_schema() -> EntityExtractionSchema {
     }
 }
 
-/// [`org_schema`] wrapped in a validated plugin.
-pub fn extraction_plugin() -> EntityExtractionPlugin {
-    EntityExtractionPlugin::new(org_schema()).expect("org-chart schema must validate")
+/// [`org_schema`] wrapped in a validated [`EntityExtractor`].
+pub fn org_extractor() -> EntityExtractor {
+    EntityExtractor::new(org_schema()).expect("org-chart schema must validate")
 }
 
 /// The single-column identity map both entity tables use.

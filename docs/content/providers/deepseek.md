@@ -48,4 +48,4 @@ Two bridge-specific transforms are applied before the Anthropic body is built:
 
 ## See also
 
-[Prompt cache](@/plugins/prompt-cache.md) for the client-owned local response cache, unaffected by the bridge's provider-side prompt-cache restriction.
+[Prompt cache](@/services/prompt-cache.md) for the client-owned local response cache, unaffected by the bridge's provider-side prompt-cache restriction.

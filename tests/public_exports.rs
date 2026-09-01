@@ -35,7 +35,7 @@ fn request_prompt_cache_types_are_root_exported_unconditionally() {
     assert_eq!(usage.read_tokens + usage.write_tokens, 6);
 }
 
-#[cfg(feature = "plugin-prompt-cache")]
+#[cfg(feature = "service-prompt-cache")]
 mod prompt_cache_surface {
     use std::sync::Arc;
     use std::time::Duration;
@@ -118,7 +118,7 @@ mod prompt_cache_surface {
     }
 }
 
-#[cfg(feature = "plugin-rate-limit")]
+#[cfg(feature = "service-rate-limit")]
 mod rate_limit_surface {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -381,7 +381,7 @@ mod cost_otel_bridge_surface {
     }
 }
 
-#[cfg(any(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+#[cfg(any(feature = "plugin-memory", feature = "service-prompt-cache"))]
 mod export_surface {
     use cuca::{
         CUCA_EXPORT_FORMAT, CUCA_EXPORT_VERSION, CucaExport, CucaExportError, GraphExportSection,
@@ -422,7 +422,7 @@ mod export_surface {
 
     /// The combined coordinator report is nameable wherever both components
     /// are compiled.
-    #[cfg(all(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+    #[cfg(all(feature = "plugin-memory", feature = "service-prompt-cache"))]
     #[test]
     fn combined_import_report_is_root_exported() {
         use std::time::Duration;
@@ -451,7 +451,7 @@ mod export_surface {
     }
 }
 
-#[cfg(feature = "plugin-replay")]
+#[cfg(feature = "service-replay")]
 mod replay_surface {
     use std::sync::Arc;
 

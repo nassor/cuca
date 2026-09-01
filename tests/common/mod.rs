@@ -25,9 +25,9 @@ use cuca::{CucaClient, CucaClientBuilder, PluginError, UnifiedRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
 
-/// Live entity-extraction adapter shared by the entity-extraction and
-/// cross-plugin combination suites.
-#[cfg(feature = "plugin-entity-extraction")]
+/// Live entity-extraction adapter shared by the entity-extraction suite and
+/// the cross-capability combination suite.
+#[cfg(feature = "service-entity-extraction")]
 pub mod extraction;
 
 /// Test plugin that rewrites the **first** model-generated chunk of a stream

@@ -106,5 +106,5 @@ completed frame whose `data`, `event` or `id` bytes are not valid UTF-8, which
 becomes `CucaError::SseParse`. Partial lines are never validated, because a
 multi-byte character split across two chunks is not an error, it is Tuesday.
 
-Next page: [Everything is a plugin](@/concepts/plugin-layering.md), which covers
+Next page: [Plugins and services](@/concepts/plugin-layering.md), which covers
 the two stages of the pipeline the parser never sees.

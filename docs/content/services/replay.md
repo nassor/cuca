@@ -2,7 +2,7 @@
 title = "Replay"
 description = "Deterministic re-materialization of a recorded session trajectory as an AgentResponseStream, with no provider dispatch."
 template = "page.html"
-weight = 17
+weight = 4
 +++
 
 # Replay
@@ -11,7 +11,7 @@ weight = 17
 <dt>In one line</dt>
 <dd>Re-materializes a recorded session trajectory as the same AgentResponseStream a live provider turn produces, with no network call.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-replay</code> feature, which pulls in <code>plugin-session-log</code>.</dd>
+<dd>The <code>service-replay</code> feature, which pulls in <code>plugin-session-log</code>.</dd>
 <dt>Read this if</dt>
 <dd>You are replaying a recorded turn for a regression fixture, an offline eval, or a fork-point comparison.</dd>
 </dl>

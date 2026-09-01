@@ -2,7 +2,7 @@
 title = "Speculative"
 description = "The fast/slow model orchestrator: complexity routing, the draft and fallback pipeline, and the client pool."
 template = "page.html"
-weight = 11
+weight = 2
 +++
 
 # Speculative
@@ -11,14 +11,14 @@ weight = 11
 <dt>In one line</dt>
 <dd>Routes a turn to a fast or slow model tier by complexity, drafts speculatively on the fast tier, and falls back to the slow tier on rejection or latency.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-speculative</code> feature and a <code>SwappableModelPair</code>.</dd>
+<dd>The <code>service-speculative</code> feature and a <code>SwappableModelPair</code>.</dd>
 <dt>Read this if</dt>
 <dd>You are attaching a <code>ModelOrchestrator</code> to a client, or tuning its complexity thresholds.</dd>
 </dl>
 
 ## Location
 
-Unlike the other twelve plugin features, `plugin-speculative` has no `src/plugins/` submodule. Its implementation lives in `src/orchestrator.rs`, gated behind the same feature flag.
+`service-speculative` is a service, not a plugin: its implementation lives in `src/services/orchestrator.rs`, gated behind the same feature flag.
 
 ## Entry types
 

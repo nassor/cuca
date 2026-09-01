@@ -1,18 +1,18 @@
-//! Client-owned local response cache (`plugin-prompt-cache`).
+//! Client-owned local response cache (`service-prompt-cache`).
 //!
 //! [`PromptCache`] is a bounded, TTL-and-LRU-evicting cache of complete
 //! `UnifiedRequest` -> `UnifiedResponse` pairs, keyed by the lowercase
-//! SHA-256 hex digest of the effective request
-//! ([`digest_request`]). It is a plain client-level service (see
-//! `CucaClient`), never a `CucaPlugin`: callers compute the lookup key
-//! themselves (after provider selection and every `on_request` hook runs)
-//! and pass it to [`PromptCache::lookup`]; a miss is completed by calling
+//! SHA-256 hex digest of the effective request ([`digest_request`]). It is an
+//! explicit-call service, never a `CucaPlugin` ([`crate::services`] owns that
+//! contract): callers compute the lookup key themselves (after provider
+//! selection and every `on_request` hook runs) and pass it to
+//! [`PromptCache::lookup`]; a miss is completed by calling
 //! [`PromptCache::insert`] once the response finishes.
 //!
 //! # Determinism
 //!
 //! The cache never reads the wall clock directly inside its public methods:
-//! every method goes through the crate-private [`CacheClock`] the instance
+//! every method goes through the crate-private `CacheClock` the instance
 //! was built with (the production instance reads UNIX milliseconds; tests
 //! substitute a deterministic clock). LRU order is tracked independently of
 //! hash-map iteration order via an oldest-first key list (`lru_order`), so

@@ -1,5 +1,5 @@
 //! Deterministic integration coverage for the client-owned prompt cache
-//! (`plugin-prompt-cache`), driven end-to-end through `CucaClient::generate_stream`
+//! (`service-prompt-cache`), driven end-to-end through `CucaClient::generate_stream`
 //! and a local, ephemeral, OpenAI-compatible (llama.cpp) SSE mock server.
 //!
 //! No real provider and no filesystem fixtures: the SSE server is an
@@ -10,7 +10,7 @@
 //! local-mock-server style. No test here reaches the live llama.cpp harness in
 //! `tests/common/mod.rs`; only the shared mock server is used.
 
-#![cfg(all(feature = "provider-llamacpp", feature = "plugin-prompt-cache"))]
+#![cfg(all(feature = "provider-llamacpp", feature = "service-prompt-cache"))]
 
 mod common;
 
@@ -22,8 +22,8 @@ use common::spawn_counting_sse_server;
 use cuca::CucaClient;
 use cuca::error::PluginError;
 use cuca::plugin::CucaPlugin;
-use cuca::plugins::prompt_cache::{PromptCache, PromptCacheConfig};
 use cuca::request::{AgentResponseStream, UnifiedRequest, UnifiedResponse};
+use cuca::services::prompt_cache::{PromptCache, PromptCacheConfig};
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use tokio_stream::StreamExt;
 

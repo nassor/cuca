@@ -55,18 +55,13 @@ jobs:
           - plugin-mcp
           - plugin-sandbox
           - plugin-memory
-          - plugin-entity-extraction
           - plugin-guardrails
           - plugin-subagent
           - plugin-hitl
           - plugin-web-search
           - plugin-skills
           - plugin-telemetry
-          - plugin-speculative
           - plugin-session-log
-          - plugin-replay
-          - plugin-prompt-cache
-          - plugin-rate-limit
           - plugin-cost
           - plugin-redaction
     steps:
@@ -74,28 +69,35 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --no-default-features --features provider-openai,${{ matrix.plugin }}
+  service_solo:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service:
+          - service-entity-extraction
+          - service-speculative
+          - service-replay
+          - service-prompt-cache
+          - service-rate-limit
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --no-default-features --features provider-openai,${{ matrix.service }}
   plugin_layering:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Reverse-edge check
+      - name: Flat-tier check
         run: |
-          # A hit below means a foundational plugin's source references a derived plugin in code
-          # form (a reverse edge in the plugin dependency graph), which compiles undetected in both
-          # the solo and all-features builds.
-          if grep -rnE 'plugins::entity_extraction|plugin-entity-extraction' src/plugins/memory/; then
-            echo "layering violation: plugin-memory must stay ignorant of plugin-entity-extraction"
+          # The plugin tier is flat: prompt-cache, entity-extraction, replay,
+          # speculative, and rate-limit moved out to the service tier, so
+          # nothing under src/plugins/ may name a service -- not a service-*
+          # feature, not a crate::services path, not the plugins:: path one of
+          # those modules used to live at. A cfg(all(...)) reverse edge would
+          # compile undetected in both the solo and all-features builds, so
+          # this has to be caught by inspection.
+          if grep -rnE 'service-|crate::services|plugins::(prompt_cache|entity_extraction|replay|rate_limit)' src/plugins/; then
+            echo "layering violation: no plugin may name a service, in any form"
             exit 1
           fi
-          if grep -rnE 'cfg\(feature = "plugin-speculative"|crate::orchestrator' src/plugins/; then
-            echo "layering violation: no plugin module may cfg-gate on or import the speculative orchestrator"
-            exit 1
-          fi
-          if grep -rnE 'plugins::replay|plugin-replay' src/plugins/session_log.rs; then
-            echo "layering violation: plugin-session-log must stay ignorant of plugin-replay"
-            exit 1
-          fi
-          # plugin-cost is foundational with no derived dependant, so the directory-wide check
-          # above already covers src/plugins/cost.rs; there is no dedicated grep leg for it yet.
-          # A leg of the form `grep -rn 'plugin-<derived>' src/plugins/cost.rs` becomes required
-          # the first time a plugin declares plugin-<derived> = ["plugin-cost", ...].

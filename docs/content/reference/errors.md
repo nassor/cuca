@@ -100,7 +100,7 @@ formats through `Display` because `reqwest::Error` is not `Clone` and
 
 ## `PromptCacheError`
 
-Four variants, gated on `plugin-prompt-cache`. Not a `CucaError` variant, and
+Four variants, gated on `service-prompt-cache`. Not a `CucaError` variant, and
 not convertible to one by a `From` impl: `CucaClient` maps it at the seam,
 sending `Json` to `CucaError::Json` and everything else to `CucaError::Config`.
 
@@ -113,7 +113,7 @@ sending `Json` to `CucaError::Json` and everything else to `CucaError::Config`.
 
 ## `CucaExportError`
 
-Four variants, gated on `plugin-memory` or `plugin-prompt-cache`.
+Four variants, gated on `plugin-memory` or `service-prompt-cache`.
 
 | Variant | Fields | Condition |
 |---|---|---|

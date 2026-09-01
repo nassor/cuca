@@ -1,72 +1,44 @@
 //! Feature-gated plugin implementations.
 //!
 //! Every capability behind a `plugin-*` feature lives in one submodule here;
-//! each submodule's `//!` header is the authority on its hooks, its
-//! bounded-growth policy, and any documented cross-plugin edge. Nothing in
-//! this module is compiled unless its feature is enabled.
+//! each submodule's `//!` header is the authority on its hooks and its
+//! bounded-growth policy. Every module here implements
+//! [`CucaPlugin`](crate::plugin::CucaPlugin) and is driven by the request
+//! pipeline; an explicit-call capability belongs one tier up, in the sibling
+//! service tier, whose module docs own the tier rule. This tier is flat: no
+//! plugin depends on another plugin, and nothing under this directory names a
+//! service in any form — not a feature, not a path, not a doc link — so a
+//! directory-wide grep is a valid reverse-edge check. Nothing in this module is
+//! compiled unless its feature is enabled.
 
-/// OpenTelemetry observability hooks for the request pipeline.
-#[cfg(feature = "plugin-telemetry")]
-pub mod telemetry;
-
-/// JSON Schema output guardrails with bounded retry injection.
-#[cfg(feature = "plugin-guardrails")]
-pub mod guardrails;
-
-/// Context-window compaction plus the working memory graph.
-#[cfg(feature = "plugin-memory")]
-pub mod memory;
-
-/// Schema-validated entity/relationship extraction into a `MemoryGraph` delta
-/// the caller merges into the memory plugin's working graph.
-#[cfg(feature = "plugin-entity-extraction")]
-pub mod entity_extraction;
-
-/// Model Context Protocol client: remote tool discovery and invocation.
-#[cfg(feature = "plugin-mcp")]
-pub mod mcp;
-
-/// WebAssembly code-execution sandbox with fuel, memory, and time bounds.
-#[cfg(feature = "plugin-sandbox")]
-pub mod sandbox;
-
-/// Child subagent delegation with optional Git worktree isolation.
-#[cfg(feature = "plugin-subagent")]
-pub mod subagent;
-
-/// Human-in-the-loop approval interceptors for high-risk tool calls.
-#[cfg(feature = "plugin-hitl")]
-pub mod hitl;
-/// Deterministic re-materialization of a recorded session trajectory as an
-/// `AgentResponseStream`, with no provider dispatch.
-#[cfg(feature = "plugin-replay")]
-pub mod replay;
-/// Append-only session trajectory store and forking.
-#[cfg(feature = "plugin-session-log")]
-pub mod session_log;
-/// Reusable agent skills: SKILL.md instructions discoverable via the
-/// `skill` / `skill_read` / `skill_search` tools (agentskills.io).
-#[cfg(feature = "plugin-skills")]
-pub mod skills;
-/// Provider-backed web search and page extraction tools.
-#[cfg(feature = "plugin-web-search")]
-pub mod web_search;
-
-/// Client-owned local response cache with deterministic effective-request
-/// digesting and bounded LRU/TTL eviction.
-#[cfg(feature = "plugin-prompt-cache")]
-pub mod prompt_cache;
-
-/// Client-side outbound throttle: an integer token bucket over request rate
-/// plus a hard cap on concurrently in-flight turns.
-#[cfg(feature = "plugin-rate-limit")]
-pub mod rate_limit;
-
-/// Outbound PII/secret scrubbing over every text-bearing request field.
-#[cfg(feature = "plugin-redaction")]
-pub mod redaction;
-
-/// Cumulative token/currency ledger with a hard budget cap enforced before
-/// provider dispatch.
+// Deliberately no `///` summary on these declarations, here or in the sibling
+// tier's `mod.rs`. A doc comment written at the declaration site makes rustdoc
+// resolve the *whole* merged doc block -- including the target file's own `//!`
+// header -- in this parent module's scope, where none of a submodule's items are
+// nameable, so every in-module intra-doc link in every header below silently
+// degrades to plain text. Each module's first `//!` line already supplies the
+// summary the module list renders.
 #[cfg(feature = "plugin-cost")]
 pub mod cost;
+#[cfg(feature = "plugin-guardrails")]
+pub mod guardrails;
+#[cfg(feature = "plugin-hitl")]
+pub mod hitl;
+#[cfg(feature = "plugin-mcp")]
+pub mod mcp;
+#[cfg(feature = "plugin-memory")]
+pub mod memory;
+#[cfg(feature = "plugin-redaction")]
+pub mod redaction;
+#[cfg(feature = "plugin-sandbox")]
+pub mod sandbox;
+#[cfg(feature = "plugin-session-log")]
+pub mod session_log;
+#[cfg(feature = "plugin-skills")]
+pub mod skills;
+#[cfg(feature = "plugin-subagent")]
+pub mod subagent;
+#[cfg(feature = "plugin-telemetry")]
+pub mod telemetry;
+#[cfg(feature = "plugin-web-search")]
+pub mod web_search;

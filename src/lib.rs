@@ -1,5 +1,6 @@
 //! CUCA: Compact Universal Client for Agents.
-//! Unified, zero-default, everything-is-a-plugin async LLM client.
+//! Unified, zero-default async LLM client: a pipeline-plugin tier and an
+//! explicit-call service tier over one provider abstraction.
 
 #![forbid(unsafe_code)]
 #[cfg(not(any(
@@ -34,6 +35,11 @@ pub mod plugin;
 /// Feature-gated plugin implementations; one submodule per `plugin-*` feature.
 pub mod plugins;
 
+/// Feature-gated explicit-call capabilities; one submodule per `service-*`
+/// feature. Services are driven by direct method calls and never implement
+/// `CucaPlugin`.
+pub mod services;
+
 /// Client core: builder, client, and the plugin-instrumented stream pipeline.
 pub mod client;
 
@@ -42,7 +48,7 @@ pub(crate) mod provider;
 
 /// Canonical JSON encoding for `serde_json::Value` leaves carried inside
 /// postcard-encoded storage records and digest input.
-#[cfg(any(feature = "plugin-session-log", feature = "plugin-prompt-cache"))]
+#[cfg(any(feature = "plugin-session-log", feature = "service-prompt-cache"))]
 pub(crate) mod canonical;
 
 /// tiktoken-rs encoder resolution shared by the token-counting plugins.
@@ -51,7 +57,7 @@ pub(crate) mod tokenize;
 
 /// Versioned canonical `cuca-export` envelope for memory-graph and
 /// local-response-cache state.
-#[cfg(any(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+#[cfg(any(feature = "plugin-memory", feature = "service-prompt-cache"))]
 pub mod export;
 
 /// The cost ledger to OpenTelemetry bridge: a ready-made `CostObserver` that
@@ -59,29 +65,14 @@ pub mod export;
 #[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
 pub mod cost_otel;
 
-/// Speculative fast/slow model pairing and deterministic complexity routing.
-#[cfg(feature = "plugin-speculative")]
-pub mod orchestrator;
 pub use crate::client::{CucaClient, CucaClientBuilder};
 #[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
 pub use crate::cost_otel::OtelCostObserver;
 pub use crate::error::{CucaError, PluginError};
-#[cfg(any(feature = "plugin-memory", feature = "plugin-prompt-cache"))]
+#[cfg(any(feature = "plugin-memory", feature = "service-prompt-cache"))]
 pub use crate::export::{
     CUCA_EXPORT_FORMAT, CUCA_EXPORT_VERSION, CucaExport, CucaExportError, CucaImportReport,
     GraphExportSection, PromptCacheExportSection,
-};
-#[cfg(feature = "plugin-entity-extraction")]
-pub use crate::plugins::entity_extraction::{
-    CandidateEntity, CandidateRelationship, EntityExtractionCandidate, EntityExtractionModel,
-    EntityExtractionPlugin, EntityExtractionReport, EntityExtractionSchema, EntityReference,
-    EntityTable, PropertyColumn, PropertyType, RelationshipTable,
-};
-
-#[cfg(feature = "plugin-speculative")]
-pub use crate::orchestrator::{
-    ClientPool, Complexity, ComplexityEvaluator, DraftValidator, JsonToolDraftValidator,
-    ModelOrchestrator, SwappableModelPair, TurnExecutor,
 };
 #[cfg(feature = "plugin-cost")]
 pub use crate::plugins::cost::{
@@ -103,23 +94,8 @@ pub use crate::plugins::memory::{
     GraphImportReport, GraphNode, GraphRelationship, GraphSnapshot, MemoryConfig, MemoryGraph,
     MemoryPlugin, MergePolicy, MergeReport, Summarizer, VectorStore,
 };
-#[cfg(feature = "plugin-prompt-cache")]
-pub use crate::plugins::prompt_cache::{
-    PromptCache, PromptCacheConfig, PromptCacheEntry, PromptCacheError, PromptCacheImportReport,
-    PromptCacheSnapshot,
-};
-#[cfg(feature = "plugin-rate-limit")]
-pub use crate::plugins::rate_limit::{
-    RateLimitConfig, RateLimitError, RateLimitObserver, RateLimitPermit, RateLimitUsage,
-    RateLimiter,
-};
 #[cfg(feature = "plugin-redaction")]
 pub use crate::plugins::redaction::{Redacted, RedactionConfig, RedactionPlugin, RedactionRule};
-#[cfg(feature = "plugin-replay")]
-pub use crate::plugins::replay::{
-    ReplayCompletion, ReplayConfig, ReplayNote, ReplayTrajectory, ReplayTurn, ReplayUsage,
-    SessionReplay,
-};
 #[cfg(feature = "plugin-sandbox")]
 pub use crate::plugins::sandbox::{SandboxConfig, SandboxPlugin, SandboxResult};
 #[cfg(feature = "plugin-session-log")]
@@ -141,5 +117,31 @@ pub use crate::plugins::web_search::{
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,
     ThinkingConfig, ThinkingEffort, ThinkingParams, UnifiedRequest, UnifiedResponse,
+};
+#[cfg(feature = "service-entity-extraction")]
+pub use crate::services::entity_extraction::{
+    CandidateEntity, CandidateRelationship, EntityExtractionCandidate, EntityExtractionModel,
+    EntityExtractionReport, EntityExtractionSchema, EntityExtractor, EntityReference, EntityTable,
+    PropertyColumn, PropertyType, RelationshipTable,
+};
+#[cfg(feature = "service-speculative")]
+pub use crate::services::orchestrator::{
+    ClientPool, Complexity, ComplexityEvaluator, DraftValidator, JsonToolDraftValidator,
+    ModelOrchestrator, SwappableModelPair, TurnExecutor,
+};
+#[cfg(feature = "service-prompt-cache")]
+pub use crate::services::prompt_cache::{
+    PromptCache, PromptCacheConfig, PromptCacheEntry, PromptCacheError, PromptCacheImportReport,
+    PromptCacheSnapshot,
+};
+#[cfg(feature = "service-rate-limit")]
+pub use crate::services::rate_limit::{
+    RateLimitConfig, RateLimitError, RateLimitObserver, RateLimitPermit, RateLimitUsage,
+    RateLimiter,
+};
+#[cfg(feature = "service-replay")]
+pub use crate::services::replay::{
+    ReplayCompletion, ReplayConfig, ReplayNote, ReplayTrajectory, ReplayTurn, ReplayUsage,
+    SessionReplay,
 };
 pub use crate::session::{SessionEvent, SessionRecord};

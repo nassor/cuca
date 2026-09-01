@@ -14,7 +14,7 @@
 //! # Run
 //!
 //! ```sh
-//! cargo run --example rate_limit --features provider-llamacpp,plugin-rate-limit
+//! cargo run --example rate_limit --features provider-llamacpp,service-rate-limit
 //! ```
 //!
 //! # Configuration
@@ -25,7 +25,7 @@
 //! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
 //! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
 //!
-//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example rate_limit --features provider-llamacpp,plugin-rate-limit`
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example rate_limit --features provider-llamacpp,service-rate-limit`
 //!
 //! # Output
 //!
@@ -54,12 +54,12 @@
 //! With no server on the base URL, the program prints one line naming the
 //! address and exits successfully.
 //!
-//! # Why a limiter and not a plugin hook?
+//! # Why a service and not a plugin hook?
 //!
-//! `RateLimiter` is not a `CucaPlugin`, so it is passed around rather than
-//! registered on the builder. `CucaPlugin::on_request` is synchronous and
-//! could only reject a request, never pace it, and a hook-acquired permit
-//! would leak on the dispatch-error and early-stream-drop paths. Dropping
+//! `RateLimiter` is a service, not a `CucaPlugin`, so it is passed around rather
+//! than registered on the builder. `CucaPlugin::on_request` is synchronous and
+//! could only reject a request, never pace it, and a hook-acquired permit would
+//! leak on the dispatch-error and early-stream-drop paths. Dropping
 //! `RateLimitPermit` releases the slot on every exit path, which is why the
 //! caller holds it across the drain.
 

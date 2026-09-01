@@ -1,4 +1,4 @@
-//! Client-side outbound throttle (`plugin-rate-limit`): an integer token
+//! Client-side outbound throttle (`service-rate-limit`): an integer token
 //! bucket over request rate, plus a hard cap on concurrently in-flight turns.
 //!
 //! [`RateLimiter`] paces a caller that fans out over
@@ -8,20 +8,19 @@
 //!
 //! # Explicit-call contract
 //!
-//! `RateLimiter` is not a [`CucaPlugin`](crate::plugin::CucaPlugin). It has no
-//! request or stream hooks, so passing it to `register_plugin` is a compile
-//! error rather than an inert registration. The entry points are
+//! An explicit-call service, never a [`CucaPlugin`](crate::plugin::CucaPlugin)
+//! ([`crate::services`] owns that contract). The entry points are
 //! [`RateLimiter::acquire`], [`RateLimiter::try_acquire`], the returned
 //! [`RateLimitPermit`], and [`RateLimiter::usage`].
 //!
-//! The hook shape cannot carry this capability.
+//! Why no hook could carry this capability:
 //! [`CucaPlugin::on_request`](crate::plugin::CucaPlugin::on_request) is
 //! synchronous, so a hook can only reject a request, never pace it. Pacing is
 //! the capability. A hook-acquired concurrency permit also leaks on three real
 //! paths: `generate_stream` returning `Err` after the `on_request` hooks ran,
-//! a consumer dropping the stream before its end, and the speculative arm that
-//! returns the orchestrator stream unwrapped. None of those reach a terminal
-//! hook. An RAII [`RateLimitPermit`] releases on all of them.
+//! a consumer dropping the stream before its end, and the client path that
+//! hands back a stream the top-level instrumentation never wraps. None of those
+//! reach a terminal hook. An RAII [`RateLimitPermit`] releases on all of them.
 //!
 //! # Mandatory hand-off
 //!
@@ -79,7 +78,7 @@
 //! No 429 or `Retry-After` feedback loop. A non-2xx response becomes
 //! [`CucaError::Http`](crate::error::CucaError::Http) inside the provider
 //! adapters and is propagated by `?` before any stream wrapper exists, so no
-//! plugin-visible surface ever sees a status; response headers are never
+//! plugin hook ever sees a status; response headers are never
 //! captured at all. A caller that still hits a 429 widens `interval` or lowers
 //! `max_requests`.
 
@@ -701,7 +700,7 @@ impl RateLimiter {
     }
 }
 
-#[cfg(all(test, feature = "plugin-rate-limit"))]
+#[cfg(all(test, feature = "service-rate-limit"))]
 mod tests {
     use std::sync::atomic::AtomicU64;
 
