@@ -16,13 +16,47 @@ weight = 16
 <dd>You are writing a redaction policy, registering <code>RedactionPlugin</code>, or tracing why a field was or was not scrubbed.</dd>
 </dl>
 
+`RedactionPlugin` scrubs matched secrets and PII out of every text-bearing field of the outbound `UnifiedRequest` in `on_request`, replacing each hit with a `[REDACTED:<kind>]` marker before the request reaches a provider. Rules are entirely caller-authored: `Literal`, `Prefixed`, `EmailLike`, and `DigitRun` cover common leak shapes, and the plugin ships no built-in rule set or heuristic detector. Reach for it to keep API keys, emails, and other caller-known secrets out of a provider's logs and a session-log trajectory.
+
+```rust,name=Scrub a key and an email before dispatch
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, RedactionConfig, RedactionPlugin, RedactionRule, UnifiedRequest};
+
+let redaction = Arc::new(RedactionPlugin::new(RedactionConfig::new(vec![
+    RedactionRule::Prefixed {
+        kind: "api-key".into(),
+        prefix: "sk-".into(),
+        min_len: 8,
+        max_len: 64,
+    },
+    RedactionRule::EmailLike { kind: "email".into() },
+])?)?);
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&redaction) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+let mut req = UnifiedRequest::new("google/gemma-4-e4b")
+    .add_user_message("key sk-live-51H9x0AbCdEfGh, contact ops@example.com");
+redaction.on_request(&mut req)?;
+```
+
+```text,name=Both fields matched before the request left the process
+key [REDACTED:api-key], contact [REDACTED:email]
+```
+
 ## Entry types
 
 `RedactionPlugin`, `RedactionConfig`, `RedactionRule`, `Redacted`.
 
 ## `CucaPlugin`
 
-`RedactionPlugin` implements `CucaPlugin` with the plugin name `"redaction"` and attaches via `register_plugin`, like any other hook plugin. It overrides `on_request` only; `execute_local_tool`, `on_stream_chunk`, and `on_response_complete` take the trait defaults — see *Inbound deferral* below for why `on_stream_chunk` in particular stays a no-op rather than a partial implementation.
+`RedactionPlugin` implements `CucaPlugin` with the plugin name `"redaction"` and attaches via `register_plugin`, like any other hook plugin. It overrides `on_request` only; `execute_local_tool`, `on_stream_chunk`, and `on_response_complete` take the trait defaults: see *Inbound deferral* below for why `on_stream_chunk` in particular stays a no-op rather than a partial implementation.
 
 The single matcher entry point is `RedactionPlugin::scrub_str`, `pub fn scrub_str<'a>(&self, text: &'a str) -> Result<Redacted<'a>, PluginError>`. `on_request` calls it once per scrubbed field, and it is public so a caller can scrub a value before it ever enters a request, or reuse the same compiled policy outside the pipeline entirely. A clean string returns `Redacted { text: Cow::Borrowed(text), count: 0 }` and allocates nothing.
 
@@ -37,7 +71,7 @@ The single matcher entry point is `RedactionPlugin::scrub_str`, `pub fn scrub_st
 | `EmailLike` | A `local@domain.tld`-shaped run: ASCII local part, at least one dot in the domain, no trailing separator | `kind` |
 | `DigitRun` | A run of `min_digits..=max_digits` ASCII digits, optionally interrupted by single `-` or ` ` separators (card / phone / national-ID shapes) | `kind`, `min_digits`, `max_digits` |
 
-Overlapping matches resolve leftmost-longest, breaking ties by policy order — the order `rules` are given in `RedactionConfig::new`.
+Overlapping matches resolve leftmost-longest, breaking ties by policy order: the order `rules` are given in `RedactionConfig::new`.
 
 ## Config
 
@@ -61,8 +95,8 @@ Overlapping matches resolve leftmost-longest, breaking ties by policy order — 
 | Pattern length | `RedactionConfig::MAX_PATTERN_BYTES` (512) | an empty or over-long `Literal::value` / `Prefixed::prefix` |
 | `kind` slug | `RedactionConfig::MAX_KIND_BYTES` (32) | a `kind` that is not a non-empty ASCII `[a-z0-9_-]` slug, or one over the byte cap |
 | Idempotency marker | `RedactionConfig::REDACTION_MARKER` (`"[REDACTED:"`) | a `Literal::value` that contains the marker itself |
-| `Prefixed` range | — | `min_len > max_len` |
-| `DigitRun` range | — | `min_digits == 0`, or `min_digits > max_digits` |
+| `Prefixed` range | n/a | `min_len > max_len` |
+| `DigitRun` range | n/a | `min_digits == 0`, or `min_digits > max_digits` |
 | Match cap | `RedactionConfig::MAX_MATCHES_PER_TEXT` (4096) | `max_matches_per_text == 0`, or over the ceiling |
 
 Rejecting a `Literal::value` that contains `REDACTION_MARKER` is what makes scrubbing idempotent: a caller cannot author a rule that matches the plugin's own replacement token, so a second pass over already-scrubbed text adds no further redactions.
@@ -78,19 +112,19 @@ Rejecting a `Literal::value` that contains `REDACTION_MARKER` is what makes scru
 | `UnifiedMessage::name` | `"message_name"` | scrub the `Some` payload |
 | `ToolDefinition::description` | `"tool_description"` | scrub when `scrub_tool_definitions` is set |
 
-Each redaction emits one `tracing::warn!` under target `cuca::redaction` carrying `kind`, the `field` label, and the message index — never the matched bytes or the surrounding text. The message index is the position in `req.messages`, except for the `tool_description` field, where it is the position in `req.tools` instead.
+Each redaction emits one `tracing::warn!` under target `cuca::redaction` carrying `kind`, the `field` label, and the message index: never the matched bytes or the surrounding text. The message index is the position in `req.messages`, except for the `tool_description` field, where it is the position in `req.tools` instead.
 
 ## Not scrubbed, on purpose
 
 Each omission is a stated decision, not a gap:
 
-- `Thinking::signature` — an optional provider signature authenticating the reasoning; rewriting it invalidates it.
-- `ToolCall::id`, `ToolResult::tool_call_id`, `UnifiedMessage::tool_call_id` — correlation ids; scrubbing them breaks call/result matching.
-- `ToolCall::name`, `ToolDefinition::name` — tool identity; a renamed tool is an unroutable tool.
-- `ToolDefinition::input_schema` — JSON Schema keywords (`const`, `enum`, `pattern`) are the tool's contract; rewriting them silently changes tool semantics. [Guardrails](@/plugins/guardrails.md) validates against these same schemas.
-- `ImageBase64 { media_type, data }` — a literal hit inside base64 is a coincidence, and rewriting the payload corrupts the image.
-- JSON object keys inside `arguments` — part of the tool's input contract, not user data.
-- `req.model`, `req.provider`, `temperature`, `max_tokens`, `stream`, `thinking`, `prompt_cache` — routing/sampling knobs, not text.
+- `Thinking::signature`: an optional provider signature authenticating the reasoning; rewriting it invalidates it.
+- `ToolCall::id`, `ToolResult::tool_call_id`, `UnifiedMessage::tool_call_id`: correlation ids; scrubbing them breaks call/result matching.
+- `ToolCall::name`, `ToolDefinition::name`: tool identity; a renamed tool is an unroutable tool.
+- `ToolDefinition::input_schema`: JSON Schema keywords (`const`, `enum`, `pattern`) are the tool's contract; rewriting them silently changes tool semantics. [Guardrails](@/plugins/guardrails.md) validates against these same schemas.
+- `ImageBase64 { media_type, data }`: a literal hit inside base64 is a coincidence, and rewriting the payload corrupts the image.
+- JSON object keys inside `arguments`: part of the tool's input contract, not user data.
+- `req.model`, `req.provider`, `temperature`, `max_tokens`, `stream`, `thinking`, `prompt_cache`: routing/sampling knobs, not text.
 
 ## Why no regex
 
@@ -106,9 +140,9 @@ Each omission is a stated decision, not a gap:
 
 ## Order observability
 
-The plugin does not require a registration position relative to any other plugin — but its effect is order-observable at two consuming sites, and both orders are legal:
+The plugin does not require a registration position relative to any other plugin, but its effect is order-observable at two consuming sites, and both orders are legal:
 
-- **`plugin-session-log`.** `on_request` hooks run in registration order over one shared request. Registering `RedactionPlugin` before `SessionLogPlugin` means the trajectory stores scrubbed content; registering it after means the log persists the raw value — to disk, if `FileBackend` is in use, where the append-only format never rewrites an existing frame. Model-output records are never scrubbed at any order, because `on_stream_chunk` is deferred.
+- **`plugin-session-log`.** `on_request` hooks run in registration order over one shared request. Registering `RedactionPlugin` before `SessionLogPlugin` means the trajectory stores scrubbed content; registering it after means the log persists the raw value, to disk, if `FileBackend` is in use, where the append-only format never rewrites an existing frame. Model-output records are never scrubbed at any order, because `on_stream_chunk` is deferred.
 - **`service-prompt-cache`.** The digest is computed from the request after every `on_request` hook, so enabling redaction changes every cache key. A snapshot imported from a pre-redaction run is rejected as a digest mismatch by `PromptCache::replace_snapshot`, not silently mismatched.
 
 ## Bounds
@@ -118,18 +152,18 @@ Nothing in this plugin grows with traffic:
 | Structure | Cap | At-cap policy | Usage reading |
 |---|---|---|---|
 | `rules` | `RedactionConfig::MAX_RULES` (256), each pattern `MAX_PATTERN_BYTES` (512), each `kind` `MAX_KIND_BYTES` (32) | fixed at construction; `RedactionConfig::new` / `validate` reject an over-cap or empty policy before any allocation | `rule_count()` |
-| per-call match buffer | `max_matches_per_text`, itself `<= MAX_MATCHES_PER_TEXT` (4096) | checked while pushing, so the buffer never exceeds the cap; over the cap the call returns `PluginError::HookFailure` and `on_request` refuses the whole turn before dispatch. This refusal is not atomic at the request level — fields scrubbed earlier in the same pass stay scrubbed in memory — but the mutated request never reaches a provider either way | `match_cap()` |
+| per-call match buffer | `max_matches_per_text`, itself `<= MAX_MATCHES_PER_TEXT` (4096) | checked while pushing, so the buffer never exceeds the cap; over the cap the call returns `PluginError::HookFailure` and `on_request` refuses the whole turn before dispatch. This refusal is not atomic at the request level: fields scrubbed earlier in the same pass stay scrubbed in memory, but the mutated request never reaches a provider either way | `match_cap()` |
 | stats | fixed: two `u64` counters plus one most-recent `(kind, field, count)` tuple | the event slot is replaced, never appended; the total uses `saturating_add` | `last_request_redactions()`, `total_redactions()`, `last_redaction_event()` |
-| `ToolCall::arguments` recursion | `RedactionConfig::MAX_JSON_DEPTH` (64) stack frames | a depth pre-pass walks the value before any rewrite, so exceeding the cap returns `PluginError::HookFailure` atomically — no partially-rewritten `arguments` — with no unbounded recursion on an adversarially nested `serde_json::Value` | n/a (per-call) |
+| `ToolCall::arguments` recursion | `RedactionConfig::MAX_JSON_DEPTH` (64) stack frames | a depth pre-pass walks the value before any rewrite, so exceeding the cap returns `PluginError::HookFailure` atomically, no partially-rewritten `arguments`, with no unbounded recursion on an adversarially nested `serde_json::Value` | n/a (per-call) |
 
-Searchers and replacement tokens are built once in `RedactionPlugin::new`; there is no per-request searcher construction. A clean string allocates nothing — `scrub_str` hands back a `Cow::Borrowed` and neither per-call buffer is ever pushed to. A dirty string allocates one output `String`, sized exactly from the input length and the net replacement delta, plus the bounded match buffer and one `rules.len()`-entry candidate cache that keeps the scan linear in the input instead of re-searching every rule after every replacement. Both cap-adjacent conditions are hard, loud errors rather than truncation: the request is always refused before dispatch rather than crossing the wire partially scrubbed, whether or not the in-memory `UnifiedRequest` was partially mutated first.
+Searchers and replacement tokens are built once in `RedactionPlugin::new`; there is no per-request searcher construction. A clean string allocates nothing: `scrub_str` hands back a `Cow::Borrowed` and neither per-call buffer is ever pushed to. A dirty string allocates one output `String`, sized exactly from the input length and the net replacement delta, plus the bounded match buffer and one `rules.len()`-entry candidate cache that keeps the scan linear in the input instead of re-searching every rule after every replacement. Both cap-adjacent conditions are hard, loud errors rather than truncation: the request is always refused before dispatch rather than crossing the wire partially scrubbed, whether or not the in-memory `UnifiedRequest` was partially mutated first.
 
 ## Non-guarantees
 
 - **It is a byte matcher, not a classifier.** An unlisted secret shape crosses the wire; there is no heuristic "looks like a secret" detector.
 - **No built-in rule set.** `rules` must be non-empty and every rule is caller-authored, so a false positive (`DigitRun` eating an order number, for example) is a policy the caller wrote and can see in the `tracing` event.
 - **It does not encrypt, and it does not redact anything already persisted or exported.** Redaction happens upstream of storage; it is not an export-time guarantee.
-- **The tracing event never carries the matched value** — only `kind`, the field label, and the message index.
+- **The tracing event never carries the matched value**: only `kind`, the field label, and the message index.
 
 ## Registering it
 
@@ -154,7 +188,7 @@ let client = CucaClient::builder()
 
 ## Try it
 
-`examples/redaction.rs` runs one client through one turn against a four-rule caller-authored policy: a `Literal` deploy key, a `Prefixed` `sk-` API key, an `EmailLike` email, and a `DigitRun` card number, all fake. Five stages print in order: the compiled policy (`rule_count()`, `match_cap()`); two direct `scrub_str` calls on a clean and a dirty sample, each reporting its match count and whether the result was `Cow::Borrowed` (nothing allocated) or `Cow::Owned` (one rewritten `String`); the seeded prompt before and after, with a `wire:` line showing all four values replaced by their `[REDACTED:<kind>]` markers; the streamed reply; and the counters afterward — `last_request_redactions()` and `total_redactions()` both reach `4`, and `last_redaction_event()` names the last kind matched. The example never prints a matched value from the plugin's own reporting path; the `Literal` rule is described by byte length, not value. With no server reachable, the policy and both `scrub_str` results still print before the run exits.
+`examples/redaction.rs` runs one client through one turn against a four-rule caller-authored policy: a `Literal` deploy key, a `Prefixed` `sk-` API key, an `EmailLike` email, and a `DigitRun` card number, all fake. Five stages print in order: the compiled policy (`rule_count()`, `match_cap()`); two direct `scrub_str` calls on a clean and a dirty sample, each reporting its match count and whether the result was `Cow::Borrowed` (nothing allocated) or `Cow::Owned` (one rewritten `String`); the seeded prompt before and after, with a `wire:` line showing all four values replaced by their `[REDACTED:<kind>]` markers; the streamed reply; and the counters afterward: `last_request_redactions()` and `total_redactions()` both reach `4`, and `last_redaction_event()` names the last kind matched. The example never prints a matched value from the plugin's own reporting path; the `Literal` rule is described by byte length, not value. With no server reachable, the policy and both `scrub_str` results still print before the run exits.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example redaction --features "provider-llamacpp plugin-redaction"

@@ -16,6 +16,45 @@ weight = 7
 <dd>You are registering <code>HitlPlugin</code> or implementing an <code>ApprovalChannel</code>.</dd>
 </dl>
 
+`HitlPlugin` classifies streamed tool calls by risk, keyword-matching the tool name against shell/exec, file-write, and external-API-write groups, and pauses a `Risk::High` call on a caller-supplied `ApprovalChannel` before it executes. A channel that cannot reach an approver must return `Denied`, so a lost round trip never lets a tool run. Reach for it to put a human, or an automated policy, between the model and a destructive tool call.
+
+```rust,name=Gate a shell call behind an approval channel
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{ApprovalChannel, ApprovalDecision, ApprovalRequest, CucaClient, HitlPlugin};
+use serde_json::json;
+
+struct AutoApprove;
+
+impl ApprovalChannel for AutoApprove {
+    fn request_approval(&self, _req: &ApprovalRequest) -> ApprovalDecision {
+        ApprovalDecision::Approved
+    }
+}
+
+let hitl = Arc::new(HitlPlugin::new(Arc::new(AutoApprove)));
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&hitl) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+let mut call = MessageContentBlock::ToolCall {
+    id: "call-1".into(),
+    name: "shell_exec".into(),
+    arguments: json!({"cmd": "ls"}),
+};
+hitl.on_stream_chunk(&mut call)?;
+```
+
+```text,name=Approved so the call streams through unchanged
+ToolCall { id: "call-1", name: "shell_exec", arguments: {"cmd": "ls"} }
+hitl.audit_len()   1
+```
+
 ## Entry types
 
 `HitlPlugin`, `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `OneshotApprovalChannel`, `Risk`, `HitlAuditEntry`.

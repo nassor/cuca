@@ -16,6 +16,30 @@ weight = 10
 <dd>You are registering <code>OpenTelemetryPlugin</code> or wiring its metrics into an exporter.</dd>
 </dl>
 
+`OpenTelemetryPlugin` records request, streamed-token, and latency metrics onto a caller-supplied OpenTelemetry meter provider, and logs request dispatch and completion through `tracing`. It installs no meter provider of its own, so it composes with whatever exporter pipeline the caller already runs. Reach for it to get request-rate, token, and latency dashboards without hand-rolling the counters.
+
+```rust,name=Wire the three instruments onto a meter provider
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, OpenTelemetryPlugin};
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+
+let meter_provider = SdkMeterProvider::builder().build();
+let otel = Arc::new(OpenTelemetryPlugin::new(&meter_provider));
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&otel) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+// Every dispatched request now increments cuca_requests_total by 1 and
+// records one cuca_request_duration_seconds sample under the "cuca_client"
+// meter; see Instruments below for the full set.
+```
+
 ## Entry types
 
 `OpenTelemetryPlugin`.

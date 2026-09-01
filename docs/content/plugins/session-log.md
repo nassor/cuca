@@ -16,6 +16,36 @@ weight = 12
 <dd>You are registering <code>SessionLogPlugin</code>, choosing a <code>SessionBackend</code>, or forking a session.</dd>
 </dl>
 
+`SessionLogPlugin` records every request, streamed block, and completion as an append-only `SessionEvent`, writing to the session named by `with_session_id` (default `"default"`). `InMemoryBackend` (capped) and `FileBackend` (COBS-framed, disk-bound) are the two storage seams, and `fork_session` branches a new session from any historical point. Reach for it to build a replayable audit trail, or to fork a conversation at a known point.
+
+```rust,name=Record a turn and replay it back
+use std::sync::Arc;
+
+use cuca::plugin::{CucaPlugin, SessionStorePlugin};
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, SessionLogPlugin, UnifiedRequest};
+
+let session_log = Arc::new(SessionLogPlugin::new_in_memory());
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&session_log) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+let mut req = UnifiedRequest::new("google/gemma-4-e4b").add_system_message("You are concise.");
+session_log.on_request(&mut req)?;
+let mut chunk = MessageContentBlock::Text("hello".to_string());
+session_log.on_stream_chunk(&mut chunk)?;
+let records = session_log.replay_session("default")?;
+```
+
+```text,name=One SystemPrompt record plus one Output record
+records.len()               2
+records[0].point_id()       "default:0"
+records[1].point_id()       "default:1"
+```
+
 ## Entry types
 
 `SessionLogPlugin`, `SessionBackend`, `InMemoryBackend`, `FileBackend`.

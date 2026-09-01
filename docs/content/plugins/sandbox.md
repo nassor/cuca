@@ -16,6 +16,40 @@ weight = 2
 <dd>You are registering <code>SandboxPlugin</code>, writing a guest module, or sizing its resource limits.</dd>
 </dl>
 
+`SandboxPlugin` runs model-generated WebAssembly in a fresh, memory-confined wasmtime store per call: the guest exports `memory` and `run(ptr, len) -> i32`, may import `env.write_out`, and the plugin hands its collected output back as a `ToolResult` for `run_code`/`sandbox_exec` tool calls. Every call is bounded by `max_memory_bytes`, a fuel-based `max_instructions`, and a wall-clock `timeout_ms` enforced by epoch interruption. Reach for it to let a model execute short sandboxed logic instead of looping through JSON tool calls.
+
+```rust,name=Run a guest module that echoes its input
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, SandboxConfig, SandboxPlugin};
+
+const ECHO_WAT: &str = r#"
+(module
+  (import "env" "write_out" (func $write_out (param i32 i32)))
+  (memory (export "memory") 1)
+  (func (export "run") (param $ptr i32) (param $len i32) (result i32)
+    (call $write_out (local.get $ptr) (local.get $len))
+    (i32.const 0)))
+"#;
+
+let sandbox = Arc::new(SandboxPlugin::new(SandboxConfig::default()));
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&sandbox) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+let result = sandbox.run(ECHO_WAT.as_bytes(), b"hello sandbox")?;
+```
+
+```text,name=The guest wrote its input straight back out
+result.stdout               b"hello sandbox"
+result.memory_bytes_used    65536
+```
+
 ## Entry types
 
 `SandboxPlugin`, `SandboxConfig`, `SandboxResult`.

@@ -16,9 +16,49 @@ weight = 2
 <dd>You are attaching a <code>ModelOrchestrator</code> to a client, or tuning its complexity thresholds.</dd>
 </dl>
 
-## Location
+`ModelOrchestrator` pairs a fast, low-latency model with a slow, high-capacity one and picks a tier per turn. A deterministic `ComplexityEvaluator` routes the request, the fast tier streams a speculative draft, and a rejected block or a missed latency deadline moves the remainder of the turn to the slow tier. Reach for it when most turns are cheap routing or parameter extraction and only some need the large model.
 
-`service-speculative` is a service, not a plugin: its implementation lives in `src/services/orchestrator.rs`, gated behind the same feature flag.
+```rust,name=Route a turn across a fast and a slow tier
+use std::sync::Arc;
+
+use cuca::types::ProviderEndpoint;
+use cuca::{ClientPool, CucaClient, ModelOrchestrator, SwappableModelPair, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let pool = Arc::new(ClientPool::new());
+let orchestrator = ModelOrchestrator::new(
+    SwappableModelPair {
+        fast_provider: ProviderEndpoint::LlamaCpp,
+        fast_model_id: "google/gemma-4-e4b".to_string(),
+        slow_provider: ProviderEndpoint::LlamaCpp,
+        slow_model_id: "qwen3-coder-30b".to_string(),
+        latency_threshold_ms: 800,
+        fallback_on_tool_error: true,
+    },
+    Arc::clone(&pool),
+)
+.with_endpoint("http://127.0.0.1:1234/v1", None);
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_orchestrator(orchestrator)
+    .build()?;
+
+// The tier executor overwrites `model` with the routed tier's model id.
+let mut stream = client
+    .generate_stream(UnifiedRequest::new("google/gemma-4-e4b").add_user_message("Say ok."))
+    .await?;
+while let Some(block) = stream.next().await {
+    let _ = block?;
+}
+
+// Both tiers share one (provider, base_url) key, so the pool holds one client.
+println!("pooled clients: {}", pool.len());
+```
+
+```text,name=Expected output
+pooled clients: 1
+```
 
 ## Entry types
 
@@ -26,7 +66,7 @@ weight = 2
 
 ## Attaching
 
-`ModelOrchestrator` is not a `CucaPlugin`. It is attached with `CucaClientBuilder::with_orchestrator(orchestrator)`. When one is attached, `CucaClient::generate_stream` runs `on_request` hooks as usual, then hands the whole turn to `ModelOrchestrator::execute_adaptive_turn` instead of dispatching to a provider adapter directly.
+Attached with `CucaClientBuilder::with_orchestrator(orchestrator)`. When one is attached, `CucaClient::generate_stream` runs `on_request` hooks as usual, then hands the whole turn to `ModelOrchestrator::execute_adaptive_turn` instead of dispatching to a provider adapter directly.
 
 ## `SwappableModelPair`
 

@@ -16,6 +16,46 @@ weight = 14
 <dd>You are registering <code>CostPlugin</code>, setting a budget cap, or reading its per-model spend.</dd>
 </dl>
 
+`CostPlugin` estimates prompt and completion tokens with tiktoken, prices them against a caller-supplied `PricingTable`, and refuses a turn in `on_request` once the projected spend would cross `max_total_tokens` or `max_total_micros`. Every reading is an estimate: no provider adapter parses an upstream `usage` object into `UnifiedResponse::prompt_tokens`, so this plugin is the crate's only token and spend ledger. Reach for it to enforce a budget cap or to read per-model spend without an upstream billing API.
+
+```rust,name=Charge a turn against a priced model
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::ProviderEndpoint;
+use cuca::{CostConfig, CostPlugin, CucaClient, ModelRates, PricingTable, UnifiedRequest};
+
+let cost = Arc::new(CostPlugin::new(CostConfig {
+    pricing: PricingTable::new().with_model(
+        "google/gemma-4-e4b",
+        ModelRates {
+            input_micros_per_mtok: 3_000_000,
+            output_micros_per_mtok: 15_000_000,
+            ..Default::default()
+        },
+    ),
+    max_total_tokens: Some(50_000),
+    ..Default::default()
+})?);
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&cost) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+let mut req = UnifiedRequest::new("google/gemma-4-e4b")
+    .add_system_message("You are concise.")
+    .add_user_message("Explain CUCA in one sentence.");
+cost.on_request(&mut req)?;
+let usage = cost.usage()?;
+```
+
+```text,name=One estimated turn against the rate table above
+usage.prompt_tokens   16
+usage.spent_micros    48
+```
+
 ## Entry types
 
 `CostPlugin`, `CostConfig`, `CostUsage`, `CostEntry`, `CostObserver`, `PricingTable`, `PricingResolver`, `ModelRates`, `UnpricedModelPolicy`.

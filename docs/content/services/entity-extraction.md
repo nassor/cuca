@@ -16,6 +16,56 @@ weight = 1
 <dd>You are calling <code>EntityExtractor::extract</code> or applying its report to a working memory graph.</dd>
 </dl>
 
+`EntityExtractor` validates model-produced entity and relationship rows against a schema you declare up front, then builds the accepted rows into a graph delta. It is driven by direct calls: `extract(source, model)` asks an `EntityExtractionModel` for a candidate and validates it, and `validate_candidate(candidate)` validates a candidate you already hold. Both return an `EntityExtractionReport { delta, nodes_accepted, relationships_accepted }` whose `delta` is a standalone `MemoryGraph`, never a mutation of live plugin state. Reach for it when a model should populate a [`MemoryPlugin`](@/plugins/memory.md) working graph under a declared contract instead of free-form text.
+
+```rust,name=Validate a candidate and merge its delta
+use cuca::{
+    CandidateEntity, EntityExtractionCandidate, EntityExtractionSchema, EntityExtractor,
+    EntityTable, MemoryConfig, MemoryPlugin, MergePolicy, PropertyColumn, PropertyType,
+};
+
+let extractor = EntityExtractor::new(EntityExtractionSchema {
+    name: "contacts".into(),
+    entities: vec![EntityTable {
+        name: "person".into(),
+        labels: vec!["Person".into()],
+        identity_columns: vec!["email".into()],
+        columns: vec![PropertyColumn {
+            name: "email".into(),
+            property_type: PropertyType::String,
+            required: true,
+        }],
+        allow_model_properties: false,
+    }],
+    relationships: vec![],
+})?;
+
+let report = extractor.validate_candidate(EntityExtractionCandidate {
+    entities: vec![CandidateEntity {
+        table: "person".into(),
+        properties: [("email".to_string(), serde_json::json!("ada@example.com"))]
+            .into_iter()
+            .collect(),
+    }],
+    relationships: vec![],
+})?;
+println!(
+    "{} node(s), {} relationship(s)",
+    report.nodes_accepted, report.relationships_accepted
+);
+
+// The delta is inert until it is applied, and dropping the report discards
+// the extraction. `MemoryPlugin::replace_graph` swaps the graph wholesale.
+let memory = MemoryPlugin::new(MemoryConfig::default())?;
+let merged = memory.merge_graph(report.delta, MergePolicy::Overwrite)?;
+println!("{} node(s) added", merged.nodes_added);
+```
+
+```text,name=Expected output
+1 node(s), 0 relationship(s)
+1 node(s) added
+```
+
 ## Feature edge
 
 `service-entity-extraction = ["plugin-memory"]` in `Cargo.toml`: enabling this feature enables `plugin-memory` with it. This is one of the crate's two hard service feature edges.
@@ -23,15 +73,6 @@ weight = 1
 ## Entry types
 
 `EntityExtractor`, `EntityExtractionSchema`, `EntityTable`, `RelationshipTable`, `PropertyColumn`, `PropertyType`, `EntityReference`, `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionReport`, `EntityExtractionModel`.
-
-## Not a `CucaPlugin`
-
-`EntityExtractor` does not implement `CucaPlugin`. It has no request or stream hooks, so registering it with `register_plugin` is a compile error, not an inert no-op. It is driven by direct calls:
-
-- `EntityExtractor::extract(source, model)` asks an `EntityExtractionModel` for a candidate, then validates it.
-- `EntityExtractor::validate_candidate(candidate)` validates a candidate the caller already has.
-
-Both return an `EntityExtractionReport { delta, nodes_accepted, relationships_accepted }`. `delta` is a standalone `MemoryGraph`, not a mutation of any live plugin state; the extraction step never touches a [`MemoryPlugin`](@/plugins/memory.md). Applying the delta is the caller's job, through `MemoryPlugin::merge_graph` with a chosen `MergePolicy`, or `MemoryPlugin::replace_graph` for a wholesale replacement. Dropping the report discards the extraction.
 
 ## Schema
 

@@ -27,9 +27,7 @@ kicker = "Reference"
 | [`service-speculative`](@/services/speculative.md) | `ModelOrchestrator` | `with_orchestrator` | `plugin-session-log`, documented-optional |
 | [`service-rate-limit`](@/services/rate-limit.md) | `RateLimiter` | direct calls only | none |
 
-None of the five implements `CucaPlugin`. `register_plugin` on any of them is a
-compile error, not an inert no-op: the reasoning for each, and the mechanical
-difference between explicit-call and pipeline-replacement, is in
+The mechanical difference between explicit-call and pipeline-replacement is in
 [Plugins and services](@/concepts/plugin-layering.md).
 
 ## Depending on the plugin tier

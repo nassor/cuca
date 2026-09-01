@@ -1,6 +1,6 @@
 +++
 title = "Rate limit"
-description = "The client-side outbound throttle: an integer token bucket over request rate plus a concurrency cap, and why it is a service rather than a CucaPlugin."
+description = "The client-side outbound throttle: an integer token bucket over request rate, a concurrency cap, and the permit that holds a slot for a whole turn."
 template = "page.html"
 weight = 5
 +++
@@ -16,22 +16,48 @@ weight = 5
 <dd>You are calling <code>RateLimiter::acquire</code> or <code>try_acquire</code> around <code>CucaClient::generate_stream</code>.</dd>
 </dl>
 
+`RateLimiter` paces outbound turns from the caller's side: an integer token bucket over request rate plus a hard cap on turns in flight. `acquire()` waits for a concurrency slot and then a token, up to `RateLimitConfig::max_wait`; `try_acquire()` takes both or fails at once, with no waiting and no Tokio reactor; `usage()` reads a cheap `RateLimitUsage` gauge. Reach for it when a fan-out over `CucaClient::generate_stream` has to stay inside a provider's quota.
+
+```rust,name=Pace one turn through a shared limiter
+use std::sync::Arc;
+use std::time::Duration;
+
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, RateLimitConfig, RateLimiter, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let limiter = Arc::new(RateLimiter::new(
+    RateLimitConfig::new(60, Duration::from_secs(60), 4, 128)?,
+)?);
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .build()?;
+
+// Hold the permit for the whole turn: dispatch and drain.
+let permit = limiter.acquire().await?;
+let usage = limiter.usage()?;
+println!(
+    "tokens={} in_flight={} waiting={}",
+    usage.available_tokens, usage.in_flight, usage.waiting
+);
+
+let mut stream = client
+    .generate_stream(UnifiedRequest::new("google/gemma-4-e4b").add_user_message("Say ok."))
+    .await?;
+while let Some(block) = stream.next().await {
+    let _ = block?;
+}
+drop(permit);
+```
+
+```text,name=Expected output with the permit still held
+tokens=59 in_flight=1 waiting=0
+```
+
 ## Entry types
 
 `RateLimiter`, `RateLimitConfig`, `RateLimitPermit`, `RateLimitUsage`, `RateLimitObserver`, `RateLimitError`.
-
-## Not a `CucaPlugin`
-
-`RateLimiter` does not implement `CucaPlugin`. Registering it with `register_plugin` is a compile error, not an inert no-op, because it has no request or stream hooks. Two things about the pipeline rule this shape out:
-
-- `on_request` is synchronous — `fn on_request(&self, _req: &mut UnifiedRequest) -> Result<(), PluginError>`, no `async`, no `.await` — so a hook can only reject a request fast; it can never pace one. Pacing, waiting for a token or a free concurrency slot, is the entire capability.
-- Acquiring a concurrency permit in `on_request` and releasing it in `on_response_complete` leaks the permit on three real paths: a dispatch error returned after the request hooks already ran (no stream is ever built, so no terminal hook fires), a consumer dropping the stream before it ends (the terminal hooks run only in `PluginStream`'s `Poll::Ready(None)` arm), and the speculative fast/slow orchestrator's unwrapped stream (documented as never running the client's top-level `on_response_complete`). An RAII `RateLimitPermit` has none of these holes, because `Drop` runs on every one of those exits, including a panic or an early `?`.
-
-It is driven by direct calls instead:
-
-- `RateLimiter::acquire()` waits for a slot and a token, up to `RateLimitConfig::max_wait`.
-- `RateLimiter::try_acquire()` succeeds only if a slot and a whole token are both free right now; no waiting, no Tokio reactor involvement.
-- `RateLimiter::usage()` reads a cheap `RateLimitUsage` gauge.
 
 ## Config
 
@@ -50,21 +76,9 @@ It is driven by direct calls instead:
 
 ## The acquire, dispatch, drain, drop hand-off
 
-Hold the permit for the whole turn, not just the call that starts it. Dropping it before the stream is drained under-counts concurrency, because the slot is what actually comes back on drop; the token stays spent:
+Hold the permit for the whole turn, not just the call that starts it. Dropping it before the stream is drained under-counts concurrency, because the slot is what actually comes back on drop; the token stays spent.
 
-```rust,name=Pace one turn through a shared limiter
-let limiter = Arc::new(RateLimiter::new(
-    RateLimitConfig::new(60, Duration::from_secs(60), 4, 128)?,
-)?);
-
-// Hold the permit for the whole turn: dispatch *and* drain.
-let permit = limiter.acquire().await?;
-let mut stream = client.generate_stream(request).await?;
-while let Some(block) = stream.next().await { /* … */ }
-drop(permit);
-```
-
-`acquire` waits for a slot before it waits for a token, on purpose: a caller that gives up waiting for a slot has spent no quota, and the number of parked callers is already bounded by `max_concurrent + max_waiters` together. Share one `RateLimiter` behind that `Arc` across every task dispatching to the same throttled provider; both `RateLimiter` and `RateLimitPermit` are `Send + Sync`.
+`acquire` waits for a slot before it waits for a token, on purpose: a caller that gives up waiting for a slot has spent no quota, and the number of parked callers is already bounded by `max_concurrent + max_waiters` together. Share one `RateLimiter` behind an `Arc` across every task dispatching to the same throttled provider; both `RateLimiter` and `RateLimitPermit` are `Send + Sync`.
 
 ## Try it
 

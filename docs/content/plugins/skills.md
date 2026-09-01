@@ -16,6 +16,40 @@ weight = 9
 <dd>You are registering <code>SkillsPlugin</code> or authoring a <code>SKILL.md</code> file.</dd>
 </dl>
 
+`SkillsPlugin` loads reusable `SKILL.md` instructions, either from a directory of `SKILL.md` subdirectories or provided inline, and resolves the `skill`, `skill_read`, and `skill_search` tool calls a model issues against them. When `inject_catalog` is set (the default), `on_request` appends a system message naming the three tools and listing every loaded skill's name and description. Reach for it to give a model a discoverable library of task-specific instructions without hand-writing them into every system prompt.
+
+```rust,name=Load one inline skill and answer a skill tool call
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, Skill, SkillsPlugin};
+use serde_json::json;
+
+let skills = Arc::new(SkillsPlugin::inline(vec![Skill::inline(
+    "math",
+    "Solve arithmetic problems",
+    "Add, subtract, multiply and divide exactly as asked.",
+)]));
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&skills) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+let mut call = MessageContentBlock::ToolCall {
+    id: "c1".into(),
+    name: "skill".into(),
+    arguments: json!({ "name": "math" }),
+};
+skills.on_stream_chunk(&mut call)?;
+```
+
+```text,name=The tool call resolves to the skill's instructions
+ToolResult { tool_call_id: "c1", output: "{\"description\":\"Solve arithmetic problems\",\"instructions\":\"Add, subtract, multiply and divide exactly as asked.\",\"name\":\"math\",\"references\":[]}" }
+```
+
 ## Entry types
 
 `SkillsPlugin`, `SkillsConfig`, `Skill`.

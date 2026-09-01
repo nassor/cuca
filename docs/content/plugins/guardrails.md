@@ -16,6 +16,45 @@ weight = 5
 <dd>You are registering <code>JsonGuardrailPlugin</code> or reading its retry behavior.</dd>
 </dl>
 
+`JsonGuardrailPlugin` validates tool call arguments, and optionally model text responses, against caller-registered JSON Schemas as blocks stream in. A failing value is not an error: the plugin replaces the block with a `ToolResult` diagnostic and re-injects it so the model can retry, bounded by `max_attempts` before it emits `"guardrail_exhausted"`. Reach for it to keep a model's structured tool calls honest against a schema without hand-writing retry logic.
+
+```rust,name=Reject a tool call missing a required field
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, JsonGuardrailPlugin};
+use serde_json::json;
+
+let schemas = HashMap::from([(
+    "make_reservation".to_string(),
+    json!({
+        "type": "object",
+        "required": ["date"],
+        "properties": { "date": { "type": "string" } }
+    }),
+)]);
+let guardrails = Arc::new(JsonGuardrailPlugin::with_schemas(schemas, 3)?);
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&guardrails) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+let mut call = MessageContentBlock::ToolCall {
+    id: "call-1".into(),
+    name: "make_reservation".into(),
+    arguments: json!({}),
+};
+guardrails.on_stream_chunk(&mut call)?;
+```
+
+```text,name=The missing date field re-injects a diagnostic
+ToolResult { tool_call_id: "call-1", output: "{\"error\":\"schema_validation_failed\",\"issues\":[\"\\\"date\\\" is a required property\"],\"tool\":\"make_reservation\"}" }
+```
+
 ## Entry types
 
 `JsonGuardrailPlugin`.

@@ -16,13 +16,48 @@ weight = 3
 <dd>You are configuring a client-level cache or exporting and importing its state.</dd>
 </dl>
 
+`PromptCache` stores complete `UnifiedRequest` to `UnifiedResponse` pairs on the client, bounded by a capacity and a time-to-live. Attach it with `CucaClientBuilder::with_prompt_cache_config(config)` for a client-private cache, or `with_prompt_cache_service(service)` to share one `Arc<PromptCache>` between clients. `CucaClient::generate_stream` then looks up after every `on_request` hook and before provider dispatch, and writes an entry back only after a fully successful stream. Reach for it when identical turns repeat and should skip the provider entirely.
+
+```rust,name=Serve a repeated turn from the client cache
+use std::time::Duration;
+
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, PromptCacheConfig, UnifiedRequest};
+use tokio_stream::StreamExt;
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .with_prompt_cache_config(PromptCacheConfig::new(128, Duration::from_secs(300))?)
+    .build()?;
+
+let request = UnifiedRequest::new("google/gemma-4-e4b")
+    .add_user_message("Explain CUCA in one sentence.");
+
+// A miss: dispatched to the provider, written back once the stream ends.
+let mut stream = client.generate_stream(request.clone()).await?;
+while let Some(block) = stream.next().await {
+    let _ = block?;
+}
+
+// A hit: the same effective request digests to the same key, so the stored
+// blocks replay and no provider is called.
+let mut stream = client.generate_stream(request).await?;
+while let Some(block) = stream.next().await {
+    let _ = block?;
+}
+
+let cache = client.prompt_cache().expect("configured on the builder");
+println!("{} of {} entries", cache.len()?, cache.capacity());
+```
+
+```text,name=Expected output
+1 of 128 entries
+```
+
 ## Entry types
 
 `PromptCache`, `PromptCacheConfig`, `PromptCacheEntry`, `PromptCacheSnapshot`, `PromptCacheImportReport`, `PromptCacheError`.
-
-## Not a `CucaPlugin`
-
-`PromptCache` does not implement `CucaPlugin`. Registering it with `register_plugin` is a compile error, not an inert no-op. It is a plain client-level service, attached with `CucaClientBuilder::with_prompt_cache_config(config)` or `with_prompt_cache_service(service)`, and wired directly into `CucaClient::generate_stream`: a lookup runs after every `on_request` hook and before provider dispatch, and a miss is written back after a fully successful stream.
 
 ## Key
 

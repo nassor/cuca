@@ -16,13 +16,40 @@ weight = 4
 <dd>You are replaying a recorded turn for a regression fixture, an offline eval, or a fork-point comparison.</dd>
 </dl>
 
+`SessionReplay` reads a recorded session back through the session log's `SessionBackend` seam and re-materializes it as the same `AgentResponseStream` a live turn produces. `SessionReplay::new(backend)` binds an `Arc<dyn SessionBackend>` with the default `ReplayConfig`, and `with_config(backend, config)` sets the caps instead. That backend is `SessionLogPlugin::backend()` for an already-registered log, or `FileBackend::new(dir)` for a directory of `.cslog` files. Reach for it when a recorded turn has to drive a regression fixture, an offline eval, or a fork-point comparison.
+
+```rust,name=Replay a recorded session from disk
+use std::sync::Arc;
+
+use cuca::{FileBackend, SessionReplay};
+use tokio_stream::StreamExt;
+
+// The directory holds the `.cslog` files a `SessionLogPlugin` wrote.
+let replay = SessionReplay::new(Arc::new(FileBackend::new("/tmp/cuca-sessions")?));
+let trajectory = replay.load("demo")?;
+println!(
+    "{} turn(s), {} block(s), {} of {} records",
+    trajectory.len(),
+    trajectory.usage().blocks,
+    trajectory.usage().records,
+    trajectory.usage().max_records
+);
+
+let mut blocks = trajectory.stream_turn(0)?;
+while let Some(block) = blocks.next().await {
+    // A replayed stream never yields Err: `load` raised every failure already.
+    println!("replayed: {:?}", block?);
+}
+```
+
+```text,name=Expected output for the session examples/replay.rs records
+1 turn(s), 1 block(s), 5 of 65536 records
+replayed: Text("ok")
+```
+
 ## Entry types
 
 `SessionReplay`, `ReplayConfig`, `ReplayTrajectory`, `ReplayTurn`, `ReplayUsage`, `ReplayCompletion`, `ReplayNote`.
-
-## Not a `CucaPlugin`
-
-`SessionReplay` does not implement `CucaPlugin`. Registering it with `register_plugin` is a compile error, not an inert no-op, the same rule that governs `PromptCache`: replay drives a session instead of observing one, there is no live request or chunk to attach to, and no hook signature can return a stream. `SessionReplay::new(backend)` or `with_config(backend, config)` binds an `Arc<dyn SessionBackend>`, taken from `SessionLogPlugin::backend()` for an already-registered log or `FileBackend::new(dir)` for a directory of `.cslog` files.
 
 ## Loading a trajectory
 

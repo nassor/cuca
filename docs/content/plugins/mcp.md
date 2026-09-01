@@ -16,6 +16,26 @@ weight = 1
 <dd>You are registering <code>McpPlugin</code> or choosing an <code>McpTransport</code>.</dd>
 </dl>
 
+`McpPlugin` connects to one Model Context Protocol server, a spawned child process over stdio or a Streamable HTTP endpoint, discovers its tools once with `tools/list`, and executes model-issued `ToolCall` blocks whose name matches a discovered tool. It speaks only the stateless MCP protocol version `2026-07-28`: every request carries its own protocol version and capabilities, with no connection-setup phase. Reach for it to expose an existing MCP server's tools to a model without writing a bespoke bridge.
+
+```rust,name=Connect over stdio and register the discovered tools
+use std::sync::Arc;
+
+use cuca::plugin::CucaPlugin;
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, McpPlugin};
+
+let mcp = Arc::new(McpPlugin::connect_stdio("mcp-server-filesystem").await?);
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url("http://127.0.0.1:1234/v1")
+    .register_plugin(Arc::clone(&mcp) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+// mcp.tools() now returns the server's discovered tools, sorted by name.
+```
+
 ## Entry types
 
 `McpPlugin`, `McpTransport`.
