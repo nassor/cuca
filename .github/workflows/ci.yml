@@ -79,6 +79,7 @@ jobs:
           - service-replay
           - service-prompt-cache
           - service-rate-limit
+          - service-vector-store
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

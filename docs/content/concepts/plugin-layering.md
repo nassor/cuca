@@ -13,12 +13,12 @@ weight = 3
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You are adding a capability and need to know which tier and attachment point it belongs to, or why <code>register_plugin</code> refuses one of the seventeen</dd>
+<dd>You are adding a capability and need to know which tier and attachment point it belongs to, or why <code>register_plugin</code> refuses one of the eighteen</dd>
 </dl>
 
-Seventeen non-provider features: twelve plugins, five services. Every plugin
+Eighteen non-provider features: twelve plugins, six services. Every plugin
 implements `CucaPlugin` and registers on the builder. Every service is a
-compile error if you try: four call their capability directly, and one
+compile error if you try: five call their capability directly, and one
 replaces the dispatch stage outright.
 
 That is not an inconsistency, it is the architecture. A plugin implements
@@ -33,7 +33,7 @@ drives the capability.
 | Tier | Mechanism | The pipeline can | Members |
 |---|---|---|---|
 | Plugin | hook (`register_plugin`) | drive it: hooks fire at fixed points, in registration order | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost`, `plugin-redaction` |
-| Service | explicit call | not drive it: the caller decides when and applies the result | `service-prompt-cache`, `service-entity-extraction`, `service-replay`, `service-rate-limit` |
+| Service | explicit call | not drive it: the caller decides when and applies the result | `service-prompt-cache`, `service-entity-extraction`, `service-replay`, `service-rate-limit`, `service-vector-store` |
 | Service | pipeline replacement (`with_orchestrator`) | not host it: it owns the dispatch stage | `service-speculative` |
 
 `plugin-session-log` sits in the first row twice: it implements `CucaPlugin`
@@ -139,15 +139,16 @@ re-enter the orchestrator. See
 Core sits below every plugin and every service. The plugin tier is flat: no
 plugin depends on another plugin, in Cargo features, in `#[cfg]`/import edges,
 or at runtime. Services may depend on the plugin features they declare, and
-`Cargo.toml` has exactly two hard edges, both service to plugin:
+`Cargo.toml` has exactly three hard edges, all service to plugin:
 
-```toml,name=The two hard service feature edges in Cargo.toml
+```toml,name=The three hard service feature edges in Cargo.toml
 service-entity-extraction = ["plugin-memory"]
 service-replay = ["plugin-session-log"]
+service-vector-store = ["plugin-memory", "dep:wide"]
 ```
 
 `plugin-memory` and `plugin-session-log` compile and work with no knowledge
-that a dependent service exists. `service-speculative` adds a third,
+that a dependent service exists. `service-speculative` adds a fourth,
 documented-optional edge to `plugin-session-log`:
 `ModelOrchestrator::with_session_store` is compiled out of existence without
 it, and records `SessionEvent::ModelSwap` with it. `service-prompt-cache` and

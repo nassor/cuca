@@ -110,6 +110,10 @@ service-replay = ["plugin-session-log"]
 # plugin-session-log is documented-optional, not a feature edge:
 # ModelOrchestrator::with_session_store is compiled out of existence without it.
 service-speculative = ["dep:tokio", "dep:tokio-stream"]
+# service-vector-store: implements the `VectorStore` offload seam declared in
+# src/plugins/memory/mod.rs, so plugin-memory is a hard dependency; wide is the
+# feature-owned SIMD kernel dependency for the retrieval scan.
+service-vector-store = ["plugin-memory", "dep:wide"]
 
 [dependencies]
 bytes = "1"
@@ -139,6 +143,9 @@ opentelemetry = { version = "0.32", optional = true }
 # runtime needed), so the telemetry tests stay on the current-thread Tokio flavor.
 opentelemetry_sdk = { version = "0.32", optional = true, features = ["metrics", "testing"] }
 tracing = { version = "0.1", optional = true }
+# wide: portable SIMD (`f32x8`) for the vector store's cosine scan. Stable-only
+# by construction: `std::simd` is nightly, and this crate pins stable 1.98.
+wide = { version = "1.7", optional = true }
 
 # Test-only deps for the integration suite: `ctor` runs the `--mcp-echo-server`
 # interceptor in tests/plugin_mcp.rs before libtest's main (that test binary
@@ -157,6 +164,9 @@ tokio-stream = "0.1"
 # references the `schemars` crate by name, so the test crate needs it as a
 # direct dev-dependency to derive the `echo` tool's inputSchema.
 schemars = "1"
+# `divan` runs benches/vector_store.rs (harness = false); it is a bench-only
+# harness and no test target uses it.
+divan = "0.1"
 
 # Documented demos (see examples/): each streams from llama.cpp's local
 # OpenAI-compatible chat route, so they build only when the llama.cpp provider
@@ -204,3 +214,19 @@ required-features = ["provider-llamacpp", "plugin-redaction"]
 name = "replay"
 path = "examples/replay.rs"
 required-features = ["provider-llamacpp", "service-replay"]
+
+# vector_store additionally needs the service feature the store lives behind:
+# `InMemoryVectorStore` only exists when `service-vector-store` is enabled, and
+# that feature pulls in `plugin-memory` for the offload seam half of the demo.
+[[example]]
+name = "vector_store"
+path = "examples/vector_store.rs"
+required-features = ["provider-llamacpp", "service-vector-store"]
+
+# The retrieval scan is the crate's hottest explicit-call path; this bench pins
+# the SIMD kernel against a scalar baseline. A provider feature is required
+# because the library refuses to build without one.
+[[bench]]
+name = "vector_store"
+harness = false
+required-features = ["provider-openai", "service-vector-store"]

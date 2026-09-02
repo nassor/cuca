@@ -154,6 +154,9 @@ path = "@/services/replay.md"
 [[extra.nav.items.children]]
 title = "Rate limit"
 path = "@/services/rate-limit.md"
+[[extra.nav.items.children]]
+title = "Vector store"
+path = "@/services/vector-store.md"
 
 [[extra.nav]]
 label = "How-to guides"

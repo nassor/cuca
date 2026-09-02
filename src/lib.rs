@@ -144,4 +144,9 @@ pub use crate::services::replay::{
     ReplayCompletion, ReplayConfig, ReplayNote, ReplayTrajectory, ReplayTurn, ReplayUsage,
     SessionReplay,
 };
+#[cfg(feature = "service-vector-store")]
+pub use crate::services::vector_store::{
+    Embedder, InMemoryVectorStore, RECALL_RENDER_MARKER, RecallInjection, RetrievalReport,
+    RetrievedTurn, VectorStoreConfig, VectorStoreError, VectorStoreUsage,
+};
 pub use crate::session::{SessionEvent, SessionRecord};

@@ -26,6 +26,9 @@
 //! - `service-speculative` — documented-optional on `plugin-session-log`:
 //!   `ModelOrchestrator::with_session_store` is compiled out of existence
 //!   without it, and records `SessionEvent::ModelSwap` with it.
+//! - `service-vector-store = ["plugin-memory", "dep:wide"]` — hard: the store
+//!   implements the memory plugin's `VectorStore` offload seam and hands
+//!   recalled turns back through `vector_store::RetrievalReport::inject`.
 //!
 //! The direction is one-way. A plugin MUST NEVER name a service in any form: no
 //! `use crate::services::…`, no `cfg(feature = "service-…")` (including inside
@@ -50,3 +53,5 @@ pub mod prompt_cache;
 pub mod rate_limit;
 #[cfg(feature = "service-replay")]
 pub mod replay;
+#[cfg(feature = "service-vector-store")]
+pub mod vector_store;

@@ -1,6 +1,6 @@
 +++
 title = "Error types"
-description = "Every variant of CucaError, PluginError, PromptCacheError and CucaExportError, with its Display text and its conversions."
+description = "Every variant of CucaError, PluginError, PromptCacheError, CucaExportError and VectorStoreError, with its Display text and its conversions."
 template = "page.html"
 weight = 2
 +++
@@ -121,6 +121,26 @@ Four variants, gated on `plugin-memory` or `service-prompt-cache`.
 | `Validation` | `component: &'static str`, `field: &'static str`, `message: String` | a section failed its own validation |
 | `Unsupported` | `component: &'static str` | the envelope carries non-empty data for a component this build compiled out |
 | `State` | `message: String` | a staged import could not be committed |
+
+## `VectorStoreError`
+
+Six variants, gated on `service-vector-store`. Not a `CucaError` variant: only
+`VectorStore::store_turns` must return `PluginError`, and
+`From<VectorStoreError> for PluginError` converts it there.
+
+| Variant | Fields | Condition |
+|---|---|---|
+| `Config` | `String` | a zero bound, a `warn_fraction` outside `(0.0, 1.0]`, a `max_entries * dimensions` arena that overflows `usize`, or a zero `k` passed to a `retrieve*` call |
+| `Embedding` | `String` | an embedding of the wrong width, or a non-finite component or squared norm |
+| `EntryTooLarge` | `bytes: usize`, `max_entry_bytes: usize` | a turn over `VectorStoreConfig::max_entry_bytes` at insert |
+| `Poisoned` | none | the state lock was poisoned by a panic on another thread |
+| `Json` | `String` | measuring a tool call's arguments failed (unreachable for a `serde_json::Value`, but library code never unwraps) |
+| `Embedder` | `PluginError` | the caller's `Embedder` failed; carried through unchanged |
+
+`From<VectorStoreError> for PluginError`: `Embedder(e)` unwraps to `e`
+unchanged, `Embedding` and `EntryTooLarge` become `PluginError::Validation`
+under the `vector-store` schema, and every other variant becomes
+`PluginError::Internal` carrying the `Display` text.
 
 ## Errors the stream swallows
 

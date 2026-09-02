@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twenty-four features, all opt-in: seven providers, twelve plugins, five services</dd>
+<dd>Twenty-five features, all opt-in: seven providers, twelve plugins, six services</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -68,13 +68,15 @@ No plugin depends on another plugin: the tier is flat.
 | `service-replay` | `plugin-session-log` |
 | `service-prompt-cache` | `dep:sha2`, `dep:postcard` |
 | `service-rate-limit` | `dep:tokio` |
+| `service-vector-store` | `plugin-memory`, `dep:wide` |
 
-`service-entity-extraction = ["plugin-memory"]` and
-`service-replay = ["plugin-session-log"]` are the two hard feature edges,
-both service to plugin. `service-speculative` adds a third, documented-optional
-edge to `plugin-session-log`. `service-prompt-cache` and `service-rate-limit`
-declare no plugin dependency at all. A plugin must never depend on, or name, a
-service.
+`service-entity-extraction = ["plugin-memory"]`,
+`service-replay = ["plugin-session-log"]` and
+`service-vector-store = ["plugin-memory", "dep:wide"]` are the three hard feature edges,
+all service to plugin. `service-speculative` adds a fourth,
+documented-optional edge to `plugin-session-log`. `service-prompt-cache` and
+`service-rate-limit` declare no plugin dependency at all. A plugin must never
+depend on, or name, a service.
 
 ## Unconditional dependencies
 
@@ -107,6 +109,7 @@ wire types, the SSE parser and the response stream contract.
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
 | `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
 | `postcard` | `1` | `use-std`; `default-features = false` | `plugin-session-log`, `service-prompt-cache` |
+| `wide` | `1.7` | default | `service-vector-store` |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only
 through the `reqwest/rustls` entry that every provider feature and
@@ -122,7 +125,7 @@ COBS helpers.
 | Module | Gate |
 |---|---|
 | `export` | `plugin-memory` or `service-prompt-cache` |
-| `services` | any of the five `service-*` features |
+| `services` | any of the six `service-*` features |
 
 Every other public module compiles unconditionally: `types`, `error`, `request`,
 `session`, `sse`, `plugin`, `plugins`, `client`. The `plugins` module is always
@@ -170,7 +173,7 @@ need one or more plugin or service features on top, because what they demonstrat
 | `no_provider` | `--no-default-features`, asserted to fail |
 | `doc` | `--all-features` |
 | `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the twelve plugin features |
-| `service_solo` | `--no-default-features --features provider-openai,<service>`, once per each of the five service features |
+| `service_solo` | `--no-default-features --features provider-openai,<service>`, once per each of the six service features |
 | `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, references `crate::services`, or imports one of the `plugins::` paths the five moved modules left behind |
 
 Next page: [Error types](@/reference/errors.md).

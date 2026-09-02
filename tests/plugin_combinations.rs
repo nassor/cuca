@@ -2,7 +2,7 @@
 //! capability features are co-enabled, in either tier (plugin + plugin,
 //! plugin + service, service + service).
 //!
-//! One file rather than one test per owning module. Seven of the thirteen
+//! One file rather than one test per owning module. Seven of the fifteen
 //! surfaces below (`memory + prompt-cache`, `speculative + prompt-cache`,
 //! `memory + prompt-cache` export, `cost + prompt-cache`, `cost + memory`,
 //! `cost + telemetry`, `redaction + prompt-cache`) are *core-mediated*: they
@@ -61,6 +61,13 @@
 //!     hit replays the stored blocks and the session-log record of the
 //!     dispatched turn replays to the same sequence, pinning the two against
 //!     each other.
+//! 14. `vector-store → memory` (hard feature dep): `CompactionStrategy::Offload`
+//!     writes the oldest turns into the store, and the caller's
+//!     `retrieve` + `RetrievalReport::inject` hand-off puts them back into the
+//!     prompt the provider is actually sent.
+//! 15. `vector-store + prompt-cache` (caller-mediated digest): the digest covers
+//!     the full message list, so injecting a recall changes the cache key and
+//!     an otherwise identical turn misses.
 #![cfg(feature = "provider-llamacpp")]
 
 mod common;
@@ -2405,6 +2412,307 @@ mod replay_agrees_with_a_cache_hit {
                 .expect("the cached turn must be there")
                 .is_complete(),
             "a cache hit still runs on_response_complete, so its turn is terminated"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 14: vector-store → memory (offload, recall, and back into the prompt)
+// ---------------------------------------------------------------------------
+
+/// `service-vector-store` enables `plugin-memory` in `Cargo.toml`; both are
+/// named so the gate states the surface rather than relying on the edge.
+#[cfg(all(feature = "service-vector-store", feature = "plugin-memory"))]
+mod vector_store_recall_roundtrip {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use crate::common;
+    use cuca::plugin::CucaPlugin;
+    use cuca::plugins::memory::VectorStore;
+    use cuca::types::{MessageRole, UnifiedMessage};
+    use cuca::{
+        CompactionStrategy, CompressionAction, Embedder, InMemoryVectorStore, MemoryConfig,
+        MemoryPlugin, PluginError, RECALL_RENDER_MARKER, RecallInjection, Summarizer,
+        UnifiedRequest, VectorStoreConfig,
+    };
+
+    const DIMENSIONS: usize = 64;
+    const FACT: &str = "the deploy token lives in vault slot 7";
+    const QUESTION: &str = "where does the deploy token live?";
+
+    /// Never called: no config below lists `CompactionStrategy::Summarize`,
+    /// and `with_extensions` is the only constructor that accepts a store.
+    struct NoSummarizer;
+
+    impl Summarizer for NoSummarizer {
+        fn summarize(&self, _turns: &[UnifiedMessage]) -> String {
+            String::new()
+        }
+    }
+
+    /// FNV-1a bag of words; `DefaultHasher` is avoided because its seed is
+    /// per-process random and recall order would stop being reproducible.
+    struct HashEmbedder;
+
+    impl Embedder for HashEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, PluginError> {
+            let mut vector = vec![0.0f32; DIMENSIONS];
+            for token in text
+                .split(|c: char| !c.is_ascii_alphanumeric())
+                .filter(|token| !token.is_empty())
+            {
+                let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+                for byte in token.bytes() {
+                    hash ^= u64::from(byte.to_ascii_lowercase());
+                    hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+                vector[(hash % DIMENSIONS as u64) as usize] += 1.0;
+            }
+            Ok(vector)
+        }
+    }
+
+    /// Records the request as the provider adapter will see it.
+    #[derive(Default)]
+    struct RequestCapture {
+        requests: Mutex<Vec<UnifiedRequest>>,
+    }
+
+    impl CucaPlugin for RequestCapture {
+        fn name(&self) -> &'static str {
+            "request-capture"
+        }
+
+        fn on_request(&self, req: &mut UnifiedRequest) -> Result<(), PluginError> {
+            self.requests
+                .lock()
+                .expect("capture lock must not be poisoned")
+                .push(req.clone());
+            Ok(())
+        }
+    }
+
+    /// The loop neither capability owns alone: memory decides what leaves the
+    /// prompt, the store decides what comes back, and only the caller's
+    /// `inject` connects them.
+    #[tokio::test]
+    async fn offloaded_history_returns_to_the_dispatched_prompt() {
+        let store = Arc::new(
+            InMemoryVectorStore::new(
+                VectorStoreConfig::new(32, DIMENSIONS, 16 * 1024).expect("config must build"),
+                Arc::new(HashEmbedder),
+            )
+            .expect("store must build"),
+        );
+        let memory = MemoryPlugin::with_extensions(
+            MemoryConfig {
+                strategies: vec![CompactionStrategy::Offload { turns: 4 }],
+                ..Default::default()
+            },
+            Arc::new(NoSummarizer),
+            Arc::clone(&store) as Arc<dyn VectorStore>,
+        )
+        .expect("memory plugin must build");
+
+        let mut messages = vec![
+            UnifiedMessage::system("You are concise."),
+            UnifiedMessage::user(FACT),
+            UnifiedMessage::assistant("Noted: vault slot 7."),
+            UnifiedMessage::user("the staging cluster is named borealis"),
+            UnifiedMessage::assistant("Noted: borealis."),
+            UnifiedMessage::user(QUESTION),
+        ];
+        let report = memory.compress(&mut messages).expect("compress must run");
+        assert!(report.actions.contains(&CompressionAction::Offloaded));
+        assert_eq!(store.len().expect("len must read"), 4);
+
+        let recall = store.retrieve(QUESTION, 1).expect("retrieval must run");
+        let mut request = UnifiedRequest::new("combo-recall-model");
+        request.messages = messages;
+        assert_eq!(recall.inject(&mut request), RecallInjection::Inserted);
+
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let capture = Arc::new(RequestCapture::default());
+        let client = common::llamacpp_builder(format!("http://{addr}/v1"))
+            .register_plugin(Arc::clone(&capture) as Arc<dyn CucaPlugin>)
+            .build()
+            .expect("client build must succeed");
+        common::drain_timeout(
+            client
+                .generate_stream(request)
+                .await
+                .expect("generate_stream must start"),
+            10,
+        )
+        .await;
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "the recall-carrying turn must reach the provider"
+        );
+
+        let captured = capture
+            .requests
+            .lock()
+            .expect("capture lock must not be poisoned");
+        let messages = &captured[0].messages;
+        let index = messages
+            .iter()
+            .position(|m| common::text_of(&m.content).starts_with(RECALL_RENDER_MARKER))
+            .expect("the dispatched prompt must carry the recall message");
+        assert_eq!(messages[index].role, MessageRole::System);
+        assert!(
+            common::text_of(&messages[index].content).contains("vault slot 7"),
+            "the offloaded fact must be back in the prompt: {:?}",
+            common::text_of(&messages[index].content)
+        );
+        assert_eq!(
+            common::text_of(&messages[index + 1].content),
+            QUESTION,
+            "recall sits immediately before the newest user message"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Surface 15: vector-store + prompt-cache (recall is inside the cache key)
+// ---------------------------------------------------------------------------
+
+#[cfg(all(feature = "service-vector-store", feature = "service-prompt-cache"))]
+mod vector_store_changes_cache_keys {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    use crate::common;
+    use cuca::plugins::memory::VectorStore;
+    use cuca::services::prompt_cache::digest_request;
+    use cuca::types::UnifiedMessage;
+    use cuca::{
+        Embedder, InMemoryVectorStore, PluginError, PromptCache, PromptCacheConfig,
+        RecallInjection, UnifiedRequest, VectorStoreConfig,
+    };
+
+    const MODEL: &str = "combo-recall-cache-model";
+    const DIMENSIONS: usize = 16;
+
+    /// One axis per known word, so the recall text is stable and the digest
+    /// difference is the only moving part.
+    struct BasisEmbedder;
+
+    impl Embedder for BasisEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, PluginError> {
+            let mut vector = vec![0.0f32; DIMENSIONS];
+            if text.contains("vault") {
+                vector[0] = 1.0;
+            }
+            if text.contains("borealis") {
+                vector[1] = 1.0;
+            }
+            Ok(vector)
+        }
+    }
+
+    fn filled_store() -> Arc<InMemoryVectorStore> {
+        let store = Arc::new(
+            InMemoryVectorStore::new(
+                VectorStoreConfig::new(8, DIMENSIONS, 4096).expect("config must build"),
+                Arc::new(BasisEmbedder),
+            )
+            .expect("store must build"),
+        );
+        store
+            .store_turns(
+                "combo",
+                &[UnifiedMessage::user(
+                    "the deploy token lives in vault slot 7",
+                )],
+            )
+            .expect("the store must accept the turn");
+        store
+    }
+
+    fn request() -> UnifiedRequest {
+        UnifiedRequest::new(MODEL).add_user_message("where does the deploy token live?")
+    }
+
+    /// The digest hashes the whole message list, so a recall message is part of
+    /// the key rather than invisible metadata riding alongside it.
+    #[test]
+    fn injecting_a_recall_changes_the_digest() {
+        let store = filled_store();
+        let recall = store.retrieve("vault", 1).expect("retrieval must run");
+        let plain = request();
+        let mut injected = plain.clone();
+        assert_eq!(recall.inject(&mut injected), RecallInjection::Inserted);
+
+        assert_ne!(
+            digest_request(&plain).expect("digest must succeed"),
+            digest_request(&injected).expect("digest must succeed"),
+            "a recalled turn must key differently from the bare question"
+        );
+    }
+
+    /// End to end: the same question hits the cache until recall is injected,
+    /// at which point it is a different prompt and must dispatch again.
+    #[tokio::test]
+    async fn a_recalled_turn_misses_a_cache_the_bare_question_hits() {
+        let dispatches = Arc::new(AtomicUsize::new(0));
+        let addr = common::spawn_counting_sse_server(Arc::clone(&dispatches), "ok").await;
+        let cache = Arc::new(
+            PromptCache::new(
+                PromptCacheConfig::new(16, Duration::from_secs(60)).expect("config must build"),
+            )
+            .expect("cache must build"),
+        );
+        let client = common::llamacpp_builder(format!("http://{addr}/v1"))
+            .with_prompt_cache_service(Arc::clone(&cache))
+            .build()
+            .expect("client build must succeed");
+
+        for _ in 0..2 {
+            common::drain_timeout(
+                client
+                    .generate_stream(request())
+                    .await
+                    .expect("generate_stream must start"),
+                10,
+            )
+            .await;
+        }
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            1,
+            "the identical bare question must be served from the cache"
+        );
+
+        let store = filled_store();
+        let recall = store.retrieve("vault", 1).expect("retrieval must run");
+        let mut injected = request();
+        assert_eq!(recall.inject(&mut injected), RecallInjection::Inserted);
+        common::drain_timeout(
+            client
+                .generate_stream(injected)
+                .await
+                .expect("generate_stream must start"),
+            10,
+        )
+        .await;
+
+        assert_eq!(
+            dispatches.load(Ordering::SeqCst),
+            2,
+            "the recall changed the key, so the turn must reach the provider"
+        );
+        assert_eq!(
+            cache
+                .snapshot()
+                .expect("snapshot must succeed")
+                .entries
+                .len(),
+            2
         );
     }
 }

@@ -554,3 +554,75 @@ mod replay_surface {
             .expect("a non-empty replay streams");
     }
 }
+
+#[cfg(feature = "service-vector-store")]
+mod vector_store_surface {
+    use std::sync::Arc;
+
+    use cuca::{
+        Embedder, InMemoryVectorStore, PluginError, RECALL_RENDER_MARKER, RecallInjection,
+        RetrievalReport, RetrievedTurn, UnifiedRequest, VectorStoreConfig, VectorStoreError,
+        VectorStoreUsage,
+    };
+
+    /// A basis embedder: `"alpha"` is e0, everything else is the zero vector.
+    struct FixedEmbedder;
+
+    impl Embedder for FixedEmbedder {
+        fn embed(&self, text: &str) -> Result<Vec<f32>, PluginError> {
+            let mut vector = vec![0.0f32; 8];
+            if text.contains("alpha") {
+                vector[0] = 1.0;
+            }
+            Ok(vector)
+        }
+    }
+
+    /// The store, its config, its usage reading, and the recall DTOs are all
+    /// nameable from the crate root, and the concrete store coerces to the
+    /// `VectorStore` seam the memory plugin declares.
+    #[test]
+    fn vector_store_types_are_root_exported() {
+        let config = VectorStoreConfig::new(4, 8, 4096)
+            .expect("a valid configuration must build")
+            .with_warn_fraction(0.8)
+            .expect("a valid warn fraction must be accepted");
+        assert_eq!(config.max_entries, 4);
+
+        let store = Arc::new(
+            InMemoryVectorStore::new(config, Arc::new(FixedEmbedder)).expect("store must build"),
+        );
+        let seam: Arc<dyn cuca::VectorStore> = Arc::clone(&store) as Arc<dyn cuca::VectorStore>;
+        seam.store_turns(
+            "surface",
+            &[cuca::types::UnifiedMessage::user("alpha token")],
+        )
+        .expect("the seam must accept the turn");
+
+        let usage: VectorStoreUsage = store.usage().expect("usage must read");
+        assert_eq!((usage.entries, usage.capacity), (1, 4));
+        assert_eq!(store.capacity(), 4);
+
+        let report: RetrievalReport = store.retrieve("alpha", 2).expect("query must run");
+        assert_eq!(report.scanned, 1);
+        let hit: &RetrievedTurn = report.turns.first().expect("one hit must come back");
+        assert_eq!(hit.session_hint, "surface");
+
+        let mut request = UnifiedRequest::new("gpt-4o").add_user_message("follow-up");
+        assert_eq!(report.inject(&mut request), RecallInjection::Inserted);
+        assert!(
+            request
+                .messages
+                .iter()
+                .any(|m| format!("{m:?}").contains(RECALL_RENDER_MARKER))
+        );
+    }
+
+    #[test]
+    fn vector_store_config_errors_are_root_exported() {
+        let error =
+            VectorStoreConfig::new(0, 8, 4096).expect_err("zero max_entries must be rejected");
+        assert!(matches!(error, VectorStoreError::Config(_)));
+        assert!(!error.to_string().is_empty());
+    }
+}

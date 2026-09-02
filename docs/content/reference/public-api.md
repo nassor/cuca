@@ -9,7 +9,7 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twelve modules and roughly ninety re-exported items, grouped by the feature that gates them</dd>
+<dd>Twelve modules and roughly one hundred and thirty re-exported items, grouped by the feature that gates them</dd>
 <dt>You need</dt>
 <dd>Nothing; this page mirrors <code>src/lib.rs</code></dd>
 <dt>Read this if</dt>
@@ -67,6 +67,7 @@ Types reachable through `cuca::types` rather than the crate root:
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |
 | `plugin-mcp` | `McpPlugin`, `McpTransport` |
 | `plugin-memory` | `Budget`, `CompactionStrategy`, `CompressionAction`, `CompressionReport`, `ContextUsage`, `ContextUsageObserver`, `ContextWindowResolver`, `GraphContextConfig`, `GraphDirection`, `GraphImportReport`, `GraphNode`, `GraphRelationship`, `GraphSnapshot`, `MemoryConfig`, `MemoryGraph`, `MemoryPlugin`, `MergePolicy`, `MergeReport`, `Summarizer`, `VectorStore` |
+| `plugin-redaction` | `Redacted`, `RedactionConfig`, `RedactionPlugin`, `RedactionRule` |
 | `service-entity-extraction` | `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionModel`, `EntityExtractor`, `EntityExtractionReport`, `EntityExtractionSchema`, `EntityReference`, `EntityTable`, `PropertyColumn`, `PropertyType`, `RelationshipTable` |
 | `service-prompt-cache` | `PromptCache`, `PromptCacheConfig`, `PromptCacheEntry`, `PromptCacheError`, `PromptCacheImportReport`, `PromptCacheSnapshot` |
 | `plugin-sandbox` | `SandboxConfig`, `SandboxPlugin`, `SandboxResult` |
@@ -77,6 +78,8 @@ Types reachable through `cuca::types` rather than the crate root:
 | `plugin-telemetry` | `OpenTelemetryPlugin` |
 | `plugin-web-search` | `SearchResult`, `WebSearchConfig`, `WebSearchPlugin`, `WebSearchProvider` |
 | `service-rate-limit` | `RateLimiter`, `RateLimitConfig`, `RateLimitPermit`, `RateLimitUsage`, `RateLimitObserver`, `RateLimitError` |
+| `service-replay` | `ReplayCompletion`, `ReplayConfig`, `ReplayNote`, `ReplayTrajectory`, `ReplayTurn`, `ReplayUsage`, `SessionReplay` |
+| `service-vector-store` | `Embedder`, `InMemoryVectorStore`, `RECALL_RENDER_MARKER`, `RecallInjection`, `RetrievalReport`, `RetrievedTurn`, `VectorStoreConfig`, `VectorStoreError`, `VectorStoreUsage` |
 | `plugin-memory` or `service-prompt-cache` | `CUCA_EXPORT_FORMAT`, `CUCA_EXPORT_VERSION`, `CucaExport`, `CucaExportError`, `CucaImportReport`, `GraphExportSection`, `PromptCacheExportSection` |
 | `plugin-cost` and `plugin-telemetry` | `OtelCostObserver` |
 

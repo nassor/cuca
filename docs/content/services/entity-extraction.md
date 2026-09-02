@@ -68,7 +68,7 @@ println!("{} node(s) added", merged.nodes_added);
 
 ## Feature edge
 
-`service-entity-extraction = ["plugin-memory"]` in `Cargo.toml`: enabling this feature enables `plugin-memory` with it. This is one of the crate's two hard service feature edges.
+`service-entity-extraction = ["plugin-memory"]` in `Cargo.toml`: enabling this feature enables `plugin-memory` with it. This is one of the crate's three hard service feature edges.
 
 ## Entry types
 
