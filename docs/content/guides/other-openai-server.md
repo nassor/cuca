@@ -57,7 +57,8 @@ there.
 ## Step 3: build the client
 
 ```rust,name=The two calls that matter
-use cuca::{CucaClient, ProviderEndpoint};
+use cuca::CucaClient;
+use cuca::types::ProviderEndpoint;
 
 let client = CucaClient::builder()
     .with_provider(ProviderEndpoint::Vllm)
@@ -115,8 +116,10 @@ $env:CUCA_BASE_URL = "http://10.0.0.7:8000/v1"; $env:CUCA_MODEL = "your-model-id
 
 Text on stdout means the endpoint, the model id and the protocol all agree. A
 `CucaError::Http` with a status and a body means you reached a server and it
-refused; the body carries its reason. A `CucaError::Transport` means nothing
-answered.
+refused; the body carries its reason. The bundled examples report an
+unreachable address instead of failing: they print `No server answered at
+<base URL>` and exit successfully, so an exit code of `0` with that line means
+nothing answered.
 
 Those two variables affect the examples and the test harness only. No code under
 `src/` reads any environment variable, so your own client passes its base URL to

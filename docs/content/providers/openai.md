@@ -19,28 +19,49 @@ weight = 1
 The smallest streaming turn: the `OpenAi` variant, an API key, and every other
 builder default.
 
+Add the crate with `cargo add cuca --features provider-openai`, `cargo add tokio --features rt,macros`, and `cargo add tokio-stream`.
+
 ```rust,name=A first stream through the OpenAI adapter
+use std::io::{Write, stdout};
+
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{CucaClient, UnifiedRequest};
 use tokio_stream::StreamExt;
 
-let client = CucaClient::builder()
-    .with_provider(ProviderEndpoint::OpenAi)
-    .with_api_key(std::env::var("OPENAI_API_KEY")?)
-    .build()?;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = CucaClient::builder()
+        .with_provider(ProviderEndpoint::OpenAi)
+        .with_api_key(std::env::var("OPENAI_API_KEY")?)
+        .build()?;
 
-let mut stream = client
-    .generate_stream(UnifiedRequest::new("gpt-4o-mini").add_user_message("Say hello."))
-    .await?;
-while let Some(block) = stream.next().await {
-    if let MessageContentBlock::Text(text) = block? {
-        print!("{text}");
+    let request = UnifiedRequest::new("gpt-4o-mini")
+        .add_system_message("You are concise.")
+        .add_user_message("Say hello.")
+        .set_max_tokens(128);
+    let mut stream = client.generate_stream(request).await?;
+
+    let mut text_blocks = 0usize;
+    let mut thinking_blocks = 0usize;
+    while let Some(block) = stream.next().await {
+        match block? {
+            MessageContentBlock::Text(text) => {
+                print!("{text}");
+                stdout().flush()?;
+                text_blocks += 1;
+            }
+            MessageContentBlock::Thinking { .. } => thinking_blocks += 1,
+            _ => {}
+        }
     }
+    println!("\nblocks: {text_blocks} text, {thinking_blocks} thinking");
+    Ok(())
 }
 ```
 
-```text,name=Expected output; exact wording varies by model
+```text,name=Expected shape; not captured from a live run
 Hello! How can I help you today?
+blocks: 1 text, 0 thinking
 ```
 
 ## Endpoint
@@ -66,6 +87,7 @@ Request body, from a `UnifiedRequest`:
 
 - `stream` is always `true`.
 - `temperature` and `max_tokens` are included only when set on the request.
+- `tools` carries every `UnifiedRequest::tools` entry as `{"type": "function", "function": {name, description, parameters}}`, with `parameters` holding the definition's `input_schema`; the key is omitted when the request declares no tool, and no `tool_choice` is sent, so the server's own selection default applies.
 - A message's `Text` blocks are joined with a newline into plain string content.
 - A message carrying any `ImageBase64` block becomes a content array of `{type: "text"}` and `{type: "image_url"}` parts instead of a plain string.
 - A `Thinking` block becomes `reasoning_content` on an assistant message carrying exactly one thinking block; elsewhere it is dropped.

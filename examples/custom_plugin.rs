@@ -2,7 +2,7 @@
 //!
 //! # Prerequisites
 //!
-//! - A checkout of this repository (the example depends on `cuca-core` by path).
+//! - A checkout of this repository (the example builds from this crate).
 //! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
 //!   (`llama-server`) on port 1234 with the demo model loaded.
 //!
@@ -24,15 +24,22 @@
 //!
 //! # Output
 //!
-//! The reply prints as text chunks; when the stream ends, the plugin prints a
-//! summary line:
+//! The reply prints as text chunks, then the plugin's summary line. From one
+//! run against `google/gemma-4-12b-qat` on llama.cpp:
 //!
 //! ```text
-//! [example-block-counter] model=google/gemma-4-e4b duration=2.31s completion_tokens=23 blocks=23
+//! CUCA most commonly refers to either the Credit Union of Central Alabama or the Center for Urban Community Action, depending on the context.
+//! [example-block-counter] model=google/gemma-4-12b-qat duration=81.89s completion_tokens=1991 blocks=1991
 //! ```
 //!
-//! For a text-only reply, `completion_tokens` equals the block count: the
-//! client counts one token per `Text`, `Thinking`, and `ToolCall` block.
+//! The summary line carries its own leading newline because the hook runs
+//! inside the caller's final `next()` poll, before the drain loop returns.
+//!
+//! `completion_tokens` equals the block count here: the client counts one token
+//! per `Text`, `Thinking`, and `ToolCall` block. Both reach 1991 because this
+//! demo sets no `max_tokens` and a reasoning model emits one `Thinking` block
+//! per reasoning token. The reply, the counts, and the duration all depend on
+//! the model.
 //!
 //! # The plugin pipeline
 //!
@@ -72,8 +79,10 @@ impl CucaPlugin for BlockCounterPlugin {
     }
 
     fn on_response_complete(&self, res: &UnifiedResponse) -> Result<(), PluginError> {
+        // The hook fires inside the caller's final `next()` poll, so the
+        // leading newline is what separates this line from the streamed reply.
         println!(
-            "[example-block-counter] model={} duration={:.2}s completion_tokens={} blocks={}",
+            "\n[example-block-counter] model={} duration={:.2}s completion_tokens={} blocks={}",
             res.model,
             res.duration_secs,
             res.completion_tokens,
@@ -96,7 +105,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // registration order; each is held as an `Arc<dyn CucaPlugin>`.
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url)
+        .with_base_url(base_url.clone())
         .register_plugin(Arc::new(BlockCounterPlugin::default()))
         .build()?;
 
@@ -106,7 +115,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_user_message("Explain CUCA in one sentence.");
 
     // Stage 3: start the stream.
-    let mut stream = client.generate_stream(request).await?;
+    let mut stream = match client.generate_stream(request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            println!("No server answered at {base_url}: {error}");
+            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
+            return Ok(());
+        }
+    };
 
     // Stage 4: drain the stream; the plugin's summary prints from
     // `on_response_complete` once the stream ends.

@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Point <code>cuca-core</code> at <code>llama-server</code> on port 1234 and run <code>cargo run --example llamacpp_gemma</code></dd>
+<dd>Point <code>cuca</code> at <code>llama-server</code> on port 1234 and run <code>cargo run --example llamacpp_gemma</code></dd>
 <dt>You need</dt>
 <dd>Rust 1.98 or newer, <code>git</code>, and a GGUF build of Gemma 4 E4B for <code>llama-server</code></dd>
 <dt>Read this if</dt>
@@ -21,8 +21,8 @@ same on Linux, macOS and Windows (PowerShell).
 
 ## Step 1: get the crate
 
-`cuca-core` is not published to crates.io, so the source comes from a checkout
-and dependants reference it by path.
+The crate is named `cuca`, and it is not published to crates.io, so the source
+comes from a checkout and dependants reference it by path.
 
 ```bash,name=Runs the same on all three platforms
 git clone https://github.com/nassor/cuca
@@ -93,6 +93,15 @@ cargo run --example llamacpp_gemma --features provider-llamacpp
 The reply prints incrementally: each `MessageContentBlock::Text` the stream
 yields goes straight to stdout, flushed per block, so you see the answer being
 written rather than appearing at once. The process exits when the stream ends.
+One run of this command against `google/gemma-4-12b-qat` printed:
+
+```text,name=Expected output with a reasoning model
+CUCA is an acronym that has several different meanings depending on the context, such as a Clinical Unit Coordination Area in healthcare or a brand of beer.
+```
+
+The wording is the model's own. A reasoning model also spends time on
+`Thinking` blocks before the first word arrives, and this example drops them, so
+expect a pause before the text starts.
 
 If your model id or port differs from the defaults, the example reads two
 environment variables. It defaults to `http://127.0.0.1:1234/v1` and
@@ -112,8 +121,10 @@ Windows (PowerShell), where environment assignments are separate statements and
 $env:CUCA_BASE_URL = "http://127.0.0.1:1234/v1"; $env:CUCA_MODEL = "your-model-id"; cargo run --example llamacpp_gemma --features provider-llamacpp
 ```
 
-A connection error instead of text means `llama-server` is not answering at that
-base URL. Re-run the `curl` check from step 2.
+If nothing is answering at that base URL, the example says so and exits
+successfully rather than failing: it prints `No server answered at <base URL>`
+followed by the address to start `llama-server` on. Re-run the `curl` check from
+step 2.
 
 ## What just happened
 

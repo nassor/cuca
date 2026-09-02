@@ -1,24 +1,76 @@
-+++
-title = "Skills"
-description = "The reusable agent skills plugin: SKILL.md loading, the catalog injection, and the skill, skill_read, and skill_search tools."
-template = "page.html"
-weight = 9
-+++
+//! Give a model a library of `SKILL.md` instructions it can discover and read.
+//!
+//! The demo writes one skill and one bundled reference file into a temporary
+//! directory, loads them with `SkillsPlugin::from_dir`, and lets the model find
+//! its own way: `on_request` injects a catalog naming the three tools and every
+//! loaded skill, the model calls `skill` to read the instructions, those
+//! instructions send it to `skill_read` for the conversion factor, and the last
+//! turn, which offers no tools at all, answers from what it gathered. The
+//! directory is removed when the program ends.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example skills --features provider-llamacpp,plugin-skills
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example skills --features provider-llamacpp,plugin-skills`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Loaded from /tmp/cuca-skills-3284142
+//!   unit-convert: Convert between metric and imperial units using exact factors (1 reference file(s))
+//!
+//! The model reaches for the skill out of the injected catalog
+//!   catalog in the outbound request, last line: - unit-convert: Convert between metric and imperial units using exact factors
+//!   skill returned: {"description":"Convert between metric and imperial units using exact factors","instructions":"# Unit conversion\n\nRead `factors.md` for the exact factor, multiply, and answer with the number\nfollowed by the unit and nothing else.","name":"unit-convert","references":["factors.md"]}
+//!   thinking blocks: 138
+//!
+//! The model reaches for the reference file
+//!   catalog in the outbound request, last line: - unit-convert: Convert between metric and imperial units using exact factors
+//!   skill_read returned: 1 mile = 1.609344 kilometers
+//! 1 pound = 0.45359237 kilograms
+//!
+//!   thinking blocks: 122
+//!
+//! The answer, from the instructions and the factor
+//!   reply: 19.312128 kilometers
+//!   thinking blocks: 369
+//! ```
+//!
+//! The temporary path carries the process id, and the reply wording and block
+//! counts depend on the model; `12 * 1.609344` does not.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why the catalog and the tools are separate things
+//!
+//! The injected catalog is prose: it tells the model which skills exist and
+//! which tools reach them. It is not what makes a call possible. The wire
+//! `tools` array is, which is why `skill_tools` below declares the two tools
+//! this demo uses even though the catalog already names all three. A tool
+//! result that fails, an unknown skill or a missing reference, comes back as
+//! error text inside the `ToolResult` rather than failing the hook, so the
+//! model can correct itself in the same conversation.
 
-# Skills
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Loads reusable SKILL.md instructions and resolves skill, skill_read, and skill_search tool calls against them.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-skills</code> feature and either a skills directory or inline <code>Skill</code> values.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>SkillsPlugin</code> or authoring a <code>SKILL.md</code> file.</dd>
-</dl>
-
-`SkillsPlugin` loads reusable `SKILL.md` instructions, either from a directory of `SKILL.md` subdirectories or provided inline, and resolves the `skill`, `skill_read`, and `skill_search` tool calls a model issues against them. When `inject_catalog` is set (the default), `on_request` appends a system message naming the three tools and listing every loaded skill's name and description. Reach for it to give a model a discoverable library of task-specific instructions without hand-writing them into every system prompt.
-
-```rust,name=Let a model discover a skill and read its reference file
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -318,66 +370,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Loaded from /tmp/cuca-skills-3284142
-  unit-convert: Convert between metric and imperial units using exact factors (1 reference file(s))
-
-The model reaches for the skill out of the injected catalog
-  catalog in the outbound request, last line: - unit-convert: Convert between metric and imperial units using exact factors
-  skill returned: {"description":"Convert between metric and imperial units using exact factors","instructions":"# Unit conversion\n\nRead `factors.md` for the exact factor, multiply, and answer with the number\nfollowed by the unit and nothing else.","name":"unit-convert","references":["factors.md"]}
-  thinking blocks: 138
-
-The model reaches for the reference file
-  catalog in the outbound request, last line: - unit-convert: Convert between metric and imperial units using exact factors
-  skill_read returned: 1 mile = 1.609344 kilometers
-1 pound = 0.45359237 kilograms
-
-  thinking blocks: 122
-
-The answer, from the instructions and the factor
-  reply: 19.312128 kilometers
-  thinking blocks: 369
-```
-
-## Try it
-
-`examples/skills.rs` runs the program above against a live model. It writes a `SKILL.md` and one `references/factors.md` into a temporary directory, loads them with `SkillsPlugin::from_dir`, and takes three turns: the model calls `skill` and gets the instructions back, answers the question with them in the prompt, then calls `skill_read` for the bundled file. The directory is removed when the program ends. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. Which tool the model reaches for, its wording, and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example skills --features "provider-llamacpp plugin-skills"
-```
-
-## Entry types
-
-`SkillsPlugin`, `SkillsConfig`, `Skill`.
-
-## `CucaPlugin`
-
-`SkillsPlugin` implements `CucaPlugin` with the plugin name `"skills"`. It overrides `on_request` and `on_stream_chunk`.
-
-| Hook | Behavior |
-|---|---|
-| `on_request` | Injects a system message naming the three tools and listing every loaded skill's name and description, when `SkillsConfig::inject_catalog` is true and at least one skill is loaded |
-| `on_stream_chunk` | Resolves `skill`, `skill_read`, and `skill_search` tool calls into `ToolResult` blocks |
-
-## Config
-
-`SkillsConfig` defaults: `skills_dir: None`, `inline_skills: []`, `inject_catalog: true`, `max_search_results: 5`.
-
-`SkillsConfig::skills_dir` points at a directory whose direct subdirectories each hold a `SKILL.md`: YAML-ish frontmatter with required `name:` and `description:` keys, an instructions body, and an optional `references/` directory of bundled files. `inline_skills` are provided programmatically and win over directory-discovered skills on a name conflict.
-
-## Tools
-
-| Tool | Arguments | Behavior |
-|---|---|---|
-| `skill` | `name` | Returns the named skill's full instructions |
-| `skill_read` | `skill`, `file` | Returns a reference file bundled with the named skill |
-| `skill_search` | `query` | Returns skills ranked by a substring match score, capped at `max_search_results` |
-
-`skill_search` scores each whitespace-split query term at three points per match in the skill name, two in the description, and one in the instructions; a blank query returns every loaded skill.
-
-## Capacity
-
-No growth cap. The skill list is fixed once at construction, deduplicated by name and sorted.

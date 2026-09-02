@@ -223,6 +223,113 @@ name = "vector_store"
 path = "examples/vector_store.rs"
 required-features = ["provider-llamacpp", "service-vector-store"]
 
+# prompt_cache additionally needs the service feature the cache lives behind:
+# `PromptCache` and `CucaClientBuilder::with_prompt_cache_config` only exist
+# when `service-prompt-cache` is enabled.
+[[example]]
+name = "prompt_cache"
+path = "examples/prompt_cache.rs"
+required-features = ["provider-llamacpp", "service-prompt-cache"]
+
+# entity_extraction additionally needs the service feature the extractor lives
+# behind: `EntityExtractor` only exists when `service-entity-extraction` is
+# enabled, and that feature pulls in `plugin-memory` for the mandatory
+# delta-to-graph hand-off half of the demo.
+[[example]]
+name = "entity_extraction"
+path = "examples/entity_extraction.rs"
+required-features = ["provider-llamacpp", "service-entity-extraction"]
+
+# speculative additionally needs the service feature the orchestrator lives
+# behind: `ModelOrchestrator` only exists when `service-speculative` is
+# enabled.
+[[example]]
+name = "speculative"
+path = "examples/speculative.rs"
+required-features = ["provider-llamacpp", "service-speculative"]
+
+# cost additionally needs the plugin feature the ledger lives behind:
+# `CostPlugin` only exists when `plugin-cost` is enabled.
+[[example]]
+name = "cost"
+path = "examples/cost.rs"
+required-features = ["provider-llamacpp", "plugin-cost"]
+
+# memory additionally needs the plugin feature the compactor lives behind:
+# `MemoryPlugin` only exists when `plugin-memory` is enabled.
+[[example]]
+name = "memory"
+path = "examples/memory.rs"
+required-features = ["provider-llamacpp", "plugin-memory"]
+
+# session_log additionally needs the plugin feature the trajectory store lives
+# behind: `SessionLogPlugin` only exists when `plugin-session-log` is enabled.
+[[example]]
+name = "session_log"
+path = "examples/session_log.rs"
+required-features = ["provider-llamacpp", "plugin-session-log"]
+
+# telemetry additionally needs the plugin feature the instruments live behind:
+# `OpenTelemetryPlugin` only exists when `plugin-telemetry` is enabled, and
+# that feature carries the `opentelemetry_sdk` the demo reads its exporter from.
+[[example]]
+name = "telemetry"
+path = "examples/telemetry.rs"
+required-features = ["provider-llamacpp", "plugin-telemetry"]
+
+# guardrails additionally needs the plugin feature the validator lives behind:
+# `JsonGuardrailPlugin` only exists when `plugin-guardrails` is enabled.
+[[example]]
+name = "guardrails"
+path = "examples/guardrails.rs"
+required-features = ["provider-llamacpp", "plugin-guardrails"]
+
+# hitl additionally needs the plugin feature the approval gate lives behind:
+# `HitlPlugin` only exists when `plugin-hitl` is enabled.
+[[example]]
+name = "hitl"
+path = "examples/hitl.rs"
+required-features = ["provider-llamacpp", "plugin-hitl"]
+
+# skills additionally needs the plugin feature the skill loader lives behind:
+# `SkillsPlugin` only exists when `plugin-skills` is enabled.
+[[example]]
+name = "skills"
+path = "examples/skills.rs"
+required-features = ["provider-llamacpp", "plugin-skills"]
+
+# sandbox additionally needs the plugin feature wasmtime lives behind:
+# `SandboxPlugin` only exists when `plugin-sandbox` is enabled, and that
+# feature also supplies the `wat` support the inline guest module relies on.
+[[example]]
+name = "sandbox"
+path = "examples/sandbox.rs"
+required-features = ["provider-llamacpp", "plugin-sandbox"]
+
+# mcp additionally needs the plugin feature the connector lives behind:
+# `McpPlugin` only exists when `plugin-mcp` is enabled. The MCP server the demo
+# talks to is this same example binary re-executed with `--mcp-add-server`,
+# which uses rmcp's server SDK through the `transport-io` dev-dependency.
+[[example]]
+name = "mcp"
+path = "examples/mcp.rs"
+required-features = ["provider-llamacpp", "plugin-mcp"]
+
+# subagent additionally needs the plugin feature the fan-out lives behind:
+# `SubagentPlugin` only exists when `plugin-subagent` is enabled.
+[[example]]
+name = "subagent"
+path = "examples/subagent.rs"
+required-features = ["provider-llamacpp", "plugin-subagent"]
+
+# web_search additionally needs the plugin feature the retrieval bridge lives
+# behind: `WebSearchPlugin` only exists when `plugin-web-search` is enabled,
+# and that feature carries its own TLS backend for the outbound HTTPS call.
+[[example]]
+name = "web_search"
+path = "examples/web_search.rs"
+required-features = ["provider-llamacpp", "plugin-web-search"]
+
 # The retrieval scan is the crate's hottest explicit-call path; this bench pins
 # the SIMD kernel against a scalar baseline. A provider feature is required
 # because the library refuses to build without one.

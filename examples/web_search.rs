@@ -1,24 +1,69 @@
-+++
-title = "Web search"
-description = "The live web search plugin: the three provider backends, the web_search and web_extract tools, and their request shapes."
-template = "page.html"
-weight = 8
-+++
+//! Resolve a model's `web_search` call against a live search backend.
+//!
+//! The model is given one tool, calls it, and the plugin performs the HTTPS
+//! request on a short-lived thread while the stream pauses; the normalized
+//! result comes back as a `ToolResult` and a second turn answers from it. Every
+//! backend the plugin speaks to is a paid API, so the demo needs a key in
+//! `CUCA_SEARCH_API_KEY` and prints one line and exits without one.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//! - A [Firecrawl](https://firecrawl.dev) API key.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example web_search --features provider-llamacpp,plugin-web-search
+//! ```
+//!
+//! # Configuration
+//!
+//! The first two values default to a local llama.cpp server; override them to
+//! target any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//! - `CUCA_SEARCH_API_KEY`: Firecrawl API key. Required; without it the program
+//!   prints one line and exits successfully.
+//! - `CUCA_SEARCH_BASE_URL`: search endpoint override, defaults to
+//!   `https://api.firecrawl.dev`.
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp, with a
+//! deliberately invalid key, which is the only key that was available:
+//!
+//! ```text
+//! Backend Firecrawl, at most 3 results per search
+//!
+//! Turn 1: the model searches, and the pipeline pauses for the HTTP call
+//!   tool result: internal plugin error: web search returned HTTP 401 Unauthorized: {"success":false,"error":"Unauthorized: Invalid token"}
+//!   thinking blocks: 60
+//!
+//! No results, so there is no second turn
+//!   a valid key makes this a JSON array of {title, url, snippet} objects
+//! ```
+//!
+//! Every line above is from a real run: a real turn, a real tool call, and a
+//! real HTTPS request to `https://api.firecrawl.dev/v1/search`. With a valid
+//! key the `ToolResult` instead carries a JSON array of at most `max_results`
+//! `SearchResult` objects and the second turn answers from them; that output
+//! has not been captured here, because no Firecrawl key was available.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why a failed search is not an error
+//!
+//! The 401 above did not fail the hook. Transport failures, non-2xx responses
+//! and argument-validation failures all land inside the `ToolResult` as text,
+//! because the model is the one that can react: it can rephrase the query, try
+//! another tool, or tell the user the search is unavailable. A hook that
+//! errored instead would take the whole stream down over a rate limit.
 
-# Web search
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Resolves web_search and web_extract tool calls against a configured search backend.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-web-search</code> feature and an API key for the configured backend.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>WebSearchPlugin</code> or choosing a <code>WebSearchProvider</code>.</dd>
-</dl>
-
-`WebSearchPlugin` resolves `web_search` and `web_extract` tool calls a model issues against one configured backend: Firecrawl, Tavily, or DeepSeek Web Search. Only Firecrawl exposes a scrape endpoint, so `web_extract` returns `PluginError::NotSupported` on the other two before any network call. Reach for it to give a model live retrieval without wiring a bespoke HTTP tool for each search API.
-
-```rust,name=Resolve a web_search call against a live backend
 use std::sync::Arc;
 
 use cuca::plugin::CucaPlugin;
@@ -184,56 +229,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Backend Firecrawl, at most 3 results per search
-
-Turn 1: the model searches, and the pipeline pauses for the HTTP call
-  tool result: internal plugin error: web search returned HTTP 401 Unauthorized: {"success":false,"error":"Unauthorized: Invalid token"}
-  thinking blocks: 60
-
-No results, so there is no second turn
-  a valid key makes this a JSON array of {title, url, snippet} objects
-```
-
-## Try it
-
-`examples/web_search.rs` runs the program above against a live model. The model calls `web_search`, the plugin performs the HTTPS request on a short-lived thread while the stream pauses, and a second turn answers from whatever came back. It needs a `llama-server` on port 1234 with the demo model loaded plus `CUCA_SEARCH_API_KEY` holding a Firecrawl key, and prints one line and exits when the key is absent; `CUCA_SEARCH_BASE_URL` overrides the backend endpoint, and `CUCA_BASE_URL` and `CUCA_MODEL` retarget the model at any OpenAI-compatible server. The reply wording and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example web_search --features "provider-llamacpp plugin-web-search"
-```
-
-## Entry types
-
-`WebSearchPlugin`, `WebSearchConfig`, `WebSearchProvider`, `SearchResult`.
-
-## `CucaPlugin`
-
-`WebSearchPlugin` implements `CucaPlugin` with the plugin name `"web-search"`. It overrides `on_stream_chunk` only.
-
-## Config
-
-`WebSearchConfig` defaults: `provider: Firecrawl`, `api_key: ""` (must be set for live calls), `base_url: None`, `max_results: 5`.
-
-## Providers
-
-| `WebSearchProvider` | Search route | Auth | Page extraction |
-|---|---|---|---|
-| `Firecrawl` | `POST {base}/v1/search` | `Authorization: Bearer` | Yes, `POST {base}/v1/scrape` |
-| `Tavily` | `POST {base}/search` | `api_key` field in the request body | No |
-| `DeepSeekWebSearch` | `POST {base}/web-search` | `Authorization: Bearer` | No |
-
-Default base URLs when `WebSearchConfig::base_url` is `None`: `https://api.firecrawl.dev` for Firecrawl, `https://api.tavily.com` for Tavily, `https://api.deepseek.com` for DeepSeek Web Search.
-
-## Tools
-
-| Tool | Arguments | Behavior |
-|---|---|---|
-| `web_search` | `query` (required, non-blank) | Returns normalized `SearchResult { title, url, snippet }` items as a `ToolResult` |
-| `web_extract` | `url` (required, non-blank) | Returns extracted page text on Firecrawl; on Tavily and DeepSeek Web Search it returns `PluginError::NotSupported` before any network call, since only Firecrawl exposes a scrape endpoint |
-
-## Capacity
-
-No growth cap. The plugin holds only its configuration and an HTTP client; nothing accumulates between calls.

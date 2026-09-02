@@ -14,10 +14,10 @@ kicker = "Compact Universal Client for Agents"
 <dt>You need</dt>
 <dd>Rust 1.98 or newer, and a checkout of the repository</dd>
 <dt>Read this if</dt>
-<dd>You are deciding whether <code>cuca-core</code> fits, or looking for where a fact lives on this site</dd>
+<dd>You are deciding whether <code>cuca</code> fits, or looking for where a fact lives on this site</dd>
 </dl>
 
-`cuca-core` is one library crate. It builds a request, dispatches it to a model
+`cuca` is one library crate. It builds a request, dispatches it to a model
 backend, parses the Server-Sent Events the backend streams back, and hands the
 caller a stream of normalized blocks. Every capability beyond that sits behind a
 Cargo feature.

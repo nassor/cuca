@@ -1,24 +1,77 @@
-+++
-title = "Telemetry"
-description = "The OpenTelemetry observability plugin: its three instruments, the meter name, and the tracing log events."
-template = "page.html"
-weight = 10
-+++
+//! Read the three CUCA instruments out of an in-memory OpenTelemetry exporter.
+//!
+//! An `SdkMeterProvider` is built over `InMemoryMetricExporter`, handed to
+//! `OpenTelemetryPlugin`, and the plugin is registered on the client. Two real
+//! turns then stream through it, so the request counter, the streamed-block
+//! counter, and the latency histogram all move for real. One `force_flush`
+//! later the demo prints every exported series with its data points, its
+//! attributes, and the histogram's own count and sum.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example telemetry --features provider-llamacpp,plugin-telemetry
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example telemetry --features provider-llamacpp,plugin-telemetry`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Meter "cuca_client" on an SdkMeterProvider reading into InMemoryMetricExporter
+//!
+//! Turn 1: "Name one bird. Reply with the name only."
+//!   reply: Sparrow
+//!   blocks: 2 text, 78 thinking
+//!
+//! Turn 2: "Name one fish. Reply with the name only."
+//!   reply: Salmon
+//!   blocks: 1 text, 72 thinking
+//!
+//! Exported after force_flush, scope "cuca_client"
+//!   cuca_requests_total  Sum<u64>  Total LLM requests dispatched by CUCA
+//!     2  model="google/gemma-4-12b-qat" provider="LlamaCpp"
+//!   cuca_request_duration_seconds  Histogram<f64>  Latency distribution of LLM execution turns
+//!     count 2, sum 57.034, min 25.250, max 31.784  status="success"
+//!   cuca_streamed_tokens_total  Sum<u64>  Total streaming tokens processed across sessions
+//!     153  no attributes
+//! ```
+//!
+//! The counters are the honest shape of the instruments. `cuca_requests_total`
+//! carries one data point per model and provider pair. `cuca_streamed_tokens_total`
+//! counts one per streamed content block with no attributes at all, so its 153
+//! is exactly the block counts printed above, `2 + 78 + 1 + 72`, and not a token
+//! count. The numbers depend on the model and the machine. The series names,
+//! their kinds, and their attribute keys do not.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why the exporter is the caller's
+//!
+//! `OpenTelemetryPlugin::new` takes a `&dyn MeterProvider` and installs nothing
+//! global, so the plugin composes with whatever pipeline an application already
+//! runs. This demo hands it the in-memory exporter because that is the one
+//! pipeline whose output can be printed to a terminal; a deployment passes the
+//! same handle its OTLP pipeline is built from, and reads the same three series
+//! on the collector side.
 
-# Telemetry
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Records request, token, and latency metrics on a caller-supplied OpenTelemetry meter provider, and emits structured logs.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-telemetry</code> feature and a <code>&amp;dyn opentelemetry::metrics::MeterProvider</code>.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>OpenTelemetryPlugin</code> or wiring its metrics into an exporter.</dd>
-</dl>
-
-`OpenTelemetryPlugin` records request, streamed-token, and latency metrics onto a caller-supplied OpenTelemetry meter provider, and logs request dispatch and completion through `tracing`. It installs no meter provider of its own, so it composes with whatever exporter pipeline the caller already runs. Reach for it to get request-rate, token, and latency dashboards without hand-rolling the counters.
-
-```rust,name=Read the three instruments out of an in-memory exporter
 use std::sync::Arc;
 
 use cuca::plugin::CucaPlugin;
@@ -168,85 +221,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     print_series(&exporter.get_finished_metrics()?);
     Ok(())
 }
-```
-
-```text,name=Expected output
-Meter "cuca_client" on an SdkMeterProvider reading into InMemoryMetricExporter
-
-Turn 1: "Name one bird. Reply with the name only."
-  reply: Sparrow
-  blocks: 2 text, 78 thinking
-
-Turn 2: "Name one fish. Reply with the name only."
-  reply: Salmon
-  blocks: 1 text, 72 thinking
-
-Exported after force_flush, scope "cuca_client"
-  cuca_requests_total  Sum<u64>  Total LLM requests dispatched by CUCA
-    2  model="google/gemma-4-12b-qat" provider="LlamaCpp"
-  cuca_request_duration_seconds  Histogram<f64>  Latency distribution of LLM execution turns
-    count 2, sum 57.034, min 25.250, max 31.784  status="success"
-  cuca_streamed_tokens_total  Sum<u64>  Total streaming tokens processed across sessions
-    153  no attributes
-```
-
-## Try it
-
-`examples/telemetry.rs` is the program above. Two live turns move all three instruments, and one `force_flush` prints every exported series with its data points and attributes. `cuca_streamed_tokens_total` reaching 153 is exactly the block counts printed per turn, `2 + 78 + 1 + 72`, which is what "one increment per streamed block" means in practice.
-
-The counts and durations come from `google/gemma-4-12b-qat` on one machine and change with both. The series names, their kinds, and their attribute keys do not.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example telemetry --features "provider-llamacpp plugin-telemetry"
-```
-
-## Entry types
-
-`OpenTelemetryPlugin`.
-
-## `CucaPlugin`
-
-`OpenTelemetryPlugin` implements `CucaPlugin` with the plugin name `"opentelemetry-observability"`. It overrides `on_request`, `on_stream_chunk`, and `on_response_complete`.
-
-## Instruments
-
-Created once from the meter named `"cuca_client"`:
-
-| Instrument | Kind | Recorded |
-|---|---|---|
-| `cuca_requests_total` | `Counter<u64>` | Incremented by 1 in `on_request`, with `model` and `provider` attributes |
-| `cuca_streamed_tokens_total` | `Counter<u64>` | Incremented by 1 in `on_stream_chunk`, once per streamed content block |
-| `cuca_request_duration_seconds` | `Histogram<f64>` | Recorded in `on_response_complete` with `res.duration_secs` |
-
-The token counter is a coarse approximation: one increment per streamed block, not a real token count.
-
-## Logs
-
-`tracing::info!` events under target `cuca::telemetry` on request dispatch (`model`, `provider`) and on response completion (`duration`, `prompt_tokens`, `completion_tokens`).
-
-## Cost bridge
-
-`OtelCostObserver`, compiled only when `plugin-cost` is also enabled, records the cost ledger to the same `"cuca_client"` meter. It is built from a `&dyn opentelemetry::metrics::MeterProvider`, attaches through `CostConfig::observers` ([Cost accounting](@/plugins/cost.md)), and lives in core, at `cuca::cost_otel`, because neither plugin may name the other. Its ten instruments are `Gauge<u64>`, recorded with no attributes on every `on_request` charge and every `on_response_complete` commit, one per `CostUsage` field. Gauges rather than counters: a reading is a cumulative snapshot, and the observer seam carries no deltas.
-
-| Instrument | `CostUsage` field |
-|---|---|
-| `cuca_cost_spent_micros` | `spent_micros` |
-| `cuca_cost_prompt_tokens` | `prompt_tokens` |
-| `cuca_cost_completion_tokens` | `completion_tokens` |
-| `cuca_cost_cache_read_tokens` | `cache_read_tokens` |
-| `cuca_cost_cache_write_tokens` | `cache_write_tokens` |
-| `cuca_cost_turns` | `turns` |
-| `cuca_cost_unpriced_turns` | `unpriced_turns` |
-| `cuca_cost_overflow_turns` | `overflow_turns` |
-| `cuca_cost_untokenized_image_blocks` | `untokenized_image_blocks` |
-| `cuca_cost_near_cap` | `near_cap`, as `1` or `0` |
-
-`examples/cost_otel.rs` registers both plugins on one meter provider and prints all ten gauges after a live priced turn.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example cost_otel --features "provider-llamacpp plugin-cost plugin-telemetry"
-```
-
-## Capacity
-
-No growth cap. Accumulation and export are the caller's OpenTelemetry meter provider's responsibility; no default meter provider is installed by this plugin.

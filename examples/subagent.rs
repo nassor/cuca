@@ -1,24 +1,76 @@
-+++
-title = "Subagent"
-description = "The child subagent delegation plugin: spawn and collect tools, Git worktree isolation, and the pending-child cap."
-template = "page.html"
-weight = 6
-+++
+//! Fan a task out to a child agent mid-stream, then collect its summary.
+//!
+//! The parent model calls `spawn_subagent`, and the plugin answers immediately
+//! with the new child's id: the spawn is non-blocking, and the pending gauge
+//! moves to one while the child is still running. A caller-supplied
+//! `SubagentRunner` executes that child as its own live turn. A second parent
+//! turn calls `collect_subagent`, which drains the pending registry back to
+//! zero and hands the child's summary to the parent conversation.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example subagent --features provider-llamacpp,plugin-subagent
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example subagent --features provider-llamacpp,plugin-subagent`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Pending gauge: 0 of 1024 children awaiting collection
+//!
+//! Turn 1: the parent delegates, and spawning does not block
+//!   child id from the tool result: sub-0
+//!   pending 1 of 1024, spawns so far 1
+//!   thinking blocks: 121
+//!
+//! The child runs its own turn while the parent waits
+//!   the child delivered its result
+//!
+//! Turn 2: the parent collects the summary through the same pipeline
+//!   collected summary: "The largest moon of Saturn is Titan."
+//!   pending 0 of 1024, spawns so far 1
+//!   thinking blocks: 83
+//!
+//! Spawn log, 1 entr(ies)
+//!   parent session "unset", worktree "none"
+//! ```
+//!
+//! The child's summary and the block counts depend on the model. The ids and
+//! the gauge do not: ids are `sub-<n>` from a per-plugin counter, so the first
+//! child is always `sub-0`, and pending goes one up on spawn and one down on
+//! collect.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why spawn and collect are split
+//!
+//! `spawn_subagent` registers a receiver and fires the child on a background
+//! task, so the parent stream keeps producing blocks while the child works.
+//! Only `collect` blocks, and it blocks the calling thread with a std
+//! `recv()`, which parks that one thread and carries no runtime guard. On a
+//! current-thread runtime the parent's thread is also the child's only
+//! executor, so collecting before the child has delivered would park the
+//! executor the child needs; the wait loop below is what keeps the two apart.
 
-# Subagent
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Turns spawn_subagent and collect_subagent tool calls into asynchronous child agent runs, optionally isolated in a Git worktree.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-subagent</code> feature and a caller-supplied <code>SubagentRunner</code> that executes one child run.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>SubagentPlugin</code> or implementing <code>SubagentRunner</code>.</dd>
-</dl>
-
-`SubagentPlugin` turns `spawn_subagent`/`collect_subagent` tool calls, or direct `spawn_subagent`/`collect` calls, into asynchronous child agent runs executed by a caller-supplied `SubagentRunner`, optionally isolated in a Git worktree. Spawning is non-blocking: it starts the child on a background task and returns its id immediately, while `collect` blocks until that child's `SubagentResult` is ready. Reach for it to fan a task out to an isolated child agent and collect its summary back into the parent conversation.
-
-```rust,name=Delegate a task to a child agent and collect it back
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -282,67 +334,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Pending gauge: 0 of 1024 children awaiting collection
-
-Turn 1: the parent delegates, and spawning does not block
-  child id from the tool result: sub-0
-  pending 1 of 1024, spawns so far 1
-  thinking blocks: 121
-
-The child runs its own turn while the parent waits
-  the child delivered its result
-
-Turn 2: the parent collects the summary through the same pipeline
-  collected summary: "The largest moon of Saturn is Titan."
-  pending 0 of 1024, spawns so far 1
-  thinking blocks: 83
-
-Spawn log, 1 entr(ies)
-  parent session "unset", worktree "none"
-```
-
-## Try it
-
-`examples/subagent.rs` runs the program above against a live model. The parent model calls `spawn_subagent`, the plugin returns the child's id without blocking, a runner executes the child as its own live turn, and a second parent turn calls `collect_subagent` to pull the summary back. The pending gauge is printed on both sides of the fan-out. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. Both replies and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example subagent --features "provider-llamacpp plugin-subagent"
-```
-
-## Entry types
-
-`SubagentPlugin`, `SubagentSpec`, `SubagentResult`, `SubagentRunner`, `WorktreeConfig`.
-
-## `CucaPlugin`
-
-`SubagentPlugin` implements `CucaPlugin` with the plugin name `"subagent-delegation"`. It overrides `on_stream_chunk` only.
-
-## Tools
-
-| Tool | Arguments | Behavior |
-|---|---|---|
-| `spawn_subagent` | `name?`, `task` (required, non-blank), `tool_scope?`, `worktree?`, `session_id?` | Registers the child, starts it on a background task, and replaces the block with a `ToolResult` carrying the child's id |
-| `collect_subagent` | `subagent_id` | Blocks until the named child finishes, then replaces the block with a `ToolResult` carrying its summary, or the error text on failure |
-
-Spawning is non-blocking; only `collect` blocks. When `SubagentSpec::worktree` is set, `spawn_subagent` first runs `git worktree add <path> [-b <branch>]` in the current working directory; a non-git working directory or a failed add surfaces as `PluginError::NotSupported`.
-
-## Capacity, pending children
-
-| | |
-|---|---|
-| Bound | `SubagentPlugin::DEFAULT_MAX_PENDING`, 1024 spawned-but-uncollected children |
-| At-cap policy | `spawn_subagent` refuses the spawn rather than evicting a pending child |
-| Usage gauge | `SubagentPlugin::pending_len()` against `max_pending()` |
-
-## Capacity, spawn log
-
-| | |
-|---|---|
-| Bound | `SubagentPlugin::MAX_SPAWN_LOG`, 4096 entries |
-| At-cap policy | The oldest logged spawn is dropped |
-| Usage gauge | `SubagentPlugin::spawns()` |
-
-`SubagentPlugin::spawn_count()` is a separate, uncapped total counter of every spawn since construction.

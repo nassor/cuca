@@ -33,28 +33,32 @@
 //!
 //! # Output
 //!
-//! The live reply prints as it streams, then the same blocks print again out of
-//! the trajectory. The shape, with the numbers one short run produced:
+//! One run against `google/gemma-4-12b-qat` on llama.cpp:
 //!
 //! ```text
 //! Live turn (the only provider dispatch in this program)
-//!   streamed: Text("ok")
-//!   1 blocks in 0.00 s
+//!   58 blocks in 34.17 s: 57 Thinking, 1 Text
+//!   last block: Text("ok")
 //!
-//! Client dropped. Replaying from /tmp/cuca-replay-example-1956693
-//!   session `demo`: 1 turn(s), 1 block(s), 5 records of 65536 (near cap: false)
-//!   turn 0 covers sequences 0..=4, complete: true
+//! Client dropped. Replaying from /tmp/cuca-replay-example-3199010
+//!   session `demo`: 1 turn(s), 58 block(s), 62 records of 65536 (near cap: false)
+//!   turn 0 covers sequences 0..=61, complete: true
 //!     system prompt: "You are concise."
 //!     message: User with 1 block(s)
-//!     accounting: 0 ms, 0 prompt tokens, 1 completion tokens
-//!   replayed: Text("ok")
+//!     accounting: 34166 ms, 0 prompt tokens, 58 completion tokens
+//!   replayed 58 blocks: 57 Thinking, 1 Text
+//!   last block: Text("ok")
+//!   identical to the live stream, block for block: true
 //!
-//! Rebuilt UnifiedResponse: model=canned-model provider=LlamaCpp
-//!   duration=0.000 s prompt=0 completion=1 content=1 blocks
+//! Rebuilt UnifiedResponse: model=google/gemma-4-12b-qat provider=LlamaCpp
+//!   duration=34.166 s prompt=0 completion=58 content=58 blocks
 //!
 //! Fork-point replay at `demo:2`
-//!   3 of 5 records retained, 1 turn(s), 1 block(s)
+//!   3 of 62 records retained, 1 turn(s), 1 block(s)
 //! ```
+//!
+//! The `identical to the live stream` line is the demo: 58 blocks came back in
+//! the same order with no `CucaClient` alive to dispatch them.
 //!
 //! Block counts and record counts depend on the model: a reasoning-heavy reply
 //! adds `Thinking` blocks, and each recorded block is one more record. The
@@ -75,7 +79,7 @@
 //! called directly rather than registered on the builder. Replay drives
 //! sessions instead of observing one: there is no live request to mutate, no
 //! arriving chunk to annotate, and no hook signature that can return a stream.
-//! Stage 2 below is the reason the rule exists — a "plugin" that only ever runs
+//! Stage 2 below is the reason the rule exists: a "plugin" that only ever runs
 //! when the caller explicitly asks would be a permanent no-op in the pipeline.
 //!
 //! Two documented fidelity gaps also show up here: `ImageBase64` blocks are
@@ -123,6 +127,27 @@ fn describe(block: &MessageContentBlock) -> String {
     }
 }
 
+/// Per-kind counts of a block sequence, in first-seen order.
+///
+/// A reasoning model emits one `Thinking` block per token, so printing every
+/// block twice (once live, once replayed) would bury the comparison the demo
+/// is about.
+fn kinds(blocks: &[String]) -> String {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for block in blocks {
+        let kind = block.split('(').next().unwrap_or(block);
+        match counts.iter_mut().find(|(seen, _)| *seen == kind) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((kind, 1)),
+        }
+    }
+    counts
+        .iter()
+        .map(|(kind, count)| format!("{count} {kind}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Base URL and model come from the environment so the example runs
@@ -159,13 +184,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
     };
-    let mut live_blocks = 0usize;
+    let mut live: Vec<String> = Vec::new();
     while let Some(chunk) = stream.next().await {
         match chunk {
-            Ok(block) => {
-                live_blocks += 1;
-                println!("  streamed: {}", describe(&block));
-            }
+            Ok(block) => live.push(describe(&block)),
             Err(error) => {
                 println!("  the stream ended early: {error}");
                 break;
@@ -173,8 +195,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!(
-        "  {live_blocks} blocks in {:.2} s",
-        started.elapsed().as_secs_f64()
+        "  {} blocks in {:.2} s: {}",
+        live.len(),
+        started.elapsed().as_secs_f64(),
+        kinds(&live)
+    );
+    println!(
+        "  last block: {}",
+        live.last().map_or("none", String::as_str)
     );
 
     // Stage 2: no client, no provider, no cache. The dispatch path is *gone*
@@ -233,14 +261,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // `stream_turn` clones the turn's blocks, so the trajectory stays
     // replayable; `into_stream` moves them out instead.
-    let mut replayed = trajectory.stream_turn(0)?;
-    while let Some(item) = replayed.next().await {
+    let mut replayed: Vec<String> = Vec::new();
+    let mut stream = trajectory.stream_turn(0)?;
+    while let Some(item) = stream.next().await {
         // A replayed stream never yields Err: every failure was raised by
         // `load` above, so a materialized stream runs to completion.
         match item {
-            Ok(block) => println!("  replayed: {}", describe(&block)),
+            Ok(block) => replayed.push(describe(&block)),
             Err(error) => println!("  unreachable: {error}"),
         }
+    }
+    println!("  replayed {} blocks: {}", replayed.len(), kinds(&replayed));
+    println!(
+        "  last block: {}",
+        replayed.last().map_or("none", String::as_str)
+    );
+    // The claim the demo exists to check: same blocks, same order, no
+    // provider. `zip` would hide a length difference, so the lengths are
+    // compared too.
+    match replayed
+        .iter()
+        .zip(&live)
+        .position(|(after, before)| after != before)
+    {
+        None if replayed.len() == live.len() => {
+            println!("  identical to the live stream, block for block: true")
+        }
+        None => println!(
+            "  block counts differ: {} live, {} replayed",
+            live.len(),
+            replayed.len()
+        ),
+        Some(index) => println!(
+            "  first divergence at block {index}: live {}, replayed {}",
+            live[index], replayed[index]
+        ),
     }
 
     // Stage 3: the aggregated shape, for consumers written against

@@ -1,24 +1,96 @@
-+++
-title = "Guardrails"
-description = "The JSON Schema output guardrail plugin: schema keys, the retry protocol, and the tracked-call cap."
-template = "page.html"
-weight = 5
-+++
+//! Validate live tool calls against JSON Schemas and watch the diagnostic
+//! replace one in the stream.
+//!
+//! One `book_flight` tool is offered to the model on three real turns, each
+//! through a differently configured `JsonGuardrailPlugin`. The first guardrail
+//! enforces the schema the tool advertises, so the model's call passes and
+//! reaches the caller untouched. The second enforces a policy that also demands
+//! a `passenger`, which no call to this tool can carry, so `on_stream_chunk`
+//! replaces the `ToolCall` block with a `ToolResult` carrying the diagnostic the
+//! model would read on its next turn. The third enforces the same policy with a
+//! retry budget of zero, which is the `"guardrail_exhausted"` path. Every turn
+//! prints the blocks that reached the caller, the tracked-call gauge, and the
+//! retry event.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded. The model must
+//!   support tool calling.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example guardrails --features provider-llamacpp,plugin-guardrails
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example guardrails --features provider-llamacpp,plugin-guardrails`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Tool book_flight advertises: {"additionalProperties":false,"properties":{"date":{"pattern":"^\\d{4}-\\d{2}-\\d{2}$","type":"string"},"destination":{"type":"string"}},"required":["destination","date"],"type":"object"}
+//! Guardrail policy for the last two turns: {"properties":{"date":{"pattern":"^\\d{4}-\\d{2}-\\d{2}$","type":"string"},"destination":{"type":"string"},"passenger":{"type":"string"}},"required":["destination","date","passenger"],"type":"object"}
+//!
+//! Policy matches the tool, retry budget 3: "Book a flight to Lisbon for 2026-03-14 with the book_flight tool."
+//!   thinking blocks: 117
+//!   ToolCall call="0UNMlIsYtMPi2o1N6r910nE645OFrWuD" name="book_flight" passed the schema
+//!     {"date":"2026-03-14","destination":"Lisbon"}
+//!   tracked_calls: 0
+//!   last_retry_event: none, nothing was rewritten
+//!
+//! Policy demands a passenger, retry budget 3: "Book a flight to Porto for 2026-04-02 with the book_flight tool."
+//!   thinking blocks: 87
+//!   ToolResult call="bgzkJZOykk62A9zcSTMnE3X7YHgXQEhe"
+//!     {"error":"schema_validation_failed","issues":["\"passenger\" is a required property"],"tool":"book_flight"}
+//!   tracked_calls: 1
+//!   last_retry_event: schema "book_flight", error "schema_validation_failed", attempt 1
+//!
+//! Same policy, retry budget 0: "Book a flight to Faro for 2026-05-20 with the book_flight tool."
+//!   thinking blocks: 107
+//!   ToolResult call="g1zw5RS7PUVPuVM5o4xM7or2ZerArLPu"
+//!     {"error":"guardrail_exhausted","issues":["\"passenger\" is a required property"],"tool":"book_flight"}
+//!   tracked_calls: 1
+//!   last_retry_event: schema "book_flight", error "guardrail_exhausted", attempt 1
+//! ```
+//!
+//! The first turn is the pass-through: `tracked_calls` stays `0`, because the
+//! plugin only tracks a call id once that call has failed. The second is the
+//! retry path: the attempt count is inside the budget, so the diagnostic says
+//! `schema_validation_failed` and the model is expected to correct itself on the
+//! next turn. The third is the bound: a zero retry budget means the first
+//! failure is already past it, so the plugin stops asking and says
+//! `guardrail_exhausted`. Both diagnostics carry the same `issues`, so the
+//! `error` field is the only thing the budget changes.
+//!
+//! The tool-call ids and the thinking counts depend on the model, as does
+//! whether it emits a valid ISO date at all. The diagnostic shapes, the attempt
+//! counts, and the gauge do not.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why a diagnostic block and not an error
+//!
+//! `on_stream_chunk` returning `Err` would drop the block and leave the caller
+//! nothing to feed back, so the plugin rewrites the block instead: a
+//! `ToolResult` for the same call id, carrying the schema issues as JSON. That
+//! is a message the model can read on the next turn, which is what makes the
+//! correction loop self-contained. The bound exists because the loop would
+//! otherwise never end: a model that cannot satisfy the schema would be asked
+//! forever.
 
-# Guardrails
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Validates tool call arguments and text responses against caller-registered JSON Schemas, re-injecting a diagnostic on failure instead of erroring the stream.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-guardrails</code> feature.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>JsonGuardrailPlugin</code> or reading its retry behavior.</dd>
-</dl>
-
-`JsonGuardrailPlugin` validates tool call arguments, and optionally model text responses, against caller-registered JSON Schemas as blocks stream in. A failing value is not an error: the plugin replaces the block with a `ToolResult` diagnostic and re-injects it so the model can retry, bounded by `max_attempts` before it emits `"guardrail_exhausted"`. Reach for it to keep a model's structured tool calls honest against a schema without hand-writing retry logic.
-
-```rust,name=Pass a valid tool call and reject two invalid ones
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -216,69 +288,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     .await?;
     Ok(())
 }
-```
-
-```text,name=Expected output
-Tool book_flight advertises: {"additionalProperties":false,"properties":{"date":{"pattern":"^\\d{4}-\\d{2}-\\d{2}$","type":"string"},"destination":{"type":"string"}},"required":["destination","date"],"type":"object"}
-Guardrail policy for the last two turns: {"properties":{"date":{"pattern":"^\\d{4}-\\d{2}-\\d{2}$","type":"string"},"destination":{"type":"string"},"passenger":{"type":"string"}},"required":["destination","date","passenger"],"type":"object"}
-
-Policy matches the tool, retry budget 3: "Book a flight to Lisbon for 2026-03-14 with the book_flight tool."
-  thinking blocks: 117
-  ToolCall call="0UNMlIsYtMPi2o1N6r910nE645OFrWuD" name="book_flight" passed the schema
-    {"date":"2026-03-14","destination":"Lisbon"}
-  tracked_calls: 0
-  last_retry_event: none, nothing was rewritten
-
-Policy demands a passenger, retry budget 3: "Book a flight to Porto for 2026-04-02 with the book_flight tool."
-  thinking blocks: 87
-  ToolResult call="bgzkJZOykk62A9zcSTMnE3X7YHgXQEhe"
-    {"error":"schema_validation_failed","issues":["\"passenger\" is a required property"],"tool":"book_flight"}
-  tracked_calls: 1
-  last_retry_event: schema "book_flight", error "schema_validation_failed", attempt 1
-
-Same policy, retry budget 0: "Book a flight to Faro for 2026-05-20 with the book_flight tool."
-  thinking blocks: 107
-  ToolResult call="g1zw5RS7PUVPuVM5o4xM7or2ZerArLPu"
-    {"error":"guardrail_exhausted","issues":["\"passenger\" is a required property"],"tool":"book_flight"}
-  tracked_calls: 1
-  last_retry_event: schema "book_flight", error "guardrail_exhausted", attempt 1
-```
-
-## Try it
-
-`examples/guardrails.rs` is the program above. It runs the same tool through three guardrail configurations: the schema the tool advertises, so the model's call passes untouched and `tracked_calls()` stays `0`; a policy that also demands a `passenger`, so the invalid call is replaced by the `schema_validation_failed` diagnostic at attempt 1; and that same policy with a retry budget of `0`, where the first failure is already past the budget and the diagnostic says `guardrail_exhausted`. Both diagnostics carry the same `issues`, so the retry budget is the only thing that changed.
-
-It needs a `llama-server` on port 1234 with a tool-calling model loaded. The tool-call ids and thinking counts come from `google/gemma-4-12b-qat` and change with the model, as does whether it emits a valid ISO date at all; the diagnostic shapes and attempt counts do not.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example guardrails --features "provider-llamacpp plugin-guardrails"
-```
-
-## Entry types
-
-`JsonGuardrailPlugin`.
-
-## `CucaPlugin`
-
-`JsonGuardrailPlugin` implements `CucaPlugin` with the plugin name `"json-guardrails"`. It overrides `on_stream_chunk` only.
-
-## Construction
-
-| Constructor | `max_attempts` |
-|---|---|
-| `JsonGuardrailPlugin::new(schema_path)` | 3, loading a JSON object of tool name to JSON Schema from `schema_path` |
-| `JsonGuardrailPlugin::with_schemas(schemas, max_attempts)` | caller-supplied |
-
-Schemas are keyed by tool name. The reserved key `"response"`, when registered, guards model text responses that look like a JSON object (text starting with `{`). A tool with no registered schema passes through unvalidated.
-
-## Retry behavior
-
-An invalid `ToolCall` is replaced with a `ToolResult` carrying `{"error": ..., "tool": ..., "issues": [...]}`. The `error` field is `"schema_validation_failed"` while the tracked attempt count for that call id is at or below `max_attempts`, and `"guardrail_exhausted"` once it is exceeded. Each retry injection also emits a `tracing::warn!` event under target `cuca::guardrails` with `schema_name`, `error_type`, and `attempt_count`.
-
-## Capacity
-
-| | |
-|---|---|
-| Bound | `JsonGuardrailPlugin::MAX_TRACKED_CALLS`, 4096 tool call ids tracked for their attempt count |
-| At-cap policy | The oldest tracked id is evicted, in insertion order |
-| Usage gauge | `JsonGuardrailPlugin::tracked_calls()` |

@@ -1,24 +1,91 @@
-+++
-title = "Entity extraction"
-description = "Schema-guided entity and relationship extraction into a graph delta for the memory plugin's working graph."
-template = "page.html"
-weight = 1
-+++
+//! Extract a typed graph from prose, merge it into memory, and answer from
+//! the merged graph.
+//!
+//! Stage 1 asks a live model for an org chart and validates its answer against
+//! an `EntityExtractionSchema`, so the accepted delta is schema-typed rather
+//! than whatever JSON the model felt like emitting. Stage 2 performs the
+//! mandatory hand-off: the report's `delta` is inert until
+//! `MemoryPlugin::merge_graph` applies it. Stage 3 renders the merged graph
+//! into the next request and asks a question whose answer exists only in the
+//! graph, since the source prose is never sent again.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example entity_extraction --features provider-llamacpp,service-entity-extraction
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example entity_extraction --features provider-llamacpp,service-entity-extraction`
+//!
+//! # Output
+//!
+//! One run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Schema `org-chart`: entity tables [person, company], relationship tables [works_at]
+//!
+//! Stage 1: one live extraction turn
+//!   the model answered with 326 thinking blocks and 166 chars of JSON
+//!   accepted 4 nodes, 2 relationships
+//!   node entity:6:person:object:1:4:namestring:12:Grace Hopper [person] {"name":"Grace Hopper","title":"rear admiral"}
+//!   node entity:6:person:object:1:4:namestring:12:Ada Lovelace [person] {"name":"Ada Lovelace","title":"mathematician"}
+//!   node entity:7:company:object:1:4:namestring:13:Naval Systems [company] {"name":"Naval Systems"}
+//!   node entity:7:company:object:1:4:namestring:18:Analytical Engines [company] {"name":"Analytical Engines"}
+//!   edge entity:6:person:object:1:4:namestring:12:Grace Hopper -[works_at]-> entity:7:company:object:1:4:namestring:13:Naval Systems
+//!   edge entity:6:person:object:1:4:namestring:12:Ada Lovelace -[works_at]-> entity:7:company:object:1:4:namestring:18:Analytical Engines
+//!
+//! Stage 2: the mandatory hand-off (MemoryPlugin::merge_graph)
+//!   graph before the merge: 0 nodes, 0 relationships
+//!   merge report: 4 added, 0 overwritten, 0 kept, 2 edges added, 0 renamed
+//!   graph after the merge: 4 nodes, 2 relationships
+//!
+//! Stage 3: the graph rendered into the next request
+//!   CUCA graph memory: 4 nodes, 2 relationships
+//!   node entity:6:person:object:1:4:namestring:12:Ada Lovelace: labels=[person] props={"name":"Ada Lovelace","title":"mathematician"}
+//!   node entity:6:person:object:1:4:namestring:12:Grace Hopper: labels=[person] props={"name":"Grace Hopper","title":"rear admiral"}
+//!   node entity:7:company:object:1:4:namestring:13:Naval Systems: labels=[company] props={"name":"Naval Systems"}
+//!   node entity:7:company:object:1:4:namestring:18:Analytical Engines: labels=[company] props={"name":"Analytical Engines"}
+//!   rel relationship:8:works_at53:entity:6:person:object:1:4:namestring:12:Ada Lovelace60:entity:7:company:object:1:4:namestring:18:Analytical Enginesobject:0:: entity:6:person:object:1:4:namestring:12:Ada Lovelace -[works_at]-> entity:7:company:object:1:4:namestring:18:Analytical Engines weight=1
+//!   rel relationship:8:works_at53:entity:6:person:object:1:4:namestring:12:Grace Hopper55:entity:7:company:object:1:4:namestring:13:Naval Systemsobject:0:: entity:6:person:object:1:4:namestring:12:Grace Hopper -[works_at]-> entity:7:company:object:1:4:namestring:13:Naval Systems weight=1
+//!   asked: Which company does Grace Hopper work at, and what is her title?
+//!   reply: Grace Hopper works at Naval Systems and her title is rear admiral.
+//! ```
+//!
+//! Stage 3 is the point of the demo: the source prose is never in that
+//! request, so the reply can only come from the rendered graph.
+//!
+//! The thinking-block count, the JSON length and the final reply depend on the
+//! model. The node ids do not: they are a length-prefixed canonical encoding
+//! of the table name plus the identity columns, so the same extraction always
+//! produces the same ids, and a relationship id folds in both endpoints and
+//! its own properties.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why a service and not a plugin hook?
+//!
+//! `EntityExtractor` is a service, not a `CucaPlugin`. Extraction is a turn of
+//! its own against a model of the caller's choosing, and its product is a
+//! graph, which no hook signature can return. The hand-off in stage 2 is the
+//! reason: the delta is a standalone `MemoryGraph` that the application
+//! merges, so a hook that silently merged it would take the merge policy away
+//! from the caller.
 
-# Entity extraction
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Validates model-produced entity and relationship candidates against a declared schema and builds a graph delta.</dd>
-<dt>You need</dt>
-<dd>The <code>service-entity-extraction</code> feature, which enables <code>plugin-memory</code>.</dd>
-<dt>Read this if</dt>
-<dd>You are calling <code>EntityExtractor::extract</code> or applying its report to a working memory graph.</dd>
-</dl>
-
-`EntityExtractor` validates model-produced entity and relationship rows against a schema you declare up front, then builds the accepted rows into a graph delta. It is driven by direct calls: `extract(source, model)` asks an `EntityExtractionModel` for a candidate and validates it, and `validate_candidate(candidate)` validates a candidate you already hold. Both return an `EntityExtractionReport { delta, nodes_accepted, relationships_accepted }` whose `delta` is a standalone `MemoryGraph`, never a mutation of live plugin state. Reach for it when a model should populate a [`MemoryPlugin`](@/plugins/memory.md) working graph under a declared contract instead of free-form text.
-
-```rust,name=Extract a typed graph then answer from the merged graph
 use std::pin::Pin;
 
 use cuca::plugin::CucaPlugin;
@@ -353,69 +420,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Schema `org-chart`: entity tables [person, company], relationship tables [works_at]
-
-Stage 1: one live extraction turn
-  the model answered with 326 thinking blocks and 166 chars of JSON
-  accepted 4 nodes, 2 relationships
-  node entity:6:person:object:1:4:namestring:12:Grace Hopper [person] {"name":"Grace Hopper","title":"rear admiral"}
-  node entity:6:person:object:1:4:namestring:12:Ada Lovelace [person] {"name":"Ada Lovelace","title":"mathematician"}
-  node entity:7:company:object:1:4:namestring:13:Naval Systems [company] {"name":"Naval Systems"}
-  node entity:7:company:object:1:4:namestring:18:Analytical Engines [company] {"name":"Analytical Engines"}
-  edge entity:6:person:object:1:4:namestring:12:Grace Hopper -[works_at]-> entity:7:company:object:1:4:namestring:13:Naval Systems
-  edge entity:6:person:object:1:4:namestring:12:Ada Lovelace -[works_at]-> entity:7:company:object:1:4:namestring:18:Analytical Engines
-
-Stage 2: the mandatory hand-off (MemoryPlugin::merge_graph)
-  graph before the merge: 0 nodes, 0 relationships
-  merge report: 4 added, 0 overwritten, 0 kept, 2 edges added, 0 renamed
-  graph after the merge: 4 nodes, 2 relationships
-
-Stage 3: the graph rendered into the next request
-  CUCA graph memory: 4 nodes, 2 relationships
-  node entity:6:person:object:1:4:namestring:12:Ada Lovelace: labels=[person] props={"name":"Ada Lovelace","title":"mathematician"}
-  node entity:6:person:object:1:4:namestring:12:Grace Hopper: labels=[person] props={"name":"Grace Hopper","title":"rear admiral"}
-  node entity:7:company:object:1:4:namestring:13:Naval Systems: labels=[company] props={"name":"Naval Systems"}
-  node entity:7:company:object:1:4:namestring:18:Analytical Engines: labels=[company] props={"name":"Analytical Engines"}
-  rel relationship:8:works_at53:entity:6:person:object:1:4:namestring:12:Ada Lovelace60:entity:7:company:object:1:4:namestring:18:Analytical Enginesobject:0:: entity:6:person:object:1:4:namestring:12:Ada Lovelace -[works_at]-> entity:7:company:object:1:4:namestring:18:Analytical Engines weight=1
-  rel relationship:8:works_at53:entity:6:person:object:1:4:namestring:12:Grace Hopper55:entity:7:company:object:1:4:namestring:13:Naval Systemsobject:0:: entity:6:person:object:1:4:namestring:12:Grace Hopper -[works_at]-> entity:7:company:object:1:4:namestring:13:Naval Systems weight=1
-  asked: Which company does Grace Hopper work at, and what is her title?
-  reply: Grace Hopper works at Naval Systems and her title is rear admiral.
-```
-
-`google/gemma-4-12b-qat` produced that run: the thinking-block count, the JSON length and the final reply are the model's. The node and relationship ids are not: they are a length-prefixed canonical encoding of the table name plus the identity columns, so the same extraction always derives the same ids, and a relationship id folds in both endpoints and its own properties.
-
-## Try it
-
-`examples/entity_extraction.rs` is the program above. It asks a live model for an org chart, validates the reply into a schema-typed delta, performs the mandatory hand-off with `MemoryPlugin::merge_graph`, then renders the merged graph into a second request and asks a question whose answer exists only in the graph, since the source prose is never sent again. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example entity_extraction --features "provider-llamacpp service-entity-extraction"
-```
-
-## Feature edge
-
-`service-entity-extraction = ["plugin-memory"]` in `Cargo.toml`: enabling this feature enables `plugin-memory` with it. This is one of the crate's three hard service feature edges.
-
-## Entry types
-
-`EntityExtractor`, `EntityExtractionSchema`, `EntityTable`, `RelationshipTable`, `PropertyColumn`, `PropertyType`, `EntityReference`, `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionReport`, `EntityExtractionModel`.
-
-## Schema
-
-`EntityExtractionSchema` declares:
-
-- `entities: Vec<EntityTable>`, each with a `name`, `labels` copied onto every produced node, `identity_columns` that form the node's identity and hence its graph id, declared `columns: Vec<PropertyColumn>`, and `allow_model_properties`.
-- `relationships: Vec<RelationshipTable>`, each with a `name`, an edge `kind`, `from_table` and `to_table` endpoint constraints, declared `columns`, and `allow_model_properties`.
-
-Table names are unique across entities and relationships. Each `PropertyColumn` declares a `name`, a `property_type` (`String`, `Boolean`, `Integer`, `Number`, `Array`, `Object`, or `Null`), and whether it is `required`.
-
-## Validation
-
-Validation is total: an unknown table, a missing required property, a type mismatch, an undeclared property on a table with `allow_model_properties = false`, or a relationship endpoint that no accepted entity satisfies all return `PluginError::Validation`. Nothing is accepted partially.
-
-## Capacity
-
-No growth cap. Each call produces one standalone report; nothing is retained between calls.

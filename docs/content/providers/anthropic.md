@@ -19,28 +19,49 @@ weight = 2
 The smallest streaming turn: the `Anthropic` variant and an API key. A bearer
 token via `with_bearer_token` is the other auth mode; see Authentication.
 
+Add the crate with `cargo add cuca --features provider-anthropic`, `cargo add tokio --features rt,macros`, and `cargo add tokio-stream`.
+
 ```rust,name=A first stream through the Anthropic adapter
+use std::io::{Write, stdout};
+
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{CucaClient, UnifiedRequest};
 use tokio_stream::StreamExt;
 
-let client = CucaClient::builder()
-    .with_provider(ProviderEndpoint::Anthropic)
-    .with_api_key(std::env::var("ANTHROPIC_API_KEY")?)
-    .build()?;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = CucaClient::builder()
+        .with_provider(ProviderEndpoint::Anthropic)
+        .with_api_key(std::env::var("ANTHROPIC_API_KEY")?)
+        .build()?;
 
-let mut stream = client
-    .generate_stream(UnifiedRequest::new("claude-sonnet-4-0").add_user_message("Say hello."))
-    .await?;
-while let Some(block) = stream.next().await {
-    if let MessageContentBlock::Text(text) = block? {
-        print!("{text}");
+    let request = UnifiedRequest::new("claude-sonnet-4-0")
+        .add_system_message("You are concise.")
+        .add_user_message("Say hello.")
+        .set_max_tokens(128);
+    let mut stream = client.generate_stream(request).await?;
+
+    let mut text_blocks = 0usize;
+    let mut thinking_blocks = 0usize;
+    while let Some(block) = stream.next().await {
+        match block? {
+            MessageContentBlock::Text(text) => {
+                print!("{text}");
+                stdout().flush()?;
+                text_blocks += 1;
+            }
+            MessageContentBlock::Thinking { .. } => thinking_blocks += 1,
+            _ => {}
+        }
     }
+    println!("\nblocks: {text_blocks} text, {thinking_blocks} thinking");
+    Ok(())
 }
 ```
 
-```text,name=Expected output; exact wording varies by model
+```text,name=Expected shape; not captured from a live run
 Hello! How can I help you today?
+blocks: 1 text, 0 thinking
 ```
 
 ## Endpoint
@@ -79,6 +100,7 @@ The resulting access token is passed to `CucaClientBuilder::with_bearer_token`, 
 - `max_tokens` is required by the API and defaults to 1024 when the unified request leaves it unset.
 - System message `Text` blocks are joined with a newline into the top-level `system` string; non-text system content is dropped; the key is omitted with no system messages.
 - `messages` carries user and assistant turns only. Tool results ride inside a user message as `tool_result` blocks; standalone `Tool`-role messages are skipped.
+- `tools` carries every `UnifiedRequest::tools` entry as `{name, description, input_schema}`; the key is omitted when the request declares no tool, and no `tool_choice` is sent, so the API's own selection default applies.
 
 ## Thinking
 

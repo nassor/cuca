@@ -19,29 +19,56 @@ weight = 5
 The smallest streaming turn: the `LlamaCpp` variant and an explicit base URL
 for a server on port 1234; no API key. The adapter's own default is port 8080.
 
+Add the crate with `cargo add cuca --features provider-llamacpp`, `cargo add tokio --features rt,macros`, and `cargo add tokio-stream`.
+
 ```rust,name=A first stream through the llama.cpp adapter
+use std::io::{Write, stdout};
+
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{CucaClient, UnifiedRequest};
 use tokio_stream::StreamExt;
 
-let client = CucaClient::builder()
-    .with_provider(ProviderEndpoint::LlamaCpp)
-    .with_base_url("http://127.0.0.1:1234/v1")
-    .build()?;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let base_url =
+        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
+    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
 
-let mut stream = client
-    .generate_stream(UnifiedRequest::new("google/gemma-4-e4b").add_user_message("Say hello."))
-    .await?;
-while let Some(block) = stream.next().await {
-    if let MessageContentBlock::Text(text) = block? {
-        print!("{text}");
+    let client = CucaClient::builder()
+        .with_provider(ProviderEndpoint::LlamaCpp)
+        .with_base_url(base_url)
+        .build()?;
+
+    let request = UnifiedRequest::new(model)
+        .add_system_message("You are concise.")
+        .add_user_message("Say hello.")
+        .set_max_tokens(128);
+    let mut stream = client.generate_stream(request).await?;
+
+    let mut text_blocks = 0usize;
+    let mut thinking_blocks = 0usize;
+    while let Some(block) = stream.next().await {
+        match block? {
+            MessageContentBlock::Text(text) => {
+                print!("{text}");
+                stdout().flush()?;
+                text_blocks += 1;
+            }
+            MessageContentBlock::Thinking { .. } => thinking_blocks += 1,
+            _ => {}
+        }
     }
+    println!("\nblocks: {text_blocks} text, {thinking_blocks} thinking");
+    Ok(())
 }
 ```
 
 ```text,name=Expected output; exact wording varies by model
-Hello! How can I help you today?
+Hello.
+blocks: 2 text, 18 thinking
 ```
+
+`google/gemma-4-12b-qat`, served by a local server on port 1234, produced this reply.
 
 ## Endpoint
 

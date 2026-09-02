@@ -1,24 +1,91 @@
-+++
-title = "Prompt cache"
-description = "The client-owned local response cache: the digest key, the TTL and LRU cap, and the export snapshot."
-template = "page.html"
-weight = 3
-+++
+//! Serve a repeated turn from the client cache, then hand the cache to a
+//! second client that has no server to talk to.
+//!
+//! Stage 1 sends one turn through a client carrying a `PromptCache` and times
+//! it. Stage 2 sends the byte-identical turn again: the digest matches, the
+//! stored blocks replay, and the timing plus the hook counters show that no
+//! provider was involved. Stage 3 changes one word, which changes the digest
+//! and costs a second real dispatch. Stage 4 exports the cache with
+//! `prompt_cache_snapshot`, imports it into a client whose base URL is a
+//! closed port, and replays the first turn there: a hit answers, and a
+//! never-cached turn fails on the connection the hit never opened.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example prompt_cache --features provider-llamacpp,service-prompt-cache
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example prompt_cache --features provider-llamacpp,service-prompt-cache`
+//!
+//! # Output
+//!
+//! One run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Cache: 0/64 entries, ttl 300 s
+//! Key of the turn about to run: 5fe40816c33c86f1...
+//!
+//! Stage 1: the first turn (a miss)
+//!   reply: A tokenizer is a tool that breaks down text into smaller units, such as words, characters, or subwords, to make it processable by machine learning models.
+//!   28564 ms, 33 text blocks, 291 thinking blocks
+//!   hooks: on_request 1, on_stream_chunk 324, on_response_complete 1
+//!   cache: 1/64 entries
+//!
+//! Stage 2: the identical turn (a hit)
+//!   reply: A tokenizer is a tool that breaks down text into smaller units, such as words, characters, or subwords, to make it processable by machine learning models.
+//!   0 ms, 33 text blocks, 291 thinking blocks
+//!   hooks: on_request 2, on_stream_chunk 324, on_response_complete 2
+//!   identical to stage 1: true
+//!
+//! Stage 3: one word changed, so the digest changes
+//!   key: ef2c17e471bfb101...
+//!   reply: An embedding is a numerical representation of data, such as words or images, in a high-dimensional vector space where similar items are positioned closer together.
+//!   36273 ms, 2/64 entries
+//!
+//! Stage 4: the snapshot, imported into a client with no reachable server
+//!   exported 2 entries, imported 2, expired 0, evicted 0
+//!   base URL: http://127.0.0.1:1/v1
+//!   replayed stage 1 in 0 ms: A tokenizer is a tool that breaks down text into smaller units, such as words, characters, or subwords, to make it processable by machine learning models.
+//!   an uncached turn on that client: transport failure: error sending request for url (http://127.0.0.1:1/v1/chat/completions)
+//! ```
+//!
+//! Stage 4 is the point of the demo. The second client cannot reach any
+//! server, so the only thing that can answer is the imported cache, and the
+//! uncached turn shows what happens when the digest misses.
+//!
+//! The replies, the block counts, and the two dispatch timings depend on the
+//! model. Everything else does not: a hit is always served without a socket,
+//! `on_stream_chunk` never advances on a hit, and `on_response_complete` runs
+//! once per turn either way.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why a service and not a plugin hook?
+//!
+//! `PromptCache` is a service, not a `CucaPlugin`. Its lookup has to happen
+//! after every `on_request` hook has finished mutating the request, since the
+//! digest covers the effective request, and it has to be able to *replace*
+//! the provider dispatch. No hook signature can do either: `on_request`
+//! returns `Result<(), PluginError>`, so it can refuse a turn but never
+//! answer one. The cache is wired on the builder and read by
+//! `CucaClient::generate_stream` itself.
 
-# Prompt cache
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Caches complete UnifiedRequest to UnifiedResponse pairs on the client, keyed by a digest of the effective request.</dd>
-<dt>You need</dt>
-<dd>The <code>service-prompt-cache</code> feature.</dd>
-<dt>Read this if</dt>
-<dd>You are configuring a client-level cache or exporting and importing its state.</dd>
-</dl>
-
-`PromptCache` stores complete `UnifiedRequest` to `UnifiedResponse` pairs on the client, bounded by a capacity and a time-to-live. Attach it with `CucaClientBuilder::with_prompt_cache_config(config)` for a client-private cache, or `with_prompt_cache_service(service)` to share one `Arc<PromptCache>` between clients. `CucaClient::generate_stream` then looks up after every `on_request` hook and before provider dispatch, and writes an entry back only after a fully successful stream. Reach for it when identical turns repeat and should skip the provider entirely.
-
-```rust,name=Serve a repeated turn from the client cache
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -223,79 +290,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Cache: 0/64 entries, ttl 300 s
-Key of the turn about to run: 5fe40816c33c86f1...
-
-Stage 1: the first turn (a miss)
-  reply: A tokenizer is a tool that breaks down text into smaller units, such as words, characters, or subwords, to make it processable by machine learning models.
-  28564 ms, 33 text blocks, 291 thinking blocks
-  hooks: on_request 1, on_stream_chunk 324, on_response_complete 1
-  cache: 1/64 entries
-
-Stage 2: the identical turn (a hit)
-  reply: A tokenizer is a tool that breaks down text into smaller units, such as words, characters, or subwords, to make it processable by machine learning models.
-  0 ms, 33 text blocks, 291 thinking blocks
-  hooks: on_request 2, on_stream_chunk 324, on_response_complete 2
-  identical to stage 1: true
-
-Stage 3: one word changed, so the digest changes
-  key: ef2c17e471bfb101...
-  reply: An embedding is a numerical representation of data, such as words or images, in a high-dimensional vector space where similar items are positioned closer together.
-  36273 ms, 2/64 entries
-
-Stage 4: the snapshot, imported into a client with no reachable server
-  exported 2 entries, imported 2, expired 0, evicted 0
-  base URL: http://127.0.0.1:1/v1
-  replayed stage 1 in 0 ms: A tokenizer is a tool that breaks down text into smaller units, such as words, characters, or subwords, to make it processable by machine learning models.
-  an uncached turn on that client: transport failure: error sending request for url (http://127.0.0.1:1/v1/chat/completions)
-```
-
-`google/gemma-4-12b-qat` produced that run: the replies, the block counts and the two dispatch timings are the model's. The rest is the cache's, for any model: a hit costs no socket, `on_stream_chunk` does not advance on it, `on_response_complete` runs once per turn either way, and the digest changes when one word of the request does.
-
-## Try it
-
-`examples/prompt_cache.rs` is the program above. It runs one turn, repeats it byte for byte to hit the cache, changes one word to miss it, then exports the cache with `prompt_cache_snapshot` and imports it into a second client whose base URL is a closed port: the hit still answers there, and an uncached turn fails on the connection the hit never opened. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example prompt_cache --features "provider-llamacpp service-prompt-cache"
-```
-
-## Entry types
-
-`PromptCache`, `PromptCacheConfig`, `PromptCacheEntry`, `PromptCacheSnapshot`, `PromptCacheImportReport`, `PromptCacheError`.
-
-## Key
-
-The lookup key is the lowercase SHA-256 hex digest of the effective request, the request exactly as it will cross the wire after provider selection and every `on_request` hook. The hashed bytes are the postcard encoding of a borrowed mirror of the whole `UnifiedRequest`, with every `serde_json::Value` leaf encoded as canonical JSON text: object keys sorted recursively, array order and scalar values preserved. The mirror destructures the request exhaustively, so a new `UnifiedRequest` field fails to compile until it is part of the key. A non-finite `temperature` is rejected with `PromptCacheError::Validation` rather than digested. The digest input format is not stable across crate versions.
-
-## Hooks on a hit
-
-A hit replays the stored `content` blocks in order and skips provider dispatch, `execute_local_tool`, and `on_stream_chunk`. Every registered plugin's `on_response_complete` runs exactly once, against the stored `UnifiedResponse` with `duration_secs` replaced by the replay's own elapsed time; `model`, `provider`, `content`, `prompt_tokens`, `completion_tokens`, `finish_reason`, and `prompt_cache_usage` are the stored values.
-
-| Turn stage | On a hit |
-|---|---|
-| `on_request` | runs, in registration order, before the lookup |
-| provider dispatch | skipped |
-| `execute_local_tool` | skipped |
-| `on_stream_chunk` | skipped |
-| `on_response_complete` | runs exactly once |
-| cache write-back | skipped; only a miss writes |
-
-A session log therefore keeps one `ResponseComplete` event per turn whether or not the turn was served from cache, and `plugin-telemetry` records the replay latency. Nothing re-derives per-block state on a replay: `service-entity-extraction` is a separate explicit-call service and `plugin-memory` implements no completion hook, so no extraction repeats.
-
-## Capacity
-
-`PromptCacheConfig::new(capacity, ttl)` is the only constructor; there is no default configuration, and it rejects a zero `capacity` or a zero `ttl` with `PromptCacheError::Config`.
-
-| | |
-|---|---|
-| Bound | `PromptCacheConfig::capacity` entries, each expiring `ttl` after insertion |
-| At-cap policy | Deterministic LRU eviction: the least recently used entry is evicted to make room |
-| Usage gauge | `PromptCache::len()` against `capacity()`; `len()` is an upper bound that may include not-yet-pruned expired entries, `snapshot()` gives the exact live set |
-
-## Export
-
-`CucaClient::prompt_cache_snapshot()` returns a `PromptCacheSnapshot` of every live entry, sorted by key. `CucaClient::replace_prompt_cache_snapshot(snapshot)` validates the snapshot in full, then atomically replaces the cache's state, returning a `PromptCacheImportReport` of imported, expired, and capacity-evicted entry counts.

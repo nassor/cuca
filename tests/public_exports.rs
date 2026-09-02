@@ -245,8 +245,8 @@ mod redaction_surface {
 #[cfg(feature = "plugin-memory")]
 mod memory_surface {
     use cuca::{
-        GraphImportReport, GraphNode, GraphRelationship, GraphSnapshot, MemoryConfig, MemoryGraph,
-        MemoryPlugin,
+        GRAPH_RENDER_MARKER, GraphImportReport, GraphNode, GraphRelationship, GraphSnapshot,
+        MemoryConfig, MemoryGraph, MemoryPlugin,
     };
 
     #[test]
@@ -277,6 +277,18 @@ mod memory_surface {
         assert_eq!(report.nodes, 1);
         assert_eq!(report.relationships, 1);
         assert_eq!(plugin.snapshot().expect("snapshot must succeed"), snapshot);
+    }
+
+    #[test]
+    fn graph_render_marker_is_root_exported() {
+        let mut graph = MemoryGraph::new();
+        graph.upsert_node(GraphNode {
+            id: "a".into(),
+            labels: Vec::new(),
+            properties: serde_json::Map::new(),
+        });
+
+        assert!(graph.render(8, 8).starts_with(GRAPH_RENDER_MARKER));
     }
 }
 

@@ -1,24 +1,90 @@
-+++
-title = "Cost accounting"
-description = "The token and currency ledger plugin: budget caps, per-model breakdown, and the tiktoken estimate it prices from."
-template = "page.html"
-weight = 14
-+++
+//! Charge live turns against a price table, then let the budget cap refuse one.
+//!
+//! A `CostPlugin` is registered on the client with rates for the demo model, a
+//! 160-token cumulative cap, and a `warn_fraction` of `0.3`.
+//! Real turns then stream through it: `on_request` charges the prompt estimate
+//! and enforces the cap before dispatch, `on_response_complete` charges the
+//! completion estimate, and the ledger is printed after every turn. The cap is
+//! crossed while the conversation is still running, so the last turn is refused
+//! before it reaches the provider and the ledger keeps nothing for it.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example cost --features provider-llamacpp,plugin-cost
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example cost --features provider-llamacpp,plugin-cost`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Budget: 160 tokens, against a first prompt estimated at 18 tokens
+//! Rates: 3000000 micros/Mtok in, 15000000 micros/Mtok out
+//!
+//! Turn 1: "Name one bird. Reply with the name only."
+//!   reply: Eagle
+//!   blocks: 67 thinking
+//!   ledger: 18 prompt + 71 completion = 89/160 tokens, 1119 micros, turns 1
+//!   near cap: true
+//!
+//! Turn 2: "Name one fish. Reply with the name only."
+//!   reply: Salmon
+//!   blocks: 46 thinking
+//!   ledger: 52 prompt + 119 completion = 171/160 tokens, 1941 micros, turns 2
+//!   near cap: true
+//!   warning injected into this prompt: "CUCA cost warning: This client has used 77% of its budget cap; wrap up soon."
+//!
+//! Turn 3: "Name one insect. Reply with the name only."
+//!   refused before dispatch
+//!   plugin "cost-accounting" at stage "request": token budget exceeded: this turn would reach 221 of 160 tokens
+//!   ledger after the refusal: 171/160 tokens, turns 2
+//!
+//! Per-model breakdown
+//!   google/gemma-4-12b-qat  52 prompt + 119 completion, 1941 micros, turns 2
+//!
+//! After reset(): 0 tokens, turns 0, cap still Some(160)
+//! ```
+//!
+//! The committed total ends at `171/160`, past its own cap, and that is the
+//! design: `on_request` gates the turn on the projected *prompt* total, then
+//! `on_response_complete` charges the completion once the stream is over. A cap
+//! therefore bounds what is dispatched, never what is billed for a turn already
+//! in flight. The refusal itself charges nothing, which is why the ledger reads
+//! the same before and after it.
+//!
+//! Which turn the cap refuses depends on the model: every charged token is a
+//! tiktoken estimate of what the model actually emitted, and a reasoning model
+//! spends most of its completion budget on `Thinking` blocks. The budget, the
+//! rates, and the refusal being charge-free do not depend on the model.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why the cap is projected, not detected
+//!
+//! `on_request` charges the prompt estimate and compares the *projected* total
+//! against the cap, so a budget is never crossed rather than merely reported
+//! afterwards. That is also why the refused turn commits nothing: the check
+//! runs before the charge, and no terminal hook fires on a turn that never
+//! dispatched.
 
-# Cost accounting
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Estimates prompt and completion tokens with tiktoken, prices them against a caller-supplied table, and refuses a turn that would cross a configured budget cap.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-cost</code> feature.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>CostPlugin</code>, setting a budget cap, or reading its per-model spend.</dd>
-</dl>
-
-`CostPlugin` estimates prompt and completion tokens with tiktoken, prices them against a caller-supplied `PricingTable`, and refuses a turn in `on_request` once the projected spend would cross `max_total_tokens` or `max_total_micros`. Every reading is an estimate: no provider adapter parses an upstream `usage` object into `UnifiedResponse::prompt_tokens`, so this plugin is the crate's only token and spend ledger. Reach for it to enforce a budget cap or to read per-model spend without an upstream billing API.
-
-```rust,name=Charge live turns then let the budget refuse one
 use std::sync::{Arc, Mutex};
 
 use cuca::plugin::CucaPlugin;
@@ -236,102 +302,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
-```
-
-```text,name=Expected output
-Budget: 160 tokens, against a first prompt estimated at 18 tokens
-Rates: 3000000 micros/Mtok in, 15000000 micros/Mtok out
-
-Turn 1: "Name one bird. Reply with the name only."
-  reply: Eagle
-  blocks: 67 thinking
-  ledger: 18 prompt + 71 completion = 89/160 tokens, 1119 micros, turns 1
-  near cap: true
-
-Turn 2: "Name one fish. Reply with the name only."
-  reply: Salmon
-  blocks: 46 thinking
-  ledger: 52 prompt + 119 completion = 171/160 tokens, 1941 micros, turns 2
-  near cap: true
-  warning injected into this prompt: "CUCA cost warning: This client has used 77% of its budget cap; wrap up soon."
-
-Turn 3: "Name one insect. Reply with the name only."
-  refused before dispatch
-  plugin "cost-accounting" at stage "request": token budget exceeded: this turn would reach 221 of 160 tokens
-  ledger after the refusal: 171/160 tokens, turns 2
-
-Per-model breakdown
-  google/gemma-4-12b-qat  52 prompt + 119 completion, 1941 micros, turns 2
-
-After reset(): 0 tokens, turns 0, cap still Some(160)
-```
-
-## Try it
-
-`examples/cost.rs` is the program above. It prices the demo model, caps the ledger at 160 tokens, and dispatches a growing conversation until the cap refuses a turn: turn 2 crosses `warn_fraction` and carries the injected `CUCA cost warning:` system message, turn 3 is refused in `on_request` and charges nothing.
-
-The committed total ends past its own cap, at `171/160`, because `on_request` gates on the projected prompt total and `on_response_complete` charges the completion afterwards. A cap bounds what is dispatched, not what a turn already in flight bills. Which turn crosses it depends on the model: every figure is a tiktoken estimate of what `google/gemma-4-12b-qat` actually emitted, most of it `Thinking` blocks.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example cost --features "provider-llamacpp plugin-cost"
-```
-
-## Entry types
-
-`CostPlugin`, `CostConfig`, `CostUsage`, `CostEntry`, `CostObserver`, `PricingTable`, `PricingResolver`, `ModelRates`, `UnpricedModelPolicy`.
-
-## `CucaPlugin`
-
-`CostPlugin` implements `CucaPlugin` with the plugin name `"cost-accounting"` and attaches via `register_plugin`, like any other hook plugin. It overrides `on_request` and `on_response_complete`; `execute_local_tool` and `on_stream_chunk` use the trait defaults, because the plugin owns no tool and a budget cannot abort a turn mid-stream. `CostPlugin::new(config)` validates `CostConfig` and loads the tiktoken encoder named by `encoder_name`, returning `PluginError::Internal` for either failure.
-
-Every reading is an estimate. `UnifiedResponse::prompt_tokens` is always `0` and `completion_tokens` counts blocks, not tokens; no provider adapter parses an upstream `usage` object into either field. `prompt_cache_usage`, populated by the Anthropic adapter only, is the sole provider-reported token data in the crate, and the only correction `CostPlugin` applies against its own tiktoken count.
-
-## Config
-
-`CostConfig` fields and their defaults:
-
-| Field | Default |
-|---|---|
-| `encoder_name` | `"cl100k_base"` |
-| `pricing` | empty `PricingTable` |
-| `pricing_resolver` | `None` |
-| `max_total_tokens` | `None` |
-| `max_total_micros` | `None` |
-| `warn_fraction` | `None` |
-| `max_tracked_models` | `64` |
-| `on_unpriced_model` | `UnpricedModelPolicy::CountTokensOnly` |
-| `observers` | empty |
-
-`max_total_tokens` and `max_total_micros` each disable enforcement on that axis when `None`; `Some(0)` is rejected. `warn_fraction` must fall in `(0.0, 1.0]` and requires at least one cap set. `UnpricedModelPolicy::Reject` with an empty `pricing` table and no `pricing_resolver` is rejected, since it would refuse every turn. Rates in `ModelRates` and spend in `CostUsage` are micro-units of a caller-defined currency per million tokens; the crate never names a currency and never converts.
-
-## Hooks
-
-`on_request` estimates the turn's prompt tokens, including every `req.tools` schema, prices them through `rates_for` (the resolver first, then `pricing`), and projects the post-charge totals against `max_total_tokens` and `max_total_micros`. Either projected total crossing its cap returns `PluginError::HookFailure` and charges nothing. A `warn_fraction` crossing injects a one-shot system message starting `CUCA cost warning:`, the same marker scheme `plugin-memory` uses for its own warning. The charge then commits and every `CostObserver` receives the fresh `CostUsage`; an observer `Err` aborts the turn.
-
-`on_response_complete` estimates completion tokens from `res.content`, re-prices the prompt portion at the cache read and write rates when `res.prompt_cache_usage` is present, commits the model's bucket, and observes again. An observer `Err` here is logged and never surfaces; a poisoned ledger lock instead surfaces on the plugin's next `on_request`.
-
-A client-level cache hit (`service-prompt-cache`) still runs `on_response_complete` against the replayed response, so a cached turn is still charged: the ledger reads as gross, pre-cache spend.
-
-## Caps
-
-| | |
-|---|---|
-| Bound | `CostConfig::max_tracked_models` per-model entries, caller-set, default `64` |
-| At-cap policy | A turn for an untracked model folds into one reserved overflow bucket and increments `CostUsage::overflow_turns`; no eviction, and `usage()` totals stay exact, only per-model attribution degrades |
-| Usage gauge | `CostPlugin::usage()` for totals, `CostPlugin::breakdown()` (bounded by `max_tracked_models + 1`) for the per-model slice |
-
-`CostConfig::pricing` and `CostConfig::observers` are caller-owned and fixed at construction; neither grows from traffic.
-
-## Accessors
-
-`CostPlugin::usage()` returns a `Copy` `CostUsage` reading under one lock. `CostPlugin::breakdown()` returns the per-model entries as a `Vec<(String, CostEntry)>`, sorted by model id. `CostPlugin::reset()` zeroes the ledger for a billing-period rollover, leaving configuration untouched. `CostPlugin::estimate_request_tokens(req)` runs the same estimator the hooks use, callable before a client exists.
-
-## OpenTelemetry bridge
-
-`OtelCostObserver` is a `CostObserver` the crate ships, compiled only when `plugin-cost` and `plugin-telemetry` are both enabled. Put one in `CostConfig::observers` and every reading reaches a caller-supplied meter provider; its `observe` is infallible, so it never aborts a turn. It lives in core, at `cuca::cost_otel`, because neither plugin may name the other. Its instruments are listed under [Telemetry](@/plugins/telemetry.md).
-
-`examples/cost_otel.rs` runs that bridge: one priced live turn, the ledger read three ways, and the gauges read back through an in-memory exporter.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example cost_otel --features "provider-llamacpp plugin-cost plugin-telemetry"
-```

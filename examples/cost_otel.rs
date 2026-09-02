@@ -7,7 +7,7 @@
 //!
 //! # Prerequisites
 //!
-//! - A checkout of this repository (the example depends on `cuca-core` by path).
+//! - A checkout of this repository (the example builds from this crate).
 //! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
 //!   (`llama-server`) on port 1234 with the demo model loaded.
 //!
@@ -29,16 +29,58 @@
 //!
 //! # Output
 //!
-//! The reply prints as text chunks. Three blocks follow it: the `CostUsage`
-//! reading, the per-model breakdown, and the ten gauges the bridge recorded,
-//! read back through an in-memory exporter. Two of those ten lines, with the
-//! numbers a short prompt produced:
+//! The reply prints as text chunks, then the `CostUsage` reading, the per-model
+//! breakdown, and every `cuca_cost_` gauge read back out of the in-memory
+//! exporter. From one run against `google/gemma-4-12b-qat` on llama.cpp:
 //!
 //! ```text
+//! "CUCA" is an ambiguous term that can refer to a mythical witch-like creature in Brazilian folklore, various community action organizations, or other entities depending on the context.
+//!
+//! Cost ledger
+//!   turns                     1
+//!   prompt tokens             16
+//!   completion tokens         2069
+//!   spent (micro-units)       31083
+//!   unpriced turns            0
+//!   near cap                  false
+//!
+//! Per-model breakdown
+//!   google/gemma-4-12b-qat: prompt=16 completion=2069 spent=31083
+//!
 //! Exported OTel gauges
+//!   cuca_cost_cache_read_tokens         = 0
+//!   cuca_cost_cache_read_tokens         = 0
+//!   cuca_cost_cache_write_tokens        = 0
+//!   cuca_cost_cache_write_tokens        = 0
+//!   cuca_cost_completion_tokens         = 0
+//!   cuca_cost_completion_tokens         = 2069
+//!   cuca_cost_near_cap                  = 0
+//!   cuca_cost_near_cap                  = 0
+//!   cuca_cost_overflow_turns            = 0
+//!   cuca_cost_overflow_turns            = 0
 //!   cuca_cost_prompt_tokens             = 16
-//!   cuca_cost_spent_micros              = 258
+//!   cuca_cost_prompt_tokens             = 16
+//!   cuca_cost_spent_micros              = 48
+//!   cuca_cost_spent_micros              = 31083
+//!   cuca_cost_turns                     = 0
+//!   cuca_cost_turns                     = 1
+//!   cuca_cost_unpriced_turns            = 0
+//!   cuca_cost_unpriced_turns            = 0
+//!   cuca_cost_untokenized_image_blocks  = 0
+//!   cuca_cost_untokenized_image_blocks  = 0
 //! ```
+//!
+//! Every gauge appears twice because two export batches exist and
+//! `exported_cost_gauges` flattens all of them. The turn ran for about 70
+//! seconds, longer than the `PeriodicReader`'s own export interval, so one
+//! batch was collected mid-turn, right after `on_request` charged the 16 prompt
+//! tokens at 48 micros and before `on_response_complete` committed the
+//! completion, and the second came from the `force_flush` at the end. A gauge
+//! reports the last value in its batch, so the pair is the same instrument at
+//! two moments. The printout is sorted by name and then value, not by time.
+//!
+//! The reply, the completion count, and the spend depend on the model. The
+//! gauge names and the 16-token prompt charge at these rates do not.
 //!
 //! With no server on the base URL, the program prints one line naming the
 //! address and exits successfully.

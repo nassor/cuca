@@ -2,7 +2,7 @@
 //!
 //! # Prerequisites
 //!
-//! - A checkout of this repository (the example depends on `cuca-core` by path).
+//! - A checkout of this repository (the example builds from this crate).
 //! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
 //!   (`llama-server`) on port 1234 with the demo model loaded.
 //!
@@ -27,11 +27,29 @@
 //! Text blocks print to stdout as they arrive; every other block type and
 //! every stream error print to stderr:
 //!
-//! - `Thinking` prints as `[reasoning] …` (Gemma 4 E4B emits reasoning
-//!   depending on the server and request).
-//! - `ToolCall` prints as `[tool call] <name> <args>`.
+//! - `Thinking` prints as `[reasoning] …`, one line per streamed block.
+//! - `ToolCall` prints as `[tool call] <name> <args> (id: <id>)`.
 //! - `ImageBase64` and `ToolResult` print a one-line note.
 //! - An `Err` prints as `[error] …` and stops the drain.
+//!
+//! Expect that stderr stream to be long. One run against
+//! `google/gemma-4-12b-qat` on llama.cpp wrote 1506 `[reasoning]` lines, one
+//! per reasoning token, for two lines of answer on stdout:
+//!
+//! ```text
+//! 1. In Romanian folklore, the **Cuca** is a legendary bogeyman used to frighten children into behaving.
+//! 2. It is traditionally depicted as a witch-like creature with a long nose and long hair.
+//! ```
+//!
+//! That volume is the point of the example rather than noise: it shows every
+//! block the provider actually sent. Redirect stderr to keep the answer alone,
+//! `cargo run --example stream_all_blocks --features provider-llamacpp 2>/dev/null`
+//! on Linux and macOS. The counts and the answer depend on the model, and which
+//! tags appear at all depends on what the server emits: a plain prose reply
+//! from a non-reasoning model is all `Text`.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
 //!
 //! # Why a match over the stream?
 //!
@@ -59,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // the base URL above is passed explicitly to reach port 1234; no API key.
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url)
+        .with_base_url(base_url.clone())
         .build()?;
 
     // Stage 2: build the request.
@@ -68,7 +86,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_user_message("List two short facts about CUCA.");
 
     // Stage 3: start the stream.
-    let mut stream = client.generate_stream(request).await?;
+    let mut stream = match client.generate_stream(request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            println!("No server answered at {base_url}: {error}");
+            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
+            return Ok(());
+        }
+    };
 
     // Stage 4: match on every block variant, keeping the text reply clean of
     // the other annotations.

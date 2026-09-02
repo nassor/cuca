@@ -1,24 +1,93 @@
-+++
-title = "Memory"
-description = "The context compaction and working memory graph plugin: triggers, the compaction pipeline, and graph context injection."
-template = "page.html"
-weight = 3
-+++
+//! Watch a live conversation cross a compaction trigger inside `on_request`.
+//!
+//! A `MemoryPlugin` is registered on the client with a six-message trigger, a
+//! deliberately tiny context window, and a `warn_fraction` of `0.2`. Four real
+//! turns then stream through it. A `ContextUsageObserver` prints the gauge the
+//! hook hands it on every request, a second plugin registered after memory
+//! prints the prompt memory left behind, and the last turn shows both edits the
+//! hook makes: the one-shot near-limit warning, and the compaction that trims
+//! the message list back under the trigger.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example memory --features provider-llamacpp,plugin-memory
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example memory --features provider-llamacpp,plugin-memory`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Trigger: max_messages 6, window 256 tokens, warn at 20%
+//! Strategy: SlidingWindow { keep_messages: 4 }
+//! Prompt shape letters: S system, U user, A assistant
+//!
+//! Turn 1: "The vault is in Lisbon. Reply with: noted"
+//!   gauge: 16/256 tokens (6%), window resolved false
+//!   prompt: 2 messages in, 2 out (SU), warning false
+//!   reply: noted
+//!
+//! Turn 2: "The key rotates on friday. Reply with: noted"
+//!   gauge: 29/256 tokens (11%), window resolved false
+//!   prompt: 4 messages in, 4 out (SUAU), warning false
+//!   reply: noted
+//!
+//! Turn 3: "The owner is ops@example.com. Reply with: noted"
+//!   gauge: 43/256 tokens (17%), window resolved false
+//!   prompt: 6 messages in, 6 out (SUAUAU), warning false
+//!   reply: noted
+//!
+//! Turn 4: "Where is the vault? Answer in one word."
+//!   gauge: 56/256 tokens (22%), window resolved false
+//!   prompt: 8 messages in, 4 out (SAUS), warning true, compacted
+//!   reply: Unknown.
+//! ```
+//!
+//! Turn 4 is both edits at once. The gauge crosses `0.2`, so the hook appends
+//! one warning system message, taking the prompt to nine messages; the
+//! nine-message prompt is over the six-message trigger, so `SlidingWindow`
+//! trims it to four. The two messages the plugin never removes are still
+//! there, first system and most recent user, which is why the shape is `SAUS`.
+//!
+//! `Unknown.` is the honest consequence: the message that said Lisbon is one of
+//! the four the window dropped, so the model cannot read it any more. Keeping
+//! dropped turns reachable is the vector store's offload seam, not compaction's
+//! job.
+//!
+//! The replies and the exact token counts depend on the model. The message
+//! counts do not: the trigger, the strategy, and the never-remove invariant are
+//! all deterministic.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why the counts are read from a second plugin
+//!
+//! `on_request` compacts the request in place and returns nothing: the
+//! `CompressionReport` it builds internally is only returned by the out of band
+//! `MemoryPlugin::compress`. Hooks run in registration order over one shared
+//! request, so the honest way to see what the hook did to a dispatched turn is
+//! a plugin registered after it. The gauge is the other half: the plugin hands
+//! every `ContextUsageObserver` a `ContextUsage` reading on every request,
+//! before any compaction, which is the reading a dashboard would show.
 
-# Memory
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Compacts the request's message list when it crosses a configured size trigger, and can render an in-memory working graph into requests as context.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-memory</code> feature.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>MemoryPlugin</code>, tuning compaction, or working with the <code>MemoryGraph</code>.</dd>
-</dl>
-
-`MemoryPlugin` keeps a conversation's message list inside a configured size budget: it counts tokens with tiktoken-rs and, once `max_messages`, `max_tokens`, or `max_fraction` triggers, runs an ordered pipeline of compaction strategies until the request fits again. It also owns an optional in-memory working graph that `on_request` renders into every request as durable, structured context. Reach for it once a long conversation risks crossing the model's context window, or when the agent needs graph-shaped long-term memory beyond plain summarization.
-
-```rust,name=Compact a live conversation once it crosses the trigger
 use std::sync::{Arc, Mutex};
 
 use cuca::plugin::CucaPlugin;
@@ -211,97 +280,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Trigger: max_messages 6, window 256 tokens, warn at 20%
-Strategy: SlidingWindow { keep_messages: 4 }
-Prompt shape letters: S system, U user, A assistant
-
-Turn 1: "The vault is in Lisbon. Reply with: noted"
-  gauge: 16/256 tokens (6%), window resolved false
-  prompt: 2 messages in, 2 out (SU), warning false
-  reply: noted
-
-Turn 2: "The key rotates on friday. Reply with: noted"
-  gauge: 29/256 tokens (11%), window resolved false
-  prompt: 4 messages in, 4 out (SUAU), warning false
-  reply: noted
-
-Turn 3: "The owner is ops@example.com. Reply with: noted"
-  gauge: 43/256 tokens (17%), window resolved false
-  prompt: 6 messages in, 6 out (SUAUAU), warning false
-  reply: noted
-
-Turn 4: "Where is the vault? Answer in one word."
-  gauge: 56/256 tokens (22%), window resolved false
-  prompt: 8 messages in, 4 out (SAUS), warning true, compacted
-  reply: Unknown.
-```
-
-## Try it
-
-`examples/memory.rs` is the program above. Turn 4 carries both edits `on_request` makes: the gauge crosses `warn_fraction`, so one warning system message is appended, and the resulting nine-message prompt is over the six-message trigger, so `SlidingWindow` trims it to four. `SAUS` is the surviving shape, first system message and most recent user message included, because those two are never removed.
-
-The `Unknown.` reply is the point rather than a defect: the message that stated Lisbon is one of the four the window dropped. Reaching dropped turns again is the [vector store](@/services/vector-store.md) offload seam, not compaction's job. The replies and the token counts come from `google/gemma-4-12b-qat` and change with the model; the message counts do not.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example memory --features "provider-llamacpp plugin-memory"
-```
-
-## Entry types
-
-`MemoryPlugin`, `MemoryConfig`, `MemoryGraph`, `GraphContextConfig`, `GraphNode`, `GraphRelationship`, `GraphDirection`, `MergePolicy`, `MergeReport`, `GraphSnapshot`, `Budget`, `CompactionStrategy`, `CompressionAction`, `CompressionReport`, `ContextUsage`, `ContextUsageObserver`, `ContextWindowResolver`, `Summarizer`, `VectorStore`, `GraphImportReport`.
-
-## `CucaPlugin`
-
-`MemoryPlugin` implements `CucaPlugin` with the plugin name `"context-memory"`. It overrides `on_request` only; `on_stream_chunk` and `on_response_complete` use the trait defaults.
-
-## Config
-
-`MemoryConfig` defaults:
-
-| Field | Default |
-|---|---|
-| `encoder_name` | `"cl100k_base"` |
-| `context_window_tokens` | 128000 |
-| `context_window_resolver` | `None` |
-| `max_messages` | `None` |
-| `max_tokens` | `None` |
-| `max_fraction` | `Some(0.8)` |
-| `warn_fraction` | `None` |
-| `observers` | empty |
-| `offload_turns` | 10 |
-| `max_drop_system_observations` | 3 |
-| `graph_context` | `None` |
-| `strategies` | see below |
-
-`max_tokens` and `max_fraction` are mutually exclusive; setting both is rejected at construction. `max_messages`, when set, takes precedence over either token budget.
-
-Default `strategies` pipeline, in order: `Offload { turns: 10 }`, `Summarize { turns: 10 }`, `DeduplicateFileReads { tool_name: "read_file" }`, `ClearToolResults { keep_pairs: 3 }`, `ClampOversizedMessages { max_part_tokens: 4096 }`, `SlidingWindow { keep_messages: 40 }`, `DropObservations`, `DropTurns`.
-
-## Capacity, message list
-
-| | |
-|---|---|
-| Bound | The active `Budget`, resolved from `max_messages`, `max_tokens`, or `max_fraction` against the resolved context window |
-| At-cap policy | The ordered `strategies` pipeline runs in sequence; a strategy with no extension seam configured no-ops |
-| Usage gauge | `MemoryPlugin::count_tokens()` |
-
-## Capacity, working graph
-
-The `MemoryGraph` itself carries no internal cap; it grows only through explicit calls to `MemoryPlugin::merge_graph`, `replace_graph`, or `replace_snapshot`, never from a hook.
-
-| | |
-|---|---|
-| Bound (per-request render) | `GraphContextConfig::max_nodes` (default 64) and `max_relationships` (default 128) |
-| At-cap policy | `MemoryGraph::render` selects the bounded subset for that request; the stored graph is unaffected |
-| Usage gauge | `MemoryGraph::len()` (nodes) and `MemoryGraph::relationship_count()` |
-
-When `MemoryConfig::graph_context` is set, `on_request` renders the graph into a system message placed right after the first system message. The message is idempotent: it starts with a fixed marker, so a later request replaces it in place rather than appending, and it is removed once the graph is empty.
-
-## See also
-
-[Entity extraction](@/services/entity-extraction.md) produces graph deltas applied to this plugin's working graph through `merge_graph` or `replace_graph`.
-
-[Vector store](@/services/vector-store.md) implements the `VectorStore` offload seam `CompactionStrategy::Offload` writes to, wired through `MemoryPlugin::with_extensions`.

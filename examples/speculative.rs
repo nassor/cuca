@@ -1,24 +1,112 @@
-+++
-title = "Speculative"
-description = "The fast/slow model orchestrator: complexity routing, the draft and fallback pipeline, and the client pool."
-template = "page.html"
-weight = 2
-+++
+//! Route turns across a fast and a slow model tier, and watch one turn cascade
+//! from the fast tier to the slow one.
+//!
+//! Stage 1 runs the deterministic `ComplexityEvaluator` over three requests,
+//! with no network. Stage 2 sends the simple one through the orchestrator, so
+//! the fast tier serves it end to end. Stage 3 asks for a reply the default
+//! `JsonToolDraftValidator` refuses, which re-routes the turn to the slow tier
+//! with the rejection attached, twice, until the cascade budget is spent.
+//! Stage 4 sends the multi-file request, which routing sends straight to the
+//! slow tier with no draft phase. Stage 5 prints the verdicts behind stage 3.
+//!
+//! Both tiers run through injected `TurnExecutor`s so every routing decision
+//! is printed as it happens; they draw their clients from the same
+//! `ClientPool` the pooled executors use.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 serving both tier models.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example speculative --features provider-llamacpp,service-speculative
+//! ```
+//!
+//! # Configuration
+//!
+//! A fast/slow pair needs two model ids, so this demo reads one variable per
+//! tier instead of `CUCA_MODEL`. All three default to a local llama.cpp
+//! server; override them to target any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_FAST_MODEL`: fast-tier model id, defaults to `google/gemma-4-e4b`.
+//! - `CUCA_SLOW_MODEL`: slow-tier model id, defaults to `google/gemma-4-12b-qat`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_FAST_MODEL=<small-id> CUCA_SLOW_MODEL=<large-id> cargo run --example speculative --features provider-llamacpp,service-speculative`
+//!
+//! # Output
+//!
+//! One run with `google/gemma-4-e4b` as the fast tier and
+//! `google/gemma-4-12b-qat` as the slow tier:
+//!
+//! ```text
+//! Pair: fast google/gemma-4-e4b, slow google/gemma-4-12b-qat
+//! Thresholds: tool depth 1, input tokens 2000, file refs 3
+//!
+//! Stage 1: routing, with no network
+//!   Fast  <- classify one short sentence
+//!   Slow  <- four file references
+//!   Slow  <- one tool-call round trip
+//!
+//! Stage 2: the Fast request, latency budget 60000 ms
+//!   fast tier -> google/gemma-4-e4b
+//!   reply: Positive
+//!   346 ms, 1 text blocks, 0 thinking blocks
+//!
+//! Stage 3: a refused draft and the fallback cascade
+//!   fast tier -> google/gemma-4-e4b
+//!   slow tier -> google/gemma-4-12b-qat
+//!   slow tier -> google/gemma-4-12b-qat
+//!   cascade exhausted: provider llamacpp failed: text block is valid JSON but not a JSON object
+//!   35635 ms, 0 text blocks, 77 thinking blocks
+//!
+//! Stage 4: the Slow request, no draft phase
+//!   slow tier -> google/gemma-4-12b-qat
+//!   reply: src/sse.rs
+//!   24975 ms, 5 text blocks, 244 thinking blocks
+//!
+//! Stage 5: the draft verdicts behind the cascade
+//!   accepted: Text("The sentiment is neutral.")
+//!   rejected: Text("42") because text block is valid JSON but not a JSON object
+//!   rejected: ToolCall(read_file) because tool call id must be non-empty
+//!
+//! Pooled clients: 1 (both tiers share one provider and base URL)
+//! ```
+//!
+//! Stage 3 is the point of the demo: three tier lines for one turn. The fast
+//! tier drafted a bare integer, the validator refused it, the slow tier was
+//! asked again with the rejection attached, refused again, and the second
+//! cascade spent the budget, so the last rejection surfaced as
+//! `CucaError::Provider`. A slow tier that answers in prose ends the same turn
+//! with a reply instead.
+//!
+//! The replies, the block counts and the timings depend on the models. The
+//! routing decisions in stage 1 and the verdicts in stage 5 depend on neither:
+//! both are pure functions of the request and the block.
+//!
+//! # The latency guard
+//!
+//! `SwappableModelPair::latency_threshold_ms` is left generous here on
+//! purpose. The guard swaps tiers at the first poll at which the fast stream
+//! is still `Pending` *after* the deadline, so a tier stream that is only ever
+//! woken when a block is ready, like the channel-backed executor below, never
+//! offers the guard that poll. The validation cascade is the fallback a demo
+//! can trigger on purpose.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why a service and not a plugin hook?
+//!
+//! `ModelOrchestrator` is a service, not a `CucaPlugin`. It decides which
+//! provider a turn reaches and may re-dispatch that turn to a second one
+//! mid-stream. `on_request` can only mutate a request, and `on_stream_chunk`
+//! sees one block at a time with no way to replace the stream it came from, so
+//! no hook can route a turn across two tiers.
 
-# Speculative
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Routes a turn to a fast or slow model tier by complexity, drafts speculatively on the fast tier, and falls back to the slow tier on rejection or latency.</dd>
-<dt>You need</dt>
-<dd>The <code>service-speculative</code> feature and a <code>SwappableModelPair</code>.</dd>
-<dt>Read this if</dt>
-<dd>You are attaching a <code>ModelOrchestrator</code> to a client, or tuning its complexity thresholds.</dd>
-</dl>
-
-`ModelOrchestrator` pairs a fast, low-latency model with a slow, high-capacity one and picks a tier per turn. A deterministic `ComplexityEvaluator` routes the request, the fast tier streams a speculative draft, and a rejected block or a missed latency deadline moves the remainder of the turn to the slow tier. Reach for it when most turns are cheap routing or parameter extraction and only some need the large model.
-
-```rust,name=Route turns across a fast and a slow tier
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -307,92 +395,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     Ok(())
 }
-```
-
-```text,name=Expected output
-Pair: fast google/gemma-4-e4b, slow google/gemma-4-12b-qat
-Thresholds: tool depth 1, input tokens 2000, file refs 3
-
-Stage 1: routing, with no network
-  Fast  <- classify one short sentence
-  Slow  <- four file references
-  Slow  <- one tool-call round trip
-
-Stage 2: the Fast request, latency budget 60000 ms
-  fast tier -> google/gemma-4-e4b
-  reply: Positive
-  346 ms, 1 text blocks, 0 thinking blocks
-
-Stage 3: a refused draft and the fallback cascade
-  fast tier -> google/gemma-4-e4b
-  slow tier -> google/gemma-4-12b-qat
-  slow tier -> google/gemma-4-12b-qat
-  cascade exhausted: provider llamacpp failed: text block is valid JSON but not a JSON object
-  35635 ms, 0 text blocks, 77 thinking blocks
-
-Stage 4: the Slow request, no draft phase
-  slow tier -> google/gemma-4-12b-qat
-  reply: src/sse.rs
-  24975 ms, 5 text blocks, 244 thinking blocks
-
-Stage 5: the draft verdicts behind the cascade
-  accepted: Text("The sentiment is neutral.")
-  rejected: Text("42") because text block is valid JSON but not a JSON object
-  rejected: ToolCall(read_file) because tool call id must be non-empty
-
-Pooled clients: 1 (both tiers share one provider and base URL)
-```
-
-`google/gemma-4-e4b` as the fast tier and `google/gemma-4-12b-qat` as the slow tier produced that run: the replies, the block counts and the timings are theirs. The stage 1 routing decisions and the stage 5 verdicts are not, since both are pure functions of the request and the block.
-
-## Try it
-
-`examples/speculative.rs` is the program above. It routes three requests with no network, serves the simple one from the fast tier, then asks for a reply the default `JsonToolDraftValidator` refuses so the turn cascades to the slow tier twice and spends its budget, and finally sends the multi-file request straight to the slow tier. Both tiers run through injected `TurnExecutor`s, so every dispatch prints as it happens. It needs a `llama-server` on port 1234 serving both tier models; `CUCA_BASE_URL`, `CUCA_FAST_MODEL` and `CUCA_SLOW_MODEL` retarget it at any OpenAI-compatible server.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example speculative --features "provider-llamacpp service-speculative"
-```
-
-## Entry types
-
-`ModelOrchestrator`, `SwappableModelPair`, `ClientPool`, `Complexity`, `ComplexityEvaluator`, `DraftValidator`, `JsonToolDraftValidator`, `TurnExecutor`.
-
-## Attaching
-
-Attached with `CucaClientBuilder::with_orchestrator(orchestrator)`. When one is attached, `CucaClient::generate_stream` runs `on_request` hooks as usual, then hands the whole turn to `ModelOrchestrator::execute_adaptive_turn` instead of dispatching to a provider adapter directly.
-
-## `SwappableModelPair`
-
-| Field | Meaning |
-|---|---|
-| `fast_provider`, `fast_model_id` | The low-latency routing tier |
-| `slow_provider`, `slow_model_id` | The high-capacity tier |
-| `latency_threshold_ms` | Milliseconds the fast tier has to produce its next block before the orchestrator may swap to the slow tier |
-| `fallback_on_tool_error` | Whether a rejected draft block triggers a fallback to the slow tier |
-
-## `ModelOrchestrator`
-
-| Method | Effect |
-|---|---|
-| `new(config, pool)` | Default `ComplexityEvaluator` and `JsonToolDraftValidator`; both tiers start on their provider adapters' own default endpoints |
-| `with_executors(config, pool, fast, slow)` | Injects tier executors directly |
-| `with_endpoint(base_url, api_key)` | Points both pooled tier clients at `base_url`, with `api_key` as their credential when given; rebuilds the tier executors |
-| `with_session_store(store, session_id)` | Gated on `plugin-session-log`; attaches a [session log](@/plugins/session-log.md) store for `SessionEvent::ModelSwap` records |
-| `client_pool()` | Returns the shared `ClientPool` |
-| `execute_adaptive_turn(request)` | Runs the three-stage pipeline and returns the block stream |
-
-## Pipeline
-
-1. Complexity routing: `Complexity::Slow` requests go straight to the slow tier with no draft phase.
-2. Speculative draft: the fast tier streams; each block passes through `DraftValidator`, rejecting malformed tool calls, invalid JSON, or low confidence.
-3. Fallback cascade: when `fallback_on_tool_error` is set, a rejection re-routes the turn to the slow tier with the captured error state, up to two cascades; exhaustion surfaces the last rejection as `CucaError::Provider`. Validation runs on the slow tier's blocks too, so a second rejection spends the second cascade.
-
-The fast tier gets `latency_threshold_ms` to produce its next block. The deadline is checked only where the fast stream reports `Pending`, so the swap happens at the first poll that finds the stream still pending past the deadline; a tier stream woken only when a block is ready never presents that poll, and the turn stays on the fast tier. Blocks already yielded stay delivered.
-
-## `ComplexityEvaluator`
-
-Default thresholds: `slow_tool_call_depth: 1`, `slow_input_tokens: 2000`, `slow_multi_file_threshold: 3`. A request meeting or exceeding any one of tool-call depth, approximate input token volume, or distinct file references routes to `Complexity::Slow`.
-
-## Capacity
-
-`ClientPool` caches one `CucaClient` per `(provider, base_url)` pair and is deliberately uncapped: its size is a property of the deployment, not of traffic. The usage gauge is `ClientPool::len()`.

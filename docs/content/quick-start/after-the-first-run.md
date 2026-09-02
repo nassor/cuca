@@ -38,8 +38,15 @@ cargo run --example stream_all_blocks --features provider-llamacpp
 [error] <CucaError Display text>
 ```
 
-An `[error]` line stops the drain. Which tags actually appear depends on the
-server and the model: a plain prose reply from Gemma 4 E4B is all `Text`.
+An `[error]` line stops the drain. Which tags appear depends on the server and
+the model: a plain prose reply is all `Text`, while a reasoning model buries it.
+One run against `google/gemma-4-12b-qat` wrote 1506 `[reasoning]` lines to
+stderr for two lines of answer on stdout:
+
+```text,name=stdout from that run
+1. In Romanian folklore, the **Cuca** is a legendary bogeyman used to frighten children into behaving.
+2. It is traditionally depicted as a witch-like creature with a long nose and long hair.
+```
 
 ## Add a plugin
 
@@ -51,23 +58,25 @@ when the stream ends:
 cargo run --example custom_plugin --features provider-llamacpp
 ```
 
-```text,name=The summary line the plugin prints; values will differ
-[example-block-counter] model=google/gemma-4-e4b duration=2.31s completion_tokens=23 blocks=23
+```text,name=The summary line from one run against gemma-4-12b-qat
+CUCA most commonly refers to either the Credit Union of Central Alabama or the Center for Urban Community Action, depending on the context.
+[example-block-counter] model=google/gemma-4-12b-qat duration=81.89s completion_tokens=1991 blocks=1991
 ```
 
-For a text-only reply the two counts agree, because the client counts one token
-per `Text`, `Thinking` and `ToolCall` block. `prompt_tokens` stays `0`: no
-adapter populates it.
+The two counts agree because the client counts one token per `Text`, `Thinking`
+and `ToolCall` block, and both reach 1991 because the example sets no
+`max_tokens` and this model reasons before it answers. `prompt_tokens` stays
+`0`: no adapter populates it.
 
 To write your own, see [Write a custom plugin](@/guides/custom-plugin.md).
 
 ## Depend on the crate from your own project
 
-`cuca-core` is not on crates.io, so a dependant names the checkout by path and
-picks its features explicitly:
+The crate is named `cuca` and is not on crates.io, so a dependant names the
+checkout by path and picks its features explicitly:
 
 ```bash,name=Runs the same on all three platforms
-cargo add cuca-core --path /path/to/cuca --features provider-llamacpp
+cargo add cuca --path /path/to/cuca --features provider-llamacpp
 ```
 
 Swap `provider-llamacpp` for whichever adapter speaks to your backend. The seven

@@ -1,24 +1,73 @@
-+++
-title = "Sandbox"
-description = "The WebAssembly code execution plugin: the guest ABI, resource limits, and the run_code and sandbox_exec tools."
-template = "page.html"
-weight = 2
-+++
+//! Let a model run a real WebAssembly guest, under hard resource limits.
+//!
+//! The model is offered one tool, `run_code`, and names a published module plus
+//! the input to feed it. A caller-side plugin binds the module bytes into the
+//! call, then `SandboxPlugin` compiles and runs the guest in a fresh wasmtime
+//! store and hands back whatever the guest wrote through `write_out`. A second
+//! turn answers from that output, and one last line runs a guest that never
+//! returns, so the fuel budget is the thing that stops it.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example sandbox --features provider-llamacpp,plugin-sandbox
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example sandbox --features provider-llamacpp,plugin-sandbox`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Limits per call: 67108864 bytes of memory, 1000000 instructions of fuel, 5000 ms
+//!
+//! Turn 1: the model calls the tool, wasmtime runs the guest
+//!   guest wrote: "acuc"
+//!   ran in 0 ms using 65536 bytes of linear memory
+//!   thinking blocks: 59
+//!
+//! Turn 2: the same question, with the guest's output in the prompt
+//!   reply: Reversing the word "cuca" produces **acuc**.
+//!   thinking blocks: 47
+//!
+//! A guest that never returns
+//!   internal plugin error: fuel exhausted: instruction budget exceeded
+//! ```
+//!
+//! The reply wording and the block counts depend on the model, and the
+//! execution time depends on the machine. The rest does not: the guest reverses
+//! its input, one memory page is 65536 bytes, and a guest that loops forever
+//! always ends on the fuel budget.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why the module comes from the host
+//!
+//! `run_code` carries the module in its own arguments, base64 encoded, because
+//! the plugin's contract is "run exactly these bytes" and nothing else. That
+//! leaves the question of who produces the bytes, and it is not the model: no
+//! model reproduces a compiled module verbatim, and one that could would be
+//! choosing the code that runs. The application publishes the modules and the
+//! model chooses among them by name, which is also why the guest ABI is two
+//! exports and one import: a guest with no imports beyond `write_out` cannot
+//! reach the host at all.
 
-# Sandbox
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Runs model-generated WebAssembly modules in a confined wasmtime instance and returns the collected output as a ToolResult.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-sandbox</code> feature.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>SandboxPlugin</code>, writing a guest module, or sizing its resource limits.</dd>
-</dl>
-
-`SandboxPlugin` runs model-generated WebAssembly in a fresh, memory-confined wasmtime store per call: the guest exports `memory` and `run(ptr, len) -> i32`, may import `env.write_out`, and the plugin hands its collected output back as a `ToolResult` for `run_code`/`sandbox_exec` tool calls. Every call is bounded by `max_memory_bytes`, a fuel-based `max_instructions`, and a wall-clock `timeout_ms` enforced by epoch interruption. Reach for it to let a model execute short sandboxed logic instead of looping through JSON tool calls.
-
-```rust,name=Run a model-chosen guest module under wasmtime
 use std::sync::Arc;
 
 use base64::Engine as _;
@@ -267,64 +316,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Limits per call: 67108864 bytes of memory, 1000000 instructions of fuel, 5000 ms
-
-Turn 1: the model calls the tool, wasmtime runs the guest
-  guest wrote: "acuc"
-  ran in 0 ms using 65536 bytes of linear memory
-  thinking blocks: 59
-
-Turn 2: the same question, with the guest's output in the prompt
-  reply: Reversing the word "cuca" produces **acuc**.
-  thinking blocks: 47
-
-A guest that never returns
-  internal plugin error: fuel exhausted: instruction budget exceeded
-```
-
-## Try it
-
-`examples/sandbox.rs` runs the program above against a live model. The model picks the published module by name and supplies the input, a caller-side plugin binds the module bytes into the call, wasmtime runs the guest, and one further line shows a guest that never returns being stopped by the fuel budget. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. The reply wording, the execution time and the thinking-block counts are model- and machine-dependent; the output above came from `google/gemma-4-12b-qat`.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example sandbox --features "provider-llamacpp plugin-sandbox"
-```
-
-## Entry types
-
-`SandboxPlugin`, `SandboxConfig`, `SandboxResult`.
-
-## `CucaPlugin`
-
-`SandboxPlugin` implements `CucaPlugin` with the plugin name `"wasm-sandbox"`. It overrides `on_stream_chunk` only.
-
-| Hook | Behavior |
-|---|---|
-| `on_request` | No-op. |
-| `on_stream_chunk` | Routes `run_code` and `sandbox_exec` `ToolCall` blocks to a `ToolResult` carrying the guest's collected stdout, or the error text on failure. Unknown tool names pass through untouched. |
-| `on_response_complete` | No-op. |
-
-## Config
-
-`SandboxConfig` defaults:
-
-| Field | Default | Meaning |
-|---|---|---|
-| `max_memory_bytes` | 67108864 (64 MiB) | Linear memory cap per instance |
-| `max_instructions` | 1000000 | Fuel budget per call; the guest traps on exhaustion |
-| `timeout_ms` | 5000 | Wall-clock cap, enforced by epoch interruption |
-
-## Guest ABI
-
-- The guest module exports a linear memory named `memory` and a function `run(ptr: i32, len: i32) -> i32`.
-- The guest may import `env.write_out(ptr: i32, len: i32)`.
-- The host writes the raw input bytes into instance memory at a fixed scratch offset, 1024, before calling `run(1024, input.len())`.
-- The guest calls `write_out` any number of times; each call appends `memory[ptr..ptr+len]` to the host's collected stdout.
-- `run` returns `0` on success; any non-zero value is a guest-reported error.
-
-## Capacity
-
-Every call runs in a fresh store on a process-wide engine, so no state carries between calls. The one bound that spans a single call: guest output through `write_out` is capped at 8388608 bytes (8 MiB). At that cap, the call fails with `PluginError::Internal` carrying the trap message `write_out: output limit exceeded`. The usage gauge is `SandboxPlugin::last_diagnostic()`, which returns the `(execution_time_ms, memory_bytes_used)` of the most recent successful run.

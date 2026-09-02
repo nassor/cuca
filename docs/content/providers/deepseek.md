@@ -19,28 +19,49 @@ weight = 4
 The smallest streaming turn: the `DeepSeek` variant and an API key. The default
 base URL selects the native route.
 
+Add the crate with `cargo add cuca --features provider-deepseek`, `cargo add tokio --features rt,macros`, and `cargo add tokio-stream`.
+
 ```rust,name=A first stream through the DeepSeek adapter
+use std::io::{Write, stdout};
+
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{CucaClient, UnifiedRequest};
 use tokio_stream::StreamExt;
 
-let client = CucaClient::builder()
-    .with_provider(ProviderEndpoint::DeepSeek)
-    .with_api_key(std::env::var("DEEPSEEK_API_KEY")?)
-    .build()?;
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let client = CucaClient::builder()
+        .with_provider(ProviderEndpoint::DeepSeek)
+        .with_api_key(std::env::var("DEEPSEEK_API_KEY")?)
+        .build()?;
 
-let mut stream = client
-    .generate_stream(UnifiedRequest::new("deepseek-v4-flash").add_user_message("Say hello."))
-    .await?;
-while let Some(block) = stream.next().await {
-    if let MessageContentBlock::Text(text) = block? {
-        print!("{text}");
+    let request = UnifiedRequest::new("deepseek-v4-flash")
+        .add_system_message("You are concise.")
+        .add_user_message("Say hello.")
+        .set_max_tokens(128);
+    let mut stream = client.generate_stream(request).await?;
+
+    let mut text_blocks = 0usize;
+    let mut thinking_blocks = 0usize;
+    while let Some(block) = stream.next().await {
+        match block? {
+            MessageContentBlock::Text(text) => {
+                print!("{text}");
+                stdout().flush()?;
+                text_blocks += 1;
+            }
+            MessageContentBlock::Thinking { .. } => thinking_blocks += 1,
+            _ => {}
+        }
     }
+    println!("\nblocks: {text_blocks} text, {thinking_blocks} thinking");
+    Ok(())
 }
 ```
 
-```text,name=Expected output; exact wording varies by model
+```text,name=Expected shape; not captured from a live run
 Hello! How can I help you today?
+blocks: 1 text, 0 thinking
 ```
 
 ## Endpoint

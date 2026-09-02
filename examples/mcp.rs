@@ -1,24 +1,67 @@
-+++
-title = "MCP"
-description = "The Model Context Protocol client plugin: transports, the stateless 2026-07-28 protocol, and tool call routing."
-template = "page.html"
-weight = 1
-+++
+//! Expose an MCP server's tools to a model, and route its calls back.
+//!
+//! `McpPlugin` connects over stdio to a server that is this same example binary
+//! re-executed with `--mcp-add-server`, so the demo needs nothing installed and
+//! still speaks JSON-RPC over a real child process's pipes. Discovery runs at
+//! connect time, the discovered tool is published to the model, and the call
+//! the model makes is executed by the child mid-stream and delivered as a
+//! `ToolResult`. A second turn answers from it.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example mcp --features provider-llamacpp,plugin-mcp
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example mcp --features provider-llamacpp,plugin-mcp`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Discovered over stdio, from tools/list:
+//!   add: Add two numbers and return their sum
+//!
+//! Turn 1: the model calls the MCP tool, the child process answers
+//!   tool result from the MCP server: "42"
+//!   thinking blocks: 78
+//!
+//! Turn 2: the same question, with the server's answer in the prompt
+//!   reply: The sum of 21 and 21 is 42.
+//!   thinking blocks: 44
+//! ```
+//!
+//! The reply wording and the block counts depend on the model. The discovered
+//! tool, its description and the sum do not: they come from the child process.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why the connector never rewrites the prompt
+//!
+//! `on_request` is a no-op, so publishing the discovered tools is the caller's
+//! job, as the loop over `McpPlugin::tools` below does. A connector that
+//! injected them would decide for the application which of a server's tools a
+//! given turn may use, and would collide with every other source of tools in
+//! the same request. The stream hook is the opposite: it claims a call only
+//! when the name is in the discovered set, and leaves every other tool call
+//! untouched.
 
-# MCP
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Connects to one Model Context Protocol server, discovers its tools, and executes them as ToolCall to ToolResult exchanges.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-mcp</code> feature and a reachable MCP server (a spawned child process or a Streamable HTTP endpoint).</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>McpPlugin</code> or choosing an <code>McpTransport</code>.</dd>
-</dl>
-
-`McpPlugin` connects to one Model Context Protocol server, a spawned child process over stdio or a Streamable HTTP endpoint, discovers its tools once with `tools/list`, and executes model-issued `ToolCall` blocks whose name matches a discovered tool. It speaks only the stateless MCP protocol version `2026-07-28`: every request carries its own protocol version and capabilities, with no connection-setup phase. Reach for it to expose an existing MCP server's tools to a model without writing a bespoke bridge.
-
-```rust,name=Serve one MCP tool over stdio and route the model's call
 use std::sync::Arc;
 
 use cuca::plugin::CucaPlugin;
@@ -235,59 +278,3 @@ mod add_server {
         std::process::exit(0);
     }
 }
-```
-
-```text,name=Expected output
-Discovered over stdio, from tools/list:
-  add: Add two numbers and return their sum
-
-Turn 1: the model calls the MCP tool, the child process answers
-  tool result from the MCP server: "42"
-  thinking blocks: 78
-
-Turn 2: the same question, with the server's answer in the prompt
-  reply: The sum of 21 and 21 is 42.
-  thinking blocks: 44
-```
-
-## Try it
-
-`examples/mcp.rs` runs the program above against a live model, with no third-party MCP server needed: the example binary re-executes itself with `--mcp-add-server` and serves one `add` tool over stdio, so the plugin talks to a genuine child process over real pipes. The model calls `add`, the child computes the sum, and a second turn answers from it. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. The tool-call id, the reply wording and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example mcp --features "provider-llamacpp plugin-mcp"
-```
-
-## Entry types
-
-`McpPlugin`, `McpTransport`.
-
-## `CucaPlugin`
-
-`McpPlugin` implements `CucaPlugin` with the plugin name `"mcp-connector"`. It overrides `on_stream_chunk` only.
-
-| Hook | Behavior |
-|---|---|
-| `on_request` | No-op. Discovered tools are injected into the caller's tool set through `McpPlugin::tools()`, not by rewriting the request. |
-| `on_stream_chunk` | Routes `ToolCall` blocks whose name is a discovered tool to a `ToolResult` carrying the call's rendered output, or the error text on failure. Unknown tool names pass through untouched. |
-| `on_response_complete` | No-op. |
-
-## Transport
-
-| Variant | Connection |
-|---|---|
-| `McpTransport::Stdio { command, args }` | Spawns the executable as a child process and speaks MCP over its stdio pipes |
-| `McpTransport::StreamableHttp { url }` | Connects over Streamable HTTP, the MCP 2026-07-28 binding |
-| `McpTransport::WebSocket { url }` | Not connectable; resolves to `PluginError::NotSupported`, there is no WebSocket client transport |
-
-`McpPlugin::connect_stdio(command)` is shorthand for `McpPlugin::connect(McpTransport::stdio(command))`.
-
-## Protocol
-
-The plugin speaks only the stateless MCP protocol version `2026-07-28`. There is no connection-setup phase and no shared connection state; every request carries its protocol version, client identity, and client capabilities in `_meta`. Connecting probes the server once with `server/discover`, then lists every tool with pagination-aware `tools/list`.
-
-A server answering `tools/call` with `resultType: "input_required"` (multi round trip requests, SEP-2322) or `resultType: "task"` (SEP-2663) is not driven further; both surface as `PluginError::NotSupported` instead of a fabricated result.
-
-## Capacity
-
-The discovered tool map is populated once at connect time from `tools/list`, not on each request, so it carries no traffic-growth cap. `McpPlugin::tools()` returns the full list, sorted by name.

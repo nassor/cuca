@@ -63,7 +63,12 @@ pub struct OpenAiCompatConfig {
 ///
 /// `stream` is always `true`: this adapter only produces streaming responses,
 /// and a non-streaming response could not be parsed by the SSE pipeline.
-/// `temperature`/`max_tokens` are included only when set.
+/// `temperature`/`max_tokens` are included only when set. `tools` carries
+/// every [`UnifiedRequest::tools`] entry as an OpenAI function tool,
+/// `{"type": "function", "function": {name, description, parameters}}` with
+/// `parameters` holding the definition's `input_schema`; the key is omitted
+/// when the request declares no tool, and `tool_choice` is never emitted, so
+/// the server's own selection default applies.
 /// When `req.thinking` is set, DeepSeek receives a top-level `thinking` mode
 /// object (`{"type": "enabled"}` / `{"type": "disabled"}`, it has no effort
 /// knob), while the other OpenAI-compatible endpoints receive
@@ -82,6 +87,23 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
     }
     if let Some(max_tokens) = req.max_tokens {
         body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+    }
+    if !req.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = req
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "type": "function",
+                    "function": {
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.input_schema,
+                    },
+                })
+            })
+            .collect();
+        body.insert("tools".to_string(), serde_json::json!(tools));
     }
     body.insert("stream".to_string(), serde_json::Value::Bool(true));
     if let Some(thinking) = &req.thinking {
@@ -322,7 +344,7 @@ impl ChatCompletionTranslator {
     /// flushed calls are drained one per subsequent call. Text deltas become
     /// [`MessageContentBlock::Text`], `reasoning_content` becomes
     /// [`MessageContentBlock::Thinking`], and a tool call is emitted once its
-    /// argument fragment accumulates to valid JSON, or at
+    /// argument fragment accumulates to valid JSON, or at a non-null
     /// `finish_reason`/`[DONE]`, whichever comes first. OpenAI error bodies
     /// (`{"error":{"message":...}}`) yield [`CucaError::Provider`].
     pub fn translate(&mut self, payload: &str) -> Result<Option<MessageContentBlock>, CucaError> {
@@ -390,7 +412,15 @@ impl ChatCompletionTranslator {
             }
         }
 
-        if choice.get("finish_reason").is_some() {
+        // A frame's `finish_reason` is terminal only when it carries a value.
+        // Every OpenAI-compatible server sends `"finish_reason": null` on
+        // ordinary delta frames, including the frame that opens a tool call, so
+        // keying on the field's presence would flush that call's accumulator
+        // before its argument fragments arrived and emit `null` arguments.
+        if choice
+            .get("finish_reason")
+            .is_some_and(|reason| !reason.is_null())
+        {
             self.flush_accumulated();
         }
         Ok(None)
@@ -625,6 +655,7 @@ mod tests {
     use serde_json::json;
 
     use crate::request::ThinkingConfig;
+    use crate::types::ToolDefinition;
 
     #[test]
     fn build_body_maps_text_system_and_user_messages() {
@@ -729,6 +760,48 @@ mod tests {
             body["messages"][0],
             json!({ "role": "tool", "tool_call_id": "call_1", "content": "42" })
         );
+    }
+
+    #[test]
+    fn build_body_maps_tool_definitions_to_function_tools() {
+        let req = UnifiedRequest::new("gpt-4o")
+            .add_user_message("what is the weather in NYC")
+            .add_tool(ToolDefinition {
+                name: "get_weather".into(),
+                description: "Look up the current weather for a city".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"],
+                }),
+            });
+        let body = build_chat_completion_body(&req);
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "description": "Look up the current weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                },
+            }])
+        );
+        // No tool_choice: the server's own selection default applies.
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn build_body_omits_tools_when_none_declared() {
+        let req = UnifiedRequest::new("gpt-4o").add_user_message("hi");
+        let body = build_chat_completion_body(&req);
+
+        assert!(body.get("tools").is_none());
     }
 
     #[test]
@@ -934,6 +1007,41 @@ mod tests {
             })
         );
         assert_eq!(translator.translate("{}").unwrap(), None);
+    }
+
+    /// Real servers put `"finish_reason": null` on every delta frame, the
+    /// tool-call opener included. Treating that as terminal flushed the
+    /// accumulator before the argument fragment arrived, and the consumer got
+    /// a `ToolCall` with `null` arguments.
+    #[test]
+    fn translate_ignores_null_finish_reason_while_accumulating() {
+        let mut translator = ChatCompletionTranslator::new();
+        assert_eq!(
+            translator
+                .translate(r#"{"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_note","arguments":""}}]},"finish_reason":null}]}"#)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            translator
+                .translate(r#"{"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"type":"function","function":{"arguments":"{\"notebook\":\"scratch\"}"}}]},"finish_reason":null}]}"#)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            translator
+                .translate(r#"{"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            translator.translate("{}").unwrap(),
+            Some(MessageContentBlock::ToolCall {
+                id: "call_1".into(),
+                name: "write_note".into(),
+                arguments: json!({ "notebook": "scratch" }),
+            })
+        );
     }
 
     #[test]

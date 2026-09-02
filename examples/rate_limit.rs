@@ -1,9 +1,11 @@
 //! Pace a fan-out of turns through one client-side rate limiter.
 //!
-//! Six turns share one `CucaClient` and one `Arc<RateLimiter>` sized at three
-//! requests per two seconds with at most two turns in flight. Each turn runs
-//! the hand-off the limiter's contract requires: acquire a permit, dispatch,
-//! drain the whole stream, drop the permit. The permit's lifetime is the turn.
+//! Six turns share one `CucaClient` and one `Arc<RateLimiter>` sized at one
+//! request per 45 seconds with one turn in flight. Each turn runs the hand-off
+//! the limiter's contract requires: acquire a permit, dispatch, drain the
+//! whole stream, drop the permit. The permit's lifetime is the turn, and the
+//! bucket is slower than the model, so the admission timestamps are the
+//! bucket's refill schedule.
 //!
 //! # Prerequisites
 //!
@@ -29,27 +31,37 @@
 //!
 //! # Output
 //!
-//! The first turn's reply prints as it streams. Each fanned-out turn then
-//! prints one line: the millisecond it was admitted, the gauge reading at that
-//! moment, and the millisecond its stream finished. A peak line follows, then
-//! the `try_acquire` drain. The shape, with the numbers one short run produced:
+//! One run against `google/gemma-4-12b-qat` on llama.cpp:
 //!
 //! ```text
-//!   turn 2: admitted at 42 ms (tokens=0 in_flight=2 waiting=0), drained 7 chars at 83 ms
-//!   turn 4: admitted at 665 ms (tokens=0 in_flight=2 waiting=2), drained 7 chars at 705 ms
+//! Limiter: 1 requests / 45s, burst 1, 1 concurrent, 8 queued, 600s wait budget
+//!   before any turn        tokens=1 in_flight=0 waiting=0
 //!
-//! Peak while the fan-out ran: in_flight=2 (cap 2), waiting=3 (cap 8)
-//! 6 turns took 2027 ms through a 3-per-2s bucket
+//!   turn 0 replies: turn 0 (+49 thinking blocks)
+//!
+//! Fanning out 5 turns over the same limiter
+//!   turn 1: admitted at 45030 ms (tokens=0 in_flight=1 waiting=4), replied "turn 1" (+59 thinking) at 75968 ms
+//!   turn 2: admitted at 90054 ms (tokens=0 in_flight=1 waiting=3), replied "turn 2" (+53 thinking) at 126285 ms
+//!   turn 3: admitted at 135061 ms (tokens=0 in_flight=1 waiting=2), replied "turn 3" (+58 thinking) at 166749 ms
+//!   turn 4: admitted at 180070 ms (tokens=0 in_flight=1 waiting=1), replied "turn 4" (+50 thinking) at 211396 ms
+//!   turn 5: admitted at 225078 ms (tokens=0 in_flight=1 waiting=0), replied "turn 5" (+46 thinking) at 255461 ms
+//!
+//! Peak while the fan-out ran: in_flight=1 (cap 1), waiting=5 (cap 8)
+//! 6 turns took 255479 ms through a 1-per-45s bucket
 //!
 //! Draining the bucket with try_acquire
-//!   refused: the bucket is empty, retry after 601 ms
+//!   refused: the bucket is empty, retry after 14625 ms
+//!   after the demo         tokens=0 in_flight=0 waiting=0
 //! ```
 //!
-//! Admission times spread out once the bucket empties, `in_flight` never
-//! passes the cap, and the refusal carries the wait instead of a failed
-//! request. Turn numbers arrive out of order because parked callers race for
-//! each refilled token; the wait budget, not a queue position, is what bounds
-//! any one of them. The numbers themselves depend on the server and the model.
+//! The admission timestamps are the demo: 45 seconds apart, one per refilled
+//! token, with `waiting` counting down as each parked caller is admitted.
+//! `in_flight` never passes the cap, and the `try_acquire` refusal carries the
+//! wait instead of a failed request.
+//!
+//! The replies and the thinking-block counts depend on the model. The
+//! admission schedule does not: the bucket refills one token every 45 seconds
+//! whatever the model is doing.
 //!
 //! With no server on the base URL, the program prints one line naming the
 //! address and exits successfully.
@@ -85,12 +97,14 @@ fn print_usage(label: &str, limiter: &RateLimiter) {
     }
 }
 
-/// A short turn: the reply length is irrelevant here, the pacing is the point.
+/// A short turn. The reply is one word: the pacing is the point, and a
+/// reasoning model needs a token budget big enough to finish thinking and
+/// still say it.
 fn request(model: &str, turn: usize) -> UnifiedRequest {
     UnifiedRequest::new(model)
         .add_system_message("You are concise.")
         .add_user_message(format!("Reply with exactly: turn {turn}"))
-        .set_max_tokens(32)
+        .set_max_tokens(96)
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -105,8 +119,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage 1: the bounds. Every one of them is validated at construction, so
     // a zero rate or a zero cap fails here instead of being clamped.
     let limiter = Arc::new(RateLimiter::new(
-        RateLimitConfig::new(3, Duration::from_secs(2), 2, 8)?
-            .with_max_wait(Duration::from_secs(10))?,
+        RateLimitConfig::new(1, Duration::from_secs(45), 1, 8)?
+            .with_max_wait(Duration::from_secs(600))?,
     )?);
     let config = limiter.config();
     println!(
@@ -143,12 +157,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
     print!("\n  turn 0 replies: ");
+    let mut thinking = 0usize;
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(MessageContentBlock::Text(text)) => {
                 print!("{text}");
                 stdout().flush()?;
             }
+            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
             Ok(_) => {}
             Err(error) => {
                 print!("[the stream ended early: {error}]");
@@ -156,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    println!();
+    println!(" (+{thinking} thinking blocks)");
     drop(permit);
 
     // Stage 4: the remaining turns, all dispatched at once. The limiter is
@@ -185,14 +201,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => format!("usage unavailable: {error}"),
             };
 
-            let mut characters = 0usize;
+            let mut reply = String::new();
+            let mut thinking = 0usize;
             match client.generate_stream(request(&model, turn)).await {
                 Ok(mut stream) => {
                     while let Some(chunk) = stream.next().await {
                         match chunk {
-                            Ok(MessageContentBlock::Text(text)) => {
-                                characters += text.chars().count();
-                            }
+                            Ok(MessageContentBlock::Text(text)) => reply.push_str(&text),
+                            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
                             Ok(_) => {}
                             Err(error) => {
                                 println!("  turn {turn}: the stream ended early, {error}");
@@ -204,8 +220,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Err(error) => println!("  turn {turn}: dispatch failed, {error}"),
             }
             println!(
-                "  turn {turn}: admitted at {admitted_ms} ms ({reading}), drained {characters} \
-                 chars at {} ms",
+                "  turn {turn}: admitted at {admitted_ms} ms ({reading}), replied {:?} \
+                 (+{thinking} thinking) at {} ms",
+                reply.trim(),
                 started.elapsed().as_millis()
             );
             // Explicit for the demo: the slot comes back here, not when the

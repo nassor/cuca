@@ -55,6 +55,11 @@ use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint};
 /// - `contents`: one entry per non-system message: role `"user"` for
 ///   `User`/`Tool` messages and `"model"` for `Assistant`, with the parts built
 ///   by [`block_to_part`].
+/// - `tools`: one entry holding a `functionDeclarations` array with every
+///   [`UnifiedRequest::tools`] definition as `{name, description, parameters}`,
+///   `parameters` holding the definition's `input_schema`; the key is omitted
+///   when the request declares no tool, and `toolConfig` is never emitted, so
+///   the API's own selection default applies.
 /// - `thinkingConfig`: only when `req.thinking` is set: `includeThoughts:
 ///   false` when disabled; otherwise `thinkingBudget` (params override), else
 ///   `thinkingLevel` (params override, then the unified-effort map), else
@@ -142,6 +147,23 @@ pub fn build_generate_content_body(req: &UnifiedRequest) -> Result<serde_json::V
         })
         .collect();
     body.insert("contents".to_string(), serde_json::json!(contents));
+    if !req.tools.is_empty() {
+        let declarations: Vec<serde_json::Value> = req
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                })
+            })
+            .collect();
+        body.insert(
+            "tools".to_string(),
+            serde_json::json!([{ "functionDeclarations": declarations }]),
+        );
+    }
 
     Ok(serde_json::Value::Object(body))
 }
@@ -453,7 +475,7 @@ mod tests {
     use crate::error::PluginError;
     use crate::plugin::CucaPlugin;
     use crate::request::{ThinkingConfig, UnifiedResponse};
-    use crate::types::UnifiedMessage;
+    use crate::types::{ToolDefinition, UnifiedMessage};
 
     #[test]
     fn build_body_maps_system_instruction_and_generation_config() {
@@ -591,6 +613,47 @@ mod tests {
             body["contents"][0]["parts"][0],
             json!({ "functionResponse": { "name": "call_7", "response": { "output": "ok" } } })
         );
+    }
+
+    #[test]
+    fn build_body_maps_tool_definitions_to_function_declarations() {
+        let req = UnifiedRequest::new("gemini-2.0-flash")
+            .add_user_message("what is the weather in NYC")
+            .add_tool(ToolDefinition {
+                name: "get_weather".into(),
+                description: "Look up the current weather for a city".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"],
+                }),
+            });
+        let body = build_generate_content_body(&req).unwrap();
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "functionDeclarations": [{
+                    "name": "get_weather",
+                    "description": "Look up the current weather for a city",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "city": { "type": "string" } },
+                        "required": ["city"],
+                    },
+                }],
+            }])
+        );
+        // No toolConfig: the API's own selection default applies.
+        assert!(body.get("toolConfig").is_none());
+    }
+
+    #[test]
+    fn build_body_omits_tools_when_none_declared() {
+        let req = UnifiedRequest::new("gemini-2.0-flash").add_user_message("hi");
+        let body = build_generate_content_body(&req).unwrap();
+
+        assert!(body.get("tools").is_none());
     }
 
     // --- thinking ---

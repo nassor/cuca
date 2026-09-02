@@ -1,24 +1,77 @@
-+++
-title = "Human approval"
-description = "The human-in-the-loop approval plugin: risk classification, the failure-closed default, and the audit log cap."
-template = "page.html"
-weight = 7
-+++
+//! Gate a destructive tool call behind an approval policy, then read the audit
+//! trail.
+//!
+//! One `ApprovalChannel` rules on both stages: it approves a write aimed at the
+//! `scratch` notebook and denies the same tool aimed at `audit`. Stage 1 is
+//! what approval means, the block streams through untouched and the
+//! application is what executes it. Stage 2 is what denial means, the plugin
+//! replaces the call with a denial `ToolResult`, nothing runs, and the model
+//! still gets an answer it can act on. The audit log at the end carries one
+//! entry per gated call, with the approver's identity.
+//!
+//! # Prerequisites
+//!
+//! - A checkout of this repository (the example builds from this crate).
+//! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
+//!   (`llama-server`) on port 1234 with the demo model loaded.
+//!
+//! # Run
+//!
+//! ```sh
+//! cargo run --example hitl --features provider-llamacpp,plugin-hitl
+//! ```
+//!
+//! # Configuration
+//!
+//! Both values default to a local llama.cpp server; override them to target
+//! any OpenAI-compatible server:
+//!
+//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//!
+//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example hitl --features provider-llamacpp,plugin-hitl`
+//!
+//! # Output
+//!
+//! From one run against `google/gemma-4-12b-qat` on llama.cpp:
+//!
+//! ```text
+//! Stage 1: a call the policy approves
+//!   gate: file_write write_note {"notebook":"scratch","text":"ship it"} -> Approved
+//!   delivered: [ToolCall { id: "AIG5T6wty1u1kN5zRNPtMxvOjy8hTYpo", name: "write_note", arguments: Object {"notebook": String("scratch"), "text": String("ship it")} }]
+//!   app executed: appended note 1 to notebook "scratch"
+//!   reply: OK. I've saved the note "ship it" in your scratch notebook.
+//!   thinking blocks: 73 then 0
+//!
+//! Stage 2: the same tool, a notebook the policy refuses
+//!   gate: file_write write_note {"notebook":"audit","text":"ship it"} -> Denied
+//!   delivered: [ToolResult { tool_call_id: "POLkDMwHOUZcg35grlKbmhCSxvOQ3SoT", output: "denied by approver" }]
+//!   reply: I'm sorry, but I was unable to save the note to the audit notebook because it was denied by the approver.
+//!   thinking blocks: 55 then 250
+//!
+//! Audit log, 2 of 65536 entries
+//!   approved file_write   approver ops-oncall
+//!   denied   file_write   approver ops-oncall
+//!   notebook "scratch" holds ["ship it"]
+//! ```
+//!
+//! The replies, the call ids and the block counts depend on the model. The two
+//! rulings do not: `write_note` matches the file-write keyword group, so both
+//! calls are `Risk::High`, and the policy reads the notebook name out of
+//! `ApprovalRequest::detail`.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
+//!
+//! # Why the approval channel blocks
+//!
+//! `ApprovalChannel::request_approval` parks the calling thread, which is the
+//! whole mechanism: the pipeline pauses at a gated call until an approver
+//! decides, so the tool cannot run while the answer is still in flight. The
+//! same design makes the failure mode a policy question rather than a race. An
+//! implementation that cannot reach an approver must return `Denied`, so a lost
+//! round trip refuses the call instead of letting it through.
 
-# Human approval
-
-<dl class="page-facts">
-<dt>In one line</dt>
-<dd>Classifies streamed tool calls by risk and pauses on high-risk calls for an interactive approval decision.</dd>
-<dt>You need</dt>
-<dd>The <code>plugin-hitl</code> feature and a caller-supplied <code>ApprovalChannel</code>.</dd>
-<dt>Read this if</dt>
-<dd>You are registering <code>HitlPlugin</code> or implementing an <code>ApprovalChannel</code>.</dd>
-</dl>
-
-`HitlPlugin` classifies streamed tool calls by risk, keyword-matching the tool name against shell/exec, file-write, and external-API-write groups, and pauses a `Risk::High` call on a caller-supplied `ApprovalChannel` before it executes. A channel that cannot reach an approver must return `Denied`, so a lost round trip never lets a tool run. Reach for it to put a human, or an automated policy, between the model and a destructive tool call.
-
-```rust,name=Gate a write tool on an approval policy
 use std::sync::{Arc, Mutex};
 
 use cuca::plugin::CucaPlugin;
@@ -291,65 +344,3 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     Ok(())
 }
-```
-
-```text,name=Expected output
-Stage 1: a call the policy approves
-  gate: file_write write_note {"notebook":"scratch","text":"ship it"} -> Approved
-  delivered: [ToolCall { id: "AIG5T6wty1u1kN5zRNPtMxvOjy8hTYpo", name: "write_note", arguments: Object {"notebook": String("scratch"), "text": String("ship it")} }]
-  app executed: appended note 1 to notebook "scratch"
-  reply: OK. I've saved the note "ship it" in your scratch notebook.
-  thinking blocks: 73 then 0
-
-Stage 2: the same tool, a notebook the policy refuses
-  gate: file_write write_note {"notebook":"audit","text":"ship it"} -> Denied
-  delivered: [ToolResult { tool_call_id: "POLkDMwHOUZcg35grlKbmhCSxvOQ3SoT", output: "denied by approver" }]
-  reply: I'm sorry, but I was unable to save the note to the audit notebook because it was denied by the approver.
-  thinking blocks: 55 then 250
-
-Audit log, 2 of 65536 entries
-  approved file_write   approver ops-oncall
-  denied   file_write   approver ops-oncall
-  notebook "scratch" holds ["ship it"]
-```
-
-## Try it
-
-`examples/hitl.rs` runs the program above against a live model. One policy approves a note bound for the `scratch` notebook and denies the same tool aimed at `audit`, the application executes only the call the gate let through, and the audit log prints both rulings at the end. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. Whether the model calls the tool at all, how it words each reply, and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example hitl --features "provider-llamacpp plugin-hitl"
-```
-
-## Entry types
-
-`HitlPlugin`, `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `OneshotApprovalChannel`, `Risk`, `HitlAuditEntry`.
-
-## `CucaPlugin`
-
-`HitlPlugin` implements `CucaPlugin` with the plugin name `"hitl-approvals"`. It overrides `on_stream_chunk` only.
-
-## Risk classification
-
-`classify_tool_call(name)` matches the tool name, case-insensitively, against keyword groups:
-
-| Group | Keywords | `Risk` |
-|---|---|---|
-| Shell and exec | `shell`, `exec`, `bash`, `run_command`, `terminal` | `High` |
-| File write | `write`, `edit`, `delete`, `remove`, `rm_`, `mv_`, `move`, `create_file` | `High` |
-| External API write | `http_post`, `http_put`, `http_delete`, `api_write`, `post_`, `put_`, `delete_` | `High` |
-| Everything else, including unrecognized names | | `Low` |
-
-`Risk::Low` calls stream through without touching the channel. A `Risk::High` call blocks on `ApprovalChannel::request_approval`: `ApprovalDecision::Approved` streams the call through unchanged; `ApprovalDecision::Denied` replaces the block with a `ToolResult` carrying `"denied by approver"`.
-
-## Failure-closed default
-
-An `ApprovalChannel` implementation that cannot reach an approver must return `ApprovalDecision::Denied`, so a tool never executes on a lost approval round trip. `OneshotApprovalChannel` follows this rule: a dropped sender resolves to `Denied`.
-
-## Capacity
-
-| | |
-|---|---|
-| Bound | `HitlPlugin::DEFAULT_MAX_AUDIT_ENTRIES`, 65536 audit entries |
-| At-cap policy | The hook fails rather than evicting; a gated call whose ruling cannot be recorded is refused |
-| Usage gauge | `HitlPlugin::audit_len()` against `max_audit_entries()` |

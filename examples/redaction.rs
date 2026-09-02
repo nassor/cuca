@@ -1,7 +1,7 @@
 //! Scrub caller-owned secrets out of a request before it reaches the provider.
 //!
-//! One four-rule policy — a known literal key, an `sk-` prefixed token, an
-//! address, and a card-shaped digit run — is compiled into a `RedactionPlugin`
+//! One four-rule policy, a known literal key, an `sk-` prefixed token, an
+//! address, and a card-shaped digit run, is compiled into a `RedactionPlugin`
 //! and registered on the client. A prompt deliberately seeded with all four
 //! shapes is then dispatched: the hook rewrites it in `on_request`, so what
 //! crosses the wire carries `[REDACTED:{kind}]` tokens instead. The same
@@ -35,8 +35,8 @@
 //! # Output
 //!
 //! The policy prints first, then the two direct `scrub_str` calls, then the
-//! before/after prompt, the reply, and the counters. The shape, with the
-//! numbers one run produced:
+//! before/after prompt, the reply, and the counters. From one run against
+//! `google/gemma-4-12b-qat` on llama.cpp:
 //!
 //! ```text
 //! Policy: 4 rules, match cap 1024 matches per string
@@ -55,6 +55,7 @@
 //!   before: Rotate the runner: key DEPLOY-KEY-a1b2c3d4, provider token sk-live-51H9x0AbCdEfGh, notify ops@example.com, billing card 4111 1111 1111 1111. Reply with exactly: understood
 //!   wire:   Rotate the runner: key [REDACTED:deploy-key], provider token [REDACTED:api-key], notify [REDACTED:email], billing card [REDACTED:card]. Reply with exactly: understood
 //!   reply:  understood
+//!   blocks: 290 thinking, not printed
 //!
 //! Counters after the turn
 //!   last_request_redactions  4
@@ -64,13 +65,13 @@
 //!
 //! The `wire:` line is the request as the hook left it, and it is what the
 //! provider received. `last_redaction_event` names the *class* of the last
-//! value replaced in that field and how many were replaced there — never the
-//! matched bytes, which is the whole point. The reply text depends on the
-//! server and the model; the counters do not.
+//! value replaced in that field and how many were replaced there, never the
+//! matched bytes, which is the whole point. The reply text and the thinking
+//! block count depend on the model; the counters do not.
 //!
 //! With no server on the base URL, everything up to and including the `wire:`
-//! line still prints — none of it needs a provider — and the program then names
-//! the unreachable address, says how to fix it, and exits successfully.
+//! line still prints, since none of it needs a provider, and the program then
+//! names the unreachable address, says how to fix it, and exits successfully.
 //!
 //! # Why an outbound hook and not an inbound filter?
 //!
@@ -166,7 +167,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
     let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
 
-    // Stage 1: the policy. Every rule is caller-authored — there is no built-in
+    // Stage 1: the policy. Every rule is caller-authored: there is no built-in
     // rule set and no "looks like a secret" heuristic, so a false positive is
     // always a policy someone wrote and can see. The bounds (rule count,
     // pattern length, `kind` slug, match cap) are validated here, so an
@@ -230,11 +231,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  wire:   {}", plugin.scrub_str(SEEDED_PROMPT)?.text);
 
     // Stage 4: dispatch and drain. `on_request` runs before the provider
-    // adapter translates anything onto the wire.
+    // adapter translates anything onto the wire. A reasoning model spends most
+    // of its budget on `Thinking` blocks before the first `Text` block, so
+    // `max_tokens` has to leave room for both or the reply comes back empty.
     let request = UnifiedRequest::new(&model)
         .add_system_message("You are concise.")
         .add_user_message(SEEDED_PROMPT)
-        .set_max_tokens(64);
+        .set_max_tokens(512);
     let mut stream = match client.generate_stream(request).await {
         Ok(stream) => stream,
         Err(error) => {
@@ -245,12 +248,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     print!("  reply:  ");
     stdout().flush()?;
+    let mut thinking_blocks = 0usize;
     while let Some(chunk) = stream.next().await {
         match chunk {
             Ok(MessageContentBlock::Text(text)) => {
                 print!("{text}");
                 stdout().flush()?;
             }
+            // Counted rather than printed: one block per reasoning token would
+            // bury the one line this stage exists to show.
+            Ok(MessageContentBlock::Thinking { .. }) => thinking_blocks += 1,
             Ok(_) => {}
             Err(error) => {
                 print!("[the stream ended early: {error}]");
@@ -259,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     println!();
+    println!("  blocks: {thinking_blocks} thinking, not printed");
 
     // Stage 5: the counters. Fixed-size by construction: two totals and one
     // most-recent event tuple, replaced rather than appended, so nothing here

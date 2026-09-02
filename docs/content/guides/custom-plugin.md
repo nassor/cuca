@@ -62,8 +62,10 @@ impl CucaPlugin for BlockCounterPlugin {
     }
 
     fn on_response_complete(&self, res: &UnifiedResponse) -> Result<(), PluginError> {
+        // The hook fires inside the caller's final `next()` poll, so the
+        // leading newline is what separates this line from the streamed reply.
         println!(
-            "[example-block-counter] model={} duration={:.2}s completion_tokens={} blocks={}",
+            "\n[example-block-counter] model={} duration={:.2}s completion_tokens={} blocks={}",
             res.model,
             res.duration_secs,
             res.completion_tokens,
@@ -83,7 +85,7 @@ identifiable.
 ```rust,name=Registration order is hook order
 let client = CucaClient::builder()
     .with_provider(ProviderEndpoint::LlamaCpp)
-    .with_base_url(base_url)
+    .with_base_url(base_url.clone())
     .register_plugin(Arc::new(BlockCounterPlugin::default()))
     .build()?;
 ```
@@ -97,14 +99,20 @@ them, at every hook site, and `client.plugins()` returns them in that order.
 cargo run --example custom_plugin --features provider-llamacpp
 ```
 
-```text,name=The summary line; values will differ
-[example-block-counter] model=google/gemma-4-e4b duration=2.31s completion_tokens=23 blocks=23
+```text,name=The summary line from one run against gemma-4-12b-qat
+CUCA most commonly refers to either the Credit Union of Central Alabama or the Center for Urban Community Action, depending on the context.
+[example-block-counter] model=google/gemma-4-12b-qat duration=81.89s completion_tokens=1991 blocks=1991
 ```
 
-Both counts agree for a text-only reply, because the client counts one token per
-`Text`, `Thinking` and `ToolCall` block. They diverge as soon as the reply
-carries an `ImageBase64` or `ToolResult` block, which count as blocks but not as
-tokens.
+The summary line carries its own leading newline: the client fires
+`on_response_complete` inside the final `next()` poll, before the drain loop
+returns. `google/gemma-4-12b-qat` reasons before it answers and the example sets
+no `max_tokens`, which is why both counts reach 1991; the reply text and the
+numbers change with the model.
+
+The two counts agree here because the client counts one token per `Text`,
+`Thinking` and `ToolCall` block. They diverge as soon as the reply carries an
+`ImageBase64` or `ToolResult` block, which count as blocks but not as tokens.
 
 ## If your plugin answers tool calls
 

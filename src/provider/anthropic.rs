@@ -284,6 +284,10 @@ pub fn authorization_url(cfg: &OAuthPkceConfig, challenge: &str, state: &str) ->
 /// - `messages` carries user/assistant messages only. Tool results ride inside
 ///   a user message as `tool_result` blocks per the Anthropic wire contract,
 ///   so standalone `Tool`-role messages are skipped.
+/// - `tools` carries every [`UnifiedRequest::tools`] entry as
+///   `{name, description, input_schema}`, the Anthropic tool shape; the key is
+///   omitted when the request declares no tool, and `tool_choice` is never
+///   emitted, so the API's own selection default applies.
 ///
 /// When `req.thinking` is set, a top-level `thinking` key is emitted: adaptive
 /// mode (`{"type": "adaptive"}` plus `effort` when a unified effort is set)
@@ -377,6 +381,20 @@ pub fn build_anthropic_request(req: &UnifiedRequest) -> Result<serde_json::Value
                 serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
             );
         }
+    }
+    if !req.tools.is_empty() {
+        let tools: Vec<serde_json::Value> = req
+            .tools
+            .iter()
+            .map(|tool| {
+                serde_json::json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "input_schema": tool.input_schema,
+                })
+            })
+            .collect();
+        body.insert("tools".to_string(), serde_json::json!(tools));
     }
     body.insert("messages".to_string(), serde_json::json!(messages));
     Ok(serde_json::Value::Object(body))
@@ -1009,7 +1027,7 @@ mod tests {
         UnifiedRequest, UnifiedResponse,
     };
     use crate::sse::SseEvent;
-    use crate::types::UnifiedMessage;
+    use crate::types::{ToolDefinition, UnifiedMessage};
 
     use super::*;
 
@@ -1261,6 +1279,45 @@ mod tests {
             body["messages"][1]["content"][0],
             json!({ "type": "tool_result", "tool_use_id": "toolu_1", "content": "72F" })
         );
+    }
+
+    #[test]
+    fn build_body_maps_tool_definitions_to_anthropic_tools() {
+        let req = UnifiedRequest::new("claude-3-5-sonnet-20241022")
+            .add_user_message("what is the weather in NYC")
+            .add_tool(ToolDefinition {
+                name: "get_weather".into(),
+                description: "Look up the current weather for a city".into(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"],
+                }),
+            });
+        let body = build_anthropic_request(&req).unwrap();
+
+        assert_eq!(
+            body["tools"],
+            json!([{
+                "name": "get_weather",
+                "description": "Look up the current weather for a city",
+                "input_schema": {
+                    "type": "object",
+                    "properties": { "city": { "type": "string" } },
+                    "required": ["city"],
+                },
+            }])
+        );
+        // No tool_choice: the API's own selection default applies.
+        assert!(body.get("tool_choice").is_none());
+    }
+
+    #[test]
+    fn build_body_omits_tools_when_none_declared() {
+        let req = UnifiedRequest::new("claude-3-5-sonnet-20241022").add_user_message("hi");
+        let body = build_anthropic_request(&req).unwrap();
+
+        assert!(body.get("tools").is_none());
     }
 
     #[test]

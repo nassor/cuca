@@ -59,10 +59,10 @@ Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShel
 3. Add CUCA from your checkout, with the llama.cpp provider enabled. Substitute the path of this repository for `/path/to/cuca`.
 
    ```
-   cargo add cuca-core --path /path/to/cuca --features provider-llamacpp
+   cargo add cuca --path /path/to/cuca --features provider-llamacpp
    ```
 
-   You see `Adding cuca-core (local) to dependencies`.
+   You see `Adding cuca (local) to dependencies`, followed by the feature list, with `+ provider-llamacpp` enabled and every other feature listed as disabled.
 
    llama-server's chat route speaks the OpenAI-compatible `/v1/chat/completions` protocol, but the llama.cpp adapter's own default base URL is `http://127.0.0.1:8080`; the demo below overrides it to reach the server on port 1234, and no API key is needed.
 
@@ -111,14 +111,14 @@ Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShel
    cargo run
    ```
 
-   You see Gemma 4 E4B's reply stream to your terminal, one chunk at a time; the process exits once the stream ends.
+   You see Gemma 4 E4B's reply stream to your terminal, one chunk at a time; the process exits once the stream ends. A reasoning model pauses before the first word: the demo prints `Text` blocks and drops `Thinking` ones, so nothing appears until the reasoning is done.
 
 ## After the first run
 
 - Enable only the provider features you use.
 - The same demo works against any OpenAI-compatible endpoint, such as Ollama, vLLM, or a remote gateway, by switching to `provider-openai` and setting the base URL in `with_base_url` and the model name in `UnifiedRequest::new`; Ollama serves this protocol at `http://localhost:11434/v1` once `ollama serve` is running with a model pulled.
 - LM Studio speaks the same protocol through its own dedicated adapter, `provider-lmstudio`, which already defaults to LM Studio's local server at `http://127.0.0.1:1234/v1`.
-- The repository's `examples/` folder demonstrates the same pattern in eight flavors: `cargo run --example llamacpp_gemma --features provider-llamacpp` (plain reply), `stream_all_blocks` (every block type), `custom_plugin` (a counting plugin), `cost_otel` (a priced turn exported to OpenTelemetry, which also needs `plugin-cost,plugin-telemetry`), `rate_limit` (a paced fan-out of turns, which also needs `service-rate-limit`), `redaction` (outbound scrubbing, which also needs `plugin-redaction`), `replay` (a recorded turn re-materialized offline, which also needs `service-replay`), and `vector_store` (offloaded history recalled into the next prompt, which also needs `service-vector-store`). The examples read `CUCA_BASE_URL` and `CUCA_MODEL` from the environment (defaults target a local llama.cpp server), e.g. `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example llamacpp_gemma --features provider-llamacpp` to point at a vLLM server instead.
+- The repository's `examples/` folder covers the core client plus every plugin and every service; every example reads `CUCA_BASE_URL` and `CUCA_MODEL` from the environment, so one build retargets at any OpenAI-compatible server. `Cargo.toml` lists each one with the features it needs, and every plugin and service page on the site has a "Try it" section with that example's exact `cargo run` command and its real output.
 
 ### Integration tests (live llama.cpp)
 

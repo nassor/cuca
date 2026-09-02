@@ -4,7 +4,7 @@
 //!
 //! # Prerequisites
 //!
-//! - A checkout of this repository (the example depends on `cuca-core` by path).
+//! - A checkout of this repository (the example builds from this crate).
 //! - A running [llama.cpp](https://github.com/ggml-org/llama.cpp) server
 //!   (`llama-server`) on port 1234 with the demo model loaded.
 //!
@@ -26,9 +26,21 @@
 //!
 //! # Output
 //!
-//! The model's reply prints as text chunks arrive. The program exits when the
-//! stream ends; if the llama.cpp server is not running, it fails with a
-//! connection error.
+//! The reply prints as its text chunks arrive, and nothing else: this example
+//! keeps only `Text` blocks. From one run against `google/gemma-4-12b-qat` on
+//! llama.cpp:
+//!
+//! ```text
+//! CUCA is an acronym that has several different meanings depending on the context, such as a Clinical Unit Coordination Area in healthcare or a brand of beer.
+//! ```
+//!
+//! The reply depends on the model. The run took about four minutes because no
+//! `max_tokens` is set and this model reasons at length before answering; every
+//! one of those reasoning blocks is dropped here. `stream_all_blocks` prints
+//! them.
+//!
+//! With no server on the base URL, the program prints one line naming the
+//! address and exits successfully.
 //!
 //! # Why the llama.cpp adapter?
 //!
@@ -60,7 +72,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // behavior are explained in the module docs.
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url)
+        .with_base_url(base_url.clone())
         .build()?;
 
     // Stage 2: build the request.
@@ -71,7 +83,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage 3: generate_stream starts the request and returns the normalized
     // `AgentResponseStream`, which yields `Result<MessageContentBlock,
     // CucaError>` items.
-    let mut stream = client.generate_stream(request).await?;
+    let mut stream = match client.generate_stream(request).await {
+        Ok(stream) => stream,
+        Err(error) => {
+            println!("No server answered at {base_url}: {error}");
+            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
+            return Ok(());
+        }
+    };
 
     // Stage 4: drain the stream and print each text block as it arrives.
     // Flushing after every chunk makes the streaming visible even when piped.

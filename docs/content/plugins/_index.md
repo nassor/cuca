@@ -21,11 +21,11 @@ kicker = "Reference"
 
 | Feature | Entry type | Attachment | Hooks overridden |
 |---|---|---|---|
-| [`plugin-mcp`](@/plugins/mcp.md) | `McpPlugin` | `register_plugin` | `on_request`, `on_stream_chunk`, `on_response_complete` |
-| [`plugin-sandbox`](@/plugins/sandbox.md) | `SandboxPlugin` | `register_plugin` | `on_request`, `on_stream_chunk`, `on_response_complete` |
+| [`plugin-mcp`](@/plugins/mcp.md) | `McpPlugin` | `register_plugin` | `on_stream_chunk` |
+| [`plugin-sandbox`](@/plugins/sandbox.md) | `SandboxPlugin` | `register_plugin` | `on_stream_chunk` |
 | [`plugin-memory`](@/plugins/memory.md) | `MemoryPlugin` | `register_plugin` | `on_request` |
-| [`plugin-guardrails`](@/plugins/guardrails.md) | `JsonGuardrailPlugin` | `register_plugin` | `on_stream_chunk`, `on_response_complete` |
-| [`plugin-subagent`](@/plugins/subagent.md) | `SubagentPlugin` | `register_plugin` | `on_request`, `on_stream_chunk`, `on_response_complete` |
+| [`plugin-guardrails`](@/plugins/guardrails.md) | `JsonGuardrailPlugin` | `register_plugin` | `on_stream_chunk` |
+| [`plugin-subagent`](@/plugins/subagent.md) | `SubagentPlugin` | `register_plugin` | `on_stream_chunk` |
 | [`plugin-hitl`](@/plugins/hitl.md) | `HitlPlugin` | `register_plugin` | `on_stream_chunk` |
 | [`plugin-web-search`](@/plugins/web-search.md) | `WebSearchPlugin` | `register_plugin` | `on_stream_chunk` |
 | [`plugin-skills`](@/plugins/skills.md) | `SkillsPlugin` | `register_plugin` | `on_request`, `on_stream_chunk` |

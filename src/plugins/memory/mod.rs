@@ -105,11 +105,9 @@ use crate::types::{MessageContentBlock, MessageRole, UnifiedMessage};
 
 pub mod graph;
 pub use graph::{
-    GraphDirection, GraphNode, GraphRelationship, GraphSnapshot, MemoryGraph, MergePolicy,
-    MergeReport,
+    GRAPH_RENDER_MARKER, GraphDirection, GraphNode, GraphRelationship, GraphSnapshot, MemoryGraph,
+    MergePolicy, MergeReport,
 };
-
-use graph::GRAPH_RENDER_MARKER;
 
 /// Fixed session hint used when offloading turns to a [`VectorStore`].
 ///
@@ -488,6 +486,10 @@ impl MemoryPlugin {
     }
 
     /// Locked access to the working graph.
+    ///
+    /// The returned value is a guard on a non-reentrant [`std::sync::Mutex`],
+    /// so two `graph()` calls in one expression deadlock; take one guard per
+    /// reading.
     ///
     /// # Errors
     ///

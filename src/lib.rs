@@ -90,9 +90,9 @@ pub use crate::plugins::mcp::{McpPlugin, McpTransport};
 #[cfg(feature = "plugin-memory")]
 pub use crate::plugins::memory::{
     Budget, CompactionStrategy, CompressionAction, CompressionReport, ContextUsage,
-    ContextUsageObserver, ContextWindowResolver, GraphContextConfig, GraphDirection,
-    GraphImportReport, GraphNode, GraphRelationship, GraphSnapshot, MemoryConfig, MemoryGraph,
-    MemoryPlugin, MergePolicy, MergeReport, Summarizer, VectorStore,
+    ContextUsageObserver, ContextWindowResolver, GRAPH_RENDER_MARKER, GraphContextConfig,
+    GraphDirection, GraphImportReport, GraphNode, GraphRelationship, GraphSnapshot, MemoryConfig,
+    MemoryGraph, MemoryPlugin, MergePolicy, MergeReport, Summarizer, VectorStore,
 };
 #[cfg(feature = "plugin-redaction")]
 pub use crate::plugins::redaction::{Redacted, RedactionConfig, RedactionPlugin, RedactionRule};

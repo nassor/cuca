@@ -18,7 +18,7 @@ weight = 6
 
 `InMemoryVectorStore` implements `VectorStore`, the offload seam declared by `plugin-memory`. `MemoryPlugin::with_extensions` is the only constructor that accepts one, and `CompactionStrategy::Offload` is what writes to it: the turns compaction removes from the live prompt are embedded and stored instead of discarded. Reading is a direct call, and the recalled turns reach the model only through `RetrievalReport::inject`.
 
-```rust,name=Offload history, then recall it into the next request
+```rust,name=Offload history then recall it into the next request
 use std::sync::Arc;
 
 use cuca::plugins::memory::VectorStore;
