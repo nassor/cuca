@@ -85,7 +85,7 @@ This adapter's request builder and SSE translator are shared by four other endpo
 
 Request body, from a `UnifiedRequest`:
 
-- `stream` is always `true`.
+- `stream` is always `true`, and `stream_options` is always `{"include_usage": true}`.
 - `temperature` and `max_tokens` are included only when set on the request.
 - `tools` carries every `UnifiedRequest::tools` entry as `{"type": "function", "function": {name, description, parameters}}`, with `parameters` holding the definition's `input_schema`; the key is omitted when the request declares no tool, and no `tool_choice` is sent, so the server's own selection default applies.
 - A message's `Text` blocks are joined with a newline into plain string content.
@@ -95,6 +95,24 @@ Request body, from a `UnifiedRequest`:
 - `ToolResult` becomes a `role: "tool"` message with `tool_call_id` and the output as `content`.
 
 Response frames arrive as `choices[0].delta.{content, reasoning_content, tool_calls}`, terminated by `data: [DONE]`. Tool calls are accumulated by their frame `index` across multiple deltas and flushed as complete `ToolCall` blocks on `finish_reason` or `[DONE]`.
+
+## Token usage
+
+Because the request sets `stream_options.include_usage`, the last frame before `[DONE]` carries a `usage` object: most servers send it as one more frame with an empty `choices` array, DeepSeek on the final `finish_reason` frame. The `usage` object never becomes a block. Its `prompt_tokens` and `completion_tokens` become `UnifiedResponse::prompt_tokens` and `completion_tokens`, and the whole object becomes `UnifiedResponse::usage` as a `TokenUsage`, with `completion_tokens_details.reasoning_tokens` as `reasoning_tokens` when the server breaks it out. Plugins see it in `on_response_complete`; a caller reads it per call with `CucaClient::generate_stream_with_response`:
+
+```rust,name=Read one call's token usage
+let (mut stream, response) = client
+    .generate_stream_with_response(UnifiedRequest::new("gpt-4o-mini").add_user_message("Say hello."))
+    .await?;
+while let Some(block) = stream.next().await {
+    let _ = block?;
+}
+if let Some(usage) = response.take().and_then(|res| res.usage) {
+    println!("{} prompt + {} completion tokens", usage.prompt_tokens, usage.completion_tokens);
+}
+```
+
+A server that sends no `usage` frame leaves `usage` at `None`, and the response keeps the fallback counts: `completion_tokens` one per `Text`, `Thinking` and `ToolCall` block, `prompt_tokens` `0`.
 
 ## Thinking effort
 

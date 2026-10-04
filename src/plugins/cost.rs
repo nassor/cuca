@@ -15,13 +15,16 @@
 //!
 //! # What the core reports
 //!
-//! [`UnifiedResponse::prompt_tokens`] is always `0`, and
-//! [`UnifiedResponse::completion_tokens`] is a per-block count rather than a
-//! token count: the client adds `1` per `Text`, `Thinking`, or `ToolCall`
-//! block. No provider adapter parses an upstream `usage` object into either
-//! field. [`UnifiedResponse::prompt_cache_usage`] carries the only
-//! provider-reported token numbers in the crate, and only the Anthropic adapter
-//! populates it. Every figure this plugin records is therefore a tiktoken
+//! [`UnifiedResponse::usage`] carries provider-reported prompt and completion
+//! tokens when the adapter received them (the OpenAI-compatible adapters ask
+//! for them with `stream_options.include_usage`); without it,
+//! [`UnifiedResponse::prompt_tokens`] is `0` and
+//! [`UnifiedResponse::completion_tokens`] is a per-block count. This plugin
+//! reads neither: the prompt charge must be made in `on_request`, before the
+//! provider has counted anything, and the ledger stays one consistent
+//! estimator across every provider. [`UnifiedResponse::prompt_cache_usage`],
+//! populated by the Anthropic adapter only, is the one provider figure it
+//! applies. Every figure this plugin records is therefore a tiktoken
 //! estimate, reconciled against provider truth for cache read and write tokens
 //! alone.
 //!
@@ -1045,6 +1048,7 @@ mod tests {
             finish_reason: None,
             content,
             prompt_cache_usage: None,
+            usage: None,
         }
     }
 

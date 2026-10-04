@@ -2282,6 +2282,7 @@ mod replay_speculative {
                 finish_reason: Some("stop".into()),
                 content: blocks.clone(),
                 prompt_cache_usage: None,
+                usage: None,
             })
             .expect("on_response_complete must return Ok(())");
 

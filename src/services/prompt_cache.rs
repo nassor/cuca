@@ -872,6 +872,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             content: vec![MessageContentBlock::Text("ok".to_string())],
             prompt_cache_usage: None,
+            usage: None,
         }
     }
 

@@ -65,7 +65,7 @@ pub mod export;
 #[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
 pub mod cost_otel;
 
-pub use crate::client::{CucaClient, CucaClientBuilder};
+pub use crate::client::{CucaClient, CucaClientBuilder, ResponseHandle};
 #[cfg(all(feature = "plugin-cost", feature = "plugin-telemetry"))]
 pub use crate::cost_otel::OtelCostObserver;
 pub use crate::error::{CucaError, PluginError};
@@ -116,7 +116,7 @@ pub use crate::plugins::web_search::{
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,
-    ThinkingConfig, ThinkingEffort, ThinkingParams, UnifiedRequest, UnifiedResponse,
+    ThinkingConfig, ThinkingEffort, ThinkingParams, TokenUsage, UnifiedRequest, UnifiedResponse,
 };
 #[cfg(feature = "service-entity-extraction")]
 pub use crate::services::entity_extraction::{

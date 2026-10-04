@@ -16,7 +16,7 @@ weight = 14
 <dd>You are registering <code>CostPlugin</code>, setting a budget cap, or reading its per-model spend.</dd>
 </dl>
 
-`CostPlugin` estimates prompt and completion tokens with tiktoken, prices them against a caller-supplied `PricingTable`, and refuses a turn in `on_request` once the projected spend would cross `max_total_tokens` or `max_total_micros`. Every reading is an estimate: no provider adapter parses an upstream `usage` object into `UnifiedResponse::prompt_tokens`, so this plugin is the crate's only token and spend ledger. Reach for it to enforce a budget cap or to read per-model spend without an upstream billing API.
+`CostPlugin` estimates prompt and completion tokens with tiktoken, prices them against a caller-supplied `PricingTable`, and refuses a turn in `on_request` once the projected spend would cross `max_total_tokens` or `max_total_micros`. Every reading is an estimate, made before the turn is dispatched so the cap can refuse it; provider-reported counts arrive only afterwards, in `UnifiedResponse::usage`, and only from adapters that receive them, so this plugin is the crate's only budget-enforcing ledger. Reach for it to enforce a budget cap or to read per-model spend without an upstream billing API.
 
 ```rust,name=Charge live turns then let the budget refuse one
 use std::sync::{Arc, Mutex};
@@ -284,7 +284,7 @@ cargo run --example cost --features "provider-llamacpp plugin-cost"
 
 `CostPlugin` implements `CucaPlugin` with the plugin name `"cost-accounting"` and attaches via `register_plugin`, like any other hook plugin. It overrides `on_request` and `on_response_complete`; `execute_local_tool` and `on_stream_chunk` use the trait defaults, because the plugin owns no tool and a budget cannot abort a turn mid-stream. `CostPlugin::new(config)` validates `CostConfig` and loads the tiktoken encoder named by `encoder_name`, returning `PluginError::Internal` for either failure.
 
-Every reading is an estimate. `UnifiedResponse::prompt_tokens` is always `0` and `completion_tokens` counts blocks, not tokens; no provider adapter parses an upstream `usage` object into either field. `prompt_cache_usage`, populated by the Anthropic adapter only, is the sole provider-reported token data in the crate, and the only correction `CostPlugin` applies against its own tiktoken count.
+Every reading is an estimate. `CostPlugin` charges its own tiktoken counts and never reads `UnifiedResponse::prompt_tokens`, `completion_tokens` or `usage`, which carry provider-reported counts only when the adapter received them (the OpenAI-compatible adapters do; elsewhere `prompt_tokens` is `0` and `completion_tokens` counts blocks). `prompt_cache_usage`, populated by the Anthropic adapter only, is the only correction `CostPlugin` applies against its own tiktoken count.
 
 ## Config
 

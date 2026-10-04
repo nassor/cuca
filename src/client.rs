@@ -25,8 +25,13 @@
 //!    the stream ends, and (under `service-prompt-cache`) writes one cache
 //!    entry after a fully successful completion.
 //!
-//! Token accounting: `completion_tokens` counts one token per `Text`, `Thinking`,
-//! and `ToolCall` block; `prompt_tokens` stays `0`.
+//! Token accounting: when the provider reports usage (the OpenAI-compatible
+//! adapters ask for it with `stream_options.include_usage`),
+//! `prompt_tokens`/`completion_tokens` are the provider's counts and
+//! [`UnifiedResponse::usage`] is `Some`. Otherwise `completion_tokens` counts
+//! one per `Text`, `Thinking`, and `ToolCall` block and `prompt_tokens` stays
+//! `0`. [`CucaClient::generate_stream_with_response`] hands the terminal
+//! response of one call to its caller.
 
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
@@ -40,7 +45,9 @@ use crate::plugin::CucaPlugin;
 use crate::provider::anthropic::OAuthPkceConfig;
 #[cfg(feature = "provider-llamacpp")]
 use crate::provider::llamacpp::LlamaCppConfig;
-use crate::request::{AgentResponseStream, PromptCacheUsage, UnifiedRequest, UnifiedResponse};
+use crate::request::{
+    AgentResponseStream, PromptCacheUsage, TokenUsage, UnifiedRequest, UnifiedResponse,
+};
 #[cfg(feature = "service-speculative")]
 use crate::services::orchestrator::ModelOrchestrator;
 #[cfg(feature = "service-prompt-cache")]
@@ -55,31 +62,42 @@ use crate::types::{MessageContentBlock, ProviderEndpoint};
 ///
 /// Every provider stream-construction point builds one alongside its
 /// [`AgentResponseStream`] (see [`ProviderDispatch`]); adapters that never
-/// report prompt-cache usage build [`Self::empty`] and never call
-/// [`Self::set`], so their responses' `prompt_cache_usage` always stays
-/// `None`. [`PluginStream`] reads the handle with [`Self::take`] exactly once,
-/// when the inner stream reaches `None`, and copies the result into
-/// [`UnifiedResponse::prompt_cache_usage`] before terminal hooks run.
+/// report metadata build [`Self::empty`] and never record into it, so their
+/// responses' `prompt_cache_usage` and `usage` always stay `None`.
+/// [`PluginStream`] reads the handle with [`Self::take`] exactly once, when
+/// the inner stream reaches `None`, and copies the result into
+/// [`UnifiedResponse::prompt_cache_usage`] and [`UnifiedResponse::usage`]
+/// (plus `prompt_tokens`/`completion_tokens`) before terminal hooks run.
 ///
-/// The payload type, [`PromptCacheUsage`], is unconditional (defined in
-/// [`crate::request`] with no feature gate), so this handle compiles and
-/// behaves identically whether or not `service-prompt-cache` is enabled.
+/// The payload types, [`PromptCacheUsage`] and [`TokenUsage`], are
+/// unconditional (defined in [`crate::request`] with no feature gate), so
+/// this handle compiles and behaves identically whether or not
+/// `service-prompt-cache` is enabled.
 ///
 /// A poisoned lock is treated as "no usage" rather than propagated: metadata
 /// is best-effort and must never turn a successful provider stream into an
 /// error. Explicit cache/export APIs remain the place state/serialization
 /// errors surface.
 #[derive(Clone, Default)]
-pub(crate) struct ResponseMetadataHandle(Arc<Mutex<Option<PromptCacheUsage>>>);
+pub(crate) struct ResponseMetadataHandle(Arc<Mutex<ResponseMetadata>>);
+
+/// What a provider stream reported besides content blocks.
+#[derive(Debug, Default, PartialEq)]
+pub(crate) struct ResponseMetadata {
+    /// Provider prompt-cache counters.
+    pub(crate) prompt_cache_usage: Option<PromptCacheUsage>,
+    /// Provider token usage.
+    pub(crate) token_usage: Option<TokenUsage>,
+}
 
 impl ResponseMetadataHandle {
-    /// Build a handle carrying no usage. Used by every adapter that never
-    /// reports provider prompt-cache usage, and by the orchestrator path.
+    /// Build a handle carrying no metadata. Used by every adapter that never
+    /// reports provider metadata, and by the orchestrator path.
     pub(crate) fn empty() -> Self {
         Self::default()
     }
 
-    /// Record `usage`, overwriting any previously recorded value.
+    /// Record prompt-cache `usage`, overwriting any previously recorded value.
     ///
     /// A poisoned lock silently drops the update rather than panicking or
     /// propagating an error: see the type-level "poisoned lock" note.
@@ -87,27 +105,89 @@ impl ResponseMetadataHandle {
     /// Called by the Anthropic SSE stream translator once it decodes
     /// `message_start` usage, so by `provider-anthropic` and by
     /// `provider-deepseek`, whose bridge reuses that translator. Every other
-    /// adapter builds [`Self::empty`] and never calls this, so a build with
-    /// neither feature never calls it either.
+    /// adapter never calls this, so a build with neither feature never calls
+    /// it either.
     #[cfg_attr(
         not(any(test, feature = "provider-anthropic", feature = "provider-deepseek")),
         expect(
             dead_code,
-            reason = "only the Anthropic translator records usage; other adapters build `empty()`"
+            reason = "only the Anthropic translator records prompt-cache usage"
         )
     )]
-    pub(crate) fn set(&self, usage: PromptCacheUsage) {
+    pub(crate) fn set_prompt_cache_usage(&self, usage: PromptCacheUsage) {
         if let Ok(mut guard) = self.0.lock() {
-            *guard = Some(usage);
+            guard.prompt_cache_usage = Some(usage);
         }
     }
 
-    /// Take the recorded usage, if any, leaving the handle empty afterward.
+    /// Record token `usage`, overwriting any previously recorded value.
     ///
-    /// A poisoned lock is treated as "no usage" (`None`), never an error: see
+    /// A poisoned lock silently drops the update, as for
+    /// [`Self::set_prompt_cache_usage`]. Called by the OpenAI-compatible
+    /// stream once its translator decodes a `usage` object.
+    #[cfg_attr(
+        not(any(
+            test,
+            feature = "provider-openai",
+            feature = "provider-vllm",
+            feature = "provider-lmstudio",
+            feature = "provider-deepseek",
+            feature = "provider-llamacpp",
+        )),
+        expect(
+            dead_code,
+            reason = "only the OpenAI-compatible translator records token usage"
+        )
+    )]
+    pub(crate) fn set_token_usage(&self, usage: TokenUsage) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.token_usage = Some(usage);
+        }
+    }
+
+    /// Take the recorded metadata, leaving the handle empty afterward.
+    ///
+    /// A poisoned lock is treated as "nothing reported", never an error: see
     /// the type-level "poisoned lock" note.
-    pub(crate) fn take(&self) -> Option<PromptCacheUsage> {
+    pub(crate) fn take(&self) -> ResponseMetadata {
+        self.0
+            .lock()
+            .map(|mut guard| std::mem::take(&mut *guard))
+            .unwrap_or_default()
+    }
+}
+
+/// The caller's handle on the terminal [`UnifiedResponse`] of one
+/// [`CucaClient::generate_stream_with_response`] call.
+///
+/// Empty until the returned stream has yielded `None`; then it holds the
+/// response the `on_response_complete` hooks received, token usage included.
+/// Clones share one slot.
+#[derive(Clone, Default)]
+pub struct ResponseHandle(Arc<Mutex<Option<UnifiedResponse>>>);
+
+impl ResponseHandle {
+    /// Take the terminal response, leaving the handle empty.
+    ///
+    /// `None` while the stream has not ended yet, once the response was
+    /// already taken, or when the stream was not instrumented (the
+    /// orchestrator path with no prompt cache configured). A poisoned lock
+    /// also reads as `None`.
+    pub fn take(&self) -> Option<UnifiedResponse> {
         self.0.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    /// Store the terminal response; a poisoned lock drops it.
+    fn set(&self, response: UnifiedResponse) {
+        if let Ok(mut guard) = self.0.lock() {
+            *guard = Some(response);
+        }
+    }
+}
+
+impl std::fmt::Debug for ResponseHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResponseHandle").finish_non_exhaustive()
     }
 }
 
@@ -522,7 +602,42 @@ impl CucaClient {
     /// without a registered adapter; plus any provider dispatch error.
     pub async fn generate_stream(
         &self,
+        request: UnifiedRequest,
+    ) -> Result<AgentResponseStream, CucaError> {
+        self.run_pipeline(request, None).await
+    }
+
+    /// [`Self::generate_stream`], plus a [`ResponseHandle`] on the aggregated
+    /// [`UnifiedResponse`] of this one call.
+    ///
+    /// The handle is filled with the same response `on_response_complete`
+    /// hooks receive, once the stream has yielded `None`; read it with
+    /// [`ResponseHandle::take`] after draining the stream. This is how a
+    /// caller gets per-call token usage ([`UnifiedResponse::usage`]) without
+    /// a plugin, even with several calls in flight on one client. On the
+    /// orchestrator path with no prompt cache configured, the stream is not
+    /// instrumented (see [`Self::generate_stream`]) and the handle stays
+    /// empty.
+    ///
+    /// # Errors
+    ///
+    /// The same as [`Self::generate_stream`].
+    pub async fn generate_stream_with_response(
+        &self,
+        request: UnifiedRequest,
+    ) -> Result<(AgentResponseStream, ResponseHandle), CucaError> {
+        let handle = ResponseHandle::default();
+        let stream = self.run_pipeline(request, Some(handle.clone())).await?;
+        Ok((stream, handle))
+    }
+
+    /// The pipeline behind [`Self::generate_stream`]; `completed`, when
+    /// `Some`, receives the terminal [`UnifiedResponse`] of an instrumented
+    /// stream.
+    async fn run_pipeline(
+        &self,
         mut request: UnifiedRequest,
+        completed: Option<ResponseHandle>,
     ) -> Result<AgentResponseStream, CucaError> {
         request.provider = self.selected_provider.clone();
         for plugin in self.plugins.iter() {
@@ -539,7 +654,7 @@ impl CucaClient {
             Some(cache) => {
                 let key = digest_request(&request).map_err(map_prompt_cache_error)?;
                 match cache.lookup(&key).map_err(map_prompt_cache_error)? {
-                    Some(entry) => return Ok(self.instrument_cache_hit(entry)),
+                    Some(entry) => return Ok(self.instrument_cache_hit(entry, completed)),
                     None => Some((Arc::clone(cache), request.clone())),
                 }
             }
@@ -610,7 +725,7 @@ impl CucaClient {
                     stream: orchestrator.execute_adaptive_turn(request).await?,
                     metadata: ResponseMetadataHandle::empty(),
                 };
-                return Ok(self.instrument(model, dispatch, cache_write));
+                return Ok(self.instrument(model, dispatch, cache_write, completed));
             }
             let dispatch = ProviderDispatch {
                 stream: orchestrator.execute_adaptive_turn(request).await?,
@@ -703,7 +818,7 @@ impl CucaClient {
                 feature = "provider-lmstudio",
             )
         ))]
-        return Ok(self.instrument(model, dispatch, cache_write));
+        return Ok(self.instrument(model, dispatch, cache_write, completed));
         #[cfg(all(
             not(feature = "service-prompt-cache"),
             any(
@@ -716,13 +831,14 @@ impl CucaClient {
                 feature = "provider-lmstudio",
             )
         ))]
-        return Ok(self.instrument(model, dispatch));
+        return Ok(self.instrument(model, dispatch, completed));
     }
 
     /// Wrap a provider stream with the plugin instrumentation: `on_stream_chunk`
     /// per block, `on_response_complete` once at the end, the aggregated
-    /// [`UnifiedResponse`] token/content accounting, and (when `cache_write`
-    /// is `Some`) a one-shot cache write after a fully successful completion.
+    /// [`UnifiedResponse`] token/content accounting, (when `cache_write`
+    /// is `Some`) a one-shot cache write after a fully successful completion,
+    /// and (when `completed` is `Some`) the hand-off of the terminal response.
     #[cfg(all(
         feature = "service-prompt-cache",
         any(
@@ -740,6 +856,7 @@ impl CucaClient {
         model: String,
         dispatch: ProviderDispatch,
         cache_write: Option<(Arc<PromptCache>, UnifiedRequest)>,
+        completed: Option<ResponseHandle>,
     ) -> AgentResponseStream {
         Box::pin(PluginStream {
             inner: dispatch.stream,
@@ -755,16 +872,19 @@ impl CucaClient {
                 finish_reason: None,
                 content: Vec::new(),
                 prompt_cache_usage: None,
+                usage: None,
             },
             done: false,
+            completed,
             cache_write: cache_write.map(|(cache, request)| CacheWriteSeam { cache, request }),
             saw_error: false,
         })
     }
 
     /// Wrap a provider stream with the plugin instrumentation: `on_stream_chunk`
-    /// per block, `on_response_complete` once at the end, and the aggregated
-    /// [`UnifiedResponse`] token/content accounting.
+    /// per block, `on_response_complete` once at the end, the aggregated
+    /// [`UnifiedResponse`] token/content accounting, and (when `completed` is
+    /// `Some`) the hand-off of the terminal response.
     #[cfg(all(
         not(feature = "service-prompt-cache"),
         any(
@@ -777,7 +897,12 @@ impl CucaClient {
             feature = "provider-lmstudio",
         )
     ))]
-    fn instrument(&self, model: String, dispatch: ProviderDispatch) -> AgentResponseStream {
+    fn instrument(
+        &self,
+        model: String,
+        dispatch: ProviderDispatch,
+        completed: Option<ResponseHandle>,
+    ) -> AgentResponseStream {
         Box::pin(PluginStream {
             inner: dispatch.stream,
             metadata: dispatch.metadata,
@@ -792,8 +917,10 @@ impl CucaClient {
                 finish_reason: None,
                 content: Vec::new(),
                 prompt_cache_usage: None,
+                usage: None,
             },
             done: false,
+            completed,
         })
     }
 
@@ -801,7 +928,11 @@ impl CucaClient {
     /// without dispatching to a provider, running local-tool execution, or
     /// per-chunk hooks.
     #[cfg(feature = "service-prompt-cache")]
-    fn instrument_cache_hit(&self, entry: PromptCacheEntry) -> AgentResponseStream {
+    fn instrument_cache_hit(
+        &self,
+        entry: PromptCacheEntry,
+        completed: Option<ResponseHandle>,
+    ) -> AgentResponseStream {
         let response = entry.response;
         let blocks = response.content.clone().into_iter();
         Box::pin(CacheHitStream {
@@ -810,6 +941,7 @@ impl CucaClient {
             started: std::time::Instant::now(),
             response,
             done: false,
+            completed,
         })
     }
 }
@@ -830,6 +962,9 @@ pub struct PluginStream {
     // Guards the completion hook against double invocation if a consumer polls
     // again after the inner stream reported `None`.
     done: bool,
+    /// The caller's [`ResponseHandle`], from
+    /// [`CucaClient::generate_stream_with_response`]; filled once at the end.
+    completed: Option<ResponseHandle>,
     /// Present only on a cache miss with a configured cache: the service and
     /// effective request to write back after a fully successful completion.
     #[cfg(feature = "service-prompt-cache")]
@@ -905,8 +1040,9 @@ impl Stream for PluginStream {
                     }
                 }
                 this.response.content.push(chunk.clone());
-                // One token per text/reasoning/tool-call block; images and tool
-                // results carry no generated tokens.
+                // Fallback accounting, replaced at the end when the provider
+                // reports usage: one per text/reasoning/tool-call block;
+                // images and tool results carry no generated tokens.
                 match &chunk {
                     MessageContentBlock::Text(_)
                     | MessageContentBlock::Thinking { .. }
@@ -930,9 +1066,15 @@ impl Stream for PluginStream {
                     this.done = true;
                     this.response.duration_secs = this.started.elapsed().as_secs_f64();
                     // Read exactly once, here: a poisoned metadata lock
-                    // degrades to `None` rather than failing the stream (see
-                    // `ResponseMetadataHandle`'s docs).
-                    this.response.prompt_cache_usage = this.metadata.take();
+                    // degrades to "nothing reported" rather than failing the
+                    // stream (see `ResponseMetadataHandle`'s docs).
+                    let metadata = this.metadata.take();
+                    this.response.prompt_cache_usage = metadata.prompt_cache_usage;
+                    if let Some(usage) = metadata.token_usage {
+                        this.response.prompt_tokens = usage.prompt_tokens;
+                        this.response.completion_tokens = usage.completion_tokens;
+                        this.response.usage = Some(usage);
+                    }
                     // `finish_reason` stays `None`; no provider adapter
                     // populates it.
                     for plugin in this.plugins.iter() {
@@ -954,6 +1096,7 @@ impl Stream for PluginStream {
                     {
                         let _ = seam.cache.insert(seam.request, this.response.clone());
                     }
+                    publish_response(&mut this.completed, &mut this.response);
                 }
                 Poll::Ready(None)
             }
@@ -972,7 +1115,7 @@ impl Stream for PluginStream {
 /// `duration_secs` is replaced with the elapsed time since this stream was
 /// constructed (every other field is the stored value, unchanged: `model`,
 /// `provider`, `content`, `prompt_tokens`, `completion_tokens`,
-/// `finish_reason`, `prompt_cache_usage`). Terminal hook
+/// `finish_reason`, `prompt_cache_usage`, `usage`). Terminal hook
 /// errors are swallowed/logged exactly as [`PluginStream`] does, and a
 /// `done` guard prevents a duplicate completion if a consumer polls again
 /// after `None`.
@@ -985,6 +1128,8 @@ struct CacheHitStream {
     started: std::time::Instant,
     response: UnifiedResponse,
     done: bool,
+    /// See [`PluginStream::completed`].
+    completed: Option<ResponseHandle>,
 }
 
 #[cfg(feature = "service-prompt-cache")]
@@ -1007,8 +1152,25 @@ impl Stream for CacheHitStream {
                     let _ = e;
                 }
             }
+            publish_response(&mut this.completed, &mut this.response);
         }
         Poll::Ready(None)
+    }
+}
+
+/// Hand the terminal `response` to the caller's [`ResponseHandle`], if any.
+///
+/// Runs once, after the terminal hooks and the cache write, which are the
+/// last readers of `response`'s content: the content is moved into the
+/// handle rather than cloned, so a stream's own `response` is left with an
+/// empty `content` afterwards.
+fn publish_response(completed: &mut Option<ResponseHandle>, response: &mut UnifiedResponse) {
+    if let Some(handle) = completed.take() {
+        let content = std::mem::take(&mut response.content);
+        handle.set(UnifiedResponse {
+            content,
+            ..response.clone()
+        });
     }
 }
 
@@ -1052,10 +1214,17 @@ mod tests {
     async fn response_metadata_handle_reaches_terminal_response() {
         let (tx, rx) = std::sync::mpsc::channel();
         let handle = ResponseMetadataHandle::empty();
-        handle.set(crate::request::PromptCacheUsage {
+        handle.set_prompt_cache_usage(crate::request::PromptCacheUsage {
             read_tokens: 7,
             write_tokens: 3,
         });
+        let usage = TokenUsage {
+            prompt_tokens: 15,
+            completion_tokens: 4,
+            reasoning_tokens: Some(0),
+        };
+        handle.set_token_usage(usage);
+        let caller = ResponseHandle::default();
 
         let stream = PluginStream {
             inner: Box::pin(tokio_stream::iter([Ok(MessageContentBlock::Text(
@@ -1073,12 +1242,14 @@ mod tests {
                 finish_reason: None,
                 content: Vec::new(),
                 prompt_cache_usage: None,
+                usage: None,
             },
             #[cfg(feature = "service-prompt-cache")]
             cache_write: None,
             #[cfg(feature = "service-prompt-cache")]
             saw_error: false,
             done: false,
+            completed: Some(caller.clone()),
         };
 
         use tokio_stream::StreamExt;
@@ -1092,10 +1263,20 @@ mod tests {
                 write_tokens: 3
             })
         );
+        // Reported usage replaces the one-per-block fallback.
+        assert_eq!(completed.usage, Some(usage));
+        assert_eq!(
+            (completed.prompt_tokens, completed.completion_tokens),
+            (15, 4)
+        );
+        // The caller's handle receives the very response the hooks saw.
+        assert_eq!(caller.take(), Some(completed));
+        assert_eq!(caller.take(), None, "taking empties the handle");
     }
 
     #[tokio::test]
     async fn empty_metadata_handle_leaves_response_metadata_none() {
+        let caller = ResponseHandle::default();
         let stream = PluginStream {
             inner: Box::pin(tokio_stream::iter([Ok(MessageContentBlock::Text(
                 "hi".into(),
@@ -1112,19 +1293,33 @@ mod tests {
                 finish_reason: None,
                 content: Vec::new(),
                 prompt_cache_usage: None,
+                usage: None,
             },
             #[cfg(feature = "service-prompt-cache")]
             cache_write: None,
             #[cfg(feature = "service-prompt-cache")]
             saw_error: false,
             done: false,
+            completed: Some(caller.clone()),
         };
 
         use tokio_stream::StreamExt;
         let mut stream = Box::pin(stream);
+        assert!(caller.take().is_none(), "empty before the stream ends");
         while stream.next().await.is_some() {}
-        // No plugin recorded the response, but the stream itself must have
-        // drained to completion without any error from the empty handle.
+        // Nothing reported: the metadata stays `None` and the block-count
+        // fallback stands.
+        let completed = caller.take().expect("the stream ended");
+        assert_eq!(completed.prompt_cache_usage, None);
+        assert_eq!(completed.usage, None);
+        assert_eq!(
+            (completed.prompt_tokens, completed.completion_tokens),
+            (0, 1)
+        );
+        assert_eq!(
+            completed.content,
+            vec![MessageContentBlock::Text("hi".into())]
+        );
     }
 
     #[test]
@@ -1138,8 +1333,9 @@ mod tests {
         .join();
 
         // A metadata lock failure must not fail a successful stream: `take`
-        // degrades to "no usage" rather than propagating the poison error.
-        assert_eq!(handle.take(), None);
+        // degrades to "nothing reported" rather than propagating the poison
+        // error.
+        assert_eq!(handle.take(), ResponseMetadata::default());
     }
 
     #[tokio::test]
@@ -1194,12 +1390,14 @@ mod tests {
                 finish_reason: None,
                 content: Vec::new(),
                 prompt_cache_usage: None,
+                usage: None,
             },
             #[cfg(feature = "service-prompt-cache")]
             cache_write: None,
             #[cfg(feature = "service-prompt-cache")]
             saw_error: false,
             done: false,
+            completed: None,
         };
 
         use tokio_stream::StreamExt;
@@ -1394,6 +1592,7 @@ mod tests {
                     read_tokens: 5,
                     write_tokens: 0,
                 }),
+                usage: None,
             }
         }
 
@@ -1503,6 +1702,7 @@ mod tests {
                 finish_reason: None,
                 content: Vec::new(),
                 prompt_cache_usage: None,
+                usage: None,
             }
         }
 
@@ -1528,6 +1728,7 @@ mod tests {
                 started: std::time::Instant::now(),
                 response: base_response(),
                 done: false,
+                completed: None,
                 cache_write: Some(CacheWriteSeam { cache, request }),
                 saw_error: false,
             })

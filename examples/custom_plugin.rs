@@ -35,11 +35,13 @@
 //! The summary line carries its own leading newline because the hook runs
 //! inside the caller's final `next()` poll, before the drain loop returns.
 //!
-//! `completion_tokens` equals the block count here: the client counts one token
-//! per `Text`, `Thinking`, and `ToolCall` block. Both reach 1991 because this
-//! demo sets no `max_tokens` and a reasoning model emits one `Thinking` block
-//! per reasoning token. The reply, the counts, and the duration all depend on
-//! the model.
+//! `completion_tokens` is the server's own count when it reports usage, as
+//! llama-server's chat route does; it then roughly tracks `blocks`, since a
+//! streamed delta carries about one token. A server that reports no usage
+//! leaves the fallback: one per `Text`, `Thinking`, and `ToolCall` block.
+//! Both reach about 1991 here because this demo sets no `max_tokens` and a
+//! reasoning model streams its reasoning before it answers. The reply, the
+//! counts, and the duration all depend on the model.
 //!
 //! # The plugin pipeline
 //!

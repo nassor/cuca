@@ -6,7 +6,10 @@
 //! rename or a missing/incorrectly gated re-export fails to compile.
 #![cfg(any(feature = "provider-openai", feature = "provider-llamacpp"))]
 
-use cuca::{PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage, UnifiedRequest};
+use cuca::{
+    PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage, ResponseHandle, TokenUsage,
+    UnifiedRequest,
+};
 
 #[test]
 fn request_prompt_cache_types_are_root_exported_unconditionally() {
@@ -33,6 +36,19 @@ fn request_prompt_cache_types_are_root_exported_unconditionally() {
         write_tokens: 2,
     };
     assert_eq!(usage.read_tokens + usage.write_tokens, 6);
+}
+
+#[test]
+fn token_usage_and_response_handle_are_root_exported_unconditionally() {
+    let usage = TokenUsage {
+        prompt_tokens: 15,
+        completion_tokens: 4,
+        reasoning_tokens: Some(0),
+    };
+    assert_eq!(usage.prompt_tokens + usage.completion_tokens, 19);
+
+    // A fresh handle holds nothing until a stream fills it.
+    assert!(ResponseHandle::default().take().is_none());
 }
 
 #[cfg(feature = "service-prompt-cache")]
