@@ -107,12 +107,15 @@ CUCA most commonly refers to either the Credit Union of Central Alabama or the C
 The summary line carries its own leading newline: the client fires
 `on_response_complete` inside the final `next()` poll, before the drain loop
 returns. `google/gemma-4-12b-qat` reasons before it answers and the example sets
-no `max_tokens`, which is why both counts reach 1991; the reply text and the
+no `max_tokens`, which is why both counts are this large; the reply text and the
 numbers change with the model.
 
-The two counts agree here because the client counts one token per `Text`,
-`Thinking` and `ToolCall` block. They diverge as soon as the reply carries an
-`ImageBase64` or `ToolResult` block, which count as blocks but not as tokens.
+`completion_tokens` is the server's token count from its final `usage` frame,
+and `blocks` counts what streamed; a delta carries about one token, so the two
+roughly agree for a text-only reply. They diverge as soon as the reply carries
+an `ImageBase64` or `ToolResult` block, which count as blocks but not as
+tokens. A server that reports no usage leaves `completion_tokens` at one per
+`Text`, `Thinking` and `ToolCall` block, and `UnifiedResponse::usage` at `None`.
 
 ## If your plugin answers tool calls
 

@@ -23,6 +23,17 @@
 //! into `pending` in `index` order; subsequent `translate` calls pop them one
 //! at a time. [`openai_compat_stream`] additionally drains `pending` directly
 //! when the frame stream ends, so flushed tool calls are never lost.
+//!
+//! # Token usage
+//!
+//! Every request asks for `stream_options.include_usage`, which OpenAI, vLLM,
+//! LM Studio, llama.cpp's `llama-server`, and DeepSeek all honour: the last
+//! frame before `[DONE]` then carries a `usage` object with the call's real
+//! token counts. Most servers send it as an extra frame whose `choices` array
+//! is empty; DeepSeek puts it on the final `finish_reason` frame instead. The
+//! translator reads `usage` from any frame and keeps the last one it saw (see
+//! [`ChatCompletionTranslator::take_usage`]); the stream publishes it as
+//! response metadata, which becomes [`crate::UnifiedResponse::usage`].
 
 #![cfg(any(
     feature = "provider-openai",
@@ -41,7 +52,7 @@ use tokio_stream::Stream;
 
 use crate::client::{ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
-use crate::request::{ThinkingEffort, ThinkingParams, UnifiedRequest};
+use crate::request::{ThinkingEffort, ThinkingParams, TokenUsage, UnifiedRequest};
 use crate::sse::SseStreamParser;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
 
@@ -63,6 +74,9 @@ pub struct OpenAiCompatConfig {
 ///
 /// `stream` is always `true`: this adapter only produces streaming responses,
 /// and a non-streaming response could not be parsed by the SSE pipeline.
+/// `stream_options.include_usage` is always `true` too, so the server reports
+/// the call's token usage in a final frame (see the
+/// [module docs](crate::provider::openai_compat)).
 /// `temperature`/`max_tokens` are included only when set. `tools` carries
 /// every [`UnifiedRequest::tools`] entry as an OpenAI function tool,
 /// `{"type": "function", "function": {name, description, parameters}}` with
@@ -106,6 +120,10 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
         body.insert("tools".to_string(), serde_json::json!(tools));
     }
     body.insert("stream".to_string(), serde_json::Value::Bool(true));
+    body.insert(
+        "stream_options".to_string(),
+        serde_json::json!({ "include_usage": true }),
+    );
     if let Some(thinking) = &req.thinking {
         if thinking.enabled {
             match req.provider {
@@ -325,6 +343,9 @@ pub struct ChatCompletionTranslator {
     pending: VecDeque<MessageContentBlock>,
     /// Set once `data: [DONE]` was seen; the frame stream is over.
     done: bool,
+    /// The latest `usage` object a frame carried, until
+    /// [`Self::take_usage`] claims it.
+    usage: Option<TokenUsage>,
 }
 
 impl ChatCompletionTranslator {
@@ -334,7 +355,17 @@ impl ChatCompletionTranslator {
             tool_acc: HashMap::new(),
             pending: VecDeque::new(),
             done: false,
+            usage: None,
         }
+    }
+
+    /// Claim the token usage the last `usage`-carrying frame reported,
+    /// leaving the translator with none.
+    ///
+    /// `None` means no frame so far carried a usable `usage` object (one with
+    /// both `prompt_tokens` and `completion_tokens`).
+    pub fn take_usage(&mut self) -> Option<TokenUsage> {
+        self.usage.take()
     }
 
     /// Translate one `data:` payload into at most one block.
@@ -345,8 +376,10 @@ impl ChatCompletionTranslator {
     /// [`MessageContentBlock::Text`], `reasoning_content` becomes
     /// [`MessageContentBlock::Thinking`], and a tool call is emitted once its
     /// argument fragment accumulates to valid JSON, or at a non-null
-    /// `finish_reason`/`[DONE]`, whichever comes first. OpenAI error bodies
-    /// (`{"error":{"message":...}}`) yield [`CucaError::Provider`].
+    /// `finish_reason`/`[DONE]`, whichever comes first. A frame's `usage`
+    /// object (sent on the last frame under `include_usage`) is recorded for
+    /// [`Self::take_usage`] and never becomes a block itself. OpenAI error
+    /// bodies (`{"error":{"message":...}}`) yield [`CucaError::Provider`].
     pub fn translate(&mut self, payload: &str) -> Result<Option<MessageContentBlock>, CucaError> {
         // [DONE] terminates the stream; check it before draining pending so the
         // flushed tool calls surface on subsequent calls and the stream wrapper
@@ -358,6 +391,15 @@ impl ChatCompletionTranslator {
         }
         // Drain pending first: at most one block per call, in completion order.
         if let Some(block) = self.pending.pop_front() {
+            // The usage frame follows `finish_reason` directly, so it can be
+            // the very frame that drains a flushed tool call: still record its
+            // usage. Parsing stays lenient here, as this frame's own deltas
+            // were never read on this path.
+            if let Ok(value) = serde_json::from_str::<serde_json::Value>(payload)
+                && let Some(usage) = token_usage_of(&value)
+            {
+                self.usage = Some(usage);
+            }
             return Ok(Some(block));
         }
 
@@ -373,6 +415,13 @@ impl ChatCompletionTranslator {
             .and_then(|m| m.as_str())
         {
             return Err(CucaError::provider(ProviderEndpoint::OpenAi, message));
+        }
+
+        // `usage` is `null` on ordinary frames and an object on the final
+        // `include_usage` frame; vLLM's `continuous_usage_stats` sends it on
+        // every frame, and the last one is the total.
+        if let Some(usage) = token_usage_of(&value) {
+            self.usage = Some(usage);
         }
 
         let Some(choice) = value
@@ -518,6 +567,29 @@ impl Default for ChatCompletionTranslator {
     }
 }
 
+/// Read an OpenAI-style `usage` object from a chat completion frame.
+///
+/// `None` when the frame has no `usage` object or it lacks either counter, so
+/// "the server reported nothing" never reads as zero. Counts beyond `u32`
+/// saturate. `completion_tokens_details.reasoning_tokens` is optional.
+fn token_usage_of(frame: &serde_json::Value) -> Option<TokenUsage> {
+    let usage = frame.get("usage")?;
+    let counter = |value: Option<&serde_json::Value>| {
+        value
+            .and_then(serde_json::Value::as_u64)
+            .map(|n| u32::try_from(n).unwrap_or(u32::MAX))
+    };
+    Some(TokenUsage {
+        prompt_tokens: counter(usage.get("prompt_tokens"))?,
+        completion_tokens: counter(usage.get("completion_tokens"))?,
+        reasoning_tokens: counter(
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens")),
+        ),
+    })
+}
+
 /// Feed one transport chunk through the SSE parser and translator.
 ///
 /// Pure helper so translation is testable without the network: parses every
@@ -569,6 +641,7 @@ pub async fn openai_compat_stream(
             body,
         });
     }
+    let metadata = ResponseMetadataHandle::empty();
     Ok(ProviderDispatch {
         stream: Box::pin(OpenAiCompatStream {
             inner: Box::pin(response.bytes_stream()),
@@ -576,8 +649,9 @@ pub async fn openai_compat_stream(
             translator: ChatCompletionTranslator::new(),
             buffer: VecDeque::new(),
             ended: false,
+            metadata: metadata.clone(),
         }),
-        metadata: ResponseMetadataHandle::empty(),
+        metadata,
     })
 }
 
@@ -595,6 +669,8 @@ struct OpenAiCompatStream {
     /// True once `[DONE]` was seen or the byte stream ended; the stream then
     /// emits only what is left in `buffer`/`pending`.
     ended: bool,
+    /// Publishes the reported token usage to the dispatch caller.
+    metadata: ResponseMetadataHandle,
 }
 
 impl Stream for OpenAiCompatStream {
@@ -615,6 +691,11 @@ impl Stream for OpenAiCompatStream {
                         Ok(blocks) => {
                             for block in blocks.into_iter().flatten() {
                                 this.buffer.push_back(block);
+                            }
+                            // A `usage` frame becomes response metadata,
+                            // never a content block.
+                            if let Some(usage) = this.translator.take_usage() {
+                                this.metadata.set_token_usage(usage);
                             }
                             if this.translator.done {
                                 // [DONE] ended the frame stream; emit any tool
@@ -687,6 +768,27 @@ mod tests {
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn build_body_always_requests_stream_usage() {
+        for provider in [
+            ProviderEndpoint::OpenAi,
+            ProviderEndpoint::Vllm,
+            ProviderEndpoint::LmStudio,
+            ProviderEndpoint::LlamaCpp,
+            ProviderEndpoint::DeepSeek,
+        ] {
+            let mut req = UnifiedRequest::new("m").add_user_message("hi");
+            req.provider = provider.clone();
+            let body = build_chat_completion_body(&req);
+
+            assert_eq!(
+                body["stream_options"],
+                json!({ "include_usage": true }),
+                "{provider} must ask for the usage frame"
+            );
+        }
     }
 
     #[test]
@@ -1145,6 +1247,114 @@ mod tests {
         }
     }
 
+    /// The `include_usage` final frame, verbatim from LM Studio: empty
+    /// `choices`, a `usage` object with reasoning details.
+    const LMSTUDIO_USAGE_FRAME: &str = r#"{"id":"chatcmpl-s922lylhmdkzh85dos5vt","object":"chat.completion.chunk","created":1791114975,"model":"google/gemma-4-e2b","system_fingerprint":"google/gemma-4-e2b","choices":[],"usage":{"prompt_tokens":15,"completion_tokens":4,"total_tokens":19,"completion_tokens_details":{"reasoning_tokens":0}}}"#;
+
+    #[test]
+    fn translate_usage_frame_records_usage_and_yields_no_block() {
+        let mut translator = ChatCompletionTranslator::new();
+        assert_eq!(translator.take_usage(), None);
+
+        let block = translator.translate(LMSTUDIO_USAGE_FRAME).unwrap();
+
+        assert!(block.is_none());
+        assert_eq!(
+            translator.take_usage(),
+            Some(TokenUsage {
+                prompt_tokens: 15,
+                completion_tokens: 4,
+                reasoning_tokens: Some(0),
+            })
+        );
+        assert_eq!(
+            translator.take_usage(),
+            None,
+            "taking the usage leaves the translator empty"
+        );
+    }
+
+    /// DeepSeek sends no usage-only frame: `usage` rides on the final
+    /// `finish_reason` frame, whose one choice carries no content.
+    #[test]
+    fn translate_usage_on_the_finish_reason_frame() {
+        let mut translator = ChatCompletionTranslator::new();
+        let block = translator
+            .translate(r#"{"choices":[{"index":0,"delta":{"content":""},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":30,"total_tokens":41,"completion_tokens_details":{"reasoning_tokens":22}}}"#)
+            .unwrap();
+        assert!(block.is_none());
+        assert_eq!(
+            translator.take_usage(),
+            Some(TokenUsage {
+                prompt_tokens: 11,
+                completion_tokens: 30,
+                reasoning_tokens: Some(22),
+            })
+        );
+    }
+
+    #[test]
+    fn translate_usage_without_details_has_no_reasoning_tokens() {
+        let mut translator = ChatCompletionTranslator::new();
+        translator
+            .translate(r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":12,"total_tokens":21}}"#)
+            .unwrap();
+        assert_eq!(
+            translator.take_usage(),
+            Some(TokenUsage {
+                prompt_tokens: 9,
+                completion_tokens: 12,
+                reasoning_tokens: None,
+            })
+        );
+    }
+
+    #[test]
+    fn translate_ignores_null_or_incomplete_usage() {
+        for frame in [
+            r#"{"choices":[{"delta":{"content":"Hi"}}],"usage":null}"#,
+            r#"{"choices":[{"delta":{"content":"Hi"}}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":3}}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":"3","completion_tokens":1}}"#,
+        ] {
+            let mut translator = ChatCompletionTranslator::new();
+            translator.translate(frame).unwrap();
+            assert_eq!(
+                translator.take_usage(),
+                None,
+                "no usage reported for {frame}"
+            );
+        }
+    }
+
+    #[test]
+    fn translate_usage_frame_that_drains_a_flushed_tool_call_still_records_usage() {
+        let mut translator = ChatCompletionTranslator::new();
+        translator
+            .translate(r#"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","type":"function","function":{"name":"f","arguments":"{\"a\""}}]}}]}"#)
+            .unwrap();
+        // finish_reason flushes the still-incomplete call into pending.
+        assert!(
+            translator
+                .translate(r#"{"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#)
+                .unwrap()
+                .is_none()
+        );
+        // The usage frame is the one that drains it.
+        let block = translator
+            .translate(r#"{"choices":[],"usage":{"prompt_tokens":20,"completion_tokens":7}}"#)
+            .unwrap();
+        assert!(matches!(block, Some(MessageContentBlock::ToolCall { .. })));
+        assert_eq!(
+            translator.take_usage(),
+            Some(TokenUsage {
+                prompt_tokens: 20,
+                completion_tokens: 7,
+                reasoning_tokens: None,
+            })
+        );
+    }
+
     /// Feed every frame in `chunks` through a fresh parser/translator pair and
     /// return the emitted blocks, draining the pending queue afterwards.
     fn collect_blocks(chunks: &[&[u8]]) -> Vec<MessageContentBlock> {
@@ -1204,6 +1414,33 @@ mod tests {
                     arguments: json!({ "a": 1 }),
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn translate_sse_usage_frame_leaves_blocks_unchanged_and_reports_usage() {
+        let wire = format!(
+            "data: {}\n\ndata: {}\n\ndata: {LMSTUDIO_USAGE_FRAME}\n\ndata: [DONE]\n\n",
+            r#"{"choices":[{"delta":{"content":"Hello"}}],"usage":null}"#,
+            r#"{"choices":[{"delta":{},"finish_reason":"stop"}],"usage":null}"#,
+        );
+        let mut parser = SseStreamParser::new();
+        let mut translator = ChatCompletionTranslator::new();
+
+        let blocks = translate_sse(&mut parser, &mut translator, wire.as_bytes()).unwrap();
+
+        assert_eq!(
+            blocks.into_iter().flatten().collect::<Vec<_>>(),
+            vec![MessageContentBlock::Text("Hello".into())]
+        );
+        assert!(translator.done);
+        assert_eq!(
+            translator.take_usage(),
+            Some(TokenUsage {
+                prompt_tokens: 15,
+                completion_tokens: 4,
+                reasoning_tokens: Some(0),
+            })
         );
     }
 }

@@ -236,6 +236,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             content: Vec::new(),
             prompt_cache_usage: None,
+            usage: None,
         };
         plugin
             .on_response_complete(&res)

@@ -945,7 +945,7 @@ impl Stream for AnthropicStream {
                             // `message_start` usage becomes response
                             // metadata, never a content block.
                             if let Some(usage) = this.translator.take_prompt_cache_usage() {
-                                this.metadata.set(usage);
+                                this.metadata.set_prompt_cache_usage(usage);
                             }
                             if this.translator.done {
                                 // message_stop ended the frame stream; emit

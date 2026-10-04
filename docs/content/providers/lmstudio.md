@@ -86,7 +86,7 @@ blocks: 2 text, 67 thinking
 
 ## Shared adapter
 
-This provider shares the [OpenAI](@/providers/openai.md)-compatible request builder and SSE translator in full. LM Studio can emit `reasoning_content` for reasoning models, which flows into `Thinking` blocks through the same translation. See the OpenAI page for the request body shape, the tool-call accumulation rules, and the thinking effort mapping.
+This provider shares the [OpenAI](@/providers/openai.md)-compatible request builder and SSE translator in full. LM Studio can emit `reasoning_content` for reasoning models, which flows into `Thinking` blocks through the same translation. LM Studio honours `stream_options.include_usage`, so every response carries its real token usage in `UnifiedResponse::usage`, reasoning tokens included. See the OpenAI page for the request body shape, the tool-call accumulation rules, the token usage frame, and the thinking effort mapping.
 
 ## Base URL deviation
 

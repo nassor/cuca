@@ -42,15 +42,15 @@ Available in every build that compiles at all.
 
 | Group | Items |
 |---|---|
-| Client | `CucaClient`, `CucaClientBuilder` |
+| Client | `CucaClient`, `CucaClientBuilder`, `ResponseHandle` |
 | Errors | `CucaError`, `PluginError` |
-| Request and response | `AgentResponseStream`, `PromptCacheBreakpoint`, `PromptCacheDirective`, `PromptCacheUsage`, `ThinkingConfig`, `ThinkingEffort`, `ThinkingParams`, `UnifiedRequest`, `UnifiedResponse` |
+| Request and response | `AgentResponseStream`, `PromptCacheBreakpoint`, `PromptCacheDirective`, `PromptCacheUsage`, `ThinkingConfig`, `ThinkingEffort`, `ThinkingParams`, `TokenUsage`, `UnifiedRequest`, `UnifiedResponse` |
 | Session | `SessionEvent`, `SessionRecord` |
 
 `PromptCacheBreakpoint`, `PromptCacheDirective` and `PromptCacheUsage` are
 ungated even though `service-prompt-cache` is not: they are fields of
 `UnifiedRequest` and `UnifiedResponse`, so they exist wherever those do. The
-cache itself is gated.
+cache itself is gated. `TokenUsage` is ungated for the same reason.
 
 Types reachable through `cuca::types` rather than the crate root:
 `MessageContentBlock`, `MessageRole`, `ProviderEndpoint`, `ToolDefinition`,
@@ -127,6 +127,7 @@ wins. `with_prompt_cache_service` takes precedence over
 | `api_key` | none |
 | `plugins` | none |
 | `generate_stream` | none |
+| `generate_stream_with_response` | none |
 | `bearer_token` | `provider-anthropic` |
 | `oauth_config` | `provider-anthropic` |
 | `llamacpp_config` | `provider-llamacpp` |

@@ -63,10 +63,13 @@ CUCA most commonly refers to either the Credit Union of Central Alabama or the C
 [example-block-counter] model=google/gemma-4-12b-qat duration=81.89s completion_tokens=1991 blocks=1991
 ```
 
-The two counts agree because the client counts one token per `Text`, `Thinking`
-and `ToolCall` block, and both reach 1991 because the example sets no
-`max_tokens` and this model reasons before it answers. `prompt_tokens` stays
-`0`: no adapter populates it.
+`completion_tokens` and `prompt_tokens` are the server's own counts: the chat
+route asks for `stream_options.include_usage`, and llama-server answers with a
+final `usage` frame. A streamed delta carries about one token, so the two
+numbers on the line roughly agree; both are this large because the example sets
+no `max_tokens` and this model reasons before it answers. A server that reports
+no usage leaves `prompt_tokens` at `0` and `completion_tokens` counting one per
+`Text`, `Thinking` and `ToolCall` block.
 
 To write your own, see [Write a custom plugin](@/guides/custom-plugin.md).
 

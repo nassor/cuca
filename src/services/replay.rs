@@ -715,6 +715,7 @@ impl ReplayTurn {
             finish_reason: None,
             content: self.blocks.clone(),
             prompt_cache_usage: None,
+            usage: None,
         }
     }
 

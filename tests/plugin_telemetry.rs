@@ -88,6 +88,7 @@ fn on_response_complete_records_latency_and_usage() {
         finish_reason: Some("stop".into()),
         content: Vec::new(),
         prompt_cache_usage: None,
+        usage: None,
     };
     plugin
         .on_response_complete(&res)

@@ -54,6 +54,7 @@ fn hooks_record_system_output_and_usage_events() {
         finish_reason: Some("stop".into()),
         content: Vec::new(),
         prompt_cache_usage: None,
+        usage: None,
     };
     plugin
         .on_response_complete(&res)
@@ -202,6 +203,7 @@ fn file_backend_persists_hook_records_across_plugin_instances() {
             finish_reason: Some("stop".into()),
             content: Vec::new(),
             prompt_cache_usage: None,
+            usage: None,
         };
         plugin
             .on_response_complete(&res)

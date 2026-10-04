@@ -1597,6 +1597,7 @@ mod tests {
             finish_reason: Some("stop".into()),
             content: Vec::new(),
             prompt_cache_usage: None,
+            usage: None,
         };
         plugin.on_response_complete(&res).unwrap();
 
@@ -1788,6 +1789,7 @@ mod tests {
             finish_reason: None,
             content: Vec::new(),
             prompt_cache_usage: None,
+            usage: None,
         };
         assert!(plugin.on_response_complete(&res).is_err());
     }
