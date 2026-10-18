@@ -1,6 +1,6 @@
 +++
 title = "Providers"
-description = "Seven provider adapters, three wire protocols, one dispatch match. Default base URLs, auth headers and routes for all of them."
+description = "Eight provider adapters, seven HTTP ones over three wire protocols and one in-process engine, one dispatch match. Default base URLs, auth headers and routes for all of them."
 template = "section.html"
 sort_by = "weight"
 
@@ -10,14 +10,14 @@ kicker = "Reference"
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Seven <code>provider-*</code> features, each owning one <code>dispatch_*</code> method and one <code>ProviderEndpoint</code> variant</dd>
+<dd>Eight <code>provider-*</code> features, each owning one <code>dispatch_*</code> method and one <code>ProviderEndpoint</code> variant</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature enabled; the crate does not compile without one</dd>
 <dt>Read this if</dt>
 <dd>You need a base URL, an auth header, a route, or the exact behavior one adapter does not share with the others</dd>
 </dl>
 
-## The seven adapters
+## The seven HTTP adapters
 
 | Feature | `ProviderEndpoint` | Default base URL | Auth header | Route |
 |---|---|---|---|---|
@@ -33,6 +33,10 @@ Every feature in the table enables `reqwest` with its `rustls` backend and
 `tokio-stream`. `provider-anthropic` additionally enables `sha2`, `getrandom`
 and `base64` for its OAuth PKCE surface. The full dependency mapping is
 [The feature matrix](@/reference/features.md).
+
+## The in-process adapter
+
+[`provider-local`](@/providers/local.md) is the eighth adapter and the only one without a base URL, an auth header or a route: its `ProviderEndpoint` variant, `Local`, runs Gemma 4 E2B on the CPU inside your process, in pure Rust, with no HTTP endpoint. It does not use `tokio-stream`; it uses `reqwest` only for the one-time model download from Hugging Face. The model is attached with `CucaClientBuilder::with_local_model`.
 
 ## Three wire protocols, two shared modules
 
@@ -68,9 +72,9 @@ pub(crate) async fn dispatch_<provider>(
 has a mirrored `#[cfg(not(feature = ...))]` counterpart returning
 `CucaError::ProviderNotEnabled` with the missing flag name.
 
-## The eighth variant
+## The ninth variant
 
-`ProviderEndpoint` has an eighth variant, `Custom(String)`, which is not gated
+`ProviderEndpoint` has nine variants, but only eight have adapters. The ninth is `Custom(String)`, which is not gated
 by any feature and has no adapter. Dispatching it always returns:
 
 ```text,name=CucaError::Config from the Custom arm
@@ -81,11 +85,16 @@ The default value of `ProviderEndpoint` is `OpenAi`. `UnifiedRequest::new` sets
 the field to `Custom(String::new())`, which `generate_stream` then overwrites
 with the client's own selected provider before any hook runs.
 
-## No provider reads the environment
+## Where providers read the environment
 
-No file under `src/provider/` reads an environment variable. Base URLs, API keys
-and bearer tokens reach an adapter only through `CucaClientBuilder`. The three
-`CUCA_*` variables that exist belong to the examples and the test harness, and
-are listed in [Environment variables](@/reference/environment.md).
+None of the seven HTTP adapters reads an environment variable. Base URLs, API keys
+and bearer tokens reach them only through `CucaClientBuilder`. The three
+`CUCA_*` variables that belong to the examples and the test harness are listed in
+[Environment variables](@/reference/environment.md).
+
+`provider-local` is the exception, and only as a fallback: when
+`LocalModelConfig::cache_dir` is `None` it reads `CUCA_CACHE_DIR` and then the
+platform's cache variables, and when `LocalModelConfig::hf_token` is `None` it
+reads `HF_TOKEN`. Setting the config fields keeps it from reading either.
 
 ## Per-provider pages

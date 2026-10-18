@@ -1,6 +1,6 @@
 base_url = "https://nassor.github.io/cuca"
 title = "CUCA Documentation"
-description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, seven provider adapters."
+description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, eight provider adapters."
 default_language = "en"
 compile_sass = false
 build_search_index = false
@@ -91,6 +91,9 @@ path = "@/providers/vllm.md"
 [[extra.nav.items.children]]
 title = "LM Studio"
 path = "@/providers/lmstudio.md"
+[[extra.nav.items.children]]
+title = "Local (in-process)"
+path = "@/providers/local.md"
 
 [[extra.nav]]
 label = "Plugins"

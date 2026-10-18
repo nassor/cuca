@@ -11,6 +11,7 @@
     feature = "provider-llamacpp",
     feature = "provider-vllm",
     feature = "provider-lmstudio",
+    feature = "provider-local",
 )))]
 compile_error!("CUCA requires one provider-* feature; enable the adapter for the backend you use.");
 
@@ -113,6 +114,11 @@ pub use crate::plugins::telemetry::OpenTelemetryPlugin;
 #[cfg(feature = "plugin-web-search")]
 pub use crate::plugins::web_search::{
     SearchResult, WebSearchConfig, WebSearchPlugin, WebSearchProvider,
+};
+#[cfg(feature = "provider-local")]
+pub use crate::provider::local::{
+    DownloadProgress, DownloadProgressCallback, LocalModel, LocalModelConfig, ModelSource,
+    SamplingConfig,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,

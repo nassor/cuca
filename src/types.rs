@@ -24,6 +24,8 @@ pub enum ProviderEndpoint {
     GoogleGemini,
     /// DeepSeek API.
     DeepSeek,
+    /// In-process local model (`provider-local`).
+    Local,
     /// A bespoke gateway, identified by its opaque key.
     Custom(String),
 }
@@ -48,6 +50,7 @@ impl std::fmt::Display for ProviderEndpoint {
             ProviderEndpoint::Anthropic => "anthropic",
             ProviderEndpoint::GoogleGemini => "gemini",
             ProviderEndpoint::DeepSeek => "deepseek",
+            ProviderEndpoint::Local => "local",
             ProviderEndpoint::Custom(inner) => inner.as_str(),
         };
         f.write_str(s)
@@ -228,6 +231,7 @@ mod tests {
             (ProviderEndpoint::Anthropic, json!("anthropic")),
             (ProviderEndpoint::GoogleGemini, json!("google_gemini")),
             (ProviderEndpoint::DeepSeek, json!("deep_seek")),
+            (ProviderEndpoint::Local, json!("local")),
             // A newtype variant serializes under its variant name as the map key, so
             // `Custom("my-gateway")` becomes `{"custom": "my-gateway"}`.
             (
@@ -299,6 +303,7 @@ mod tests {
             (ProviderEndpoint::Anthropic, "anthropic"),
             (ProviderEndpoint::GoogleGemini, "gemini"),
             (ProviderEndpoint::DeepSeek, "deepseek"),
+            (ProviderEndpoint::Local, "local"),
             (ProviderEndpoint::Custom("my-gateway".into()), "my-gateway"),
         ];
         for (endpoint, expected) in cases {

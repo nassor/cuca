@@ -62,6 +62,7 @@ Types reachable through `cuca::types` rather than the crate root:
 
 | Gate | Items |
 |---|---|
+| `provider-local` | `DownloadProgress`, `DownloadProgressCallback`, `LocalModel`, `LocalModelConfig`, `ModelSource`, `SamplingConfig` |
 | `plugin-cost` | `CostConfig`, `CostEntry`, `CostObserver`, `CostPlugin`, `CostUsage`, `ModelRates`, `PricingResolver`, `PricingTable`, `UnpricedModelPolicy` |
 | `plugin-guardrails` | `JsonGuardrailPlugin` |
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |
@@ -106,6 +107,7 @@ re-exported at the crate root.
 | `with_api_key` | none |
 | `with_bearer_token` | `provider-anthropic` |
 | `with_anthropic_oauth` | `provider-anthropic` |
+| `with_local_model` | `provider-local` |
 | `register_plugin` | none |
 | `with_orchestrator` | `service-speculative` |
 | `with_prompt_cache_config` | `service-prompt-cache` |
@@ -131,6 +133,7 @@ wins. `with_prompt_cache_service` takes precedence over
 | `bearer_token` | `provider-anthropic` |
 | `oauth_config` | `provider-anthropic` |
 | `llamacpp_config` | `provider-llamacpp` |
+| `local_model` | `provider-local` |
 | `orchestrator` | `service-speculative` |
 | `prompt_cache` | `service-prompt-cache` |
 | `prompt_cache_snapshot` | `service-prompt-cache` |

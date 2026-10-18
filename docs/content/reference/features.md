@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twenty-five features, all opt-in: seven providers, twelve plugins, six services</dd>
+<dd>Twenty-six features, all opt-in: eight providers, twelve plugins, six services</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -25,7 +25,7 @@ weight = 1
 CUCA requires one provider-* feature; enable the adapter for the backend you use.
 ```
 
-The gate is `#[cfg(not(any(...)))]` over all seven provider features. CI asserts
+The gate is `#[cfg(not(any(...)))]` over all eight provider features. CI asserts
 that `cargo check --no-default-features` fails.
 
 ## Provider features
@@ -39,6 +39,7 @@ that `cargo check --no-default-features` fails.
 | `provider-llamacpp` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-vllm` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-lmstudio` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
+| `provider-local` | `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:tokio`, `reqwest/rustls` |
 
 ## Plugin features
 
@@ -95,10 +96,10 @@ wire types, the SSE parser and the response stream contract.
 
 | Crate | Version requirement | Declared features | Owned by |
 |---|---|---|---|
-| `reqwest` | `0.13` | `json`, `stream`, `form`; `default-features = false` | all seven `provider-*`, `plugin-web-search` |
-| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; `default-features = false` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit` |
-| `tokio-stream` | `0.1` | default | all seven `provider-*`, `service-speculative` |
-| `sha2` | `0.11` | default | `provider-anthropic`, `service-prompt-cache` |
+| `reqwest` | `0.13` | `json`, `stream`, `form`; `default-features = false` | all eight `provider-*`, `plugin-web-search` |
+| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; `default-features = false` | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit` |
+| `tokio-stream` | `0.1` | default | the seven HTTP `provider-*` (not `provider-local`), `service-speculative` |
+| `sha2` | `0.11` | default | `provider-anthropic`, `provider-local`, `service-prompt-cache` |
 | `getrandom` | `0.4` | default | `provider-anthropic` |
 | `base64` | `0.23` | none | `provider-anthropic`, `plugin-sandbox` |
 | `rmcp` | `3` | `client`, `transport-child-process`, `transport-streamable-http-client-reqwest` | `plugin-mcp` |
@@ -110,10 +111,17 @@ wire types, the SSE parser and the response stream contract.
 | `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
 | `postcard` | `1` | `use-std`; `default-features = false` | `plugin-session-log`, `service-prompt-cache` |
 | `wide` | `1.7` | default | `service-vector-store` |
+| `candle-core` | `0.9.2` | `default-features = false` | `provider-local` |
+| `candle-nn` | `0.9.2` | `default-features = false` | `provider-local` |
+| `half` | `2` | default | `provider-local` |
+| `minijinja` | `2.24` | `loader` | `provider-local` |
+| `minijinja-contrib` | `2.24` | `pycompat` | `provider-local` |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only
 through the `reqwest/rustls` entry that every provider feature and
-`plugin-web-search` carries. `jsonschema` is declared with
+`plugin-web-search` carries. `candle-core` and `candle-nn` are pinned to 0.9.x
+because 0.10 and 0.11 hard-depend on `tokenizers[onig]`, which compiles C.
+`jsonschema` is declared with
 `default-features = false` because guardrails compiles inline schemas only and
 needs no `$ref` retrieval. `postcard` is declared with
 `default-features = false` because its default `heapless-cas` feature pulls in

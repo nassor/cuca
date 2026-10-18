@@ -34,7 +34,7 @@ Nine variants. `#[derive(Debug, Clone)]`. No variant is feature-gated.
 
 The `provider` field in `Provider` formats through `ProviderEndpoint`'s
 `Display`, whose labels differ from its serde names: `llamacpp`, `vllm`,
-`lmstudio`, `openai`, `anthropic`, `gemini`, `deepseek`, and the inner string for
+`lmstudio`, `openai`, `anthropic`, `gemini`, `deepseek`, `local`, and the inner string for
 `Custom`.
 
 `CucaError::provider(endpoint, msg)` constructs the `Provider` variant.
@@ -92,7 +92,7 @@ always `None`.
 | `From<serde_json::Error> for CucaError` | `CucaError::Json { message }` | none |
 | `From<std::io::Error> for CucaError` | `CucaError::Io { message }` | none |
 | `From<std::io::Error> for PluginError` | `PluginError::Io(msg)` | none |
-| `From<reqwest::Error> for CucaError` | `CucaError::Transport { message }` | any of the seven `provider-*` features |
+| `From<reqwest::Error> for CucaError` | `CucaError::Transport { message }` | any of the eight `provider-*` features |
 
 The `reqwest` conversion is the only feature-gated item in `src/error.rs`. It
 formats through `Display` because `reqwest::Error` is not `Clone` and

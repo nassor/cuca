@@ -95,11 +95,11 @@ than accidentally:
 
 | Crate | Enabled by |
 |---|---|
-| `reqwest` with `rustls` | all seven `provider-*` features, and `plugin-web-search` |
-| `tokio` | `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit` |
+| `reqwest` with `rustls` | all eight `provider-*` features, and `plugin-web-search` |
+| `tokio` | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit` |
 | `tracing` | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
 | `base64` | `provider-anthropic`, `plugin-sandbox` |
-| `sha2` | `provider-anthropic`, `service-prompt-cache` |
+| `sha2` | `provider-anthropic`, `provider-local`, `service-prompt-cache` |
 | `tiktoken-rs` | `plugin-memory`, `plugin-cost` |
 
 `plugin-web-search` enabling `reqwest/rustls` itself is what lets it run HTTPS

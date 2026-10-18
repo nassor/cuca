@@ -17,6 +17,8 @@
   route and the speculative orchestrator, the block-count fallback stays and
   `usage` is `None`. `plugin-telemetry` and `plugin-session-log` now record the
   real counts; `CostPlugin` still uses its tiktoken estimates.
+- `ProviderEndpoint` has a new variant, `Local`. An exhaustive `match` on
+  `ProviderEndpoint` must add an arm for it.
 
 ### Added
 
@@ -35,6 +37,18 @@
 - `UnifiedRequest::tools` reaches the wire in every provider adapter
   (OpenAI-compatible `tools`, Anthropic `tools`, Gemini
   `functionDeclarations`), without a tool-choice override.
+- `provider-local`: Gemma 4 E2B (Q4_0 GGUF) runs in-process on the CPU in pure
+  Rust through candle, with no HTTP endpoint and no llama.cpp.
+  `LocalModel::load(LocalModelConfig)` downloads the pinned model into a cache
+  directory (resumable, SHA-256-verified) or opens a GGUF file; attach it with
+  `CucaClientBuilder::with_local_model` and select `ProviderEndpoint::Local`.
+  New public items: `LocalModel`, `LocalModelConfig`, `ModelSource`,
+  `SamplingConfig`, `DownloadProgress`, `DownloadProgressCallback`,
+  `CucaClient::local_model`. The engine is a single slot with a bounded queue,
+  reuses the K/V cache across requests that share a prefix, is text-only, and
+  reports exact token usage. See `examples/local_gemma.rs` and
+  `tests/provider_local.rs`; build with `RUSTFLAGS="-C target-cpu=native"` for
+  candle's SIMD kernels.
 
 ### Fixed
 

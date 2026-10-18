@@ -1,6 +1,6 @@
 +++
 title = "Environment variables"
-description = "Three variables, all belonging to the examples and the test harness. No file under src/ reads the environment."
+description = "Three variables for the examples and the test harness, plus the provider-local variables. Only provider-local reads the environment, and only as a fallback."
 template = "page.html"
 weight = 3
 +++
@@ -9,23 +9,26 @@ weight = 3
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Three variables, all read by <code>examples/</code> and <code>tests/</code>; the library itself reads none</dd>
+<dd>Three variables read by <code>examples/</code> and <code>tests/</code>, plus the <code>provider-local</code> variables; the library reads the environment only in <code>provider-local</code>, as a fallback</dd>
 <dt>You need</dt>
 <dd>Nothing; every variable has a default or a documented fallback</dd>
 <dt>Read this if</dt>
 <dd>You are pointing an example or the test suite somewhere other than a local llama.cpp server</dd>
 </dl>
 
-## The library reads none
+## The library reads the environment only in `provider-local`
 
-No file under `src/` reads an environment variable. Base URLs, API keys and
+No HTTP adapter reads an environment variable. Base URLs, API keys and
 bearer tokens reach the client only through `CucaClientBuilder`. The three
-`std::env` calls that exist in `src/` are `std::env::temp_dir()` inside test
+`std::env` calls that exist in `src/` outside `provider-local` are `std::env::temp_dir()` inside test
 modules of `plugin-guardrails`, `plugin-session-log` and `plugin-skills`, and
 none of them reads a variable.
 
 A library that read `OPENAI_API_KEY` from the process environment would make
-credential resolution invisible to its caller. Configuration is passed in.
+credential resolution invisible to its caller. Configuration is passed in. The
+one exception is `provider-local`, which reads `CUCA_CACHE_DIR`, `HF_TOKEN` and
+the platform's cache variables, only when the matching `LocalModelConfig` field
+(`cache_dir`, `hf_token`) is `None`; see [Local](@/providers/local.md).
 
 ## The three variables
 
@@ -93,6 +96,22 @@ behave as unset.
 Skip lines are written with `eprintln!`, which libtest captures, so they are
 invisible without `--nocapture`. See
 [Run the live integration suite](@/guides/integration-tests.md).
+
+## The `provider-local` variables
+
+| Variable | Read by | Effect |
+|---|---|---|
+| `CUCA_CACHE_DIR` | the library (`LocalModelConfig::cache_dir` is `None`), the example, the live tests | the model download cache directory, used as given |
+| `HF_TOKEN` | the library (`LocalModelConfig::hf_token` is `None`), the example | Hugging Face bearer token; the pinned model downloads anonymously |
+| `CUCA_LOCAL_MODEL_PATH` | `examples/local_gemma.rs`, `tests/provider_local.rs` | path of an existing GGUF file; skips the download |
+| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs` | `1` downloads the pinned model into the cache for the test run |
+
+When `CUCA_CACHE_DIR` is unset, the cache directory is `%LOCALAPPDATA%\cuca` on
+Windows (falling back to `%USERPROFILE%\AppData\Local\cuca`),
+`$HOME/Library/Caches/cuca` on macOS, and `$XDG_CACHE_HOME/cuca` (falling back to
+`$HOME/.cache/cuca`) elsewhere. With none of them set, `LocalModel::load` fails
+with a configuration error. `CUCA_REQUIRE_LIVE=1` also turns the local tests'
+`SKIP: local model not available: ...` into a panic.
 
 ## Setting them
 

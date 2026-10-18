@@ -54,3 +54,7 @@ pub(crate) mod gemini;
 /// frames.
 #[cfg(feature = "provider-llamacpp")]
 pub(crate) mod llamacpp;
+
+/// In-process Gemma 4 engine: model download, GGUF load, tokenizer, chat template, and generation on a dedicated thread.
+#[cfg(feature = "provider-local")]
+pub(crate) mod local;

@@ -26,7 +26,8 @@
 //!    entry after a fully successful completion.
 //!
 //! Token accounting: when the provider reports usage (the OpenAI-compatible
-//! adapters ask for it with `stream_options.include_usage`),
+//! adapters ask for it with `stream_options.include_usage`; the in-process
+//! `provider-local` engine always reports exact counts),
 //! `prompt_tokens`/`completion_tokens` are the provider's counts and
 //! [`UnifiedResponse::usage`] is `Some`. Otherwise `completion_tokens` counts
 //! one per `Text`, `Thinking`, and `ToolCall` block and `prompt_tokens` stays
@@ -45,6 +46,8 @@ use crate::plugin::CucaPlugin;
 use crate::provider::anthropic::OAuthPkceConfig;
 #[cfg(feature = "provider-llamacpp")]
 use crate::provider::llamacpp::LlamaCppConfig;
+#[cfg(feature = "provider-local")]
+use crate::provider::local::{LocalModel, MODEL_REQUIRED};
 use crate::request::{
     AgentResponseStream, PromptCacheUsage, TokenUsage, UnifiedRequest, UnifiedResponse,
 };
@@ -104,14 +107,20 @@ impl ResponseMetadataHandle {
     ///
     /// Called by the Anthropic SSE stream translator once it decodes
     /// `message_start` usage, so by `provider-anthropic` and by
-    /// `provider-deepseek`, whose bridge reuses that translator. Every other
-    /// adapter never calls this, so a build with neither feature never calls
-    /// it either.
+    /// `provider-deepseek`, whose bridge reuses that translator, and by the
+    /// `provider-local` engine after prefill. Every other
+    /// adapter never calls this, so a build with none of those features never
+    /// calls it either.
     #[cfg_attr(
-        not(any(test, feature = "provider-anthropic", feature = "provider-deepseek")),
+        not(any(
+            test,
+            feature = "provider-anthropic",
+            feature = "provider-deepseek",
+            feature = "provider-local",
+        )),
         expect(
             dead_code,
-            reason = "only the Anthropic translator records prompt-cache usage"
+            reason = "only the Anthropic translator and the local engine record prompt-cache usage"
         )
     )]
     pub(crate) fn set_prompt_cache_usage(&self, usage: PromptCacheUsage) {
@@ -124,7 +133,8 @@ impl ResponseMetadataHandle {
     ///
     /// A poisoned lock silently drops the update, as for
     /// [`Self::set_prompt_cache_usage`]. Called by the OpenAI-compatible
-    /// stream once its translator decodes a `usage` object.
+    /// stream once its translator decodes a `usage` object, and by the
+    /// `provider-local` engine once generation ends.
     #[cfg_attr(
         not(any(
             test,
@@ -133,10 +143,11 @@ impl ResponseMetadataHandle {
             feature = "provider-lmstudio",
             feature = "provider-deepseek",
             feature = "provider-llamacpp",
+            feature = "provider-local",
         )),
         expect(
             dead_code,
-            reason = "only the OpenAI-compatible translator records token usage"
+            reason = "only the OpenAI-compatible translator and the local engine record token usage"
         )
     )]
     pub(crate) fn set_token_usage(&self, usage: TokenUsage) {
@@ -234,6 +245,8 @@ pub struct CucaClientBuilder {
     plugins: Vec<Arc<dyn CucaPlugin>>,
     #[cfg(feature = "provider-llamacpp")]
     llamacpp_config: Option<LlamaCppConfig>,
+    #[cfg(feature = "provider-local")]
+    local_model: Option<LocalModel>,
     #[cfg(feature = "service-speculative")]
     orchestrator: Option<ModelOrchestrator>,
     #[cfg(feature = "service-prompt-cache")]
@@ -256,6 +269,8 @@ impl CucaClientBuilder {
             plugins: Vec::new(),
             #[cfg(feature = "provider-llamacpp")]
             llamacpp_config: None,
+            #[cfg(feature = "provider-local")]
+            local_model: None,
             #[cfg(feature = "service-speculative")]
             orchestrator: None,
             #[cfg(feature = "service-prompt-cache")]
@@ -272,6 +287,17 @@ impl CucaClientBuilder {
     #[cfg(feature = "provider-llamacpp")]
     pub fn with_llamacpp_config(mut self, config: LlamaCppConfig) -> Self {
         self.llamacpp_config = Some(config);
+        self
+    }
+
+    /// Attach the in-process model [`ProviderEndpoint::Local`] requests run
+    /// on. Required when the selected provider is `Local`; [`Self::build`]
+    /// fails without it. Cheap to call repeatedly with clones of one
+    /// [`LocalModel`]: every client built from clones shares the one engine
+    /// thread and its single-slot queue.
+    #[cfg(feature = "provider-local")]
+    pub fn with_local_model(mut self, model: LocalModel) -> Self {
+        self.local_model = Some(model);
         self
     }
 
@@ -370,6 +396,10 @@ impl CucaClientBuilder {
         let selected_provider = self.provider.ok_or_else(|| {
             CucaError::Config("no provider selected; call with_provider before build".into())
         })?;
+        #[cfg(feature = "provider-local")]
+        if selected_provider == ProviderEndpoint::Local && self.local_model.is_none() {
+            return Err(CucaError::Config(MODEL_REQUIRED.into()));
+        }
         #[cfg(feature = "service-prompt-cache")]
         let prompt_cache = match self.prompt_cache_service {
             Some(service) => Some(service),
@@ -400,6 +430,8 @@ impl CucaClientBuilder {
             http_client: reqwest::Client::new(),
             #[cfg(feature = "provider-llamacpp")]
             llamacpp_config: self.llamacpp_config,
+            #[cfg(feature = "provider-local")]
+            local_model: self.local_model,
             #[cfg(feature = "service-speculative")]
             orchestrator: self.orchestrator,
             plugins: self.plugins.into(),
@@ -444,6 +476,8 @@ pub struct CucaClient {
     plugins: Arc<[Arc<dyn CucaPlugin>]>,
     #[cfg(feature = "provider-llamacpp")]
     llamacpp_config: Option<LlamaCppConfig>,
+    #[cfg(feature = "provider-local")]
+    local_model: Option<LocalModel>,
     #[cfg(feature = "service-speculative")]
     orchestrator: Option<ModelOrchestrator>,
     #[cfg(feature = "service-prompt-cache")]
@@ -492,6 +526,16 @@ impl CucaClient {
     #[cfg(feature = "provider-llamacpp")]
     pub fn llamacpp_config(&self) -> Option<&LlamaCppConfig> {
         self.llamacpp_config.as_ref()
+    }
+
+    /// The in-process model attached via
+    /// [`CucaClientBuilder::with_local_model`], when one was set.
+    ///
+    /// `dispatch_local` reads it to queue each `ProviderEndpoint::Local`
+    /// request on the model's engine thread.
+    #[cfg(feature = "provider-local")]
+    pub fn local_model(&self) -> Option<&LocalModel> {
+        self.local_model.as_ref()
     }
 
     /// The speculative fast/slow orchestrator, when one was
@@ -670,6 +714,7 @@ impl CucaClient {
                 feature = "provider-llamacpp",
                 feature = "provider-vllm",
                 feature = "provider-lmstudio",
+                feature = "provider-local",
             ))
         ))]
         let _ = &cache_write;
@@ -681,6 +726,7 @@ impl CucaClient {
             feature = "provider-llamacpp",
             feature = "provider-vllm",
             feature = "provider-lmstudio",
+            feature = "provider-local",
         )))]
         return Err(match &self.selected_provider {
             ProviderEndpoint::LlamaCpp => CucaError::ProviderNotEnabled("provider-llamacpp"),
@@ -690,6 +736,7 @@ impl CucaClient {
             ProviderEndpoint::OpenAi => CucaError::ProviderNotEnabled("provider-openai"),
             ProviderEndpoint::Vllm => CucaError::ProviderNotEnabled("provider-vllm"),
             ProviderEndpoint::LmStudio => CucaError::ProviderNotEnabled("provider-lmstudio"),
+            ProviderEndpoint::Local => CucaError::ProviderNotEnabled("provider-local"),
             ProviderEndpoint::Custom(_) => {
                 CucaError::Config("custom endpoints require a registered adapter".into())
             }
@@ -744,6 +791,7 @@ impl CucaClient {
             feature = "provider-llamacpp",
             feature = "provider-vllm",
             feature = "provider-lmstudio",
+            feature = "provider-local",
         ))]
         let model = request.model.clone();
         // The endpoint is matched by reference: ProviderEndpoint is Clone, not
@@ -756,6 +804,7 @@ impl CucaClient {
             feature = "provider-llamacpp",
             feature = "provider-vllm",
             feature = "provider-lmstudio",
+            feature = "provider-local",
         ))]
         let dispatch = match &self.selected_provider {
             #[cfg(feature = "provider-llamacpp")]
@@ -772,6 +821,8 @@ impl CucaClient {
             ProviderEndpoint::Vllm => self.dispatch_vllm(request).await?,
             #[cfg(feature = "provider-lmstudio")]
             ProviderEndpoint::LmStudio => self.dispatch_lmstudio(request).await?,
+            #[cfg(feature = "provider-local")]
+            ProviderEndpoint::Local => self.dispatch_local(request).await?,
             // Runtime complement of the compile-time provider gate: these arms
             // compile only when the matching feature is off.
             #[cfg(not(feature = "provider-llamacpp"))]
@@ -800,6 +851,10 @@ impl CucaClient {
             ProviderEndpoint::LmStudio => {
                 return Err(CucaError::ProviderNotEnabled("provider-lmstudio"));
             }
+            #[cfg(not(feature = "provider-local"))]
+            ProviderEndpoint::Local => {
+                return Err(CucaError::ProviderNotEnabled("provider-local"));
+            }
             ProviderEndpoint::Custom(_) => {
                 return Err(CucaError::Config(
                     "custom endpoints require a registered adapter".into(),
@@ -816,6 +871,7 @@ impl CucaClient {
                 feature = "provider-llamacpp",
                 feature = "provider-vllm",
                 feature = "provider-lmstudio",
+                feature = "provider-local",
             )
         ))]
         return Ok(self.instrument(model, dispatch, cache_write, completed));
@@ -829,6 +885,7 @@ impl CucaClient {
                 feature = "provider-llamacpp",
                 feature = "provider-vllm",
                 feature = "provider-lmstudio",
+                feature = "provider-local",
             )
         ))]
         return Ok(self.instrument(model, dispatch, completed));
@@ -849,6 +906,7 @@ impl CucaClient {
             feature = "provider-llamacpp",
             feature = "provider-vllm",
             feature = "provider-lmstudio",
+            feature = "provider-local",
         )
     ))]
     fn instrument(
@@ -895,6 +953,7 @@ impl CucaClient {
             feature = "provider-llamacpp",
             feature = "provider-vllm",
             feature = "provider-lmstudio",
+            feature = "provider-local",
         )
     ))]
     fn instrument(
@@ -1431,6 +1490,18 @@ mod tests {
             .build()
             .unwrap_or_else(|e| panic!("provider set, build must succeed: {e}"));
         assert_eq!(client.selected_provider(), &ProviderEndpoint::OpenAi);
+    }
+
+    /// `Local` is the one provider whose build needs an attached model.
+    #[cfg(feature = "provider-local")]
+    #[test]
+    fn build_local_provider_without_model_is_config_error() {
+        let err = CucaClient::builder()
+            .with_provider(ProviderEndpoint::Local)
+            .build()
+            .err()
+            .expect("Local without a model must fail to build");
+        assert!(matches!(err, CucaError::Config(_)));
     }
 
     #[test]

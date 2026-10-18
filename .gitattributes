@@ -1,0 +1,2 @@
+# Golden chat renders read this fixture via include_str!; CRLF conversion would break them.
+src/provider/local/testdata/* -text

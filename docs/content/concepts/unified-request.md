@@ -140,9 +140,9 @@ the benefit of a serialization detail. The tagging changed instead.
 Blocks round-trip through `plugin-session-log`, so this is not a cosmetic
 choice: it is what makes a recorded session replayable.
 
-## The eighth provider variant
+## The ninth provider variant
 
-`ProviderEndpoint` has eight variants, but only seven have adapters. The eighth
+`ProviderEndpoint` has nine variants, but only eight have adapters. The ninth
 is `Custom(String)`, and dispatching it always fails:
 
 ```text,name=CucaError::Config from the Custom dispatch arm

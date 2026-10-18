@@ -21,6 +21,11 @@ all-features = true
 doctest = false
 
 # Dependency/feature split:
+# - provider-local does not use tokio-stream (its stream is a plain mpsc receiver).
+#   candle-core/candle-nn are pinned to 0.9.x: 0.10-0.11 hard-depend on
+#   tokenizers[onig], which compiles C (onig_sys); upgrade once a release ships the
+#   fancy-regex switch (candle main 5814a6f). Not used directly: candle-transformers,
+#   tokenizers, hf-hub, memmap2, rayon, rand.
 # - Core (unconditional): bytes, futures-core, memchr, serde, serde_json. They define
 #   the public wire types, SSE parser, and response stream contract.
 # - Network and runtime dependencies are optional. Every provider enables reqwest and
@@ -28,7 +33,8 @@ doctest = false
 #   implementation directly needs them.
 # - Cross-feature sharing is intentional: base64 (provider-anthropic + plugin-sandbox),
 #   tracing (plugin-guardrails + plugin-telemetry + plugin-redaction), tiktoken-rs
-#   (plugin-memory + plugin-cost), and reqwest/rustls (providers + plugin-web-search).
+#   (plugin-memory + plugin-cost), sha2 (provider-anthropic + service-prompt-cache +
+#   provider-local), and reqwest/rustls (providers + plugin-web-search + provider-local).
 #   reqwest is built with default-features = false; HTTPS users explicitly enable its
 #   rustls backend.
 # - opentelemetry_sdk is optional under plugin-telemetry (used only by that plugin's tests).
@@ -55,6 +61,10 @@ provider-deepseek = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 provider-llamacpp = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 provider-vllm = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+# provider-local: in-process Gemma 4 inference on CPU (src/provider/local/). Pure Rust:
+# no HTTP endpoint, no llama.cpp. reqwest is used only for the one-time model download
+# (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file.
+provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:tokio", "reqwest/rustls"]
 # Essential agentic & infrastructural capability plugins: each implements CucaPlugin
 # and runs on the request pipeline. The tier is flat — no plugin feature enables
 # another plugin feature, and none may name a service-* feature.
@@ -146,6 +156,13 @@ tracing = { version = "0.1", optional = true }
 # wide: portable SIMD (`f32x8`) for the vector store's cosine scan. Stable-only
 # by construction: `std::simd` is nightly, and this crate pins stable 1.98.
 wide = { version = "1.7", optional = true }
+# provider-local: candle 0.9.x for CPU tensors and quantized matmul; half for f16 block
+# scales; minijinja (+pycompat for the Gemma 4 chat template's Python string methods).
+candle-core = { version = "0.9.2", optional = true, default-features = false }
+candle-nn = { version = "0.9.2", optional = true, default-features = false }
+half = { version = "2", optional = true }
+minijinja = { version = "2.24", optional = true, features = ["loader"] }
+minijinja-contrib = { version = "2.24", optional = true, features = ["pycompat"] }
 
 # Test-only deps for the integration suite: `ctor` runs the `--mcp-echo-server`
 # interceptor in tests/plugin_mcp.rs before libtest's main (that test binary
@@ -175,6 +192,13 @@ divan = "0.1"
 name = "llamacpp_gemma"
 path = "examples/llamacpp_gemma.rs"
 required-features = ["provider-llamacpp"]
+
+# local_gemma runs Gemma 4 E2B in-process on CPU: `LocalModel` exists only when
+# `provider-local` is enabled.
+[[example]]
+name = "local_gemma"
+path = "examples/local_gemma.rs"
+required-features = ["provider-local"]
 
 [[example]]
 name = "stream_all_blocks"

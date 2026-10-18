@@ -209,6 +209,7 @@ impl From<std::io::Error> for PluginError {
     feature = "provider-llamacpp",
     feature = "provider-vllm",
     feature = "provider-lmstudio",
+    feature = "provider-local",
 ))]
 impl From<reqwest::Error> for CucaError {
     fn from(e: reqwest::Error) -> Self {
@@ -387,6 +388,7 @@ mod tests {
         feature = "provider-llamacpp",
         feature = "provider-vllm",
         feature = "provider-lmstudio",
+        feature = "provider-local",
     ))]
     /// `From<reqwest::Error>` maps into `CucaError::Transport` without network.
     #[test]
