@@ -9,13 +9,29 @@
 //! `LocalModel::load` resolves and loads the GGUF file and starts one engine
 //! thread; `CucaClientBuilder::with_local_model` attaches it to a client for
 //! `ProviderEndpoint::Local`. Usage, behavior and build notes live on
-//! `LocalModel`. Bounds:
+//! `LocalModel`.
+//!
+//! # Choosing a model
+//!
+//! Any dense `gemma4` GGUF runs: the loader reads every dimension (layers,
+//! widths, query and KV head counts, FFN widths, vocabulary) from the file's
+//! metadata and tensor shapes, and rejects an unsupported one (MoE, another
+//! architecture, a tensor dtype candle cannot read) with an error naming the
+//! cause. [`ModelSource`] has verified presets: Gemma 4 E2B and E4B, each at
+//! Q4_0 and Q8_0 (`ModelSource::gemma4_it`, or by name through
+//! `str::parse`), plus [`ModelSource::hugging_face`] and
+//! [`ModelSource::File`] for any other file. The default is E2B Q4_0
+//! (2.84 GB).
+//!
+//! Bounds:
 //!
 //! - Single-slot FIFO engine: one request runs at a time, at most 16 queue
 //!   behind it (further callers wait), 64 output blocks buffered per request.
-//! - K/V cache memory is `context_length * 36,864` bytes (302 MB at 8192).
-//! - Per-layer embedding rows (5,040 bytes each) are read from disk per input
-//!   token instead of being held in RAM (saves 1.32 GB).
+//! - K/V cache memory is `context_length * 2 * 4 * sum(n_kv_head * head_dim)`
+//!   bytes over the layers that own K/V: `context_length * 36,864` for E2B
+//!   (302 MB at 8192), `context_length * 114,688` for E4B (939 MB at 8192).
+//! - Per-layer embedding rows are read from disk per input token instead of
+//!   being held in RAM (5,040 bytes each and 1.32 GB saved in E2B Q4_0).
 //! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix.
 
 mod chat;
@@ -57,7 +73,93 @@ const THINKING_OPEN: &str = "<|channel>thought\n";
 /// Connect timeout of the one-off download client.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A published Gemma 4 instruction-tuned checkpoint size, for
+/// [`ModelSource::gemma4_it`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gemma4Variant {
+    /// Gemma 4 E2B (35 layers, 4.6B parameters with embeddings).
+    E2b,
+    /// Gemma 4 E4B (42 layers, 7.5B parameters with embeddings).
+    E4b,
+}
+
+/// Quantization of a published Gemma 4 GGUF file, for
+/// [`ModelSource::gemma4_it`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Gemma4Quant {
+    /// 4-bit legacy quantization: the smallest and fastest file.
+    Q4_0,
+    /// 8-bit quantization: about 1.75 times the size, closer to the original
+    /// weights.
+    Q8_0,
+}
+
+/// One pinned entry of the built-in preset table.
+struct Preset {
+    name: &'static str,
+    repo: &'static str,
+    revision: &'static str,
+    file: &'static str,
+    sha256: &'static str,
+}
+
+impl Preset {
+    fn source(&self) -> ModelSource {
+        ModelSource::HuggingFace {
+            repo: self.repo.to_string(),
+            revision: self.revision.to_string(),
+            file: self.file.to_string(),
+            sha256: Some(self.sha256.to_string()),
+        }
+    }
+}
+
+// Revisions are the repositories' commit hashes and the digests the `lfs.oid`
+// of each file, both read from the Hugging Face API.
+const E2B_REVISION: &str = "b4243c156154b6dca9324415f8c7ccc098b4aed1";
+const E4B_REVISION: &str = "b8093469224f83f5c38f691eb906c380e9e63114";
+
+const E2B_Q4_0: Preset = Preset {
+    name: "gemma4-e2b-q4_0",
+    repo: "ggml-org/gemma-4-E2B-it-GGUF",
+    revision: E2B_REVISION,
+    file: "gemma-4-E2B-it-Q4_0.gguf",
+    sha256: "8e30dff3ac4c8434c49a7036fa15564bdbb6044e42bf04550bf1a096ad7e6a52",
+};
+const E2B_Q8_0: Preset = Preset {
+    name: "gemma4-e2b-q8_0",
+    repo: "ggml-org/gemma-4-E2B-it-GGUF",
+    revision: E2B_REVISION,
+    file: "gemma-4-E2B-it-Q8_0.gguf",
+    sha256: "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+};
+const E4B_Q4_0: Preset = Preset {
+    name: "gemma4-e4b-q4_0",
+    repo: "ggml-org/gemma-4-E4B-it-GGUF",
+    revision: E4B_REVISION,
+    file: "gemma-4-E4B-it-Q4_0.gguf",
+    sha256: "a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2",
+};
+const E4B_Q8_0: Preset = Preset {
+    name: "gemma4-e4b-q8_0",
+    repo: "ggml-org/gemma-4-E4B-it-GGUF",
+    revision: E4B_REVISION,
+    file: "gemma-4-E4B-it-Q8_0.gguf",
+    sha256: "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+};
+
+/// Every built-in preset, in the order of [`ModelSource::PRESET_NAMES`].
+const PRESETS: [&Preset; 4] = [&E2B_Q4_0, &E2B_Q8_0, &E4B_Q4_0, &E4B_Q8_0];
+
 /// Where [`LocalModel::load`] gets the GGUF file from.
+///
+/// Any dense `gemma4` GGUF works: the loader derives every dimension from the
+/// file. The associated functions build the verified presets (see
+/// [`ModelSource::gemma4_it`]); other files are described with
+/// [`ModelSource::hugging_face`] or [`ModelSource::File`]. A source also parses
+/// from a string (`str::parse`): a preset name from
+/// [`ModelSource::PRESET_NAMES`] (ASCII case-insensitive), or
+/// `repo:revision:file`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSource {
     /// A file hosted on Hugging Face, downloaded once into the cache and
@@ -77,17 +179,93 @@ pub enum ModelSource {
 }
 
 impl ModelSource {
+    /// Names accepted by `str::parse::<ModelSource>`, one per preset, in the
+    /// order `gemma4-e2b-q4_0`, `gemma4-e2b-q8_0`, `gemma4-e4b-q4_0`,
+    /// `gemma4-e4b-q8_0`.
+    pub const PRESET_NAMES: [&'static str; 4] =
+        [E2B_Q4_0.name, E2B_Q8_0.name, E4B_Q4_0.name, E4B_Q8_0.name];
+
+    /// A verified Gemma 4 instruction-tuned preset: `variant` at `quant`,
+    /// from the `ggml-org` GGUF repository of that variant at a pinned commit,
+    /// with the file's SHA-256.
+    ///
+    /// | Preset | File | Size |
+    /// | --- | --- | --- |
+    /// | `E2b`, `Q4_0` | `gemma-4-E2B-it-Q4_0.gguf` | 2.84 GB |
+    /// | `E2b`, `Q8_0` | `gemma-4-E2B-it-Q8_0.gguf` | 4.97 GB |
+    /// | `E4b`, `Q4_0` | `gemma-4-E4B-it-Q4_0.gguf` | 4.59 GB |
+    /// | `E4b`, `Q8_0` | `gemma-4-E4B-it-Q8_0.gguf` | 8.03 GB |
+    pub fn gemma4_it(variant: Gemma4Variant, quant: Gemma4Quant) -> Self {
+        match (variant, quant) {
+            (Gemma4Variant::E2b, Gemma4Quant::Q4_0) => E2B_Q4_0.source(),
+            (Gemma4Variant::E2b, Gemma4Quant::Q8_0) => E2B_Q8_0.source(),
+            (Gemma4Variant::E4b, Gemma4Quant::Q4_0) => E4B_Q4_0.source(),
+            (Gemma4Variant::E4b, Gemma4Quant::Q8_0) => E4B_Q8_0.source(),
+        }
+    }
+
+    /// Gemma 4 E2B instruction-tuned at `quant`; see
+    /// [`ModelSource::gemma4_it`].
+    pub fn gemma4_e2b_it(quant: Gemma4Quant) -> Self {
+        Self::gemma4_it(Gemma4Variant::E2b, quant)
+    }
+
+    /// Gemma 4 E4B instruction-tuned at `quant`; see
+    /// [`ModelSource::gemma4_it`].
+    pub fn gemma4_e4b_it(quant: Gemma4Quant) -> Self {
+        Self::gemma4_it(Gemma4Variant::E4b, quant)
+    }
+
     /// Gemma 4 E2B instruction-tuned, Q4_0 quantization, from
     /// `ggml-org/gemma-4-E2B-it-GGUF` at a pinned revision with its SHA-256
-    /// (2.84 GB).
+    /// (2.84 GB). The default source of [`LocalModelConfig`].
     pub fn gemma4_e2b_it_q4_0() -> Self {
+        Self::gemma4_e2b_it(Gemma4Quant::Q4_0)
+    }
+
+    /// An arbitrary GGUF file on Hugging Face, without a checksum.
+    ///
+    /// `revision` should be a commit hash: the cache is keyed by it, so a
+    /// moving ref such as `main` would pin a stale file forever. The download
+    /// is not verified (`sha256` is `None`); build
+    /// [`ModelSource::HuggingFace`] directly to pin a digest.
+    pub fn hugging_face(
+        repo: impl Into<String>,
+        revision: impl Into<String>,
+        file: impl Into<String>,
+    ) -> Self {
         ModelSource::HuggingFace {
-            repo: "ggml-org/gemma-4-E2B-it-GGUF".to_string(),
-            revision: "b4243c156154b6dca9324415f8c7ccc098b4aed1".to_string(),
-            file: "gemma-4-E2B-it-Q4_0.gguf".to_string(),
-            sha256: Some(
-                "8e30dff3ac4c8434c49a7036fa15564bdbb6044e42bf04550bf1a096ad7e6a52".to_string(),
-            ),
+            repo: repo.into(),
+            revision: revision.into(),
+            file: file.into(),
+            sha256: None,
+        }
+    }
+}
+
+/// Parses a preset name from [`ModelSource::PRESET_NAMES`] (ASCII
+/// case-insensitive) or `repo:revision:file` (an unverified
+/// [`ModelSource::hugging_face`] source; none of the three parts contains
+/// `:`).
+impl std::str::FromStr for ModelSource {
+    type Err = CucaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        if let Some(preset) = PRESETS.iter().find(|p| p.name.eq_ignore_ascii_case(s)) {
+            return Ok(preset.source());
+        }
+        let parts: Vec<&str> = s.split(':').collect();
+        match parts.as_slice() {
+            [repo, revision, file]
+                if !repo.is_empty() && !revision.is_empty() && !file.is_empty() =>
+            {
+                Ok(Self::hugging_face(*repo, *revision, *file))
+            }
+            _ => Err(CucaError::Config(format!(
+                "unknown model `{s}`: expected a preset ({}) or `repo:revision:file`",
+                Self::PRESET_NAMES.join(", ")
+            ))),
         }
     }
 }
@@ -164,8 +342,10 @@ pub struct LocalModelConfig {
     /// environment variable, then to anonymous access.
     pub hf_token: Option<String>,
     /// Maximum tokens of prompt plus completion per request, also the K/V
-    /// cache capacity: it costs `context_length * 36,864` bytes of RAM. Must
-    /// be at least 1 and at most the model's own maximum.
+    /// cache capacity: it costs `context_length * 2 * 4 * sum(n_kv_head *
+    /// head_dim)` bytes of RAM over the K/V-owning layers (E2B:
+    /// `context_length * 36,864`; see [`LocalModel`]). Must be at least 1 and
+    /// at most the model's own maximum.
     pub context_length: usize,
     /// Default sampling parameters.
     pub sampling: SamplingConfig,
@@ -228,13 +408,18 @@ pub(crate) struct LocalModelInner {
 ///   error). A running request streams through a bounded 64-block channel, so
 ///   a slow consumer paces generation, and dropping the stream stops it.
 /// - The K/V cache is preallocated for `context_length` positions and costs
-///   `context_length * 36,864` bytes (302 MB at the default 8192). It is
+///   `context_length * 2 * 4 * sum(n_kv_head * head_dim)` bytes over the layers
+///   that own K/V (each layer's head dimension depends on its attention
+///   type): `context_length * 36,864` bytes for E2B (302 MB at the default
+///   8192) and `context_length * 114,688` for E4B (939 MB at 8192). It is
 ///   reused across requests: a prompt that shares a prefix with the previous
 ///   one only prefills the new tokens, reported as the response's
 ///   `prompt_cache_usage`.
-/// - Weights stay quantized (about 1.5 GB resident). The 1.32 GB per-layer
-///   embedding table is not loaded: one 5,040-byte row per input token is
-///   read from the GGUF file, usually from the OS page cache.
+/// - Weights stay quantized. The per-layer embedding table (`per_layer_token_embd`:
+///   1.32 GB in the E2B Q4_0 file, 1.59 GB in E4B Q4_0) is not loaded: one row
+///   per input token (5,040 bytes in E2B Q4_0) is read from the GGUF file,
+///   usually from the OS page cache. Resident weights are therefore about
+///   the file size minus that table (E2B Q4_0: 1.5 GB of 2.84 GB).
 ///
 /// # Behavior
 ///
@@ -249,10 +434,10 @@ pub(crate) struct LocalModelInner {
 ///
 /// # Build
 ///
-/// candle selects its Q4_0 and Q8_0 SIMD kernels at compile time, so build
-/// for the host CPU, e.g. `RUSTFLAGS="-C target-cpu=native" cargo build
-/// --release --features provider-local`; generic builds are several times
-/// slower.
+/// candle selects its quantized SIMD kernels (Q4_0, Q8_0, ...) at compile
+/// time, so build for the host CPU, e.g. `RUSTFLAGS="-C target-cpu=native"
+/// cargo build --release --features provider-local`; generic builds are
+/// several times slower.
 #[derive(Clone)]
 pub struct LocalModel {
     inner: Arc<LocalModelInner>,
@@ -271,7 +456,7 @@ impl LocalModel {
     /// read the weights, tokenizer and chat template, and start the engine
     /// thread.
     ///
-    /// The heavy work (download, hashing, parsing 2.8 GB of weights) runs on
+    /// The heavy work (download, hashing, parsing gigabytes of weights) runs on
     /// the engine thread; this future only awaits its result, so it never
     /// blocks the async runtime.
     ///
@@ -282,7 +467,9 @@ impl LocalModel {
     /// [`CucaError::Io`] when the file is missing or unreadable or the thread
     /// cannot start; [`CucaError::Transport`] and [`CucaError::Http`] for
     /// download failures; [`CucaError::Provider`] for an unsupported or
-    /// malformed GGUF file or a failed checksum.
+    /// malformed GGUF file (another architecture, MoE, per-layer KV head
+    /// counts, a tensor dtype candle cannot read, a missing tensor or
+    /// metadata key) or a failed checksum.
     pub async fn load(config: LocalModelConfig) -> Result<Self, CucaError> {
         validate(&config)?;
         let context_length = config.context_length;
@@ -562,6 +749,94 @@ mod tests {
     }
 
     #[test]
+    fn presets_are_pinned_and_named_consistently() {
+        use std::str::FromStr;
+        let cases = [
+            (
+                Gemma4Variant::E2b,
+                Gemma4Quant::Q4_0,
+                "gemma4-e2b-q4_0",
+                "ggml-org/gemma-4-E2B-it-GGUF",
+                "gemma-4-E2B-it-Q4_0.gguf",
+            ),
+            (
+                Gemma4Variant::E2b,
+                Gemma4Quant::Q8_0,
+                "gemma4-e2b-q8_0",
+                "ggml-org/gemma-4-E2B-it-GGUF",
+                "gemma-4-E2B-it-Q8_0.gguf",
+            ),
+            (
+                Gemma4Variant::E4b,
+                Gemma4Quant::Q4_0,
+                "gemma4-e4b-q4_0",
+                "ggml-org/gemma-4-E4B-it-GGUF",
+                "gemma-4-E4B-it-Q4_0.gguf",
+            ),
+            (
+                Gemma4Variant::E4b,
+                Gemma4Quant::Q8_0,
+                "gemma4-e4b-q8_0",
+                "ggml-org/gemma-4-E4B-it-GGUF",
+                "gemma-4-E4B-it-Q8_0.gguf",
+            ),
+        ];
+        for (i, (variant, quant, name, repo, file)) in cases.into_iter().enumerate() {
+            let source = ModelSource::gemma4_it(variant, quant);
+            assert_eq!(ModelSource::PRESET_NAMES[i], name);
+            assert_eq!(ModelSource::from_str(name).unwrap(), source);
+            assert_eq!(
+                ModelSource::from_str(&name.to_ascii_uppercase()).unwrap(),
+                source
+            );
+            let ModelSource::HuggingFace {
+                repo: r,
+                revision,
+                file: f,
+                sha256,
+            } = source
+            else {
+                panic!("presets are Hugging Face files");
+            };
+            assert_eq!((r.as_str(), f.as_str()), (repo, file));
+            assert_eq!(revision.len(), 40);
+            let digest = sha256.expect("presets pin a digest");
+            assert_eq!(digest.len(), 64);
+            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+        }
+        assert_eq!(
+            ModelSource::gemma4_e2b_it_q4_0(),
+            ModelSource::gemma4_e2b_it(Gemma4Quant::Q4_0)
+        );
+        assert_eq!(
+            ModelSource::gemma4_e4b_it(Gemma4Quant::Q8_0),
+            ModelSource::gemma4_it(Gemma4Variant::E4b, Gemma4Quant::Q8_0)
+        );
+    }
+
+    #[test]
+    fn sources_parse_from_repo_revision_file() {
+        let source: ModelSource = "unsloth/gemma-4-E2B-it-GGUF:0314792d:gemma-4-E2B-it-Q4_1.gguf"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            source,
+            ModelSource::hugging_face(
+                "unsloth/gemma-4-E2B-it-GGUF",
+                "0314792d",
+                "gemma-4-E2B-it-Q4_1.gguf"
+            )
+        );
+        for bad in ["", "gemma4-e9b-q4_0", "a:b", "a:b:c:d", "a::c", ":b:c"] {
+            let err = bad.parse::<ModelSource>().unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains("gemma4-e4b-q8_0")),
+                "{bad:?}: {err:?}"
+            );
+        }
+    }
+
+    #[test]
     fn debug_output_hides_the_token_and_names_the_callback() {
         let config = LocalModelConfig {
             hf_token: Some("hf_secret".into()),
@@ -653,7 +928,10 @@ mod tests {
         };
         let err = LocalModel::load(config).await.unwrap_err();
         let _ = std::fs::remove_file(&path);
-        assert!(matches!(err, CucaError::Io { .. }), "{err}");
+        assert!(
+            matches!(&err, CucaError::Provider { message, .. } if message.contains("not a supported GGUF file")),
+            "{err}"
+        );
     }
 
     #[tokio::test]

@@ -103,8 +103,9 @@ invisible without `--nocapture`. See
 |---|---|---|
 | `CUCA_CACHE_DIR` | the library (`LocalModelConfig::cache_dir` is `None`), the example, the live tests | the model download cache directory, used as given |
 | `HF_TOKEN` | the library (`LocalModelConfig::hf_token` is `None`), the example | Hugging Face bearer token; the pinned model downloads anonymously |
-| `CUCA_LOCAL_MODEL_PATH` | `examples/local_gemma.rs`, `tests/provider_local.rs` | path of an existing GGUF file; skips the download |
-| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs` | `1` downloads the pinned model into the cache for the test run |
+| `CUCA_LOCAL_MODEL_PATH` | `examples/local_gemma.rs`, `tests/provider_local.rs` | path of an existing GGUF file (any dense `gemma4` checkpoint); skips the download and wins over `CUCA_LOCAL_MODEL` |
+| `CUCA_LOCAL_MODEL` | `examples/local_gemma.rs`, `tests/provider_local.rs` | which model to download: a preset name (`gemma4-e2b-q4_0`, `gemma4-e2b-q8_0`, `gemma4-e4b-q4_0`, `gemma4-e4b-q8_0`, ASCII case-insensitive) or an unverified `repo:revision:file`; parsed with `ModelSource::from_str`, an unknown value fails the run with the accepted names. Default: `gemma4-e2b-q4_0` |
+| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs` | `1` downloads the default model (E2B Q4_0) into the cache for the test run; `CUCA_LOCAL_MODEL` selects another model and downloads it without this variable |
 
 When `CUCA_CACHE_DIR` is unset, the cache directory is `%LOCALAPPDATA%\cuca` on
 Windows (falling back to `%USERPROFILE%\AppData\Local\cuca`),

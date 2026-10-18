@@ -36,7 +36,7 @@ and `base64` for its OAuth PKCE surface. The full dependency mapping is
 
 ## The in-process adapter
 
-[`provider-local`](@/providers/local.md) is the eighth adapter and the only one without a base URL, an auth header or a route: its `ProviderEndpoint` variant, `Local`, runs Gemma 4 E2B on the CPU inside your process, with no HTTP endpoint; the engine code is pure Rust, though candle's dependency tree builds one C crate (`onig_sys`). It does not use `tokio-stream`; it uses `reqwest` only for the one-time model download from Hugging Face. The model is attached with `CucaClientBuilder::with_local_model`.
+[`provider-local`](@/providers/local.md) is the eighth adapter and the only one without a base URL, an auth header or a route: its `ProviderEndpoint` variant, `Local`, runs Gemma 4 (E2B or E4B, any dense `gemma4` GGUF) on the CPU inside your process, with no HTTP endpoint; the engine code is pure Rust, though candle's dependency tree builds one C crate (`onig_sys`). It does not use `tokio-stream`; it uses `reqwest` only for the one-time model download from Hugging Face. The model is attached with `CucaClientBuilder::with_local_model`.
 
 ## Three wire protocols, two shared modules
 

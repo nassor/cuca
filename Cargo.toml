@@ -192,7 +192,7 @@ name = "llamacpp_gemma"
 path = "examples/llamacpp_gemma.rs"
 required-features = ["provider-llamacpp"]
 
-# local_gemma runs Gemma 4 E2B in-process on CPU: `LocalModel` exists only when
+# local_gemma runs Gemma 4 (E2B or E4B) in-process on CPU: `LocalModel` exists only when
 # `provider-local` is enabled.
 [[example]]
 name = "local_gemma"

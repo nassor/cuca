@@ -100,10 +100,12 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// [`CucaError::Io`] when the file cannot be read or parsed as GGUF,
+    /// [`CucaError::Io`] when the file cannot be opened or read,
     /// [`CucaError::Config`] when `config.context_length` exceeds the model
-    /// maximum, and [`CucaError::Provider`] for an unsupported checkpoint, a
-    /// missing tensor or metadata key, or an unusable tokenizer.
+    /// maximum, and [`CucaError::Provider`] for a file that is not a GGUF
+    /// file candle can parse (for example an unsupported tensor dtype such as
+    /// an IQ quantization), an unsupported checkpoint (wrong architecture,
+    /// MoE), a missing tensor or metadata key, or an unusable tokenizer.
     pub(crate) fn open(
         path: &Path,
         config: &LocalModelConfig,
@@ -112,7 +114,16 @@ impl Engine {
             message: format!("reading GGUF `{}`: {e}", path.display()),
         };
         let mut reader = BufReader::new(File::open(path).map_err(|e| io_err(&e))?);
-        let content = gguf_file::Content::read(&mut reader).map_err(|e| io_err(&e))?;
+        let content = gguf_file::Content::read(&mut reader).map_err(|e| match e {
+            // A read failure of the file itself; anything else is a header
+            // candle cannot interpret (a tensor dtype it does not implement,
+            // such as an IQ quantization, is the usual cause).
+            candle_core::Error::Io(_) => io_err(&e),
+            other => local_err(format!(
+                "`{}` is not a supported GGUF file: {other}",
+                path.display()
+            )),
+        })?;
         drop(reader);
 
         let architecture = content
@@ -542,5 +553,36 @@ mod tests {
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
         let out = run(&mut e, &[], Some(1));
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
+    }
+
+    /// A GGUF header declaring one tensor of dtype 20 (IQ4_NL), which candle
+    /// cannot read: the load must name an unsupported file, not an I/O error.
+    #[test]
+    fn open_reports_an_unreadable_tensor_dtype_as_unsupported() {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes()); // version
+        bytes.extend(1u64.to_le_bytes()); // tensors
+        bytes.extend(0u64.to_le_bytes()); // metadata entries
+        bytes.extend(1u64.to_le_bytes()); // name length
+        bytes.push(b'x');
+        bytes.extend(1u32.to_le_bytes()); // dimensions
+        bytes.extend(32u64.to_le_bytes());
+        bytes.extend(20u32.to_le_bytes()); // IQ4_NL
+        bytes.extend(0u64.to_le_bytes()); // offset
+        bytes.resize(bytes.len().next_multiple_of(32) + 64, 0);
+        let path = std::env::temp_dir().join(format!("cuca-iq4-{}.gguf", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+
+        let config = LocalModelConfig::default();
+        let result = Engine::open(&path, &config);
+        let _ = std::fs::remove_file(&path);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("an IQ4_NL tensor must not load"),
+        };
+        assert!(
+            matches!(&err, CucaError::Provider { message, .. } if message.contains("not a supported GGUF file")),
+            "{err:?}"
+        );
     }
 }

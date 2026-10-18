@@ -117,8 +117,8 @@ pub use crate::plugins::web_search::{
 };
 #[cfg(feature = "provider-local")]
 pub use crate::provider::local::{
-    DownloadProgress, DownloadProgressCallback, LocalModel, LocalModelConfig, ModelSource,
-    SamplingConfig,
+    DownloadProgress, DownloadProgressCallback, Gemma4Quant, Gemma4Variant, LocalModel,
+    LocalModelConfig, ModelSource, SamplingConfig,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,

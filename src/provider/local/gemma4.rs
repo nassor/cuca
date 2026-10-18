@@ -1,4 +1,13 @@
-//! Gemma 4 E2B forward pass on candle CPU tensors, loaded from a GGUF file.
+//! Gemma 4 dense (`gemma4` architecture) forward pass on candle CPU tensors,
+//! loaded from a GGUF file.
+//!
+//! Every dimension comes from the GGUF metadata and tensor shapes (layer
+//! count, widths, head counts and dimensions, per-layer FFN width, vocabulary,
+//! per-layer-embedding width): the loader holds no checkpoint constants, so
+//! the E2B and E4B checkpoints load through the same code, and an unsupported
+//! one (MoE, per-layer KV head counts, a tensor dtype candle cannot read) is
+//! rejected with an error naming the cause. The numbers quoted below are
+//! those of the E2B checkpoint, the reference.
 //!
 //! The architecture differs from earlier Gemma generations in these ways, all
 //! implemented in [`Gemma4::forward`]:
@@ -6,37 +15,43 @@
 //! - RMSNorm multiplies by the weight directly (no `1 + w`), attention scale
 //!   is 1.0, and there is no attention soft-cap; the value projection gets a
 //!   weightless RMSNorm.
-//! - Layers alternate sliding-window (window 512, head dim 256, RoPE base
-//!   1e4) and full attention (head dim 512, RoPE base 1e6 with the
-//!   `rope_freqs.weight` per-pair factors that leave 192 of 256 pairs
-//!   unrotated). One KV head serves all 8 query heads.
+//! - Layers follow `sliding_window_pattern`: sliding-window (E2B: window 512,
+//!   head dim 256, RoPE base 1e4) or full attention (head dim 512, RoPE base
+//!   1e6 with the `rope_freqs.weight` per-pair factors that leave 192 of 256
+//!   pairs unrotated). `head_count_kv` KV heads serve the `head_count` query
+//!   heads in equal groups (grouped-query attention): E2B has one KV head for
+//!   8 query heads, E4B two.
 //! - The last `shared_kv_layers` layers own no K/V projections: they attend
 //!   to the cache of the last earlier layer of their own attention type.
-//! - Per-layer embeddings: every token also selects a 8960-wide row of
-//!   `per_layer_token_embd`, split into one 256-wide slice per layer and
-//!   gated into that layer's residual stream.
+//! - Per-layer embeddings: every token also selects a row of
+//!   `per_layer_token_embd` (E2B: 8960 wide), split into one
+//!   `embedding_length_per_layer_input`-wide slice per layer and gated into
+//!   that layer's residual stream.
 //! - Final logits are soft-capped: `30 * tanh(x / 30)`.
 //!
 //! # Memory
 //!
-//! - Weights stay quantized (Q4_0 / Q8_0) and are consumed by candle's
-//!   quantized matmul; norm vectors and `per_layer_model_proj` (BF16) are
-//!   held as f32.
-//! - The token embedding (Q8_0, 427 MB) is held once and shared with the tied
-//!   LM head.
-//! - `per_layer_token_embd` (Q4_0, 1.32 GB) is never loaded: each token's row
-//!   (5,040 bytes) is read from the GGUF file with a seek and dequantized, so
-//!   a forward pass costs one small disk read (usually an OS page-cache hit)
-//!   per input token.
+//! - Weights stay quantized (any dtype candle's quantized matmul reads) and
+//!   are consumed by candle's quantized matmul; norm vectors and
+//!   `per_layer_model_proj` (BF16 in the published files) are held as f32.
+//! - The token embedding (E2B Q4_0 file: Q8_0, 427 MB) is held once and shared
+//!   with the tied LM head.
+//! - `per_layer_token_embd` (E2B Q4_0 file: Q4_0, 1.32 GB) is never loaded:
+//!   each token's row (5,040 bytes there) is read from the GGUF file with a
+//!   seek and dequantized by [`dequant_row`], so a forward pass costs one
+//!   small disk read (usually an OS page-cache hit) per input token.
 //! - The KV cache is preallocated for `context_length` positions: only the
-//!   15 layers that own K/V store them (12 sliding with head dim 256, 3 full
-//!   with head dim 512), `context_length * 36,864` bytes in f32 (302 MB at
-//!   8192). Sliding layers keep every position, not a ring, so a sliding
-//!   layer reads a `window`-long slice at the end of its cache.
+//!   layers that own K/V store them, `context_length * 2 * 4 *
+//!   sum(n_kv_head * head_dim)` bytes in f32, the sum running over those
+//!   layers with `head_dim` of that layer's attention type. For E2B that is
+//!   15 layers (12 sliding with head dim 256, 3 full with head dim 512, one KV
+//!   head): `context_length * 36,864` bytes (302 MB at 8192). Sliding layers
+//!   keep every position, not a ring, so a sliding layer reads a
+//!   `window`-long slice at the end of its cache.
 //! - RoPE cos/sin tables are built once for `context_length` positions.
 //! - A prefill call processes at most [`prefill_chunk`] tokens, which bounds
 //!   the transient `n_head * chunk * context_length` f32 score matrix of a
-//!   full-attention layer to about 64 MB.
+//!   full-attention layer to `n_head * 8 MB` (64 MB at 8 query heads).
 
 use std::collections::HashMap;
 use std::f64::consts::FRAC_1_SQRT_2;
@@ -115,6 +130,43 @@ fn md_f32(md: &HashMap<String, gguf_file::Value>, key: &str) -> Result<f32, Cuca
     md_get(md, key)?.to_f32().map_err(|e| meta_err(key, e))
 }
 
+/// The KV head count: `head_count_kv` is a scalar in the published files; an
+/// array is accepted when every layer agrees.
+fn md_kv_heads(md: &HashMap<String, gguf_file::Value>) -> Result<usize, CucaError> {
+    const KEY: &str = "gemma4.attention.head_count_kv";
+    let value = md_get(md, KEY)?;
+    let Ok(items) = value.to_vec() else {
+        return md_usize(md, KEY);
+    };
+    let counts = items
+        .iter()
+        .map(|v| v.to_u32().map_err(|e| meta_err(KEY, e)))
+        .collect::<Result<Vec<u32>, CucaError>>()?;
+    match counts.split_first() {
+        Some((&first, rest)) if rest.iter().all(|&c| c == first) => {
+            usize::try_from(first).map_err(|e| meta_err(KEY, e))
+        }
+        _ => Err(err(
+            "GGUF metadata `gemma4.attention.head_count_kv`: per-layer KV head counts are not supported",
+        )),
+    }
+}
+
+/// Reject a value length that differs from the key length: the cache and the
+/// attention code use one head dimension for both.
+fn require_equal_value_length(
+    md: &HashMap<String, gguf_file::Value>,
+    key: &str,
+    key_length: usize,
+) -> Result<(), CucaError> {
+    match md.get(key) {
+        Some(_) if md_usize(md, key)? != key_length => Err(err(format!(
+            "GGUF metadata `{key}`: differs from the key length {key_length}; only equal key and value lengths are supported"
+        ))),
+        _ => Ok(()),
+    }
+}
+
 /// Hyperparameters read from the `gemma4.*` GGUF metadata.
 #[derive(Debug, Clone)]
 pub(crate) struct Gemma4Params {
@@ -122,8 +174,10 @@ pub(crate) struct Gemma4Params {
     pub(crate) n_layer: usize,
     /// Residual stream width.
     pub(crate) n_embd: usize,
-    /// Query heads (one KV head serves them all).
+    /// Query heads, served by `n_kv_head` KV heads in equal groups.
     pub(crate) n_head: usize,
+    /// KV heads per K/V-owning layer (grouped-query attention).
+    pub(crate) n_kv_head: usize,
     /// Head dimension of full-attention layers.
     pub(crate) head_dim_full: usize,
     /// Head dimension of sliding-window layers.
@@ -152,7 +206,8 @@ pub(crate) struct Gemma4Params {
 
 impl Gemma4Params {
     /// Read and validate the hyperparameters; rejects checkpoints this
-    /// implementation does not cover (MoE, more than one KV head).
+    /// implementation does not cover (MoE, per-layer KV head counts,
+    /// differing key and value lengths).
     pub(crate) fn from_metadata(md: &HashMap<String, gguf_file::Value>) -> Result<Self, CucaError> {
         if let Some(experts) = md.get("gemma4.expert_count")
             && !matches!(experts.to_u32(), Ok(0))
@@ -164,7 +219,7 @@ impl Gemma4Params {
         let model_ctx = md_usize(md, "gemma4.context_length")?;
         let n_embd = md_usize(md, "gemma4.embedding_length")?;
         let n_head = md_usize(md, "gemma4.attention.head_count")?;
-        let n_head_kv = md_usize(md, "gemma4.attention.head_count_kv")?;
+        let n_kv_head = md_kv_heads(md)?;
         let head_dim_full = md_usize(md, "gemma4.attention.key_length")?;
         let head_dim_swa = md_usize(md, "gemma4.attention.key_length_swa")?;
         let window = md_usize(md, "gemma4.attention.sliding_window")?;
@@ -183,9 +238,13 @@ impl Gemma4Params {
             .map(|v| v.to_bool().map_err(|e| meta_err(PATTERN, e)))
             .collect::<Result<Vec<bool>, CucaError>>()?;
 
-        if n_head_kv != 1 {
-            return Err(err("only single-KV-head Gemma 4 checkpoints are supported"));
+        if n_kv_head == 0 || !n_head.is_multiple_of(n_kv_head) {
+            return Err(err(format!(
+                "GGUF metadata `gemma4.attention.head_count_kv`: {n_kv_head} KV heads do not divide {n_head} query heads"
+            )));
         }
+        require_equal_value_length(md, "gemma4.attention.value_length", head_dim_full)?;
+        require_equal_value_length(md, "gemma4.attention.value_length_swa", head_dim_swa)?;
         if n_layer == 0 || n_embd == 0 || n_head == 0 || ple_dim == 0 || model_ctx == 0 {
             return Err(err(
                 "GGUF metadata: layer, embedding, head, per-layer-input and context sizes must be non-zero",
@@ -227,6 +286,7 @@ impl Gemma4Params {
             n_layer,
             n_embd,
             n_head,
+            n_kv_head,
             head_dim_full,
             head_dim_swa,
             window,
@@ -306,49 +366,128 @@ pub(crate) fn prefill_chunk(context_length: usize) -> usize {
     (2_097_152 / context_length.max(1)).clamp(16, 256)
 }
 
-/// Dequantize one row of a Q4_0 or Q8_0 tensor into `out`, multiplying every
-/// element by `scale`.
+/// Dequantize one row of a tensor into `out`, multiplying every element by
+/// `scale`.
 ///
-/// `bytes` holds the row's blocks and must be exactly
-/// `out.len() / 32` blocks long (18 bytes per Q4_0 block, 34 per Q8_0 block).
+/// F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 are decoded in place, with
+/// no allocation. Every other dtype candle reads (the K-quants and Q8_1) goes
+/// through candle's own dequantizer, which allocates per call.
+///
+/// `bytes` holds the row's blocks and must be exactly `out.len() /
+/// block_size` blocks of `type_size` bytes (for example 18 bytes per 32
+/// elements for Q4_0, 34 for Q8_0, 144 per 256 for Q4_K).
 pub(crate) fn dequant_row(
     dtype: GgmlDType,
     bytes: &[u8],
     scale: f32,
     out: &mut [f32],
 ) -> Result<(), CucaError> {
-    let (block_bytes, quants) = match dtype {
-        GgmlDType::Q4_0 => (18, 16),
-        GgmlDType::Q8_0 => (34, 32),
-        other => {
-            return Err(err(format!(
-                "row dequantization supports Q4_0 and Q8_0 only, got {other:?}"
-            )));
-        }
-    };
-    if !out.len().is_multiple_of(32) || bytes.len() != out.len() / 32 * block_bytes {
+    let block = dtype.block_size();
+    if !out.len().is_multiple_of(block) || bytes.len() != out.len() / block * dtype.type_size() {
         return Err(err(format!(
             "row of {} bytes does not hold {} {dtype:?} elements",
             bytes.len(),
             out.len()
         )));
     }
-    let (out_blocks, _) = out.as_chunks_mut::<32>();
-    for (block, o) in bytes.chunks_exact(block_bytes).zip(out_blocks) {
-        let d = half::f16::from_bits(u16::from_le_bytes([block[0], block[1]])).to_f32() * scale;
-        let qs = &block[2..2 + quants];
-        if dtype == GgmlDType::Q4_0 {
-            for (j, &q) in qs.iter().enumerate() {
-                o[j] = f32::from(i16::from(q & 0x0F) - 8) * d;
-                o[j + 16] = f32::from(i16::from(q >> 4) - 8) * d;
+    let f16_at = |b: &[u8], at: usize| {
+        half::f16::from_bits(u16::from_le_bytes([b[at], b[at + 1]])).to_f32() * scale
+    };
+    match dtype {
+        GgmlDType::F32 => {
+            let (words, _) = bytes.as_chunks::<4>();
+            for (o, w) in out.iter_mut().zip(words) {
+                *o = f32::from_le_bytes(*w) * scale;
             }
-        } else {
-            for (o, &q) in o.iter_mut().zip(qs) {
-                *o = f32::from(q.cast_signed()) * d;
+        }
+        GgmlDType::F16 => {
+            let (halves, _) = bytes.as_chunks::<2>();
+            for (o, h) in out.iter_mut().zip(halves) {
+                *o = half::f16::from_bits(u16::from_le_bytes(*h)).to_f32() * scale;
+            }
+        }
+        GgmlDType::BF16 => {
+            let (halves, _) = bytes.as_chunks::<2>();
+            for (o, h) in out.iter_mut().zip(halves) {
+                *o = half::bf16::from_bits(u16::from_le_bytes(*h)).to_f32() * scale;
+            }
+        }
+        GgmlDType::Q4_0 | GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1 | GgmlDType::Q8_0 => {
+            let (out_blocks, _) = out.as_chunks_mut::<32>();
+            for (b, o) in bytes.chunks_exact(dtype.type_size()).zip(out_blocks) {
+                let d = f16_at(b, 0);
+                match dtype {
+                    // d, 16 bytes of nibbles: low nibbles are elements 0..16,
+                    // high nibbles 16..32, each minus 8.
+                    GgmlDType::Q4_0 => {
+                        for (j, &q) in b[2..18].iter().enumerate() {
+                            o[j] = f32::from(i16::from(q & 0x0F) - 8) * d;
+                            o[j + 16] = f32::from(i16::from(q >> 4) - 8) * d;
+                        }
+                    }
+                    // d, m, nibbles: element = nibble * d + m.
+                    GgmlDType::Q4_1 => {
+                        let m = f16_at(b, 2);
+                        for (j, &q) in b[4..20].iter().enumerate() {
+                            o[j] = f32::from(q & 0x0F) * d + m;
+                            o[j + 16] = f32::from(q >> 4) * d + m;
+                        }
+                    }
+                    // d, 32 high bits, nibbles: a 5-bit quant minus 16. High
+                    // bit j of `qh` extends low-nibble element j, bit j + 16
+                    // extends high-nibble element j + 16.
+                    GgmlDType::Q5_0 => {
+                        let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
+                        for (j, &q) in b[6..22].iter().enumerate() {
+                            let (lo, hi) = q5_pair(q, qh, j);
+                            o[j] = f32::from(lo - 16) * d;
+                            o[j + 16] = f32::from(hi - 16) * d;
+                        }
+                    }
+                    // d, m, 32 high bits, nibbles: element = 5-bit quant * d + m.
+                    GgmlDType::Q5_1 => {
+                        let m = f16_at(b, 2);
+                        let qh = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+                        for (j, &q) in b[8..24].iter().enumerate() {
+                            let (lo, hi) = q5_pair(q, qh, j);
+                            o[j] = f32::from(lo) * d + m;
+                            o[j + 16] = f32::from(hi) * d + m;
+                        }
+                    }
+                    // d, 32 signed bytes.
+                    _ => {
+                        for (o, &q) in o.iter_mut().zip(&b[2..34]) {
+                            *o = f32::from(q.cast_signed()) * d;
+                        }
+                    }
+                }
+            }
+        }
+        other => {
+            let info = gguf_file::TensorInfo {
+                ggml_dtype: other,
+                shape: out.len().into(),
+                offset: 0,
+            };
+            let values = info
+                .read(&mut std::io::Cursor::new(bytes), 0, &Device::Cpu)
+                .and_then(|t| t.dequantize(&Device::Cpu))
+                .and_then(|t| t.to_vec1::<f32>())
+                .map_err(candle_err)?;
+            for (o, v) in out.iter_mut().zip(values) {
+                *o = v * scale;
             }
         }
     }
     Ok(())
+}
+
+/// The 5-bit quants (low nibble plus its high bit) of elements `j` and
+/// `j + 16` of a Q5_0 or Q5_1 block.
+fn q5_pair(q: u8, qh: u32, j: usize) -> (i16, i16) {
+    let lo = (q & 0x0F) | ((((qh >> j) << 4) & 0x10) as u8);
+    let hi = (q >> 4) | (((qh >> (j + 12)) & 0x10) as u8);
+    (i16::from(lo), i16::from(hi))
 }
 
 /// RoPE inverse frequencies for `head_dim / 2` pairs: `base^(-2i/d)` divided
@@ -608,10 +747,12 @@ impl Gemma4 {
             .ok_or_else(|| err(format!("tensor `{}`: scalar", name::TOKEN_EMBD)))?;
         let embd = loader.qtensor(name::TOKEN_EMBD, &[vocab, p.n_embd])?;
         let embd_dtype = embd.dtype();
-        if !matches!(embd_dtype, GgmlDType::Q8_0 | GgmlDType::Q4_0) {
+        if !p.n_embd.is_multiple_of(embd_dtype.block_size()) {
             return Err(err(format!(
-                "tensor `{}`: dtype {embd_dtype:?} is not supported (Q8_0 or Q4_0 expected)",
-                name::TOKEN_EMBD
+                "tensor `{}`: row length {} is not a multiple of the {embd_dtype:?} block size {}",
+                name::TOKEN_EMBD,
+                p.n_embd,
+                embd_dtype.block_size()
             )));
         }
         let embd = Arc::new(embd);
@@ -644,12 +785,11 @@ impl Gemma4 {
             )));
         }
         let ple_dtype = ple_info.ggml_dtype;
-        if !matches!(ple_dtype, GgmlDType::Q4_0 | GgmlDType::Q8_0)
-            || !ple_row_len.is_multiple_of(ple_dtype.block_size())
-        {
+        if !ple_row_len.is_multiple_of(ple_dtype.block_size()) {
             return Err(err(format!(
-                "tensor `{}`: dtype {ple_dtype:?} is not supported (Q4_0 or Q8_0 expected)",
-                name::PER_LAYER_TOKEN_EMBD
+                "tensor `{}`: row length {ple_row_len} is not a multiple of the {ple_dtype:?} block size {}",
+                name::PER_LAYER_TOKEN_EMBD,
+                ple_dtype.block_size()
             )));
         }
         let ple_row_bytes = ple_row_len / ple_dtype.block_size() * ple_dtype.type_size();
@@ -707,6 +847,7 @@ impl Gemma4 {
                 p.head_dim_full
             };
             let q_width = p.n_head * d;
+            let kv_width = p.n_kv_head * d;
             let gate_name = name::blk(il, name::FFN_GATE);
             let ff = *loader
                 .shape(&gate_name)?
@@ -716,15 +857,23 @@ impl Gemma4 {
 
             let kv = if il < p.n_layer_kv {
                 kv_layers.push(Some((
-                    Tensor::zeros((1, 1, context_length, d), DType::F32, &Device::Cpu)
-                        .map_err(candle_err)?,
-                    Tensor::zeros((1, 1, context_length, d), DType::F32, &Device::Cpu)
-                        .map_err(candle_err)?,
+                    Tensor::zeros(
+                        (1, p.n_kv_head, context_length, d),
+                        DType::F32,
+                        &Device::Cpu,
+                    )
+                    .map_err(candle_err)?,
+                    Tensor::zeros(
+                        (1, p.n_kv_head, context_length, d),
+                        DType::F32,
+                        &Device::Cpu,
+                    )
+                    .map_err(candle_err)?,
                 )));
                 Some(KvWeights {
-                    wk: loader.matmul(&blk(name::ATTN_K), &[d, p.n_embd])?,
+                    wk: loader.matmul(&blk(name::ATTN_K), &[kv_width, p.n_embd])?,
                     k_norm: loader.vector(&blk(name::ATTN_K_NORM), d)?,
-                    wv: loader.matmul(&blk(name::ATTN_V), &[d, p.n_embd])?,
+                    wv: loader.matmul(&blk(name::ATTN_V), &[kv_width, p.n_embd])?,
                 })
             } else {
                 kv_layers.push(None);
@@ -891,10 +1040,10 @@ impl Gemma4 {
         let q = rope(&q, &cos, &sin)?;
 
         if let Some(kv) = &lw.kv {
-            let k = kv.wk.forward(&h)?.reshape((1, t, 1, d))?;
+            let k = kv.wk.forward(&h)?.reshape((1, t, p.n_kv_head, d))?;
             let k = rms(&k, &kv.k_norm, eps)?.transpose(1, 2)?.contiguous()?;
             let k = rope(&k, &cos, &sin)?;
-            let v = kv.wv.forward(&h)?.reshape((1, t, 1, d))?;
+            let v = kv.wv.forward(&h)?.reshape((1, t, p.n_kv_head, d))?;
             let v = rms(&v, ones, eps)?.transpose(1, 2)?.contiguous()?;
             let (cache_k, cache_v) = self.cache(il)?;
             cache_k.slice_set(&k, 2, start)?;
@@ -910,22 +1059,13 @@ impl Gemma4 {
         let l = hi - lo;
         let k = cache_k.narrow(2, lo, l)?;
         let v = cache_v.narrow(2, lo, l)?;
-        let scores = q
-            .reshape((1, 1, p.n_head * t, d))?
-            .matmul(&k.transpose(2, 3)?)?;
-        let scores = if t > 1 {
+        let mask = if t > 1 {
             let mask = attention_mask(start, t, lo, hi, sliding.then_some(p.window));
-            let mask = Tensor::from_vec(mask, (t, l), &Device::Cpu)?;
-            scores
-                .reshape((1, p.n_head, t, l))?
-                .broadcast_add(&mask)?
-                .reshape((1, 1, p.n_head * t, l))?
+            Some(Tensor::from_vec(mask, (t, l), &Device::Cpu)?)
         } else {
-            scores
+            None
         };
-        let attn = softmax_last_dim(&scores.contiguous()?)?.matmul(&v)?;
-        let attn = attn
-            .reshape((1, p.n_head, t, d))?
+        let attn = attend(&q, &k, &v, mask.as_ref())?
             .transpose(1, 2)?
             .contiguous()?
             .reshape((1, t, p.n_head * d))?;
@@ -959,6 +1099,35 @@ impl Gemma4 {
 /// RMSNorm with a learned weight (no `1 + w`).
 fn rms(x: &Tensor, weight: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
     rms_norm(&x.contiguous()?, weight, eps)
+}
+
+/// Grouped-query attention without a score scale: `q` is `(1, n_head, t, d)`,
+/// `k` and `v` are `(1, n_kv, l, d)` and `mask` the additive `t x l` mask
+/// (`None` for a single query, which sees every key). Query head `h` reads KV
+/// head `h / (n_head / n_kv)`. The result is `(1, n_head, t, d)`.
+///
+/// The `n_head / n_kv` query heads of one KV head are stacked into the rows of
+/// one matmul against that head's keys, so K and V are never repeated.
+fn attend(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    mask: Option<&Tensor>,
+) -> candle_core::Result<Tensor> {
+    let (_, n_head, t, d) = q.dims4()?;
+    let (_, n_kv, l, _) = k.dims4()?;
+    let rows = n_head / n_kv * t;
+    let scores = q.reshape((1, n_kv, rows, d))?.matmul(&k.transpose(2, 3)?)?;
+    let scores = match mask {
+        Some(mask) => scores
+            .reshape((1, n_head, t, l))?
+            .broadcast_add(mask)?
+            .reshape((1, n_kv, rows, l))?,
+        None => scores,
+    };
+    softmax_last_dim(&scores.contiguous()?)?
+        .matmul(v)?
+        .reshape((1, n_head, t, d))
 }
 
 #[cfg(test)]
@@ -1025,7 +1194,33 @@ pub(crate) mod tiny {
         QTensor::quantize(&t, GgmlDType::F32).unwrap()
     }
 
+    /// Head counts and embedding dtypes of a tiny model.
+    #[derive(Clone, Copy)]
+    pub(crate) struct TinyOptions {
+        pub(crate) n_head: usize,
+        pub(crate) n_kv_head: usize,
+        /// Dtype of `token_embd.weight` (rows of `N_EMBD` = 64).
+        pub(crate) embd_dtype: GgmlDType,
+        /// Dtype of `per_layer_token_embd.weight` (rows of 192).
+        pub(crate) ple_dtype: GgmlDType,
+    }
+
+    impl Default for TinyOptions {
+        fn default() -> Self {
+            Self {
+                n_head: N_HEAD,
+                n_kv_head: 1,
+                embd_dtype: GgmlDType::Q8_0,
+                ple_dtype: GgmlDType::Q4_0,
+            }
+        }
+    }
+
     pub(crate) fn write_tiny_model() -> TinyModel {
+        write_tiny_model_with(TinyOptions::default())
+    }
+
+    pub(crate) fn write_tiny_model_with(o: TinyOptions) -> TinyModel {
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
             "cuca-gemma4-tiny-{}-{}.gguf",
@@ -1038,11 +1233,11 @@ pub(crate) mod tiny {
 
         add(
             "token_embd.weight",
-            quantized(&mut rng, &[VOCAB, N_EMBD], GgmlDType::Q8_0, 0.5),
+            quantized(&mut rng, &[VOCAB, N_EMBD], o.embd_dtype, 0.5),
         );
         add(
             "per_layer_token_embd.weight",
-            quantized(&mut rng, &[VOCAB, N_LAYER * PLE], GgmlDType::Q4_0, 0.5),
+            quantized(&mut rng, &[VOCAB, N_LAYER * PLE], o.ple_dtype, 0.5),
         );
         add(
             "per_layer_model_proj.weight",
@@ -1067,23 +1262,23 @@ pub(crate) mod tiny {
             add(&b("attn_norm"), norm(&mut rng, N_EMBD));
             add(
                 &b("attn_q"),
-                quantized(&mut rng, &[N_HEAD * d, N_EMBD], GgmlDType::Q4_0, 0.3),
+                quantized(&mut rng, &[o.n_head * d, N_EMBD], GgmlDType::Q4_0, 0.3),
             );
             add(&b("attn_q_norm"), norm(&mut rng, d));
             if il < N_LAYER_KV {
                 add(
                     &b("attn_k"),
-                    quantized(&mut rng, &[d, N_EMBD], GgmlDType::Q4_0, 0.3),
+                    quantized(&mut rng, &[o.n_kv_head * d, N_EMBD], GgmlDType::Q4_0, 0.3),
                 );
                 add(&b("attn_k_norm"), norm(&mut rng, d));
                 add(
                     &b("attn_v"),
-                    quantized(&mut rng, &[d, N_EMBD], GgmlDType::Q4_0, 0.3),
+                    quantized(&mut rng, &[o.n_kv_head * d, N_EMBD], GgmlDType::Q4_0, 0.3),
                 );
             }
             add(
                 &b("attn_output"),
-                quantized(&mut rng, &[N_EMBD, N_HEAD * d], GgmlDType::Q4_0, 0.3),
+                quantized(&mut rng, &[N_EMBD, o.n_head * d], GgmlDType::Q4_0, 0.3),
             );
             add(&b("post_attention_norm"), norm(&mut rng, N_EMBD));
             add(&b("ffn_norm"), norm(&mut rng, N_EMBD));
@@ -1125,8 +1320,11 @@ pub(crate) mod tiny {
             ("gemma4.block_count", Value::U32(N_LAYER as u32)),
             ("gemma4.context_length", Value::U32(CONTEXT as u32)),
             ("gemma4.embedding_length", Value::U32(N_EMBD as u32)),
-            ("gemma4.attention.head_count", Value::U32(N_HEAD as u32)),
-            ("gemma4.attention.head_count_kv", Value::U32(1)),
+            ("gemma4.attention.head_count", Value::U32(o.n_head as u32)),
+            (
+                "gemma4.attention.head_count_kv",
+                Value::U32(o.n_kv_head as u32),
+            ),
             ("gemma4.attention.key_length", Value::U32(HEAD_FULL as u32)),
             (
                 "gemma4.attention.key_length_swa",
@@ -1292,7 +1490,126 @@ mod tests {
     fn dequant_row_rejects_bad_input() {
         let mut out = [0f32; 32];
         assert!(dequant_row(GgmlDType::Q4_0, &[0u8; 17], 1.0, &mut out).is_err());
-        assert!(dequant_row(GgmlDType::F32, &[0u8; 128], 1.0, &mut out).is_err());
+        assert!(dequant_row(GgmlDType::F32, &[0u8; 127], 1.0, &mut out).is_err());
+        // 32 elements are not a whole 256-element K-quant block.
+        assert!(dequant_row(GgmlDType::Q4K, &[0u8; 144], 1.0, &mut out).is_err());
+    }
+
+    /// Nibble bytes `j | (15 - j) << 4` of a 32-element legacy block.
+    fn nibbles() -> Vec<u8> {
+        (0..16u8).map(|j| j | ((15 - j) << 4)).collect()
+    }
+
+    #[test]
+    fn dequant_row_q4_1() {
+        // Element = nibble * d + m, scaled; low nibbles first, then high.
+        let mut block = Vec::from(f16_bytes(0.5));
+        block.extend(f16_bytes(-1.0));
+        block.extend(nibbles());
+        let mut out = [0f32; 32];
+        dequant_row(GgmlDType::Q4_1, &block, 2.0, &mut out).unwrap();
+        for j in 0..16 {
+            assert_eq!(out[j], (j as f32 * 0.5 - 1.0) * 2.0, "low {j}");
+            assert_eq!(out[j + 16], ((15 - j) as f32 * 0.5 - 1.0) * 2.0, "high {j}");
+        }
+    }
+
+    /// The 5-bit quant of element `i` of a Q5 block: its nibble (low nibbles
+    /// are elements 0..16, high nibbles 16..32) plus bit `i` of `qh` as bit 4.
+    fn q5_quant(qh: u32, i: usize) -> f32 {
+        let q = nibbles()[i % 16];
+        let nibble = if i < 16 { q & 0x0F } else { q >> 4 };
+        f32::from(nibble | ((((qh >> i) & 1) as u8) << 4))
+    }
+
+    #[test]
+    fn dequant_row_q5_0() {
+        let qh = 0xA5C3_0F1Eu32;
+        let mut block = Vec::from(f16_bytes(0.25));
+        block.extend(qh.to_le_bytes());
+        block.extend(nibbles());
+        let mut out = [0f32; 32];
+        dequant_row(GgmlDType::Q5_0, &block, 2.0, &mut out).unwrap();
+        for (i, &o) in out.iter().enumerate() {
+            assert_eq!(o, (q5_quant(qh, i) - 16.0) * 0.25 * 2.0, "element {i}");
+        }
+    }
+
+    #[test]
+    fn dequant_row_q5_1() {
+        let qh = 0x5A3C_F0E1u32;
+        let mut block = Vec::from(f16_bytes(0.25));
+        block.extend(f16_bytes(3.0));
+        block.extend(qh.to_le_bytes());
+        block.extend(nibbles());
+        // Two blocks to cover the block stride.
+        block.extend_from_within(..);
+        let mut out = [0f32; 64];
+        dequant_row(GgmlDType::Q5_1, &block, 2.0, &mut out).unwrap();
+        for (i, &o) in out.iter().enumerate() {
+            assert_eq!(o, (q5_quant(qh, i % 32) * 0.25 + 3.0) * 2.0, "element {i}");
+        }
+    }
+
+    #[test]
+    fn dequant_row_float_dtypes() {
+        let values = [1.5f32, -2.0, 0.25, 8.0];
+        let mut out = [0f32; 4];
+
+        let bytes: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
+        dequant_row(GgmlDType::F32, &bytes, 2.0, &mut out).unwrap();
+        assert_eq!(out, [3.0, -4.0, 0.5, 16.0]);
+
+        let bytes: Vec<u8> = values.iter().flat_map(|&v| f16_bytes(v)).collect();
+        dequant_row(GgmlDType::F16, &bytes, 2.0, &mut out).unwrap();
+        assert_eq!(out, [3.0, -4.0, 0.5, 16.0]);
+
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|&v| half::bf16::from_f32(v).to_bits().to_le_bytes())
+            .collect();
+        dequant_row(GgmlDType::BF16, &bytes, 2.0, &mut out).unwrap();
+        assert_eq!(out, [3.0, -4.0, 0.5, 16.0]);
+    }
+
+    /// Every dtype candle can quantize to must dequantize a row exactly as
+    /// candle's own dequantizer does: the legacy and float paths are decoded
+    /// here, the K-quants are delegated.
+    #[test]
+    fn dequant_row_matches_candle_for_every_dtype() {
+        let row: Vec<f32> = (0..512)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.07)
+            .collect();
+        let tensor = Tensor::from_vec(row, 512, &Device::Cpu).unwrap();
+        for dtype in [
+            GgmlDType::F32,
+            GgmlDType::F16,
+            GgmlDType::BF16,
+            GgmlDType::Q4_0,
+            GgmlDType::Q4_1,
+            GgmlDType::Q5_0,
+            GgmlDType::Q5_1,
+            GgmlDType::Q8_0,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+        ] {
+            let qt = QTensor::quantize(&tensor, dtype).unwrap();
+            let expected = qt
+                .dequantize(&Device::Cpu)
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            let mut out = vec![0f32; 512];
+            dequant_row(dtype, &qt.data().unwrap(), 1.0, &mut out).unwrap();
+            assert_eq!(out, expected, "{dtype:?}");
+            dequant_row(dtype, &qt.data().unwrap(), 4.0, &mut out).unwrap();
+            for (o, e) in out.iter().zip(&expected) {
+                assert_eq!(*o, e * 4.0, "{dtype:?}");
+            }
+        }
     }
 
     #[test]
@@ -1352,6 +1669,71 @@ mod tests {
         assert_eq!(a.dims(), &[1, 1, 6, 8]);
     }
 
+    /// `attend` on narrowed cache views against a per-head scalar reference:
+    /// query head `h` must read KV head `h / (n_head / n_kv)`.
+    #[test]
+    fn grouped_attention_matches_a_per_head_reference() {
+        let dev = Device::Cpu;
+        let (n_head, n_kv, ctx, d, lo, l) = (4usize, 2usize, 16usize, 8usize, 3usize, 5usize);
+        let gen_values = |n: usize, salt: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| (((i * 31 + salt * 17) % 23) as f32 - 11.0) * 0.1)
+                .collect()
+        };
+        let kc = gen_values(n_kv * ctx * d, 1);
+        let vc = gen_values(n_kv * ctx * d, 2);
+        let cache_k = Tensor::from_vec(kc.clone(), (1, n_kv, ctx, d), &dev).unwrap();
+        let cache_v = Tensor::from_vec(vc.clone(), (1, n_kv, ctx, d), &dev).unwrap();
+        let k = cache_k.narrow(2, lo, l).unwrap();
+        let v = cache_v.narrow(2, lo, l).unwrap();
+
+        for t in [3usize, 1] {
+            let qv = gen_values(n_head * t * d, 3 + t);
+            let q = Tensor::from_vec(qv.clone(), (1, n_head, t, d), &dev).unwrap();
+            let hi = lo + l;
+            let mask_values = attention_mask(hi - t, t, lo, hi, None);
+            let mask =
+                (t > 1).then(|| Tensor::from_vec(mask_values.clone(), (t, l), &dev).unwrap());
+            let got = attend(&q, &k, &v, mask.as_ref())
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+            assert_eq!(got.len(), n_head * t * d);
+
+            for h in 0..n_head {
+                let kv_head = h / (n_head / n_kv);
+                for i in 0..t {
+                    let scores: Vec<f32> = (0..l)
+                        .map(|j| {
+                            let key = &kc[(kv_head * ctx + lo + j) * d..][..d];
+                            let dot: f32 = qv[(h * t + i) * d..][..d]
+                                .iter()
+                                .zip(key)
+                                .map(|(a, b)| a * b)
+                                .sum();
+                            dot + mask_values[i * l + j]
+                        })
+                        .collect();
+                    let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let weights: Vec<f32> = scores.iter().map(|s| (s - max).exp()).collect();
+                    let total: f32 = weights.iter().sum();
+                    for x in 0..d {
+                        let expected: f32 = (0..l)
+                            .map(|j| weights[j] / total * vc[(kv_head * ctx + lo + j) * d + x])
+                            .sum();
+                        let actual = got[(h * t + i) * d + x];
+                        assert!(
+                            (actual - expected).abs() < 1e-4,
+                            "t {t} head {h} query {i} dim {x}: {actual} vs {expected}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
     fn md(entries: &[(&str, gguf_file::Value)]) -> HashMap<String, gguf_file::Value> {
         entries
             .iter()
@@ -1389,6 +1771,7 @@ mod tests {
         assert_eq!(p.n_layer, 35);
         assert_eq!(p.n_layer_kv, 15);
         assert_eq!(p.n_embd, 1536);
+        assert_eq!(p.n_kv_head, 1);
         assert_eq!((p.head_dim_full, p.head_dim_swa), (512, 256));
         assert_eq!((p.window, p.ple_dim, p.model_ctx), (512, 256, 131_072));
         assert_eq!(p.kv_source[15], 13);
@@ -1416,26 +1799,68 @@ mod tests {
     }
 
     #[test]
-    fn params_reject_unsupported_checkpoints() {
+    fn params_read_the_gqa_metadata() {
         let mut meta = e2b_metadata();
         meta.insert(
             "gemma4.attention.head_count_kv".into(),
             gguf_file::Value::U32(2),
         );
-        let msg = Gemma4Params::from_metadata(&meta).unwrap_err().to_string();
-        assert!(msg.contains("only single-KV-head"), "{msg}");
+        assert_eq!(Gemma4Params::from_metadata(&meta).unwrap().n_kv_head, 2);
+
+        // A uniform per-layer array is accepted as one count.
+        meta.insert(
+            "gemma4.attention.head_count_kv".into(),
+            gguf_file::Value::Array(vec![gguf_file::Value::U32(4); 35]),
+        );
+        assert_eq!(Gemma4Params::from_metadata(&meta).unwrap().n_kv_head, 4);
+    }
+
+    #[test]
+    fn params_reject_unsupported_checkpoints() {
+        use gguf_file::Value::{Array, U32};
+        let reject = |key: &str, value: gguf_file::Value, needle: &str| {
+            let mut meta = e2b_metadata();
+            meta.insert(key.into(), value);
+            let msg = Gemma4Params::from_metadata(&meta).unwrap_err().to_string();
+            assert!(msg.contains(needle), "{msg}");
+        };
+        reject(
+            "gemma4.attention.head_count_kv",
+            U32(3),
+            "3 KV heads do not divide 8 query heads",
+        );
+        reject(
+            "gemma4.attention.head_count_kv",
+            U32(0),
+            "0 KV heads do not divide",
+        );
+        reject(
+            "gemma4.attention.head_count_kv",
+            Array(vec![U32(1), U32(2)]),
+            "per-layer KV head counts",
+        );
+        reject(
+            "gemma4.attention.value_length",
+            U32(256),
+            "differs from the key length 512",
+        );
+        reject(
+            "gemma4.attention.value_length_swa",
+            U32(128),
+            "differs from the key length 256",
+        );
+        reject("gemma4.expert_count", U32(8), "MoE");
 
         let mut meta = e2b_metadata();
-        meta.insert("gemma4.expert_count".into(), gguf_file::Value::U32(8));
-        let msg = Gemma4Params::from_metadata(&meta).unwrap_err().to_string();
-        assert!(msg.contains("MoE"), "{msg}");
-
-        let mut meta = e2b_metadata();
-        meta.insert("gemma4.expert_count".into(), gguf_file::Value::U32(0));
+        meta.insert("gemma4.expert_count".into(), U32(0));
+        meta.insert("gemma4.attention.value_length".into(), U32(512));
+        meta.insert("gemma4.attention.value_length_swa".into(), U32(256));
         assert!(Gemma4Params::from_metadata(&meta).is_ok());
     }
 
-    use super::tiny::{PROMPT, assert_close, load, write_tiny_model};
+    use super::tiny::{
+        PROMPT, TinyOptions, assert_close, load, write_tiny_model, write_tiny_model_with,
+    };
 
     #[test]
     fn tiny_model_loads_and_yields_finite_varying_logits() {
@@ -1535,5 +1960,109 @@ mod tests {
         let err = Gemma4::load(&content, &model.path, 33).err().unwrap();
         assert!(matches!(&err, CucaError::Config(m) if m.contains("exceeds the model maximum 32")));
         assert!(Gemma4::load(&content, &model.path, 0).is_err());
+    }
+
+    /// Per-position KV bytes by the general formula: every K/V-owning layer
+    /// stores `n_kv_head * head_dim` K and V values in f32.
+    fn kv_bytes_per_position(p: &Gemma4Params) -> usize {
+        (0..p.n_layer_kv)
+            .map(|il| {
+                let d = if p.is_sliding[il] {
+                    p.head_dim_swa
+                } else {
+                    p.head_dim_full
+                };
+                p.n_kv_head * d * 2 * 4
+            })
+            .sum()
+    }
+
+    #[test]
+    fn kv_cache_bytes_follow_the_general_formula() {
+        // E2B: 12 sliding (256) and 3 full (512) owners, one KV head.
+        let e2b = Gemma4Params::from_metadata(&e2b_metadata()).unwrap();
+        assert_eq!(kv_bytes_per_position(&e2b), 36_864);
+        assert_eq!(kv_bytes_per_position(&e2b) * 8192, 301_989_888);
+
+        // E4B: 42 layers (every sixth full), 18 shared, two KV heads: 20
+        // sliding and 4 full owners.
+        let mut meta = e2b_metadata();
+        let pattern = (0..42)
+            .map(|il| gguf_file::Value::Bool(il % 6 != 5))
+            .collect();
+        for (key, value) in [
+            ("gemma4.block_count", gguf_file::Value::U32(42)),
+            ("gemma4.embedding_length", gguf_file::Value::U32(2560)),
+            ("gemma4.attention.head_count_kv", gguf_file::Value::U32(2)),
+            (
+                "gemma4.attention.shared_kv_layers",
+                gguf_file::Value::U32(18),
+            ),
+            (
+                "gemma4.attention.sliding_window_pattern",
+                gguf_file::Value::Array(pattern),
+            ),
+        ] {
+            meta.insert(key.into(), value);
+        }
+        let e4b = Gemma4Params::from_metadata(&meta).unwrap();
+        assert_eq!((e4b.n_layer_kv, e4b.n_kv_head), (24, 2));
+        assert_eq!(kv_bytes_per_position(&e4b), 114_688);
+    }
+
+    /// Grouped-query attention (4 query heads over 2 KV heads) must keep the
+    /// forward pass consistent across chunking and single-token decode, like
+    /// the single-KV-head model.
+    #[test]
+    fn gqa_tiny_model_is_chunk_and_decode_consistent() {
+        let model = write_tiny_model_with(TinyOptions {
+            n_head: 4,
+            n_kv_head: 2,
+            ..TinyOptions::default()
+        });
+        let mut whole = load(&model, 32);
+        let expected = whole.forward(&PROMPT, 0, true).unwrap().unwrap();
+        assert!(expected.iter().all(|l| l.is_finite()));
+
+        let mut chunked = load(&model, 32);
+        chunked.forward(&PROMPT[..3], 0, false).unwrap();
+        chunked.forward(&PROMPT[3..8], 3, false).unwrap();
+        let got = chunked.forward(&PROMPT[8..], 8, true).unwrap().unwrap();
+        assert_close(&expected, &got);
+
+        let mut stepped = load(&model, 32);
+        let n = PROMPT.len();
+        stepped.forward(&PROMPT[..n - 1], 0, false).unwrap();
+        let got = stepped
+            .forward(&PROMPT[n - 1..], n - 1, true)
+            .unwrap()
+            .unwrap();
+        assert_close(&expected, &got);
+    }
+
+    /// Both embedding tables load and look up rows in every legacy and float
+    /// dtype, not just the published Q4_0 / Q8_0 layout.
+    #[test]
+    fn tiny_models_load_with_other_embedding_dtypes() {
+        for (embd_dtype, ple_dtype) in [
+            (GgmlDType::Q4_1, GgmlDType::Q5_0),
+            (GgmlDType::Q5_1, GgmlDType::Q8_0),
+            (GgmlDType::Q5_0, GgmlDType::Q4_1),
+            (GgmlDType::F16, GgmlDType::Q5_1),
+            (GgmlDType::F32, GgmlDType::F16),
+            (GgmlDType::BF16, GgmlDType::BF16),
+        ] {
+            let model = write_tiny_model_with(TinyOptions {
+                embd_dtype,
+                ple_dtype,
+                ..TinyOptions::default()
+            });
+            let mut g = load(&model, 32);
+            let logits = g.forward(&PROMPT, 0, true).unwrap().unwrap();
+            assert!(
+                logits.iter().all(|l| l.is_finite() && l.abs() <= 30.0),
+                "{embd_dtype:?} / {ple_dtype:?}"
+            );
+        }
     }
 }

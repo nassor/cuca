@@ -1,29 +1,39 @@
-//! Run Gemma 4 E2B in-process on the CPU: no server, no HTTP endpoint.
+//! Run Gemma 4 in-process on the CPU: no server, no HTTP endpoint.
 //!
 //! One `LocalModel` downloads (once) and loads the model; one client routes a
-//! request to it and streams the reply.
+//! request to it and streams the reply. The default is E2B Q4_0; the
+//! environment selects another checkpoint (see Configuration).
 //!
 //! # Prerequisites
 //!
 //! - A checkout of this repository (the example builds from this crate).
-//! - About 2.8 GB of disk for the one-time download of the Q4_0 GGUF file
-//!   (`ggml-org/gemma-4-E2B-it-GGUF`, SHA-256 verified), and roughly 1.5 GB of
-//!   RAM plus the KV cache (`context_length * 36,864` bytes, 302 MB at the
-//!   default 8192).
+//! - Disk for the one-time download of the GGUF file: 2.84 GB for the default
+//!   E2B Q4_0 (`ggml-org/gemma-4-E2B-it-GGUF`, SHA-256 verified), up to
+//!   8.03 GB for E4B Q8_0. RAM is about the file size minus the per-layer
+//!   embedding table, plus the KV cache: roughly 1.5 GB plus 302 MB at the
+//!   default 8192 context for E2B Q4_0 (`context_length * 36,864` bytes; the
+//!   general formula is on `LocalModel`). See "Choosing a model" in the
+//!   local-provider docs page for every preset.
 //!
 //! # Run
 //!
-//! candle picks its Q4_0/Q8_0 SIMD kernels at compile time, so build for the
+//! candle picks its quantized SIMD kernels at compile time, so build for the
 //! host CPU:
 //!
 //! ```sh
 //! RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_gemma --features provider-local
+//! CUCA_LOCAL_MODEL=gemma4-e4b-q4_0 RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_gemma --features provider-local
 //! ```
 //!
 //! # Configuration
 //!
-//! - `CUCA_LOCAL_MODEL_PATH`: path of an already downloaded GGUF file; skips
-//!   the download.
+//! - `CUCA_LOCAL_MODEL_PATH`: path of an already downloaded GGUF file (any
+//!   dense `gemma4` checkpoint); skips the download and wins over
+//!   `CUCA_LOCAL_MODEL`.
+//! - `CUCA_LOCAL_MODEL`: what to download: a preset name (`gemma4-e2b-q4_0`,
+//!   `gemma4-e2b-q8_0`, `gemma4-e4b-q4_0`, `gemma4-e4b-q8_0`, ASCII
+//!   case-insensitive) or an unverified `repo:revision:file` on Hugging Face.
+//!   Default: `gemma4-e2b-q4_0`.
 //! - `CUCA_CACHE_DIR`: download cache directory, defaults to the platform cache
 //!   directory.
 //! - `HF_TOKEN`: Hugging Face token, only needed for gated mirrors.
@@ -52,7 +62,8 @@ use tokio_stream::StreamExt;
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Stage 1: load the model. A path in the environment skips the download;
-    // otherwise the default source is the pinned Gemma 4 E2B Q4_0 file, and the
+    // `CUCA_LOCAL_MODEL` picks a preset or `repo:revision:file` to download;
+    // otherwise the default source is the pinned Gemma 4 E2B Q4_0 file. The
     // callback reports download progress on stderr.
     let mut config = LocalModelConfig {
         on_download_progress: Some(DownloadProgressCallback::new(|progress| {
@@ -65,6 +76,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
         config.source = ModelSource::File(PathBuf::from(path));
+    } else if let Ok(name) = std::env::var("CUCA_LOCAL_MODEL")
+        && !name.is_empty()
+    {
+        config.source = name.parse()?;
     }
     let model = LocalModel::load(config).await?;
     eprintln!();
@@ -78,7 +93,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Stage 3: build the request. Thinking is on, so the stream carries
     // `Thinking` blocks ahead of the answer.
-    let request = UnifiedRequest::new("gemma-4-e2b-it")
+    let request = UnifiedRequest::new("gemma-4-it")
         .add_system_message("You are concise.")
         .add_user_message("Explain CUCA in one sentence.")
         .enable_thinking(None)

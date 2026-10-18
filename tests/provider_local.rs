@@ -1,17 +1,23 @@
 //! Live tests for the in-process `provider-local` Gemma 4 engine.
 //!
-//! These run the real model on the CPU, so they need the GGUF file:
+//! These run the real model on the CPU, so they need a Gemma 4 GGUF file:
 //!
-//! - `CUCA_LOCAL_MODEL_PATH=<file.gguf>` loads an existing file, or
-//! - `CUCA_LOCAL_DOWNLOAD=1` downloads the pinned Gemma 4 E2B Q4_0 file
-//!   (2.84 GB) into the cache directory (`CUCA_CACHE_DIR` overrides it).
+//! - `CUCA_LOCAL_MODEL_PATH=<file.gguf>` loads an existing file (any dense
+//!   `gemma4` checkpoint), or
+//! - `CUCA_LOCAL_MODEL=<preset or repo:revision:file>` downloads that model
+//!   into the cache directory (`CUCA_CACHE_DIR` overrides it): a preset name
+//!   (`gemma4-e2b-q4_0`, `gemma4-e2b-q8_0`, `gemma4-e4b-q4_0`,
+//!   `gemma4-e4b-q8_0`) or an unverified `repo:revision:file`; or
+//! - `CUCA_LOCAL_DOWNLOAD=1` downloads the default, the pinned Gemma 4 E2B
+//!   Q4_0 file (2.84 GB).
 //!
-//! With neither set, every test prints `SKIP: local model not available: ...`
-//! and passes, unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build
-//! for the host CPU, since candle's SIMD kernels are chosen at compile time:
+//! `CUCA_LOCAL_MODEL_PATH` wins when several are set. With none set, every
+//! test prints `SKIP: local model not available: ...` and passes, unless
+//! `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build for the host CPU,
+//! since candle's SIMD kernels are chosen at compile time:
 //!
 //! ```sh
-//! CUCA_LOCAL_DOWNLOAD=1 RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local
+//! CUCA_LOCAL_MODEL=gemma4-e4b-q4_0 RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local
 //! ```
 //!
 //! One model is loaded for the whole binary and the tests take turns on its
@@ -34,17 +40,33 @@ use tokio_stream::StreamExt;
 static MODEL: OnceCell<Option<LocalModel>> = OnceCell::const_new();
 static ENGINE_TURN: Mutex<()> = Mutex::const_new(());
 
+/// The model to load, from the environment; `None` when none is configured.
+///
+/// `CUCA_LOCAL_MODEL_PATH` (an existing file) wins. Otherwise
+/// `CUCA_LOCAL_MODEL` selects a download, by preset name or
+/// `repo:revision:file`, and `CUCA_LOCAL_DOWNLOAD=1` alone downloads the
+/// default (E2B Q4_0).
+fn model_source() -> Option<ModelSource> {
+    if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
+        return Some(ModelSource::File(path.into()));
+    }
+    match std::env::var("CUCA_LOCAL_MODEL") {
+        Ok(name) if !name.is_empty() => Some(
+            name.parse()
+                .unwrap_or_else(|e| panic!("CUCA_LOCAL_MODEL={name:?}: {e}")),
+        ),
+        _ if std::env::var("CUCA_LOCAL_DOWNLOAD").as_deref() == Ok("1") => {
+            Some(ModelSource::gemma4_e2b_it_q4_0())
+        }
+        _ => None,
+    }
+}
+
 /// The shared model, loaded on first use; `None` when no source is configured.
 async fn model() -> Option<LocalModel> {
     MODEL
         .get_or_init(|| async {
-            let source = if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-                ModelSource::File(path.into())
-            } else if std::env::var("CUCA_LOCAL_DOWNLOAD").as_deref() == Ok("1") {
-                ModelSource::gemma4_e2b_it_q4_0()
-            } else {
-                return None;
-            };
+            let source = model_source()?;
             let config = LocalModelConfig {
                 source,
                 on_download_progress: Some(DownloadProgressCallback::new(|p| {
@@ -67,8 +89,8 @@ async fn model() -> Option<LocalModel> {
 
 /// Skip (or, under `CUCA_REQUIRE_LIVE=1`, fail) when no model is configured.
 fn skip_or_fail() {
-    let reason =
-        "SKIP: local model not available: set CUCA_LOCAL_MODEL_PATH or CUCA_LOCAL_DOWNLOAD=1";
+    let reason = "SKIP: local model not available: set CUCA_LOCAL_MODEL_PATH, \
+                  CUCA_LOCAL_MODEL or CUCA_LOCAL_DOWNLOAD=1";
     if std::env::var("CUCA_REQUIRE_LIVE").as_deref() == Ok("1") {
         panic!("{reason}");
     }
@@ -130,7 +152,7 @@ async fn ask(model: &LocalModel, request: UnifiedRequest) -> Reply {
 }
 
 fn request() -> UnifiedRequest {
-    UnifiedRequest::new("gemma-4-e2b-it")
+    UnifiedRequest::new("gemma-4-it")
 }
 
 #[tokio::test]
