@@ -39,8 +39,8 @@
   `functionDeclarations`), without a tool-choice override.
 - `provider-local`: Gemma 4 E2B (Q4_0 GGUF) runs in-process on the CPU through
   candle 0.11, with no HTTP endpoint and no llama.cpp. The engine code is pure
-  Rust with no FFI written by cuca; candle's dependency tree builds C/C++ crates
-  (`onig_sys` and `esaxx-rs`, via `tokenizers`), so a C/C++ toolchain is required.
+  Rust with no FFI written by cuca; candle's dependency tree builds one C crate
+  (`onig_sys`, via `tokenizers`), so a C compiler is required.
   `LocalModel::load(LocalModelConfig)` downloads the pinned model into a cache
   directory (resumable, SHA-256-verified) or opens a GGUF file; attach it with
   `CucaClientBuilder::with_local_model` and select `ProviderEndpoint::Local`.

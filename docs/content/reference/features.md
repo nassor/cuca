@@ -120,7 +120,7 @@ wire types, the SSE parser and the response stream contract.
 `reqwest` is declared with `default-features = false`, so TLS arrives only
 through the `reqwest/rustls` entry that every provider feature and
 `plugin-web-search` carries. `candle-core` hard-depends on `tokenizers[onig]`,
-so `provider-local` also compiles C (`onig_sys`) and C++ (`esaxx-rs`).
+so `provider-local` also compiles C (`onig_sys`).
 `jsonschema` is declared with
 `default-features = false` because guardrails compiles inline schemas only and
 needs no `$ref` retrieval. `postcard` is declared with

@@ -80,8 +80,8 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_gemma --fea
 | Dependencies it owns | `candle-core` and `candle-nn` (0.11), `half`, `minijinja`, `minijinja-contrib`; it reuses `reqwest`, `sha2` and `tokio`, and does not use `tokio-stream` |
 
 candle-core 0.11 hard-depends on `tokenizers[onig]`, so the dependency tree
-compiles C (`onig_sys`) and C++ (`esaxx-rs`); the feature needs a C/C++ toolchain.
-cuca never calls those crates; the engine code is pure Rust.
+compiles C (`onig_sys`); the feature needs a C compiler.
+cuca never calls that crate; the engine code is pure Rust.
 
 ## Choosing the model file
 

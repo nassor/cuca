@@ -23,8 +23,8 @@ doctest = false
 # Dependency/feature split:
 # - provider-local does not use tokio-stream (its stream is a plain mpsc receiver).
 #   candle-core/candle-nn 0.11: candle-core hard-depends on tokenizers[onig], so the
-#   tree builds C/C++ (onig_sys, esaxx-rs); the engine code itself is pure Rust. Not
-#   used directly: candle-transformers, tokenizers, hf-hub, memmap2, rayon, rand.
+#   tree builds C (onig_sys); the engine code itself is pure Rust. Not used directly:
+#   candle-transformers, tokenizers, hf-hub, memmap2, rayon, rand.
 # - Core (unconditional): bytes, futures-core, memchr, serde, serde_json. They define
 #   the public wire types, SSE parser, and response stream contract.
 # - Network and runtime dependencies are optional. Every provider enables reqwest and
