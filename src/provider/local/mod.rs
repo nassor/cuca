@@ -1,7 +1,9 @@
 //! In-process Gemma 4 inference (`provider-local`).
 //!
-//! Pure Rust on the CPU through candle 0.9.x: no llama.cpp, no FFI, and no
-//! HTTP endpoint. The model runs inside the application and is consumed
+//! The engine is pure Rust on the CPU through candle 0.11: no llama.cpp, no FFI
+//! written by this crate, and no HTTP endpoint. (candle's dependency tree
+//! compiles C/C++ crates, `onig_sys` and `esaxx-rs`, via `tokenizers`; cuca
+//! never calls them.) The model runs inside the application and is consumed
 //! through the library API only.
 //!
 //! `LocalModel::load` resolves and loads the GGUF file and starts one engine

@@ -22,10 +22,9 @@ doctest = false
 
 # Dependency/feature split:
 # - provider-local does not use tokio-stream (its stream is a plain mpsc receiver).
-#   candle-core/candle-nn are pinned to 0.9.x: 0.10-0.11 hard-depend on
-#   tokenizers[onig], which compiles C (onig_sys); upgrade once a release ships the
-#   fancy-regex switch (candle main 5814a6f). Not used directly: candle-transformers,
-#   tokenizers, hf-hub, memmap2, rayon, rand.
+#   candle-core/candle-nn 0.11: candle-core hard-depends on tokenizers[onig], so the
+#   tree builds C/C++ (onig_sys, esaxx-rs); the engine code itself is pure Rust. Not
+#   used directly: candle-transformers, tokenizers, hf-hub, memmap2, rayon, rand.
 # - Core (unconditional): bytes, futures-core, memchr, serde, serde_json. They define
 #   the public wire types, SSE parser, and response stream contract.
 # - Network and runtime dependencies are optional. Every provider enables reqwest and
@@ -156,10 +155,10 @@ tracing = { version = "0.1", optional = true }
 # wide: portable SIMD (`f32x8`) for the vector store's cosine scan. Stable-only
 # by construction: `std::simd` is nightly, and this crate pins stable 1.98.
 wide = { version = "1.7", optional = true }
-# provider-local: candle 0.9.x for CPU tensors and quantized matmul; half for f16 block
+# provider-local: candle for CPU tensors and quantized matmul; half for f16 block
 # scales; minijinja (+pycompat for the Gemma 4 chat template's Python string methods).
-candle-core = { version = "0.9.2", optional = true, default-features = false }
-candle-nn = { version = "0.9.2", optional = true, default-features = false }
+candle-core = { version = "0.11.0", optional = true, default-features = false }
+candle-nn = { version = "0.11.0", optional = true, default-features = false }
 half = { version = "2", optional = true }
 minijinja = { version = "2.24", optional = true, features = ["loader"] }
 minijinja-contrib = { version = "2.24", optional = true, features = ["pycompat"] }

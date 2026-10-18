@@ -37,8 +37,8 @@
 //!
 //! The first run waits for the download and the load; later runs only load.
 //! Generation is CPU-bound: on one development machine (release build,
-//! `target-cpu=native`) decoding ran at roughly 13 tokens per second and
-//! prefill at roughly 30; expect different figures on other CPUs.
+//! `target-cpu=native`) decoding ran at roughly 17 tokens per second and
+//! prefill at roughly 60; expect different figures on other CPUs.
 
 use std::io::{Write, stdout};
 use std::path::PathBuf;

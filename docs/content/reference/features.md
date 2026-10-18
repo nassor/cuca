@@ -111,16 +111,16 @@ wire types, the SSE parser and the response stream contract.
 | `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
 | `postcard` | `1` | `use-std`; `default-features = false` | `plugin-session-log`, `service-prompt-cache` |
 | `wide` | `1.7` | default | `service-vector-store` |
-| `candle-core` | `0.9.2` | `default-features = false` | `provider-local` |
-| `candle-nn` | `0.9.2` | `default-features = false` | `provider-local` |
+| `candle-core` | `0.11.0` | `default-features = false` | `provider-local` |
+| `candle-nn` | `0.11.0` | `default-features = false` | `provider-local` |
 | `half` | `2` | default | `provider-local` |
 | `minijinja` | `2.24` | `loader` | `provider-local` |
 | `minijinja-contrib` | `2.24` | `pycompat` | `provider-local` |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only
 through the `reqwest/rustls` entry that every provider feature and
-`plugin-web-search` carries. `candle-core` and `candle-nn` are pinned to 0.9.x
-because 0.10 and 0.11 hard-depend on `tokenizers[onig]`, which compiles C.
+`plugin-web-search` carries. `candle-core` hard-depends on `tokenizers[onig]`,
+so `provider-local` also compiles C (`onig_sys`) and C++ (`esaxx-rs`).
 `jsonschema` is declared with
 `default-features = false` because guardrails compiles inline schemas only and
 needs no `$ref` retrieval. `postcard` is declared with

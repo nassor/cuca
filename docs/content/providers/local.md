@@ -1,6 +1,6 @@
 +++
 title = "Local (in-process)"
-description = "The provider-local adapter: Gemma 4 E2B on the CPU inside your process, in pure Rust. Model source and download, configuration, concurrency, memory and behavior."
+description = "The provider-local adapter: Gemma 4 E2B on the CPU inside your process, engine code in pure Rust. Model source and download, configuration, concurrency, memory and behavior."
 template = "page.html"
 weight = 8
 +++
@@ -16,8 +16,8 @@ weight = 8
 <dd>You are routing requests through <code>ProviderEndpoint::Local</code>, or want a model with no external service to run.</dd>
 </dl>
 
-This is the only provider that does not speak HTTP. The engine is 100% Rust:
-no llama.cpp, no FFI, and no HTTP endpoint. `LocalModel::load` resolves the
+This is the only provider that does not speak HTTP. The engine code is pure Rust:
+no llama.cpp, no FFI written by cuca, and no HTTP endpoint. `LocalModel::load` resolves the
 GGUF file, loads the weights, the tokenizer and the chat template, and starts one
 dedicated engine thread. `CucaClientBuilder::with_local_model` attaches the model
 to a client built for `ProviderEndpoint::Local`, and `generate_stream` routes
@@ -77,10 +77,11 @@ RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_gemma --fea
 | `ProviderEndpoint` variant | `Local` |
 | Attached with | `CucaClientBuilder::with_local_model`; `build` fails without it |
 | Network use | only the one-time model download from Hugging Face |
-| Dependencies it owns | `candle-core` and `candle-nn` (0.9.x), `half`, `minijinja`, `minijinja-contrib`; it reuses `reqwest`, `sha2` and `tokio`, and does not use `tokio-stream` |
+| Dependencies it owns | `candle-core` and `candle-nn` (0.11), `half`, `minijinja`, `minijinja-contrib`; it reuses `reqwest`, `sha2` and `tokio`, and does not use `tokio-stream` |
 
-candle is pinned to 0.9.x because 0.10 and 0.11 hard-depend on
-`tokenizers[onig]`, which compiles C.
+candle-core 0.11 hard-depends on `tokenizers[onig]`, so the dependency tree
+compiles C (`onig_sys`) and C++ (`esaxx-rs`); the feature needs a C/C++ toolchain.
+cuca never calls those crates; the engine code is pure Rust.
 
 ## Choosing the model file
 
