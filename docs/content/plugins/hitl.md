@@ -16,30 +16,80 @@ weight = 7
 <dd>You are registering <code>HitlPlugin</code> or implementing an <code>ApprovalChannel</code>.</dd>
 </dl>
 
-`HitlPlugin` classifies streamed tool calls by risk, keyword-matching the tool name against shell/exec, file-write, and external-API-write groups, and pauses a `Risk::High` call on a caller-supplied `ApprovalChannel` before it executes. A channel that cannot reach an approver must return `Denied`, so a lost round trip never lets a tool run. Reach for it to put a human, or an automated policy, between the model and a destructive tool call.
+## Feature and entry type
 
-```rust,name=Gate a write tool on an approval policy
-use std::sync::{Arc, Mutex};
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-hitl` (enables `dep:tokio`) |
+| Entry type | `HitlPlugin` |
+| Supporting types | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `OneshotApprovalChannel`, `Risk` |
+| Also in `cuca::plugins::hitl` | `HitlAuditEntry`, `classify_tool_call` |
+| Plugin name | `"hitl-approvals"` |
+| Attachment | `register_plugin` |
+| Peer features | None |
+| Needs | An `ApprovalChannel` implementation |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{
-    MessageContentBlock, MessageRole, ProviderEndpoint, ToolDefinition, UnifiedMessage,
-};
-use cuca::{
-    AgentResponseStream, ApprovalChannel, ApprovalDecision, ApprovalRequest, CucaClient, CucaError,
-    HitlPlugin, PluginError, UnifiedRequest,
-};
-use serde_json::{Value, json};
-use tokio_stream::StreamExt;
+## Hooks
 
-/// The one notebook this policy is willing to let the model write into.
-const OPEN_NOTEBOOK: &str = "scratch";
+`HitlPlugin` overrides `on_stream_chunk` only. Blocks other than `ToolCall` pass through untouched.
 
-/// One approval policy, two outcomes.
-///
-/// `ApprovalRequest::detail` is the tool name plus its JSON arguments, which is
-/// everything an approver needs to rule on the call, so the policy needs no
-/// access to the request or the stream.
+`classify_tool_call(name)` lowercases the tool name and checks it for each keyword as a substring. Three groups are `Risk::High`, and each group sets the `ApprovalRequest::action` string:
+
+- Shell and exec, action `shell_exec`: `shell`, `exec`, `bash`, `run_command`, `terminal`.
+- File write, action `file_write`: `write`, `edit`, `delete`, `remove`, `rm_`, `mv_`, `move`, `create_file`.
+- External API write, action `external_api_write`: `http_post`, `http_put`, `http_delete`, `api_write`, `post_`, `put_`, `delete_`.
+
+Every other name, including an unrecognized one, is `Risk::Low`. The shell group is checked first.
+
+- A `Risk::Low` call streams through without touching the channel and without an audit entry.
+- A `Risk::High` call builds an `ApprovalRequest` and blocks on `ApprovalChannel::request_approval`. The request carries `tool_call_id`, `action`, and `detail`, which is the tool name plus its JSON arguments cut to 200 characters with a trailing ellipsis.
+- `ApprovalDecision::Approved` streams the call through unchanged and records `"approved"`.
+- `ApprovalDecision::Denied` replaces the block with a `ToolResult` whose output is `"denied by approver"` and records `"denied"`. The application executes nothing.
+
+An approved call is not executed by the plugin. The application runs it.
+
+`ApprovalChannel` is synchronous: `request_approval` parks the calling thread until an approver rules. Its optional `approver_id()` defaults to `None` and fills the audit entry.
+
+A channel that cannot reach an approver must return `ApprovalDecision::Denied`. A tool then never runs on a lost approval round trip.
+
+`OneshotApprovalChannel::new()` returns the channel plus a Tokio oneshot `Sender<ApprovalDecision>` for the UI side, and resolves one request per pair. A dropped sender, or a second request, resolves to `Denied`. `OneshotApprovalChannel::default()` has no sender and denies every request. The channel blocks with Tokio's blocking receive, which panics inside a runtime worker, so drive it from a dedicated OS thread. It is a test and UI seam.
+
+`HitlAuditEntry` has `action_requested`, `approver_id`, `status` (`"approved"` or `"denied"`) and `timestamp_ms`, milliseconds since the Unix epoch.
+
+## Configuration
+
+`HitlPlugin` has no config struct. Constructors take the settings.
+
+| Setting | Type | Default | Meaning |
+|---|---|---|---|
+| `channel` | `Arc<dyn ApprovalChannel>` | required | Rules on each high-risk call. |
+| `max_audit_entries` | `usize` | `65_536` | Cap on retained audit entries. |
+
+- `HitlPlugin::new(channel)` uses `DEFAULT_MAX_AUDIT_ENTRIES`, 65_536.
+- `HitlPlugin::with_max_audit_entries(channel, max_audit_entries)` sets the cap and rejects zero.
+
+## Caps and at-cap policy
+
+| Bound | At-cap policy | Usage gauge |
+|---|---|---|
+| `DEFAULT_MAX_AUDIT_ENTRIES`, 65_536, or `max_audit_entries()` | The hook fails; no entry is evicted | `audit_len()` against `max_audit_entries()` |
+
+- The audit log gains one entry per gated decision, approved or denied.
+- At the cap, a gated call whose ruling cannot be recorded is refused. Nothing evicts an old ruling, so the record of who allowed what stays complete.
+- `audit_log()` returns a snapshot in decision order. No method removes entries, so a full log refuses every gated call for the life of the plugin instance.
+
+## Errors
+
+- `PluginError::Internal` when a gated call arrives with the log at its cap. The message reads `hitl audit log full: <n> of <cap> entries stored`. The stream yields it as `CucaError::Plugin`, and the call is neither streamed through nor replaced by a denial.
+- `PluginError::Validation` from `HitlPlugin::with_max_audit_entries` for a cap of zero.
+
+A denial is not an error. It is a `ToolResult` in the stream.
+
+## Example
+
+`examples/hitl.rs` runs one policy that approves a note bound for the `scratch` notebook and denies the same tool aimed at `audit`. The application executes only the approved call, and the audit log prints both rulings. It needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+
+```rust,name=An approval policy and its registration, from examples/hitl.rs
 struct NotebookPolicy;
 
 impl ApprovalChannel for NotebookPolicy {
@@ -58,239 +108,16 @@ impl ApprovalChannel for NotebookPolicy {
     }
 }
 
-/// Keeps the tool call the model issued.
-///
-/// `on_stream_chunk` hooks run in registration order over one shared block, so
-/// a recorder registered *before* `HitlPlugin` sees the call as the model wrote
-/// it, which a denied call otherwise erases.
-#[derive(Default)]
-struct CallRecorder {
-    calls: Mutex<Vec<MessageContentBlock>>,
-}
+let hitl = Arc::new(HitlPlugin::new(Arc::new(NotebookPolicy)));
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url.clone())
+    .register_plugin(Arc::clone(&hitl) as Arc<dyn CucaPlugin>)
+    .build()?;
+```
 
-impl CallRecorder {
-    fn take(&self) -> Vec<MessageContentBlock> {
-        std::mem::take(&mut self.calls.lock().unwrap_or_else(|p| p.into_inner()))
-    }
-}
-
-impl CucaPlugin for CallRecorder {
-    fn name(&self) -> &'static str {
-        "call-recorder"
-    }
-
-    fn on_stream_chunk(&self, chunk: &mut MessageContentBlock) -> Result<(), PluginError> {
-        if matches!(chunk, MessageContentBlock::ToolCall { .. }) {
-            self.calls
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .push(chunk.clone());
-        }
-        Ok(())
-    }
-}
-
-/// The tool the model is offered. `classify_tool_call` reads the name only, and
-/// `write_note` matches the file-write keyword group, so every call is gated.
-fn write_note_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "write_note".to_string(),
-        description: "Append one note to a named notebook.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "notebook": { "type": "string", "description": "notebook name" },
-                "text": { "type": "string", "description": "the note to append" },
-            },
-            "required": ["notebook", "text"],
-        }),
-    }
-}
-
-/// Drain a turn into its text, the tool blocks the consumer received, and the
-/// thinking-block count.
-///
-/// A reasoning model emits one `Thinking` block per token, so printing every
-/// block buries the lines this demo is about. The count stays in the output
-/// because it is the honest shape of a live turn.
-async fn drain(mut stream: AgentResponseStream) -> (String, Vec<MessageContentBlock>, usize) {
-    let mut text = String::new();
-    let mut tools = Vec::new();
-    let mut thinking = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-            Ok(block) => tools.push(block),
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    (text, tools, thinking)
-}
-
-/// The follow-up turn: the same prompt, the call the model made, and the result
-/// the gate produced or permitted.
-fn follow_up(
-    model: &str,
-    prompt: &str,
-    call: MessageContentBlock,
-    output: String,
-) -> UnifiedRequest {
-    let call_id = match &call {
-        MessageContentBlock::ToolCall { id, .. } => id.clone(),
-        _ => String::new(),
-    };
-    UnifiedRequest::new(model)
-        // A reasoning model spends the token budget on thinking first, so a
-        // tight cap can end the turn before any text is emitted.
-        .set_max_tokens(320)
-        .add_user_message(prompt)
-        .add_message(UnifiedMessage {
-            role: MessageRole::Assistant,
-            content: vec![call],
-            name: None,
-            tool_call_id: None,
-        })
-        .add_message(UnifiedMessage {
-            role: MessageRole::Tool,
-            content: vec![MessageContentBlock::ToolResult {
-                tool_call_id: call_id.clone(),
-                output,
-            }],
-            name: None,
-            tool_call_id: Some(call_id),
-        })
-}
-
-/// The application-side executor: what an approved call is allowed to do.
-fn append_note(notebook: &Mutex<Vec<String>>, arguments: &Value) -> String {
-    let name = arguments
-        .get("notebook")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let text = arguments.get("text").and_then(Value::as_str).unwrap_or("");
-    let mut notes = notebook.lock().unwrap_or_else(|p| p.into_inner());
-    notes.push(text.to_string());
-    format!("appended note {} to notebook {name:?}", notes.len())
-}
-
-/// One gated turn: the model is given the tool, the gate rules on the call it
-/// makes, and the returned blocks show which way the ruling went.
-async fn gated_turn(
-    client: &CucaClient,
-    model: &str,
-    prompt: &str,
-) -> Result<(String, Vec<MessageContentBlock>, usize), CucaError> {
-    let request = UnifiedRequest::new(model)
-        .set_max_tokens(160)
-        .add_user_message(prompt)
-        .add_tool(write_note_tool());
-    Ok(drain(client.generate_stream(request).await?).await)
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
-
-    let recorder = Arc::new(CallRecorder::default());
-    let hitl = Arc::new(HitlPlugin::new(Arc::new(NotebookPolicy)));
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::clone(&recorder) as Arc<dyn CucaPlugin>)
-        .register_plugin(Arc::clone(&hitl) as Arc<dyn CucaPlugin>)
-        .build()?;
-    let notebook: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-    let approved_prompt = format!("Save the note \"ship it\" in the {OPEN_NOTEBOOK} notebook.");
-    println!("Stage 1: a call the policy approves");
-    let (reply, blocks, thinking) = match gated_turn(&client, &model, &approved_prompt).await {
-        Ok(turn) => turn,
-        Err(error) => {
-            println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(());
-        }
-    };
-    let call = recorder.take().into_iter().next();
-    let Some(call @ MessageContentBlock::ToolCall { .. }) = call else {
-        println!("  the model answered without calling the tool: {reply:?}");
-        return Ok(());
-    };
-    println!("  delivered: {blocks:?}");
-    // An approved call streams through untouched, so executing it is the
-    // application's job: the gate decided that it may run, not that it ran.
-    let MessageContentBlock::ToolCall { arguments, .. } = &call else {
-        unreachable!("matched above")
-    };
-    let output = append_note(&notebook, arguments);
-    println!("  app executed: {output}");
-    let (reply, _, follow_thinking) = drain(
-        client
-            .generate_stream(follow_up(&model, &approved_prompt, call, output))
-            .await?,
-    )
-    .await;
-    println!("  reply: {}", reply.trim());
-    println!("  thinking blocks: {thinking} then {follow_thinking}");
-
-    let denied_prompt = "Save the note \"ship it\" in the audit notebook.";
-    println!("\nStage 2: the same tool, a notebook the policy refuses");
-    let (reply, blocks, thinking) = gated_turn(&client, &model, denied_prompt).await?;
-    let call = recorder.take().into_iter().next();
-    let Some(call @ MessageContentBlock::ToolCall { .. }) = call else {
-        println!("  the model answered without calling the tool: {reply:?}");
-        return Ok(());
-    };
-    println!("  delivered: {blocks:?}");
-    // The denial is already a ToolResult, so nothing executed and the model
-    // still gets an answer it can act on.
-    let denial = blocks
-        .iter()
-        .find_map(|block| match block {
-            MessageContentBlock::ToolResult { output, .. } => Some(output.clone()),
-            _ => None,
-        })
-        .unwrap_or_default();
-    let (reply, _, follow_thinking) = drain(
-        client
-            .generate_stream(follow_up(&model, denied_prompt, call, denial))
-            .await?,
-    )
-    .await;
-    println!("  reply: {}", reply.trim());
-    println!("  thinking blocks: {thinking} then {follow_thinking}");
-
-    println!(
-        "\nAudit log, {} of {} entries",
-        hitl.audit_len(),
-        hitl.max_audit_entries()
-    );
-    for entry in hitl.audit_log() {
-        println!(
-            "  {:8} {:12} approver {}",
-            entry.status,
-            entry.action_requested,
-            entry
-                .approver_id
-                .unwrap_or_else(|| "unattributed".to_string())
-        );
-    }
-    println!(
-        "  notebook {OPEN_NOTEBOOK:?} holds {:?}",
-        notebook.lock().unwrap_or_else(|p| p.into_inner())
-    );
-
-    Ok(())
-}
+```bash,name=Runs the same on all three platforms
+cargo run --example hitl --features "provider-llamacpp plugin-hitl"
 ```
 
 ```text,name=Expected output
@@ -313,43 +140,11 @@ Audit log, 2 of 65536 entries
   notebook "scratch" holds ["ship it"]
 ```
 
-## Try it
+Whether the model calls the tool, its wording and the thinking-block counts depend on the model; this output came from `google/gemma-4-12b-qat`. The full program also registers a recorder plugin before `HitlPlugin`, because a denied call otherwise erases the call the model made.
 
-`examples/hitl.rs` runs the program above against a live model. One policy approves a note bound for the `scratch` notebook and denies the same tool aimed at `audit`, the application executes only the call the gate let through, and the audit log prints both rulings at the end. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. Whether the model calls the tool at all, how it words each reply, and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
+## Related pages
 
-```bash,name=Runs the same on all three platforms
-cargo run --example hitl --features "provider-llamacpp plugin-hitl"
-```
-
-## Entry types
-
-`HitlPlugin`, `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `OneshotApprovalChannel`, `Risk`, `HitlAuditEntry`.
-
-## `CucaPlugin`
-
-`HitlPlugin` implements `CucaPlugin` with the plugin name `"hitl-approvals"`. It overrides `on_stream_chunk` only.
-
-## Risk classification
-
-`classify_tool_call(name)` matches the tool name, case-insensitively, against keyword groups:
-
-| Group | Keywords | `Risk` |
-|---|---|---|
-| Shell and exec | `shell`, `exec`, `bash`, `run_command`, `terminal` | `High` |
-| File write | `write`, `edit`, `delete`, `remove`, `rm_`, `mv_`, `move`, `create_file` | `High` |
-| External API write | `http_post`, `http_put`, `http_delete`, `api_write`, `post_`, `put_`, `delete_` | `High` |
-| Everything else, including unrecognized names | | `Low` |
-
-`Risk::Low` calls stream through without touching the channel. A `Risk::High` call blocks on `ApprovalChannel::request_approval`: `ApprovalDecision::Approved` streams the call through unchanged; `ApprovalDecision::Denied` replaces the block with a `ToolResult` carrying `"denied by approver"`.
-
-## Failure-closed default
-
-An `ApprovalChannel` implementation that cannot reach an approver must return `ApprovalDecision::Denied`, so a tool never executes on a lost approval round trip. `OneshotApprovalChannel` follows this rule: a dropped sender resolves to `Denied`.
-
-## Capacity
-
-| | |
-|---|---|
-| Bound | `HitlPlugin::DEFAULT_MAX_AUDIT_ENTRIES`, 65536 audit entries |
-| At-cap policy | The hook fails rather than evicting; a gated call whose ruling cannot be recorded is refused |
-| Usage gauge | `HitlPlugin::audit_len()` against `max_audit_entries()` |
+- [Plugins](@/plugins/_index.md) lists every plugin, its hooks and its caps.
+- [Memory discipline](@/concepts/memory-discipline.md) explains why a full audit log refuses instead of evicting.
+- [Write a custom plugin](@/guides/custom-plugin.md) walks through the hook contract.
+- [Error types](@/reference/errors.md) lists `PluginError`.

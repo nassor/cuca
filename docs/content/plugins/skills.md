@@ -9,315 +9,122 @@ weight = 9
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Loads reusable SKILL.md instructions and resolves skill, skill_read, and skill_search tool calls against them.</dd>
+<dd>Loads reusable <code>SKILL.md</code> instructions and resolves <code>skill</code>, <code>skill_read</code> and <code>skill_search</code> tool calls against them.</dd>
 <dt>You need</dt>
 <dd>The <code>plugin-skills</code> feature and either a skills directory or inline <code>Skill</code> values.</dd>
 <dt>Read this if</dt>
 <dd>You are registering <code>SkillsPlugin</code> or authoring a <code>SKILL.md</code> file.</dd>
 </dl>
 
-`SkillsPlugin` loads reusable `SKILL.md` instructions, either from a directory of `SKILL.md` subdirectories or provided inline, and resolves the `skill`, `skill_read`, and `skill_search` tool calls a model issues against them. When `inject_catalog` is set (the default), `on_request` appends a system message naming the three tools and listing every loaded skill's name and description. Reach for it to give a model a discoverable library of task-specific instructions without hand-writing them into every system prompt.
+## Feature and entry type
 
-```rust,name=Let a model discover a skill and read its reference file
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-skills` (no dependencies) |
+| Entry type | `SkillsPlugin` |
+| Supporting types | `SkillsConfig`, `Skill` |
+| Plugin name | `"skills"` |
+| Attachment | `register_plugin` |
+| Peer features | None |
+| Needs | A skills directory, inline `Skill` values, or both |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{
-    MessageContentBlock, MessageRole, ProviderEndpoint, ToolDefinition, UnifiedMessage,
-};
-use cuca::{
-    AgentResponseStream, CucaClient, PluginError, SkillsPlugin, UnifiedRequest, UnifiedResponse,
-};
-use serde_json::json;
-use tokio_stream::StreamExt;
+Build the plugin with `SkillsPlugin::new(config)`, `SkillsPlugin::from_dir(path)` (default config, scanning `path`) or `SkillsPlugin::inline(skills)` (default config, no directory). `Skill::inline(name, description, instructions)` builds a skill without references. The accessors are `skill(name)`, `list_skills()`, `search(query, limit)` and `read_reference(skill, file)`.
 
-/// The question, whose answer needs both the skill and its reference file.
-const QUESTION: &str = "Load the unit-convert skill, then tell me how many kilometers 12 miles is.";
+## Hooks
 
-/// The `SKILL.md` the demo writes, in the agentskills.io frontmatter shape the
-/// plugin parses: a leading `---`, `name:` and `description:`, a closing `---`,
-/// then the instruction body. `license:` is parsed and ignored.
-const SKILL_MD: &str = "---\n\
-name: unit-convert\n\
-description: Convert between metric and imperial units using exact factors\n\
-license: Apache-2.0\n\
----\n\
-\n\
-# Unit conversion\n\
-\n\
-Read `factors.md` for the exact factor, multiply, and answer with the number\n\
-followed by the unit and nothing else.\n";
+`SkillsPlugin` overrides `on_request` and `on_stream_chunk`.
 
-/// One bundled reference file, reachable through the `skill_read` tool.
-const FACTORS_MD: &str = "1 mile = 1.609344 kilometers\n1 pound = 0.45359237 kilograms\n";
+- `on_request` appends one system message to the request when `inject_catalog` is true and at least one skill is loaded. The message names the three tools, tells the model to use `skill_search` first when unsure which skill applies, and lists each skill as `- <name>: <description>`.
+- `on_stream_chunk` replaces a `skill`, `skill_read` or `skill_search` `ToolCall` with a `ToolResult`. Any other block passes through untouched.
 
-/// Removes the demo skills directory even when a turn returns early.
-struct SkillsDir(PathBuf);
+Tool arguments and results:
 
-impl SkillsDir {
-    /// Lay out `<tmp>/cuca-skills-<pid>/unit-convert/{SKILL.md,references/}`:
-    /// the plugin scans direct subdirectories, so the skill name is a directory.
-    fn create() -> std::io::Result<Self> {
-        let root = std::env::temp_dir().join(format!("cuca-skills-{}", std::process::id()));
-        let skill = root.join("unit-convert");
-        std::fs::create_dir_all(skill.join("references"))?;
-        std::fs::write(skill.join("SKILL.md"), SKILL_MD)?;
-        std::fs::write(skill.join("references").join("factors.md"), FACTORS_MD)?;
-        Ok(Self(root))
-    }
+- `skill` takes a non-blank `name`. The output is a JSON object `{name, description, instructions, references}`, where `references` lists the file names.
+- `skill_read` takes non-blank `skill` and `file`. The output is the content of that reference file.
+- `skill_search` takes a non-blank `query`. The output is a JSON array of `{name, description}` objects, at most `max_search_results` long.
 
-    fn path(&self) -> &Path {
-        &self.0
-    }
-}
+Search is case-insensitive. Each whitespace-separated query term scores 3 points per occurrence in the skill name, 2 in the description and 1 in the instructions. Skills with a positive score are ranked by score descending, then name ascending. `SkillsPlugin::search` called directly with a blank query returns every skill.
 
-impl Drop for SkillsDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
+Failures never fail the hook. The error text becomes the `ToolResult` output, so the model can react to it in the conversation.
 
-/// Keeps the catalog `on_request` injected and the tool call the model issued.
-///
-/// Hooks run in registration order over one shared request and one shared
-/// block, so this plugin sees the injected catalog only when it is registered
-/// after `SkillsPlugin`, and sees the model's `ToolCall` only because the
-/// skills plugin has not replaced it yet.
-#[derive(Default)]
-struct Recorder {
-    catalog: Mutex<Option<String>>,
-    call: Mutex<Option<MessageContentBlock>>,
-}
+## Configuration
 
-impl Recorder {
-    fn take_call(&self) -> Option<MessageContentBlock> {
-        self.call.lock().unwrap_or_else(|p| p.into_inner()).take()
-    }
-}
+`SkillsConfig` defaults:
 
-impl CucaPlugin for Recorder {
-    fn name(&self) -> &'static str {
-        "recorder"
-    }
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `skills_dir` | `Option<PathBuf>` | `None` | Directory whose direct subdirectories each hold a `SKILL.md`. |
+| `inline_skills` | `Vec<Skill>` | empty | Skills supplied in code. |
+| `inject_catalog` | `bool` | `true` | Whether `on_request` injects the catalog message. |
+| `max_search_results` | `usize` | `5` | Cap on `skill_search` results. |
 
-    fn on_request(&self, req: &mut UnifiedRequest) -> Result<(), PluginError> {
-        *self.catalog.lock().unwrap_or_else(|p| p.into_inner()) = req
-            .messages
-            .iter()
-            .filter(|message| message.role == MessageRole::System)
-            .flat_map(|message| message.content.iter())
-            .filter_map(|block| match block {
-                MessageContentBlock::Text(text) => Some(text.clone()),
-                _ => None,
-            })
-            .next_back();
-        Ok(())
-    }
+- `skills_dir` subdirectories without a `SKILL.md` are skipped silently.
+- `inline_skills` win over directory skills on a name conflict. Among duplicates, the later entry wins, and the final list is sorted by name.
 
-    fn on_stream_chunk(&self, chunk: &mut MessageContentBlock) -> Result<(), PluginError> {
-        if matches!(chunk, MessageContentBlock::ToolCall { .. }) {
-            *self.call.lock().unwrap_or_else(|p| p.into_inner()) = Some(chunk.clone());
-        }
-        Ok(())
-    }
+### SKILL.md format
 
-    fn on_response_complete(&self, _res: &UnifiedResponse) -> Result<(), PluginError> {
-        Ok(())
-    }
-}
+A `SKILL.md` file has this shape:
 
-/// Two of the three tools the plugin answers, declared so the model can call
-/// them.
-///
-/// The injected catalog tells the model the tools exist; the wire `tools` array
-/// is what lets it emit a call for one.
-fn skill_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "skill".to_string(),
-            description: "Load a skill's full instructions by name.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "name": { "type": "string" } },
-                "required": ["name"],
-            }),
-        },
-        ToolDefinition {
-            name: "skill_read".to_string(),
-            description: "Read a reference file bundled with a skill.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "skill": { "type": "string" },
-                    "file": { "type": "string" },
-                },
-                "required": ["skill", "file"],
-            }),
-        },
-    ]
-}
+- The first line is `---`, followed by `key: value` lines, then a closing `---` line.
+- `name:` and `description:` are required and must not be blank. Values may be unquoted or double-quoted.
+- Other keys, such as `license` or `allowed-tools`, are read and ignored.
+- Everything after the closing line, trimmed, is the instructions.
+- Every regular file in an optional `references/` directory next to `SKILL.md` becomes a reference keyed by file name. Content is read as UTF-8, lossy.
 
-/// Drain a turn into its text, the tool results the consumer received, and the
-/// thinking-block count.
-///
-/// A reasoning model emits one `Thinking` block per token, so printing every
-/// block buries the lines this demo is about. The count stays in the output
-/// because it is the honest shape of a live turn.
-async fn drain(mut stream: AgentResponseStream) -> (String, Vec<(String, String)>, usize) {
-    let mut text = String::new();
-    let mut results = Vec::new();
-    let mut thinking = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-            Ok(MessageContentBlock::ToolResult {
-                tool_call_id,
-                output,
-            }) => results.push((tool_call_id, output)),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    (text, results, thinking)
-}
+The skill name is the `name:` value. The directory name does not matter.
 
-/// A turn over `history`, with the skill tools offered when `with_tools`.
-fn turn(model: &str, history: &[UnifiedMessage], with_tools: bool) -> UnifiedRequest {
-    let mut request = UnifiedRequest::new(model)
-        // A reasoning model spends the token budget on thinking first, so a
-        // tight cap can end the turn before any text is emitted.
-        .set_max_tokens(768);
-    request.messages = history.to_vec();
-    if with_tools {
-        for tool in skill_tools() {
-            request = request.add_tool(tool);
-        }
-    }
-    request
-}
+## Caps and at-cap policy
 
-/// Append the call the model made and the result the plugin produced, so the
-/// next turn sees the exchange as the conversation it was.
-fn extend(history: &mut Vec<UnifiedMessage>, call: MessageContentBlock, output: &str) {
-    let call_id = match &call {
-        MessageContentBlock::ToolCall { id, .. } => id.clone(),
-        _ => String::new(),
-    };
-    history.push(UnifiedMessage {
-        role: MessageRole::Assistant,
-        content: vec![call],
-        name: None,
-        tool_call_id: None,
-    });
-    history.push(UnifiedMessage {
-        role: MessageRole::Tool,
-        content: vec![MessageContentBlock::ToolResult {
-            tool_call_id: call_id.clone(),
-            output: output.to_string(),
-        }],
-        name: None,
-        tool_call_id: Some(call_id),
-    });
-}
+No cap: the skill list is fixed at construction, deduplicated by name and sorted, so nothing grows with traffic. The usage gauge is none.
 
-/// Name of the tool a recorded call invoked.
-fn tool_name(call: &MessageContentBlock) -> &str {
-    match call {
-        MessageContentBlock::ToolCall { name, .. } => name,
-        _ => "",
-    }
-}
+- `max_search_results` bounds one `skill_search` result, not the plugin.
+- The plugin loads every skill and every reference file into memory at construction and sets no size limit on them.
+- The catalog message grows with the number of loaded skills and is added to every request while `inject_catalog` is true.
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+## Errors
 
-    let dir = SkillsDir::create()?;
-    let skills = Arc::new(SkillsPlugin::from_dir(dir.path())?);
-    println!("Loaded from {}", dir.path().display());
-    for skill in skills.list_skills() {
-        println!(
-            "  {}: {} ({} reference file(s))",
-            skill.name,
-            skill.description,
-            skill.references.len()
-        );
-    }
+Construction returns `PluginError::Io`, from `SkillsPlugin::new` and `from_dir`, when:
 
-    let recorder = Arc::new(Recorder::default());
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        // The same recorder sits on both sides of the skills plugin, because
-        // its two hooks need opposite positions: the chunk hook must run
-        // before the plugin replaces the model's `ToolCall`, and the request
-        // hook must run after the plugin has appended its catalog.
-        .register_plugin(Arc::clone(&recorder) as Arc<dyn CucaPlugin>)
-        .register_plugin(Arc::clone(&skills) as Arc<dyn CucaPlugin>)
-        .register_plugin(Arc::clone(&recorder) as Arc<dyn CucaPlugin>)
-        .build()?;
+- `skills_dir` cannot be read.
+- A `SKILL.md` or a reference file is unreadable.
+- A `SKILL.md` has no leading `---` line or no closing `---` line.
+- A `SKILL.md` lacks a non-blank `name:` or `description:`.
 
-    let mut history = vec![UnifiedMessage::user(QUESTION)];
+The message names the offending file. Inline skills are never rejected.
 
-    // Two tool-using turns: the model discovers the skill, then the reference
-    // file the skill's own instructions point it at.
-    for stage in [
-        "the skill out of the injected catalog",
-        "the reference file",
-    ] {
-        println!("\nThe model reaches for {stage}");
-        let stream = match client.generate_stream(turn(&model, &history, true)).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                println!("\nNo server answered at {base_url}: {error}");
-                println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-                return Ok(());
-            }
-        };
-        let (reply, results, thinking) = drain(stream).await;
-        if let Some(catalog) = recorder
-            .catalog
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .as_deref()
-            .and_then(|catalog| catalog.lines().next_back())
-        {
-            println!("  catalog in the outbound request, last line: {catalog}");
-        }
-        let (Some(call), Some((_, output))) = (recorder.take_call(), results.into_iter().next())
-        else {
-            println!("  the model answered without calling a skill tool: {reply:?}");
-            return Ok(());
-        };
-        println!("  {} returned: {output}", tool_name(&call));
-        println!("  thinking blocks: {thinking}");
-        extend(&mut history, call, &output);
-    }
+At call time the hook returns no error. Each variant below becomes `ToolResult` output text:
 
-    // The final turn offers no tools: everything the skill asked for is in the
-    // transcript, so the only thing left is the answer.
-    println!("\nThe answer, from the instructions and the factor");
-    let (reply, _, thinking) = drain(
-        client
-            .generate_stream(turn(&model, &history, false))
-            .await?,
-    )
-    .await;
-    println!("  reply: {}", reply.trim());
-    println!("  thinking blocks: {thinking}");
+- `PluginError::Validation` when a required tool argument is missing, not a string, or blank.
+- `PluginError::Internal` for an unknown skill name (the text points to `skill_search`), an unknown skill in `skill_read`, or a skill with no such reference file.
 
-    Ok(())
-}
+## Example
+
+`examples/skills.rs` writes a `SKILL.md` and one `references/factors.md` into a temporary directory and loads them with `SkillsPlugin::from_dir`. It takes three turns: the model calls `skill` and gets the instructions back, then calls `skill_read` for the bundled file, then answers. The directory is removed when the program ends. It needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+
+```text,name=The SKILL.md the example writes
+---
+name: unit-convert
+description: Convert between metric and imperial units using exact factors
+license: Apache-2.0
+---
+
+# Unit conversion
+
+Read `factors.md` for the exact factor, multiply, and answer with the number
+followed by the unit and nothing else.
+```
+
+```rust,name=Load a skills directory and register the plugin, from examples/skills.rs
+let skills = Arc::new(SkillsPlugin::from_dir(dir.path())?);
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url.clone())
+    .register_plugin(Arc::clone(&skills) as Arc<dyn CucaPlugin>)
+    .build()?;
+```
+
+```bash,name=Runs the same on all three platforms
+cargo run --example skills --features "provider-llamacpp plugin-skills"
 ```
 
 ```text,name=Expected output
@@ -341,43 +148,10 @@ The answer, from the instructions and the factor
   thinking blocks: 369
 ```
 
-## Try it
+The temporary directory path depends on the platform. Which tool the model calls, its wording and the thinking-block counts depend on the model; this output came from `google/gemma-4-12b-qat`. The full program also registers a recorder plugin around `SkillsPlugin` to print the catalog and the model's tool call.
 
-`examples/skills.rs` runs the program above against a live model. It writes a `SKILL.md` and one `references/factors.md` into a temporary directory, loads them with `SkillsPlugin::from_dir`, and takes three turns: the model calls `skill` and gets the instructions back, answers the question with them in the prompt, then calls `skill_read` for the bundled file. The directory is removed when the program ends. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. Which tool the model reaches for, its wording, and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
+## Related pages
 
-```bash,name=Runs the same on all three platforms
-cargo run --example skills --features "provider-llamacpp plugin-skills"
-```
-
-## Entry types
-
-`SkillsPlugin`, `SkillsConfig`, `Skill`.
-
-## `CucaPlugin`
-
-`SkillsPlugin` implements `CucaPlugin` with the plugin name `"skills"`. It overrides `on_request` and `on_stream_chunk`.
-
-| Hook | Behavior |
-|---|---|
-| `on_request` | Injects a system message naming the three tools and listing every loaded skill's name and description, when `SkillsConfig::inject_catalog` is true and at least one skill is loaded |
-| `on_stream_chunk` | Resolves `skill`, `skill_read`, and `skill_search` tool calls into `ToolResult` blocks |
-
-## Config
-
-`SkillsConfig` defaults: `skills_dir: None`, `inline_skills: []`, `inject_catalog: true`, `max_search_results: 5`.
-
-`SkillsConfig::skills_dir` points at a directory whose direct subdirectories each hold a `SKILL.md`: YAML-ish frontmatter with required `name:` and `description:` keys, an instructions body, and an optional `references/` directory of bundled files. `inline_skills` are provided programmatically and win over directory-discovered skills on a name conflict.
-
-## Tools
-
-| Tool | Arguments | Behavior |
-|---|---|---|
-| `skill` | `name` | Returns the named skill's full instructions |
-| `skill_read` | `skill`, `file` | Returns a reference file bundled with the named skill |
-| `skill_search` | `query` | Returns skills ranked by a substring match score, capped at `max_search_results` |
-
-`skill_search` scores each whitespace-split query term at three points per match in the skill name, two in the description, and one in the instructions; a blank query returns every loaded skill.
-
-## Capacity
-
-No growth cap. The skill list is fixed once at construction, deduplicated by name and sorted.
+- [Plugins](@/plugins/_index.md) lists every plugin, its hooks and its caps.
+- [Write a custom plugin](@/guides/custom-plugin.md) walks through the hook contract.
+- [Error types](@/reference/errors.md) lists `PluginError`.

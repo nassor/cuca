@@ -33,8 +33,9 @@ docs_rs = "https://docs.rs/cuca-core"
 
 # The reading order, declared once. `base.html` renders the sidebar, the
 # breadcrumb and the previous/next pager from this list, so all three agree.
-# A group collapses in the sidebar, so a hub item keeps its children here
-# rather than hiding them behind the hub page alone.
+# A group lists its hub (`_index.md`) and its pages as sibling items. An item
+# with `[[extra.nav.items.children]]` nests those pages under it, as the Local
+# provider's subpages sit under Local (in-process).
 [[extra.nav]]
 label = "Quick start"
 [[extra.nav.items]]
@@ -70,73 +71,94 @@ label = "Providers"
 [[extra.nav.items]]
 title = "Overview"
 path = "@/providers/_index.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "OpenAI"
 path = "@/providers/openai.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Anthropic"
 path = "@/providers/anthropic.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Google Gemini"
 path = "@/providers/gemini.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "DeepSeek"
 path = "@/providers/deepseek.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "llama.cpp"
 path = "@/providers/llamacpp.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "vLLM"
 path = "@/providers/vllm.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "LM Studio"
 path = "@/providers/lmstudio.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Local (in-process)"
-path = "@/providers/local.md"
+path = "@/providers/local/_index.md"
+[[extra.nav.items.children]]
+title = "Configuration"
+path = "@/providers/local/configuration.md"
+[[extra.nav.items.children]]
+title = "Requests and responses"
+path = "@/providers/local/requests.md"
+[[extra.nav.items.children]]
+title = "Limits and errors"
+path = "@/providers/local/limits-and-errors.md"
+[[extra.nav.items.children]]
+title = "Model sources and presets"
+path = "@/providers/local/model-sources.md"
 [[extra.nav.items.children]]
 title = "Local models and formats"
-path = "@/providers/local-models.md"
+path = "@/providers/local/models.md"
+[[extra.nav.items.children]]
+title = "Speculative decoding"
+path = "@/providers/local/drafting.md"
+[[extra.nav.items.children]]
+title = "Run on a GPU"
+path = "@/providers/local/gpu.md"
+[[extra.nav.items.children]]
+title = "Build requirements and tests"
+path = "@/providers/local/build-and-tests.md"
 
 [[extra.nav]]
 label = "Plugins"
 [[extra.nav.items]]
 title = "Overview"
 path = "@/plugins/_index.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "MCP"
 path = "@/plugins/mcp.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Sandbox"
 path = "@/plugins/sandbox.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Memory"
 path = "@/plugins/memory.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Guardrails"
 path = "@/plugins/guardrails.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Subagent"
 path = "@/plugins/subagent.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Human approval"
 path = "@/plugins/hitl.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Web search"
 path = "@/plugins/web-search.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Skills"
 path = "@/plugins/skills.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Telemetry"
 path = "@/plugins/telemetry.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Session log"
 path = "@/plugins/session-log.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Redaction"
 path = "@/plugins/redaction.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Cost accounting"
 path = "@/plugins/cost.md"
 
@@ -145,22 +167,22 @@ label = "Services"
 [[extra.nav.items]]
 title = "Overview"
 path = "@/services/_index.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Entity extraction"
 path = "@/services/entity-extraction.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Speculative"
 path = "@/services/speculative.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Prompt cache"
 path = "@/services/prompt-cache.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Replay"
 path = "@/services/replay.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Rate limit"
 path = "@/services/rate-limit.md"
-[[extra.nav.items.children]]
+[[extra.nav.items]]
 title = "Vector store"
 path = "@/services/vector-store.md"
 

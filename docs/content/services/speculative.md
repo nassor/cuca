@@ -9,390 +9,153 @@ weight = 2
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Routes a turn to a fast or slow model tier by complexity, drafts speculatively on the fast tier, and falls back to the slow tier on rejection or latency.</dd>
+<dd>Routes a turn to a fast or slow model tier by complexity, drafts on the fast tier, and falls back to the slow tier on a rejected block or a missed latency deadline.</dd>
 <dt>You need</dt>
 <dd>The <code>service-speculative</code> feature and a <code>SwappableModelPair</code>.</dd>
 <dt>Read this if</dt>
-<dd>You are attaching a <code>ModelOrchestrator</code> to a client, or tuning its complexity thresholds.</dd>
+<dd>You attach a <code>ModelOrchestrator</code> to a client or tune its complexity thresholds. For why the tiers escalate, read <a href="@/concepts/speculative-routing.md">Speculative fast/slow routing</a>.</dd>
 </dl>
 
-`ModelOrchestrator` pairs a fast, low-latency model with a slow, high-capacity one and picks a tier per turn. A deterministic `ComplexityEvaluator` routes the request, the fast tier streams a speculative draft, and a rejected block or a missed latency deadline moves the remainder of the turn to the slow tier. Reach for it when most turns are cheap routing or parameter extraction and only some need the large model.
+## Feature and entry type
 
-```rust,name=Route turns across a fast and a slow tier
-use std::sync::{Arc, Mutex};
-use std::time::Instant;
+| Item | Value |
+|---|---|
+| Feature | `service-speculative` |
+| Own dependencies | `dep:tokio`, `dep:tokio-stream` |
+| Declared plugin edge | none in `Cargo.toml`; documented-optional on `plugin-session-log` |
+| Entry type | `ModelOrchestrator` |
+| Module | `cuca::services::orchestrator` |
+| Attachment | `CucaClientBuilder::with_orchestrator(orchestrator)` or direct calls |
 
-use cuca::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
-use cuca::{
-    AgentResponseStream, ClientPool, ComplexityEvaluator, CucaError, DraftValidator,
-    JsonToolDraftValidator, ModelOrchestrator, SwappableModelPair, TurnExecutor, UnifiedRequest,
+`ModelOrchestrator` never implements `CucaPlugin`. Passing it to `register_plugin` is a compile error.
+
+The documented-optional edge is `ModelOrchestrator::with_session_store`. It exists only when `plugin-session-log` is also enabled and is compiled out otherwise, so a swap is never silently dropped. The session log plugin does not know this service exists.
+
+Supporting types: `SwappableModelPair`, `ClientPool`, `Complexity`, `ComplexityEvaluator`, `DraftValidator`, `JsonToolDraftValidator`, `TurnExecutor`, `PoolTurnExecutor`.
+
+## Entry points
+
+`ModelOrchestrator` constructors:
+
+- `new(config, pool)` builds the default `ComplexityEvaluator`, the default `JsonToolDraftValidator` and pool-backed tier executors. Both tiers start on their provider adapter's default endpoint.
+- `with_executors(config, pool, fast, slow)` injects `TurnExecutor`s directly. The validator and evaluator stay at their defaults, and no session store is attached.
+- `with_endpoint(base_url, api_key)` points both pooled tiers at `base_url`, with `api_key` as the credential when given. It rebuilds the tier executors, so it replaces any injected by `with_executors`.
+- `with_session_store(store, session_id)` attaches a [session log](@/plugins/session-log.md) store that receives `SessionEvent::ModelSwap` records. It requires `plugin-session-log`.
+
+Running a turn:
+
+- `execute_adaptive_turn(request).await` runs the three stage pipeline and returns an `AgentResponseStream`.
+- `client_pool()` returns the shared `ClientPool`.
+
+### Attaching to a client
+
+With `CucaClientBuilder::with_orchestrator`, `CucaClient::generate_stream` runs the `on_request` hooks, then hands the turn to `execute_adaptive_turn` instead of a provider adapter.
+
+- The orchestrator stream runs no top-level `on_stream_chunk` or `on_response_complete` hooks.
+- Exception: with `service-prompt-cache` and a cache configured, a cache miss wraps the stream in the usual instrumentation, so the terminal hooks and the cache write run for that turn.
+- A cache hit returns before the orchestrator is reached.
+- `with_base_url` and `with_api_key` on the client configure that client, not the tier clients. The tier endpoint is `with_endpoint`.
+- The pool clients are built without an orchestrator, so tier turns dispatch straight to providers and never re-enter it.
+
+### Pipeline
+
+1. Complexity routing. A `Complexity::Slow` request goes straight to the slow tier with no draft phase.
+2. Speculative draft. The fast tier streams, and each block passes through `DraftValidator`. A rejected block is appended to a working copy of the request as a `ToolResult` message so the next tier sees what was refused and why.
+3. Fallback cascade. With `fallback_on_tool_error` set, a rejection re-routes the remainder of the turn to the slow tier, up to two cascades. Blocks from the slow tier are validated too, so a second rejection spends the second cascade.
+
+Blocks already yielded stay delivered when the turn swaps tier.
+
+### Latency swap
+
+The latency guard runs only when the fast stream reports `Pending`. At the first such poll after more than `latency_threshold_ms` has elapsed since the draft began, the turn swaps to the slow tier. A tier stream that is woken only when a block is ready never presents that poll, and the turn stays on the fast tier.
+
+The latency swap does not depend on `fallback_on_tool_error`. Every swap appends a `ModelSwap` record when a session store is attached, with reason `latency_threshold` or `fallback_validation`. A failed append is written to stderr and does not fail the turn.
+
+### Routing rules
+
+`ComplexityEvaluator::evaluate` returns `Complexity::Slow` when any one indicator meets or exceeds its threshold, checked in this order:
+
+- Tool call depth counts the messages that carry a `ToolCall` or `ToolResult` block.
+- Input tokens are estimated as `chars / 4` per text, thinking or tool argument block (minimum 1), with 1 per tool result and 0 per image. No tokenizer is involved.
+- File references count distinct path like tokens per message: tokens starting with `./` or `/`, or a `word.ext` token with a known source or config extension.
+
+### Draft validation
+
+`JsonToolDraftValidator` is the default `DraftValidator`:
+
+- a `ToolCall` needs a non-empty `id` and `name`, and string `arguments` must parse as JSON;
+- a `Text` block that parses as JSON must parse to an object, and any other text passes;
+- every other block passes.
+
+A custom `DraftValidator` returns `Err(reason)` to reject a block. Rejection of low confidence output is a supported use of that seam.
+
+## Configuration
+
+`SwappableModelPair` has no `Default`; every field is required.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `fast_provider`<br>`fast_model_id` | `ProviderEndpoint`<br>`String` | The low latency tier. |
+| `slow_provider`<br>`slow_model_id` | `ProviderEndpoint`<br>`String` | The high capacity tier. |
+| `latency_threshold_ms` | `u64` | Draft time after which the first `Pending` poll swaps to the slow tier. |
+| `fallback_on_tool_error` | `bool` | Whether a rejected block re-routes to the slow tier. |
+
+`ComplexityEvaluator` fields, all public:
+
+| Key | Type | Default |
+|---|---|---|
+| `slow_tool_call_depth` | `usize` | `1` |
+| `slow_input_tokens` | `usize` | `2000` |
+| `slow_multi_file_threshold` | `usize` | `3` |
+
+- The orchestrator endpoint defaults to an empty base URL and no key, which leaves each provider adapter on its own default endpoint.
+- The evaluator and validator are fixed at `ComplexityEvaluator::default()` and `JsonToolDraftValidator` by every constructor; no builder method replaces them.
+
+## Caps and at-cap policy
+
+- Bound: `ClientPool` is uncapped. It holds one `CucaClient` per distinct `(provider, base_url)` pair, so its size follows the deployment, and repeated requests add no entries.
+- At-cap policy: none, because no entry is ever evicted. A caller that creates a distinct base URL per request owns that bound and builds a client per tenant instead.
+- Usage gauge: `ClientPool::len()` is O(1); `is_empty()` is the companion.
+- Turn bound: at most 2 slow tier fallback cascades per turn (`FALLBACK_ATTEMPTS`).
+
+## Errors
+
+- `execute_adaptive_turn` returns the tier executor's `CucaError` when a tier fails to start.
+- A rejected block with no cascade left, or with `fallback_on_tool_error` unset, ends the stream with `CucaError::Provider { provider, message }`. The message is the validator's reason, and `provider` is the tier that produced the block.
+- `ClientPool::get_or_create` returns `CucaError::Config` when the pool lock is poisoned, plus whatever `CucaClientBuilder::build` rejects.
+- A provider feature that is not compiled does not fail at build time. It surfaces as `CucaError::ProviderNotEnabled` at `generate_stream` time.
+- `TurnExecutor::execute` needs a running tokio runtime, which `execute_adaptive_turn` always has.
+
+The default validator's reasons are `tool call id must be non-empty`, `tool call name must be non-empty`, `tool call arguments are not valid JSON: ...` and `text block is valid JSON but not a JSON object`. Variants of `CucaError` are listed in [Error types](@/reference/errors.md).
+
+## Example
+
+```rust,name=Attach an orchestrator to a client
+let config = SwappableModelPair {
+    fast_provider: ProviderEndpoint::LlamaCpp,
+    fast_model_id: "fast-tier-id".into(),
+    slow_provider: ProviderEndpoint::LlamaCpp,
+    slow_model_id: "slow-tier-id".into(),
+    latency_threshold_ms: 60_000,
+    fallback_on_tool_error: true,
 };
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::ReceiverStream;
-
-/// Tier lines in dispatch order, shared by both executors.
-type TierLog = Arc<Mutex<Vec<String>>>;
-
-/// A `TurnExecutor` that dispatches one tier through a pooled client and
-/// records the dispatch.
-///
-/// `TurnExecutor::execute` is synchronous while `generate_stream` is not, so
-/// the turn is spawned and its blocks are forwarded through a channel. That is
-/// also what makes the latency guard observable: the returned stream reports
-/// `Pending` until the tier produces its first block.
-struct TierExecutor {
-    tier: &'static str,
-    model_id: String,
-    base_url: String,
-    pool: Arc<ClientPool>,
-    log: TierLog,
-}
-
-impl TurnExecutor for TierExecutor {
-    fn tier_name(&self) -> &'static str {
-        self.tier
-    }
-
-    fn execute(&self, mut request: UnifiedRequest) -> Result<AgentResponseStream, CucaError> {
-        request.model = self.model_id.clone();
-        if let Ok(mut log) = self.log.lock() {
-            log.push(format!("{} tier -> {}", self.tier, self.model_id));
-        }
-        let client = self
-            .pool
-            .get_or_create(&ProviderEndpoint::LlamaCpp, &self.base_url, None)?;
-        let (sender, receiver) = tokio::sync::mpsc::channel(64);
-        tokio::spawn(async move {
-            match client.generate_stream(request).await {
-                Ok(mut stream) => {
-                    while let Some(item) = stream.next().await {
-                        if sender.send(item).await.is_err() {
-                            break;
-                        }
-                    }
-                }
-                Err(error) => {
-                    let _ = sender.send(Err(error)).await;
-                }
-            }
-        });
-        Ok(Box::pin(ReceiverStream::new(receiver)))
-    }
-}
-
-/// One drained turn: text, per-kind block counts, and the first error.
-struct Turn {
-    text: String,
-    text_blocks: usize,
-    thinking_blocks: usize,
-    error: Option<String>,
-}
-
-/// Drain a turn, counting `Thinking` blocks instead of printing them: the slow
-/// tier emits one per token and would bury the lines this demo is about.
-async fn drain(mut stream: AgentResponseStream) -> Turn {
-    let mut turn = Turn {
-        text: String::new(),
-        text_blocks: 0,
-        thinking_blocks: 0,
-        error: None,
-    };
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(text)) => {
-                turn.text_blocks += 1;
-                turn.text.push_str(&text);
-            }
-            Ok(MessageContentBlock::Thinking { .. }) => turn.thinking_blocks += 1,
-            Ok(_) => {}
-            Err(error) => {
-                turn.error = Some(error.to_string());
-                break;
-            }
-        }
-    }
-    turn.text = turn.text.trim().to_string();
-    turn
-}
-
-/// The three requests stage 1 routes: one per routing indicator plus the
-/// simple case.
-fn requests(model: &str) -> [(&'static str, UnifiedRequest); 3] {
-    let tool_turn = UnifiedRequest::new(model)
-        .add_user_message("Summarize what the tool returned.")
-        .add_message(UnifiedMessage {
-            role: MessageRole::Assistant,
-            content: vec![MessageContentBlock::ToolCall {
-                id: "call_1".into(),
-                name: "read_file".into(),
-                arguments: serde_json::json!({ "path": "src/lib.rs" }),
-            }],
-            name: None,
-            tool_call_id: None,
-        });
-    [
-        (
-            "classify one short sentence",
-            UnifiedRequest::new(model)
-                .add_system_message("Reply with one word: positive, negative or neutral.")
-                .add_user_message("The build finished.")
-                .set_max_tokens(512),
-        ),
-        (
-            "four file references",
-            UnifiedRequest::new(model)
-                .add_system_message("Reply with one file path and nothing else.")
-                .add_user_message(
-                    "Which of src/sse.rs, src/client.rs, src/request.rs and src/types.rs parses \
-                     server-sent events?",
-                )
-                .set_max_tokens(512),
-        ),
-        ("one tool-call round trip", tool_turn),
-    ]
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and the two tier models come from the environment so the
-    // example runs against any OpenAI-compatible server; the defaults target a
-    // local llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let fast_model =
-        std::env::var("CUCA_FAST_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
-    let slow_model =
-        std::env::var("CUCA_SLOW_MODEL").unwrap_or_else(|_| "google/gemma-4-12b-qat".to_string());
-    println!("Pair: fast {fast_model}, slow {slow_model}");
-
-    let evaluator = ComplexityEvaluator::default();
-    println!(
-        "Thresholds: tool depth {}, input tokens {}, file refs {}",
-        evaluator.slow_tool_call_depth,
-        evaluator.slow_input_tokens,
-        evaluator.slow_multi_file_threshold
-    );
-
-    println!("\nStage 1: routing, with no network");
-    let [
-        (fast_label, fast_request),
-        (slow_label, slow_request),
-        (tool_label, tool_request),
-    ] = requests(&fast_model);
-    for (label, request) in [
-        (fast_label, &fast_request),
-        (slow_label, &slow_request),
-        (tool_label, &tool_request),
-    ] {
-        println!(
-            "  {:<5} <- {label}",
-            format!("{:?}", evaluator.evaluate(request))
-        );
-    }
-
-    let pool = Arc::new(ClientPool::new());
-    let log: TierLog = Arc::new(Mutex::new(Vec::new()));
-    // One orchestrator per latency budget: the budget lives on the immutable
-    // pair, so stage 4 needs its own.
-    let orchestrator = |latency_threshold_ms: u64| {
-        let config = SwappableModelPair {
-            fast_provider: ProviderEndpoint::LlamaCpp,
-            fast_model_id: fast_model.clone(),
-            slow_provider: ProviderEndpoint::LlamaCpp,
-            slow_model_id: slow_model.clone(),
-            latency_threshold_ms,
-            fallback_on_tool_error: true,
-        };
-        let tier = |name: &'static str, model_id: String| {
-            Arc::new(TierExecutor {
-                tier: name,
-                model_id,
-                base_url: base_url.clone(),
-                pool: Arc::clone(&pool),
-                log: Arc::clone(&log),
-            }) as Arc<dyn TurnExecutor>
-        };
-        ModelOrchestrator::with_executors(
-            config.clone(),
-            Arc::clone(&pool),
-            tier("fast", config.fast_model_id.clone()),
-            tier("slow", config.slow_model_id.clone()),
-        )
-    };
-
-    // Every stage below drains one turn and reports which tiers ran; `log` is
-    // cleared first so each stage's lines are its own.
-    let run = |orchestrator: ModelOrchestrator, request: UnifiedRequest| {
-        let log = Arc::clone(&log);
-        async move {
-            log.lock().expect("tier log must not be poisoned").clear();
-            let started = Instant::now();
-            let turn = drain(orchestrator.execute_adaptive_turn(request).await?).await;
-            for line in log.lock().expect("tier log must not be poisoned").iter() {
-                println!("  {line}");
-            }
-            Ok::<_, CucaError>((turn, started.elapsed().as_millis()))
-        }
-    };
-
-    println!("\nStage 2: the Fast request, latency budget 60000 ms");
-    let (turn, elapsed) = run(orchestrator(60_000), fast_request).await?;
-    if let Some(error) = &turn.error {
-        println!("\nNo server answered at {base_url}: {error}");
-        println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-        return Ok(());
-    }
-    println!("  reply: {}", turn.text);
-    println!(
-        "  {elapsed} ms, {} text blocks, {} thinking blocks",
-        turn.text_blocks, turn.thinking_blocks
-    );
-
-    // Stage 3: the draft the validator refuses. The default
-    // `JsonToolDraftValidator` rejects a text block that parses as JSON but is
-    // not an object, so a bare integer reply is refused whether it arrives as
-    // one block or as one digit per block.
-    println!("\nStage 3: a refused draft and the fallback cascade");
-    let arithmetic = UnifiedRequest::new(&fast_model)
-        .add_system_message("You output one integer and nothing else: no words, no punctuation.")
-        .add_user_message("What is 6 times 7?")
-        .set_max_tokens(512);
-    let (turn, elapsed) = run(orchestrator(60_000), arithmetic).await?;
-    match &turn.error {
-        Some(error) => println!("  cascade exhausted: {error}"),
-        None => println!("  accepted draft, no cascade: {:?}", turn.text),
-    }
-    println!(
-        "  {elapsed} ms, {} text blocks, {} thinking blocks",
-        turn.text_blocks, turn.thinking_blocks
-    );
-
-    println!("\nStage 4: the Slow request, no draft phase");
-    let (turn, elapsed) = run(orchestrator(60_000), slow_request).await?;
-    println!("  reply: {}", turn.text);
-    println!(
-        "  {elapsed} ms, {} text blocks, {} thinking blocks",
-        turn.text_blocks, turn.thinking_blocks
-    );
-
-    // Stage 5: the verdicts behind stage 3. Every rejected block is appended
-    // to the working request as a synthetic tool result before the turn
-    // re-routes, so the next tier sees what was refused and why.
-    println!("\nStage 5: the draft verdicts behind the cascade");
-    let validator = JsonToolDraftValidator;
-    for (label, block) in [
-        (
-            "Text(\"The sentiment is neutral.\")",
-            MessageContentBlock::Text("The sentiment is neutral.".into()),
-        ),
-        ("Text(\"42\")", MessageContentBlock::Text("42".into())),
-        (
-            "ToolCall(read_file)",
-            MessageContentBlock::ToolCall {
-                id: String::new(),
-                name: "read_file".into(),
-                arguments: serde_json::json!({ "path": "src/lib.rs" }),
-            },
-        ),
-    ] {
-        match validator.validate(&block) {
-            Ok(()) => println!("  accepted: {label}"),
-            Err(reason) => println!("  rejected: {label} because {reason}"),
-        }
-    }
-
-    println!(
-        "\nPooled clients: {} (both tiers share one provider and base URL)",
-        pool.len()
-    );
-    Ok(())
-}
+let orchestrator = ModelOrchestrator::new(config, Arc::new(ClientPool::default()))
+    .with_endpoint("http://127.0.0.1:1234/v1", None);
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_orchestrator(orchestrator)
+    .build()?;
 ```
 
-```text,name=Expected output
-Pair: fast google/gemma-4-e4b, slow google/gemma-4-12b-qat
-Thresholds: tool depth 1, input tokens 2000, file refs 3
-
-Stage 1: routing, with no network
-  Fast  <- classify one short sentence
-  Slow  <- four file references
-  Slow  <- one tool-call round trip
-
-Stage 2: the Fast request, latency budget 60000 ms
-  fast tier -> google/gemma-4-e4b
-  reply: Positive
-  346 ms, 1 text blocks, 0 thinking blocks
-
-Stage 3: a refused draft and the fallback cascade
-  fast tier -> google/gemma-4-e4b
-  slow tier -> google/gemma-4-12b-qat
-  slow tier -> google/gemma-4-12b-qat
-  cascade exhausted: provider llamacpp failed: text block is valid JSON but not a JSON object
-  35635 ms, 0 text blocks, 77 thinking blocks
-
-Stage 4: the Slow request, no draft phase
-  slow tier -> google/gemma-4-12b-qat
-  reply: src/sse.rs
-  24975 ms, 5 text blocks, 244 thinking blocks
-
-Stage 5: the draft verdicts behind the cascade
-  accepted: Text("The sentiment is neutral.")
-  rejected: Text("42") because text block is valid JSON but not a JSON object
-  rejected: ToolCall(read_file) because tool call id must be non-empty
-
-Pooled clients: 1 (both tiers share one provider and base URL)
-```
-
-`google/gemma-4-e4b` as the fast tier and `google/gemma-4-12b-qat` as the slow tier produced that run: the replies, the block counts and the timings are theirs. The stage 1 routing decisions and the stage 5 verdicts are not, since both are pure functions of the request and the block.
-
-## Try it
-
-`examples/speculative.rs` is the program above. It routes three requests with no network, serves the simple one from the fast tier, then asks for a reply the default `JsonToolDraftValidator` refuses so the turn cascades to the slow tier twice and spends its budget, and finally sends the multi-file request straight to the slow tier. Both tiers run through injected `TurnExecutor`s, so every dispatch prints as it happens. It needs a `llama-server` on port 1234 serving both tier models; `CUCA_BASE_URL`, `CUCA_FAST_MODEL` and `CUCA_SLOW_MODEL` retarget it at any OpenAI-compatible server.
+`examples/speculative.rs` is the full program. It routes three requests with no network, serves a simple one from the fast tier, triggers a fallback cascade with a reply the default validator refuses, and sends a multi file request straight to the slow tier. Both tiers run through injected `TurnExecutor`s, so every dispatch prints. It needs a `llama-server` on port 1234 serving both tier models. `CUCA_BASE_URL`, `CUCA_FAST_MODEL` and `CUCA_SLOW_MODEL` retarget it.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example speculative --features "provider-llamacpp service-speculative"
 ```
 
-## Entry types
+## Related pages
 
-`ModelOrchestrator`, `SwappableModelPair`, `ClientPool`, `Complexity`, `ComplexityEvaluator`, `DraftValidator`, `JsonToolDraftValidator`, `TurnExecutor`.
-
-## Attaching
-
-Attached with `CucaClientBuilder::with_orchestrator(orchestrator)`. When one is attached, `CucaClient::generate_stream` runs `on_request` hooks as usual, then hands the whole turn to `ModelOrchestrator::execute_adaptive_turn` instead of dispatching to a provider adapter directly.
-
-## `SwappableModelPair`
-
-| Field | Meaning |
-|---|---|
-| `fast_provider`, `fast_model_id` | The low-latency routing tier |
-| `slow_provider`, `slow_model_id` | The high-capacity tier |
-| `latency_threshold_ms` | Milliseconds the fast tier has to produce its next block before the orchestrator may swap to the slow tier |
-| `fallback_on_tool_error` | Whether a rejected draft block triggers a fallback to the slow tier |
-
-## `ModelOrchestrator`
-
-| Method | Effect |
-|---|---|
-| `new(config, pool)` | Default `ComplexityEvaluator` and `JsonToolDraftValidator`; both tiers start on their provider adapters' own default endpoints |
-| `with_executors(config, pool, fast, slow)` | Injects tier executors directly |
-| `with_endpoint(base_url, api_key)` | Points both pooled tier clients at `base_url`, with `api_key` as their credential when given; rebuilds the tier executors |
-| `with_session_store(store, session_id)` | Gated on `plugin-session-log`; attaches a [session log](@/plugins/session-log.md) store for `SessionEvent::ModelSwap` records |
-| `client_pool()` | Returns the shared `ClientPool` |
-| `execute_adaptive_turn(request)` | Runs the three-stage pipeline and returns the block stream |
-
-## Pipeline
-
-1. Complexity routing: `Complexity::Slow` requests go straight to the slow tier with no draft phase.
-2. Speculative draft: the fast tier streams; each block passes through `DraftValidator`, rejecting malformed tool calls, invalid JSON, or low confidence.
-3. Fallback cascade: when `fallback_on_tool_error` is set, a rejection re-routes the turn to the slow tier with the captured error state, up to two cascades; exhaustion surfaces the last rejection as `CucaError::Provider`. Validation runs on the slow tier's blocks too, so a second rejection spends the second cascade.
-
-The fast tier gets `latency_threshold_ms` to produce its next block. The deadline is checked only where the fast stream reports `Pending`, so the swap happens at the first poll that finds the stream still pending past the deadline; a tier stream woken only when a block is ready never presents that poll, and the turn stays on the fast tier. Blocks already yielded stay delivered.
-
-## `ComplexityEvaluator`
-
-Default thresholds: `slow_tool_call_depth: 1`, `slow_input_tokens: 2000`, `slow_multi_file_threshold: 3`. A request meeting or exceeding any one of tool-call depth, approximate input token volume, or distinct file references routes to `Complexity::Slow`.
-
-## Capacity
-
-`ClientPool` caches one `CucaClient` per `(provider, base_url)` pair and is deliberately uncapped: its size is a property of the deployment, not of traffic. The usage gauge is `ClientPool::len()`.
+- [Speculative fast/slow routing](@/concepts/speculative-routing.md) explains why the tiers escalate.
+- [Session log](@/plugins/session-log.md) records the `ModelSwap` events.
+- [Prompt cache](@/services/prompt-cache.md) interacts with the orchestrator path.
+- [Services overview](@/services/_index.md) lists all six services.

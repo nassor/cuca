@@ -9,208 +9,160 @@ weight = 3
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Compacts the request's message list when it crosses a configured size trigger, and can render an in-memory working graph into requests as context.</dd>
+<dd><code>MemoryPlugin</code> compacts the request's message list when it crosses a size trigger, and renders an in-memory working graph into requests as context.</dd>
 <dt>You need</dt>
 <dd>The <code>plugin-memory</code> feature.</dd>
 <dt>Read this if</dt>
 <dd>You are registering <code>MemoryPlugin</code>, tuning compaction, or working with the <code>MemoryGraph</code>.</dd>
 </dl>
 
-`MemoryPlugin` keeps a conversation's message list inside a configured size budget: it counts tokens with tiktoken-rs and, once `max_messages`, `max_tokens`, or `max_fraction` triggers, runs an ordered pipeline of compaction strategies until the request fits again. It also owns an optional in-memory working graph that `on_request` renders into every request as durable, structured context. Reach for it once a long conversation risks crossing the model's context window, or when the agent needs graph-shaped long-term memory beyond plain summarization.
+## Feature and entry type
 
-```rust,name=Compact a live conversation once it crosses the trigger
-use std::sync::{Arc, Mutex};
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-memory` (enables `dep:tiktoken-rs`) |
+| Plugin name | `"context-memory"` |
+| Entry types | `MemoryPlugin`, `MemoryConfig`, `MemoryGraph` |
+| Attachment | `CucaClientBuilder::register_plugin` |
+| Needs | Nothing running; an optional `Summarizer` and `VectorStore` enable two strategies |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
-use cuca::{
-    AgentResponseStream, CompactionStrategy, ContextUsage, ContextUsageObserver, CucaClient,
-    MemoryConfig, MemoryPlugin, PluginError, UnifiedRequest,
-};
-use tokio_stream::StreamExt;
+Supporting types:
 
-/// Per-turn completion cap. A reasoning model spends most of it on `Thinking`
-/// blocks, so a smaller budget returns an empty reply.
-const MAX_TOKENS: u32 = 512;
+- Compaction: `CompactionStrategy`, `CompressionAction`, `CompressionReport`, `Budget`.
+- Usage reporting: `ContextUsage`, `ContextUsageObserver`, `ContextWindowResolver`.
+- Extension seams: `Summarizer`, `VectorStore`.
+- Graph: `GraphContextConfig`, `GraphNode`, `GraphRelationship`, `GraphDirection`, `MergePolicy`, `MergeReport`, `GraphSnapshot`, `GraphImportReport`.
 
-/// Compaction trigger: compress once the prompt is longer than this.
-const MAX_MESSAGES: usize = 6;
+## Hooks
 
-/// Context window the fractions are measured against. The real window of the
-/// demo model is far larger; 256 tokens is what makes a four-turn conversation
-/// cross `warn_fraction` instead of a four-hundred-turn one. A deployment sets
-/// the model's own window here, or supplies a `ContextWindowResolver`.
-const WINDOW_TOKENS: u32 = 256;
+`MemoryPlugin` acts on `on_request` only. `on_stream_chunk` and `on_response_complete` use the trait defaults.
 
-/// Prompt for each turn. The first three seed facts, the fourth asks about the
-/// oldest of them, after compaction has run.
-const PROMPTS: [&str; 4] = [
-    "The vault is in Lisbon. Reply with: noted",
-    "The key rotates on friday. Reply with: noted",
-    "The owner is ops@example.com. Reply with: noted",
-    "Where is the vault? Answer in one word.",
-];
+On every request, `on_request` runs these steps in order:
 
-/// The marker the near-limit warning starts with.
-const WARNING_MARKER: &str = "CUCA context warning:";
+1. Count the request's tokens and hand a `ContextUsage` reading to every `ContextUsageObserver`. An observer error fails the request.
+2. When `warn_fraction` is set and usage reaches it, append one system message that starts with `CUCA context warning:`. The marker makes the warning one-shot.
+3. Resolve the `Budget`. When the request is over it, run the compaction pipeline.
+4. When `graph_context` is set, render the working graph into a system message right after the first system message.
 
-/// The reporting gauge seam: handed one reading per request, before compaction.
-#[derive(Default)]
-struct UsageGauge {
-    latest: Mutex<Option<ContextUsage>>,
-}
+### Triggers
 
-impl UsageGauge {
-    fn latest(&self) -> Option<ContextUsage> {
-        self.latest.lock().ok().and_then(|latest| *latest)
-    }
-}
+- `max_messages`, `max_tokens` and `max_fraction` select the trigger. `max_messages` wins when combined with either token budget.
+- `max_tokens` and `max_fraction` are mutually exclusive; setting both is rejected at construction. The default `max_fraction` is `Some(0.8)`, so a config that sets `max_tokens` must also set `max_fraction: None`.
+- `max_messages` triggers when the list is longer than the value. `max_tokens` triggers when usage reaches it. `max_fraction` multiplies the resolved context window.
+- The window comes from `ContextWindowResolver` when one is set and returns a value, otherwise from `context_window_tokens`.
+- With no trigger set, the budget is `Budget::Unlimited` and `on_request` compacts nothing.
 
-impl ContextUsageObserver for UsageGauge {
-    fn observe(&self, usage: &ContextUsage) -> Result<(), PluginError> {
-        *self
-            .latest
-            .lock()
-            .map_err(|_| PluginError::Internal("gauge lock poisoned".into()))? = Some(*usage);
-        Ok(())
-    }
-}
+### Compaction pipeline
 
-/// The prompt as the memory hook left it: message count, role shape, and
-/// whether the near-limit warning is in there.
-#[derive(Default)]
-struct PromptRecorder {
-    shape: Mutex<Option<(usize, String, bool)>>,
-}
+- Strategies run in the order of `strategies`. A strategy whose extension seam is absent no-ops, and a strategy error is recorded and the pipeline continues.
+- With a trigger, the pipeline re-measures after each acting strategy and stops once under budget. It runs at most 4 passes and stops early when a pass makes no progress.
+- The most recent user message and the first system message survive every strategy.
+- Every strategy that removes messages also removes the `ToolResult` message of each dropped `ToolCall`, so no result outlives its call.
+- `MemoryPlugin::compress(&mut messages)` is the out-of-band entry point. It runs the whole `strategies` list once with no budget and returns a `CompressionReport`.
+- `MemoryPlugin::count_tokens()` approximates: it sums tiktoken-rs counts of `"<role> <text>"` per message, over `Text` blocks only, and models no per-message framing tokens.
 
-impl PromptRecorder {
-    fn shape(&self) -> Option<(usize, String, bool)> {
-        self.shape.lock().ok().and_then(|shape| shape.clone())
-    }
-}
+| Strategy | Effect |
+|---|---|
+| `Offload { turns }` | Moves the oldest turns to the `VectorStore`; no-op without a store. |
+| `Summarize { turns }` | Replaces the oldest turns with one summary user message; no-op without a `Summarizer`. |
+| `DeduplicateFileReads { tool_name }` | Blanks file-read results superseded by a newer read of the same file. |
+| `ClearToolResults { keep_pairs }` | Blanks old `ToolResult` outputs, keeping the newest pairs. |
+| `ClampOversizedMessages { max_part_tokens }` | Head and tail truncates any block over the token limit. |
+| `SlidingWindow { keep_messages }` | Drops the oldest messages down to a tail of `keep_messages`. |
+| `DropObservations` | Drops redundant system messages after the first, up to `max_drop_system_observations`. |
+| `DropTurns` | Drops the oldest `offload_turns` removable turns. |
 
-impl CucaPlugin for PromptRecorder {
-    fn name(&self) -> &'static str {
-        "prompt-recorder"
-    }
+### Working graph
 
-    fn on_request(&self, req: &mut UnifiedRequest) -> Result<(), PluginError> {
-        let letters: String = req
-            .messages
-            .iter()
-            .map(|message| match message.role {
-                MessageRole::System => 'S',
-                MessageRole::User => 'U',
-                MessageRole::Assistant => 'A',
-                MessageRole::Tool => 'T',
-            })
-            .collect();
-        let warned = req
-            .messages
-            .iter()
-            .flat_map(|message| message.content.iter())
-            .any(|block| {
-                matches!(block, MessageContentBlock::Text(text) if text.starts_with(WARNING_MARKER))
-            });
-        *self
-            .shape
-            .lock()
-            .map_err(|_| PluginError::Internal("recorder lock poisoned".into()))? =
-            Some((req.messages.len(), letters, warned));
-        Ok(())
-    }
-}
+- The plugin owns one `MemoryGraph` behind a mutex: nodes with labels and properties, and directed weighted relationships.
+- `merge_graph(other, policy)`, `replace_graph(graph)`, `replace_snapshot(snapshot)`, `snapshot()` and `graph()` access it. Merging happens under one lock hold.
+- The rendered message starts with the marker `CUCA graph memory:`. A later request replaces it in place, and it is removed once the graph is empty.
+- The graph step runs after compaction, so compaction cannot delete the graph message, and its token cost is not counted against the request that triggered compaction.
 
-/// Drain a turn into its text, dropping the `Thinking` blocks a reasoning model
-/// emits one per token: printing them would bury the four lines per turn this
-/// demo is about.
-async fn drain(mut stream: AgentResponseStream) -> String {
-    let mut text = String::new();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    text
-}
+## Configuration
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+`MemoryConfig` implements `Default`; `MemoryPlugin::new(config)` validates it.
 
-    let gauge = Arc::new(UsageGauge::default());
-    let strategy = CompactionStrategy::SlidingWindow { keep_messages: 4 };
-    // One strategy, not the default eight-step pipeline: every other step needs
-    // an extension seam or tool traffic this demo has none of, and would no-op.
-    let memory = Arc::new(MemoryPlugin::new(MemoryConfig {
-        context_window_tokens: WINDOW_TOKENS,
-        max_messages: Some(MAX_MESSAGES),
-        warn_fraction: Some(0.2),
-        observers: vec![Arc::clone(&gauge) as Arc<dyn ContextUsageObserver>],
-        strategies: vec![strategy.clone()],
-        ..Default::default()
-    })?);
-    let recorder = Arc::new(PromptRecorder::default());
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::clone(&memory) as Arc<dyn CucaPlugin>)
-        .register_plugin(Arc::clone(&recorder) as Arc<dyn CucaPlugin>)
-        .build()?;
+| Key | Type | Default |
+|---|---|---|
+| `encoder_name` | `String` | `"cl100k_base"` |
+| `context_window_tokens` | `u32` | `128000` |
+| `context_window_resolver` | `Option<Arc<dyn ContextWindowResolver>>` | `None` |
+| `max_messages` | `Option<usize>` | `None` |
+| `max_tokens` | `Option<u32>` | `None` |
+| `max_fraction` | `Option<f32>` | `Some(0.8)` |
+| `warn_fraction` | `Option<f32>` | `None` |
+| `observers` | `Vec<Arc<dyn ContextUsageObserver>>` | empty |
+| `offload_turns` | `usize` | `10` |
+| `max_drop_system_observations` | `usize` | `3` |
+| `graph_context` | `Option<GraphContextConfig>` | `None` |
+| `strategies` | `Vec<CompactionStrategy>` | the eight-step pipeline below |
 
-    println!("Trigger: max_messages {MAX_MESSAGES}, window {WINDOW_TOKENS} tokens, warn at 20%");
-    println!("Strategy: {strategy:?}");
-    println!("Prompt shape letters: S system, U user, A assistant");
+- `encoder_name` is a tiktoken-rs encoder name or a model name such as `"gpt-4o"`.
+- `context_window_tokens` is the fallback window, and the base for `max_fraction` and `warn_fraction`.
+- `offload_turns` is how many turns `DropTurns` removes per pass.
+- `GraphContextConfig` defaults: `max_nodes` 64, `max_relationships` 128.
 
-    let mut messages = vec![UnifiedMessage::system("You are concise.")];
-    for (index, prompt) in PROMPTS.iter().enumerate() {
-        messages.push(UnifiedMessage::user(*prompt));
-        println!("\nTurn {}: {prompt:?}", index + 1);
-        let sent = messages.len();
-        let mut request = UnifiedRequest::new(&model).set_max_tokens(MAX_TOKENS);
-        request.messages = messages.clone();
-        let stream = match client.generate_stream(request).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                println!("\nNo server answered at {base_url}: {error}");
-                println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-                return Ok(());
-            }
-        };
-        if let Some(usage) = gauge.latest() {
-            println!(
-                "  gauge: {}/{} tokens ({:.0}%), window resolved {}",
-                usage.used_tokens,
-                usage.window_tokens,
-                f64::from(usage.used_tokens) / f64::from(usage.window_tokens) * 100.0,
-                usage.resolved
-            );
-        }
-        if let Some((count, letters, warned)) = recorder.shape() {
-            let note = if count < sent { ", compacted" } else { "" };
-            println!(
-                "  prompt: {sent} messages in, {count} out ({letters}), warning {warned}{note}"
-            );
-        }
-        let reply = drain(stream).await;
-        println!("  reply: {}", reply.trim());
-        // The conversation the caller owns keeps growing: compaction rewrites
-        // the request the provider sees, never the caller's own history.
-        messages.push(UnifiedMessage::assistant(reply.trim()));
-    }
+Default `strategies`, in order: `Offload { turns: 10 }`, `Summarize { turns: 10 }`, `DeduplicateFileReads { tool_name: "read_file" }`, `ClearToolResults { keep_pairs: 3 }`, `ClampOversizedMessages { max_part_tokens: 4096 }`, `SlidingWindow { keep_messages: 40 }`, `DropObservations`, `DropTurns`.
 
-    Ok(())
-}
+`MemoryPlugin::with_extensions(config, summarizer, store)` attaches the `Summarizer` and `VectorStore` that `Summarize` and `Offload` need.
+
+## Caps and at-cap policy
+
+Message list:
+
+| Item | Value |
+|---|---|
+| Bound | The active `Budget`, resolved from `max_messages`, `max_tokens` or `max_fraction` against the resolved window. |
+| At the bound | The `strategies` pipeline runs in order until the request fits, at most 4 passes. |
+| Usage gauge | `ContextUsageObserver` readings on every request; `MemoryPlugin::count_tokens()` on demand. |
+
+Working graph:
+
+| Item | Value |
+|---|---|
+| Bound on storage | None. The graph grows only through explicit `merge_graph`, `replace_graph` and `replace_snapshot` calls, never from a hook, so the caller owns the bound. |
+| Bound per request | `GraphContextConfig::max_nodes` (64) and `max_relationships` (128). |
+| At the per-request bound | `MemoryGraph::render` selects a bounded subset for that request; the stored graph is unchanged. |
+| Usage gauge | `MemoryGraph::len()` (nodes) and `MemoryGraph::relationship_count()`. |
+
+`warn_fraction` injects the one-shot near-limit warning before the bound is reached.
+
+## Errors
+
+Every error `MemoryPlugin` itself raises is `PluginError::Internal`.
+
+- `MemoryPlugin::new` and `with_extensions` fail when both `max_tokens` and `max_fraction` are set, or when the encoder cannot load.
+- `count_tokens`, `compress`, `graph`, `merge_graph`, `replace_graph`, `snapshot` and `replace_snapshot` fail when the encoder or graph mutex is poisoned.
+- `replace_snapshot` fails on an invalid snapshot: a duplicate node or relationship id, a non-finite weight, or an endpoint missing from the nodes. The working graph is untouched.
+- `MemoryGraph::add_relationship` fails when `from` or `to` names an unknown node.
+- `on_request` returns the token-count failure and any error a `ContextUsageObserver` returns. Either fails the request before dispatch.
+- A strategy error never fails the request. It lands in `CompressionReport::last_error` and the pipeline continues. A failed `Offload` returns the turns to their original positions.
+
+## Example
+
+`examples/memory.rs` runs four turns with `max_messages: Some(6)`, a 256 token window, `warn_fraction: Some(0.2)` and a single `SlidingWindow { keep_messages: 4 }` strategy.
+
+```rust,name=Compact a conversation once it crosses the trigger
+let memory = Arc::new(MemoryPlugin::new(MemoryConfig {
+    context_window_tokens: 256,
+    max_messages: Some(6),
+    warn_fraction: Some(0.2),
+    observers: vec![gauge as Arc<dyn ContextUsageObserver>],
+    strategies: vec![CompactionStrategy::SlidingWindow { keep_messages: 4 }],
+    ..Default::default()
+})?);
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url)
+    .register_plugin(memory as Arc<dyn CucaPlugin>)
+    .build()?;
+```
+
+Turn 4 carries both edits. The gauge crosses `warn_fraction`, so one warning message is appended, and the nine message prompt exceeds the six message trigger, so `SlidingWindow` trims it to four. The surviving shape is `SAUS` because the first system message and the most recent user message are never removed. The reply `Unknown.` follows from the dropped turns: reaching them again is the offload seam of the [vector store](@/services/vector-store.md).
+
+```bash,name=Runs the same on all three platforms
+cargo run --example memory --features "provider-llamacpp plugin-memory"
 ```
 
 ```text,name=Expected output
@@ -239,69 +191,11 @@ Turn 4: "Where is the vault? Answer in one word."
   reply: Unknown.
 ```
 
-## Try it
+The replies and token counts depend on the model; the message counts do not. The output above came from `google/gemma-4-12b-qat`.
 
-`examples/memory.rs` is the program above. Turn 4 carries both edits `on_request` makes: the gauge crosses `warn_fraction`, so one warning system message is appended, and the resulting nine-message prompt is over the six-message trigger, so `SlidingWindow` trims it to four. `SAUS` is the surviving shape, first system message and most recent user message included, because those two are never removed.
+## Related pages
 
-The `Unknown.` reply is the point rather than a defect: the message that stated Lisbon is one of the four the window dropped. Reaching dropped turns again is the [vector store](@/services/vector-store.md) offload seam, not compaction's job. The replies and the token counts come from `google/gemma-4-12b-qat` and change with the model; the message counts do not.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example memory --features "provider-llamacpp plugin-memory"
-```
-
-## Entry types
-
-`MemoryPlugin`, `MemoryConfig`, `MemoryGraph`, `GraphContextConfig`, `GraphNode`, `GraphRelationship`, `GraphDirection`, `MergePolicy`, `MergeReport`, `GraphSnapshot`, `Budget`, `CompactionStrategy`, `CompressionAction`, `CompressionReport`, `ContextUsage`, `ContextUsageObserver`, `ContextWindowResolver`, `Summarizer`, `VectorStore`, `GraphImportReport`.
-
-## `CucaPlugin`
-
-`MemoryPlugin` implements `CucaPlugin` with the plugin name `"context-memory"`. It overrides `on_request` only; `on_stream_chunk` and `on_response_complete` use the trait defaults.
-
-## Config
-
-`MemoryConfig` defaults:
-
-| Field | Default |
-|---|---|
-| `encoder_name` | `"cl100k_base"` |
-| `context_window_tokens` | 128000 |
-| `context_window_resolver` | `None` |
-| `max_messages` | `None` |
-| `max_tokens` | `None` |
-| `max_fraction` | `Some(0.8)` |
-| `warn_fraction` | `None` |
-| `observers` | empty |
-| `offload_turns` | 10 |
-| `max_drop_system_observations` | 3 |
-| `graph_context` | `None` |
-| `strategies` | see below |
-
-`max_tokens` and `max_fraction` are mutually exclusive; setting both is rejected at construction. `max_messages`, when set, takes precedence over either token budget.
-
-Default `strategies` pipeline, in order: `Offload { turns: 10 }`, `Summarize { turns: 10 }`, `DeduplicateFileReads { tool_name: "read_file" }`, `ClearToolResults { keep_pairs: 3 }`, `ClampOversizedMessages { max_part_tokens: 4096 }`, `SlidingWindow { keep_messages: 40 }`, `DropObservations`, `DropTurns`.
-
-## Capacity, message list
-
-| | |
-|---|---|
-| Bound | The active `Budget`, resolved from `max_messages`, `max_tokens`, or `max_fraction` against the resolved context window |
-| At-cap policy | The ordered `strategies` pipeline runs in sequence; a strategy with no extension seam configured no-ops |
-| Usage gauge | `MemoryPlugin::count_tokens()` |
-
-## Capacity, working graph
-
-The `MemoryGraph` itself carries no internal cap; it grows only through explicit calls to `MemoryPlugin::merge_graph`, `replace_graph`, or `replace_snapshot`, never from a hook.
-
-| | |
-|---|---|
-| Bound (per-request render) | `GraphContextConfig::max_nodes` (default 64) and `max_relationships` (default 128) |
-| At-cap policy | `MemoryGraph::render` selects the bounded subset for that request; the stored graph is unaffected |
-| Usage gauge | `MemoryGraph::len()` (nodes) and `MemoryGraph::relationship_count()` |
-
-When `MemoryConfig::graph_context` is set, `on_request` renders the graph into a system message placed right after the first system message. The message is idempotent: it starts with a fixed marker, so a later request replaces it in place rather than appending, and it is removed once the graph is empty.
-
-## See also
-
-[Entity extraction](@/services/entity-extraction.md) produces graph deltas applied to this plugin's working graph through `merge_graph` or `replace_graph`.
-
-[Vector store](@/services/vector-store.md) implements the `VectorStore` offload seam `CompactionStrategy::Offload` writes to, wired through `MemoryPlugin::with_extensions`.
+- [Plugins](@/plugins/_index.md): hook order, error handling and the plugin tier rules.
+- [Memory discipline](@/concepts/memory-discipline.md): why every growing structure carries a cap.
+- [Entity extraction](@/services/entity-extraction.md): produces graph deltas applied through `merge_graph` or `replace_graph`.
+- [Vector store](@/services/vector-store.md): implements the `VectorStore` seam that `Offload` writes to.

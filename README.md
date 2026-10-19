@@ -10,28 +10,32 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange)](https://www.rust-lang.org)
 
-CUCA is an asynchronous Rust library for LLM backends. It parses multi-modal SSE streams and normalizes every chunk into typed blocks. One `UnifiedRequest` and one `AgentResponseStream` work across every provider.
+CUCA is an asynchronous Rust library for talking to LLM backends. One `UnifiedRequest` goes in, and one `AgentResponseStream` of typed blocks (`Text`, `Thinking`, `ToolCall` and others) comes out, whichever provider answers. The streaming parser reuses one buffer and copies a frame only when it emits an event.
 
-## Design
+## What you get
 
-- **Explicit provider selection.** `default = []`; compilation fails until you enable at least one `provider-*` feature. Pick `provider-openai` (also for OpenAI-compatible endpoints such as Ollama via a base-URL override), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm`, `provider-lmstudio`, or `provider-local`, which runs a GGUF language model (Gemma 3 and 4, Qwen 2.5 and 3, Llama 3.2, SmolLM 3, Phi 3.5 and 4-mini, DeepSeek-R1 distills, Granite 3 MoE) in-process with no server, on the CPU by default or on a GPU with `provider-local-vulkan`, `provider-local-metal`, `provider-local-cuda` or `provider-local-rocm`.
-- **Lean dependency boundary.** The core carries wire types and the SSE parser. HTTP, Tokio stream adapters, provider SDK support, and plugin or service dependencies compile only when their owning feature is enabled.
-- **Optional per-request thinking.** One effort level, `minimal` to `xhigh`, maps onto each provider's native controls: OpenAI-compatible `reasoning_effort`, Anthropic budget and adaptive modes, Gemini budgets and levels, DeepSeek thinking mode. Providers without a knob ignore it.
-- **Plugins observe, services are called.** MCP connectors, WASM sandboxing, memory compression and in-memory graph memory, output guardrails, subagent delegation, human approval, web search, skills, telemetry, session logging, token and cost accounting with budget caps, and outbound PII and secret redaction are compile-time plugin features that hook the request/stream pipeline. Local response caching, schema-guided entity extraction, deterministic session replay, speculative fast/slow routing, client-side rate limiting, and bounded vector recall of offloaded turns are compile-time services: explicit-call, client-level capabilities that never implement the plugin trait.
+Nothing is compiled by default. You pick Cargo features, and the build fails until you pick at least one provider. The full list is on the [features page](https://nassor.github.io/cuca/reference/features/).
+
+- [Providers](https://nassor.github.io/cuca/providers/): `provider-openai` (also Ollama and other OpenAI-compatible servers), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm` and `provider-lmstudio` over HTTP, and `provider-local`, which runs a GGUF model inside your process.
+- [Plugins](https://nassor.github.io/cuca/plugins/) watch the request and the stream: MCP, WASM sandbox, memory, guardrails, subagents, human approval, web search, skills, telemetry, session log, cost accounting and redaction.
+- [Services](https://nassor.github.io/cuca/services/) are called directly: prompt cache, entity extraction, session replay, speculative fast/slow routing, rate limiting and a vector store.
+- Thinking: one effort level, `minimal` to `xhigh`, maps onto each provider's native reasoning control. Providers without one ignore it.
+
+Start with the [Quick start](#quick-start) below, or read the [documentation site](https://nassor.github.io/cuca/).
 
 ## Quick start
 
-Prerequisites: Rust 1.98 or newer, a checkout of this repository, and a running llama.cpp server (`llama-server`) on port 1234 with the demo model loaded. The demo streams one reply from Gemma 4 E4B.
+Prerequisites: Rust 1.98 or newer, a checkout of this repository, and `llama-server` from llama.cpp with a Gemma 4 E4B GGUF file. About 15 minutes end to end.
 
-Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShell).
+You will start the model on port 1234, create a small crate, and stream one reply into your terminal. Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShell).
 
-1. Make sure llama.cpp's server is up with a GGUF build of Gemma 4 E4B loaded. The `google/gemma-4-e4b` repository on Hugging Face publishes safetensors, not GGUF, so `llama-server -hf google/gemma-4-e4b` cannot load it directly; point `-m` at a GGUF file for the model, substituting its path for `/path/to/model.gguf` below.
+1. Start the model server in its own terminal and leave it running. Replace `/path/to/model.gguf` with your GGUF file. The `google/gemma-4-e4b` repository on Hugging Face holds safetensors, so `llama-server -hf` cannot load it.
 
    ```
    llama-server -m /path/to/model.gguf --port 1234 --alias google/gemma-4-e4b
    ```
 
-   `llama-server` keeps a local server on port 1234 in the foreground; leave it running in its own terminal. Confirm it is serving the model.
+   From a second terminal, check that it serves the model.
 
    Linux/macOS:
 
@@ -56,7 +60,7 @@ Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShel
 
    You see ``Creating binary (application) `cuca-demo` package``.
 
-3. Add CUCA from your checkout, with the llama.cpp provider enabled. Substitute the path of this repository for `/path/to/cuca`.
+3. Add CUCA from your checkout with the llama.cpp provider enabled. Replace `/path/to/cuca` with the path of this repository.
 
    ```
    cargo add cuca --path /path/to/cuca --features provider-llamacpp
@@ -64,7 +68,7 @@ Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShel
 
    You see `Adding cuca (local) to dependencies`, followed by the feature list, with `+ provider-llamacpp` enabled and every other feature listed as disabled.
 
-   llama-server's chat route speaks the OpenAI-compatible `/v1/chat/completions` protocol, but the llama.cpp adapter's own default base URL is `http://127.0.0.1:8080`; the demo below overrides it to reach the server on port 1234, and no API key is needed.
+   The llama.cpp adapter defaults to `http://127.0.0.1:8080`, so the demo below sets the base URL to port 1234. No API key is needed.
 
 4. Add the async runtime and stream extension trait used by the demo.
 
@@ -115,30 +119,36 @@ Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShel
 
 ## After the first run
 
-- Enable only the provider features you use.
-- The same demo works against any OpenAI-compatible endpoint, such as Ollama, vLLM, or a remote gateway, by switching to `provider-openai` and setting the base URL in `with_base_url` and the model name in `UnifiedRequest::new`; Ollama serves this protocol at `http://localhost:11434/v1` once `ollama serve` is running with a model pulled.
-- LM Studio speaks the same protocol through its own dedicated adapter, `provider-lmstudio`, which already defaults to LM Studio's local server at `http://127.0.0.1:1234/v1`.
-- `provider-local` needs no server at all: it runs a GGUF language model inside your process (twenty-two verified presets across Gemma 2, 3 and 4, Qwen 2.5, 3 and 3.5, Llama 3.2, TinyLlama, SmolLM 2 and 3, Phi 3.5 and 4-mini, OLMo 2, DeepSeek-R1-Distill-Qwen and Granite 3 (dense and MoE), listed in `ModelSource::PRESETS`; any GGUF of a supported architecture loads, with the tokenizer and chat template read from the file and reasoning and tool calls parsed into `Thinking` and `ToolCall` blocks), with no HTTP endpoint and no llama.cpp. It runs on the CPU through candle by default (Qwen 3.5, a hybrid recurrent model, only there), or on a GPU through burn and CubeCL when you enable one of `provider-local-vulkan`, `provider-local-metal`, `provider-local-cuda` or `provider-local-rocm` and set `LocalModelConfig::device` (for example `LocalDevice::Vulkan(GpuAdapter::Default)`); the CPU stays the default and nothing selects a GPU for you. The graphics backends themselves (wgpu: SPIR-V for Vulkan, MSL for Metal) are Rust, but every GPU feature still compiles C: CubeCL's runtime pulls an embedded store (`turso`) that builds C through `cc`, and on Windows a dependency's build script also runs the SDK resource compiler (`rc.exe`; `windres` on the GNU target). CUDA and ROCm additionally link a prebuilt LLVM that a build script downloads on the first build (network needed once), and ROCm is Linux-only. The GPU drivers are system libraries loaded at runtime. The engine code is pure Rust with no FFI written by cuca; candle's dependency tree does build one C crate (`onig_sys`, pulled in through `tokenizers`), so the feature needs a C compiler. `LocalModel::load` downloads the pinned model (2.84 GB for the default E2B Q4_0) into a cache directory with resume and SHA-256 verification, or opens a GGUF file you point it at; choose another checkpoint with `LocalModelConfig::source`, for example `"gemma4-e4b-q4_0".parse::<ModelSource>()?` (4.59 GB), or with `CUCA_LOCAL_MODEL=gemma4-e4b-q4_0` in `examples/local_model.rs` and the live tests. Attach the result with `CucaClientBuilder::with_local_model` and select `ProviderEndpoint::Local`. On the CPU path, build for the host CPU (`RUSTFLAGS="-C target-cpu=native"`) because candle chooses its SIMD kernels at compile time. See `examples/local_model.rs` and the Local pages on the documentation site: "Local (in-process)" for configuration, drafting and a "Running on a GPU" section, and "Local models and formats" for the preset table with each file, size and K/V cost.
-- The repository's `examples/` folder covers the core client plus every plugin and every service; every example except `local_model` reads `CUCA_BASE_URL` and `CUCA_MODEL` from the environment, so one build retargets at any OpenAI-compatible server. `Cargo.toml` lists each one with the features it needs, and every plugin and service page on the site has a "Try it" section with that example's exact `cargo run` command and its real output.
+- Enable only the provider features you use. The [Providers](https://nassor.github.io/cuca/providers/) pages list what each one talks to.
+- Any OpenAI-compatible server (Ollama, vLLM, a remote gateway) works with `provider-openai`, a different `with_base_url` and your model name. Ollama serves at `http://localhost:11434/v1`. LM Studio has its own `provider-lmstudio`, which defaults to `http://127.0.0.1:1234/v1`.
+- The `examples/` folder has a runnable demo for the core client, every plugin and every service. All except `local_model` read `CUCA_BASE_URL` and `CUCA_MODEL`. Each plugin and service page on the site shows the `cargo run` command and its output.
 
-### Integration tests (live llama.cpp)
+### Run a model with no server
 
-The suite in `tests/` runs server-dependent plugins and services against a live model server: one file per plugin or service, sharing the harness in `tests/common/mod.rs`. Each file compiles only when its own feature is on, on top of `provider-llamacpp`.
+`provider-local` runs a GGUF model inside your process, on the CPU. It downloads the default model, Gemma 4 E2B Q4_0 (2.84 GB), on first use. Inside an async function:
 
-Prerequisites: an OpenAI-compatible server (llama.cpp's `llama-server` serves this natively) with a chat model loaded at `http://127.0.0.1:1234`, no API key. The MCP echo server is embedded in `plugin_mcp.rs`: the test binary re-executes itself with `--mcp-echo-server` and serves an rmcp stdio echo server (no Python needed). On WSL2, `127.0.0.1` may not reach a server on the Windows host; set `CUCA_BASE_URL` to the host address, for example `http://172.25.0.1:1234/v1`.
+```rust
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, LocalModel, LocalModelConfig};
 
-Runs the same on Linux, macOS and Windows (PowerShell):
+let model = LocalModel::load(LocalModelConfig::default()).await?;
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::Local)
+    .with_local_model(model)
+    .build()?;
+```
+
+`generate_stream` then works as in the Quick start. The [Local page](https://nassor.github.io/cuca/providers/local/) has the full example, the presets, GPU features and the build command. [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) lists the supported architectures.
+
+### Run the live tests
+
+With a chat model on `http://127.0.0.1:1234` (a llama.cpp server works), run this on Linux, macOS and Windows (PowerShell):
 
 ```
 cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit service-vector-store plugin-redaction" -- --nocapture --test-threads=1
 ```
 
-Environment variables:
-
-- `CUCA_BASE_URL`: the OpenAI-compatible base URL; defaults to `http://127.0.0.1:1234/v1`.
-- `CUCA_MODEL`: the model id to exercise; defaults to the first id the server reports.
-- `CUCA_REQUIRE_LIVE`: set to `1` to fail when the server is unreachable; otherwise server-dependent tests print `SKIP: llama.cpp not reachable: ...` and pass.
-- `service-speculative`'s live orchestrated-turn test does not read `CUCA_BASE_URL`: its tier executors draw clients from a pool with no base URL configured, so `dispatch_llamacpp` falls back to llama.cpp's own default, `http://127.0.0.1:8080`. That test needs a server reachable there, independent of wherever `CUCA_BASE_URL` points the rest of the suite.
+Without a reachable server, the tests print `SKIP` and pass. The environment variables are in the [integration tests guide](https://nassor.github.io/cuca/guides/integration-tests/).
 
 ## License
 

@@ -1,6 +1,6 @@
 +++
 title = "Providers"
-description = "Eight provider adapters, seven HTTP ones over three wire protocols and one in-process engine, one dispatch match. Default base URLs, auth headers and routes for all of them."
+description = "The eight provider adapters, seven over HTTP and one in-process, with each one's feature flag, default base URL and auth header."
 template = "section.html"
 sort_by = "weight"
 
@@ -17,48 +17,53 @@ kicker = "Reference"
 <dd>You need a base URL, an auth header, a route, or the exact behavior one adapter does not share with the others</dd>
 </dl>
 
-## The seven HTTP adapters
+## Compare the adapters
 
-| Feature | `ProviderEndpoint` | Default base URL | Auth header | Route |
-|---|---|---|---|---|
-| [`provider-openai`](@/providers/openai.md) | `OpenAi` | `https://api.openai.com/v1` | `Authorization: Bearer`, when a key is set | `POST {base}/chat/completions` |
-| [`provider-anthropic`](@/providers/anthropic.md) | `Anthropic` | `https://api.anthropic.com/v1` | `x-api-key` or `Authorization: Bearer`, plus `anthropic-version: 2023-06-01` | `POST {base}/messages` |
-| [`provider-gemini`](@/providers/gemini.md) | `GoogleGemini` | `https://generativelanguage.googleapis.com` | `x-goog-api-key`, required | `POST {base}/v1beta/models/{model}:streamGenerateContent?alt=sse` |
-| [`provider-deepseek`](@/providers/deepseek.md) | `DeepSeek` | `https://api.deepseek.com/v1` | `Authorization: Bearer` on the native route, `x-api-key` on the bridge route | `POST {base}/chat/completions`, or `POST {base}/messages` on the bridge |
-| [`provider-llamacpp`](@/providers/llamacpp.md) | `LlamaCpp` | `http://127.0.0.1:8080` | `Authorization: Bearer`, when a key is set | `POST {base}/v1/chat/completions`, or `POST {base}/completion` on the native route |
-| [`provider-vllm`](@/providers/vllm.md) | `Vllm` | `http://127.0.0.1:8000/v1` | `Authorization: Bearer`, optional | `POST {base}/chat/completions` |
-| [`provider-lmstudio`](@/providers/lmstudio.md) | `LmStudio` | `http://127.0.0.1:1234/v1` | `Authorization: Bearer`, optional | `POST {base}/chat/completions` |
+| Feature | `ProviderEndpoint` | Default base URL | Auth header |
+|---|---|---|---|
+| [`provider-openai`](@/providers/openai.md) | `OpenAi` | `https://api.openai.com/v1` | `Authorization: Bearer`, when a key is set |
+| [`provider-anthropic`](@/providers/anthropic.md) | `Anthropic` | `https://api.anthropic.com/v1` | `x-api-key`, or `Authorization: Bearer` for a bearer token |
+| [`provider-gemini`](@/providers/gemini.md) | `GoogleGemini` | `https://generativelanguage.googleapis.com` | `x-goog-api-key`, required |
+| [`provider-deepseek`](@/providers/deepseek.md) | `DeepSeek` | `https://api.deepseek.com/v1` | `Authorization: Bearer` (native), `x-api-key` (bridge) |
+| [`provider-llamacpp`](@/providers/llamacpp.md) | `LlamaCpp` | `http://127.0.0.1:8080` | `Authorization: Bearer`, when a key is set |
+| [`provider-vllm`](@/providers/vllm.md) | `Vllm` | `http://127.0.0.1:8000/v1` | `Authorization: Bearer`, when a key is set |
+| [`provider-lmstudio`](@/providers/lmstudio.md) | `LmStudio` | `http://127.0.0.1:1234/v1` | `Authorization: Bearer`, when a key is set |
+| [`provider-local`](@/providers/local/_index.md) | `Local` | none, runs in your process | none |
 
-Every feature in the table enables `reqwest` with its `rustls` backend and
-`tokio-stream`. `provider-anthropic` additionally enables `sha2`, `getrandom`
-and `base64` for its OAuth PKCE surface. The full dependency mapping is
-[The feature matrix](@/reference/features.md).
+- The default base URL applies when the client's base URL is empty. Set another with `CucaClientBuilder::with_base_url`.
+- Each provider page lists the route, the request and stream translation, thinking, errors and limits under the same headings.
+- Every HTTP feature enables `reqwest` with its `rustls` backend and `tokio-stream`. `provider-anthropic` also enables `sha2`, `getrandom` and `base64`.
+- [The feature matrix](@/reference/features.md) maps every feature to its dependencies.
+
+## Wire formats
+
+The seven HTTP adapters speak four wire formats and share two translation modules.
+
+| Wire format | Adapters | Stream ends at |
+|---|---|---|
+| OpenAI-compatible `/chat/completions` | OpenAI, vLLM, LM Studio, DeepSeek native, llama.cpp chat | `data: [DONE]` |
+| Anthropic Messages | Anthropic, DeepSeek bridge | `message_stop` event |
+| Gemini `streamGenerateContent` | Gemini | the end of the byte stream |
+| llama.cpp native `/completion` | llama.cpp with `LlamaRoute::Completion` | the end of the byte stream |
+
+- `src/provider/openai_compat.rs` holds the OpenAI-compatible translation, documented on the [OpenAI](@/providers/openai.md) page.
+- `src/provider/anthropic.rs` holds the Anthropic translation, documented on the [Anthropic](@/providers/anthropic.md) page.
+- Gemini and the llama.cpp native route each have their own translator.
 
 ## The in-process adapter
 
-[`provider-local`](@/providers/local.md) is the eighth adapter and the only one without a base URL, an auth header or a route: its `ProviderEndpoint` variant, `Local`, runs a GGUF language model (Gemma 3 and 4, Qwen 2.5 and 3, Llama 3.2, SmolLM 3, Phi 3.5 and 4-mini, DeepSeek-R1 distills, Granite 3 MoE; see [Local models and formats](@/providers/local-models.md)) on the CPU or a GPU inside your process, with no HTTP endpoint; the engine code is pure Rust, though candle's dependency tree builds one C crate (`onig_sys`). The CPU is the default; `provider-local-vulkan`, `provider-local-metal`, `provider-local-cuda` and `provider-local-rocm` add a GPU engine through burn that `LocalModelConfig::device` selects. It does not use `tokio-stream`; it uses `reqwest` only for the one-time model download from Hugging Face. The model is attached with `CucaClientBuilder::with_local_model`.
+`provider-local` runs a GGUF language model inside your process and exposes no HTTP endpoint. It has no base URL, auth header or route.
 
-## Three wire protocols, two shared modules
+- `ProviderEndpoint::Local` selects it, and `CucaClientBuilder::with_local_model` attaches the model. `build` fails when the selected provider is `Local` and no model is attached.
+- The CPU is the default device. `provider-local-vulkan`, `provider-local-metal`, `provider-local-cuda` and `provider-local-rocm` add a GPU engine that `LocalModelConfig::device` selects.
+- It does not use `tokio-stream`. It uses `reqwest` only for the one-time model download.
+- The engine is pure Rust. The `candle` dependency tree builds one C crate, `onig_sys`.
 
-Five of the seven speak the OpenAI-compatible `/chat/completions` protocol and
-share one module, `src/provider/openai_compat.rs`: OpenAI, vLLM, LM Studio,
-DeepSeek's native route, and llama.cpp's chat route. Two speak the Anthropic
-Messages protocol and share `src/provider/anthropic.rs`: Anthropic, and
-DeepSeek's bridge route.
-
-Gemini shares neither. llama.cpp's native `/completion` route shares neither.
-
-| Module | Serves | Frame terminator |
-|---|---|---|
-| `openai_compat.rs` | `provider-openai`, `provider-vllm`, `provider-lmstudio`, `provider-deepseek` native, `provider-llamacpp` chat | `data: [DONE]` |
-| `anthropic.rs` | `provider-anthropic`, `provider-deepseek` bridge | `message_stop` event |
-| `gemini.rs` | `provider-gemini` | none; the byte stream ends |
-| `llamacpp.rs` native route | `provider-llamacpp` with `LlamaRoute::Completion` | a frame with `"stop": true` |
+See [Local (in-process)](@/providers/local/_index.md) for configuration and behavior, and [Local models and formats](@/providers/local/models.md) for the supported architectures and presets.
 
 ## Dispatch
 
-There is no provider trait. Each adapter module contributes an inherent
-`impl CucaClient` block holding one method:
+There is no provider trait. Each adapter module contributes an inherent `impl CucaClient` block with one method:
 
 ```rust,name=The shape every adapter implements
 pub(crate) async fn dispatch_<provider>(
@@ -67,34 +72,31 @@ pub(crate) async fn dispatch_<provider>(
 ) -> Result<ProviderDispatch, CucaError>
 ```
 
-`CucaClient::generate_stream` selects among them with a `match` on
-`self.selected_provider`. Each arm is gated on its own feature, and every arm
-has a mirrored `#[cfg(not(feature = ...))]` counterpart returning
-`CucaError::ProviderNotEnabled` with the missing flag name.
+`CucaClient::generate_stream` sets `request.provider` to the client's selected provider, runs the `on_request` hooks, then selects an adapter with a `match` on `self.selected_provider`. Each arm is gated on its feature. A mirrored `#[cfg(not(feature = ...))]` arm returns `CucaError::ProviderNotEnabled` with the missing flag name.
 
-## The ninth variant
+## Custom endpoints
 
-`ProviderEndpoint` has nine variants, but only eight have adapters. The ninth is `Custom(String)`, which is not gated
-by any feature and has no adapter. Dispatching it always returns:
+`ProviderEndpoint` has nine variants: the eight above and `Custom(String)`. `Custom` has no feature and no adapter. Dispatching it returns `CucaError::Config`:
 
 ```text,name=CucaError::Config from the Custom arm
 configuration error: custom endpoints require a registered adapter
 ```
 
-The default value of `ProviderEndpoint` is `OpenAi`. `UnifiedRequest::new` sets
-the field to `Custom(String::new())`, which `generate_stream` then overwrites
-with the client's own selected provider before any hook runs.
+- `ProviderEndpoint::default()` is `OpenAi`.
+- `UnifiedRequest::new` sets the request's provider to `Custom(String::new())`, and `generate_stream` overwrites it with the client's provider before any hook runs.
 
-## Where providers read the environment
+## Environment variables
 
-None of the seven HTTP adapters reads an environment variable. Base URLs, API keys
-and bearer tokens reach them only through `CucaClientBuilder`. The three
-`CUCA_*` variables that belong to the examples and the test harness are listed in
-[Environment variables](@/reference/environment.md).
+None of the seven HTTP adapters reads an environment variable. Base URLs, API keys and bearer tokens reach them only through `CucaClientBuilder`. The `CUCA_*` variables that belong to the examples and the test harness are listed in [Environment variables](@/reference/environment.md).
 
-`provider-local` is the exception, and only as a fallback: when
-`LocalModelConfig::cache_dir` is `None` it reads `CUCA_CACHE_DIR` and then the
-platform's cache variables, and when `LocalModelConfig::hf_token` is `None` it
-reads `HF_TOKEN`. Setting the config fields keeps it from reading either.
+`provider-local` reads two variables as fallbacks:
 
-## Per-provider pages
+- `CUCA_CACHE_DIR`, then the platform's cache variables, when `LocalModelConfig::cache_dir` is `None`.
+- `HF_TOKEN` when `LocalModelConfig::hf_token` is `None`.
+
+Setting the config fields keeps it from reading either.
+
+## Related pages
+
+- [Unified request](@/concepts/unified-request.md) explains the request every adapter translates.
+- [Use another OpenAI-compatible server](@/guides/other-openai-server.md) shows how to point an adapter at a server not listed here.

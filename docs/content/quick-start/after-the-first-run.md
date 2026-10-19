@@ -82,8 +82,9 @@ checkout by path and picks its features explicitly:
 cargo add cuca --path /path/to/cuca --features provider-llamacpp
 ```
 
-Swap `provider-llamacpp` for whichever adapter speaks to your backend. The seven
-choices and what each one talks to are in [Providers](@/providers/_index.md).
+Swap `provider-llamacpp` for whichever adapter speaks to your backend. The eight
+choices (seven HTTP adapters and the in-process `provider-local`) and what each
+one talks to are in [Providers](@/providers/_index.md).
 Add `plugin-*` features the same way, one per capability you want compiled in.
 
 ## Turn thinking on

@@ -9,232 +9,105 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Connects to one Model Context Protocol server, discovers its tools, and executes them as ToolCall to ToolResult exchanges.</dd>
+<dd><code>McpPlugin</code> connects to one Model Context Protocol server, discovers its tools once, and executes matching <code>ToolCall</code> blocks as <code>ToolResult</code> blocks.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-mcp</code> feature and a reachable MCP server (a spawned child process or a Streamable HTTP endpoint).</dd>
+<dd>The <code>plugin-mcp</code> feature and a reachable MCP server: a child process over stdio or a Streamable HTTP endpoint.</dd>
 <dt>Read this if</dt>
 <dd>You are registering <code>McpPlugin</code> or choosing an <code>McpTransport</code>.</dd>
 </dl>
 
-`McpPlugin` connects to one Model Context Protocol server, a spawned child process over stdio or a Streamable HTTP endpoint, discovers its tools once with `tools/list`, and executes model-issued `ToolCall` blocks whose name matches a discovered tool. It speaks only the stateless MCP protocol version `2026-07-28`: every request carries its own protocol version and capabilities, with no connection-setup phase. Reach for it to expose an existing MCP server's tools to a model without writing a bespoke bridge.
+## Feature and entry type
 
-```rust,name=Serve one MCP tool over stdio and route the model's call
-use std::sync::Arc;
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-mcp` (enables `dep:rmcp` and `dep:tokio`) |
+| Plugin name | `"mcp-connector"` |
+| Entry types | `McpPlugin`, `McpTransport` |
+| Attachment | `CucaClientBuilder::register_plugin` |
+| Needs | An MCP server speaking protocol version `2026-07-28` |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{
-    MessageContentBlock, MessageRole, ProviderEndpoint, ToolDefinition, UnifiedMessage,
-};
-use cuca::{AgentResponseStream, CucaClient, McpPlugin, McpTransport, UnifiedRequest};
-use serde_json::json;
-use tokio_stream::StreamExt;
+## Hooks
 
-/// Argument that turns this binary into the MCP server instead of the demo.
-const SERVER_FLAG: &str = "--mcp-add-server";
+`McpPlugin` acts on `on_stream_chunk`. It does not override `execute_local_tool`.
 
-/// Drain a turn into its text, the tool results the consumer received, and the
-/// thinking-block count.
-///
-/// A reasoning model emits one `Thinking` block per token, so printing every
-/// block buries the lines this demo is about. The count stays in the output
-/// because it is the honest shape of a live turn.
-async fn drain(mut stream: AgentResponseStream) -> (String, Vec<(String, String)>, usize) {
-    let mut text = String::new();
-    let mut results = Vec::new();
-    let mut thinking = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-            Ok(MessageContentBlock::ToolResult {
-                tool_call_id,
-                output,
-            }) => results.push((tool_call_id, output)),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    (text, results, thinking)
+| Hook | Behavior |
+|---|---|
+| `on_request` | No-op. The caller publishes the discovered tools through `McpPlugin::tools()`. |
+| `on_stream_chunk` | Replaces a `ToolCall` whose name is a discovered tool with a `ToolResult`. Other blocks and unknown tool names pass through. |
+| `on_response_complete` | No-op. |
+
+- The replacement `ToolResult` carries the tool's rendered output, or the error text when the call fails. The hook itself returns `Ok(())`.
+- The stream pauses while the tool runs: the hook blocks the calling thread until the server replies.
+- `McpPlugin::call_tool(name, arguments)` is the async entry point. It awaits the same worker channel through `spawn_blocking`.
+
+### Protocol
+
+- The plugin speaks only MCP `2026-07-28`, the stateless protocol. It has no connection-setup phase and no legacy fallback.
+- Every request carries its protocol version, client identity and client capabilities in `_meta`.
+- Connecting probes the server once with `server/discover`, then lists every tool with pagination-aware `tools/list`.
+- A `tools/call` answered with `resultType: "input_required"` (SEP-2322) or `resultType: "task"` (SEP-2663) is not driven further. It surfaces as `PluginError::NotSupported`.
+- Arguments map to a JSON object: an object stays as is, `null` becomes no arguments, anything else is a validation error.
+- Output rendering: text blocks join with newlines, images, audio and resources become compact placeholders, error results get a prefix, and `structuredContent` renders as JSON when no content blocks exist.
+
+## Configuration
+
+`McpPlugin` has no config struct and no keys with defaults. The `McpTransport` argument of `McpPlugin::connect` selects the connection.
+
+| Variant | Fields | Connection |
+|---|---|---|
+| `Stdio` | `command`, `args` | Spawns the executable as a child process and speaks MCP over its stdio pipes. |
+| `StreamableHttp` | `url` | Connects over Streamable HTTP, the `2026-07-28` binding. |
+| `WebSocket` | `url` | Not connectable: resolves to `PluginError::NotSupported`. |
+
+`McpPlugin::connect_stdio(command)` is shorthand for `McpPlugin::connect(McpTransport::stdio(command))`, a stdio transport with no arguments.
+
+## Caps and at-cap policy
+
+No cap: nothing grows with traffic.
+
+- The tool map is filled once at connect time from `tools/list`.
+- `McpPlugin::tools()` returns the full list sorted by name.
+- One worker thread named `cuca-mcp-worker` runs every call over an unbounded `std::sync::mpsc` channel; each hook call blocks until its own reply arrives.
+- No usage gauge exists.
+
+## Errors
+
+The hooks return no `PluginError`. A failed tool call becomes `ToolResult` text. `connect` and `call_tool` return these variants:
+
+| Variant | When |
+|---|---|
+| `Io` | The stdio child process fails to spawn, or the worker thread fails to spawn. |
+| `NotSupported` | `McpTransport::WebSocket` is used, or a tool call answers `input_required` or `task`. |
+| `Validation` (schema `tools/call arguments`) | Tool arguments are neither a JSON object nor `null`. |
+| `Internal` | The worker runtime fails to build, discovery or `tools/list` fails, a tool call fails, the worker exits or drops its reply channel, or the server returns an unrecognized response. |
+
+## Example
+
+`examples/mcp.rs` re-executes its own binary with `--mcp-add-server` as a stdio server with one `add` tool. The model calls `add`, the child computes the sum, and a second turn answers from it.
+
+```rust,name=Register McpPlugin and publish its tools
+let mcp = Arc::new(McpPlugin::connect_stdio("github-mcp-server").await?);
+
+let mut request = UnifiedRequest::new(&model);
+for tool in mcp.tools() {
+    request = request.add_tool(ToolDefinition {
+        name: tool.name.to_string(),
+        description: tool.description.as_deref().unwrap_or_default().to_string(),
+        input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
+    });
 }
 
-/// The follow-up turn: the same prompt plus the sum the MCP server computed.
-fn with_result(model: &str, prompt: &str, call_id: &str, output: &str) -> UnifiedRequest {
-    UnifiedRequest::new(model)
-        // A reasoning model spends the token budget on thinking first, so a
-        // tight cap can end the turn before any text is emitted.
-        .set_max_tokens(320)
-        .add_user_message(prompt)
-        .add_message(UnifiedMessage {
-            role: MessageRole::Assistant,
-            content: vec![MessageContentBlock::ToolCall {
-                id: call_id.to_string(),
-                name: "add".to_string(),
-                arguments: json!({ "a": 21, "b": 21 }),
-            }],
-            name: None,
-            tool_call_id: None,
-        })
-        .add_message(UnifiedMessage {
-            role: MessageRole::Tool,
-            content: vec![MessageContentBlock::ToolResult {
-                tool_call_id: call_id.to_string(),
-                output: output.to_string(),
-            }],
-            name: None,
-            tool_call_id: Some(call_id.to_string()),
-        })
-}
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url)
+    .register_plugin(mcp as Arc<dyn CucaPlugin>)
+    .build()?;
+```
 
-/// The flag check must run before any runtime exists: [`add_server::run`]
-/// builds its own and `block_on` panics inside another runtime, so `main`
-/// stays synchronous and starts the demo's runtime only on the demo path.
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if std::env::args_os().any(|arg| arg == SERVER_FLAG) {
-        add_server::run();
-    }
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?
-        .block_on(demo())
-}
+The example needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
 
-async fn demo() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
-
-    // The MCP server is this same binary, re-executed with the flag above, so
-    // the demo needs no third-party server on PATH. The plugin still speaks
-    // JSON-RPC over a real child process's stdio pipes.
-    let exe = std::env::current_exe()?;
-    let mcp = Arc::new(
-        McpPlugin::connect(McpTransport::Stdio {
-            command: exe.to_string_lossy().into_owned(),
-            args: vec![SERVER_FLAG.to_string()],
-        })
-        .await?,
-    );
-
-    // The connector never rewrites prompts, so publishing the discovered tools
-    // to the model is the caller's job.
-    let mut request = UnifiedRequest::new(&model).set_max_tokens(256);
-    println!("Discovered over stdio, from tools/list:");
-    for tool in mcp.tools() {
-        println!(
-            "  {}: {}",
-            tool.name,
-            tool.description.as_deref().unwrap_or("(no description)")
-        );
-        request = request.add_tool(ToolDefinition {
-            name: tool.name.to_string(),
-            description: tool.description.as_deref().unwrap_or_default().to_string(),
-            input_schema: serde_json::Value::Object((*tool.input_schema).clone()),
-        });
-    }
-
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::clone(&mcp) as Arc<dyn CucaPlugin>)
-        .build()?;
-
-    let prompt = "Add 21 and 21 with the add tool, then tell me the sum.";
-    println!("\nTurn 1: the model calls the MCP tool, the child process answers");
-    let stream = match client
-        .generate_stream(request.add_user_message(prompt))
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(());
-        }
-    };
-    let (reply, results, thinking) = drain(stream).await;
-    let Some((call_id, output)) = results.into_iter().next() else {
-        println!("  the model answered without calling the tool: {reply:?}");
-        return Ok(());
-    };
-    println!("  tool result from the MCP server: {output:?}");
-    println!("  thinking blocks: {thinking}");
-
-    println!("\nTurn 2: the same question, with the server's answer in the prompt");
-    let (reply, _, thinking) = drain(
-        client
-            .generate_stream(with_result(&model, prompt, &call_id, &output))
-            .await?,
-    )
-    .await;
-    println!("  reply: {}", reply.trim());
-    println!("  thinking blocks: {thinking}");
-
-    Ok(())
-}
-
-/// The MCP server this binary becomes when re-executed with [`SERVER_FLAG`].
-///
-/// One tool, `add`, served over stdio. The rmcp server framework answers
-/// `server/discover`, `tools/list` and `ping` itself, so only the tool is
-/// defined here. The process exits when stdin reaches EOF, which happens when
-/// the plugin is dropped.
-mod add_server {
-    use rmcp::handler::server::wrapper::Parameters;
-    use rmcp::schemars::JsonSchema;
-    use rmcp::serde::Deserialize;
-    use rmcp::{ServiceExt, tool, tool_router};
-
-    /// Arguments of the `add` tool: the two summands.
-    #[derive(Deserialize, JsonSchema)]
-    struct AddArgs {
-        a: f64,
-        b: f64,
-    }
-
-    struct AddServer;
-
-    #[tool_router(server_handler)]
-    impl AddServer {
-        #[tool(description = "Add two numbers and return their sum")]
-        async fn add(&self, params: Parameters<AddArgs>) -> String {
-            (params.0.a + params.0.b).to_string()
-        }
-    }
-
-    /// Serve `add` over stdio on a runtime of its own, then exit. Never returns.
-    pub(crate) fn run() -> ! {
-        let runtime = match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(error) => {
-                eprintln!("mcp add server: failed to build runtime: {error}");
-                std::process::exit(1);
-            }
-        };
-        runtime.block_on(async {
-            let service = match AddServer.serve(rmcp::transport::stdio()).await {
-                Ok(service) => service,
-                Err(error) => {
-                    eprintln!("mcp add server: failed to serve: {error}");
-                    std::process::exit(1);
-                }
-            };
-            if let Err(error) = service.waiting().await {
-                eprintln!("mcp add server: serve loop failed: {error}");
-                std::process::exit(1);
-            }
-        });
-        std::process::exit(0);
-    }
-}
+```bash,name=Runs the same on all three platforms
+cargo run --example mcp --features "provider-llamacpp plugin-mcp"
 ```
 
 ```text,name=Expected output
@@ -250,44 +123,10 @@ Turn 2: the same question, with the server's answer in the prompt
   thinking blocks: 44
 ```
 
-## Try it
+The tool-call id, the reply wording and the thinking-block counts depend on the model. The output above came from `google/gemma-4-12b-qat`.
 
-`examples/mcp.rs` runs the program above against a live model, with no third-party MCP server needed: the example binary re-executes itself with `--mcp-add-server` and serves one `add` tool over stdio, so the plugin talks to a genuine child process over real pipes. The model calls `add`, the child computes the sum, and a second turn answers from it. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. The tool-call id, the reply wording and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
+## Related pages
 
-```bash,name=Runs the same on all three platforms
-cargo run --example mcp --features "provider-llamacpp plugin-mcp"
-```
-
-## Entry types
-
-`McpPlugin`, `McpTransport`.
-
-## `CucaPlugin`
-
-`McpPlugin` implements `CucaPlugin` with the plugin name `"mcp-connector"`. It overrides `on_stream_chunk` only.
-
-| Hook | Behavior |
-|---|---|
-| `on_request` | No-op. Discovered tools are injected into the caller's tool set through `McpPlugin::tools()`, not by rewriting the request. |
-| `on_stream_chunk` | Routes `ToolCall` blocks whose name is a discovered tool to a `ToolResult` carrying the call's rendered output, or the error text on failure. Unknown tool names pass through untouched. |
-| `on_response_complete` | No-op. |
-
-## Transport
-
-| Variant | Connection |
-|---|---|
-| `McpTransport::Stdio { command, args }` | Spawns the executable as a child process and speaks MCP over its stdio pipes |
-| `McpTransport::StreamableHttp { url }` | Connects over Streamable HTTP, the MCP 2026-07-28 binding |
-| `McpTransport::WebSocket { url }` | Not connectable; resolves to `PluginError::NotSupported`, there is no WebSocket client transport |
-
-`McpPlugin::connect_stdio(command)` is shorthand for `McpPlugin::connect(McpTransport::stdio(command))`.
-
-## Protocol
-
-The plugin speaks only the stateless MCP protocol version `2026-07-28`. There is no connection-setup phase and no shared connection state; every request carries its protocol version, client identity, and client capabilities in `_meta`. Connecting probes the server once with `server/discover`, then lists every tool with pagination-aware `tools/list`.
-
-A server answering `tools/call` with `resultType: "input_required"` (multi round trip requests, SEP-2322) or `resultType: "task"` (SEP-2663) is not driven further; both surface as `PluginError::NotSupported` instead of a fabricated result.
-
-## Capacity
-
-The discovered tool map is populated once at connect time from `tools/list`, not on each request, so it carries no traffic-growth cap. `McpPlugin::tools()` returns the full list, sorted by name.
+- [Plugins](@/plugins/_index.md): hook order, error handling and the plugin tier rules.
+- [Error types](@/reference/errors.md): `PluginError` and `CucaError`.
+- [Point the client at another OpenAI-compatible server](@/guides/other-openai-server.md): retarget the example.

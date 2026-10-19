@@ -1369,12 +1369,14 @@ a.card:hover, .concept-card:hover, .next-card:hover {
     color: var(--muted-foreground);
 }
 .markdown blockquote > :last-child { margin-bottom: 0; }
-/* Tables share the figure edge like code blocks do. Cells wrap instead of
-   shrink-wrapping the table, which is why no scroll container is needed here:
-   only inline code refuses to break, and `table-layout: auto` gives it room. */
+/* Tables share the figure edge like code blocks do. Cells never break inside
+   a word: `overflow-wrap: anywhere` lowers min-content to one character, so
+   the auto layout squeezed short columns ("Plugi/n") to feed the long one.
+   Cells wrap only at spaces; inline code stays whole (nowrap), and a table
+   wider than the column scrolls inside itself (display: block) instead. */
 .markdown table { display: block; width: 100%; overflow-x: auto; }
 .markdown table code { white-space: nowrap; }
-.markdown td, .markdown th { overflow-wrap: anywhere; }
+.markdown td, .markdown th { overflow-wrap: normal; word-break: normal; hyphens: none; }
 
 /* --------------------------------------------------------------------------
    20. Responsive

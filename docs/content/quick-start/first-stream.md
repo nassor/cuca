@@ -16,8 +16,8 @@ weight = 1
 <dd>You want a reply streaming out of the crate before reading anything else</dd>
 </dl>
 
-Three steps, each ending in output you can check. Every `cargo` command runs the
-same on Linux, macOS and Windows (PowerShell).
+Three steps, each ending in output you can check. About 15 minutes end to end.
+Every `cargo` command runs the same on Linux, macOS and Windows (PowerShell).
 
 ## Step 1: get the crate
 
@@ -34,8 +34,8 @@ cargo --version
 `1.98.0`, so a `rustup`-managed toolchain installs it on the first cargo
 invocation in this directory.
 
-Nothing builds yet, and that is deliberate. Ask cargo to build with no features
-and it refuses:
+The crate has no default provider, so a build with no provider feature fails.
+Try it:
 
 ```bash,name=Runs the same on all three platforms
 cargo check --no-default-features

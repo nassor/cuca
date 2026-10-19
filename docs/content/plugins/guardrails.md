@@ -9,213 +9,94 @@ weight = 5
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Validates tool call arguments and text responses against caller-registered JSON Schemas, re-injecting a diagnostic on failure instead of erroring the stream.</dd>
+<dd><code>JsonGuardrailPlugin</code> validates tool call arguments and JSON text responses against caller-registered JSON Schemas, and re-injects a diagnostic on failure instead of erroring the stream.</dd>
 <dt>You need</dt>
 <dd>The <code>plugin-guardrails</code> feature.</dd>
 <dt>Read this if</dt>
 <dd>You are registering <code>JsonGuardrailPlugin</code> or reading its retry behavior.</dd>
 </dl>
 
-`JsonGuardrailPlugin` validates tool call arguments, and optionally model text responses, against caller-registered JSON Schemas as blocks stream in. A failing value is not an error: the plugin replaces the block with a `ToolResult` diagnostic and re-injects it so the model can retry, bounded by `max_attempts` before it emits `"guardrail_exhausted"`. Reach for it to keep a model's structured tool calls honest against a schema without hand-writing retry logic.
+## Feature and entry type
 
-```rust,name=Pass a valid tool call and reject two invalid ones
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-guardrails` (enables `dep:jsonschema` and `dep:tracing`) |
+| Plugin name | `"json-guardrails"` |
+| Entry type | `JsonGuardrailPlugin` |
+| Attachment | `CucaClientBuilder::register_plugin` |
+| Needs | Nothing running; schemas come from a JSON file or from code |
+
+## Hooks
+
+`JsonGuardrailPlugin` acts on `on_stream_chunk`. It does not override `on_request` or `execute_local_tool`, and its `on_response_complete` is a no-op.
+
+- `ToolCall` blocks validate against the schema keyed by the tool name. A tool with no registered schema passes through unvalidated.
+- A failing `ToolCall` becomes a `ToolResult` carrying `{"error": ..., "tool": ..., "issues": [...]}`, so the model sees the diagnostic and can retry.
+- `Text` blocks that start with `{` (after leading whitespace) validate against the reserved `"response"` schema when one is registered. A failing text block is replaced with the same error JSON, with `error` always `"schema_validation_failed"` and `tool` set to `"response"`. Text blocks are not attempt-counted and emit no tracing event.
+- All other blocks pass through.
+- `JsonGuardrailPlugin::validate(tool_name, value)` is the direct check. It returns `Err` with one issue string per violation.
+
+### Retry protocol
+
+- The plugin counts attempts per tool call id. Each failing block increments the count, and a valid block for that id clears it.
+- `error` is `"schema_validation_failed"` while the count is at or below `max_attempts`, and `"guardrail_exhausted"` once it exceeds it. With `max_attempts` of `0`, the first failure is already `"guardrail_exhausted"`.
+- Each injected `ToolResult` emits a `tracing::warn!` event under target `cuca::guardrails` with fields `schema_name`, `error_type` and `attempt_count`.
+- `last_retry_event()` returns the most recent `(schema_name, error_type, attempt_count)`, or `None` before the first injection.
+
+## Configuration
+
+`JsonGuardrailPlugin` has no config struct. Two constructors set the schemas and the retry bound.
+
+| Constructor | Schemas | `max_attempts` |
+|---|---|---|
+| `JsonGuardrailPlugin::new(schema_path)` | A JSON object of tool name to JSON Schema, read from `schema_path`. | `3` |
+| `JsonGuardrailPlugin::with_schemas(schemas, max_attempts)` | A `HashMap<String, serde_json::Value>`. | caller-supplied (`u32`) |
+
+- Schemas are keyed by tool name. The reserved key `"response"` guards JSON text responses.
+- Every schema compiles at construction. The set is fixed afterward.
+
+## Caps and at-cap policy
+
+| Item | Value |
+|---|---|
+| Bound | `JsonGuardrailPlugin::MAX_TRACKED_CALLS`, 4096 tool call ids tracked for their attempt count. |
+| At the bound | The oldest tracked id is evicted, in insertion order. A reused evicted id starts again at attempt 1. |
+| Usage gauge | `JsonGuardrailPlugin::tracked_calls()`. |
+
+Only failing calls are tracked, and a valid block removes its id, so a model that passes its schema leaves `tracked_calls()` at `0`.
+
+## Errors
+
+The hook does not return validation failures. It re-injects them as `ToolResult` or `Text` blocks and returns `Ok(())`.
+
+| Variant | When |
+|---|---|
+| `Io` | `new` cannot open or read `schema_path`. |
+| `Validation` | `new` finds a document that is not a JSON object, or either constructor finds a schema that fails to compile. The `schema` field names the file path or the tool name. |
+| `Internal` | `on_stream_chunk` finds the attempts mutex or the retry-event mutex poisoned. |
+
+## Example
+
+`examples/guardrails.rs` runs one `book_flight` tool through three guardrails: a policy equal to the tool's schema, a policy that also requires a `passenger`, and that same policy with `max_attempts` of `0`.
+
+```rust,name=Register a guardrail with a retry budget of three
 use std::collections::HashMap;
-use std::sync::Arc;
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{MessageContentBlock, ProviderEndpoint, ToolDefinition};
-use cuca::{CucaClient, JsonGuardrailPlugin, UnifiedRequest};
-use serde_json::json;
-use tokio_stream::StreamExt;
+let guardrails = Arc::new(JsonGuardrailPlugin::with_schemas(
+    HashMap::from([("book_flight".to_string(), schema)]),
+    3,
+)?);
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url)
+    .register_plugin(Arc::clone(&guardrails) as Arc<dyn CucaPlugin>)
+    .build()?;
+```
 
-/// Completion cap for a tool-calling turn. The reasoning blocks a 12b model
-/// emits before the call count against it, so a smaller budget returns the
-/// thinking and no call.
-const MAX_TOKENS: u32 = 512;
+The example needs a `llama-server` on port 1234 with a tool-calling model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
 
-/// The tool the model is offered, in every turn. Its `input_schema` is the
-/// contract the model sees; which schema a guardrail enforces is a separate
-/// caller decision, which is what the later turns exercise.
-fn book_flight() -> ToolDefinition {
-    ToolDefinition {
-        name: "book_flight".to_string(),
-        description: "Book one flight to a destination on a calendar date.".to_string(),
-        input_schema: tool_schema(),
-    }
-}
-
-/// The tool's own contract: a destination and an ISO calendar date.
-fn tool_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "required": ["destination", "date"],
-        "properties": {
-            "destination": { "type": "string" },
-            "date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" }
-        },
-        "additionalProperties": false
-    })
-}
-
-/// A policy stricter than the tool advertises: it also demands a `passenger`,
-/// which the tool schema forbids. Schema drift between a tool definition and
-/// the guardrail policy is the failure this plugin exists to catch, and no
-/// model output can satisfy both.
-fn enforced_schema() -> serde_json::Value {
-    json!({
-        "type": "object",
-        "required": ["destination", "date", "passenger"],
-        "properties": {
-            "destination": { "type": "string" },
-            "date": { "type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$" },
-            "passenger": { "type": "string" }
-        }
-    })
-}
-
-/// Dispatch one turn and print every block the guardrail let through.
-///
-/// The `ToolResult` blocks here were `ToolCall` blocks until `on_stream_chunk`
-/// replaced them: the caller never sees the invalid call.
-async fn turn(
-    base_url: &str,
-    client: &CucaClient,
-    guardrails: &JsonGuardrailPlugin,
-    model: &str,
-    label: &str,
-    prompt: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    println!("\n{label}: {prompt:?}");
-    let request = UnifiedRequest::new(model)
-        .add_user_message(prompt)
-        .add_tool(book_flight())
-        .set_max_tokens(MAX_TOKENS);
-    let mut stream = match client.generate_stream(request).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(false);
-        }
-    };
-    let mut thinking_blocks = 0usize;
-    let mut text = String::new();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Thinking { .. }) => thinking_blocks += 1,
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(MessageContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            }) => {
-                println!("  thinking blocks: {thinking_blocks}");
-                println!("  ToolCall call={id:?} name={name:?} passed the schema");
-                println!("    {arguments}");
-            }
-            Ok(MessageContentBlock::ToolResult {
-                tool_call_id,
-                output,
-            }) => {
-                println!("  thinking blocks: {thinking_blocks}");
-                println!("  ToolResult call={tool_call_id:?}");
-                println!("    {output}");
-            }
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    if !text.trim().is_empty() {
-        println!("  text: {}", text.trim());
-    }
-    println!("  tracked_calls: {}", guardrails.tracked_calls());
-    match guardrails.last_retry_event() {
-        Some((schema, error, attempt)) => {
-            println!("  last_retry_event: schema {schema:?}, error {error:?}, attempt {attempt}")
-        }
-        None => println!("  last_retry_event: none, nothing was rewritten"),
-    }
-    Ok(true)
-}
-
-/// A client with one guardrail plugin registered.
-fn client_with(
-    base_url: &str,
-    guardrails: &Arc<JsonGuardrailPlugin>,
-) -> Result<CucaClient, Box<dyn std::error::Error>> {
-    Ok(CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.to_string())
-        .register_plugin(Arc::clone(guardrails) as Arc<dyn CucaPlugin>)
-        .build()?)
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
-
-    println!("Tool book_flight advertises: {}", tool_schema());
-    println!(
-        "Guardrail policy for the last two turns: {}",
-        enforced_schema()
-    );
-
-    // Three plugins, not one with three schemas: the retry budget is per
-    // plugin, so a policy and its budget travel together.
-    let matching = Arc::new(JsonGuardrailPlugin::with_schemas(
-        HashMap::from([("book_flight".to_string(), tool_schema())]),
-        3,
-    )?);
-    let reachable = turn(
-        &base_url,
-        &client_with(&base_url, &matching)?,
-        &matching,
-        &model,
-        "Policy matches the tool, retry budget 3",
-        "Book a flight to Lisbon for 2026-03-14 with the book_flight tool.",
-    )
-    .await?;
-    if !reachable {
-        return Ok(());
-    }
-
-    let retrying = Arc::new(JsonGuardrailPlugin::with_schemas(
-        HashMap::from([("book_flight".to_string(), enforced_schema())]),
-        3,
-    )?);
-    turn(
-        &base_url,
-        &client_with(&base_url, &retrying)?,
-        &retrying,
-        &model,
-        "Policy demands a passenger, retry budget 3",
-        "Book a flight to Porto for 2026-04-02 with the book_flight tool.",
-    )
-    .await?;
-
-    let exhausted = Arc::new(JsonGuardrailPlugin::with_schemas(
-        HashMap::from([("book_flight".to_string(), enforced_schema())]),
-        0,
-    )?);
-    turn(
-        &base_url,
-        &client_with(&base_url, &exhausted)?,
-        &exhausted,
-        &model,
-        "Same policy, retry budget 0",
-        "Book a flight to Faro for 2026-05-20 with the book_flight tool.",
-    )
-    .await?;
-    Ok(())
-}
+```bash,name=Runs the same on all three platforms
+cargo run --example guardrails --features "provider-llamacpp plugin-guardrails"
 ```
 
 ```text,name=Expected output
@@ -244,41 +125,10 @@ Same policy, retry budget 0: "Book a flight to Faro for 2026-05-20 with the book
   last_retry_event: schema "book_flight", error "guardrail_exhausted", attempt 1
 ```
 
-## Try it
+Both diagnostics carry the same `issues`, so the retry budget is the only change between the last two turns. The tool-call ids and thinking counts depend on the model, as does whether it emits a valid ISO date; the diagnostic shapes and attempt counts do not. The output above came from `google/gemma-4-12b-qat`.
 
-`examples/guardrails.rs` is the program above. It runs the same tool through three guardrail configurations: the schema the tool advertises, so the model's call passes untouched and `tracked_calls()` stays `0`; a policy that also demands a `passenger`, so the invalid call is replaced by the `schema_validation_failed` diagnostic at attempt 1; and that same policy with a retry budget of `0`, where the first failure is already past the budget and the diagnostic says `guardrail_exhausted`. Both diagnostics carry the same `issues`, so the retry budget is the only thing that changed.
+## Related pages
 
-It needs a `llama-server` on port 1234 with a tool-calling model loaded. The tool-call ids and thinking counts come from `google/gemma-4-12b-qat` and change with the model, as does whether it emits a valid ISO date at all; the diagnostic shapes and attempt counts do not.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example guardrails --features "provider-llamacpp plugin-guardrails"
-```
-
-## Entry types
-
-`JsonGuardrailPlugin`.
-
-## `CucaPlugin`
-
-`JsonGuardrailPlugin` implements `CucaPlugin` with the plugin name `"json-guardrails"`. It overrides `on_stream_chunk` only.
-
-## Construction
-
-| Constructor | `max_attempts` |
-|---|---|
-| `JsonGuardrailPlugin::new(schema_path)` | 3, loading a JSON object of tool name to JSON Schema from `schema_path` |
-| `JsonGuardrailPlugin::with_schemas(schemas, max_attempts)` | caller-supplied |
-
-Schemas are keyed by tool name. The reserved key `"response"`, when registered, guards model text responses that look like a JSON object (text starting with `{`). A tool with no registered schema passes through unvalidated.
-
-## Retry behavior
-
-An invalid `ToolCall` is replaced with a `ToolResult` carrying `{"error": ..., "tool": ..., "issues": [...]}`. The `error` field is `"schema_validation_failed"` while the tracked attempt count for that call id is at or below `max_attempts`, and `"guardrail_exhausted"` once it is exceeded. Each retry injection also emits a `tracing::warn!` event under target `cuca::guardrails` with `schema_name`, `error_type`, and `attempt_count`.
-
-## Capacity
-
-| | |
-|---|---|
-| Bound | `JsonGuardrailPlugin::MAX_TRACKED_CALLS`, 4096 tool call ids tracked for their attempt count |
-| At-cap policy | The oldest tracked id is evicted, in insertion order |
-| Usage gauge | `JsonGuardrailPlugin::tracked_calls()` |
+- [Plugins](@/plugins/_index.md): hook order, error handling and the plugin tier rules.
+- [Error types](@/reference/errors.md): `PluginError` and `CucaError`.
+- [Write a custom plugin](@/guides/custom-plugin.md): the hook contract the guardrails follow.

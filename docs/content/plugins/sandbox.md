@@ -9,264 +9,107 @@ weight = 2
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Runs model-generated WebAssembly modules in a confined wasmtime instance and returns the collected output as a ToolResult.</dd>
+<dd><code>SandboxPlugin</code> runs a model-generated WebAssembly module in a fresh, memory-confined wasmtime store and returns its collected output as a <code>ToolResult</code>.</dd>
 <dt>You need</dt>
 <dd>The <code>plugin-sandbox</code> feature.</dd>
 <dt>Read this if</dt>
 <dd>You are registering <code>SandboxPlugin</code>, writing a guest module, or sizing its resource limits.</dd>
 </dl>
 
-`SandboxPlugin` runs model-generated WebAssembly in a fresh, memory-confined wasmtime store per call: the guest exports `memory` and `run(ptr, len) -> i32`, may import `env.write_out`, and the plugin hands its collected output back as a `ToolResult` for `run_code`/`sandbox_exec` tool calls. Every call is bounded by `max_memory_bytes`, a fuel-based `max_instructions`, and a wall-clock `timeout_ms` enforced by epoch interruption. Reach for it to let a model execute short sandboxed logic instead of looping through JSON tool calls.
+## Feature and entry type
 
-```rust,name=Run a model-chosen guest module under wasmtime
-use std::sync::Arc;
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-sandbox` (enables `dep:wasmtime`, `dep:base64` and `wasmtime/wat`) |
+| Plugin name | `"wasm-sandbox"` |
+| Entry types | `SandboxPlugin`, `SandboxConfig`, `SandboxResult` |
+| Attachment | `CucaClientBuilder::register_plugin` |
+| Needs | Nothing running; the engine is built in process on first use |
 
-use base64::Engine as _;
-use base64::engine::general_purpose::STANDARD;
-use cuca::plugin::CucaPlugin;
-use cuca::types::{
-    MessageContentBlock, MessageRole, ProviderEndpoint, ToolDefinition, UnifiedMessage,
-};
-use cuca::{
-    AgentResponseStream, CucaClient, PluginError, SandboxConfig, SandboxPlugin, UnifiedRequest,
-};
-use serde_json::{Value, json};
-use tokio_stream::StreamExt;
+## Hooks
 
-/// The guest the model gets to run: reverse the input bytes.
-///
-/// The ABI is the whole contract. The host pre-loads the input at scratch
-/// offset 1024 and calls `run(1024, len)`; this module writes the reversed
-/// bytes at 4096 and hands that region to `write_out`, then returns 0 for
-/// success. Nothing else is imported, so the guest cannot reach the host.
-const REVERSE_WAT: &str = r#"
-(module
-  (import "env" "write_out" (func $write_out (param i32 i32)))
-  (memory (export "memory") 1)
-  (func (export "run") (param $ptr i32) (param $len i32) (result i32)
-    (local $i i32)
-    (block $done
-      (loop $next
-        (br_if $done (i32.ge_s (local.get $i) (local.get $len)))
-        (i32.store8
-          (i32.add (i32.const 4096) (local.get $i))
-          (i32.load8_u
-            (i32.sub
-              (i32.add (local.get $ptr) (i32.sub (local.get $len) (i32.const 1)))
-              (local.get $i))))
-        (local.set $i (i32.add (local.get $i) (i32.const 1)))
-        (br $next)))
-    (call $write_out (i32.const 4096) (local.get $len))
-    (i32.const 0)))
-"#;
+`SandboxPlugin` acts on `on_stream_chunk`. It does not override `execute_local_tool`.
 
-/// A guest that never returns, so the fuel budget has to stop it.
-const SPIN_WAT: &str = r#"
-(module
-  (func (export "run") (param i32) (param i32) (result i32)
-    (loop $forever (br $forever))
-    (i32.const 0)))
-"#;
+| Hook | Behavior |
+|---|---|
+| `on_request` | No-op. |
+| `on_stream_chunk` | Replaces a `run_code` or `sandbox_exec` `ToolCall` with a `ToolResult`. Other blocks and other tool names pass through. |
+| `on_response_complete` | No-op. |
 
-/// The module name the demo publishes to the model.
-const MODULE: &str = "reverse";
+- `arguments.wasm` is the module, base64 encoded. Because the engine enables wasmtime's `wat` feature, WAT text is accepted as well as binary.
+- `arguments.input` is the raw UTF-8 input string. Absent means empty.
+- The `ToolResult` carries the guest's collected stdout as lossy UTF-8, or the error text when execution fails.
+- The module compiles and runs synchronously inside the hook, so the stream pauses while the guest runs.
+- `SandboxPlugin::run(wasm, input)` is the direct entry point. It returns a `SandboxResult` with `stdout`, `execution_time_ms` and `memory_bytes_used`.
 
-/// Fills the module bytes into the call before the sandbox reads them.
-///
-/// `SandboxPlugin` expects `arguments.wasm` to be the module itself, base64
-/// encoded. No model can be asked to reproduce a module byte for byte, so the
-/// application owns the code and the model only names it and supplies the
-/// input. `on_stream_chunk` hooks run in registration order over one shared
-/// block, so registering this before the sandbox is what makes the swap work.
-struct ModuleBinder;
+### Guest ABI
 
-impl CucaPlugin for ModuleBinder {
-    fn name(&self) -> &'static str {
-        "module-binder"
-    }
+- The guest exports a linear memory named `memory` and a function `run(ptr: i32, len: i32) -> i32`.
+- The guest may import `env.write_out(ptr: i32, len: i32)`.
+- The host writes the raw input bytes into instance memory at the fixed scratch offset 1024, then calls `run(1024, input.len())`.
+- Each `write_out` call appends `memory[ptr..ptr+len]` to the collected stdout.
+- `run` returns `0` on success. Any non-zero value is a guest-reported error.
+- A module with no exported `memory` can run only with empty input.
 
-    fn on_stream_chunk(&self, chunk: &mut MessageContentBlock) -> Result<(), PluginError> {
-        let MessageContentBlock::ToolCall {
-            id,
-            name,
-            arguments,
-        } = chunk
-        else {
-            return Ok(());
-        };
-        if name != "run_code" {
-            return Ok(());
-        }
-        let requested = arguments
-            .get("module")
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        if requested != MODULE {
-            *chunk = MessageContentBlock::ToolResult {
-                tool_call_id: std::mem::take(id),
-                output: format!("no module named {requested:?}; this host publishes {MODULE:?}"),
-            };
-            return Ok(());
-        }
-        if let Some(object) = arguments.as_object_mut() {
-            object.insert(
-                "wasm".to_string(),
-                Value::String(STANDARD.encode(REVERSE_WAT)),
-            );
-        }
-        Ok(())
-    }
-}
+### Isolation
 
-/// The tool the model is offered: a module name and the input to feed it.
-fn run_code_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "run_code".to_string(),
-        description: "Run a sandboxed WebAssembly module over an input string.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": {
-                "module": { "type": "string", "enum": [MODULE] },
-                "input": { "type": "string", "description": "the text to feed the module" },
-            },
-            "required": ["module", "input"],
-        }),
-    }
-}
+- Every call runs in a fresh store on a process-wide engine, so a trapped run leaves no state for the next one.
+- A process-wide lock serializes the armed-deadline window of concurrent calls, so one call's timer cannot interrupt another call.
+- The timer starts after instantiation and input setup, so `timeout_ms` bounds guest execution only.
 
-/// Drain a turn into its text, the tool results the consumer received, and the
-/// thinking-block count.
-///
-/// A reasoning model emits one `Thinking` block per token, so printing every
-/// block buries the lines this demo is about. The count stays in the output
-/// because it is the honest shape of a live turn.
-async fn drain(mut stream: AgentResponseStream) -> (String, Vec<(String, String)>, usize) {
-    let mut text = String::new();
-    let mut results = Vec::new();
-    let mut thinking = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-            Ok(MessageContentBlock::ToolResult {
-                tool_call_id,
-                output,
-            }) => results.push((tool_call_id, output)),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    (text, results, thinking)
-}
+## Configuration
 
-/// The follow-up turn: the same prompt plus what the guest wrote out.
-fn with_result(
-    model: &str,
-    prompt: &str,
-    call_id: &str,
-    input: &str,
-    output: &str,
-) -> UnifiedRequest {
-    UnifiedRequest::new(model)
-        // A reasoning model spends the token budget on thinking first, so a
-        // tight cap can end the turn before any text is emitted.
-        .set_max_tokens(320)
-        .add_user_message(prompt)
-        .add_message(UnifiedMessage {
-            role: MessageRole::Assistant,
-            content: vec![MessageContentBlock::ToolCall {
-                id: call_id.to_string(),
-                name: "run_code".to_string(),
-                arguments: json!({ "module": MODULE, "input": input }),
-            }],
-            name: None,
-            tool_call_id: None,
-        })
-        .add_message(UnifiedMessage {
-            role: MessageRole::Tool,
-            content: vec![MessageContentBlock::ToolResult {
-                tool_call_id: call_id.to_string(),
-                output: output.to_string(),
-            }],
-            name: None,
-            tool_call_id: Some(call_id.to_string()),
-        })
-}
+`SandboxConfig` has three fields. `SandboxPlugin::new(config)` takes it.
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `max_memory_bytes` | `usize` | 67108864 (64 MiB) | Linear memory cap per instance; a denied `memory.grow` traps. |
+| `max_instructions` | `u64` | 1000000 | Fuel budget per call; the guest traps when it runs out. |
+| `timeout_ms` | `u64` | 5000 | Wall-clock cap, enforced by epoch interruption. |
 
-    let config = SandboxConfig::default();
-    println!(
-        "Limits per call: {} bytes of memory, {} instructions of fuel, {} ms",
-        config.max_memory_bytes, config.max_instructions, config.timeout_ms
-    );
-    let sandbox = Arc::new(SandboxPlugin::new(config));
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::new(ModuleBinder) as Arc<dyn CucaPlugin>)
-        .register_plugin(Arc::clone(&sandbox) as Arc<dyn CucaPlugin>)
-        .build()?;
+## Caps and at-cap policy
 
-    let prompt = "Use the reverse module on the word cuca, then tell me what it produced.";
-    println!("\nTurn 1: the model calls the tool, wasmtime runs the guest");
-    let stream = match client
-        .generate_stream(
-            UnifiedRequest::new(&model)
-                .set_max_tokens(256)
-                .add_user_message(prompt)
-                .add_tool(run_code_tool()),
-        )
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(());
-        }
-    };
-    let (reply, results, thinking) = drain(stream).await;
-    let Some((call_id, output)) = results.into_iter().next() else {
-        println!("  the model answered without calling the tool: {reply:?}");
-        return Ok(());
-    };
-    println!("  guest wrote: {output:?}");
-    if let Some((elapsed_ms, memory_bytes)) = sandbox.last_diagnostic() {
-        println!("  ran in {elapsed_ms} ms using {memory_bytes} bytes of linear memory");
-    }
-    println!("  thinking blocks: {thinking}");
+Every call is bounded. Nothing accumulates across calls.
 
-    println!("\nTurn 2: the same question, with the guest's output in the prompt");
-    let (reply, _, thinking) = drain(
-        client
-            .generate_stream(with_result(&model, prompt, &call_id, "cuca", &output))
-            .await?,
-    )
-    .await;
-    println!("  reply: {}", reply.trim());
-    println!("  thinking blocks: {thinking}");
+| Bound | Value | At the bound |
+|---|---|---|
+| Memory | `max_memory_bytes`, 64 MiB | The call traps. |
+| Instructions | `max_instructions`, 1000000 | The call traps with `fuel exhausted: instruction budget exceeded`. |
+| Wall clock | `timeout_ms`, 5000 | The call traps with `epoch deadline reached: execution timed out`. |
+| Guest output | 8388608 bytes (8 MiB), not configurable | `write_out` traps with `write_out: output limit exceeded`. |
 
-    // The bound is the point of the sandbox, so it gets one line: a guest that
-    // never returns is stopped by the fuel budget, not by the host waiting.
-    println!("\nA guest that never returns");
-    match sandbox.run(SPIN_WAT.as_bytes(), b"") {
-        Ok(_) => println!("  it returned, which the fuel budget should have prevented"),
-        Err(error) => println!("  {error}"),
-    }
+- A trapped call returns `PluginError::Internal` from `run`; the hook turns it into `ToolResult` text.
+- Usage gauge: `SandboxPlugin::last_diagnostic()` returns `(execution_time_ms, memory_bytes_used)` of the most recent successful run. A failed run does not overwrite it.
+- `plugin-sandbox` does not emit the diagnostic as telemetry; read it through `last_diagnostic()`.
 
-    Ok(())
-}
+## Errors
+
+`run` returns these variants. The hook converts any `run` failure into `ToolResult` text and returns `Ok(())`.
+
+| Variant | When |
+|---|---|
+| `Validation` (schema `wasm`) | The module fails to compile, the module has no `memory` export while input is non-empty, the input does not fit at offset 1024, or the module does not export `run(ptr, len) -> i32`. |
+| `Internal` | The engine or fuel setup fails, instantiation fails, a limit traps, or `run` returns a non-zero status (`guest run reported status N`). |
+
+The hook returns `PluginError::Validation` itself, with schema `run_code.wasm` or `run_code.input`, when `arguments.wasm` is missing, is not a string or is not valid base64, or when `arguments.input` is not a string.
+
+## Example
+
+`examples/sandbox.rs` publishes a `reverse` module. A caller-side plugin binds the module bytes into the model's call, wasmtime runs the guest, and a final line shows a guest that never returns being stopped by the fuel budget.
+
+```rust,name=Run a module directly and read the gauge
+use cuca::{SandboxConfig, SandboxPlugin};
+
+let sandbox = SandboxPlugin::new(SandboxConfig::default());
+let result = sandbox.run(module_wat.as_bytes(), b"cuca")?;
+println!("{:?}", String::from_utf8_lossy(&result.stdout));
+println!("{:?}", sandbox.last_diagnostic());
+```
+
+The example needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+
+```bash,name=Runs the same on all three platforms
+cargo run --example sandbox --features "provider-llamacpp plugin-sandbox"
 ```
 
 ```text,name=Expected output
@@ -285,46 +128,10 @@ A guest that never returns
   internal plugin error: fuel exhausted: instruction budget exceeded
 ```
 
-## Try it
+The reply wording, the execution time and the thinking-block counts depend on the model and the machine. The output above came from `google/gemma-4-12b-qat`.
 
-`examples/sandbox.rs` runs the program above against a live model. The model picks the published module by name and supplies the input, a caller-side plugin binds the module bytes into the call, wasmtime runs the guest, and one further line shows a guest that never returns being stopped by the fuel budget. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. The reply wording, the execution time and the thinking-block counts are model- and machine-dependent; the output above came from `google/gemma-4-12b-qat`.
+## Related pages
 
-```bash,name=Runs the same on all three platforms
-cargo run --example sandbox --features "provider-llamacpp plugin-sandbox"
-```
-
-## Entry types
-
-`SandboxPlugin`, `SandboxConfig`, `SandboxResult`.
-
-## `CucaPlugin`
-
-`SandboxPlugin` implements `CucaPlugin` with the plugin name `"wasm-sandbox"`. It overrides `on_stream_chunk` only.
-
-| Hook | Behavior |
-|---|---|
-| `on_request` | No-op. |
-| `on_stream_chunk` | Routes `run_code` and `sandbox_exec` `ToolCall` blocks to a `ToolResult` carrying the guest's collected stdout, or the error text on failure. Unknown tool names pass through untouched. |
-| `on_response_complete` | No-op. |
-
-## Config
-
-`SandboxConfig` defaults:
-
-| Field | Default | Meaning |
-|---|---|---|
-| `max_memory_bytes` | 67108864 (64 MiB) | Linear memory cap per instance |
-| `max_instructions` | 1000000 | Fuel budget per call; the guest traps on exhaustion |
-| `timeout_ms` | 5000 | Wall-clock cap, enforced by epoch interruption |
-
-## Guest ABI
-
-- The guest module exports a linear memory named `memory` and a function `run(ptr: i32, len: i32) -> i32`.
-- The guest may import `env.write_out(ptr: i32, len: i32)`.
-- The host writes the raw input bytes into instance memory at a fixed scratch offset, 1024, before calling `run(1024, input.len())`.
-- The guest calls `write_out` any number of times; each call appends `memory[ptr..ptr+len]` to the host's collected stdout.
-- `run` returns `0` on success; any non-zero value is a guest-reported error.
-
-## Capacity
-
-Every call runs in a fresh store on a process-wide engine, so no state carries between calls. The one bound that spans a single call: guest output through `write_out` is capped at 8388608 bytes (8 MiB). At that cap, the call fails with `PluginError::Internal` carrying the trap message `write_out: output limit exceeded`. The usage gauge is `SandboxPlugin::last_diagnostic()`, which returns the `(execution_time_ms, memory_bytes_used)` of the most recent successful run.
+- [Plugins](@/plugins/_index.md): hook order, error handling and the plugin tier rules.
+- [Error types](@/reference/errors.md): `PluginError` and `CucaError`.
+- [Write a custom plugin](@/guides/custom-plugin.md): the hook contract the sandbox follows.

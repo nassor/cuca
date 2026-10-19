@@ -9,184 +9,105 @@ weight = 8
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Resolves web_search and web_extract tool calls against a configured search backend.</dd>
+<dd>Resolves <code>web_search</code> and <code>web_extract</code> tool calls against a configured search backend.</dd>
 <dt>You need</dt>
 <dd>The <code>plugin-web-search</code> feature and an API key for the configured backend.</dd>
 <dt>Read this if</dt>
 <dd>You are registering <code>WebSearchPlugin</code> or choosing a <code>WebSearchProvider</code>.</dd>
 </dl>
 
-`WebSearchPlugin` resolves `web_search` and `web_extract` tool calls a model issues against one configured backend: Firecrawl, Tavily, or DeepSeek Web Search. Only Firecrawl exposes a scrape endpoint, so `web_extract` returns `PluginError::NotSupported` on the other two before any network call. Reach for it to give a model live retrieval without wiring a bespoke HTTP tool for each search API.
+## Feature and entry type
 
-```rust,name=Resolve a web_search call against a live backend
-use std::sync::Arc;
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-web-search` (enables `dep:reqwest`, `dep:tokio`, `reqwest/rustls`) |
+| Entry type | `WebSearchPlugin` |
+| Supporting types | `WebSearchConfig`, `WebSearchProvider`, `SearchResult` |
+| Plugin name | `"web-search"` |
+| Attachment | `register_plugin` |
+| Peer features | None; the feature enables its own TLS backend, so no provider feature is needed for HTTPS |
+| Needs | An API key for the configured backend |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{
-    MessageContentBlock, MessageRole, ProviderEndpoint, ToolDefinition, UnifiedMessage,
+## Hooks
+
+`WebSearchPlugin` overrides `on_stream_chunk` only. A `ToolCall` named `web_search` or `web_extract` is replaced with a `ToolResult`. Any other block passes through untouched.
+
+- `web_search` takes a required, non-blank `query`. The output is a JSON array of `SearchResult` objects, `{title, url, snippet}`. A body with no results gives `[]`.
+- `web_extract` takes a required, non-blank `url`. The output is the page text. Only Firecrawl exposes a scrape endpoint, so on Tavily and DeepSeek Web Search the call fails with `PluginError::NotSupported` before any network call.
+
+Failures never fail the hook. The error text becomes the `ToolResult` output, so the model can react to it in the conversation. For example: `internal plugin error: web search returned HTTP 401 Unauthorized: ...`.
+
+Each call runs on a short-lived OS thread with its own current-thread Tokio runtime, and the hook waits on a std channel. The stream pauses until the result is ready, then the thread ends. This is safe on a current-thread runtime and on a runtime worker.
+
+The plugin also exposes `search(query)`, `extract_page(url)` and `build_request(query)`. `build_request` returns the method, URL, headers and body without doing any I/O.
+
+## Configuration
+
+`WebSearchConfig` defaults:
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `provider` | `WebSearchProvider` | `Firecrawl` | The search backend. |
+| `api_key` | `String` | `""` | Backend API key; set it for live calls. |
+| `base_url` | `Option<String>` | `None` | Overrides the backend base URL. |
+| `max_results` | `usize` | `5` | Results requested per search. |
+
+`WebSearchPlugin::new(config)` builds a `reqwest::Client` with a 30 second timeout. It does not validate `api_key`.
+
+### Backends
+
+| `WebSearchProvider` | Search route | Auth | Default base URL | Extraction |
+|---|---|---|---|---|
+| `Firecrawl` | `POST {base}/v1/search` | `Authorization: Bearer` | `https://api.firecrawl.dev` | `POST {base}/v1/scrape` |
+| `Tavily` | `POST {base}/search` | `api_key` in the body | `https://api.tavily.com` | None |
+| `DeepSeekWebSearch` | `POST {base}/web-search` | `Authorization: Bearer` | `https://api.deepseek.com` | None |
+
+Request bodies and response fields per backend:
+
+- Firecrawl sends `{query, limit}` and reads `data[].{title, url, description}`, with `description` as the snippet.
+- Tavily sends `{api_key, query, max_results}` and reads `results[].{title, url, content}`, with `content` as the snippet.
+- DeepSeek Web Search sends `{query, max_results}` and reads `results[].{title, url, snippet}`.
+- An item without a string `title` or `url` is dropped; a missing snippet becomes the empty string.
+- Firecrawl extraction sends `{url}` and returns `data.markdown`, or `data.content` when there is no markdown. A response with neither is an error.
+
+## Caps and at-cap policy
+
+No cap on growth: the plugin holds its configuration and an HTTP client, and nothing accumulates between calls.
+
+`max_results` bounds each search, not the plugin. The plugin passes it to the backend as `limit` or `max_results` and does not truncate the response. The usage gauge is none.
+
+## Errors
+
+The hook returns no error. Each variant below becomes `ToolResult` output text. `search` and `extract_page` return them to a direct caller.
+
+- `PluginError::Validation` when `query` or `url` is missing, not a string, or blank, and when a response body is not valid JSON.
+- `PluginError::NotSupported` for `web_extract` on Tavily or DeepSeek Web Search.
+- `PluginError::Internal` for a transport failure, a non-2xx HTTP status (the message carries the status and body), a failure to build the worker runtime, a worker thread that panics or returns nothing, and a Firecrawl scrape response with no extractable content.
+
+## Example
+
+`examples/web_search.rs` searches through Firecrawl. It needs a `llama-server` on port 1234 with the demo model loaded and `CUCA_SEARCH_API_KEY` holding a Firecrawl key; without the key it prints one line and exits. `CUCA_SEARCH_BASE_URL` overrides the backend endpoint. `CUCA_BASE_URL` and `CUCA_MODEL` retarget the model at any OpenAI-compatible server.
+
+```rust,name=Configure and register WebSearchPlugin, from examples/web_search.rs
+let config = WebSearchConfig {
+    provider: WebSearchProvider::Firecrawl,
+    api_key,
+    base_url: std::env::var("CUCA_SEARCH_BASE_URL").ok(),
+    max_results: 3,
 };
-use cuca::{
-    AgentResponseStream, CucaClient, UnifiedRequest, WebSearchConfig, WebSearchPlugin,
-    WebSearchProvider,
-};
-use serde_json::json;
-use tokio_stream::StreamExt;
-
-/// The question the model is asked, and the query it should search for.
-const QUESTION: &str =
-    "Search the web for the Rust 1.98 release announcement and tell me one thing it shipped.";
-
-/// The tool the model is offered. The plugin claims this exact name.
-fn web_search_tool() -> ToolDefinition {
-    ToolDefinition {
-        name: "web_search".to_string(),
-        description: "Search the live web and return titles, URLs and snippets.".to_string(),
-        input_schema: json!({
-            "type": "object",
-            "properties": { "query": { "type": "string" } },
-            "required": ["query"],
-        }),
-    }
-}
-
-/// Drain a turn into its text, the tool results the consumer received, and the
-/// thinking-block count.
-///
-/// A reasoning model emits one `Thinking` block per token, so printing every
-/// block buries the lines this demo is about. The count stays in the output
-/// because it is the honest shape of a live turn.
-async fn drain(mut stream: AgentResponseStream) -> (String, Vec<(String, String)>, usize) {
-    let mut text = String::new();
-    let mut results = Vec::new();
-    let mut thinking = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-            Ok(MessageContentBlock::ToolResult {
-                tool_call_id,
-                output,
-            }) => results.push((tool_call_id, output)),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    (text, results, thinking)
-}
-
-/// The follow-up turn: the same question plus whatever the backend returned.
-fn with_result(model: &str, call_id: &str, query: &str, output: &str) -> UnifiedRequest {
-    UnifiedRequest::new(model)
-        // A reasoning model spends the token budget on thinking first, so a
-        // tight cap can end the turn before any text is emitted.
-        .set_max_tokens(768)
-        .add_user_message(QUESTION)
-        .add_message(UnifiedMessage {
-            role: MessageRole::Assistant,
-            content: vec![MessageContentBlock::ToolCall {
-                id: call_id.to_string(),
-                name: "web_search".to_string(),
-                arguments: json!({ "query": query }),
-            }],
-            name: None,
-            tool_call_id: None,
-        })
-        .add_message(UnifiedMessage {
-            role: MessageRole::Tool,
-            content: vec![MessageContentBlock::ToolResult {
-                tool_call_id: call_id.to_string(),
-                output: output.to_string(),
-            }],
-            name: None,
-            tool_call_id: Some(call_id.to_string()),
-        })
-}
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
-
-    // Every backend the plugin speaks to is a paid search API, so there is no
-    // keyless path to demonstrate.
-    let Ok(api_key) = std::env::var("CUCA_SEARCH_API_KEY") else {
-        println!("Set CUCA_SEARCH_API_KEY to a Firecrawl key and run this again.");
-        return Ok(());
-    };
-    let config = WebSearchConfig {
-        provider: WebSearchProvider::Firecrawl,
-        api_key,
-        base_url: std::env::var("CUCA_SEARCH_BASE_URL").ok(),
-        max_results: 3,
-    };
-    println!(
-        "Backend {:?}, at most {} results per search",
-        config.provider, config.max_results
-    );
-    let web_search = Arc::new(WebSearchPlugin::new(config));
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::clone(&web_search) as Arc<dyn CucaPlugin>)
-        .build()?;
-
-    println!("\nTurn 1: the model searches, and the pipeline pauses for the HTTP call");
-    let stream = match client
-        .generate_stream(
-            UnifiedRequest::new(&model)
-                .set_max_tokens(256)
-                .add_user_message(QUESTION)
-                .add_tool(web_search_tool()),
-        )
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(());
-        }
-    };
-    let (reply, results, thinking) = drain(stream).await;
-    let Some((call_id, output)) = results.into_iter().next() else {
-        println!("  the model answered without searching: {reply:?}");
-        return Ok(());
-    };
-    // A transport or HTTP error lands inside the ToolResult rather than failing
-    // the hook, so the model can react to it in the conversation.
-    println!("  tool result: {output}");
-    println!("  thinking blocks: {thinking}");
-
-    // A failed search has nothing for the model to answer from, and asking it
-    // to try burns the whole token budget on deliberation about the error.
-    if !output.starts_with('[') {
-        println!("\nNo results, so there is no second turn");
-        println!("  a valid key makes this a JSON array of {{title, url, snippet}} objects");
-        return Ok(());
-    }
-
-    println!("\nTurn 2: the same question, with the search result in the prompt");
-    let (reply, _, thinking) = drain(
-        client
-            .generate_stream(with_result(&model, &call_id, "Rust 1.98 release", &output))
-            .await?,
-    )
-    .await;
-    println!("  reply: {}", reply.trim());
-    println!("  thinking blocks: {thinking}");
-
-    Ok(())
-}
+let web_search = Arc::new(WebSearchPlugin::new(config));
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url.clone())
+    .register_plugin(Arc::clone(&web_search) as Arc<dyn CucaPlugin>)
+    .build()?;
 ```
 
-```text,name=Expected output
+```bash,name=Runs the same on all three platforms
+cargo run --example web_search --features "provider-llamacpp plugin-web-search"
+```
+
+```text,name=Expected output with an invalid key
 Backend Firecrawl, at most 3 results per search
 
 Turn 1: the model searches, and the pipeline pauses for the HTTP call
@@ -197,43 +118,10 @@ No results, so there is no second turn
   a valid key makes this a JSON array of {title, url, snippet} objects
 ```
 
-## Try it
+The thinking-block count depends on the model; this output came from `google/gemma-4-12b-qat`.
 
-`examples/web_search.rs` runs the program above against a live model. The model calls `web_search`, the plugin performs the HTTPS request on a short-lived thread while the stream pauses, and a second turn answers from whatever came back. It needs a `llama-server` on port 1234 with the demo model loaded plus `CUCA_SEARCH_API_KEY` holding a Firecrawl key, and prints one line and exits when the key is absent; `CUCA_SEARCH_BASE_URL` overrides the backend endpoint, and `CUCA_BASE_URL` and `CUCA_MODEL` retarget the model at any OpenAI-compatible server. The reply wording and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
+## Related pages
 
-```bash,name=Runs the same on all three platforms
-cargo run --example web_search --features "provider-llamacpp plugin-web-search"
-```
-
-## Entry types
-
-`WebSearchPlugin`, `WebSearchConfig`, `WebSearchProvider`, `SearchResult`.
-
-## `CucaPlugin`
-
-`WebSearchPlugin` implements `CucaPlugin` with the plugin name `"web-search"`. It overrides `on_stream_chunk` only.
-
-## Config
-
-`WebSearchConfig` defaults: `provider: Firecrawl`, `api_key: ""` (must be set for live calls), `base_url: None`, `max_results: 5`.
-
-## Providers
-
-| `WebSearchProvider` | Search route | Auth | Page extraction |
-|---|---|---|---|
-| `Firecrawl` | `POST {base}/v1/search` | `Authorization: Bearer` | Yes, `POST {base}/v1/scrape` |
-| `Tavily` | `POST {base}/search` | `api_key` field in the request body | No |
-| `DeepSeekWebSearch` | `POST {base}/web-search` | `Authorization: Bearer` | No |
-
-Default base URLs when `WebSearchConfig::base_url` is `None`: `https://api.firecrawl.dev` for Firecrawl, `https://api.tavily.com` for Tavily, `https://api.deepseek.com` for DeepSeek Web Search.
-
-## Tools
-
-| Tool | Arguments | Behavior |
-|---|---|---|
-| `web_search` | `query` (required, non-blank) | Returns normalized `SearchResult { title, url, snippet }` items as a `ToolResult` |
-| `web_extract` | `url` (required, non-blank) | Returns extracted page text on Firecrawl; on Tavily and DeepSeek Web Search it returns `PluginError::NotSupported` before any network call, since only Firecrawl exposes a scrape endpoint |
-
-## Capacity
-
-No growth cap. The plugin holds only its configuration and an HTTP client; nothing accumulates between calls.
+- [Plugins](@/plugins/_index.md) lists every plugin, its hooks and its caps.
+- [Write a custom plugin](@/guides/custom-plugin.md) walks through the hook contract.
+- [Error types](@/reference/errors.md) lists `PluginError`.

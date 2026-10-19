@@ -9,279 +9,110 @@ weight = 6
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Turns spawn_subagent and collect_subagent tool calls into asynchronous child agent runs, optionally isolated in a Git worktree.</dd>
+<dd>Turns <code>spawn_subagent</code> and <code>collect_subagent</code> tool calls into asynchronous child agent runs, optionally isolated in a Git worktree.</dd>
 <dt>You need</dt>
 <dd>The <code>plugin-subagent</code> feature and a caller-supplied <code>SubagentRunner</code> that executes one child run.</dd>
 <dt>Read this if</dt>
 <dd>You are registering <code>SubagentPlugin</code> or implementing <code>SubagentRunner</code>.</dd>
 </dl>
 
-`SubagentPlugin` turns `spawn_subagent`/`collect_subagent` tool calls, or direct `spawn_subagent`/`collect` calls, into asynchronous child agent runs executed by a caller-supplied `SubagentRunner`, optionally isolated in a Git worktree. Spawning is non-blocking: it starts the child on a background task and returns its id immediately, while `collect` blocks until that child's `SubagentResult` is ready. Reach for it to fan a task out to an isolated child agent and collect its summary back into the parent conversation.
+## Feature and entry type
 
-```rust,name=Delegate a task to a child agent and collect it back
-use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-subagent` (enables `dep:tokio`) |
+| Entry type | `SubagentPlugin` |
+| Supporting types | `SubagentSpec`, `SubagentResult`, `SubagentRunner`, `WorktreeConfig` |
+| Plugin name | `"subagent-delegation"` |
+| Attachment | `register_plugin` |
+| Peer features | None |
+| Needs | A `SubagentRunner`; a running Tokio runtime when a child spawns; `git` on the path when a worktree is requested |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{MessageContentBlock, ProviderEndpoint, ToolDefinition};
-use cuca::{
-    AgentResponseStream, CucaClient, SubagentPlugin, SubagentResult, SubagentRunner, SubagentSpec,
-    UnifiedRequest,
-};
-use serde_json::json;
-use tokio_stream::StreamExt;
+`SubagentPlugin` provides the fan-out plumbing only. The `SubagentRunner` seam executes each child, for example by wrapping an external agent process or a second `CucaClient`.
 
-/// Runs one child as a real llama.cpp turn and summarizes what it said.
-///
-/// The plugin owns the fan-out plumbing and nothing else: this seam is where a
-/// deployment wires its own agent process or CLI. There is deliberately no
-/// fallback summary, so a broken child reads as `exit_ok: false` with the
-/// reason instead of a plausible-looking string.
-struct LiveRunner {
-    client: Arc<CucaClient>,
-    model: String,
-    /// Opened once the parent's stream has drained.
-    ///
-    /// `spawn_subagent` fires the child from inside `on_stream_chunk`, so the
-    /// parent's stream is still open at that moment. A local server with one
-    /// resident model serves one request at a time, and two turns racing it
-    /// would say nothing about the plugin, so the child waits for the parent to
-    /// finish. `Notify::notify_one` stores the permit, so the order of the two
-    /// is irrelevant.
-    gate: Arc<tokio::sync::Notify>,
-    /// Flipped when the child's result has been delivered; the parent must not
-    /// call `collect` before this, see the pump loop below.
-    done: Arc<AtomicBool>,
-}
+## Hooks
 
-impl SubagentRunner for LiveRunner {
-    fn spawn(&self, spec: SubagentSpec) -> Pin<Box<dyn Future<Output = SubagentResult> + Send>> {
-        let client = Arc::clone(&self.client);
-        let model = self.model.clone();
-        let done = Arc::clone(&self.done);
-        let gate = Arc::clone(&self.gate);
-        Box::pin(async move {
-            gate.notified().await;
-            let request = UnifiedRequest::new(&model)
-                .set_max_tokens(320)
-                .add_system_message("Answer in one short sentence.")
-                .add_user_message(&spec.task);
-            let mut summary = String::new();
-            let mut failure: Option<String> = None;
-            match client.generate_stream(request).await {
-                Ok(mut stream) => {
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(MessageContentBlock::Text(text)) => summary.push_str(&text),
-                            Ok(_) => {}
-                            Err(error) => {
-                                failure = Some(format!("stream error: {error}"));
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(error) => failure = Some(format!("generate_stream failed: {error}")),
-            }
-            if failure.is_none() && summary.trim().is_empty() {
-                failure = Some("the child emitted no text".to_string());
-            }
-            let exit_ok = failure.is_none();
-            done.store(true, Ordering::SeqCst);
-            SubagentResult {
-                subagent_id: spec.name,
-                summary: failure.unwrap_or_else(|| summary.trim().to_string()),
-                worktree_path: None,
-                exit_ok,
-            }
-        })
-    }
-}
+`SubagentPlugin` overrides `on_stream_chunk`. Its `on_request` and `on_response_complete` are explicit no-ops. Tool calls with any other name pass through untouched.
 
-/// The two tools the plugin answers.
-fn subagent_tools() -> Vec<ToolDefinition> {
-    vec![
-        ToolDefinition {
-            name: "spawn_subagent".to_string(),
-            description: "Delegate a task to a child agent and get its id back.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "name": { "type": "string" },
-                    "task": { "type": "string", "description": "what the child must do" },
-                },
-                "required": ["task"],
-            }),
-        },
-        ToolDefinition {
-            name: "collect_subagent".to_string(),
-            description: "Fetch a spawned child's summary by its id.".to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": { "subagent_id": { "type": "string" } },
-                "required": ["subagent_id"],
-            }),
-        },
-    ]
-}
+- `spawn_subagent` builds a `SubagentSpec` from the call arguments, starts the child on a background Tokio task, and replaces the block with a `ToolResult` whose output is the child id. Ids have the form `sub-<n>` from a per-plugin counter. Spawning does not block.
+- `collect_subagent` takes `subagent_id`, blocks the calling thread until that child finishes, and replaces the block with a `ToolResult` carrying `SubagentResult::summary`. On failure the output is the error text instead.
 
-/// Drain a turn into its text, the tool results the consumer received, and the
-/// thinking-block count.
-///
-/// A reasoning model emits one `Thinking` block per token, so printing every
-/// block buries the lines this demo is about. The count stays in the output
-/// because it is the honest shape of a live turn.
-async fn drain(mut stream: AgentResponseStream) -> (String, Vec<(String, String)>, usize) {
-    let mut text = String::new();
-    let mut results = Vec::new();
-    let mut thinking = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-            Ok(MessageContentBlock::ToolResult {
-                tool_call_id,
-                output,
-            }) => results.push((tool_call_id, output)),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    (text, results, thinking)
-}
+`spawn_subagent` arguments:
 
-/// A parent turn that offers both subagent tools.
-fn tooled(model: &str, prompt: &str) -> UnifiedRequest {
-    let mut request = UnifiedRequest::new(model)
-        .set_max_tokens(256)
-        .add_user_message(prompt);
-    for tool in subagent_tools() {
-        request = request.add_tool(tool);
-    }
-    request
-}
+- `task` is required and must not be blank.
+- `name` is a label for the child; default is the empty string.
+- `tool_scope` is an array of tool names for the child; non-string entries are ignored, and the default empty array means unrestricted. The plugin passes the scope to the runner in the spec and does not enforce it.
+- `worktree` is an object with a string `path` and an optional string `branch`; default is none.
+- `session_id` is the parent session id, recorded in the spawn log.
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+When `worktree` is set, `spawn_subagent` first runs `git worktree add <path>` (or `git worktree add -b <branch> <path>` with a branch) in the process working directory. The runner reads the path from `spec.worktree`. The plugin never removes the worktree. `SubagentResult::worktree_path` lets the caller do so after collection.
 
-    // The child's client carries no plugins: a child that could spawn children
-    // is a fan-out with no bottom.
-    let child_client = Arc::new(
-        CucaClient::builder()
-            .with_provider(ProviderEndpoint::LlamaCpp)
-            .with_base_url(base_url.clone())
-            .build()?,
-    );
-    let done = Arc::new(AtomicBool::new(false));
-    let gate = Arc::new(tokio::sync::Notify::new());
-    let subagent = Arc::new(SubagentPlugin::new(Arc::new(LiveRunner {
-        client: child_client,
-        model: model.clone(),
-        gate: Arc::clone(&gate),
-        done: Arc::clone(&done),
-    })));
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::clone(&subagent) as Arc<dyn CucaPlugin>)
-        .build()?;
+`SubagentResult` fields are `subagent_id`, `summary`, `worktree_path` and `exit_ok`. The `collect_subagent` tool result carries only `summary`.
 
-    println!(
-        "Pending gauge: {} of {} children awaiting collection",
-        subagent.pending_len(),
-        subagent.max_pending()
-    );
+`collect` parks the calling thread on a std channel. On a current-thread Tokio runtime that thread is the only executor the child has, so the child must have delivered its result before the collect call. `examples/subagent.rs` waits for the delivery before it asks the parent to collect.
 
-    println!("\nTurn 1: the parent delegates, and spawning does not block");
-    let stream = match client
-        .generate_stream(tooled(
-            &model,
-            "Delegate this to a child agent with spawn_subagent: name the largest moon of Saturn.",
-        ))
-        .await
-    {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(());
-        }
-    };
-    let (reply, results, thinking) = drain(stream).await;
-    let Some((_, child_id)) = results.into_iter().next() else {
-        println!("  the parent answered without delegating: {reply:?}");
-        return Ok(());
-    };
-    println!("  child id from the tool result: {child_id}");
-    println!(
-        "  pending {} of {}, spawns so far {}",
-        subagent.pending_len(),
-        subagent.max_pending(),
-        subagent.spawn_count()
-    );
-    println!("  thinking blocks: {thinking}");
+The plugin also exposes direct methods: `spawn_subagent(spec)`, `collect(id)`, `pending_len()`, `max_pending()`, `spawn_count()`, `spawns()` and `worktree_args(config)`, the dry-run `git worktree add` arguments.
 
-    // `collect` blocks the calling thread, and on a current-thread runtime that
-    // thread is the only executor the child has. Waiting for the delivery here
-    // is what keeps the collect turn below from parking the child forever.
-    println!("\nThe child runs its own turn while the parent waits");
-    gate.notify_one();
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
-    while !done.load(Ordering::SeqCst) {
-        if tokio::time::Instant::now() >= deadline {
-            println!("  the child did not finish within 600s");
-            return Ok(());
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    println!("  the child delivered its result");
+## Configuration
 
-    println!("\nTurn 2: the parent collects the summary through the same pipeline");
-    let (reply, results, thinking) = drain(
-        client
-            .generate_stream(tooled(
-                &model,
-                &format!(
-                    "Call collect_subagent with subagent_id {child_id} and quote its summary."
-                ),
-            ))
-            .await?,
-    )
-    .await;
-    match results.first() {
-        Some((_, summary)) => println!("  collected summary: {summary:?}"),
-        None => println!("  the parent answered without collecting: {reply:?}"),
-    }
-    println!(
-        "  pending {} of {}, spawns so far {}",
-        subagent.pending_len(),
-        subagent.max_pending(),
-        subagent.spawn_count()
-    );
-    println!("  thinking blocks: {thinking}");
+`SubagentPlugin` has no config struct. Constructors take the settings.
 
-    println!("\nSpawn log, {} entr(ies)", subagent.spawns().len());
-    for (session_id, worktree) in subagent.spawns() {
-        println!(
-            "  parent session {:?}, worktree {:?}",
-            session_id.unwrap_or_else(|| "unset".to_string()),
-            worktree.unwrap_or_else(|| "none".to_string())
-        );
-    }
+| Setting | Type | Default | Meaning |
+|---|---|---|---|
+| `runner` | `Arc<dyn SubagentRunner>` | required | Executes one child. |
+| `max_pending` | `usize` | `1024` | Cap on spawned, uncollected children. |
 
-    Ok(())
-}
+- `SubagentPlugin::new(runner)` uses `DEFAULT_MAX_PENDING`, 1024.
+- `SubagentPlugin::with_max_pending(runner, max_pending)` sets the cap and rejects zero.
+- `MAX_SPAWN_LOG`, 4096, is a constant and cannot be set.
+
+## Caps and at-cap policy
+
+| Structure | Bound | At-cap policy | Usage gauge |
+|---|---|---|---|
+| Pending children | `DEFAULT_MAX_PENDING`, 1024, or `max_pending()` | `spawn_subagent` refuses the spawn; no pending child is evicted | `pending_len()` against `max_pending()` |
+| Spawn log | `MAX_SPAWN_LOG`, 4096 entries | The oldest entry is dropped | `spawns()` |
+
+- A full registry never evicts: each pending child keeps its result receiver until `collect` removes it, and dropping one would discard a running child's result. `collect` is what drains `pending_len()`.
+- The spawn log holds `(parent_session_id, worktree_path)` per spawn. It is a rolling sample, not an audit trail.
+- `spawn_count()` is a `u64` total of every spawn since construction. It is not capped because it holds one integer.
+
+## Errors
+
+A `spawn_subagent` tool call fails the stream with `CucaError::Plugin` carrying one of these:
+
+- `PluginError::Validation` when the arguments are not a JSON object, `task` is missing or blank, `worktree` is not an object, or `worktree.path` is missing.
+- `PluginError::NotSupported` when a requested worktree cannot be prepared: `git` cannot run, the directory is not a repository, or `git worktree add` exits with failure.
+- `PluginError::Internal` when `max_pending` children already await collection. The message names the count and the cap.
+
+A `collect_subagent` call with no string `subagent_id` fails the stream with `PluginError::Validation`. Any other `collect` failure becomes the `ToolResult` output text and the stream continues:
+
+- `PluginError::NotSupported` for an unknown id.
+- `PluginError::Internal` when the background task ends without delivering a result.
+
+`SubagentPlugin::with_max_pending` returns `PluginError::Validation` for a cap of zero.
+
+## Example
+
+`examples/subagent.rs` runs a parent turn that spawns a child, waits for its result, then runs a second parent turn that collects the summary. It needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+
+```rust,name=Register SubagentPlugin, from examples/subagent.rs
+// LiveRunner implements SubagentRunner; it is defined in examples/subagent.rs.
+let subagent = Arc::new(SubagentPlugin::new(Arc::new(LiveRunner {
+    client: child_client,
+    model: model.clone(),
+    gate: Arc::clone(&gate),
+    done: Arc::clone(&done),
+})));
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url.clone())
+    .register_plugin(Arc::clone(&subagent) as Arc<dyn CucaPlugin>)
+    .build()?;
+```
+
+```bash,name=Runs the same on all three platforms
+cargo run --example subagent --features "provider-llamacpp plugin-subagent"
 ```
 
 ```text,name=Expected output
@@ -304,45 +135,11 @@ Spawn log, 1 entr(ies)
   parent session "unset", worktree "none"
 ```
 
-## Try it
+The reply wording and the thinking-block counts depend on the model; this output came from `google/gemma-4-12b-qat`.
 
-`examples/subagent.rs` runs the program above against a live model. The parent model calls `spawn_subagent`, the plugin returns the child's id without blocking, a runner executes the child as its own live turn, and a second parent turn calls `collect_subagent` to pull the summary back. The pending gauge is printed on both sides of the fan-out. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server. Both replies and the thinking-block counts are model-dependent; the output above came from `google/gemma-4-12b-qat`.
+## Related pages
 
-```bash,name=Runs the same on all three platforms
-cargo run --example subagent --features "provider-llamacpp plugin-subagent"
-```
-
-## Entry types
-
-`SubagentPlugin`, `SubagentSpec`, `SubagentResult`, `SubagentRunner`, `WorktreeConfig`.
-
-## `CucaPlugin`
-
-`SubagentPlugin` implements `CucaPlugin` with the plugin name `"subagent-delegation"`. It overrides `on_stream_chunk` only.
-
-## Tools
-
-| Tool | Arguments | Behavior |
-|---|---|---|
-| `spawn_subagent` | `name?`, `task` (required, non-blank), `tool_scope?`, `worktree?`, `session_id?` | Registers the child, starts it on a background task, and replaces the block with a `ToolResult` carrying the child's id |
-| `collect_subagent` | `subagent_id` | Blocks until the named child finishes, then replaces the block with a `ToolResult` carrying its summary, or the error text on failure |
-
-Spawning is non-blocking; only `collect` blocks. When `SubagentSpec::worktree` is set, `spawn_subagent` first runs `git worktree add <path> [-b <branch>]` in the current working directory; a non-git working directory or a failed add surfaces as `PluginError::NotSupported`.
-
-## Capacity, pending children
-
-| | |
-|---|---|
-| Bound | `SubagentPlugin::DEFAULT_MAX_PENDING`, 1024 spawned-but-uncollected children |
-| At-cap policy | `spawn_subagent` refuses the spawn rather than evicting a pending child |
-| Usage gauge | `SubagentPlugin::pending_len()` against `max_pending()` |
-
-## Capacity, spawn log
-
-| | |
-|---|---|
-| Bound | `SubagentPlugin::MAX_SPAWN_LOG`, 4096 entries |
-| At-cap policy | The oldest logged spawn is dropped |
-| Usage gauge | `SubagentPlugin::spawns()` |
-
-`SubagentPlugin::spawn_count()` is a separate, uncapped total counter of every spawn since construction.
+- [Plugins](@/plugins/_index.md) lists every plugin, its hooks and its caps.
+- [Memory discipline](@/concepts/memory-discipline.md) explains why a full registry refuses instead of evicting.
+- [Write a custom plugin](@/guides/custom-plugin.md) walks through the hook contract.
+- [Error types](@/reference/errors.md) lists `PluginError`.

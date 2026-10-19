@@ -1,6 +1,6 @@
 +++
 title = "Services"
-description = "Six service features: explicit-call, client-level capabilities plus the pipeline-replacing orchestrator, and how each depends on the plugin tier."
+description = "Six explicit-call service features that never implement CucaPlugin, and the plugin feature each one depends on."
 template = "section.html"
 sort_by = "weight"
 
@@ -10,32 +10,39 @@ kicker = "Reference"
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Six <code>service-*</code> features; five are called directly, one replaces the dispatch stage</dd>
+<dd>Six <code>service-*</code> features. Each is driven by direct method calls or a client builder attachment, never by plugin hooks.</dd>
 <dt>You need</dt>
-<dd>The service features you want, named explicitly; none is enabled by default</dd>
+<dd>The service features you want, named explicitly. None is enabled by default.</dd>
 <dt>Read this if</dt>
-<dd>You need a service's feature flag, entry type, plugin dependency, or caps</dd>
+<dd>You need a service's feature flag, entry type, plugin dependency, configuration, caps or errors.</dd>
 </dl>
 
 ## The six features
 
-| Feature | Entry type | Attachment | Plugin dependency |
-|---|---|---|---|
-| [`service-entity-extraction`](@/services/entity-extraction.md) | `EntityExtractor` | direct calls only | `plugin-memory`, hard |
-| [`service-prompt-cache`](@/services/prompt-cache.md) | `PromptCache` | `with_prompt_cache_config` or `with_prompt_cache_service` | none |
-| [`service-replay`](@/services/replay.md) | `SessionReplay` | direct calls only | `plugin-session-log`, hard |
-| [`service-speculative`](@/services/speculative.md) | `ModelOrchestrator` | `with_orchestrator` | `plugin-session-log`, documented-optional |
-| [`service-rate-limit`](@/services/rate-limit.md) | `RateLimiter` | direct calls only | none |
-| [`service-vector-store`](@/services/vector-store.md) | `InMemoryVectorStore` | direct calls plus the `with_extensions` hand-off | `plugin-memory`, hard |
+| Feature | Entry type | Required plugin feature |
+|---|---|---|
+| [`service-entity-extraction`](@/services/entity-extraction.md) | `EntityExtractor` | `plugin-memory`, hard |
+| [`service-speculative`](@/services/speculative.md) | `ModelOrchestrator` | `plugin-session-log`, documented-optional |
+| [`service-prompt-cache`](@/services/prompt-cache.md) | `PromptCache` | none |
+| [`service-replay`](@/services/replay.md) | `SessionReplay` | `plugin-session-log`, hard |
+| [`service-rate-limit`](@/services/rate-limit.md) | `RateLimiter` | none |
+| [`service-vector-store`](@/services/vector-store.md) | `InMemoryVectorStore` | `plugin-memory`, hard |
 
-The mechanical difference between explicit-call and pipeline-replacement is in
-[Plugins and services](@/concepts/plugin-layering.md).
+## Service tier rules
 
-## Depending on the plugin tier
+- A service is an explicit-call, client-level capability. The caller drives it with method calls, or attaches it to a client builder (`with_orchestrator`, `with_prompt_cache_config`, `with_prompt_cache_service`).
+- A service never implements `CucaPlugin`. Passing one to `register_plugin` is a compile error, not an inert registration.
+- A service may depend on core and on the plugin features it declares in `Cargo.toml`. A plugin never names a service: no `use`, no `cfg(feature = "service-...")`, no feature edge, no runtime lookup.
+- Every code edge from a service to a plugin is declared as `service-<name> = ["plugin-<other>"]`.
+- No service depends on another service.
+- Plugins and services do not look each other up at runtime. Data crosses tiers through a caller-injected `Arc<dyn Trait>` or an explicit hand-off by the application.
+- Each service feature builds alone on one provider. The `service_solo` CI job checks it.
 
-A service may depend on the plugin features it declares in `Cargo.toml`; a
-plugin must never depend on, or name, a service. `Cargo.toml` carries exactly
-three hard edges and one documented-optional edge, all service to plugin:
+[Plugins and services](@/concepts/plugin-layering.md) explains why the tiers are shaped this way.
+
+## Feature edges to the plugin tier
+
+`Cargo.toml` declares three hard edges, all from a service to a plugin:
 
 ```toml,name=Every service-to-plugin feature edge in Cargo.toml
 service-entity-extraction = ["plugin-memory"]
@@ -43,36 +50,22 @@ service-replay = ["plugin-session-log"]
 service-vector-store = ["plugin-memory", "dep:wide"]
 ```
 
-- `entity-extraction → memory` (hard): the extraction delta is a `MemoryGraph`
-  the caller merges into the memory plugin's working graph.
-- `replay → session-log` (hard): replay reads a recorded trajectory through the
-  session log's `SessionBackend` seam.
-- `vector-store → memory` (hard): the store implements the memory plugin's
-  `VectorStore` offload seam, wired through `MemoryPlugin::with_extensions`.
-- `speculative → session-log` (documented-optional): `ModelOrchestrator::with_session_store`
-  is compiled out of existence without it, and records `SessionEvent::ModelSwap`
-  with it.
-- `prompt-cache` and `rate-limit` declare no plugin dependency at all.
+- `entity-extraction` to `memory`, hard: the extraction delta is a `MemoryGraph` that the caller merges into the memory plugin's working graph.
+- `replay` to `session-log`, hard: replay reads a recorded trajectory through the session log's `SessionBackend` seam.
+- `vector-store` to `memory`, hard: the store implements the memory plugin's `VectorStore` offload seam, wired through `MemoryPlugin::with_extensions`, and hands recalled turns back through `RetrievalReport::inject`.
+- `speculative` to `session-log`, documented-optional: it declares no feature edge. `ModelOrchestrator::with_session_store` exists only when `plugin-session-log` is also enabled, and records `SessionEvent::ModelSwap`.
+- `prompt-cache` and `rate-limit` declare no plugin dependency.
 
-A service-to-service edge does not exist and would require re-tiering the
-shared part downward first.
+## Page layout
 
-## Caps and at-cap policies
+Every service page uses the same headings, in this order:
 
-Every service page states its caps as bound, at-cap policy, usage gauge, in
-that order. The consolidated view, and the reasoning behind refusing rather
-than evicting, is [Memory discipline](@/concepts/memory-discipline.md).
+1. Feature and entry type
+2. Entry points
+3. Configuration
+4. Caps and at-cap policy
+5. Errors
+6. Example
+7. Related pages
 
-| Service | Bound | At-cap policy | Usage gauge |
-|---|---|---|---|
-| `service-prompt-cache` | `PromptCacheConfig::capacity`, caller-set | evict least recently used | `len()`, against `capacity()` |
-| `service-replay` | `ReplayConfig::max_records`, default `65536` | refuse, never truncate | `usage().records` against `usage().max_records` |
-| `service-replay` | `ReplayConfig::max_turn_blocks`, default `4096` | refuse | `usage().blocks` |
-| `service-entity-extraction` | no growth cap | each call produces one standalone report | not applicable |
-| `service-speculative` | `ClientPool` is uncapped, bounded by configuration | no eviction | `ClientPool::len()` |
-| `service-rate-limit` | `RateLimitConfig::max_concurrent`, caller-set | callers wait for a free permit | `RateLimitUsage::in_flight` |
-| `service-rate-limit` | `RateLimitConfig::max_waiters`, caller-set | reject the acquire (`QueueFull`), never queue further | `RateLimitUsage::waiting` |
-| `service-vector-store` | `VectorStoreConfig::max_entries`, caller-set | evict oldest first, reusing its arena slot | `usage().entries` against `usage().capacity` |
-| `service-vector-store` | `VectorStoreConfig::max_entry_bytes`, caller-set | reject the turn, never truncate | `VectorStoreError::EntryTooLarge`, converted to `PluginError::Validation` at the seam and recorded in `CompressionReport::last_error` |
-
-## Per-service pages
+The consolidated view of every cap, across plugins and services, is [Memory discipline](@/concepts/memory-discipline.md).

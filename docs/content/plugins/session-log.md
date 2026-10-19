@@ -16,207 +16,124 @@ weight = 12
 <dd>You are registering <code>SessionLogPlugin</code>, choosing a <code>SessionBackend</code>, or forking a session.</dd>
 </dl>
 
-`SessionLogPlugin` records every request, streamed block, and completion as an append-only `SessionEvent`, writing to the session named by `with_session_id` (default `"default"`). `InMemoryBackend` (capped) and `FileBackend` (COBS-framed, disk-bound) are the two storage seams, and `fork_session` branches a new session from any historical point. Reach for it to build a replayable audit trail, or to fork a conversation at a known point.
+## Feature and entry type
 
-```rust,name=Record two live turns then fork the trajectory
-use std::collections::HashMap;
-use std::sync::Arc;
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-session-log` (enables `postcard`) |
+| Entry types | `SessionLogPlugin`, `SessionBackend`, `InMemoryBackend`, `FileBackend` |
+| Plugin name | `"session-log"` |
+| Attachment | `register_plugin` |
+| Also implements | `SessionStorePlugin`: `append_log`, `replay_session`, `fork_session` |
+| Needs | A `SessionBackend`; `SessionLogPlugin::new_in_memory()` builds one over a fresh `InMemoryBackend` |
 
-use cuca::plugin::{CucaPlugin, SessionStorePlugin};
-use cuca::session::{SessionEvent, SessionRecord};
-use cuca::types::{MessageContentBlock, ProviderEndpoint, UnifiedMessage};
-use cuca::{
-    AgentResponseStream, CucaClient, FileBackend, InMemoryBackend, SessionBackend,
-    SessionLogPlugin, UnifiedRequest,
-};
-use tokio_stream::StreamExt;
+## Hooks
 
-/// Per-turn completion cap. A reasoning model spends most of it on `Thinking`
-/// blocks, so a smaller budget returns an empty reply.
-const MAX_TOKENS: u32 = 512;
+`SessionLogPlugin` overrides `on_request`, `on_stream_chunk`, and `on_response_complete`. `execute_local_tool` uses the trait default. Every hook writes to the plugin's session id.
 
-/// The session the hooks write to, in both backends.
-const SESSION: &str = "demo";
+- `on_request` appends a `SystemPrompt` for every `System` message on every request. It appends a `Message` for a `User` or `Assistant` message only the first time that message position appears. `Tool` messages are not recorded. It records the request as earlier `on_request` hooks left it.
+- `on_stream_chunk` appends one record per block: `Thinking` becomes `Reasoning`, `Text` becomes `Output`, `ToolCall` becomes `ToolCall`, and `ToolResult` becomes `ToolResult` with `stdout`, `stderr`, and `exit_code` set to `None`. `ImageBase64` blocks are not recorded. Blocks are recorded verbatim.
+- `on_response_complete` appends `Latency` (`duration_ms`) and `TokenUsage`, in that order.
+- `ModelSwap` records arrive through `append_log`, called by whoever holds the store handle. The plugin's own hooks never write one.
 
-/// Two turns: the first states a fact, the second asks for it back.
-const PROMPTS: [&str; 2] = [
-    "The vault is in Lisbon. Reply with: noted",
-    "Where is the vault? Answer in one word.",
-];
+The plugin assigns every sequence number. Backends store records as given, with one exception: the `Fork` audit record a backend appends during `fork`, sequenced at the original session's tail.
 
-/// The record kind, as the store's own event variants name them.
-fn event_kind(event: &SessionEvent) -> &'static str {
-    match event {
-        SessionEvent::SystemPrompt { .. } => "SystemPrompt",
-        SessionEvent::Message { .. } => "Message",
-        SessionEvent::Reasoning { .. } => "Reasoning",
-        SessionEvent::Output { .. } => "Output",
-        SessionEvent::ToolCall { .. } => "ToolCall",
-        SessionEvent::ToolResult { .. } => "ToolResult",
-        SessionEvent::ModelSwap { .. } => "ModelSwap",
-        SessionEvent::Latency { .. } => "Latency",
-        SessionEvent::TokenUsage { .. } => "TokenUsage",
-        SessionEvent::Fork { .. } => "Fork",
-    }
-}
+### Session events
 
-/// Per-kind tally of `records`, in append order of first appearance.
-///
-/// A tally, not a listing: one `Reasoning` record per reasoning token would
-/// otherwise be the entire output.
-fn tally(records: &[SessionRecord]) -> String {
-    let mut order: Vec<&'static str> = Vec::new();
-    let mut counts: HashMap<&'static str, usize> = HashMap::new();
-    for record in records {
-        let kind = event_kind(&record.event);
-        let count = counts.entry(kind).or_insert(0);
-        if *count == 0 {
-            order.push(kind);
-        }
-        *count += 1;
-    }
-    order
-        .into_iter()
-        .map(|kind| format!("{kind} {}", counts[kind]))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
+| Variant | Fields |
+|---|---|
+| `SystemPrompt` | `text` |
+| `Message` | `role`, `content` |
+| `Reasoning` | `reasoning`, `signature` |
+| `Output` | `text` |
+| `ToolCall` | `id`, `name`, `arguments` |
+| `ToolResult` | `tool_call_id`, `output`, `stdout`, `stderr`, `exit_code` |
+| `ModelSwap` | `from`, `to`, `reason` |
+| `Latency` | `duration_ms` |
+| `TokenUsage` | `prompt_tokens`, `completion_tokens` |
+| `Fork` | `from_point`, `to_session` |
 
-/// Drain a turn into its text, dropping the `Thinking` blocks: the store
-/// already records every one of them as a `Reasoning` record.
-async fn drain(mut stream: AgentResponseStream) -> String {
-    let mut text = String::new();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => text.push_str(&chunk_text),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    text
-}
+Each stored `SessionRecord` carries `session_id`, a 0-based `sequence`, a `timestamp_ms`, and the `event`. `SessionRecord::point_id()` returns `"{session_id}:{sequence}"`, the string `fork_session` takes as `point_id`.
 
-/// Bytes the file backend has written for `SESSION`.
-fn file_bytes(dir: &std::path::Path) -> u64 {
-    std::fs::metadata(dir.join(format!("{SESSION}.cslog")))
-        .map(|meta| meta.len())
-        .unwrap_or(0)
-}
+### Forking
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+`fork_session(session_id, point_id)` branches from any historical point. The new session holds the original's prefix up to and including that point, relabelled with the new session id. The original gains one `SessionEvent::Fork` record, and the plugin then realigns that session's next sequence number to its replayed length.
 
-    // One directory per process: the file backend opens with `append(true)` and
-    // never truncates, so a shared directory would keep the previous run's
-    // frames and the counts below would grow every time.
-    let dir = std::env::temp_dir().join(format!("cuca-session-log-{}", std::process::id()));
-    let memory_backend = Arc::new(InMemoryBackend::new());
-    let memory_log = Arc::new(
-        SessionLogPlugin::new(Arc::clone(&memory_backend) as Arc<dyn SessionBackend>)
-            .with_session_id(SESSION),
-    );
-    let file_log = Arc::new(
-        SessionLogPlugin::new(Arc::new(FileBackend::new(dir.clone())?)).with_session_id(SESSION),
-    );
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::clone(&memory_log) as Arc<dyn CucaPlugin>)
-        .register_plugin(Arc::clone(&file_log) as Arc<dyn CucaPlugin>)
-        .build()?;
+The new id is `{session_id}:fork:{point_id}:{n}`, where `n` counts forks on that backend instance.
 
-    println!("Session {SESSION:?}, two backends recording the same turns");
-    println!(
-        "  memory: InMemoryBackend, cap {} records",
-        InMemoryBackend::DEFAULT_MAX_RECORDS
-    );
-    println!(
-        "  file:   {}",
-        dir.join(format!("{SESSION}.cslog")).display()
-    );
+## Configuration
 
-    let mut messages = vec![UnifiedMessage::system("You are concise.")];
-    let mut recorded = 0usize;
-    for (index, prompt) in PROMPTS.iter().enumerate() {
-        messages.push(UnifiedMessage::user(*prompt));
-        println!("\nTurn {}: {prompt:?}", index + 1);
-        let mut request = UnifiedRequest::new(&model).set_max_tokens(MAX_TOKENS);
-        request.messages = messages.clone();
-        let stream = match client.generate_stream(request).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                println!("\nNo server answered at {base_url}: {error}");
-                println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-                std::fs::remove_dir_all(&dir).ok();
-                return Ok(());
-            }
-        };
-        let reply = drain(stream).await;
-        println!("  reply: {}", reply.trim());
-        messages.push(UnifiedMessage::assistant(reply.trim()));
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `SessionLogPlugin::with_session_id(id)` | `impl Into<String>` | `"default"` | Session the hooks write to |
+| `InMemoryBackend::with_max_records(n)` | `usize` | `InMemoryBackend::DEFAULT_MAX_RECORDS` (65536) | Total-record cap across sessions; zero is rejected |
+| `FileBackend::new(dir)` | `impl Into<PathBuf>` | required | Directory for the session files; created if missing |
 
-        let records = memory_log.replay_session(SESSION)?;
-        let appended = &records[recorded..];
-        println!("  appended {} records: {}", appended.len(), tally(appended));
-        recorded = records.len();
-        println!(
-            "  gauge: {}/{} records in memory, {} bytes on disk",
-            memory_backend.len(),
-            InMemoryBackend::DEFAULT_MAX_RECORDS,
-            file_bytes(&dir)
-        );
-    }
+### Backends
 
-    // Fork from a historical point rather than the tail: the branch is the
-    // prefix up to and including that record, which is the whole point of
-    // forking an append-only log.
-    let records = memory_log.replay_session(SESSION)?;
-    let point = records
-        .iter()
-        .find(|record| matches!(record.event, SessionEvent::Message { .. }))
-        .map(SessionRecord::point_id)
-        .expect("the first turn recorded a Message");
-    println!("\nFork at {point}, the first Message record");
-    let branch = memory_log.fork_session(SESSION, &point)?;
-    println!("  new session: {branch}");
-    let branch_records = memory_log.replay_session(&branch)?;
-    println!(
-        "  branch: {} records: {}",
-        branch_records.len(),
-        tally(&branch_records)
-    );
-    let original = memory_log.replay_session(SESSION)?;
-    if let Some(SessionEvent::Fork {
-        from_point,
-        to_session,
-    }) = original.last().map(|record| &record.event)
-    {
-        println!(
-            "  original tail: Fork {{ from_point: {from_point:?}, to_session: {to_session:?} }}"
-        );
-    }
-    println!(
-        "  original: {} records, one more than before the fork",
-        original.len()
-    );
+- `InMemoryBackend` stores a `HashMap<session_id, Vec<SessionRecord>>`. It is not persisted.
+- `FileBackend` stores one file per session, `{dir}/{session_id}.cslog`, with one COBS-framed postcard record per append. It opens files with `append(true)` and never truncates or rewrites a frame.
 
-    println!(
-        "\nThe file backend replays the same trajectory: {} records",
-        file_log.replay_session(SESSION)?.len()
-    );
-    std::fs::remove_dir_all(&dir).ok();
-    Ok(())
-}
+### File format
+
+- Each `.cslog` file starts with the 8-byte magic `CUCASLOG` and a one-byte format version, `1`, written once when the file is created.
+- A missing file replays as an empty session.
+- `FileBackend` rejects a session id containing `/` or `\` rather than mapping it into a subdirectory.
+
+## Caps and at-cap policy
+
+| Structure | Bound | At-cap policy | Usage gauge |
+|---|---|---|---|
+| `InMemoryBackend` records | `max_records`, default 65536 records in total across sessions | `append` and `fork` fail with `PluginError::Internal` and evict nothing, because dropping a record would corrupt replay and forking | `InMemoryBackend::len()` against `max_records()` |
+| `FileBackend` trajectory | Disk | No in-process bound | None |
+| `FileBackend` framing scratch | 64 KiB of retained capacity | The buffer is cleared and shrunk back to 64 KiB after any larger record; no record is refused or truncated | `FileBackend::scratch_capacity()` |
+| `SessionLogPlugin` bookkeeping | None: one small entry per distinct session id | Not evicted, because evicting an entry would restart that session's sequence numbering. A caller that mints unbounded session ids owns that bound | None |
+
+`fork` on `InMemoryBackend` checks the cap before it changes anything. It needs room for the branch prefix plus the `Fork` audit record, and fails whole when that does not fit.
+
+## Errors
+
+`SessionLogPlugin` returns the `PluginError` its backend returns, and a hook propagates an append failure. A failure in `on_response_complete` is logged by the client and does not abort the turn.
+
+| Variant | When |
+|---|---|
+| `Validation`, schema `max_records` | `InMemoryBackend::with_max_records(0)` |
+| `Internal` | `InMemoryBackend` is full on `append` or `fork` |
+| `Validation`, schema `point_id` | `fork` names a `point_id` that no record in the session carries |
+| `Validation`, schema `session_id` | `FileBackend` gets a session id containing `/` or `\`, including the derived fork id |
+| `Validation`, schema `cslog` | A `.cslog` file is shorter than its header, lacks the `CUCASLOG` magic, has an unknown format version, or holds an undecodable frame |
+| `Validation`, schema `cslog` | A session has a `{session_id}.jsonl` file and no `.cslog` file; it is rejected, not replayed as empty |
+| `Io` | `FileBackend::new` cannot create the directory, or a file read, write, or frame serialization fails |
+
+## Example
+
+`examples/session_log.rs` records the same two live turns through two plugin instances, one over `InMemoryBackend` and one over `FileBackend`, then forks the in-memory session at its first `Message` record.
+
+```rust,name=Record to memory and to disk, then fork
+let memory_backend = Arc::new(InMemoryBackend::new());
+let memory_log = Arc::new(
+    SessionLogPlugin::new(Arc::clone(&memory_backend) as Arc<dyn SessionBackend>)
+        .with_session_id("demo"),
+);
+let file_log = Arc::new(
+    SessionLogPlugin::new(Arc::new(FileBackend::new(dir.clone())?)).with_session_id("demo"),
+);
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url)
+    .register_plugin(Arc::clone(&memory_log) as Arc<dyn CucaPlugin>)
+    .register_plugin(Arc::clone(&file_log) as Arc<dyn CucaPlugin>)
+    .build()?;
+
+// After the turns: branch at the first Message record.
+let branch = memory_log.fork_session("demo", &point)?;
 ```
+
+```bash,name=Runs the same on all three platforms
+cargo run --example session_log --features "provider-llamacpp plugin-session-log"
+```
+
+It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at another OpenAI-compatible server.
 
 ```text,name=Expected output
 Session "demo", two backends recording the same turns
@@ -242,59 +159,10 @@ Fork at demo:1, the first Message record
 The file backend replays the same trajectory: 213 records
 ```
 
-## Try it
+The `Reasoning` records are one per streamed `Thinking` block. Turn 2 appends a second `SystemPrompt` because only user and assistant messages are deduplicated by position. The counts and byte totals come from `google/gemma-4-12b-qat` and change with the model. The record kinds, the branch prefix, and the audit record do not.
 
-`examples/session_log.rs` is the program above. Two `SessionLogPlugin` instances record the same two live turns, one over `InMemoryBackend` and one over `FileBackend`, so the per-turn record tally, the in-memory gauge against its cap, and the bytes on disk all come from one conversation. The fork then branches at `demo:1` and prints the two-record prefix plus the `Fork` audit record the original gained.
+## Related pages
 
-The hundreds of `Reasoning` records are one per streamed `Thinking` block. Turn 2 appends a second `SystemPrompt` because only user and assistant messages are deduplicated by position. The counts and byte totals come from `google/gemma-4-12b-qat` and change with the model; the record kinds, the branch prefix, and the audit record do not.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example session_log --features "provider-llamacpp plugin-session-log"
-```
-
-## Entry types
-
-`SessionLogPlugin`, `SessionBackend`, `InMemoryBackend`, `FileBackend`.
-
-## `CucaPlugin` and `SessionStorePlugin`
-
-`SessionLogPlugin` implements `CucaPlugin` with the plugin name `"session-log"`, and also `SessionStorePlugin` (`append_log`, `replay_session`, `fork_session`). It overrides `on_request`, `on_stream_chunk`, and `on_response_complete`, writing to the session named by `SessionLogPlugin::with_session_id` (default `"default"`).
-
-## `SessionEvent`
-
-`SessionEvent` variants: `SystemPrompt { text }`, `Message { role, content }`, `Reasoning { reasoning, signature }`, `Output { text }`, `ToolCall { id, name, arguments }`, `ToolResult { tool_call_id, output, stdout, stderr, exit_code }`, `ModelSwap { from, to, reason }`, `Latency { duration_ms }`, `TokenUsage { prompt_tokens, completion_tokens }`, `Fork { from_point, to_session }`.
-
-Each stored `SessionRecord` carries `session_id`, a 0-based `sequence` assigned by the store on append, a `timestamp_ms`, and the `event`. `SessionRecord::point_id()` returns `"{session_id}:{sequence}"`, the string `fork_session` takes as `point_id`.
-
-## Backends
-
-| Backend | Storage | Growth |
-|---|---|---|
-| `InMemoryBackend` | `HashMap<session_id, Vec<SessionRecord>>` | Capped, see below |
-| `FileBackend` | One file per session, `{dir}/{session_id}.cslog`, one COBS-framed postcard record per append, opened with `append(true)` | Disk-bound |
-
-Each `.cslog` file starts with the 8-byte magic `CUCASLOG` and a one-byte format version, written once when the file is created. `replay` rejects an unknown magic or version with `PluginError::Validation`, and rejects a session whose only file is a legacy `{session_id}.jsonl` rather than replaying it as empty.
-
-`FileBackend` rejects session ids containing `/` or `\` with `PluginError::Validation` rather than mapping them into a subdirectory.
-
-## Capacity
-
-| | |
-|---|---|
-| Bound | `InMemoryBackend::DEFAULT_MAX_RECORDS`, 65536 records in total across sessions |
-| At-cap policy | `append` and `fork` fail rather than evict; this is an audit log, and dropping a record would corrupt replay and forking |
-| Usage gauge | `InMemoryBackend::len()` against `max_records()` |
-
-`FileBackend` frames every record through one reusable buffer.
-
-| | |
-|---|---|
-| Bound | 64 KiB of retained scratch capacity |
-| At-cap policy | The buffer is released and shrunk back to the bound after any larger record; no record is refused or truncated |
-| Usage gauge | `FileBackend::scratch_capacity()` |
-
-`SessionLogPlugin` also keeps two small per-session bookkeeping maps (next sequence, recorded message count); these are deliberately uncapped, since evicting an entry would restart that session's sequence numbering.
-
-## Forking
-
-`fork_session(session_id, point_id)` branches from any historical point, producing a new session whose trajectory is the prefix of the original up to and including that point. The original session gains a `SessionEvent::Fork` record for auditability.
+- [Memory discipline](@/concepts/memory-discipline.md): why the in-memory backend refuses at its cap instead of evicting.
+- [Replay](@/services/replay.md): the service that reads a trajectory back through `SessionBackend`.
+- [Redaction](@/plugins/redaction.md): registration order decides whether the log stores scrubbed or raw content.

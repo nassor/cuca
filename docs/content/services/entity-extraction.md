@@ -9,413 +9,130 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Validates model-produced entity and relationship candidates against a declared schema and builds a graph delta.</dd>
+<dd>Validates model-produced entity and relationship candidates against a declared schema and builds a standalone graph delta.</dd>
 <dt>You need</dt>
 <dd>The <code>service-entity-extraction</code> feature, which enables <code>plugin-memory</code>.</dd>
 <dt>Read this if</dt>
-<dd>You are calling <code>EntityExtractor::extract</code> or applying its report to a working memory graph.</dd>
+<dd>You call <code>EntityExtractor::extract</code> or apply its report to a <a href="@/plugins/memory.md">memory</a> working graph.</dd>
 </dl>
 
-`EntityExtractor` validates model-produced entity and relationship rows against a schema you declare up front, then builds the accepted rows into a graph delta. It is driven by direct calls: `extract(source, model)` asks an `EntityExtractionModel` for a candidate and validates it, and `validate_candidate(candidate)` validates a candidate you already hold. Both return an `EntityExtractionReport { delta, nodes_accepted, relationships_accepted }` whose `delta` is a standalone `MemoryGraph`, never a mutation of live plugin state. Reach for it when a model should populate a [`MemoryPlugin`](@/plugins/memory.md) working graph under a declared contract instead of free-form text.
+## Feature and entry type
 
-```rust,name=Extract a typed graph then answer from the merged graph
-use std::pin::Pin;
+| Item | Value |
+|---|---|
+| Feature | `service-entity-extraction` |
+| Declared plugin edge | `plugin-memory`, hard: `service-entity-extraction = ["plugin-memory"]` |
+| Own dependencies | none |
+| Entry type | `EntityExtractor` |
+| Module | `cuca::services::entity_extraction` |
+| Model boundary | `EntityExtractionModel`, implemented by the caller |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{MessageContentBlock, ProviderEndpoint};
-use cuca::{
-    CandidateEntity, CandidateRelationship, CucaClient, EntityExtractionCandidate,
-    EntityExtractionModel, EntityExtractionSchema, EntityExtractor, EntityReference, EntityTable,
-    GRAPH_RENDER_MARKER, GraphContextConfig, MemoryConfig, MemoryPlugin, MergePolicy, PluginError,
-    PropertyColumn, PropertyType, RelationshipTable, UnifiedRequest,
-};
-use tokio_stream::StreamExt;
+`EntityExtractor` never implements `CucaPlugin`. Passing it to `register_plugin` is a compile error.
 
-/// The prose the extraction reads. It is never sent again after stage 1.
-const SOURCE: &str = "Ada Lovelace is a mathematician at Analytical Engines. \
-Grace Hopper is a rear admiral at Naval Systems. \
-Analytical Engines and Naval Systems are separate companies.";
+The delta is a `MemoryGraph`, which is why the feature needs `plugin-memory`. The edge is one way: `plugin-memory` never references this module.
 
-/// The flat shape the adapter asks for. Keeping the wire shape independent of
-/// the schema is deliberate: local models are unreliable at deep nested JSON,
-/// and mapping a flat reply into schema rows is the application-side work the
-/// explicit-call contract expects.
-const WIRE_SHAPE: &str = r#"{"people":[{"name":"...","employer":"...","title":"..."}]}"#;
+Supporting types: `EntityExtractionSchema`, `EntityTable`, `RelationshipTable`, `PropertyColumn`, `PropertyType`, `EntityReference`, `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionReport`.
 
-/// `person -[works_at]-> company`, both identified by `name`. Both tables are
-/// strict, so any property the model invents is rejected, not absorbed.
-fn org_schema() -> EntityExtractionSchema {
-    let required_name = PropertyColumn {
-        name: "name".into(),
-        property_type: PropertyType::String,
-        required: true,
-    };
-    EntityExtractionSchema {
-        name: "org-chart".into(),
-        entities: vec![
-            EntityTable {
-                name: "person".into(),
-                labels: vec!["person".into()],
-                identity_columns: vec!["name".into()],
-                columns: vec![
-                    required_name.clone(),
-                    PropertyColumn {
-                        name: "title".into(),
-                        property_type: PropertyType::String,
-                        required: false,
-                    },
-                ],
-                allow_model_properties: false,
-            },
-            EntityTable {
-                name: "company".into(),
-                labels: vec!["company".into()],
-                identity_columns: vec!["name".into()],
-                columns: vec![required_name],
-                allow_model_properties: false,
-            },
-        ],
-        relationships: vec![RelationshipTable {
-            name: "works_at".into(),
-            kind: "works_at".into(),
-            from_table: "person".into(),
-            to_table: "company".into(),
-            columns: vec![],
-            allow_model_properties: false,
-        }],
-    }
-}
+## Entry points
 
-/// The single-column identity map both entity tables use.
-fn identity(name: &str) -> serde_json::Map<String, serde_json::Value> {
-    let mut map = serde_json::Map::new();
-    map.insert("name".into(), serde_json::json!(name));
-    map
-}
+- `EntityExtractor::new(schema)` validates and retains the schema. It returns `Result<EntityExtractor, PluginError>`.
+- `extract(source, model).await` asks the `EntityExtractionModel` for an unvalidated `EntityExtractionCandidate`, then runs `validate_candidate` on it.
+- `validate_candidate(candidate)` validates a candidate the caller already holds.
+- `EntityExtractionModel::extract(source, schema)` is the trait method the caller implements. It returns a boxed future of `Result<EntityExtractionCandidate, PluginError>`, so a transport or decode failure maps to the matching `PluginError`.
 
-/// A real `EntityExtractionModel` backed by llama.cpp through this crate's own
-/// client.
-struct LiveModel {
-    client: CucaClient,
-    model: String,
-    /// Thinking blocks the last call produced, counted rather than printed.
-    thinking: std::sync::atomic::AtomicUsize,
-}
+Both extractor methods return `EntityExtractionReport`:
 
-impl EntityExtractionModel for LiveModel {
-    fn extract<'a>(
-        &'a self,
-        source: &'a str,
-        schema: &'a EntityExtractionSchema,
-    ) -> Pin<Box<dyn Future<Output = Result<EntityExtractionCandidate, PluginError>> + Send + 'a>>
-    {
-        Box::pin(async move {
-            let request = UnifiedRequest::new(&self.model)
-                .add_system_message(
-                    "You are a JSON extraction engine. You reply with a single JSON object and \
-                     nothing else: no prose, no explanation, no markdown fences.",
-                )
-                .add_user_message(format!(
-                    "Extract every person, the company they work at, and their job title from \
-                     the text. Reply with exactly this shape:\n{WIRE_SHAPE}\nCopy names verbatim \
-                     from the text.\n\nText:\n{source}"
-                ))
-                .set_temperature(0.0)
-                .set_max_tokens(768);
-            let mut stream = self
-                .client
-                .generate_stream(request)
-                .await
-                .map_err(|error| {
-                    PluginError::Internal(format!("extraction turn failed: {error}"))
-                })?;
-            let mut reply = String::new();
-            while let Some(chunk) = stream.next().await {
-                match chunk {
-                    Ok(MessageContentBlock::Text(text)) => reply.push_str(&text),
-                    Ok(MessageContentBlock::Thinking { .. }) => {
-                        self.thinking
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    }
-                    Ok(_) => {}
-                    Err(error) => {
-                        return Err(PluginError::Internal(format!("stream error: {error}")));
-                    }
-                }
-            }
-            let reply = reply.trim();
-            println!(
-                "  the model answered with {} thinking blocks and {} chars of JSON",
-                self.thinking.load(std::sync::atomic::Ordering::Relaxed),
-                reply.len()
-            );
-            candidate_from(reply).ok_or_else(|| {
-                PluginError::Internal(format!(
-                    "no parseable extraction for schema `{}` in: {reply}",
-                    schema.name
-                ))
-            })
-        })
-    }
-}
+- `delta` is a standalone `MemoryGraph`.
+- `nodes_accepted` and `relationships_accepted` count the delta's nodes and relationships after duplicates coalesce.
 
-/// Map the model's flat reply into schema rows, or `None` when nothing parses.
-///
-/// The adapter never proposes a row the schema cannot accept: it drops
-/// non-string values and dedups by identity, so a validation failure here
-/// would be a real contract break rather than an unhelpful model.
-fn candidate_from(reply: &str) -> Option<EntityExtractionCandidate> {
-    let (start, end) = (reply.find('{')?, reply.rfind('}')?);
-    let value: serde_json::Value = serde_json::from_str(reply.get(start..=end)?).ok()?;
-    let mut candidate = EntityExtractionCandidate {
-        entities: Vec::new(),
-        relationships: Vec::new(),
-    };
-    let mut companies: Vec<String> = Vec::new();
-    let mut people: Vec<String> = Vec::new();
-    for row in value.get("people")?.as_array()?.iter().take(8) {
-        let field = |key: &str| row.get(key).and_then(serde_json::Value::as_str);
-        let Some(name) = field("name").map(str::trim).filter(|n| !n.is_empty()) else {
-            continue;
-        };
-        if people.iter().any(|seen| seen == name) {
-            continue;
-        }
-        people.push(name.to_string());
-        let mut properties = identity(name);
-        if let Some(title) = field("title").filter(|t| !t.is_empty()) {
-            properties.insert("title".into(), serde_json::json!(title));
-        }
-        candidate.entities.push(CandidateEntity {
-            table: "person".into(),
-            properties,
-        });
-        let Some(employer) = field("employer").map(str::trim).filter(|e| !e.is_empty()) else {
-            continue;
-        };
-        if !companies.iter().any(|seen| seen == employer) {
-            companies.push(employer.to_string());
-            candidate.entities.push(CandidateEntity {
-                table: "company".into(),
-                properties: identity(employer),
-            });
-        }
-        candidate.relationships.push(CandidateRelationship {
-            table: "works_at".into(),
-            from: EntityReference {
-                table: "person".into(),
-                identity: identity(name),
-            },
-            to: EntityReference {
-                table: "company".into(),
-                identity: identity(employer),
-            },
-            properties: serde_json::Map::new(),
-        });
-    }
-    (!candidate.entities.is_empty()).then_some(candidate)
-}
+### Hand-off the caller performs
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+The extractor never touches a `MemoryPlugin`. The delta has no effect until the application applies it, and dropping the report discards the extraction.
 
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .build()?;
-    let extractor = EntityExtractor::new(org_schema())?;
-    let schema = org_schema();
-    println!(
-        "Schema `{}`: entity tables [{}], relationship tables [{}]",
-        schema.name,
-        schema
-            .entities
-            .iter()
-            .map(|table| table.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", "),
-        schema
-            .relationships
-            .iter()
-            .map(|table| table.name.as_str())
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
+- `MemoryPlugin::merge_graph(delta, MergePolicy)` accumulates the delta into the working graph.
+- `MemoryPlugin::replace_graph(graph)` replaces the working graph wholesale.
 
-    println!("\nStage 1: one live extraction turn");
-    let live = LiveModel {
-        client,
-        model: model.clone(),
-        thinking: std::sync::atomic::AtomicUsize::new(0),
-    };
-    let report = match extractor.extract(SOURCE, &live).await {
-        Ok(report) => report,
-        Err(error) => {
-            println!("\nNo usable extraction from {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(());
-        }
-    };
-    println!(
-        "  accepted {} nodes, {} relationships",
-        report.nodes_accepted, report.relationships_accepted
-    );
-    for node in report.delta.nodes() {
-        let properties = serde_json::to_string(&node.properties)?;
-        println!(
-            "  node {} [{}] {properties}",
-            node.id,
-            node.labels.join(",")
-        );
-    }
-    for edge in report.delta.relationships() {
-        println!("  edge {} -[{}]-> {}", edge.from, edge.kind, edge.to);
-    }
+### Derived ids
 
-    // Stage 2: the hand-off. The extractor never touched a MemoryPlugin, so
-    // without this call the whole extraction is discarded when the report
-    // drops.
-    println!("\nStage 2: the mandatory hand-off (MemoryPlugin::merge_graph)");
-    let memory = MemoryPlugin::new(MemoryConfig {
-        graph_context: Some(GraphContextConfig::default()),
-        ..Default::default()
-    })?;
-    // One guard per reading: `graph()` hands back a `MutexGuard`, so two calls
-    // inside one expression would hold two guards on the same mutex and
-    // deadlock.
-    let size = |label: &str| -> Result<(), PluginError> {
-        let graph = memory.graph()?;
-        println!(
-            "  graph {label} the merge: {} nodes, {} relationships",
-            graph.len(),
-            graph.relationship_count()
-        );
-        Ok(())
-    };
-    size("before")?;
-    let merge = memory.merge_graph(report.delta, MergePolicy::Overwrite)?;
-    println!(
-        "  merge report: {} added, {} overwritten, {} kept, {} edges added, {} renamed",
-        merge.nodes_added,
-        merge.nodes_overwritten,
-        merge.nodes_kept,
-        merge.relationships_added,
-        merge.relationships_renamed
-    );
-    size("after")?;
+- A node id is `entity:` followed by the length prefixed table name and a canonical encoding of the identity columns, so the same extraction always yields the same ids.
+- A relationship id folds in the table name, both endpoint ids and the relationship's own properties.
+- Every relationship has weight `1.0` and the `kind` of its table.
+- Identical duplicate candidates count once.
 
-    // Stage 3: `on_request` is called here rather than through a registered
-    // plugin so the printed message is exactly the bytes that go out; a
-    // registered `MemoryPlugin` performs the same injection inside
-    // `generate_stream`.
-    println!("\nStage 3: the graph rendered into the next request");
-    let question = "Which company does Grace Hopper work at, and what is her title?";
-    let mut request = UnifiedRequest::new(&model)
-        .add_system_message("You are concise. Answer from the graph memory only.")
-        .add_user_message(question)
-        .set_max_tokens(512);
-    memory.on_request(&mut request)?;
-    for message in &request.messages {
-        for block in &message.content {
-            if let MessageContentBlock::Text(text) = block
-                && text.starts_with(GRAPH_RENDER_MARKER)
-            {
-                for line in text.lines() {
-                    println!("  {line}");
-                }
-            }
-        }
-    }
-    println!("  asked: {question}");
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url)
-        .build()?;
-    let mut stream = client.generate_stream(request).await?;
-    let mut reply = String::new();
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(text)) => reply.push_str(&text),
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    println!("  reply: {}", reply.trim());
+## Configuration
 
-    Ok(())
-}
+`EntityExtractor` has no config struct and no defaults. Its only input is the `EntityExtractionSchema`, and every field is required.
+
+| Key | Type | Rule |
+|---|---|---|
+| `EntityExtractionSchema::name` | `String` | Not blank; reported as `schema` in every `PluginError::Validation`. |
+| `EntityExtractionSchema::entities` | `Vec<EntityTable>` | Table names are unique across entities and relationships. |
+| `EntityExtractionSchema::relationships` | `Vec<RelationshipTable>` | Each endpoint names a declared entity table. |
+| `EntityTable::name` | `String` | The name a model uses in `CandidateEntity::table`. |
+| `EntityTable::labels` | `Vec<String>` | Copied onto every node the table produces. |
+| `EntityTable::identity_columns` | `Vec<String>` | Non-empty, no duplicates, each a `required` column; forms the node id. |
+| `EntityTable::columns` | `Vec<PropertyColumn>` | Declared properties. |
+| `EntityTable::allow_model_properties` | `bool` | `true` accepts undeclared properties; `false` rejects them. |
+| `RelationshipTable::name` | `String` | The name a model uses in `CandidateRelationship::table`. |
+| `RelationshipTable::kind` | `String` | Edge kind copied onto every edge the table produces. |
+| `RelationshipTable::from_table`<br>`RelationshipTable::to_table` | `String` | Entity tables the endpoints must reference. |
+| `RelationshipTable::columns`<br>`RelationshipTable::allow_model_properties` | `Vec<PropertyColumn>`<br>`bool` | Same rules as on `EntityTable`. |
+| `PropertyColumn::name` | `String` | The property key in the candidate's property map. |
+| `PropertyColumn::property_type` | `PropertyType` | `String`, `Boolean`, `Integer`, `Number`, `Array`, `Object` or `Null`. |
+| `PropertyColumn::required` | `bool` | The property must be present on every row of the table. |
+
+- `PropertyType::Integer` accepts a JSON number with an exact integer representation; `Number` accepts any JSON number.
+- `PropertyType::Array` and `Object` do not constrain element or member shapes.
+- A relationship endpoint is an `EntityReference` holding a `table` and exactly that table's identity columns.
+
+## Caps and at-cap policy
+
+No cap: the extractor retains only its immutable schema, and nothing grows with traffic. Each call returns one standalone report, and the size of a report follows the candidate it validates.
+
+## Errors
+
+The extractor raises one error, `PluginError::Validation { schema, message }`. Validation is total: nothing is accepted partially.
+
+`EntityExtractor::new` raises it for:
+
+- a blank schema name;
+- a duplicate table name;
+- an entity table with no identity column;
+- an identity column that is missing, duplicated or not `required`;
+- a duplicate or malformed property column;
+- a relationship endpoint naming an undeclared entity table.
+
+`validate_candidate` raises it for:
+
+- an unknown entity or relationship table;
+- a missing required property or a missing identity property;
+- a property whose JSON shape does not match its column;
+- an undeclared property on a table with `allow_model_properties = false`;
+- a relationship endpoint whose table differs from the declared one, or that does not carry exactly its table's identity columns;
+- an endpoint that no accepted entity of the same candidate satisfies;
+- two conflicting candidates that share one derived id.
+
+`extract` also returns whatever the `EntityExtractionModel` returns, which is implementation defined. The error variants are listed in [Error types](@/reference/errors.md).
+
+## Example
+
+This excerpt extracts a candidate, validates it, and performs the hand-off.
+
+```rust,name=Extract, validate and merge into memory
+let extractor = EntityExtractor::new(schema)?;           // schema: EntityExtractionSchema
+let report = extractor.extract(source, &model).await?;   // model: impl EntityExtractionModel
+let memory = MemoryPlugin::new(MemoryConfig::default())?;
+memory.merge_graph(report.delta, MergePolicy::Overwrite)?;
 ```
 
-```text,name=Expected output
-Schema `org-chart`: entity tables [person, company], relationship tables [works_at]
-
-Stage 1: one live extraction turn
-  the model answered with 326 thinking blocks and 166 chars of JSON
-  accepted 4 nodes, 2 relationships
-  node entity:6:person:object:1:4:namestring:12:Grace Hopper [person] {"name":"Grace Hopper","title":"rear admiral"}
-  node entity:6:person:object:1:4:namestring:12:Ada Lovelace [person] {"name":"Ada Lovelace","title":"mathematician"}
-  node entity:7:company:object:1:4:namestring:13:Naval Systems [company] {"name":"Naval Systems"}
-  node entity:7:company:object:1:4:namestring:18:Analytical Engines [company] {"name":"Analytical Engines"}
-  edge entity:6:person:object:1:4:namestring:12:Grace Hopper -[works_at]-> entity:7:company:object:1:4:namestring:13:Naval Systems
-  edge entity:6:person:object:1:4:namestring:12:Ada Lovelace -[works_at]-> entity:7:company:object:1:4:namestring:18:Analytical Engines
-
-Stage 2: the mandatory hand-off (MemoryPlugin::merge_graph)
-  graph before the merge: 0 nodes, 0 relationships
-  merge report: 4 added, 0 overwritten, 0 kept, 2 edges added, 0 renamed
-  graph after the merge: 4 nodes, 2 relationships
-
-Stage 3: the graph rendered into the next request
-  CUCA graph memory: 4 nodes, 2 relationships
-  node entity:6:person:object:1:4:namestring:12:Ada Lovelace: labels=[person] props={"name":"Ada Lovelace","title":"mathematician"}
-  node entity:6:person:object:1:4:namestring:12:Grace Hopper: labels=[person] props={"name":"Grace Hopper","title":"rear admiral"}
-  node entity:7:company:object:1:4:namestring:13:Naval Systems: labels=[company] props={"name":"Naval Systems"}
-  node entity:7:company:object:1:4:namestring:18:Analytical Engines: labels=[company] props={"name":"Analytical Engines"}
-  rel relationship:8:works_at53:entity:6:person:object:1:4:namestring:12:Ada Lovelace60:entity:7:company:object:1:4:namestring:18:Analytical Enginesobject:0:: entity:6:person:object:1:4:namestring:12:Ada Lovelace -[works_at]-> entity:7:company:object:1:4:namestring:18:Analytical Engines weight=1
-  rel relationship:8:works_at53:entity:6:person:object:1:4:namestring:12:Grace Hopper55:entity:7:company:object:1:4:namestring:13:Naval Systemsobject:0:: entity:6:person:object:1:4:namestring:12:Grace Hopper -[works_at]-> entity:7:company:object:1:4:namestring:13:Naval Systems weight=1
-  asked: Which company does Grace Hopper work at, and what is her title?
-  reply: Grace Hopper works at Naval Systems and her title is rear admiral.
-```
-
-`google/gemma-4-12b-qat` produced that run: the thinking-block count, the JSON length and the final reply are the model's. The node and relationship ids are not: they are a length-prefixed canonical encoding of the table name plus the identity columns, so the same extraction always derives the same ids, and a relationship id folds in both endpoints and its own properties.
-
-## Try it
-
-`examples/entity_extraction.rs` is the program above. It asks a live model for an org chart, validates the reply into a schema-typed delta, performs the mandatory hand-off with `MemoryPlugin::merge_graph`, then renders the merged graph into a second request and asks a question whose answer exists only in the graph, since the source prose is never sent again. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+`examples/entity_extraction.rs` is the full program with an org chart schema. It extracts through a live model, merges the delta, renders the graph into a second request and asks a question only the graph can answer. It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example entity_extraction --features "provider-llamacpp service-entity-extraction"
 ```
 
-## Feature edge
+## Related pages
 
-`service-entity-extraction = ["plugin-memory"]` in `Cargo.toml`: enabling this feature enables `plugin-memory` with it. This is one of the crate's three hard service feature edges.
-
-## Entry types
-
-`EntityExtractor`, `EntityExtractionSchema`, `EntityTable`, `RelationshipTable`, `PropertyColumn`, `PropertyType`, `EntityReference`, `CandidateEntity`, `CandidateRelationship`, `EntityExtractionCandidate`, `EntityExtractionReport`, `EntityExtractionModel`.
-
-## Schema
-
-`EntityExtractionSchema` declares:
-
-- `entities: Vec<EntityTable>`, each with a `name`, `labels` copied onto every produced node, `identity_columns` that form the node's identity and hence its graph id, declared `columns: Vec<PropertyColumn>`, and `allow_model_properties`.
-- `relationships: Vec<RelationshipTable>`, each with a `name`, an edge `kind`, `from_table` and `to_table` endpoint constraints, declared `columns`, and `allow_model_properties`.
-
-Table names are unique across entities and relationships. Each `PropertyColumn` declares a `name`, a `property_type` (`String`, `Boolean`, `Integer`, `Number`, `Array`, `Object`, or `Null`), and whether it is `required`.
-
-## Validation
-
-Validation is total: an unknown table, a missing required property, a type mismatch, an undeclared property on a table with `allow_model_properties = false`, or a relationship endpoint that no accepted entity satisfies all return `PluginError::Validation`. Nothing is accepted partially.
-
-## Capacity
-
-No growth cap. Each call produces one standalone report; nothing is retained between calls.
+- [Memory](@/plugins/memory.md) is the plugin whose working graph receives the delta.
+- [Plugins and services](@/concepts/plugin-layering.md) explains why the edge is one way.
+- [Services overview](@/services/_index.md) lists all six services.

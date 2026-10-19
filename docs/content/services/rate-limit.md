@@ -11,337 +11,162 @@ weight = 5
 <dt>In one line</dt>
 <dd>An integer token bucket over request rate plus a hard concurrency cap, so a caller fanning out over <code>generate_stream</code> stays inside a provider's quota.</dd>
 <dt>You need</dt>
-<dd>The <code>service-rate-limit</code> feature.</dd>
+<dd>The <code>service-rate-limit</code> feature, plus one <code>provider-*</code> feature.</dd>
 <dt>Read this if</dt>
 <dd>You are calling <code>RateLimiter::acquire</code> or <code>try_acquire</code> around <code>CucaClient::generate_stream</code>.</dd>
 </dl>
 
-`RateLimiter` paces outbound turns from the caller's side: an integer token bucket over request rate plus a hard cap on turns in flight. `acquire()` waits for a concurrency slot and then a token, up to `RateLimitConfig::max_wait`; `try_acquire()` takes both or fails at once, with no waiting and no Tokio reactor; `usage()` reads a cheap `RateLimitUsage` gauge. Reach for it when a fan-out over `CucaClient::generate_stream` has to stay inside a provider's quota.
+## Feature and entry type
 
-```rust,name=Pace a fan-out of turns through one shared limiter
-use std::io::{Write, stdout};
+| Item | Value |
+|---|---|
+| Feature flag | `service-rate-limit = ["dep:tokio"]` |
+| Declared plugin edge | none |
+| Entry type | `RateLimiter` |
+| Other public types | `RateLimitConfig`, `RateLimitPermit`, `RateLimitUsage`, `RateLimitObserver`, `RateLimitError` |
+
+`RateLimiter` is an explicit-call service. It never implements `CucaPlugin`, so passing it to `register_plugin` is a compile error. A hook cannot carry the capability: `CucaPlugin::on_request` is synchronous, so it can reject a request but never pace one. A permit taken in a hook also leaks when `generate_stream` returns `Err`, when the consumer drops the stream early, or when the stream is never wrapped by the top-level instrumentation.
+
+## Entry points
+
+| Method | Behavior |
+|---|---|
+| `RateLimiter::new(config)` | builds a limiter with a full bucket (`burst` tokens) and every slot free |
+| `acquire().await` | waits for a concurrency slot, then for a token, for at most `max_wait` |
+| `try_acquire()` | takes a slot and a token immediately, or fails at once; no waiting |
+| `usage()` | reads a `RateLimitUsage` gauge |
+| `config()` | returns the validated `RateLimitConfig` |
+
+- `acquire` takes the slot first and the token second. A caller that gives up waiting for a slot has spent no quota.
+- A token is spent and never returned. Dropping a `RateLimitPermit` returns its slot only.
+- `acquire` needs a Tokio reactor, because it uses `tokio::time` and a `tokio::sync::Semaphore`. `try_acquire` and `usage` need neither, so a non-Tokio caller can use them.
+- Share one `RateLimiter` behind an `Arc` across every task that dispatches to the same throttled provider. `RateLimiter` and `RateLimitPermit` are `Send + Sync`.
+- The limiter measures time with a monotonic clock, so a system clock jump cannot mint a burst. The bucket mutex is never held across an `.await`.
+
+### Hand-off: hold the permit for the whole turn
+
+The caller performs this sequence for every turn:
+
+1. `acquire()` the permit.
+2. Call `generate_stream`.
+3. Drain the stream.
+4. Drop the permit.
+
+Dropping the permit before the stream is drained under-counts concurrency. `usage().in_flight` makes that mistake observable.
+
+### Not covered
+
+The crate has no 429 or `Retry-After` feedback loop. A non-2xx response becomes `CucaError::Http { status, body }` inside the provider adapter and propagates before any stream or hook exists. No adapter keeps the response headers. The limiter never learns that an admitted request was rejected upstream, and it has no `penalize()` call. After a 429, widen `interval` or lower `max_requests` and rebuild the limiter. `RateLimiter` never fails a turn by itself; a caller that wants reject-only behavior calls `try_acquire`.
+
+## Configuration
+
+`RateLimitConfig::new(max_requests, interval, max_concurrent, max_waiters)` is the only base constructor. `with_burst`, `with_max_wait` and `with_warn_fraction` override a defaulted field, and `with_observer` appends an observer. Each `with_*` builder except `with_observer` returns `Result` and re-validates. `validate()` re-checks every bound, since the fields are public and a struct literal can bypass `new`.
+
+| Key | Type | Default | Valid values |
+|---|---|---|---|
+| `max_requests` | `u32` | required | non-zero |
+| `interval` | `Duration` | required | non-zero |
+| `burst` | `u32` | `max_requests` | non-zero |
+| `max_concurrent` | `usize` | required | non-zero, at most `Semaphore::MAX_PERMITS` |
+| `max_waiters` | `usize` | required | non-zero |
+| `max_wait` | `Duration` | `interval` | non-zero |
+| `warn_fraction` | `Option<f32>` | `None` | `None`, or finite and in `(0.0, 1.0]` |
+| `observers` | `Vec<Arc<dyn RateLimitObserver>>` | empty | none |
+
+- `max_requests` is the number of tokens added per `interval`.
+- `burst` is the bucket capacity, the largest instantaneous burst.
+- `max_waiters` is the most callers that may be inside `acquire` at once.
+- `max_wait` is the wait budget of one `acquire`.
+- `warn_fraction` makes every observer receive a `RateLimitUsage` once `waiting / max_waiters` reaches it. The check runs after the caller has a slot and before a token is spent.
+- `observers` is the list of `RateLimitObserver` implementations. `observe` returns `Result<(), PluginError>`, and an `Err` aborts that `acquire`.
+- The bucket counts in whole milliseconds, so an `interval` under one millisecond rounds up to one millisecond.
+
+## Caps and at-cap policy
+
+| Bound | At-cap policy | Usage gauge |
+|---|---|---|
+| token bucket, at most `burst * 1_000` thousandths of a token | saturates; a long idle period never banks credit past `burst` | `RateLimitUsage::available_tokens` |
+| `max_concurrent` permits | callers wait for a free slot | `RateLimitUsage::in_flight` |
+| `max_waiters` callers inside `acquire` | rejects, never evicts: an over-cap `acquire` returns `QueueFull` at once, before it parks | `RateLimitUsage::waiting` |
+| `max_wait` per `acquire` | the call returns `Exhausted` when the budget elapses | none |
+
+- Slots in flight plus callers waiting never exceed `max_concurrent + max_waiters`.
+- The bucket is two integers and never grows. The limiter keeps no request clone, key, log or map.
+- `RateLimitConfig::observers` is sized by the caller at construction and does not grow with traffic.
+
+## Errors
+
+`RateLimitError` is the error type of every method. It implements `std::error::Error`.
+
+- `Config(String)`: a bound was rejected by `RateLimitConfig::new`, a `with_*` call, `validate()` or `RateLimiter::new`.
+- `QueueFull { waiters, max_waiters }`: `acquire` found the waiter queue at `max_waiters` and refused instead of queueing.
+- `Busy { in_flight, max_concurrent }`: `try_acquire` found no free slot.
+- `Exhausted { retry_after }`: `try_acquire` found an empty bucket, or `acquire` ran out of `max_wait` while waiting for a slot or a token. `retry_after` is the time until the next whole token, and it is zero when a full bucket was never the obstacle.
+- `Observer(PluginError)`: a `RateLimitObserver` refused an `acquire` that crossed `warn_fraction`. The slot already taken is released before the error returns.
+- `Lock(String)`: the bucket mutex was poisoned. The limiter fails closed instead of admitting from a half-updated bucket.
+
+`Exhausted.retry_after` is the only value meant to drive a retry, and the caller decides whether to retry. `From<RateLimitError> for PluginError` is lossy:
+
+- `Config` becomes `PluginError::Validation` with schema `rate-limit-config`.
+- `Observer(e)` becomes `e` unchanged.
+- `QueueFull`, `Busy`, `Exhausted` and `Lock` become `PluginError::Internal`, with their numbers kept only in the message.
+
+A caller that needs the typed `retry_after` matches on `RateLimitError` before converting.
+
+## Example
+
+One limiter paces turns at 10 requests per 60 seconds, with 2 turns in flight and up to 8 callers waiting. The program needs a `llama-server` on port 1234 with a model loaded.
+
+```rust,name=Hold one permit across a whole turn
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use cuca::types::{MessageContentBlock, ProviderEndpoint};
-use cuca::{CucaClient, RateLimitConfig, RateLimitError, RateLimiter, UnifiedRequest};
+use cuca::types::ProviderEndpoint;
+use cuca::{CucaClient, RateLimitConfig, RateLimiter, UnifiedRequest};
 use tokio_stream::StreamExt;
-
-/// Turns fanned out concurrently after the first sequential one.
-const FANNED_OUT_TURNS: usize = 5;
-
-/// One labelled gauge reading.
-fn print_usage(label: &str, limiter: &RateLimiter) {
-    match limiter.usage() {
-        Ok(usage) => println!(
-            "  {label:<22} tokens={} in_flight={} waiting={}",
-            usage.available_tokens, usage.in_flight, usage.waiting
-        ),
-        Err(error) => println!("  {label:<22} usage unavailable: {error}"),
-    }
-}
-
-/// A short turn. The reply is one word: the pacing is the point, and a
-/// reasoning model needs a token budget big enough to finish thinking and
-/// still say it.
-fn request(model: &str, turn: usize) -> UnifiedRequest {
-    UnifiedRequest::new(model)
-        .add_system_message("You are concise.")
-        .add_user_message(format!("Reply with exactly: turn {turn}"))
-        .set_max_tokens(96)
-}
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+    let limiter = Arc::new(RateLimiter::new(RateLimitConfig::new(
+        10,
+        Duration::from_secs(60),
+        2,
+        8,
+    )?)?);
+    let client = CucaClient::builder()
+        .with_provider(ProviderEndpoint::LlamaCpp)
+        .with_base_url("http://127.0.0.1:1234/v1")
+        .build()?;
 
-    // Stage 1: the bounds. Every one of them is validated at construction, so
-    // a zero rate or a zero cap fails here instead of being clamped.
-    let limiter = Arc::new(RateLimiter::new(
-        RateLimitConfig::new(1, Duration::from_secs(45), 1, 8)?
-            .with_max_wait(Duration::from_secs(600))?,
-    )?);
-    let config = limiter.config();
-    println!(
-        "Limiter: {} requests / {:?}, burst {}, {} concurrent, {} queued, {:?} wait budget",
-        config.max_requests,
-        config.interval,
-        config.burst,
-        config.max_concurrent,
-        config.max_waiters,
-        config.max_wait
-    );
-    print_usage("before any turn", &limiter);
-
-    // Stage 2: one client for every turn. The limiter stays a separate object:
-    // it has no hooks, so `register_plugin(limiter)` would not compile.
-    let client = Arc::new(
-        CucaClient::builder()
-            .with_provider(ProviderEndpoint::LlamaCpp)
-            .with_base_url(base_url.clone())
-            .build()?,
-    );
-
-    let started = Instant::now();
-
-    // Stage 3: one turn end to end, which doubles as the reachability check.
-    // The permit is taken before the dispatch and dropped after the drain.
     let permit = limiter.acquire().await?;
-    let mut stream = match client.generate_stream(request(&model, 0)).await {
-        Ok(stream) => stream,
-        Err(error) => {
-            println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-            return Ok(());
-        }
-    };
-    print!("\n  turn 0 replies: ");
-    let mut thinking = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(text)) => {
-                print!("{text}");
-                stdout().flush()?;
-            }
-            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-            Ok(_) => {}
-            Err(error) => {
-                print!("[the stream ended early: {error}]");
-                break;
-            }
-        }
+    let usage = limiter.usage()?;
+    println!(
+        "tokens={} in_flight={} waiting={}",
+        usage.available_tokens, usage.in_flight, usage.waiting
+    );
+    let request = UnifiedRequest::new("any-model").add_user_message("Reply with: ok");
+    let mut stream = client.generate_stream(request).await?;
+    while let Some(block) = stream.next().await {
+        block?;
     }
-    println!(" (+{thinking} thinking blocks)");
     drop(permit);
-
-    // Stage 4: the remaining turns, all dispatched at once. The limiter is
-    // what decides when each of them actually reaches the provider.
-    println!("\nFanning out {FANNED_OUT_TURNS} turns over the same limiter");
-    let mut handles = Vec::with_capacity(FANNED_OUT_TURNS);
-    for turn in 1..=FANNED_OUT_TURNS {
-        let client = Arc::clone(&client);
-        let limiter = Arc::clone(&limiter);
-        let model = model.clone();
-        handles.push(tokio::spawn(async move {
-            let permit = match limiter.acquire().await {
-                Ok(permit) => permit,
-                // QueueFull past `max_waiters`, Exhausted past `max_wait`.
-                Err(error) => {
-                    println!("  turn {turn}: refused, {error}");
-                    return;
-                }
-            };
-            let admitted_ms = started.elapsed().as_millis();
-            let reading = match limiter.usage() {
-                Ok(usage) => format!(
-                    "tokens={} in_flight={} waiting={}",
-                    usage.available_tokens, usage.in_flight, usage.waiting
-                ),
-                Err(error) => format!("usage unavailable: {error}"),
-            };
-
-            let mut reply = String::new();
-            let mut thinking = 0usize;
-            match client.generate_stream(request(&model, turn)).await {
-                Ok(mut stream) => {
-                    while let Some(chunk) = stream.next().await {
-                        match chunk {
-                            Ok(MessageContentBlock::Text(text)) => reply.push_str(&text),
-                            Ok(MessageContentBlock::Thinking { .. }) => thinking += 1,
-                            Ok(_) => {}
-                            Err(error) => {
-                                println!("  turn {turn}: the stream ended early, {error}");
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(error) => println!("  turn {turn}: dispatch failed, {error}"),
-            }
-            println!(
-                "  turn {turn}: admitted at {admitted_ms} ms ({reading}), replied {:?} \
-                 (+{thinking} thinking) at {} ms",
-                reply.trim(),
-                started.elapsed().as_millis()
-            );
-            // Explicit for the demo: the slot comes back here, not when the
-            // stream ended.
-            drop(permit);
-        }));
-    }
-
-    // Stage 5: the gauge, sampled while the fan-out runs. The peak is the
-    // observable proof that the caps held.
-    let mut peak_in_flight = 0;
-    let mut peak_waiting = 0;
-    loop {
-        if let Ok(usage) = limiter.usage() {
-            peak_in_flight = peak_in_flight.max(usage.in_flight);
-            peak_waiting = peak_waiting.max(usage.waiting);
-        }
-        if handles.iter().all(tokio::task::JoinHandle::is_finished) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    for handle in handles {
-        handle.await?;
-    }
-    println!(
-        "\nPeak while the fan-out ran: in_flight={peak_in_flight} (cap {}), \
-         waiting={peak_waiting} (cap {})",
-        limiter.config().max_concurrent,
-        limiter.config().max_waiters
-    );
-    println!(
-        "{} turns took {} ms through a {}-per-{:?} bucket",
-        FANNED_OUT_TURNS + 1,
-        started.elapsed().as_millis(),
-        limiter.config().max_requests,
-        limiter.config().interval
-    );
-
-    // Stage 6: the non-blocking path. `try_acquire` never waits: it spends a
-    // token when one is there and otherwise reports how long until the next
-    // one, without ever reaching the provider.
-    println!("\nDraining the bucket with try_acquire");
-    loop {
-        match limiter.try_acquire() {
-            Ok(permit) => {
-                println!("  admitted: one token spent, nothing dispatched");
-                drop(permit);
-            }
-            Err(RateLimitError::Exhausted { retry_after }) => {
-                println!(
-                    "  refused: the bucket is empty, retry after {} ms",
-                    retry_after.as_millis()
-                );
-                break;
-            }
-            // Busy (every slot held) or Lock (poisoned bucket); neither can
-            // happen here, since each permit above is dropped immediately.
-            Err(error) => {
-                println!("  refused: {error}");
-                break;
-            }
-        }
-    }
-    print_usage("after the demo", &limiter);
     Ok(())
 }
 ```
 
 ```text,name=Expected output
-Limiter: 1 requests / 45s, burst 1, 1 concurrent, 8 queued, 600s wait budget
-  before any turn        tokens=1 in_flight=0 waiting=0
-
-  turn 0 replies: turn 0 (+49 thinking blocks)
-
-Fanning out 5 turns over the same limiter
-  turn 1: admitted at 45030 ms (tokens=0 in_flight=1 waiting=4), replied "turn 1" (+59 thinking) at 75968 ms
-  turn 2: admitted at 90054 ms (tokens=0 in_flight=1 waiting=3), replied "turn 2" (+53 thinking) at 126285 ms
-  turn 3: admitted at 135061 ms (tokens=0 in_flight=1 waiting=2), replied "turn 3" (+58 thinking) at 166749 ms
-  turn 4: admitted at 180070 ms (tokens=0 in_flight=1 waiting=1), replied "turn 4" (+50 thinking) at 211396 ms
-  turn 5: admitted at 225078 ms (tokens=0 in_flight=1 waiting=0), replied "turn 5" (+46 thinking) at 255461 ms
-
-Peak while the fan-out ran: in_flight=1 (cap 1), waiting=5 (cap 8)
-6 turns took 255479 ms through a 1-per-45s bucket
-
-Draining the bucket with try_acquire
-  refused: the bucket is empty, retry after 14625 ms
-  after the demo         tokens=0 in_flight=0 waiting=0
+tokens=9 in_flight=1 waiting=0
 ```
 
-`google/gemma-4-12b-qat` produced that run: the replies and the thinking-block counts are the model's, while the 45 second admission schedule is the bucket's and holds for any model.
-
-## Try it
-
-`examples/rate_limit.rs` is the program above. Six turns share one client and one `Arc<RateLimiter>` sized at one request per 45 seconds, with `max_concurrent = 1`, `max_waiters = 8`, and a 600 second wait budget. The bucket refills more slowly than the model answers, so the admission timestamps are the refill schedule. Each fanned-out turn prints its admission time and a `usage()` reading, a peak `in_flight`/`waiting` line follows the fan-out, and the run ends by draining the bucket with `try_acquire` until it reports `Exhausted` with a `retry_after`. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+`examples/rate_limit.rs` fans six turns out over one shared limiter sized at one request per 45 seconds. It prints each admission time and `usage()` reading, the peak `in_flight` and `waiting`, and the `retry_after` that `try_acquire` reports once the bucket is empty. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` point it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example rate_limit --features "provider-llamacpp service-rate-limit"
 ```
 
-## Entry types
+## Related pages
 
-`RateLimiter`, `RateLimitConfig`, `RateLimitPermit`, `RateLimitUsage`, `RateLimitObserver`, `RateLimitError`.
-
-## Config
-
-`RateLimitConfig::new(max_requests, interval, max_concurrent, max_waiters)` is the only base constructor; every bound must be non-zero, or it returns `RateLimitError::Config`. `with_burst`, `with_max_wait`, and `with_warn_fraction` override the defaulted fields, and `with_observer` appends a `RateLimitObserver`. `validate()` re-checks every bound, since the fields are public and a struct literal can bypass `new`.
-
-| Field | Meaning | Default |
-|---|---|---|
-| `max_requests` | Tokens replenished per `interval`; must be non-zero | required |
-| `interval` | Refill window; must be non-zero | required |
-| `burst` | Bucket capacity, the largest instantaneous burst; must be non-zero | `max_requests` |
-| `max_concurrent` | Hard cap on concurrently held permits; must be non-zero | required |
-| `max_waiters` | Hard cap on callers parked in `acquire`; must be non-zero | required |
-| `max_wait` | Per-acquire wait budget; must be non-zero | `interval` |
-| `warn_fraction` | Warn every registered observer once `waiting / max_waiters` reaches this fraction; must be in `(0.0, 1.0]` when set | `None` (disabled) |
-| `observers` | `RateLimitObserver`s notified when `warn_fraction` is crossed | empty |
-
-## The acquire, dispatch, drain, drop hand-off
-
-Hold the permit for the whole turn, not just the call that starts it. Dropping it before the stream is drained under-counts concurrency, because the slot is what actually comes back on drop; the token stays spent.
-
-`acquire` waits for a slot before it waits for a token, on purpose: a caller that gives up waiting for a slot has spent no quota, and the number of parked callers is already bounded by `max_concurrent + max_waiters` together. Share one `RateLimiter` behind an `Arc` across every task dispatching to the same throttled provider; both `RateLimiter` and `RateLimitPermit` are `Send + Sync`.
-
-## Errors
-
-| Variant | When | Carries |
-|---|---|---|
-| `Config` | A bound rejected at `RateLimitConfig::new`, a `with_*` call, `validate()`, or `RateLimiter::new` | the invalid bound, as a message |
-| `QueueFull` | `acquire`, when the waiter queue is already at `max_waiters`: the call is refused instead of queued | `waiters`, `max_waiters` |
-| `Busy` | `try_acquire` only, when no concurrency slot is free right now | `in_flight`, `max_concurrent` |
-| `Exhausted` | `try_acquire` when the bucket is empty, or `acquire` when the wait budget elapses, whether it was waiting for a slot or for a token | `retry_after`, the time until the next whole token, which is zero when a full bucket was never the obstacle |
-| `Observer` | A `RateLimitObserver` refused an acquire crossing `warn_fraction`; the already-taken slot is released before the error returns | the wrapped `PluginError` |
-| `Lock` | The bucket mutex was poisoned by a panicking lock holder; the limiter fails closed rather than admit from a half-updated bucket | a message |
-
-`Exhausted.retry_after` is the one actionable value the crate reports; nothing else in `RateLimitError` is meant to drive a retry loop, because retrying is the caller's decision, not the limiter's. `From<RateLimitError> for PluginError` is a lossy interop edge for code that already threads `PluginError`: `Config` becomes `PluginError::Validation`, `Observer(e)` round-trips `e` unchanged, and the three throttle variants collapse into `PluginError::Internal` with their numbers kept only in the message. A caller that needs the typed `retry_after` matches on `RateLimitError` before converting.
-
-## Capacity
-
-| Structure | Bound | At-cap policy | Usage gauge |
-|---|---|---|---|
-| Token bucket | Two integers, capped at `burst * 1_000` thousandths | Saturates; a long idle period never accumulates unbounded credit | `RateLimitUsage::available_tokens` |
-| Concurrency permits | `max_concurrent`, validated non-zero | Callers wait for a free slot | `RateLimitUsage::in_flight` |
-| Waiter queue | `max_waiters`, validated non-zero | Reject, never evict: an over-cap `acquire` returns `QueueFull` immediately, before it ever parks | `RateLimitUsage::waiting` |
-| `RateLimitConfig::observers` | Caller-sized at construction | Fixed; not traffic-growing | n/a |
-
-The limiter retains no per-request data: no request clone, no key, no log, no map. Only concurrent callers make it grow, and both axes of that are capped above.
-
-## If you want automatic rejection
-
-`RateLimiter` never fails a turn by itself; a caller decides what to do with `Busy`, `QueueFull`, or `Exhausted`. Wanting automatic, hook-based rejection instead of pacing is a legitimate but different capability, and it is ten lines around `try_acquire`, not a crate feature:
-
-```rust,name=A reject-only wrapper around try_acquire
-struct RejectOnBusy(Arc<RateLimiter>);
-
-impl CucaPlugin for RejectOnBusy {
-    fn name(&self) -> &'static str {
-        "reject-on-busy"
-    }
-
-    fn on_request(&self, _req: &mut UnifiedRequest) -> Result<(), PluginError> {
-        self.0.try_acquire().map(drop).map_err(PluginError::from)
-    }
-}
-```
-
-This spends a token and immediately drops the permit, so it never holds a concurrency slot across the turn; it can only fail a request, never pace one. That is exactly why `RateLimiter` itself does not ship this shape: a partial hook implementation that silently dropped the concurrency half of the capability would be exactly the silent no-op [Plugins and services](@/concepts/plugin-layering.md) rules out.
-
-## No server feedback
-
-There is no 429 or `Retry-After` seam in this crate to plug into: a non-2xx response becomes `CucaError::Http { status, body }` inside the provider's dispatch future and is propagated by `?` before any stream or plugin hook exists, and no provider adapter keeps the response's header map around afterward. `RateLimiter` therefore never learns that a request it admitted was itself rejected upstream.
-
-If a turn does come back `CucaError::Http { status: 429, .. }`, the limiter's own bounds are simply stale for that provider. There is no `penalize()` call to drain the bucket in response; widen `interval` or lower `max_requests` on the `RateLimitConfig` and rebuild the limiter instead.
-
-## Runtime coupling
-
-`acquire` needs a Tokio reactor: it calls `tokio::time::sleep` and waits on a `tokio::sync::Semaphore`. `try_acquire` and `usage` need neither, so they also work from a non-Tokio caller.
+- [Services](@/services/_index.md) lists every service and its plugin edge.
+- [Plugins and services](@/concepts/plugin-layering.md) explains the explicit-call tier.
+- [Memory discipline](@/concepts/memory-discipline.md) explains the bounded-by-default rule.
+- [Errors](@/reference/errors.md) lists the crate's error types.

@@ -1,6 +1,6 @@
 +++
 title = "The unified request and stream"
-description = "Why one request type and five block types are enough for seven backends, and where per-provider difference is allowed to live."
+description = "Why one request type and five block types are enough for every backend, and where per-provider difference is allowed to live."
 template = "page.html"
 weight = 1
 +++
@@ -9,36 +9,24 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>The unified types are the narrowest shape all seven backends can agree on, and every remaining difference is pushed into the adapter</dd>
+<dd>The unified types are the narrowest shape every backend can agree on, and every remaining difference lives in the provider adapter</dd>
 <dt>You need</dt>
-<dd>Nothing running. This page is read away from the keyboard</dd>
+<dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You are wondering why the request has the fields it has, or where a provider quirk is supposed to go</dd>
+<dd>You are wondering why the request has the fields it has, or where a provider quirk belongs</dd>
 </dl>
 
-Seven backends speak four wire protocols between them. OpenAI, vLLM, LM Studio,
-DeepSeek's native route and llama.cpp's chat route all post
-`/chat/completions`. Anthropic and DeepSeek's bridge route post `/messages`.
-Gemini posts `streamGenerateContent`. llama.cpp's native route posts
-`/completion` with raw token frames.
+The seven HTTP backends use four wire shapes. OpenAI, vLLM, LM Studio, DeepSeek's native route and llama.cpp's chat route post `/chat/completions`. Anthropic and DeepSeek's bridge route post `/messages`. Gemini posts `streamGenerateContent`. llama.cpp's native route posts `/completion` with raw token frames. The eighth provider runs a model in process and has no wire.
 
-A caller who wanted to switch between two of those would otherwise rewrite the
-request body, the auth header, the streaming frame reader and the tool-call
-round trip. `UnifiedRequest` and `MessageContentBlock` exist so that switch is a
-feature flag and a base URL.
+Switching between two of them would otherwise mean rewriting the request body, the auth header, the frame reader and the tool-call round trip. `UnifiedRequest` and `MessageContentBlock` make that switch a feature flag and a base URL.
 
-## One turn, six stages
+## One turn
 
 <div class="dgm">
 <div class="dgm-scroll">
 <svg viewBox="0 0 660 124" role="img" aria-labelledby="pipe-title pipe-desc">
   <title id="pipe-title">The six stages of one CUCA turn</title>
-  <desc id="pipe-desc">Six stages, left to right. A UnifiedRequest passes through the
-  on_request hook of every registered plugin. The selected provider adapter builds the
-  vendor body and posts it over HTTP. The reply bytes feed SseStreamParser, which emits
-  protocol-level SSE events. The same provider adapter translates those events into
-  MessageContentBlock values. Each block then passes through every plugin's
-  on_stream_chunk hook before reaching the caller.</desc>
+  <desc id="pipe-desc">Six stages, left to right. A UnifiedRequest passes through the on_request hook of every registered plugin. The selected provider adapter builds the vendor body and posts it over HTTP. The reply bytes feed SseStreamParser, which emits protocol level SSE events. The same provider adapter translates those events into MessageContentBlock values. Each block then passes through every plugin's on_stream_chunk hook before reaching the caller.</desc>
   <defs>
     <marker id="pipe-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -69,43 +57,25 @@ feature flag and a base URL.
   <path class="arw arw-data" d="M320 69 H338" marker-end="url(#pipe-arrow)"/>
   <path class="arw arw-data" d="M432 69 H450" marker-end="url(#pipe-arrow)"/>
   <path class="arw arw-ctl" d="M544 69 H562" marker-end="url(#pipe-arrow)"/>
-  <text class="t-ax" x="6" y="114">crate boundary at stage 3 and 5; the wire format never leaves the adapter</text>
+  <text class="t-ax" x="6" y="114">stages 3 and 5 are the provider adapter; the wire format never leaves it</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>Stages 3 and 5 are the only places vendor JSON exists.</b>
-Stage 4 is protocol work with no vendor knowledge, and stages 2 and 6 see
-normalized types only.</p>
+<p class="dgm-cap"><b>Stages 3 and 5 are the only places vendor JSON exists.</b> Stage 4 is protocol work with no vendor knowledge, and stages 2 and 6 see normalized types only.</p>
 </div>
 
-Stage 1 is not quite the request the caller built. `generate_stream` overwrites
-`request.provider` with the client's own selected provider before any hook runs,
-so setting the field on `UnifiedRequest` cannot mis-route a request. A plugin
-reading `req.provider` in `on_request` therefore always sees the truth.
+`generate_stream` overwrites `request.provider` with the client's selected provider before any hook runs. Setting the field on a `UnifiedRequest` therefore cannot mis-route it, and a plugin reading `req.provider` in `on_request` always sees the real endpoint. `UnifiedRequest::new` starts with `ProviderEndpoint::Custom("")` for that reason.
 
-## What the request carries, and what it deliberately does not
+## What the request carries
 
-`UnifiedRequest` has nine fields: `model`, `provider`, `messages`,
-`temperature`, `max_tokens`, `stream`, `thinking`, `tools`, `prompt_cache`. Four
-of them are `Option`, and an unset `Option` means the adapter omits the key
-rather than inventing a default. `temperature` and `max_tokens` are absent from
-an OpenAI-compatible body unless the caller set them.
+`UnifiedRequest` has nine fields: `model`, `provider`, `messages`, `temperature`, `max_tokens`, `stream`, `thinking`, `tools` and `prompt_cache`. Three are `Option`: `temperature`, `max_tokens` and `thinking`. An unset `Option` means the adapter omits the key instead of inventing a default, so an OpenAI-compatible body has no `temperature` or `max_tokens` unless the caller set them.
 
-The exception is Anthropic, where `max_tokens` is required by the API. That
-adapter substitutes `1024` when the field is unset, because the alternative is
-refusing to send a request the caller considers complete.
+Anthropic is the exception because its API requires `max_tokens`. That adapter sends `1024` when the field is unset, since the alternative is refusing a request the caller considers complete.
 
-There is no field for a vendor-specific knob, and that is the constraint the
-type is built around. A `HashMap<String, Value>` of pass-through options would
-make `UnifiedRequest` trivially extensible and simultaneously destroy the reason
-it exists: a request would stop being portable the moment anyone used it. The
-one place a vendor override is admitted is `ThinkingParams`, and it is admitted
-as a closed enum with one variant per provider, not an open map.
+The request has no field for a vendor-specific knob, and the type is built around that constraint. A `HashMap<String, Value>` of pass-through options would make `UnifiedRequest` easy to extend and would end its portability the first time anyone used it. The one vendor override is `ThinkingParams`, a closed enum with variants for Anthropic, Gemini and OpenAI-compatible reasoning, plus `None`.
 
-## Thinking: one level, five translations
+## Thinking: one level, several translations
 
-`ThinkingEffort` has five levels. Each provider gets the closest native control,
-and where a provider has fewer gradations than five, levels collapse. The
-collapse is visible rather than hidden:
+`ThinkingEffort` has five levels. Each provider gets its closest native control, and where a provider has fewer gradations the levels collapse.
 
 | Effort | OpenAI-compatible `reasoning_effort` | Anthropic `budget_tokens` | Anthropic adaptive `effort` | Gemini `thinkingLevel` |
 |---|---|---|---|---|
@@ -115,60 +85,34 @@ collapse is visible rather than hidden:
 | `High` | `"high"` | `16384` | `"high"` | `"HIGH"` |
 | `XHigh` | `"high"` | `16384` | `"xhigh"` | `"HIGH"` |
 
-DeepSeek has no effort knob at all: its native route takes a mode object,
-`{"type":"enabled"}` or `{"type":"disabled"}`, and the effort level is dropped.
-llama.cpp's chat route inherits the OpenAI-compatible column; its native
-`/completion` route has no reasoning control and ignores `thinking` entirely.
+- DeepSeek's native route has no effort knob. It takes a mode object, `{"type":"enabled"}` or `{"type":"disabled"}`, and drops the effort level.
+- llama.cpp's chat route uses the OpenAI-compatible column. Its native `/completion` route has no reasoning control and ignores `thinking`.
+- `ThinkingParams` carries a native value for a caller who needs it, and a set override wins over the unified effort. Using it costs portability.
 
-`ThinkingParams` is the escape hatch for callers who need the native value
-rather than the mapped one, and a set override wins over the unified effort.
-Reaching for it costs portability, which is exactly the trade it represents.
+## Five block types
 
-## Five block types, not four and not twelve
+`MessageContentBlock` has `Text`, `ImageBase64`, `Thinking`, `ToolCall` and `ToolResult`. Every adapter's translator emits only these, so code written against one backend behaves the same against the others.
 
-`MessageContentBlock` has `Text`, `ImageBase64`, `Thinking`, `ToolCall` and
-`ToolResult`. Every adapter's translator emits only these, so consuming code
-written against one backend compiles and behaves against the others.
+The serialization is adjacently tagged with `#[serde(tag = "type", content = "value")]`. Internal tagging cannot represent a newtype variant, and `Text(String)` is one. Session logging serializes `Text` blocks, so every variant has to round-trip.
 
-The serialization is adjacently tagged, `#[serde(tag = "type", content = "value")]`,
-which is unusual enough to be worth naming. Internal tagging cannot represent a
-newtype variant, and `Text(String)` is a newtype variant. The alternative was
-turning `Text` into `Text { text: String }` to make internal tagging work, which
-would have added a field name to the single most-used variant in the crate for
-the benefit of a serialization detail. The tagging changed instead.
+## The Custom provider
 
-Blocks round-trip through `plugin-session-log`, so this is not a cosmetic
-choice: it is what makes a recorded session replayable.
-
-## The ninth provider variant
-
-`ProviderEndpoint` has nine variants, but only eight have adapters. The ninth
-is `Custom(String)`, and dispatching it always fails:
+`ProviderEndpoint` has nine variants. Eight have adapters: `LlamaCpp`, `Vllm`, `LmStudio`, `OpenAi`, `Anthropic`, `GoogleGemini`, `DeepSeek` and `Local`. The ninth is `Custom(String)`, and dispatching it always fails.
 
 ```text,name=CucaError::Config from the Custom dispatch arm
 configuration error: custom endpoints require a registered adapter
 ```
 
-An unknown gateway could plausibly be assumed OpenAI-compatible, since most
-are. The crate refuses to assume, because a wrong guess produces a malformed
-request against a real endpoint and a confusing error from the far side. A
-caller who knows their gateway speaks a given protocol says so by selecting that
-protocol's feature and overriding the base URL, which is
-[Point the client at another OpenAI-compatible server](@/guides/other-openai-server.md).
+The crate does not assume an unknown gateway is OpenAI-compatible. A wrong guess sends a malformed request to a real endpoint and returns a confusing error from the far side. A caller who knows the gateway's protocol selects that protocol's feature and overrides the base URL, as in [Point the client at another OpenAI-compatible server](@/guides/other-openai-server.md).
 
 ## Where a provider quirk goes
 
-The rule the layout enforces: normalized types know nothing about vendors, and
-vendors are known only inside `src/provider/`. A quirk is therefore always an
-adapter change, never a new field on `UnifiedRequest`.
+Normalized types know nothing about vendors, and vendors are known only inside `src/provider/`. A quirk is therefore an adapter change, never a new field on `UnifiedRequest`.
 
-Gemini drops tool-call ids because its wire format has no field for them, and
-matches results back by function name. DeepSeek's bridge route rewrites
-`claude-opus` to `deepseek-v4-pro` and forces prompt caching off. llama.cpp's
-native route assembles a single prompt string with `### User:` markers because
-it has no message array. None of that is visible in the unified types, and all
-of it is stated on the provider's own page under
-[Providers](@/providers/_index.md).
+- Gemini's `functionResponse` names the function, not the call id, so a `ToolResult` is matched by `UnifiedMessage::name` when set, with the call id as a fallback.
+- DeepSeek's bridge route rewrites `claude-opus` to `deepseek-v4-pro`, `claude-sonnet` and `claude-haiku` to `deepseek-v4-flash`, and forces prompt caching off.
+- llama.cpp's native route builds one prompt string with `### User:` and `### Assistant:` markers, because that route has no message array.
 
-Next page: [The SSE parser](@/concepts/sse-parser.md), which is stage 4 of the
-diagram above and the one stage with no vendor knowledge at all.
+None of this is visible in the unified types. Each provider's page under [Providers](@/providers/_index.md) states its own.
+
+Next page: [The SSE parser](@/concepts/sse-parser.md).

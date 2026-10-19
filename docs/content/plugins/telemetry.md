@@ -16,159 +16,106 @@ weight = 10
 <dd>You are registering <code>OpenTelemetryPlugin</code> or wiring its metrics into an exporter.</dd>
 </dl>
 
-`OpenTelemetryPlugin` records request, streamed-token, and latency metrics onto a caller-supplied OpenTelemetry meter provider, and logs request dispatch and completion through `tracing`. It installs no meter provider of its own, so it composes with whatever exporter pipeline the caller already runs. Reach for it to get request-rate, token, and latency dashboards without hand-rolling the counters.
+## Feature and entry type
 
-```rust,name=Read the three instruments out of an in-memory exporter
-use std::sync::Arc;
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-telemetry` (enables `opentelemetry`, `opentelemetry_sdk`, `tracing`) |
+| Entry type | `OpenTelemetryPlugin`, built with `OpenTelemetryPlugin::new(&dyn MeterProvider)` |
+| Plugin name | `"opentelemetry-observability"` |
+| Attachment | `register_plugin` |
+| Needs | A meter provider the caller owns; the plugin installs no global provider |
+| Cost bridge | `OtelCostObserver`, compiled when `plugin-cost` and `plugin-telemetry` are both enabled |
 
-use cuca::plugin::CucaPlugin;
-use cuca::types::{MessageContentBlock, ProviderEndpoint};
-use cuca::{AgentResponseStream, CucaClient, OpenTelemetryPlugin, UnifiedRequest};
-use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
-use opentelemetry_sdk::metrics::{InMemoryMetricExporter, PeriodicReader, SdkMeterProvider};
-use tokio_stream::StreamExt;
+## Hooks
 
-/// Per-turn completion cap. A reasoning model spends most of it on `Thinking`
-/// blocks, so a smaller budget returns an empty reply.
-const MAX_TOKENS: u32 = 512;
+`OpenTelemetryPlugin` overrides `on_request`, `on_stream_chunk`, and `on_response_complete`. `execute_local_tool` uses the trait default.
 
-/// Two turns, so the request counter and the histogram both hold more than one
-/// point.
-const PROMPTS: [&str; 2] = [
-    "Name one bird. Reply with the name only.",
-    "Name one fish. Reply with the name only.",
-];
+- `on_request` adds 1 to `cuca_requests_total` with the attributes `model` and `provider`, then logs the dispatch.
+- `on_stream_chunk` adds 1 to `cuca_streamed_tokens_total` with no attributes, once per streamed content block. It is an approximation of a token count, because a block can span several tokens.
+- `on_response_complete` records `UnifiedResponse::duration_secs` into `cuca_request_duration_seconds` with the attribute `status="success"`, then logs the completion.
 
-/// Attribute set of one data point, as `key="value"` pairs.
-fn attributes<'a>(mut attrs: impl Iterator<Item = &'a opentelemetry::KeyValue>) -> String {
-    let mut out = String::new();
-    for attr in attrs.by_ref() {
-        if !out.is_empty() {
-            out.push(' ');
-        }
-        out.push_str(&format!("{}={:?}", attr.key.as_str(), attr.value.as_str()));
-    }
-    if out.is_empty() {
-        out.push_str("no attributes");
-    }
-    out
-}
+### Instruments
 
-/// Print every exported series: name, kind, description, then its data points.
-///
-/// The two instrument shapes this plugin creates are a `Sum<u64>` (both
-/// counters, under cumulative temporality, so one flush carries running
-/// totals) and a `Histogram<f64>`.
-fn print_series(metrics: &[ResourceMetrics]) {
-    for scope in metrics.iter().flat_map(ResourceMetrics::scope_metrics) {
-        println!(
-            "\nExported after force_flush, scope {:?}",
-            scope.scope().name()
-        );
-        for metric in scope.metrics() {
-            match metric.data() {
-                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
-                    println!("  {}  Sum<u64>  {}", metric.name(), metric.description());
-                    for point in sum.data_points() {
-                        println!("    {}  {}", point.value(), attributes(point.attributes()));
-                    }
-                }
-                AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
-                    println!(
-                        "  {}  Histogram<f64>  {}",
-                        metric.name(),
-                        metric.description()
-                    );
-                    for point in histogram.data_points() {
-                        println!(
-                            "    count {}, sum {:.3}, min {:.3}, max {:.3}  {}",
-                            point.count(),
-                            point.sum(),
-                            point.min().unwrap_or(0.0),
-                            point.max().unwrap_or(0.0),
-                            attributes(point.attributes())
-                        );
-                    }
-                }
-                other => println!("  {}  {other:?}", metric.name()),
-            }
-        }
-    }
-}
+The plugin creates all three once in `new`, from the meter named `"cuca_client"`.
 
-/// Drain a turn into its text plus per-kind block counts.
-///
-/// The block counts are what `cuca_streamed_tokens_total` counts: one
-/// increment per streamed block, `Thinking` blocks included.
-async fn drain(mut stream: AgentResponseStream) -> (String, usize, usize) {
-    let mut text = String::new();
-    let mut text_blocks = 0usize;
-    let mut thinking_blocks = 0usize;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(MessageContentBlock::Text(chunk_text)) => {
-                text_blocks += 1;
-                text.push_str(&chunk_text);
-            }
-            Ok(MessageContentBlock::Thinking { .. }) => thinking_blocks += 1,
-            Ok(_) => {}
-            Err(error) => {
-                println!("  the stream ended early: {error}");
-                break;
-            }
-        }
-    }
-    (text, text_blocks, thinking_blocks)
-}
+| Instrument | Kind | Attributes |
+|---|---|---|
+| `cuca_requests_total` | `Counter<u64>` | `model`, `provider` |
+| `cuca_streamed_tokens_total` | `Counter<u64>` | none |
+| `cuca_request_duration_seconds` | `Histogram<f64>` | `status` |
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
-    // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+### Logs
 
-    // The plain `PeriodicReader` exports from a dedicated OS thread, so
-    // `force_flush` below cannot deadlock this current-thread runtime.
-    let exporter = InMemoryMetricExporter::default();
-    let meter_provider = SdkMeterProvider::builder()
-        .with_reader(PeriodicReader::builder(exporter.clone()).build())
-        .build();
-    let otel = Arc::new(OpenTelemetryPlugin::new(&meter_provider));
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::LlamaCpp)
-        .with_base_url(base_url.clone())
-        .register_plugin(Arc::clone(&otel) as Arc<dyn CucaPlugin>)
-        .build()?;
+`tracing::info!` events under the target `cuca::telemetry`:
 
-    println!("Meter \"cuca_client\" on an SdkMeterProvider reading into InMemoryMetricExporter");
+- On request dispatch: `model` and `provider`.
+- On response completion: `duration`, `prompt_tokens`, and `completion_tokens`.
 
-    for (index, prompt) in PROMPTS.iter().enumerate() {
-        println!("\nTurn {}: {prompt:?}", index + 1);
-        let request = UnifiedRequest::new(&model)
-            .add_system_message("You are concise.")
-            .add_user_message(*prompt)
-            .set_max_tokens(MAX_TOKENS);
-        let stream = match client.generate_stream(request).await {
-            Ok(stream) => stream,
-            Err(error) => {
-                println!("\nNo server answered at {base_url}: {error}");
-                println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
-                return Ok(());
-            }
-        };
-        let (reply, text_blocks, thinking_blocks) = drain(stream).await;
-        println!("  reply: {}", reply.trim());
-        println!("  blocks: {text_blocks} text, {thinking_blocks} thinking");
-    }
+A no-op meter provider yields a plugin that only emits these logs.
 
-    meter_provider.force_flush()?;
-    print_series(&exporter.get_finished_metrics()?);
-    Ok(())
-}
+### Cost bridge
+
+`OtelCostObserver` implements `CostObserver` and records the cost ledger to the same `"cuca_client"` meter. It is built with `OtelCostObserver::new(&dyn MeterProvider)` and attached through `CostConfig::observers` (see [Cost accounting](@/plugins/cost.md)). It lives in core, at `cuca::cost_otel`, because neither plugin may name the other.
+
+Its ten instruments are `Gauge<u64>`, recorded with no attributes after every `on_request` charge and every `on_response_complete` commit, one per `CostUsage` field. They are gauges because each reading is a cumulative snapshot and the observer seam carries no deltas.
+
+| Instrument | `CostUsage` field |
+|---|---|
+| `cuca_cost_spent_micros` | `spent_micros` |
+| `cuca_cost_prompt_tokens` | `prompt_tokens` |
+| `cuca_cost_completion_tokens` | `completion_tokens` |
+| `cuca_cost_cache_read_tokens` | `cache_read_tokens` |
+| `cuca_cost_cache_write_tokens` | `cache_write_tokens` |
+| `cuca_cost_turns` | `turns` |
+| `cuca_cost_unpriced_turns` | `unpriced_turns` |
+| `cuca_cost_overflow_turns` | `overflow_turns` |
+| `cuca_cost_untokenized_image_blocks` | `untokenized_image_blocks` |
+| `cuca_cost_near_cap` | `near_cap`, recorded as `1` or `0` |
+
+The two configured caps are not recorded: they are construction-time constants.
+
+## Configuration
+
+`OpenTelemetryPlugin::new` takes only the meter provider. It has no config struct and no keys.
+
+| Fixed value | Setting |
+|---|---|
+| Meter name | `"cuca_client"`, shared with `OtelCostObserver` |
+| Log target | `cuca::telemetry` |
+
+Export, aggregation, and temporality belong to the caller's meter provider and reader.
+
+## Caps and at-cap policy
+
+No cap: the plugin holds three instrument handles and nothing grows with traffic. Accumulation is the caller's meter provider's job. `OtelCostObserver` holds ten gauge handles, no state, and takes no lock of its own. There is no usage gauge.
+
+## Errors
+
+None. Every hook returns `Ok(())`, and `OtelCostObserver::observe` always returns `Ok(())`, so neither aborts a turn.
+
+## Example
+
+`examples/telemetry.rs` registers the plugin on an in-memory exporter, runs two live turns, and prints every exported series after one `force_flush`.
+
+```rust,name=Register the plugin on an in-memory exporter
+let exporter = InMemoryMetricExporter::default();
+let meter_provider = SdkMeterProvider::builder()
+    .with_reader(PeriodicReader::builder(exporter.clone()).build())
+    .build();
+let otel = Arc::new(OpenTelemetryPlugin::new(&meter_provider));
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::LlamaCpp)
+    .with_base_url(base_url)
+    .register_plugin(Arc::clone(&otel) as Arc<dyn CucaPlugin>)
+    .build()?;
 ```
+
+```bash,name=Runs the same on all three platforms
+cargo run --example telemetry --features "provider-llamacpp plugin-telemetry"
+```
+
+It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at another OpenAI-compatible server.
 
 ```text,name=Expected output
 Meter "cuca_client" on an SdkMeterProvider reading into InMemoryMetricExporter
@@ -190,63 +137,16 @@ Exported after force_flush, scope "cuca_client"
     153  no attributes
 ```
 
-## Try it
+`cuca_streamed_tokens_total` reaches 153 because it counts every streamed block, `Thinking` blocks included: `2 + 78 + 1 + 72`. The counts and durations come from `google/gemma-4-12b-qat` on one machine and change with both. The series names, kinds, and attribute keys do not.
 
-`examples/telemetry.rs` is the program above. Two live turns move all three instruments, and one `force_flush` prints every exported series with its data points and attributes. `cuca_streamed_tokens_total` reaching 153 is exactly the block counts printed per turn, `2 + 78 + 1 + 72`, which is what "one increment per streamed block" means in practice.
-
-The counts and durations come from `google/gemma-4-12b-qat` on one machine and change with both. The series names, their kinds, and their attribute keys do not.
-
-```bash,name=Runs the same on all three platforms
-cargo run --example telemetry --features "provider-llamacpp plugin-telemetry"
-```
-
-## Entry types
-
-`OpenTelemetryPlugin`.
-
-## `CucaPlugin`
-
-`OpenTelemetryPlugin` implements `CucaPlugin` with the plugin name `"opentelemetry-observability"`. It overrides `on_request`, `on_stream_chunk`, and `on_response_complete`.
-
-## Instruments
-
-Created once from the meter named `"cuca_client"`:
-
-| Instrument | Kind | Recorded |
-|---|---|---|
-| `cuca_requests_total` | `Counter<u64>` | Incremented by 1 in `on_request`, with `model` and `provider` attributes |
-| `cuca_streamed_tokens_total` | `Counter<u64>` | Incremented by 1 in `on_stream_chunk`, once per streamed content block |
-| `cuca_request_duration_seconds` | `Histogram<f64>` | Recorded in `on_response_complete` with `res.duration_secs` |
-
-The token counter is a coarse approximation: one increment per streamed block, not a real token count.
-
-## Logs
-
-`tracing::info!` events under target `cuca::telemetry` on request dispatch (`model`, `provider`) and on response completion (`duration`, `prompt_tokens`, `completion_tokens`).
-
-## Cost bridge
-
-`OtelCostObserver`, compiled only when `plugin-cost` is also enabled, records the cost ledger to the same `"cuca_client"` meter. It is built from a `&dyn opentelemetry::metrics::MeterProvider`, attaches through `CostConfig::observers` ([Cost accounting](@/plugins/cost.md)), and lives in core, at `cuca::cost_otel`, because neither plugin may name the other. Its ten instruments are `Gauge<u64>`, recorded with no attributes on every `on_request` charge and every `on_response_complete` commit, one per `CostUsage` field. Gauges rather than counters: a reading is a cumulative snapshot, and the observer seam carries no deltas.
-
-| Instrument | `CostUsage` field |
-|---|---|
-| `cuca_cost_spent_micros` | `spent_micros` |
-| `cuca_cost_prompt_tokens` | `prompt_tokens` |
-| `cuca_cost_completion_tokens` | `completion_tokens` |
-| `cuca_cost_cache_read_tokens` | `cache_read_tokens` |
-| `cuca_cost_cache_write_tokens` | `cache_write_tokens` |
-| `cuca_cost_turns` | `turns` |
-| `cuca_cost_unpriced_turns` | `unpriced_turns` |
-| `cuca_cost_overflow_turns` | `overflow_turns` |
-| `cuca_cost_untokenized_image_blocks` | `untokenized_image_blocks` |
-| `cuca_cost_near_cap` | `near_cap`, as `1` or `0` |
-
-`examples/cost_otel.rs` registers both plugins on one meter provider and prints all ten gauges after a live priced turn.
+`examples/cost_otel.rs` registers `CostPlugin`, `OpenTelemetryPlugin`, and `OtelCostObserver` on one meter provider and prints all ten gauges after a live priced turn.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example cost_otel --features "provider-llamacpp plugin-cost plugin-telemetry"
 ```
 
-## Capacity
+## Related pages
 
-No growth cap. Accumulation and export are the caller's OpenTelemetry meter provider's responsibility; no default meter provider is installed by this plugin.
+- [Cost accounting](@/plugins/cost.md): the ledger that `OtelCostObserver` reports.
+- [Memory discipline](@/concepts/memory-discipline.md): why capped structures expose a usage reading and leave alerting to the caller's meter.
+- [Plugin layering](@/concepts/plugin-layering.md): why the bridge lives in core.

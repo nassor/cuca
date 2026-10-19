@@ -9,41 +9,41 @@ weight = 2
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Implement <code>name</code> plus the one or two hooks you need, then pass an <code>Arc</code> of it to <code>register_plugin</code></dd>
+<dd>Implement <code>name</code> plus the hooks you need, then pass an <code>Arc</code> of the plugin to <code>register_plugin</code></dd>
 <dt>You need</dt>
 <dd>A working stream, from <a href="@/quick-start/first-stream.md">Stream a first reply</a></dd>
 <dt>Read this if</dt>
 <dd>You want to observe, rewrite or intercept part of a turn without forking the crate</dd>
 </dl>
 
-Five methods on one trait. Four have default bodies, so a useful plugin is
-usually thirty lines.
+Goal: run your own code at a chosen point of every turn. The trait has five methods and only `name` is required, so a useful plugin is about thirty lines.
 
 ## Step 1: pick the hook
 
-Choose by when your code needs to run, not by what it does.
+Choose by when your code must run.
 
-| You want to | Hook | Signature detail |
-|---|---|---|
-| change the request before it is sent | `on_request` | `&mut UnifiedRequest`; the first error aborts the turn before dispatch |
-| answer a tool call yourself, locally | `execute_local_tool` | returns `Option<MessageContentBlock>`; the first plugin to return a value wins |
-| see or rewrite every block as it arrives | `on_stream_chunk` | `&mut MessageContentBlock`; the first error fails the stream |
-| act once on the finished turn | `on_response_complete` | `&UnifiedResponse`; errors here are logged, not propagated |
+| You want to | Hook | Receives | If it returns `Err` |
+|---|---|---|---|
+| Change the request before it is sent | `on_request` | `&mut UnifiedRequest` | `generate_stream` fails before dispatch; later plugins do not run |
+| Answer a tool call yourself | `execute_local_tool` | `&MessageContentBlock` (a `ToolCall`) | the stream yields `CucaError::Plugin` in place of the block and keeps polling |
+| See or rewrite each block | `on_stream_chunk` | `&mut MessageContentBlock` | the stream yields `CucaError::Plugin` in place of the block, which is not accumulated; polling continues |
+| Act once on the finished turn | `on_response_complete` | `&UnifiedResponse` | logged and dropped; the remaining plugins still run |
 
-If none of those moments is right for your capability, it probably should not be
-a `CucaPlugin` at all. Five of the crate's seventeen non-provider features are not, and they live in the service tier; the reasoning is in [Plugins and services](@/concepts/plugin-layering.md).
+`execute_local_tool` returns `Option<MessageContentBlock>`, and the first plugin to return `Some` wins.
 
-## Step 2: note that every hook takes `&self`
+If no hook fits your capability, it belongs in the service tier, which is driven by direct method calls. See [Plugins and services](@/concepts/plugin-layering.md).
 
-This is the one thing that catches people out. Hooks are `&self`, not
-`&mut self`, because the plugin list is shared across `await` points as
-`Arc<dyn CucaPlugin>`. State therefore needs interior mutability: an
-`AtomicUsize` for a counter, a `Mutex` for anything larger.
+Result: you know which of the four hooks you override.
+
+## Step 2: keep state behind `&self`
+
+Every hook takes `&self`, because the client shares the plugin list as `Arc<dyn CucaPlugin>` across `await` points. Mutable state needs interior mutability: an `AtomicUsize` for a counter, a `Mutex` for anything larger.
+
+Result: your struct holds its state in atomics or locks, and the trait bound `Send + Sync` holds.
 
 ## Step 3: implement the trait
 
-The bundled example counts blocks and reports the aggregate. It overrides two
-hooks and takes the defaults for the rest:
+The bundled example overrides two hooks and takes the defaults for the rest. It counts streamed blocks and prints the aggregate.
 
 ```rust,name=The whole plugin from examples/custom_plugin.rs
 #[derive(Default)]
@@ -76,9 +76,9 @@ impl CucaPlugin for BlockCounterPlugin {
 }
 ```
 
-`name` is the only required method. It returns `&'static str` and appears in the
-log line the client writes when an `on_response_complete` hook fails, so make it
-identifiable.
+`name` returns a `&'static str`. The client puts it on the `tracing` error event it emits when an `on_response_complete` hook fails, and only under `plugin-guardrails`. Make it unique and recognizable.
+
+Result: the plugin compiles against `cuca::plugin::CucaPlugin`.
 
 ## Step 4: register it
 
@@ -90,59 +90,52 @@ let client = CucaClient::builder()
     .build()?;
 ```
 
-Call `register_plugin` once per plugin. They run in the order you registered
-them, at every hook site, and `client.plugins()` returns them in that order.
+Call `register_plugin` once per plugin. Plugins run in registration order at every hook site, and `client.plugins()` returns them in that order.
+
+Result: `client.plugins().len()` is the number of plugins you registered.
 
 ## Step 5: run it
+
+Start `llama-server` on port 1234 as in [Stream a first reply](@/quick-start/first-stream.md), then run the example.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example custom_plugin --features provider-llamacpp
 ```
 
-```text,name=The summary line from one run against gemma-4-12b-qat
+```text,name=Expected output (one run against gemma-4-12b-qat)
 CUCA most commonly refers to either the Credit Union of Central Alabama or the Center for Urban Community Action, depending on the context.
 [example-block-counter] model=google/gemma-4-12b-qat duration=81.89s completion_tokens=1991 blocks=1991
 ```
 
-The summary line carries its own leading newline: the client fires
-`on_response_complete` inside the final `next()` poll, before the drain loop
-returns. `google/gemma-4-12b-qat` reasons before it answers and the example sets
-no `max_tokens`, which is why both counts are this large; the reply text and the
-numbers change with the model.
+Result: the reply streams, then one summary line prints. The reply text, the counts and the duration depend on the model. This model reasons before it answers and the example sets no `max_tokens`, so both counts are large.
 
-`completion_tokens` is the server's token count from its final `usage` frame,
-and `blocks` counts what streamed; a delta carries about one token, so the two
-roughly agree for a text-only reply. They diverge as soon as the reply carries
-an `ImageBase64` or `ToolResult` block, which count as blocks but not as
-tokens. A server that reports no usage leaves `completion_tokens` at one per
-`Text`, `Thinking` and `ToolCall` block, and `UnifiedResponse::usage` at `None`.
+Reading the summary:
+
+- `completion_tokens` is the server's count from its final usage frame.
+- `blocks` counts every block your hook saw, and a text delta carries about one token, so the two roughly agree for a text-only reply.
+- They diverge once the reply carries an `ImageBase64` or `ToolResult` block, which count as blocks but not as tokens.
+- A server that reports no usage leaves `completion_tokens` at one per `Text`, `Thinking` and `ToolCall` block, and `UnifiedResponse::usage` at `None`.
 
 ## If your plugin answers tool calls
 
-`execute_local_tool` has one rule the compiler cannot enforce. Given a
-`ToolCall` with id `X`, a returned value must be a `ToolResult` whose
-`tool_call_id` is `X`. Anything else fails the stream:
+For a `ToolCall` with id `X`, a value returned from `execute_local_tool` must be a `ToolResult` whose `tool_call_id` is `X`. Any other block fails the call:
 
-```text,name=PluginError::Validation on a mismatched result
-validation failed for schema local tool result: local tool executor must return a ToolResult for the input ToolCall id
+```text,name=CucaError::Plugin carrying PluginError::Validation on a mismatched result
+plugin error: validation failed for schema local tool result: local tool executor must return a ToolResult for the input ToolCall id
 ```
 
-Return `Ok(None)` for a tool call you do not handle, so the next plugin gets its
-turn.
+Return `Ok(None)` for a tool call you do not handle, so the next plugin gets its turn.
 
 ## If your plugin holds state that grows
 
-Anything whose size follows traffic needs a bound, a stated policy for reaching
-it, and a way to read current usage. That is a hard rule in this crate, not a
-suggestion, and the six existing examples of it plus the reasoning behind
-refusing rather than evicting are in
-[Memory discipline](@/concepts/memory-discipline.md).
+State whose size follows traffic needs a bound, a stated policy at the bound, and a way to read current usage. The existing structures and the reasoning for each policy are in [Memory discipline](@/concepts/memory-discipline.md).
 
 ## If your plugin stores session records
 
-Implement `SessionStorePlugin` on top of `CucaPlugin`. It adds `append_log`,
-`replay_session` and `fork_session`, none of which has a default body, and it is
-what the speculative orchestrator calls to record a model swap. The bundled
-implementation is [`plugin-session-log`](@/plugins/session-log.md).
+Implement `SessionStorePlugin` on top of `CucaPlugin`. It adds `append_log`, `replay_session` and `fork_session`, none with a default body. `ModelOrchestrator::with_session_store` takes an `Arc<dyn SessionStorePlugin>` to record model swaps. The bundled implementation is [Session log](@/plugins/session-log.md).
+
+## If the prompt cache is on
+
+A prompt-cache hit replays the stored blocks without calling `execute_local_tool` or `on_stream_chunk`. `on_request` still runs, and `on_response_complete` runs once. See [Prompt cache](@/services/prompt-cache.md).
 
 Next page: [Run the live integration suite](@/guides/integration-tests.md).

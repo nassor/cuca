@@ -9,28 +9,22 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Route cheap turns to a fast model, escalate to a slow one when the request looks hard, the draft looks wrong, or the fast tier stalls</dd>
+<dd>Route cheap turns to a fast model, and escalate to a slow one when the request looks hard, the draft looks wrong, or the fast tier stalls</dd>
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
 <dd>You want to know what triggers an escalation, and what a caller sees when one happens mid-stream</dd>
 </dl>
 
-Two models, paired. One is cheap and quick, one is expensive and capable. The
-orchestrator decides which answers, and can change its mind while the cheap one
-is already talking.
+The orchestrator pairs two models. One is cheap and quick, the other is expensive and capable. It decides which one answers, and it can change its mind while the fast one is already streaming. The feature is `service-speculative`, and [Speculative](@/services/speculative.md) is its reference page.
 
-## The three escalation triggers
+## Three escalation triggers
 
 <div class="dgm">
 <div class="dgm-scroll">
 <svg viewBox="0 0 660 190" role="img" aria-labelledby="spec-title spec-desc">
   <title id="spec-title">How a turn reaches the fast or the slow tier</title>
-  <desc id="spec-desc">A request first meets the complexity evaluator. A request the
-  evaluator calls Slow goes straight to the slow tier. Otherwise it goes to the fast
-  tier, which streams a draft. From the fast tier a second path leads down to the slow
-  tier, taken when the latency deadline passes or the draft validator rejects a block.
-  Both tiers deliver into the same single stream the caller polls.</desc>
+  <desc id="spec-desc">A request first meets the complexity evaluator. A request the evaluator calls Slow goes straight to the slow tier. Otherwise it goes to the fast tier, which streams a draft. From the fast tier a second path leads down to the slow tier, taken when the latency deadline passes or the draft validator rejects a block. Both tiers deliver into the same single stream the caller polls.</desc>
   <defs>
     <marker id="spec-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -65,98 +59,57 @@ is already talking.
   <text class="t-sm t-end" x="324" y="108">or rejection</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>The evaluator runs once, before anything is sent.</b> The
-vertical path is checked on every poll of the fast tier's stream, so an
-escalation can land after the fast tier has already yielded blocks.</p>
+<p class="dgm-cap"><b>The evaluator runs once, before anything is sent.</b> The vertical path is checked while the fast tier streams, so an escalation can land after the fast tier has already yielded blocks.</p>
 </div>
 
-Trigger one runs before dispatch. Triggers two and three run mid-stream.
+The first trigger runs before dispatch: the evaluator calls the request `Slow` and the fast tier never starts. The other two run mid-stream: the latency deadline passes, or the validator rejects a draft block.
 
-## Classification is arithmetic, not a model call
+## Classification is arithmetic
 
-`ComplexityEvaluator::evaluate` reads three signals off the request and compares
-each to a threshold. Any one of them at or above its threshold routes to the
-slow tier:
+`ComplexityEvaluator::evaluate` reads three signals off the request. Any one at or above its threshold routes the turn to the slow tier.
 
-| Signal | What it counts | Default threshold |
+| Signal | What it counts | Default |
 |---|---|---|
-| `slow_tool_call_depth` | messages containing at least one `ToolCall` or `ToolResult` block | `1` |
-| `slow_input_tokens` | approximate tokens across every block, at four characters per token | `2_000` |
-| `slow_multi_file_threshold` | distinct path-like tokens in `Text` blocks, deduplicated per message | `3` |
+| `slow_tool_call_depth` | messages holding at least one `ToolCall` or `ToolResult` block | `1` |
+| `slow_input_tokens` | approximate tokens across all blocks | `2_000` |
+| `slow_multi_file_threshold` | distinct path-like tokens in `Text` blocks, deduplicated per message, summed over messages | `3` |
 
-A tool-call depth threshold of `1` means a single completed tool round trip is
-enough. That is aggressive on purpose: a turn that has already used a tool is a
-turn with structure to maintain, and the fast tier is the one more likely to
-break it.
+- Token estimates use four characters per token, floored, with a minimum of 1 per block. `Text`, `Thinking` and serialized `ToolCall` arguments are counted by characters. A `ToolResult` counts as 1 and an `ImageBase64` block as 0.
+- A tool depth of `1` means one tool round trip is enough. A turn that has used a tool has structure to maintain, and the fast tier is more likely to break it.
+- A token is path-like if it starts with `./` or `/`, or if its last dot suffix is one of 33 known source and config extensions. The list misclassifies: prose mentioning `README.md` counts as a file reference, and a real path with an unlisted extension does not.
 
-Path detection is a fixed list. A token counts if it starts with `./` or `/`, or
-if its final dot-suffix is one of thirty-three known source extensions. That
-list will misclassify. A prose sentence mentioning `README.md` counts as a file
-reference, and a real path with an unlisted extension does not.
+A model call to classify the request would be more accurate. It would also cost a model call, add latency to the decision meant to reduce latency, and make routing differ between runs. Arithmetic on the request is cheap, exact and reproducible in a test. The orchestrator uses `ComplexityEvaluator::default()`.
 
-Asking a model to classify the request would be more accurate and would also
-cost a model call, add latency to the decision meant to reduce latency, and make
-routing nondeterministic across runs. Arithmetic on the request is cheap, exact,
-and reproducible in a test. Three tests in the suite assert the boundary values
-directly, including that an 8000-character message lands exactly on the 2000
-token threshold.
+## The latency deadline
 
-## The latency deadline is checked, not enforced
+`latency_threshold_ms` is a deadline measured from the start of the fast tier's draft. The clock starts once and is never reset by a block arriving. The check runs when the fast stream returns `Pending`, and the comparison is strict: the swap fires when elapsed time is greater than the threshold.
 
-`latency_threshold_ms` is the budget the fast tier gets to produce its next
-block. The check happens when the fast stream returns `Pending`, and it is a
-strict comparison: the swap fires once elapsed time is greater than the
-threshold, not equal to it.
+Nothing cancels the fast tier mid-token and nothing retracts what it already sent. A caller can receive several fast-tier blocks and then, in the same stream, blocks from the slow tier. The slow tier continues from the working request, not from the partial answer. The stream stays one `AgentResponseStream`, and the tier change is not visible in the block types.
 
-The consequence is worth stating plainly. Nothing cancels the fast tier
-mid-token, and nothing retracts what it already sent. A caller can therefore
-receive several fast-tier blocks and then, in the same stream, blocks from the
-slow tier that continue from the original request rather than from the partial
-answer. The stream stays a single continuous `AgentResponseStream`, and the tier
-change is invisible in the block types.
+A fast tier that never returns `Pending` is never checked, so the deadline is a guard on stalls and not a cap on total time.
 
-The alternative would be buffering the fast tier's output until the deadline
-passes, then discarding it on a swap. That converts streaming into
-request-response for every turn, which defeats the reason a fast tier exists.
-Delivering what arrived is the honest trade, and the two swap reasons are
-recorded so the seam is auditable rather than silent.
+Buffering the fast output until the deadline and discarding it on a swap would turn every turn into request and response, which removes the reason to have a fast tier. Delivering what arrived is the trade the design makes. With a session store attached, each swap is recorded as `SessionEvent::ModelSwap` with the reason `latency_threshold` or `fallback_validation`.
 
-## The validator polices structure, not meaning
+## The validator checks structure
 
-The default `DraftValidator` is `JsonToolDraftValidator`, and it checks three
-things: a `ToolCall` must have a non-empty id, a `ToolCall` whose arguments are
-carried as a JSON text must parse, and a `Text` block that happens to be valid
-JSON must be a JSON object rather than a bare scalar.
+The orchestrator always uses `JsonToolDraftValidator`; it has no setter for another. The validator checks three things:
 
-That is all. It does not check the tool exists, that the arguments match a
-schema, or that the answer is correct. Semantic validation is a different job
-with a different owner: `plugin-guardrails` validates against JSON Schema, and
-`plugin-hitl` puts a human in the path. Overloading the draft validator with
-either would tie escalation to policy, and a policy failure would then be
-answered by "ask a bigger model", which is the wrong remedy.
+- A `ToolCall` must have a non-empty id and a non-empty name.
+- A `ToolCall` whose arguments arrive as a JSON string must parse.
+- A `Text` block that parses as JSON must be a JSON object, not a bare scalar.
 
-When a block is rejected and `fallback_on_tool_error` is set, the orchestrator
-appends the rejection to the working request as a tool result and re-routes to
-the slow tier. That budget is two cascades. On exhaustion, or with
-`fallback_on_tool_error` unset, the rejection surfaces as `CucaError::Provider`
-carrying the reason.
+It does not check that the tool exists, that the arguments match a schema, or that the answer is correct. Those belong to other tiers: `plugin-guardrails` validates against JSON Schema and `plugin-hitl` puts a human in the path. Tying escalation to policy would answer a policy failure with "ask a bigger model", which is the wrong remedy.
+
+Validation applies to blocks from both tiers. When a block is rejected and `fallback_on_tool_error` is set, the orchestrator appends the rejection to the working request as a `ToolResult` message and runs the slow tier again. For a rejected `ToolCall` the result carries that call's id. For any other block the id is empty.
+
+The budget is two cascades per turn, shared across both tiers. Once it is spent, or when `fallback_on_tool_error` is unset, the rejection reaches the caller as `CucaError::Provider` with the reason. Its `provider` is the fast tier's endpoint for a draft rejection and the slow tier's for a slow rejection.
 
 ## What has no default
 
-`SwappableModelPair` has no `Default` impl. All six fields, including both model
-ids, the latency threshold and the fallback switch, must be named by the caller.
-There is no defensible default for "which model is your fast one", and a wrong
-guess spends the caller's money on the wrong tier.
+`SwappableModelPair` has no `Default`. The caller names all six fields: `fast_provider`, `fast_model_id`, `slow_provider`, `slow_model_id`, `latency_threshold_ms` and `fallback_on_tool_error`. No default answers "which model is your fast one", and a wrong guess spends the caller's money on the wrong tier.
 
-`ComplexityEvaluator` does have defaults, and the orchestrator uses them.
+## The client pool
 
-## What the client pool holds
-
-Each tier resolves to a `CucaClient` from a `ClientPool`, keyed by provider and
-base URL. The pool is deliberately uncapped: one entry per distinct endpoint a
-caller configures, which is a small fixed number set by configuration rather
-than by traffic. `ClientPool::len` reports the count. That reasoning, and the
-rule it is an exception to, are in
-[Memory discipline](@/concepts/memory-discipline.md).
+Each tier resolves to a `CucaClient` from a `ClientPool`, keyed by provider and base URL. The pool has no cap. It holds one entry per distinct endpoint a caller configures, which configuration sets and traffic does not. `ClientPool::len` reports the count. [Memory discipline](@/concepts/memory-discipline.md) explains the exception.
 
 Next page: [Memory discipline](@/concepts/memory-discipline.md).

@@ -9,43 +9,32 @@ weight = 2
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>SseStreamParser</code> is protocol work only: it frames Server-Sent Events and refuses to know what any vendor puts inside them</dd>
+<dd><code>SseStreamParser</code> does protocol work only: it frames Server-Sent Events and knows nothing about what a vendor puts inside them</dd>
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You expected the parser to hand you content blocks, or you want to know what its memory is a function of</dd>
+<dd>You expected the parser to hand you content blocks, or you want to know what its memory depends on</dd>
 </dl>
 
-The design specification gives the parser this signature:
+`SseStreamParser` turns bytes into SSE frames. Its one public method takes a chunk of bytes and returns the frames that chunk completed.
 
-```rust,name=The specified signature
-fn feed_chunk(&mut self, chunk: &[u8]) -> Vec<MessageContentBlock>;
-```
-
-The implementation returns something else:
-
-```rust,name=src/sse.rs line 113
+```rust,name=src/sse.rs
 pub fn feed_chunk(&mut self, chunk: &[u8]) -> Result<Vec<SseEvent>, CucaError>
 ```
 
-The deviation is deliberate and it is the most consequential boundary in the
-crate.
+The return type is `SseEvent`, not `MessageContentBlock`. That boundary is the most consequential one in the crate.
 
 ## Why events and not blocks
 
-Returning `MessageContentBlock` would mean the parser decides what a chunk of
-vendor JSON means. Those meanings do not agree. Anthropic sends
-`content_block_delta` frames inside an explicit
-`content_block_start` and `content_block_stop` envelope. OpenAI-compatible
-servers send `choices[0].delta`, with tool-call arguments arriving as string
-fragments that must be concatenated and then parsed. Gemini sends `parts`, some
-flagged `"thought": true`, and never sends a `[DONE]` marker at all.
+A parser that returned `MessageContentBlock` would have to decide what each vendor's JSON means, and the vendors disagree.
 
-A parser that understood all three would carry three vendor vocabularies, and
-adding a fourth backend would mean editing the parser. Instead the parser
-produces `SseEvent`, which is exactly the wire format's own vocabulary:
+- Anthropic sends `content_block_delta` frames between an explicit `content_block_start` and `content_block_stop`.
+- OpenAI-compatible servers send `choices[0].delta`, with tool-call arguments arriving as string fragments that must be joined and then parsed.
+- Gemini sends `parts`, some flagged `"thought": true`, and never sends a `[DONE]` marker.
 
-```rust,name=src/sse.rs lines 71 to 81
+A parser that understood all three would carry three vendor vocabularies, and a fourth backend would mean editing it. The parser instead produces `SseEvent`, which uses the wire format's own vocabulary.
+
+```rust,name=src/sse.rs
 pub struct SseEvent {
     pub event: String,
     pub data: String,
@@ -54,57 +43,41 @@ pub struct SseEvent {
 }
 ```
 
-Translation lives in the adapter that already owns that vendor's request body.
-Nothing else has to change to add a backend, and the state machine stays
-testable on its own, against SSE framing rather than against a provider.
+Translation lives in the adapter that already owns that vendor's request body. Adding a backend changes nothing else, and the state machine is tested against SSE framing alone.
 
-The cost is one extra hop: every adapter carries a translator. Five of the seven
-share one, `openai_compat`, so the real count is three translators for seven
-backends.
+The cost is one translator per wire shape. Four exist:
+
+- `ChatCompletionTranslator` serves OpenAI, vLLM, LM Studio, DeepSeek's native route and llama.cpp's chat route.
+- `AnthropicTranslator` serves Anthropic and DeepSeek's bridge route.
+- `GeminiTranslator` serves Gemini.
+- `CompletionTranslator` serves llama.cpp's native `/completion` route.
+
+The in-process `provider-local` engine produces blocks directly and does not use the parser.
 
 ## What the parser does with a chunk
 
-One reusable `bytes::BytesMut` buffer, one copy in, then a cursor walk. A scan
-cursor advances line by line with `memchr`, a preceding carriage return is
-stripped for CRLF tolerance, and a line is `field: value` with the colon
-required and one following space trimmed. Four fields are recognised: `event`,
-`data`, `id`, `retry`.
+The parser keeps one reusable `bytes::BytesMut` buffer. A chunk is copied in once, then a cursor walks it.
 
-`data` lines accumulate inside that same buffer. A blank line ends the frame,
-which is then parsed from the buffer slice, joined with newlines, and advanced
-away. A partial trailing line stays put until a later chunk completes it, so
-chunk boundaries never need special handling: arbitrary TCP splitting is the
-normal case, not an edge case.
+- The cursor advances line by line with `memchr`. A preceding carriage return is stripped, so CRLF and LF both work.
+- A line is `field: value`. The colon is required and one following space is trimmed. Four fields are recognised: `event`, `data`, `id` and `retry`.
+- A line starting with a colon is a comment and is ignored. Unknown fields are ignored.
+- `data` lines accumulate in the buffer. A blank line ends the frame, which is parsed from the buffer slice, joined with newlines and advanced away.
+- A partial trailing line stays in the buffer until a later chunk completes it, so arbitrary TCP chunk boundaries need no special handling.
 
-Unknown fields are ignored, for forward compatibility. A line starting with a
-colon is a comment and ignored. A malformed `retry` value stays `None` and is
-never fatal, because a reconnection hint is not worth failing a stream over.
+A frame with no `event` field gets the event name `message`. A non-empty `id` without a NUL byte updates `last_event_id`, and a frame without its own `id` inherits that value. A malformed `retry` stays `None` and never fails the stream.
 
-## What its memory is a function of
+Allocation per completed frame is the `data` string, the `event` string, and the `id` string only on a stream that carries `id:` fields.
 
-Not the number of chunks, and not the length of the stream. Each completed frame
-is advanced away, and the buffer reclaims that offset in place rather than
-reallocating. The high-water mark is the largest single frame plus one partial
-trailing line.
+## What its memory depends on
 
-The buffer starts at 8192 bytes of capacity and `capacity()` reports the current
-figure. There is no maximum, and one case makes it grow without limit: a server
-that opens a frame and never terminates it with a blank line. That frame cannot
-be dispatched until the blank line arrives, which is the SSE wire format's own
-rule rather than a decision the parser is free to make. Truncating the frame
-would hand the adapter a half-parsed JSON body, and failing the stream on a
-threshold would break any server that legitimately sends a large frame.
+The buffer's size does not depend on the number of chunks or the length of the stream. Each completed frame is advanced away, and the buffer reclaims that offset in place instead of reallocating. The high-water mark is the largest single frame plus one partial trailing line.
 
-This is the one growable structure in the crate whose bound is set by the peer
-rather than by configuration, which is why it is called out here and in
-[Memory discipline](@/concepts/memory-discipline.md) rather than left implicit.
+The buffer starts at 8192 bytes, and `capacity()` reports the current figure. There is no maximum. A server that opens a frame and never ends it with a blank line makes the buffer grow without limit, because the frame cannot be dispatched until the blank line arrives. That is the SSE wire format's own rule.
+
+Truncating the frame would hand the adapter half a JSON body. Failing the stream at a threshold would break any server that legitimately sends a large frame. This is the one growable structure whose bound the peer sets instead of configuration, so [Memory discipline](@/concepts/memory-discipline.md) lists it as an uncapped structure.
 
 ## The one error
 
-`feed_chunk` returns `Result`, and there is exactly one thing it fails on: a
-completed frame whose `data`, `event` or `id` bytes are not valid UTF-8, which
-becomes `CucaError::SseParse`. Partial lines are never validated, because a
-multi-byte character split across two chunks is not an error, it is Tuesday.
+`feed_chunk` fails on exactly one condition: a completed frame whose `data`, `event` or `id` bytes are not valid UTF-8. The error is `CucaError::SseParse`. Partial lines are never validated, so a multi-byte character split across two chunks is not an error.
 
-Next page: [Plugins and services](@/concepts/plugin-layering.md), which covers
-the two stages of the pipeline the parser never sees.
+Next page: [Plugins and services](@/concepts/plugin-layering.md).

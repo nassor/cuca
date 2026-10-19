@@ -9,78 +9,62 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Choose the provider feature by protocol, not by vendor name, then override the base URL on the builder</dd>
+<dd>Enable the provider feature whose protocol your server speaks, then set the base URL on the builder</dd>
 <dt>You need</dt>
 <dd>A running server that mounts <code>/chat/completions</code>, and its base URL</dd>
 <dt>Read this if</dt>
-<dd>Your backend is Ollama, a self-hosted vLLM, LM Studio, a corporate gateway, or anything else that speaks the OpenAI protocol</dd>
+<dd>Your backend is a self-hosted vLLM or LM Studio, a corporate gateway, or any other server that speaks the OpenAI chat protocol</dd>
 </dl>
 
-Five of the seven adapters share one wire protocol, so switching between servers
-that speak it is a feature flag and a base URL. Nothing about the request,
-the stream, or your consuming code changes.
+Goal: stream one reply from a server that is not the bundled llama.cpp default, with no change to your request or consuming code.
 
-## Step 1: decide which feature your target speaks
+Five of the seven HTTP adapters share one wire protocol, so the switch is a feature flag and a base URL. Anthropic and Gemini speak their own protocols; see [Providers](@/providers/_index.md).
 
-The choice is about protocol and defaults, not branding. All five options below
-post the same body to the same route.
+## Step 1: choose the feature
 
-| Your server | Feature | Why this one |
+Pick by the protocol and default URL your server matches. All five features post the same request body to `{base_url}/chat/completions`.
+
+| Your server | Feature | Default base URL |
 |---|---|---|
-| A hosted OpenAI-compatible API | `provider-openai` | its default base URL is the public API, and no local port is assumed |
-| vLLM | `provider-vllm` | default `http://127.0.0.1:8000/v1`, and the key is treated as optional |
-| LM Studio | `provider-lmstudio` | default `http://127.0.0.1:1234/v1`, key optional |
-| `llama-server` from llama.cpp | `provider-llamacpp` | default `http://127.0.0.1:8080`, and the chat route appends `/v1` for you |
-| Anything else OpenAI-compatible, including Ollama and gateways | any of the above | pick by which default is closest; you are overriding the base URL regardless |
+| A hosted OpenAI-compatible API | `provider-openai` | `https://api.openai.com/v1` |
+| DeepSeek native API | `provider-deepseek` | `https://api.deepseek.com/v1` |
+| vLLM | `provider-vllm` | `http://127.0.0.1:8000/v1` |
+| LM Studio | `provider-lmstudio` | `http://127.0.0.1:1234/v1` |
+| `llama-server` from llama.cpp | `provider-llamacpp` | `http://127.0.0.1:8080` |
 
-If your backend does not speak the OpenAI protocol, this guide is the wrong one.
-Anthropic and Gemini have their own adapters, listed in
-[Providers](@/providers/_index.md).
+For any other server or gateway, use the feature with the closest default. You override the base URL in step 2 anyway.
 
-## Step 2: find out whether your base URL needs `/v1`
+Add the crate with the feature. The crate has no default provider, so the feature is required.
 
-The shared adapter builds the request URL by appending to whatever you give it:
+Linux and macOS:
+
+```bash
+cargo add cuca --path /path/to/cuca --features provider-vllm
+```
+
+Windows (PowerShell):
+
+```powershell
+cargo add cuca --path C:\path\to\cuca --features provider-vllm
+```
+
+Result: `cargo add` prints `Adding cuca (local) to dependencies`, then the feature list with `+ provider-vllm` enabled. With the feature off, `generate_stream` fails with `provider feature not enabled: provider-vllm`.
+
+## Step 2: set the base URL and find the model id
+
+For `provider-openai`, `provider-deepseek`, `provider-vllm` and `provider-lmstudio`, the adapter builds the route by appending to the base URL:
 
 ```text,name=How the route is assembled
 {base_url with trailing slash trimmed}/chat/completions
 ```
 
-So the base URL must already include every path segment before
-`/chat/completions`. Most OpenAI-compatible servers mount it under `/v1`, which
-means the base URL ends in `/v1`.
+The base URL must already include every path segment before `/chat/completions`. Most servers mount the route under `/v1`, so the base URL ends in `/v1`.
 
-`provider-llamacpp` is the one exception: on its chat route it appends `/v1`
-itself when the resolved base URL does not already end in it. Passing
-`http://127.0.0.1:1234` and `http://127.0.0.1:1234/v1` both work there, and only
-there.
+`provider-llamacpp` is the exception. On its chat route it appends `/v1` when the base URL does not already end in it, so `http://127.0.0.1:1234` and `http://127.0.0.1:1234/v1` both work there.
 
-## Step 3: build the client
+A DeepSeek base URL that contains `api.deepseek.com/anthropic` or ends in `/anthropic` selects the Anthropic bridge instead, and that route requires an API key.
 
-```rust,name=The two calls that matter
-use cuca::CucaClient;
-use cuca::types::ProviderEndpoint;
-
-let client = CucaClient::builder()
-    .with_provider(ProviderEndpoint::Vllm)
-    .with_base_url("http://10.0.0.7:8000/v1")
-    .build()?;
-```
-
-If your server wants a key, add `.with_api_key("...")`, which becomes an
-`Authorization: Bearer` header. If it does not, leave it out: the header is only
-attached when a key is configured, so an unauthenticated local server needs no
-placeholder value.
-
-`with_provider` is not optional. `build()` fails without it:
-
-```text,name=CucaError::Config when with_provider was never called
-configuration error: no provider selected; call with_provider before build
-```
-
-## Step 4: confirm the model id
-
-The request carries a model id, and the server decides whether it recognises it.
-Ask the server rather than guessing.
+Ask the server which model ids it serves.
 
 Linux and macOS:
 
@@ -94,12 +78,33 @@ Windows (PowerShell), where `curl` is an alias for `Invoke-WebRequest`:
 curl.exe http://10.0.0.7:8000/v1/models
 ```
 
-Use one of the `id` values from the response in `UnifiedRequest::new`.
+Result: a JSON list. Each `id` value is a model id you can put in `UnifiedRequest::new`.
 
-## Step 5: verify before wiring it into your code
+## Step 3: build the client
 
-The bundled examples read `CUCA_BASE_URL` and `CUCA_MODEL`, so they double as a
-connectivity check for any OpenAI-compatible endpoint.
+```rust,name=The two builder calls that matter
+use cuca::CucaClient;
+use cuca::types::ProviderEndpoint;
+
+let client = CucaClient::builder()
+    .with_provider(ProviderEndpoint::Vllm)
+    .with_base_url("http://10.0.0.7:8000/v1")
+    .build()?;
+```
+
+If the server wants a key, add `.with_api_key("...")`. It becomes an `Authorization: Bearer` header. With no key the header is not sent, so an unauthenticated local server needs no placeholder.
+
+`with_provider` is required. Without it `build()` fails:
+
+```text,name=CucaError::Config when with_provider was never called
+configuration error: no provider selected; call with_provider before build
+```
+
+Result: `build()` returns `Ok(client)`.
+
+## Step 4: verify with a bundled example
+
+The examples read `CUCA_BASE_URL` and `CUCA_MODEL`, so they check any OpenAI-compatible endpoint. They always use the llama.cpp chat route, which appends `/v1` to a base URL that does not end in it. A server that mounts `/chat/completions` somewhere other than `/v1` cannot be checked this way; run your own client from step 3 instead.
 
 Linux and macOS:
 
@@ -108,33 +113,31 @@ CUCA_BASE_URL=http://10.0.0.7:8000/v1 CUCA_MODEL=your-model-id \
   cargo run --example llamacpp_gemma --features provider-llamacpp
 ```
 
-Windows (PowerShell), where assignments are separate statements joined by `;`:
+Windows (PowerShell), where each assignment is a statement and `;` joins them:
 
 ```powershell
 $env:CUCA_BASE_URL = "http://10.0.0.7:8000/v1"; $env:CUCA_MODEL = "your-model-id"; cargo run --example llamacpp_gemma --features provider-llamacpp
 ```
 
-Text on stdout means the endpoint, the model id and the protocol all agree. A
-`CucaError::Http` with a status and a body means you reached a server and it
-refused; the body carries its reason. The bundled examples report an
-unreachable address instead of failing: they print `No server answered at
-<base URL>` and exit successfully, so an exit code of `0` with that line means
-nothing answered.
+The `$env:` assignments last for the PowerShell session. Clear them with `Remove-Item Env:CUCA_BASE_URL, Env:CUCA_MODEL`.
 
-Those two variables affect the examples and the test harness only. No code under
-`src/` reads any environment variable, so your own client passes its base URL to
-the builder.
+Result: the reply text prints on stdout. That means the endpoint, the model id and the protocol agree. A reasoning model prints nothing while it thinks, because the example prints `Text` blocks only.
 
-## If you were reaching for `ProviderEndpoint::Custom`
+If `generate_stream` fails, the example prints `No server answered at <base URL>: <error>` and exits with code 0. The error text distinguishes the causes:
 
-It exists, it takes a `String`, and dispatching it always fails:
+- `HTTP error <status>: <body>` means a server answered and refused; the body carries its reason.
+- `transport failure: ...` means nothing answered at that address.
+
+The two variables affect the examples and the test harness only. A client you write passes its base URL to the builder; the variables are listed in [Environment variables](@/reference/environment.md).
+
+## If you used ProviderEndpoint::Custom
+
+`Custom` takes a `String`, and dispatching it always fails:
 
 ```text,name=CucaError::Config from the Custom arm
 configuration error: custom endpoints require a registered adapter
 ```
 
-`Custom` is a label for a gateway, not a protocol. Selecting the feature whose
-protocol your gateway actually speaks and overriding the base URL is the working
-route, which is steps 1 through 3 above.
+Select the feature whose protocol your gateway speaks and set the base URL, as in steps 1 to 3.
 
 Next page: [Write a custom plugin](@/guides/custom-plugin.md).
