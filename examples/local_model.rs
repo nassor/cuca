@@ -1,20 +1,23 @@
-//! Run Gemma 4 in-process on the CPU or a GPU: no server, no HTTP endpoint.
+//! Run a GGUF language model in-process on the CPU or a GPU: no server, no HTTP
+//! endpoint.
 //!
 //! One `LocalModel` downloads (once) and loads the model; one client routes a
-//! request to it and streams the reply. The default is E2B Q4_0; the
-//! environment selects another checkpoint (see Configuration).
+//! request to it and streams the reply. The default is Gemma 4 E2B Q4_0; the
+//! environment selects any verified preset (Gemma 3/4, Qwen 2.5/3, Llama 3.2,
+//! SmolLM 3, Phi 3.5/4, DeepSeek-R1-Distill-Qwen, Granite 3 MoE) or any other
+//! GGUF file of a supported architecture (see Configuration).
 //!
 //! # Prerequisites
 //!
 //! - A checkout of this repository (the example builds from this crate).
 //! - Disk for the one-time download of the GGUF file: 2.84 GB for the default
-//!   E2B Q4_0 (`ggml-org/gemma-4-E2B-it-GGUF`, SHA-256 verified), up to
-//!   8.03 GB for E4B Q8_0. RAM (device memory on a GPU) is about the file
-//!   size minus the per-layer embedding table, plus the KV cache: roughly
-//!   1.5 GB plus 302 MB at the
-//!   default 8192 context for E2B Q4_0 (`context_length * 36,864` bytes; the
-//!   general formula is on `LocalModel`). See "Choosing a model" in the
-//!   local-provider docs page for every preset.
+//!   (`ggml-org/gemma-4-E2B-it-GGUF`, SHA-256 verified), from 0.29 GB
+//!   (`gemma3-270m-q8_0`) to 8.03 GB (`gemma4-e4b-q8_0`) for the presets. RAM
+//!   (device memory on a GPU) is about the file size (Gemma 4 keeps its
+//!   per-layer embedding table on disk) plus the KV cache, which
+//!   `LocalModel::kv_cache_bytes` reports (the general formula is on
+//!   `LocalModel`). See "Choosing a model" in the local-provider docs page
+//!   for every preset.
 //!
 //! # Run
 //!
@@ -22,20 +25,27 @@
 //! host CPU:
 //!
 //! ```sh
-//! RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_gemma --features provider-local
-//! CUCA_LOCAL_MODEL=gemma4-e4b-q4_0 RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_gemma --features provider-local
-//! CUCA_LOCAL_DEVICE=vulkan cargo run --release --example local_gemma --features provider-local-vulkan
+//! RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local
+//! CUCA_LOCAL_MODEL=qwen3-0.6b-q8_0 RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local
+//! CUCA_LOCAL_DEVICE=vulkan cargo run --release --example local_model --features provider-local-vulkan
 //! ```
 //!
 //! # Configuration
 //!
 //! - `CUCA_LOCAL_MODEL_PATH`: path of an already downloaded GGUF file (any
-//!   dense `gemma4` checkpoint); skips the download and wins over
+//!   supported architecture); skips the download and wins over
 //!   `CUCA_LOCAL_MODEL`.
-//! - `CUCA_LOCAL_MODEL`: what to download: a preset name (`gemma4-e2b-q4_0`,
-//!   `gemma4-e2b-q8_0`, `gemma4-e4b-q4_0`, `gemma4-e4b-q8_0`, ASCII
-//!   case-insensitive) or an unverified `repo:revision:file` on Hugging Face.
-//!   Default: `gemma4-e2b-q4_0`.
+//! - `CUCA_LOCAL_MODEL`: what to download: a preset name from
+//!   `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`,
+//!   `llama3.2-1b-q4_0`; ASCII case-insensitive) or an unverified
+//!   `repo:revision:file` on Hugging Face. Default: `gemma4-e2b-q4_0`.
+//! - `CUCA_LOCAL_DRAFTER`: a preset name, `in-trunk`, or `CUCA_LOCAL_DRAFTER_PATH`,
+//!   a path, enabling self-speculative decoding on the CPU; the acceptance
+//!   counters print at the end. A preset or path is the separate
+//!   multi-token-prediction drafter of a Gemma 4 model (`gemma4-e2b-mtp-f16`);
+//!   `in-trunk` uses the prediction head inside the model's own file, which a
+//!   Qwen 3.5 `*-MTP` GGUF carries (for example
+//!   `unsloth/Qwen3.5-0.8B-MTP-GGUF`; set `CUCA_LOCAL_MODEL_PATH` to it).
 //! - `CUCA_LOCAL_DEVICE`: where the model runs: `cpu` (default), `vulkan`,
 //!   `vulkan:<n>`, `metal`, `cuda[:<n>]` or `rocm[:<n>]` (see `LocalDevice`).
 //!   A GPU needs its feature, e.g. `--features provider-local-vulkan`.
@@ -47,22 +57,22 @@
 //!
 //! The download progress goes to stderr, then `loaded on <device>`; the reply
 //! prints to stdout as its blocks arrive. Reasoning (`Thinking`) blocks print
-//! dimmed after a `[thinking]` prefix, then the answer follows as plain text.
-//! The reply depends on the model and the sampling seed.
+//! dimmed after a `[thinking]` prefix when the model reasons, then the answer
+//! follows as plain text. The reply depends on the model and the sampling
+//! seed.
 //!
 //! The first run waits for the download and the load; later runs only load.
-//! On the CPU generation is CPU-bound: on one development machine (release
-//! build, `target-cpu=native`) decoding ran at roughly 17 tokens per second
-//! and prefill at roughly 60; expect different figures on other CPUs. On a
-//! GPU the first request is slow while CubeCL autotunes and compiles its
-//! kernels.
+//! On the CPU generation is CPU-bound: figures vary with the model and the
+//! machine (see the local-provider docs page). On a GPU the first request is
+//! slow while CubeCL autotunes and compiles its kernels.
 
 use std::io::{Write, stdout};
 use std::path::PathBuf;
 
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{
-    CucaClient, DownloadProgressCallback, LocalModel, LocalModelConfig, ModelSource, UnifiedRequest,
+    CucaClient, DownloadProgressCallback, DrafterSource, LocalModel, LocalModelConfig, ModelSource,
+    UnifiedRequest,
 };
 use tokio_stream::StreamExt;
 
@@ -88,6 +98,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         config.source = name.parse()?;
     }
+    if let Some(path) = std::env::var_os("CUCA_LOCAL_DRAFTER_PATH") {
+        config.drafter = Some(ModelSource::File(PathBuf::from(path)).into());
+    } else if let Ok(name) = std::env::var("CUCA_LOCAL_DRAFTER")
+        && !name.is_empty()
+    {
+        config.drafter = Some(if name.eq_ignore_ascii_case("in-trunk") {
+            DrafterSource::InTrunk
+        } else {
+            name.parse::<ModelSource>()?.into()
+        });
+    }
     if let Ok(device) = std::env::var("CUCA_LOCAL_DEVICE")
         && !device.is_empty()
     {
@@ -95,6 +116,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let device = config.device;
     let model = LocalModel::load(config).await?;
+    let stats_handle = model.clone();
     eprintln!();
     eprintln!("loaded on {device:?}");
 
@@ -105,9 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_local_model(model)
         .build()?;
 
-    // Stage 3: build the request. Thinking is on, so the stream carries
-    // `Thinking` blocks ahead of the answer.
-    let request = UnifiedRequest::new("gemma-4-it")
+    // Stage 3: build the request. Thinking is on, so a model that reasons
+    // streams `Thinking` blocks ahead of the answer.
+    let request = UnifiedRequest::new("local")
         .add_system_message("You are concise.")
         .add_user_message("Explain CUCA in one sentence.")
         .enable_thinking(None)
@@ -137,5 +159,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout().flush()?;
     }
     println!();
+    let stats = stats_handle.draft_stats();
+    if let Some(rate) = stats.acceptance_rate() {
+        eprintln!(
+            "drafter: {} of {} drafted tokens accepted ({:.0}%) in {} rounds",
+            stats.accepted,
+            stats.drafted,
+            rate * 100.0,
+            stats.rounds
+        );
+    }
     Ok(())
 }

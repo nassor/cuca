@@ -39,7 +39,7 @@ that `cargo check --no-default-features` fails.
 | `provider-llamacpp` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-vllm` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-lmstudio` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-local` | `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:tokio`, `reqwest/rustls` |
+| `provider-local` | `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:tokio`, `dep:unicode-general-category`, `reqwest/rustls` |
 | `provider-local-gpu` | `provider-local`, `dep:burn` |
 | `provider-local-vulkan` | `provider-local-gpu`, `burn/vulkan` |
 | `provider-local-metal` | `provider-local-gpu`, `burn/metal` |
@@ -128,6 +128,7 @@ wire types, the SSE parser and the response stream contract.
 | `half` | `2` | default | `provider-local` |
 | `minijinja` | `2.24` | `loader` | `provider-local` |
 | `minijinja-contrib` | `2.24` | `pycompat` | `provider-local` |
+| `unicode-general-category` | `1` | default | `provider-local` (the byte-level BPE pre-tokenizers) |
 | `burn` | `0.22` | `std`, `fusion`, `autotune`; `default-features = false` | `provider-local-gpu` (backends: `burn/vulkan`, `burn/metal`, `burn/cuda`, `burn/rocm`) |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only

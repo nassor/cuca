@@ -62,7 +62,7 @@ Types reachable through `cuca::types` rather than the crate root:
 
 | Gate | Items |
 |---|---|
-| `provider-local` | `DownloadProgress`, `DownloadProgressCallback`, `Gemma4Quant`, `Gemma4Variant`, `GpuAdapter`, `LocalDevice`, `LocalModel`, `LocalModelConfig`, `ModelSource`, `SamplingConfig` |
+| `provider-local` | `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalModel`, `LocalModelConfig`, `ModelPreset`, `ModelSource`, `SamplingConfig` |
 | `plugin-cost` | `CostConfig`, `CostEntry`, `CostObserver`, `CostPlugin`, `CostUsage`, `ModelRates`, `PricingResolver`, `PricingTable`, `UnpricedModelPolicy` |
 | `plugin-guardrails` | `JsonGuardrailPlugin` |
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |

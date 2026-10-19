@@ -1,0 +1,185 @@
+{
+ "multi_turn": {
+  "enable_thinking": false,
+  "messages": [
+   {
+    "content": "You are a calculator.",
+    "role": "system"
+   },
+   {
+    "content": "What is 2+2?",
+    "role": "user"
+   },
+   {
+    "content": "It is 4.",
+    "role": "assistant"
+   },
+   {
+    "content": "And 3+3?",
+    "role": "user"
+   },
+   {
+    "content": "6.",
+    "role": "assistant"
+   },
+   {
+    "content": "Thanks!",
+    "role": "user"
+   }
+  ]
+ },
+ "plain": {
+  "enable_thinking": false,
+  "messages": [
+   {
+    "content": "Hello",
+    "role": "user"
+   }
+  ]
+ },
+ "system_user": {
+  "enable_thinking": false,
+  "messages": [
+   {
+    "content": "You are concise.",
+    "role": "system"
+   },
+   {
+    "content": "Hello",
+    "role": "user"
+   }
+  ]
+ },
+ "thinking_off": {
+  "enable_thinking": false,
+  "messages": [
+   {
+    "content": "Reason carefully.",
+    "role": "system"
+   },
+   {
+    "content": "Is 17 prime?",
+    "role": "user"
+   }
+  ]
+ },
+ "thinking_on": {
+  "enable_thinking": true,
+  "messages": [
+   {
+    "content": "Reason carefully.",
+    "role": "system"
+   },
+   {
+    "content": "Is 17 prime?",
+    "role": "user"
+   }
+  ]
+ },
+ "tool_round_trip": {
+  "enable_thinking": false,
+  "messages": [
+   {
+    "content": "What is the weather in Paris?",
+    "role": "user"
+   },
+   {
+    "content": "",
+    "role": "assistant",
+    "tool_calls": [
+     {
+      "function": {
+       "arguments": {
+        "city": "Paris",
+        "days": 3,
+        "metric": true,
+        "tags": [
+         "a",
+         "b"
+        ]
+       },
+       "name": "get_weather"
+      },
+      "id": "call_1",
+      "type": "function"
+     }
+    ]
+   },
+   {
+    "content": "{\"temp\":18}",
+    "name": "get_weather",
+    "role": "tool",
+    "tool_call_id": "call_1"
+   }
+  ],
+  "tools": [
+   {
+    "function": {
+     "description": "Look up the current weather",
+     "name": "get_weather",
+     "parameters": {
+      "properties": {
+       "city": {
+        "description": "City name",
+        "type": "string"
+       },
+       "unit": {
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ],
+      "type": "object"
+     }
+    },
+    "type": "function"
+   }
+  ]
+ },
+ "tools_declared": {
+  "enable_thinking": true,
+  "messages": [
+   {
+    "content": "Be brief.",
+    "role": "system"
+   },
+   {
+    "content": "What is the weather in Paris?",
+    "role": "user"
+   }
+  ],
+  "tools": [
+   {
+    "function": {
+     "description": "Look up the current weather",
+     "name": "get_weather",
+     "parameters": {
+      "properties": {
+       "city": {
+        "description": "City name",
+        "type": "string"
+       },
+       "unit": {
+        "enum": [
+         "celsius",
+         "fahrenheit"
+        ],
+        "type": "string"
+       }
+      },
+      "required": [
+       "city"
+      ],
+      "type": "object"
+     }
+    },
+    "type": "function"
+   }
+  ]
+ }
+}

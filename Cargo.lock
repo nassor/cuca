@@ -2569,6 +2569,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tracing",
+ "unicode-general-category",
  "wasmtime",
  "wide",
 ]

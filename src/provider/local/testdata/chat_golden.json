@@ -1,0 +1,188 @@
+{
+ "gemma3-1b": {
+  "bos": "<bos>",
+  "eos": "<end_of_turn>",
+  "renders": {
+   "multi_turn": "<bos><start_of_turn>user\nYou are a calculator.\n\nWhat is 2+2?<end_of_turn>\n<start_of_turn>model\nIt is 4.<end_of_turn>\n<start_of_turn>user\nAnd 3+3?<end_of_turn>\n<start_of_turn>model\n6.<end_of_turn>\n<start_of_turn>user\nThanks!<end_of_turn>\n<start_of_turn>model\n",
+   "plain": "<bos><start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\n",
+   "system_user": "<bos><start_of_turn>user\nYou are concise.\n\nHello<end_of_turn>\n<start_of_turn>model\n",
+   "thinking_off": "<bos><start_of_turn>user\nReason carefully.\n\nIs 17 prime?<end_of_turn>\n<start_of_turn>model\n",
+   "thinking_on": "<bos><start_of_turn>user\nReason carefully.\n\nIs 17 prime?<end_of_turn>\n<start_of_turn>model\n",
+   "tool_round_trip": {
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+   },
+   "tools_declared": "<bos><start_of_turn>user\nBe brief.\n\nWhat is the weather in Paris?<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "template": "gemma3-1b"
+ },
+ "gemma3-270m": {
+  "bos": "<bos>",
+  "eos": "<eos>",
+  "renders": {
+   "multi_turn": "<bos><start_of_turn>user\nYou are a calculator.\n\nWhat is 2+2?<end_of_turn>\n<start_of_turn>model\nIt is 4.<end_of_turn>\n<start_of_turn>user\nAnd 3+3?<end_of_turn>\n<start_of_turn>model\n6.<end_of_turn>\n<start_of_turn>user\nThanks!<end_of_turn>\n<start_of_turn>model\n",
+   "plain": "<bos><start_of_turn>user\nHello<end_of_turn>\n<start_of_turn>model\n",
+   "system_user": "<bos><start_of_turn>user\nYou are concise.\n\nHello<end_of_turn>\n<start_of_turn>model\n",
+   "thinking_off": "<bos><start_of_turn>user\nReason carefully.\n\nIs 17 prime?<end_of_turn>\n<start_of_turn>model\n",
+   "thinking_on": "<bos><start_of_turn>user\nReason carefully.\n\nIs 17 prime?<end_of_turn>\n<start_of_turn>model\n",
+   "tool_round_trip": {
+    "error": "Conversation roles must alternate user/assistant/user/assistant/..."
+   },
+   "tools_declared": "<bos><start_of_turn>user\nBe brief.\n\nWhat is the weather in Paris?<end_of_turn>\n<start_of_turn>model\n"
+  },
+  "template": "gemma3-1b"
+ },
+ "gemma4": {
+  "bos": "<bos>",
+  "eos": "<eos>",
+  "renders": {
+   "multi_turn": "<bos><|turn>system\nYou are a calculator.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\nIt is 4.<turn|>\n<|turn>user\nAnd 3+3?<turn|>\n<|turn>model\n6.<turn|>\n<|turn>user\nThanks!<turn|>\n<|turn>model\n",
+   "plain": "<bos><|turn>user\nHello<turn|>\n<|turn>model\n",
+   "system_user": "<bos><|turn>system\nYou are concise.<turn|>\n<|turn>user\nHello<turn|>\n<|turn>model\n",
+   "thinking_off": "<bos><|turn>system\nReason carefully.<turn|>\n<|turn>user\nIs 17 prime?<turn|>\n<|turn>model\n",
+   "thinking_on": "<bos><|turn>system\n<|think|>\nReason carefully.<turn|>\n<|turn>user\nIs 17 prime?<turn|>\n<|turn>model\n",
+   "tool_round_trip": "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Look up the current weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,metric:true,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>]}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\":18}<|\"|>}<tool_response|>",
+   "tools_declared": "<bos><|turn>system\n<|think|>\nBe brief.<|tool>declaration:get_weather{description:<|\"|>Look up the current weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n"
+  },
+  "template": "gemma4"
+ },
+ "granite33": {
+  "bos": "<|end_of_text|>",
+  "eos": "<|end_of_text|>",
+  "renders": {
+   "multi_turn": "<|start_of_role|>system<|end_of_role|>You are a calculator.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What is 2+2?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>It is 4.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>And 3+3?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>6.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Thanks!<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "plain": "<|start_of_role|>system<|end_of_role|> Knowledge Cutoff Date: April 2024.\n Today's Date: October 18, 2026. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Hello<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "system_user": "<|start_of_role|>system<|end_of_role|>You are concise.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Hello<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "thinking_off": "<|start_of_role|>system<|end_of_role|>Reason carefully.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Is 17 prime?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "thinking_on": "<|start_of_role|>system<|end_of_role|>Reason carefully.<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>Is 17 prime?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "tool_round_trip": "<|start_of_role|>system<|end_of_role|> Knowledge Cutoff Date: April 2024.\n Today's Date: October 18, 2026. You are Granite, developed by IBM. You are a helpful assistant with access to the following tools. When a tool is required to answer the user's query, respond only with <|tool_call|> followed by a JSON list of tools used. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Look up the current weather\",\n            \"parameters\": {\n                \"properties\": {\n                    \"city\": {\n                        \"description\": \"City name\",\n                        \"type\": \"string\"\n                    },\n                    \"unit\": {\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ],\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ],\n                \"type\": \"object\"\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|><|end_of_text|>\n<|start_of_role|>tool<|end_of_role|>{\"temp\":18}<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>",
+   "tools_declared": "<|start_of_role|>system<|end_of_role|>Be brief.<|end_of_text|>\n<|start_of_role|>available_tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Look up the current weather\",\n            \"parameters\": {\n                \"properties\": {\n                    \"city\": {\n                        \"description\": \"City name\",\n                        \"type\": \"string\"\n                    },\n                    \"unit\": {\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ],\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ],\n                \"type\": \"object\"\n            }\n        }\n    }\n]<|end_of_text|>\n<|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|>\n<|start_of_role|>assistant<|end_of_role|>"
+  },
+  "template": "granite33"
+ },
+ "granitemoe": {
+  "bos": "<|end_of_text|>",
+  "eos": "<|end_of_text|>",
+  "renders": {
+   "multi_turn": "<|start_of_role|>system<|end_of_role|>You are a calculator.<|end_of_text|> <|start_of_role|>user<|end_of_role|>What is 2+2?<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>It is 4.<|end_of_text|> <|start_of_role|>user<|end_of_role|>And 3+3?<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>6.<|end_of_text|> <|start_of_role|>user<|end_of_role|>Thanks!<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>",
+   "plain": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. You are Granite, developed by IBM. You are a helpful AI assistant.<|end_of_text|> <|start_of_role|>user<|end_of_role|>Hello<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>",
+   "system_user": "<|start_of_role|>system<|end_of_role|>You are concise.<|end_of_text|> <|start_of_role|>user<|end_of_role|>Hello<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>",
+   "thinking_off": "<|start_of_role|>system<|end_of_role|>Reason carefully.<|end_of_text|> <|start_of_role|>user<|end_of_role|>Is 17 prime?<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>",
+   "thinking_on": "<|start_of_role|>system<|end_of_role|>Reason carefully.<|end_of_text|> <|start_of_role|>user<|end_of_role|>Is 17 prime?<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>",
+   "tool_round_trip": "<|start_of_role|>system<|end_of_role|>Knowledge Cutoff Date: April 2024. You are Granite, developed by IBM. You are a helpful AI assistant with access to the following tools. When a tool is required to answer the user's query, respond with <|tool_call|> followed by a JSON list of tools used. If a tool does not exist in the provided list of tools, notify the user that you do not have the ability to fulfill the request.<|end_of_text|> <|start_of_role|>tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Look up the current weather\",\n            \"parameters\": {\n                \"properties\": {\n                    \"city\": {\n                        \"description\": \"City name\",\n                        \"type\": \"string\"\n                    },\n                    \"unit\": {\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ],\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ],\n                \"type\": \"object\"\n            }\n        }\n    }\n]<|end_of_text|> <|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|> <|start_of_role|>assistant<|end_of_role|><|end_of_text|> <|start_of_role|>tool<|end_of_role|>{\"temp\":18}<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>",
+   "tools_declared": "<|start_of_role|>system<|end_of_role|>Be brief.<|end_of_text|> <|start_of_role|>tools<|end_of_role|>[\n    {\n        \"type\": \"function\",\n        \"function\": {\n            \"name\": \"get_weather\",\n            \"description\": \"Look up the current weather\",\n            \"parameters\": {\n                \"properties\": {\n                    \"city\": {\n                        \"description\": \"City name\",\n                        \"type\": \"string\"\n                    },\n                    \"unit\": {\n                        \"enum\": [\n                            \"celsius\",\n                            \"fahrenheit\"\n                        ],\n                        \"type\": \"string\"\n                    }\n                },\n                \"required\": [\n                    \"city\"\n                ],\n                \"type\": \"object\"\n            }\n        }\n    }\n]<|end_of_text|> <|start_of_role|>user<|end_of_role|>What is the weather in Paris?<|end_of_text|> <|start_of_role|>assistant<|end_of_role|>"
+  },
+  "template": "granitemoe"
+ },
+ "llama32": {
+  "bos": "<|begin_of_text|>",
+  "eos": "<|eot_id|>",
+  "renders": {
+   "multi_turn": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 18 Oct 2026\n\nYou are a calculator.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nWhat is 2+2?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nIt is 4.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nAnd 3+3?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n6.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nThanks!<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "plain": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 18 Oct 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "system_user": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 18 Oct 2026\n\nYou are concise.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nHello<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "thinking_off": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 18 Oct 2026\n\nReason carefully.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nIs 17 prime?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "thinking_on": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nCutting Knowledge Date: December 2023\nToday Date: 18 Oct 2026\n\nReason carefully.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nIs 17 prime?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "tool_round_trip": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\nToday Date: 18 Oct 2026\n\n<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"get_weather\",\n        \"description\": \"Look up the current weather\",\n        \"parameters\": {\n            \"properties\": {\n                \"city\": {\n                    \"description\": \"City name\",\n                    \"type\": \"string\"\n                },\n                \"unit\": {\n                    \"enum\": [\n                        \"celsius\",\n                        \"fahrenheit\"\n                    ],\n                    \"type\": \"string\"\n                }\n            },\n            \"required\": [\n                \"city\"\n            ],\n            \"type\": \"object\"\n        }\n    }\n}\n\nWhat is the weather in Paris?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n{\"name\": \"get_weather\", \"parameters\": {\"city\": \"Paris\", \"days\": 3, \"metric\": true, \"tags\": [\"a\", \"b\"]}}<|eot_id|><|start_header_id|>ipython<|end_header_id|>\n\n\"{\\\"temp\\\":18}\"<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+   "tools_declared": "<|begin_of_text|><|start_header_id|>system<|end_header_id|>\n\nEnvironment: ipython\nCutting Knowledge Date: December 2023\nToday Date: 18 Oct 2026\n\nBe brief.<|eot_id|><|start_header_id|>user<|end_header_id|>\n\nGiven the following functions, please respond with a JSON for a function call with its proper arguments that best answers the given prompt.\n\nRespond in the format {\"name\": function name, \"parameters\": dictionary of argument name and its value}.Do not use variables.\n\n{\n    \"type\": \"function\",\n    \"function\": {\n        \"name\": \"get_weather\",\n        \"description\": \"Look up the current weather\",\n        \"parameters\": {\n            \"properties\": {\n                \"city\": {\n                    \"description\": \"City name\",\n                    \"type\": \"string\"\n                },\n                \"unit\": {\n                    \"enum\": [\n                        \"celsius\",\n                        \"fahrenheit\"\n                    ],\n                    \"type\": \"string\"\n                }\n            },\n            \"required\": [\n                \"city\"\n            ],\n            \"type\": \"object\"\n        }\n    }\n}\n\nWhat is the weather in Paris?<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+  },
+  "template": "llama32"
+ },
+ "phi35": {
+  "bos": "<s>",
+  "eos": "<|endoftext|>",
+  "renders": {
+   "multi_turn": "<|system|>\nYou are a calculator.<|end|>\n<|user|>\nWhat is 2+2?<|end|>\n<|assistant|>\nIt is 4.<|end|>\n<|user|>\nAnd 3+3?<|end|>\n<|assistant|>\n6.<|end|>\n<|user|>\nThanks!<|end|>\n<|assistant|>\n",
+   "plain": "<|user|>\nHello<|end|>\n<|assistant|>\n",
+   "system_user": "<|system|>\nYou are concise.<|end|>\n<|user|>\nHello<|end|>\n<|assistant|>\n",
+   "thinking_off": "<|system|>\nReason carefully.<|end|>\n<|user|>\nIs 17 prime?<|end|>\n<|assistant|>\n",
+   "thinking_on": "<|system|>\nReason carefully.<|end|>\n<|user|>\nIs 17 prime?<|end|>\n<|assistant|>\n",
+   "tool_round_trip": "<|user|>\nWhat is the weather in Paris?<|end|>\n<|assistant|>\n<|end|>\n<|assistant|>\n",
+   "tools_declared": "<|system|>\nBe brief.<|end|>\n<|user|>\nWhat is the weather in Paris?<|end|>\n<|assistant|>\n"
+  },
+  "template": "phi35"
+ },
+ "phi4mini": {
+  "bos": "<|endoftext|>",
+  "eos": "<|endoftext|>",
+  "renders": {
+   "multi_turn": "<|system|>You are a calculator.<|end|><|user|>What is 2+2?<|end|><|assistant|>It is 4.<|end|><|user|>And 3+3?<|end|><|assistant|>6.<|end|><|user|>Thanks!<|end|><|assistant|>",
+   "plain": "<|user|>Hello<|end|><|assistant|>",
+   "system_user": "<|system|>You are concise.<|end|><|user|>Hello<|end|><|assistant|>",
+   "thinking_off": "<|system|>Reason carefully.<|end|><|user|>Is 17 prime?<|end|><|assistant|>",
+   "thinking_on": "<|system|>Reason carefully.<|end|><|user|>Is 17 prime?<|end|><|assistant|>",
+   "tool_round_trip": "<|user|>What is the weather in Paris?<|end|><|assistant|><|end|><|tool|>{\"temp\":18}<|end|><|assistant|>",
+   "tools_declared": "<|system|>Be brief.<|end|><|user|>What is the weather in Paris?<|end|><|assistant|>"
+  },
+  "template": "phi4mini"
+ },
+ "qwen25": {
+  "bos": "<|endoftext|>",
+  "eos": "<|im_end|>",
+  "renders": {
+   "multi_turn": "<|im_start|>system\nYou are a calculator.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\nIt is 4.<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n6.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n",
+   "plain": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+   "system_user": "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+   "thinking_off": "<|im_start|>system\nReason carefully.<|im_end|>\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n",
+   "thinking_on": "<|im_start|>system\nReason carefully.<|im_end|>\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n",
+   "tool_round_trip": "<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Look up the current weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3, \"metric\": true, \"tags\": [\"a\", \"b\"]}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\":18}\n</tool_response><|im_end|>\n<|im_start|>assistant\n",
+   "tools_declared": "<|im_start|>system\nBe brief.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Look up the current weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{{\"name\": <function-name>, \"arguments\": <args-json-object>}}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  "template": "qwen25"
+ },
+ "qwen3": {
+  "bos": "<|endoftext|>",
+  "eos": "<|im_end|>",
+  "renders": {
+   "multi_turn": "<|im_start|>system\nYou are a calculator.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\nIt is 4.<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n6.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "plain": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "system_user": "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "thinking_off": "<|im_start|>system\nReason carefully.<|im_end|>\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "thinking_on": "<|im_start|>system\nReason carefully.<|im_end|>\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n",
+   "tool_round_trip": "<|im_start|>system\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Look up the current weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\", \"days\": 3, \"metric\": true, \"tags\": [\"a\", \"b\"]}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\":18}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tools_declared": "<|im_start|>system\nBe brief.\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Look up the current weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  "template": "qwen3"
+ },
+ "qwen35-08b-mtp": {
+  "bos": "",
+  "eos": "<|im_end|>",
+  "renders": {
+   "multi_turn": "<|im_start|>system\nYou are a calculator.<|im_end|>\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\nIt is 4.<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n6.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "plain": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "system_user": "<|im_start|>system\nYou are concise.<|im_end|>\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "thinking_off": "<|im_start|>system\nReason carefully.<|im_end|>\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "thinking_on": "<|im_start|>system\nReason carefully.<|im_end|>\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n",
+   "tool_round_trip": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Look up the current weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT><|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n<parameter=days>\n3\n</parameter>\n<parameter=metric>\nTrue\n</parameter>\n<parameter=tags>\n[\"a\", \"b\"]\n</parameter>\n</function>\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{\"temp\":18}\n</tool_response><|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n",
+   "tools_declared": "<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>\n{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Look up the current weather\", \"parameters\": {\"properties\": {\"city\": {\"description\": \"City name\", \"type\": \"string\"}, \"unit\": {\"enum\": [\"celsius\", \"fahrenheit\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}\n</tools>\n\nIf you choose to call a function ONLY reply in the following format with NO suffix:\n\n<tool_call>\n<function=example_function_name>\n<parameter=example_parameter_1>\nvalue_1\n</parameter>\n<parameter=example_parameter_2>\nThis is the value for the second parameter\nthat can span\nmultiple lines\n</parameter>\n</function>\n</tool_call>\n\n<IMPORTANT>\nReminder:\n- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags\n- Required parameters MUST be specified\n- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after\n- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls\n</IMPORTANT>\n\nBe brief.<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n"
+  },
+  "template": "qwen35"
+ },
+ "r1qwen": {
+  "bos": "<｜begin▁of▁sentence｜>",
+  "eos": "<｜end▁of▁sentence｜>",
+  "renders": {
+   "multi_turn": "<｜begin▁of▁sentence｜>You are a calculator.<｜User｜>What is 2+2?<｜Assistant｜>It is 4.<｜end▁of▁sentence｜><｜User｜>And 3+3?<｜Assistant｜>6.<｜end▁of▁sentence｜><｜User｜>Thanks!<｜Assistant｜>",
+   "plain": "<｜begin▁of▁sentence｜><｜User｜>Hello<｜Assistant｜>",
+   "system_user": "<｜begin▁of▁sentence｜>You are concise.<｜User｜>Hello<｜Assistant｜>",
+   "thinking_off": "<｜begin▁of▁sentence｜>Reason carefully.<｜User｜>Is 17 prime?<｜Assistant｜>",
+   "thinking_on": "<｜begin▁of▁sentence｜>Reason carefully.<｜User｜>Is 17 prime?<｜Assistant｜>",
+   "tool_round_trip": "<｜begin▁of▁sentence｜><｜User｜>What is the weather in Paris?<｜Assistant｜><｜end▁of▁sentence｜><｜tool▁outputs▁begin｜><｜tool▁output▁begin｜>{\"temp\":18}<｜tool▁output▁end｜><｜tool▁outputs▁end｜>",
+   "tools_declared": "<｜begin▁of▁sentence｜>Be brief.<｜User｜>What is the weather in Paris?<｜Assistant｜>"
+  },
+  "template": "r1qwen"
+ },
+ "smollm3": {
+  "bos": "<|begin_of_text|>",
+  "eos": "<|im_end|>",
+  "renders": {
+   "multi_turn": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 18 October 2026\nReasoning Mode: /no_think\n\n## Custom Instructions\n\nYou are a calculator.\n\n<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\nIt is 4.<|im_end|>\n<|im_start|>user\nAnd 3+3?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n6.<|im_end|>\n<|im_start|>user\nThanks!<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
+   "plain": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 18 October 2026\nReasoning Mode: /no_think\n\n## Custom Instructions\n\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
+   "system_user": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 18 October 2026\nReasoning Mode: /no_think\n\n## Custom Instructions\n\nYou are concise.\n\n<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
+   "thinking_off": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 18 October 2026\nReasoning Mode: /no_think\n\n## Custom Instructions\n\nReason carefully.\n\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
+   "thinking_on": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 18 October 2026\nReasoning Mode: /think\n\n## Custom Instructions\n\nReason carefully.\n\n<|im_start|>user\nIs 17 prime?<|im_end|>\n<|im_start|>assistant\n",
+   "tool_round_trip": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 18 October 2026\nReasoning Mode: /no_think\n\n## Custom Instructions\n\nYou are a helpful AI assistant named SmolLM, trained by Hugging Face.\n\n### Tools\n\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n\n<tools>\n{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Look up the current weather', 'parameters': {'properties': {'city': {'description': 'City name', 'type': 'string'}, 'unit': {'enum': ['celsius', 'fahrenheit'], 'type': 'string'}}, 'required': ['city'], 'type': 'object'}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n<|im_end|>\n<|im_start|>user\n{\"temp\":18}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n",
+   "tools_declared": "<|im_start|>system\n## Metadata\n\nKnowledge Cutoff Date: June 2025\nToday Date: 18 October 2026\nReasoning Mode: /think\n\n## Custom Instructions\n\nBe brief.\n\n### Tools\n\nYou may call one or more functions to assist with the user query.\nYou are provided with function signatures within <tools></tools> XML tags:\n\n<tools>\n{'type': 'function', 'function': {'name': 'get_weather', 'description': 'Look up the current weather', 'parameters': {'properties': {'city': {'description': 'City name', 'type': 'string'}, 'unit': {'enum': ['celsius', 'fahrenheit'], 'type': 'string'}}, 'required': ['city'], 'type': 'object'}}}\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call>\n\n<|im_end|>\n<|im_start|>user\nWhat is the weather in Paris?<|im_end|>\n<|im_start|>assistant\n"
+  },
+  "template": "smollm3"
+ }
+}

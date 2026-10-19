@@ -56,23 +56,83 @@ fn by_logit_desc(a: &(f32, u32), b: &(f32, u32)) -> Ordering {
     b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
 }
 
-/// Sample one token id from `logits`.
-///
-/// Warper order: `temperature <= 0` returns the argmax; otherwise logits are
-/// divided by `temperature`, truncated to the `top_k` best (`0` keeps all),
-/// softmaxed, truncated to the shortest prefix whose cumulative probability
-/// reaches `top_p` (at least one candidate), renormalised, and a token is drawn
-/// with `rng`. `logits` is scaled in place.
-pub(crate) fn sample(
+/// The sampling distribution a set of logits defines under the warper
+/// order of [`sample`]: the surviving candidates with their normalised
+/// probabilities, most likely first. Speculative sampling needs both the
+/// target's and the drafter's distribution of the same token.
+#[derive(Debug, Clone)]
+pub(crate) struct Dist {
+    /// `(probability, id)`, descending; probabilities sum to one.
+    candidates: Vec<(f32, u32)>,
+}
+
+impl Dist {
+    /// Warp `logits` (scaled in place by `temperature`): top-k, softmax,
+    /// top-p. `temperature` must be positive.
+    pub(crate) fn warp(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32) -> Self {
+        let mut candidates = warp_candidates(logits, temperature, top_k, top_p);
+        let total: f32 = candidates.iter().map(|c| c.0).sum();
+        for c in &mut candidates {
+            c.0 /= total;
+        }
+        Self { candidates }
+    }
+
+    /// Probability of `id` (zero outside the candidates).
+    pub(crate) fn prob(&self, id: u32) -> f32 {
+        self.candidates
+            .iter()
+            .find(|c| c.1 == id)
+            .map_or(0.0, |c| c.0)
+    }
+
+    /// Draw one id.
+    pub(crate) fn draw(&self, rng: &mut SplitMix64) -> u32 {
+        let target = rng.next_f32();
+        let mut acc = 0.0f32;
+        for c in &self.candidates {
+            acc += c.0;
+            if target < acc {
+                return c.1;
+            }
+        }
+        self.candidates[self.candidates.len() - 1].1
+    }
+
+    /// The residual distribution `max(0, self - other)` renormalised: where a
+    /// rejected speculative draft is resampled from. `None` when the two
+    /// distributions coincide (no residual mass).
+    pub(crate) fn residual(&self, other: &Dist) -> Option<Dist> {
+        // `other` as a map: with `top_k = 0` both lists hold the whole
+        // vocabulary, and a linear lookup per candidate would be quadratic.
+        let other: std::collections::HashMap<u32, f32> =
+            other.candidates.iter().map(|&(p, id)| (id, p)).collect();
+        let mut candidates: Vec<(f32, u32)> = self
+            .candidates
+            .iter()
+            .map(|&(p, id)| (p - other.get(&id).copied().unwrap_or(0.0), id))
+            .filter(|c| c.0 > 0.0)
+            .collect();
+        let total: f32 = candidates.iter().map(|c| c.0).sum();
+        if candidates.is_empty() || total <= 0.0 {
+            return None;
+        }
+        for c in &mut candidates {
+            c.0 /= total;
+        }
+        Some(Dist { candidates })
+    }
+}
+
+/// Temperature, top-k, softmax and top-p over `logits`: the surviving
+/// candidates with unnormalised (post-softmax, pre-renormalisation)
+/// probabilities, most likely first.
+fn warp_candidates(
     logits: &mut [f32],
     temperature: f32,
     top_k: usize,
     top_p: f32,
-    rng: &mut SplitMix64,
-) -> u32 {
-    if temperature <= 0.0 || logits.len() <= 1 {
-        return argmax(logits);
-    }
+) -> Vec<(f32, u32)> {
     for l in logits.iter_mut() {
         *l /= temperature;
     }
@@ -108,7 +168,27 @@ pub(crate) fn sample(
         }
     }
     candidates.truncate(keep);
+    candidates
+}
 
+/// Sample one token id from `logits`.
+///
+/// Warper order: `temperature <= 0` returns the argmax; otherwise logits are
+/// divided by `temperature`, truncated to the `top_k` best (`0` keeps all),
+/// softmaxed, truncated to the shortest prefix whose cumulative probability
+/// reaches `top_p` (at least one candidate), renormalised, and a token is drawn
+/// with `rng`. `logits` is scaled in place.
+pub(crate) fn sample(
+    logits: &mut [f32],
+    temperature: f32,
+    top_k: usize,
+    top_p: f32,
+    rng: &mut SplitMix64,
+) -> u32 {
+    if temperature <= 0.0 || logits.len() <= 1 {
+        return argmax(logits);
+    }
+    let candidates = warp_candidates(logits, temperature, top_k, top_p);
     let total: f32 = candidates.iter().map(|c| c.0).sum();
     let target = rng.next_f32() * total;
     let mut acc = 0.0f32;
@@ -119,6 +199,11 @@ pub(crate) fn sample(
         }
     }
     candidates[candidates.len() - 1].1
+}
+
+/// Index of the first maximum of `logits` (the greedy choice).
+pub(crate) fn greedy(logits: &[f32]) -> u32 {
+    argmax(logits)
 }
 
 #[cfg(test)]
@@ -192,6 +277,65 @@ mod tests {
         for _ in 0..200 {
             let id = sample(&mut logits(), 5.0, 3, 1.0, &mut rng);
             assert!([1, 3, 5].contains(&id), "id {id} outside the top 3");
+        }
+    }
+
+    #[test]
+    fn dist_matches_the_sampler_pipeline() {
+        let d = Dist::warp(&mut logits(), 1.0, 3, 1.0);
+        let probs: Vec<f32> = [1u32, 5, 3].iter().map(|&i| d.prob(i)).collect();
+        assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
+        assert!(probs[0] > probs[1] && probs[1] > probs[2]);
+        assert_eq!(d.prob(0), 0.0);
+        let mut rng = SplitMix64(5);
+        for _ in 0..100 {
+            assert!([1, 3, 5].contains(&d.draw(&mut rng)));
+        }
+    }
+
+    #[test]
+    fn residual_removes_the_overlap() {
+        let p = Dist {
+            candidates: vec![(0.6, 1), (0.3, 2), (0.1, 3)],
+        };
+        let q = Dist {
+            candidates: vec![(0.2, 1), (0.5, 2), (0.3, 3)],
+        };
+        let r = p.residual(&q).unwrap();
+        assert!((r.prob(1) - 1.0).abs() < 1e-6, "only token 1 has p > q");
+        assert_eq!(r.prob(2), 0.0);
+        assert!(p.residual(&p).is_none());
+    }
+
+    /// Speculative sampling of one position: draft from q, accept with
+    /// `min(1, p/q)`, else resample the residual. The emitted token follows p.
+    #[test]
+    fn speculative_acceptance_preserves_the_target_distribution() {
+        let p = Dist {
+            candidates: vec![(0.5, 0), (0.3, 1), (0.2, 2)],
+        };
+        let q = Dist {
+            candidates: vec![(0.2, 0), (0.2, 1), (0.6, 2)],
+        };
+        let mut rng = SplitMix64(11);
+        let mut counts = [0usize; 3];
+        let n = 60_000;
+        for _ in 0..n {
+            let d = q.draw(&mut rng);
+            let accept = (p.prob(d) / q.prob(d)).min(1.0);
+            let out = if rng.next_f32() < accept {
+                d
+            } else {
+                p.residual(&q).unwrap().draw(&mut rng)
+            };
+            counts[out as usize] += 1;
+        }
+        for (id, expected) in [(0usize, 0.5f64), (1, 0.3), (2, 0.2)] {
+            let got = counts[id] as f64 / n as f64;
+            assert!(
+                (got - expected).abs() < 0.01,
+                "token {id}: {got} vs {expected}"
+            );
         }
     }
 

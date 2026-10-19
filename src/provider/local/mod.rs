@@ -1,4 +1,4 @@
-//! In-process Gemma 4 inference (`provider-local`).
+//! In-process GGUF language-model inference (`provider-local`).
 //!
 //! The engine is pure Rust: candle 0.11 on the CPU (the default), or burn
 //! 0.22 (CubeCL) on a GPU selected with [`LocalModelConfig::device`] and a
@@ -16,32 +16,97 @@
 //!
 //! # Choosing a model
 //!
-//! Any dense `gemma4` GGUF runs: the loader reads every dimension (layers,
-//! widths, query and KV head counts, FFN widths, vocabulary) from the file's
-//! metadata and tensor shapes, and rejects an unsupported one (MoE, another
-//! architecture, a tensor dtype candle cannot read) with an error naming the
-//! cause. [`ModelSource`] has verified presets: Gemma 4 E2B and E4B, each at
-//! Q4_0 and Q8_0 (`ModelSource::gemma4_it`, or by name through
-//! `str::parse`), plus [`ModelSource::hugging_face`] and
-//! [`ModelSource::File`] for any other file. The default is E2B Q4_0
-//! (2.84 GB).
+//! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
+//! `gemma2`, `llama` (Llama 1-3.x and compatible), `qwen2`, `qwen3`, `phi3`
+//! (Phi 3, 3.5, 4-mini), `smollm3`, `granite`, `granitemoe`, `olmo2`,
+//! `ernie4_5` or `qwen35` (CPU only) runs: the loader reads every
+//! dimension (layers, widths, per-layer head counts and head dimensions,
+//! FFN widths or experts, vocabulary, RoPE variants) from the file's
+//! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
+//! gate/up tensors, tied or separate output heads, sliding windows, NoPE
+//! layers, soft-caps and mixtures of experts, and rejects anything else (an
+//! unknown architecture, a tensor dtype candle cannot read) with an error
+//! naming the cause. [`ModelSource::PRESETS`] lists the verified models,
+//! each pinned to a repository commit and SHA-256 (by name through
+//! `str::parse`, e.g. `qwen3-0.6b-q8_0`), next to
+//! [`ModelSource::hugging_face`] and [`ModelSource::File`] for any other
+//! file. The default is Gemma 4 E2B Q4_0 (2.84 GB). Chat template, tool-call
+//! syntax and reasoning markers come from the file ([`LocalModel::capabilities`]
+//! reports what a model supports).
 //!
 //! Bounds:
 //!
 //! - Single-slot FIFO engine: one request runs at a time, at most 16 queue
 //!   behind it (further callers wait), 64 output blocks buffered per request.
 //! - K/V cache memory is `context_length * 2 * 4 * sum(n_kv_head * head_dim)`
-//!   bytes over the layers that own K/V, in RAM or device memory:
-//!   `context_length * 36,864` for E2B (302 MB at 8192),
-//!   `context_length * 114,688` for E4B (939 MB at 8192).
-//! - Per-layer embedding rows are read from disk per input token instead of
-//!   being held in RAM (5,040 bytes each and 1.32 GB saved in E2B Q4_0).
+//!   bytes over the layers that own K/V ([`LocalModel::kv_cache_bytes`]), in
+//!   RAM or device memory: per position 36,864 bytes for Gemma 4 E2B (302 MB
+//!   at 8192), 114,688 for E4B, 229,376 for Qwen3-0.6B and 786,432 for
+//!   Phi-3.5-mini (6.44 GB at 8192: a full-attention model with 32 KV heads
+//!   needs a smaller `context_length`).
+//! - Gemma 4's per-layer embedding rows are read from disk per input token
+//!   instead of being held in RAM (5,040 bytes each and 1.32 GB saved in E2B
+//!   Q4_0). A mixture-of-experts model keeps every expert resident (file
+//!   size); a pass only computes the experts its tokens route to.
 //! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix.
+//!
+//! # Determinism
+//!
+//! On the CPU a token's logits do not depend on how the prompt was split:
+//! prefill and speculative verification run in a row-exact mode (float
+//! matmuls per row, attention per query row) that equals single-token decoding
+//! bit for bit (per-row attention on scoped threads, float matmuls per row,
+//! and a safe Q4_0/Q8_0 matmul kernel whose rows are independent of their
+//! batch), at no cost in prefill throughput. A request that
+//! reuses a cached prefix therefore generates what a cold request generates.
+//! (Quantized matmuls round activations to Q8_0, which otherwise amplifies the
+//! batch-shape rounding of a float matmul into visible logit jumps.)
+//!
+//! # Speculative decoding (opt-in)
+//!
+//! [`LocalModelConfig::drafter`] attaches Gemma 4's multi-token-prediction
+//! assistant (preset `gemma4-e2b-mtp-f16`) to a Gemma 4 E2B target. The
+//! drafter proposes up to [`LocalModelConfig::draft_tokens`] tokens from the
+//! target's last hidden state, sharing the target's K/V cache; the target
+//! verifies them in one batched pass and keeps the longest prefix it agrees
+//! with. At temperature 0 the output equals plain greedy decoding; above 0 the
+//! standard speculative-sampling acceptance rule (accept with
+//! `min(1, p/q)`, resample the rejection from `max(0, p - q)`) preserves the
+//! target's sampling distribution. An engine-side governor measures the
+//! tokens per second of plain and speculative rounds and drafts only while
+//! speculation is faster, re-probing with exponential back-off, so the worst
+//! case stays near plain decoding (a seeded sampling run always drafts, so equal
+//! prompts still reproduce equal tokens). Measured on Gemma 4 E2B Q4_0 with the
+//! E2B assistant (128-token replies, quiet development machine, speed against
+//! plain decoding on the same device): CPU 1.17x on a code prompt, 1.37x on a
+//! list, 1.00x on prose; Vulkan (RX 9070 XT) 0.97x,
+//! 0.95x and 0.96x: GPU single-token decoding is host-bound (35 tok/s), so
+//! the drafter's own launches cost as much as the verification saves, and the
+//! governor keeps the run within about 5 % of plain decoding. Drafting is off
+//! by default; it pays on the CPU.
+//!
+//! `DrafterSource::InTrunk` drafts with the prediction head embedded in a
+//! Qwen 3.5 `*-MTP` file (for example `unsloth/Qwen3.5-0.8B-MTP-GGUF`): no
+//! second file, CPU only. The head is one gated-attention block with its own
+//! K/V cache over every position (4 KB per position, 21.7 MB of weights for
+//! the 0.8B model), fed the trunk's final-norm hidden row of the last position
+//! and the next token; a chain of drafts feeds the head's own normed output
+//! back. The target verifies and rolls back exactly as above (a hybrid model
+//! rolls back at most 16 drafts, one verification call), so greedy output
+//! equals plain decoding bit for bit. Measured on Qwen3.5-0.8B Q8_0 (128-token
+//! replies, two runs on a quiet CPU, plain decoding 52-53 tok/s): a code
+//! prompt 1.36-1.40x at one draft per round, 1.21x at two and 1.57-1.63x at
+//! three or four; a list 1.05-1.41x; creative prose 0.96-1.07x (its text is
+//! hard to predict, so the governor keeps drafting mostly off); the three
+//! together 1.11-1.24x for one to four drafts (drafted tokens accepted: 75 %,
+//! 60 %, 51 %, 50 %). A draft step costs 1.05 ms against a 19-22 ms trunk
+//! step because it ranks only the first 65,536 of the 248,320 token ids: 5x
+//! cheaper than the whole vocabulary for 4 % fewer accepted tokens per round.
 
 mod chat;
 mod download;
 mod engine;
-mod gemma4;
+mod model;
 mod output;
 mod sampler;
 mod tokenizer;
@@ -57,7 +122,7 @@ use std::time::Duration;
 use futures_core::Stream;
 use tokio::sync::{mpsc, oneshot};
 
-use self::chat::{ChatTemplate, chat_prompt};
+use self::chat::{ChatFormat, ChatTemplate, chat_prompt};
 use self::tokenizer::Tokenizer;
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
@@ -73,43 +138,53 @@ pub(crate) const MODEL_REQUIRED: &str =
 const JOB_QUEUE: usize = 16;
 /// Output blocks buffered between the engine thread and the stream.
 const EVENT_BUFFER: usize = 64;
-/// Rendered text that ends a prompt inside an open reasoning channel.
-const THINKING_OPEN: &str = "<|channel>thought\n";
+/// Context length a [`LocalModelConfig`] without an explicit one aims for.
+const DEFAULT_CONTEXT_LENGTH: usize = 8192;
+
+/// The context length to run with: the configured value, or the default
+/// capped at the model's own maximum `model_max`.
+pub(crate) fn resolve_context_length(configured: Option<usize>, model_max: usize) -> usize {
+    configured.unwrap_or_else(|| DEFAULT_CONTEXT_LENGTH.min(model_max))
+}
+
+/// Default [`LocalModelConfig::draft_tokens`].
+const DEFAULT_DRAFT_TOKENS: usize = 3;
+/// Largest accepted [`LocalModelConfig::draft_tokens`].
+const MAX_DRAFT_TOKENS: usize = 16;
 /// Connect timeout of the one-off download client.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// A published Gemma 4 instruction-tuned checkpoint size, for
-/// [`ModelSource::gemma4_it`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Gemma4Variant {
-    /// Gemma 4 E2B (35 layers, 4.6B parameters with embeddings).
-    E2b,
-    /// Gemma 4 E4B (42 layers, 7.5B parameters with embeddings).
-    E4b,
+/// One entry of the verified preset table, see [`ModelSource::PRESETS`].
+///
+/// Every entry pins an exact repository commit and the SHA-256 of its file,
+/// and was loaded and checked by this crate's live test suite
+/// (`tests/provider_local.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelPreset {
+    /// Name accepted by `str::parse::<ModelSource>` (ASCII case-insensitive):
+    /// `family-size-quant`, for example `qwen3-0.6b-q8_0`.
+    pub name: &'static str,
+    /// Hugging Face repository id.
+    pub repo: &'static str,
+    /// Commit hash of the repository the download is pinned to.
+    pub revision: &'static str,
+    /// File name inside the repository.
+    pub file: &'static str,
+    /// Lowercase hex SHA-256 of the file (the `lfs.oid` of that revision).
+    pub sha256: &'static str,
+    /// Size of the file in bytes.
+    pub size_bytes: u64,
+    /// The file's `general.architecture`.
+    pub architecture: &'static str,
+    /// `true` for a multi-token-prediction drafter, which is used through
+    /// [`LocalModelConfig::drafter`] next to its target model and cannot be
+    /// loaded as the main model.
+    pub drafter: bool,
 }
 
-/// Quantization of a published Gemma 4 GGUF file, for
-/// [`ModelSource::gemma4_it`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Gemma4Quant {
-    /// 4-bit legacy quantization: the smallest and fastest file.
-    Q4_0,
-    /// 8-bit quantization: about 1.75 times the size, closer to the original
-    /// weights.
-    Q8_0,
-}
-
-/// One pinned entry of the built-in preset table.
-struct Preset {
-    name: &'static str,
-    repo: &'static str,
-    revision: &'static str,
-    file: &'static str,
-    sha256: &'static str,
-}
-
-impl Preset {
-    fn source(&self) -> ModelSource {
+impl ModelPreset {
+    /// The pinned, checksummed [`ModelSource`] of this preset.
+    pub fn source(&self) -> ModelSource {
         ModelSource::HuggingFace {
             repo: self.repo.to_string(),
             revision: self.revision.to_string(),
@@ -121,50 +196,248 @@ impl Preset {
 
 // Revisions are the repositories' commit hashes and the digests the `lfs.oid`
 // of each file, both read from the Hugging Face API.
-const E2B_REVISION: &str = "b4243c156154b6dca9324415f8c7ccc098b4aed1";
-const E4B_REVISION: &str = "b8093469224f83f5c38f691eb906c380e9e63114";
+const fn preset(
+    name: &'static str,
+    repo: &'static str,
+    revision: &'static str,
+    file: &'static str,
+    sha256: &'static str,
+    size_bytes: u64,
+    architecture: &'static str,
+) -> ModelPreset {
+    ModelPreset {
+        name,
+        repo,
+        revision,
+        file,
+        sha256,
+        size_bytes,
+        architecture,
+        drafter: false,
+    }
+}
 
-const E2B_Q4_0: Preset = Preset {
-    name: "gemma4-e2b-q4_0",
-    repo: "ggml-org/gemma-4-E2B-it-GGUF",
-    revision: E2B_REVISION,
-    file: "gemma-4-E2B-it-Q4_0.gguf",
-    sha256: "8e30dff3ac4c8434c49a7036fa15564bdbb6044e42bf04550bf1a096ad7e6a52",
-};
-const E2B_Q8_0: Preset = Preset {
-    name: "gemma4-e2b-q8_0",
-    repo: "ggml-org/gemma-4-E2B-it-GGUF",
-    revision: E2B_REVISION,
-    file: "gemma-4-E2B-it-Q8_0.gguf",
-    sha256: "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
-};
-const E4B_Q4_0: Preset = Preset {
-    name: "gemma4-e4b-q4_0",
-    repo: "ggml-org/gemma-4-E4B-it-GGUF",
-    revision: E4B_REVISION,
-    file: "gemma-4-E4B-it-Q4_0.gguf",
-    sha256: "a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2",
-};
-const E4B_Q8_0: Preset = Preset {
-    name: "gemma4-e4b-q8_0",
-    repo: "ggml-org/gemma-4-E4B-it-GGUF",
-    revision: E4B_REVISION,
-    file: "gemma-4-E4B-it-Q8_0.gguf",
-    sha256: "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
-};
-
-/// Every built-in preset, in the order of [`ModelSource::PRESET_NAMES`].
-const PRESETS: [&Preset; 4] = [&E2B_Q4_0, &E2B_Q8_0, &E4B_Q4_0, &E4B_Q8_0];
+const PRESET_TABLE: [ModelPreset; 23] = [
+    preset(
+        "gemma4-e2b-q4_0",
+        "ggml-org/gemma-4-E2B-it-GGUF",
+        "b4243c156154b6dca9324415f8c7ccc098b4aed1",
+        "gemma-4-E2B-it-Q4_0.gguf",
+        "8e30dff3ac4c8434c49a7036fa15564bdbb6044e42bf04550bf1a096ad7e6a52",
+        2_841_481_184,
+        "gemma4",
+    ),
+    preset(
+        "gemma4-e2b-q8_0",
+        "ggml-org/gemma-4-E2B-it-GGUF",
+        "b4243c156154b6dca9324415f8c7ccc098b4aed1",
+        "gemma-4-E2B-it-Q8_0.gguf",
+        "996d08777aadc6bfd3c7375ef70ba25a0f55240075860754fdb18d6d860aa63a",
+        4_967_497_152,
+        "gemma4",
+    ),
+    preset(
+        "gemma4-e4b-q4_0",
+        "ggml-org/gemma-4-E4B-it-GGUF",
+        "b8093469224f83f5c38f691eb906c380e9e63114",
+        "gemma-4-E4B-it-Q4_0.gguf",
+        "a555b900214b477d8880e7832e0b8925e139b0159640036b09fe472b6f2097f2",
+        4_590_807_392,
+        "gemma4",
+    ),
+    preset(
+        "gemma4-e4b-q8_0",
+        "ggml-org/gemma-4-E4B-it-GGUF",
+        "b8093469224f83f5c38f691eb906c380e9e63114",
+        "gemma-4-E4B-it-Q8_0.gguf",
+        "34be82b17b4942d389b9b527170c4b058027abdd32531fda063d3d97dd8ce80a",
+        8_031_242_688,
+        "gemma4",
+    ),
+    preset(
+        "gemma3-270m-q8_0",
+        "ggml-org/gemma-3-270m-it-GGUF",
+        "e7647be17ae1108f2f605ed061ca0608b171afff",
+        "gemma-3-270m-it-Q8_0.gguf",
+        "0ef57d2c838458a1952664260dcba38e5bdda37494f3af732f06e4add24068e3",
+        291_545_600,
+        "gemma3",
+    ),
+    preset(
+        "gemma3-1b-q4_0",
+        "unsloth/gemma-3-1b-it-GGUF",
+        "f0b45be0aac41bd6a100a4b5734cad5f67255bfb",
+        "gemma-3-1b-it-Q4_0.gguf",
+        "27ee88e03be02e9ba73def9a819d570d8ad73716e50769e87f374ae394b0276e",
+        721_918_496,
+        "gemma3",
+    ),
+    preset(
+        "gemma2-2b-q4_0",
+        "second-state/gemma-2-2b-it-GGUF",
+        "b7d6a1a55228d89cc129757c687384b96781f97e",
+        "gemma-2-2b-it-Q4_0.gguf",
+        "2c1a93b3dfaaff7345ef184956f3adc78e37e6a3a4fd7bddb25bff01607ef12c",
+        1_629_509_216,
+        "gemma2",
+    ),
+    preset(
+        "qwen3-0.6b-q8_0",
+        "Qwen/Qwen3-0.6B-GGUF",
+        "23749fefcc72300e3a2ad315e1317431b06b590a",
+        "Qwen3-0.6B-Q8_0.gguf",
+        "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
+        639_446_688,
+        "qwen3",
+    ),
+    preset(
+        "qwen3-1.7b-q8_0",
+        "Qwen/Qwen3-1.7B-GGUF",
+        "90862c4b9d2787eaed51d12237eafdfe7c5f6077",
+        "Qwen3-1.7B-Q8_0.gguf",
+        "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
+        1_834_426_016,
+        "qwen3",
+    ),
+    preset(
+        "qwen2.5-0.5b-q8_0",
+        "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "9217f5db79a29953eb74d5343926648285ec7e67",
+        "qwen2.5-0.5b-instruct-q8_0.gguf",
+        "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
+        675_710_816,
+        "qwen2",
+    ),
+    preset(
+        "r1-distill-qwen-1.5b-q4_0",
+        "bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
+        "9cc28b17e86fa2415fcb070f8ee5ec27c965aa61",
+        "DeepSeek-R1-Distill-Qwen-1.5B-Q4_0.gguf",
+        "b3af887d0a015b39fab2395e4faf682c1a81a6a3fd09a43f0d4292f7d94bf4d0",
+        1_068_807_776,
+        "qwen2",
+    ),
+    preset(
+        "llama3.2-1b-q4_0",
+        "bartowski/Llama-3.2-1B-Instruct-GGUF",
+        "067b946cf014b7c697f3654f621d577a3e3afd1c",
+        "Llama-3.2-1B-Instruct-Q4_0.gguf",
+        "fa0390e7c043f89ae1847bd6682d748041a99d4ef3de0e0b27d33b6af97a8be8",
+        773_025_920,
+        "llama",
+    ),
+    preset(
+        "smollm3-3b-q4_0",
+        "bartowski/HuggingFaceTB_SmolLM3-3B-GGUF",
+        "86b3536ed1ca0dcb4716745642db4e6804bf3d32",
+        "HuggingFaceTB_SmolLM3-3B-Q4_0.gguf",
+        "1e0e56d458e6b6d5ea18d0e5fe598cca252450308f1648afab49984fceae47da",
+        1_811_455_808,
+        "smollm3",
+    ),
+    preset(
+        "phi3.5-mini-q4_0",
+        "bartowski/Phi-3.5-mini-instruct-GGUF",
+        "6d70da17e749a471ccb62ade694486011a75cda3",
+        "Phi-3.5-mini-instruct-Q4_0.gguf",
+        "6e0a4c93fe5db9408348cd2cbd15eee6f448efe6f91255a208c2d28701259b1d",
+        2_182_468_896,
+        "phi3",
+    ),
+    preset(
+        "phi4-mini-q4_0",
+        "bartowski/microsoft_Phi-4-mini-instruct-GGUF",
+        "7ff82c2aaa4dde30121698a973765f39be5288c0",
+        "microsoft_Phi-4-mini-instruct-Q4_0.gguf",
+        "2124412a2d3410dd05c5d01796457283812210633165a2a86c909f815971518e",
+        2_331_442_560,
+        "phi3",
+    ),
+    preset(
+        "phi4-mini-q4_k_m",
+        "unsloth/Phi-4-mini-instruct-GGUF",
+        "78eb92a46fc37e6b524df991ed9aca9bc6aa7b80",
+        "Phi-4-mini-instruct-Q4_K_M.gguf",
+        "88c00229914083cd112853aab84ed51b87bdf6b9ce42f532d8c85c7c63b1730a",
+        2_491_874_272,
+        "phi3",
+    ),
+    preset(
+        "granite3.3-2b-q4_0",
+        "ibm-granite/granite-3.3-2b-instruct-GGUF",
+        "7cdf86ccd1f1bb3491c9b7017b033f2e51367397",
+        "granite-3.3-2b-instruct-Q4_0.gguf",
+        "d5da3f5bb5a6ae442f830bdde0df4fcccb7e8bd395dc9ee5d28e704db4065592",
+        1_453_389_088,
+        "granite",
+    ),
+    preset(
+        "olmo2-1b-q4_0",
+        "allenai/OLMo-2-0425-1B-Instruct-GGUF",
+        "62f8c199538474c3e33ed5d7e0580abd66686a27",
+        "OLMo-2-0425-1B-Instruct-Q4_0.gguf",
+        "c5efa891c82203620b4ad12f2676340b330641bc9790a5eda4f6586e855e222c",
+        892_261_536,
+        "olmo2",
+    ),
+    preset(
+        "smollm2-360m-q8_0",
+        "bartowski/SmolLM2-360M-Instruct-GGUF",
+        "7be6f65f1db715fe5dc5a4634c0d459b4eed42ec",
+        "SmolLM2-360M-Instruct-Q8_0.gguf",
+        "c004ac34cce45e03e4452bca472535bc371fcb0d07ae560bba2c57ce4a284b7b",
+        386_405_280,
+        "llama",
+    ),
+    preset(
+        "tinyllama-1.1b-q4_0",
+        "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+        "52e7645ba7c309695bec7ac98f4f005b139cf465",
+        "tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
+        "da3087fb14aede55fde6eb81a0e55e886810e43509ec82ecdc7aa5d62a03b556",
+        637_699_456,
+        "llama",
+    ),
+    preset(
+        "granite3.1-moe-1b-q4_0",
+        "bartowski/granite-3.1-1b-a400m-instruct-GGUF",
+        "940d2e1f9f65330615c7c8e980e6c5ac73d3360c",
+        "granite-3.1-1b-a400m-instruct-Q4_0.gguf",
+        "642a83a3e38607015d14ccc0cb8069d02b94a32d4bf8fd18b958ead08d4b6e0e",
+        771_466_560,
+        "granitemoe",
+    ),
+    preset(
+        "qwen3.5-0.8b-q8_0",
+        "unsloth/Qwen3.5-0.8B-MTP-GGUF",
+        "cf8a611f6ed2c2060046219a19f12cd3d5ecd67c",
+        "Qwen3.5-0.8B-Q8_0.gguf",
+        "c54f8b67069c70085b98440de696b44da8250250ac69a961b41133def876e262",
+        833_592_736,
+        "qwen35",
+    ),
+    ModelPreset {
+        drafter: true,
+        ..preset(
+            "gemma4-e2b-mtp-f16",
+            "unsloth/gemma-4-E2B-it-GGUF",
+            "0314792d7f1f7e229411f620751375812bb9faf2",
+            "MTP/mtp-gemma-4-E2B-it-F16.gguf",
+            "cf045574920f9889cebd21db2e5019535d01155947ae00f9e498714954c0fd74",
+            170_193_984,
+            "gemma4-assistant",
+        )
+    },
+];
 
 /// Where [`LocalModel::load`] gets the GGUF file from.
 ///
-/// Any dense `gemma4` GGUF works: the loader derives every dimension from the
-/// file. The associated functions build the verified presets (see
-/// [`ModelSource::gemma4_it`]); other files are described with
-/// [`ModelSource::hugging_face`] or [`ModelSource::File`]. A source also parses
-/// from a string (`str::parse`): a preset name from
-/// [`ModelSource::PRESET_NAMES`] (ASCII case-insensitive), or
-/// `repo:revision:file`.
+/// Any GGUF whose architecture the engine supports works (see the module
+/// docs): the loader derives every dimension from the file. The verified
+/// presets are in [`ModelSource::PRESETS`]; other files are described with
+/// [`ModelSource::hugging_face`] or [`ModelSource::File`]. A source also
+/// parses from a string (`str::parse`): a preset name (ASCII
+/// case-insensitive), or `repo:revision:file`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSource {
     /// A file hosted on Hugging Face, downloaded once into the cache and
@@ -184,48 +457,26 @@ pub enum ModelSource {
 }
 
 impl ModelSource {
-    /// Names accepted by `str::parse::<ModelSource>`, one per preset, in the
-    /// order `gemma4-e2b-q4_0`, `gemma4-e2b-q8_0`, `gemma4-e4b-q4_0`,
-    /// `gemma4-e4b-q8_0`.
-    pub const PRESET_NAMES: [&'static str; 4] =
-        [E2B_Q4_0.name, E2B_Q8_0.name, E4B_Q4_0.name, E4B_Q8_0.name];
+    /// Every verified preset: the models this crate's live suite runs, each
+    /// pinned to a repository commit and a SHA-256, plus the multi-token
+    /// prediction drafter. Sorted by family; the first entry is the default
+    /// ([`ModelSource::default_model`]).
+    pub const PRESETS: &'static [ModelPreset] = &PRESET_TABLE;
 
-    /// A verified Gemma 4 instruction-tuned preset: `variant` at `quant`,
-    /// from the `ggml-org` GGUF repository of that variant at a pinned commit,
-    /// with the file's SHA-256.
-    ///
-    /// | Preset | File | Size |
-    /// | --- | --- | --- |
-    /// | `E2b`, `Q4_0` | `gemma-4-E2B-it-Q4_0.gguf` | 2.84 GB |
-    /// | `E2b`, `Q8_0` | `gemma-4-E2B-it-Q8_0.gguf` | 4.97 GB |
-    /// | `E4b`, `Q4_0` | `gemma-4-E4B-it-Q4_0.gguf` | 4.59 GB |
-    /// | `E4b`, `Q8_0` | `gemma-4-E4B-it-Q8_0.gguf` | 8.03 GB |
-    pub fn gemma4_it(variant: Gemma4Variant, quant: Gemma4Quant) -> Self {
-        match (variant, quant) {
-            (Gemma4Variant::E2b, Gemma4Quant::Q4_0) => E2B_Q4_0.source(),
-            (Gemma4Variant::E2b, Gemma4Quant::Q8_0) => E2B_Q8_0.source(),
-            (Gemma4Variant::E4b, Gemma4Quant::Q4_0) => E4B_Q4_0.source(),
-            (Gemma4Variant::E4b, Gemma4Quant::Q8_0) => E4B_Q8_0.source(),
-        }
+    /// The preset called `name` (ASCII case-insensitive), if any.
+    pub fn preset(name: &str) -> Option<&'static ModelPreset> {
+        let name = name.trim();
+        Self::PRESETS
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
     }
 
-    /// Gemma 4 E2B instruction-tuned at `quant`; see
-    /// [`ModelSource::gemma4_it`].
-    pub fn gemma4_e2b_it(quant: Gemma4Quant) -> Self {
-        Self::gemma4_it(Gemma4Variant::E2b, quant)
-    }
-
-    /// Gemma 4 E4B instruction-tuned at `quant`; see
-    /// [`ModelSource::gemma4_it`].
-    pub fn gemma4_e4b_it(quant: Gemma4Quant) -> Self {
-        Self::gemma4_it(Gemma4Variant::E4b, quant)
-    }
-
-    /// Gemma 4 E2B instruction-tuned, Q4_0 quantization, from
-    /// `ggml-org/gemma-4-E2B-it-GGUF` at a pinned revision with its SHA-256
-    /// (2.84 GB). The default source of [`LocalModelConfig`].
-    pub fn gemma4_e2b_it_q4_0() -> Self {
-        Self::gemma4_e2b_it(Gemma4Quant::Q4_0)
+    /// The default model: preset `gemma4-e2b-q4_0`, Gemma 4 E2B
+    /// instruction-tuned at Q4_0 from `ggml-org/gemma-4-E2B-it-GGUF` at a
+    /// pinned revision with its SHA-256 (2.84 GB). The default source of
+    /// [`LocalModelConfig`].
+    pub fn default_model() -> Self {
+        Self::PRESETS[0].source()
     }
 
     /// An arbitrary GGUF file on Hugging Face, without a checksum.
@@ -248,7 +499,7 @@ impl ModelSource {
     }
 }
 
-/// Parses a preset name from [`ModelSource::PRESET_NAMES`] (ASCII
+/// Parses a preset name from [`ModelSource::PRESETS`] (ASCII
 /// case-insensitive) or `repo:revision:file` (an unverified
 /// [`ModelSource::hugging_face`] source; none of the three parts contains
 /// `:`).
@@ -257,7 +508,7 @@ impl std::str::FromStr for ModelSource {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-        if let Some(preset) = PRESETS.iter().find(|p| p.name.eq_ignore_ascii_case(s)) {
+        if let Some(preset) = Self::preset(s) {
             return Ok(preset.source());
         }
         let parts: Vec<&str> = s.split(':').collect();
@@ -269,7 +520,11 @@ impl std::str::FromStr for ModelSource {
             }
             _ => Err(CucaError::Config(format!(
                 "unknown model `{s}`: expected a preset ({}) or `repo:revision:file`",
-                Self::PRESET_NAMES.join(", ")
+                Self::PRESETS
+                    .iter()
+                    .map(|p| p.name)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ))),
         }
     }
@@ -442,6 +697,34 @@ impl fmt::Debug for DownloadProgressCallback {
     }
 }
 
+/// Where the multi-token-prediction head of [`LocalModelConfig::drafter`]
+/// comes from.
+///
+/// A [`ModelSource`] converts with `.into()` (it becomes
+/// [`DrafterSource::File`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DrafterSource {
+    /// A separate drafter GGUF file, resolved and downloaded like any
+    /// [`ModelSource`]: Gemma 4's assistant (preset `gemma4-e2b-mtp-f16`),
+    /// which pairs with a Gemma 4 E2B target, shares the target's K/V cache
+    /// and runs on the target's device.
+    File(ModelSource),
+    /// The prediction head embedded in the main model's own GGUF file:
+    /// Qwen 3.5 `*-MTP` files (for example `unsloth/Qwen3.5-0.8B-MTP-GGUF`)
+    /// carry one extra block after their trunk that predicts the token after
+    /// the next. It loads from the same file (nothing more to download),
+    /// keeps a K/V cache of its own (4 KB per context position for the 0.8B
+    /// model) and runs on the CPU only. A model whose file has no such block
+    /// fails to load with an error that says so.
+    InTrunk,
+}
+
+impl From<ModelSource> for DrafterSource {
+    fn from(source: ModelSource) -> Self {
+        Self::File(source)
+    }
+}
+
 /// Configuration for [`LocalModel::load`].
 ///
 /// `Debug` redacts `hf_token`.
@@ -457,15 +740,32 @@ pub struct LocalModelConfig {
     pub hf_token: Option<String>,
     /// Maximum tokens of prompt plus completion per request, also the K/V
     /// cache capacity: it costs `context_length * 2 * 4 * sum(n_kv_head *
-    /// head_dim)` bytes of RAM over the K/V-owning layers (E2B:
-    /// `context_length * 36,864`; see [`LocalModel`]). Must be at least 1 and
-    /// at most the model's own maximum. On a GPU device the cache lives in
-    /// device memory with the same size.
-    pub context_length: usize,
+    /// head_dim)` bytes of RAM over the K/V-owning layers (Gemma 4 E2B
+    /// 36,864 per position, Qwen3-0.6B 229,376, Phi-3.5-mini 786,432, i.e.
+    /// 6.44 GB at 8192: size it for the model; [`LocalModel::kv_cache_bytes`]
+    /// reports the result; see [`LocalModel`]). `None` (the default)
+    /// resolves to the smaller of 8192 and the model's own maximum, so a
+    /// model trained for 2048 or 4096 positions loads without configuration.
+    /// An explicit value must be at least 1 and at most the model's maximum,
+    /// or [`LocalModel::load`] fails with [`CucaError::Config`]. On a GPU
+    /// device the cache lives in device memory with the same size.
+    pub context_length: Option<usize>,
     /// Default sampling parameters.
     pub sampling: SamplingConfig,
     /// Where the forward pass runs; [`LocalDevice::Cpu`] by default.
     pub device: LocalDevice,
+    /// Optional multi-token-prediction drafter for self-speculative decoding:
+    /// a separate file (the `gemma4-e2b-mtp-f16` preset pairs with the Gemma 4
+    /// E2B presets, [`DrafterSource::File`]) or the head inside the main
+    /// model's own file ([`DrafterSource::InTrunk`], Qwen 3.5 `*-MTP`). It
+    /// needs a matching target; see the module docs for the exactness
+    /// guarantee and measured speedups. `None` (the default) keeps plain
+    /// decoding.
+    pub drafter: Option<DrafterSource>,
+    /// Tokens the drafter proposes per verification round, `1..=16`; ignored
+    /// without a drafter. Longer rounds win more on predictable text and
+    /// waste more verification work on unpredictable text.
+    pub draft_tokens: usize,
     /// Optional download progress observer.
     pub on_download_progress: Option<DownloadProgressCallback>,
 }
@@ -473,12 +773,14 @@ pub struct LocalModelConfig {
 impl Default for LocalModelConfig {
     fn default() -> Self {
         Self {
-            source: ModelSource::gemma4_e2b_it_q4_0(),
+            source: ModelSource::default_model(),
             cache_dir: None,
             hf_token: None,
-            context_length: 8192,
+            context_length: None,
             sampling: SamplingConfig::default(),
             device: LocalDevice::Cpu,
+            drafter: None,
+            draft_tokens: DEFAULT_DRAFT_TOKENS,
             on_download_progress: None,
         }
     }
@@ -493,6 +795,8 @@ impl fmt::Debug for LocalModelConfig {
             .field("context_length", &self.context_length)
             .field("sampling", &self.sampling)
             .field("device", &self.device)
+            .field("drafter", &self.drafter)
+            .field("draft_tokens", &self.draft_tokens)
             .field("on_download_progress", &self.on_download_progress)
             .finish()
     }
@@ -500,7 +804,7 @@ impl fmt::Debug for LocalModelConfig {
 
 /// What a loaded engine hands back to `load`: the pieces the request path
 /// needs without touching the engine thread.
-type Ready = Result<(Arc<Tokenizer>, ChatTemplate, usize), CucaError>;
+type Ready = Result<(Arc<Tokenizer>, ChatTemplate, ChatFormat, usize, usize), CucaError>;
 
 /// State shared by every clone of a [`LocalModel`].
 pub(crate) struct LocalModelInner {
@@ -508,7 +812,10 @@ pub(crate) struct LocalModelInner {
     jobs: mpsc::Sender<engine::Job>,
     tokenizer: Arc<Tokenizer>,
     template: ChatTemplate,
+    format: ChatFormat,
     context_length: usize,
+    kv_bytes_per_position: usize,
+    draft_stats: Arc<engine::DraftCounters>,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -528,22 +835,29 @@ pub(crate) struct LocalModelInner {
 ///   a slow consumer paces generation, and dropping the stream stops it.
 /// - The K/V cache is preallocated for `context_length` positions and costs
 ///   `context_length * 2 * 4 * sum(n_kv_head * head_dim)` bytes over the layers
-///   that own K/V (each layer's head dimension depends on its attention
-///   type): `context_length * 36,864` bytes for E2B (302 MB at the default
-///   8192) and `context_length * 114,688` for E4B (939 MB at 8192). It is
+///   that own K/V (each layer's head count and head dimension come from the
+///   file; [`LocalModel::kv_cache_bytes`] reports the total): Gemma 4 E2B
+///   `context_length * 36,864` bytes (302 MB at the default 8192), E4B
+///   `context_length * 114,688` (939 MB at 8192), Qwen3-0.6B
+///   `context_length * 229,376` (28 layers, 8 KV heads of 128). It is
 ///   reused across requests: a prompt that shares a prefix with the previous
 ///   one only prefills the new tokens, reported as the response's
 ///   `prompt_cache_usage`.
-/// - Weights stay quantized. The per-layer embedding table (`per_layer_token_embd`:
-///   1.32 GB in the E2B Q4_0 file, 1.59 GB in E4B Q4_0) is not loaded: one row
+/// - Weights stay quantized (a mixture-of-experts model keeps every expert,
+///   split per expert, so memory is the file size; a pass computes only the
+///   routed experts). Gemma 4's per-layer embedding table
+///   (`per_layer_token_embd`: 1.32 GB in the E2B Q4_0 file, 1.59 GB in E4B
+///   Q4_0) is not loaded: one row
 ///   per input token (5,040 bytes in E2B Q4_0) is read from the GGUF file,
 ///   usually from the OS page cache. Resident weights are therefore about
 ///   the file size minus that table (E2B Q4_0: 1.5 GB of 2.84 GB).
 /// - On a GPU device the weights and the K/V cache live in device memory.
 ///   Q4_0 and Q8_0 weights stay quantized there; F32, F16 and BF16 weights
-///   (including `per_layer_model_proj`, 92 MB as f32 for E2B) are f32; any
-///   other weight dtype is rejected at load. Embedding rows are still read
-///   from the file on the host.
+///   (including `per_layer_model_proj`, 92 MB as f32 for E2B) are f32; every
+///   other dtype (Q4_1, Q5_x, the K-quants) is requantized to Q8_0 at load
+///   (its error is far below the K-quant error), and a weight over 1 GiB
+///   is split into row chunks. Embedding rows are still read from the file
+///   on the host.
 ///
 /// # Behavior
 ///
@@ -581,7 +895,73 @@ impl fmt::Debug for LocalModel {
     }
 }
 
+/// What a loaded model supports, derived from its chat template and its
+/// output conventions; see [`LocalModel::capabilities`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct LocalCapabilities {
+    /// The model writes a reasoning channel (`<think>…</think>`, Gemma 4's
+    /// `<|channel>thought`), which the stream reports as `Thinking` blocks.
+    pub reasoning: bool,
+    /// A request can switch the reasoning off: the chat template reads
+    /// `enable_thinking`. `false` for a model that always reasons (or never
+    /// does).
+    pub can_disable_thinking: bool,
+    /// The model has a tool-call syntax the output parser understands, so
+    /// tool calls come back as `ToolUse` blocks; `false` for plain-text
+    /// models.
+    pub tools: bool,
+}
+
+/// Speculative-decoding counters of a [`LocalModel`] with a drafter, summed
+/// over every request so far; see [`LocalModel::draft_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DraftStats {
+    /// Verification rounds that carried drafted tokens.
+    pub rounds: u64,
+    /// Tokens the drafter proposed.
+    pub drafted: u64,
+    /// Drafted tokens the target model accepted.
+    pub accepted: u64,
+}
+
+impl DraftStats {
+    /// Fraction of drafted tokens that were accepted, `None` before the
+    /// first round.
+    pub fn acceptance_rate(&self) -> Option<f64> {
+        (self.drafted > 0).then(|| self.accepted as f64 / self.drafted as f64)
+    }
+}
+
 impl LocalModel {
+    /// Bytes the K/V cache occupies: `context_length * 2 * 4 * sum(n_kv_head
+    /// * head_dim)` over the layers that own K/V, in RAM or device memory.
+    ///
+    /// A hybrid model (Qwen 3.5) owns K/V only in its attention layers, and
+    /// besides keeps a recurrent state of fixed size (about 20 MB for the
+    /// 0.8B model, three copies while speculating) that is not counted here.
+    pub fn kv_cache_bytes(&self) -> u64 {
+        (self.inner.context_length as u64) * (self.inner.kv_bytes_per_position as u64)
+    }
+
+    /// What this model supports: reasoning, switching it off, tool calls.
+    pub fn capabilities(&self) -> LocalCapabilities {
+        let reasoning = self.inner.format.reasoning().is_some();
+        LocalCapabilities {
+            reasoning,
+            can_disable_thinking: reasoning && self.inner.template.reads_enable_thinking(),
+            tools: !matches!(
+                self.inner.format.tool_syntax(),
+                self::chat::ToolSyntax::Plain
+            ),
+        }
+    }
+
+    /// Speculative-decoding counters (all zero without a drafter).
+    pub fn draft_stats(&self) -> DraftStats {
+        self.inner.draft_stats.snapshot()
+    }
+
     /// Load the model described by `config`: resolve or download the file,
     /// read the weights, tokenizer and chat template, and start the engine
     /// thread.
@@ -598,27 +978,37 @@ impl LocalModel {
     /// [`CucaError::Io`] when the file is missing or unreadable or the thread
     /// cannot start; [`CucaError::Transport`] and [`CucaError::Http`] for
     /// download failures; [`CucaError::Provider`] for an unsupported or
-    /// malformed GGUF file (another architecture, MoE, per-layer KV head
-    /// counts, a tensor dtype candle cannot read, or on a GPU device a weight
-    /// dtype other than Q4_0, Q8_0, F32, F16 or BF16, a missing tensor or
-    /// metadata key), a failed checksum, or a GPU device that fails to
-    /// initialize (no such adapter, missing driver).
+    /// malformed GGUF file (an architecture outside the supported list, a
+    /// tensor dtype candle cannot read, a missing tensor or metadata key, or
+    /// a drafter that does not match its target, or `DrafterSource::InTrunk`
+    /// on a model whose file has no prediction head), a failed checksum, or a
+    /// GPU device that fails to initialize (no such adapter, missing driver).
     pub async fn load(config: LocalModelConfig) -> Result<Self, CucaError> {
         validate(&config)?;
-        let context_length = config.context_length;
-        Self::start(context_length, move || {
-            let path = resolve_model_path(&config)?;
-            let (engine, tokenizer, template) = engine::Engine::open(&path, &config)?;
-            Ok((engine, tokenizer, template))
+        let stats = Arc::new(engine::DraftCounters::default());
+        let shared = Arc::clone(&stats);
+        Self::start(stats, move || {
+            let path = resolve_model_path(&config, &config.source)?;
+            let drafter = match &config.drafter {
+                None => None,
+                Some(DrafterSource::File(source)) => Some(engine::ResolvedDrafter::File(
+                    resolve_model_path(&config, source)?,
+                )),
+                Some(DrafterSource::InTrunk) => Some(engine::ResolvedDrafter::InTrunk),
+            };
+            let (engine, tokenizer, template, format) =
+                engine::Engine::open(&path, drafter.as_ref(), shared, &config)?;
+            Ok((engine, tokenizer, template, format))
         })
         .await
     }
 
     /// Start the engine thread, build its engine with `open` there, and wait
     /// for it to report ready.
-    async fn start<F>(context_length: usize, open: F) -> Result<Self, CucaError>
+    async fn start<F>(draft_stats: Arc<engine::DraftCounters>, open: F) -> Result<Self, CucaError>
     where
-        F: FnOnce() -> Result<(engine::Engine, Arc<Tokenizer>, ChatTemplate), CucaError>
+        F: FnOnce()
+                -> Result<(engine::Engine, Arc<Tokenizer>, ChatTemplate, ChatFormat), CucaError>
             + Send
             + 'static,
     {
@@ -645,9 +1035,15 @@ impl LocalModel {
                     }
                 };
                 let mut engine = match opened {
-                    Ok((engine, tokenizer, template)) => {
+                    Ok((engine, tokenizer, template, format)) => {
                         if ready_tx
-                            .send(Ok((tokenizer, template, context_length)))
+                            .send(Ok((
+                                tokenizer,
+                                template,
+                                format,
+                                engine.context_length(),
+                                engine.kv_bytes_per_position(),
+                            )))
                             .is_err()
                         {
                             return;
@@ -668,14 +1064,19 @@ impl LocalModel {
             })?;
 
         match ready_rx.await {
-            Ok(Ok((tokenizer, template, context_length))) => Ok(LocalModel {
-                inner: Arc::new(LocalModelInner {
-                    jobs: jobs_tx,
-                    tokenizer,
-                    template,
-                    context_length,
-                }),
-            }),
+            Ok(Ok((tokenizer, template, format, context_length, kv_bytes_per_position))) => {
+                Ok(LocalModel {
+                    inner: Arc::new(LocalModelInner {
+                        jobs: jobs_tx,
+                        tokenizer,
+                        template,
+                        format,
+                        context_length,
+                        kv_bytes_per_position,
+                        draft_stats,
+                    }),
+                })
+            }
             Ok(Err(e)) => Err(e),
             Err(_) => Err(CucaError::provider(
                 ProviderEndpoint::Local,
@@ -687,7 +1088,7 @@ impl LocalModel {
 
 /// Reject configurations the engine cannot honor, before any thread starts.
 fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
-    if config.context_length == 0 {
+    if config.context_length == Some(0) {
         return Err(CucaError::Config(
             "context_length must be at least 1".into(),
         ));
@@ -707,6 +1108,18 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
     if let Some(e) = device_unavailable(config.device) {
         return Err(e);
     }
+    if config.drafter == Some(DrafterSource::InTrunk) && config.device != LocalDevice::Cpu {
+        return Err(CucaError::Config(format!(
+            "DrafterSource::InTrunk runs on the CPU only, not on {:?}",
+            config.device
+        )));
+    }
+    if config.drafter.is_some() && !(1..=MAX_DRAFT_TOKENS).contains(&config.draft_tokens) {
+        return Err(CucaError::Config(format!(
+            "draft_tokens must be in 1..={MAX_DRAFT_TOKENS}, got {}",
+            config.draft_tokens
+        )));
+    }
     Ok(())
 }
 
@@ -716,8 +1129,11 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
 /// runtime and HTTP client (never the `CucaClient` one), both dropped before
 /// returning: the engine loop later blocks on a channel, which must not happen
 /// inside a runtime.
-fn resolve_model_path(config: &LocalModelConfig) -> Result<PathBuf, CucaError> {
-    match &config.source {
+fn resolve_model_path(
+    config: &LocalModelConfig,
+    source: &ModelSource,
+) -> Result<PathBuf, CucaError> {
+    match source {
         ModelSource::File(path) => {
             if !path.is_file() {
                 return Err(CucaError::Io {
@@ -811,7 +1227,7 @@ impl CucaClient {
 
         let prompt = chat_prompt(&req)?;
         let rendered = inner.template.render(&prompt)?;
-        let prompt_ids = inner.tokenizer.encode(&rendered);
+        let prompt_ids = inner.tokenizer.encode_prompt(&rendered);
         if prompt_ids.len() >= inner.context_length {
             return Err(CucaError::provider(
                 ProviderEndpoint::Local,
@@ -827,7 +1243,7 @@ impl CucaClient {
         let metadata = ResponseMetadataHandle::empty();
         let job = engine::Job {
             prompt_ids,
-            start_in_thinking: rendered.ends_with(THINKING_OPEN),
+            start_in_thinking: inner.format.starts_in_thinking(&rendered),
             enable_thinking: prompt.enable_thinking,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
@@ -849,23 +1265,28 @@ mod tests {
     use tokio_stream::StreamExt;
 
     use super::*;
-    use crate::provider::local::engine::testing::{engine, tiny_tokenizer};
-    use crate::provider::local::gemma4::tiny::{TinyModel, write_tiny_model};
+    use crate::provider::local::engine::testing::{engine, tiny_format, tiny_tokenizer};
+    use crate::provider::local::model::tiny::{TinyModel, write_tiny_model};
 
     /// A template that renders the first message's content after `<bos>`.
     const TEMPLATE: &str = "{{ bos_token }}{{ messages[0]['content'] }}";
 
     async fn tiny_model(model: &TinyModel, context_length: usize) -> LocalModel {
         let path = model.path.clone();
-        LocalModel::start(context_length, move || {
+        LocalModel::start(Arc::default(), move || {
             let tokenizer = Arc::new(tiny_tokenizer());
-            let template = ChatTemplate::new(TEMPLATE.to_string(), "<bos>".to_string())?;
+            let template = ChatTemplate::new(
+                TEMPLATE.to_string(),
+                "<bos>".to_string(),
+                "<eos>".to_string(),
+            )?;
             // The engine must be built on the engine thread, from the path.
             let tiny = TinyModel { path };
             let engine = engine(&tiny, context_length, 0.0, None);
             // `tiny` would delete the file on drop; the caller still owns it.
             std::mem::forget(tiny);
-            Ok((engine, tokenizer, template))
+            let format = tiny_format(&tokenizer);
+            Ok((engine, tokenizer, template, format))
         })
         .await
         .expect("tiny engine starts")
@@ -882,16 +1303,23 @@ mod tests {
     #[test]
     fn defaults_match_the_documented_values() {
         let config = LocalModelConfig::default();
-        assert_eq!(config.context_length, 8192);
+        assert_eq!(config.context_length, None);
+        assert_eq!(
+            resolve_context_length(None, 131_072),
+            DEFAULT_CONTEXT_LENGTH
+        );
+        assert_eq!(resolve_context_length(None, 4096), 4096);
+        assert_eq!(resolve_context_length(None, 2048), 2048);
+        assert_eq!(resolve_context_length(Some(100_000), 4096), 100_000);
         assert_eq!(config.sampling, SamplingConfig::default());
         assert_eq!(config.sampling.top_k, 64);
-        assert_eq!(config.source, ModelSource::gemma4_e2b_it_q4_0());
+        assert_eq!(config.source, ModelSource::default_model());
         let ModelSource::HuggingFace {
             repo,
             revision,
             file,
             sha256,
-        } = ModelSource::gemma4_e2b_it_q4_0()
+        } = ModelSource::default_model()
         else {
             panic!("default source is a Hugging Face file");
         };
@@ -902,69 +1330,49 @@ mod tests {
     }
 
     #[test]
-    fn presets_are_pinned_and_named_consistently() {
+    fn presets_are_pinned_named_and_parseable() {
         use std::str::FromStr;
-        let cases = [
-            (
-                Gemma4Variant::E2b,
-                Gemma4Quant::Q4_0,
-                "gemma4-e2b-q4_0",
-                "ggml-org/gemma-4-E2B-it-GGUF",
-                "gemma-4-E2B-it-Q4_0.gguf",
-            ),
-            (
-                Gemma4Variant::E2b,
-                Gemma4Quant::Q8_0,
-                "gemma4-e2b-q8_0",
-                "ggml-org/gemma-4-E2B-it-GGUF",
-                "gemma-4-E2B-it-Q8_0.gguf",
-            ),
-            (
-                Gemma4Variant::E4b,
-                Gemma4Quant::Q4_0,
-                "gemma4-e4b-q4_0",
-                "ggml-org/gemma-4-E4B-it-GGUF",
-                "gemma-4-E4B-it-Q4_0.gguf",
-            ),
-            (
-                Gemma4Variant::E4b,
-                Gemma4Quant::Q8_0,
-                "gemma4-e4b-q8_0",
-                "ggml-org/gemma-4-E4B-it-GGUF",
-                "gemma-4-E4B-it-Q8_0.gguf",
-            ),
-        ];
-        for (i, (variant, quant, name, repo, file)) in cases.into_iter().enumerate() {
-            let source = ModelSource::gemma4_it(variant, quant);
-            assert_eq!(ModelSource::PRESET_NAMES[i], name);
-            assert_eq!(ModelSource::from_str(name).unwrap(), source);
+        let mut names = std::collections::HashSet::new();
+        for p in ModelSource::PRESETS {
+            assert!(names.insert(p.name), "duplicate preset {}", p.name);
+            assert_eq!(p.name, p.name.to_ascii_lowercase());
+            assert_eq!(p.revision.len(), 40, "{}", p.name);
+            assert_eq!(p.sha256.len(), 64, "{}", p.name);
+            assert!(
+                p.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                "{}",
+                p.name
+            );
+            assert!(p.size_bytes > 100_000_000, "{}", p.name);
+            assert!(p.file.ends_with(".gguf"), "{}", p.name);
+            assert!(!p.architecture.is_empty(), "{}", p.name);
+            let source = p.source();
+            assert_eq!(ModelSource::from_str(p.name).unwrap(), source);
             assert_eq!(
-                ModelSource::from_str(&name.to_ascii_uppercase()).unwrap(),
+                ModelSource::from_str(&p.name.to_ascii_uppercase()).unwrap(),
                 source
             );
-            let ModelSource::HuggingFace {
-                repo: r,
-                revision,
-                file: f,
-                sha256,
-            } = source
-            else {
+            assert_eq!(ModelSource::preset(p.name), Some(p));
+            let ModelSource::HuggingFace { sha256, .. } = source else {
                 panic!("presets are Hugging Face files");
             };
-            assert_eq!((r.as_str(), f.as_str()), (repo, file));
-            assert_eq!(revision.len(), 40);
-            let digest = sha256.expect("presets pin a digest");
-            assert_eq!(digest.len(), 64);
-            assert!(digest.bytes().all(|b| b.is_ascii_hexdigit()));
+            assert_eq!(sha256.as_deref(), Some(p.sha256));
         }
-        assert_eq!(
-            ModelSource::gemma4_e2b_it_q4_0(),
-            ModelSource::gemma4_e2b_it(Gemma4Quant::Q4_0)
-        );
-        assert_eq!(
-            ModelSource::gemma4_e4b_it(Gemma4Quant::Q8_0),
-            ModelSource::gemma4_it(Gemma4Variant::E4b, Gemma4Quant::Q8_0)
-        );
+        // The default stays Gemma 4 E2B Q4_0 and sits first in the table.
+        assert_eq!(ModelSource::PRESETS[0].name, "gemma4-e2b-q4_0");
+        assert_eq!(ModelSource::PRESETS[0].size_bytes, 2_841_481_184);
+        // Exactly one drafter preset; every other preset is a main model.
+        let drafters: Vec<_> = ModelSource::PRESETS.iter().filter(|p| p.drafter).collect();
+        assert_eq!(drafters.len(), 1);
+        assert_eq!(drafters[0].architecture, "gemma4-assistant");
+        for name in [
+            "qwen3-0.6b-q8_0",
+            "llama3.2-1b-q4_0",
+            "phi3.5-mini-q4_0",
+            "granite3.1-moe-1b-q4_0",
+        ] {
+            assert!(ModelSource::preset(name).is_some(), "{name}");
+        }
     }
 
     #[test]
@@ -1007,7 +1415,7 @@ mod tests {
         for (config, needle) in [
             (
                 LocalModelConfig {
-                    context_length: 0,
+                    context_length: Some(0),
                     ..Default::default()
                 },
                 "context_length",
@@ -1113,11 +1521,42 @@ mod tests {
         );
     }
 
+    /// The in-trunk head runs on the CPU only: a GPU device is a
+    /// configuration error, naming the missing backend feature when it is
+    /// compiled out and the CPU restriction otherwise; the CPU is accepted.
+    #[tokio::test]
+    async fn validate_rejects_the_in_trunk_head_on_a_gpu() {
+        let config = LocalModelConfig {
+            device: LocalDevice::Vulkan(GpuAdapter::Default),
+            drafter: Some(DrafterSource::InTrunk),
+            ..Default::default()
+        };
+        let err = LocalModel::load(config).await.unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("`provider-local-vulkan`") || m.contains("CPU only")),
+            "{err}"
+        );
+        let cpu = LocalModelConfig {
+            drafter: Some(DrafterSource::InTrunk),
+            ..Default::default()
+        };
+        assert!(validate(&cpu).is_ok());
+    }
+
+    #[test]
+    fn a_model_source_converts_to_a_file_drafter() {
+        let source = ModelSource::File("drafter.gguf".into());
+        assert_eq!(
+            DrafterSource::from(source.clone()),
+            DrafterSource::File(source)
+        );
+    }
+
     /// A GPU backend that cannot find its adapter panics during setup; the
     /// caller must get that message, not an opaque "thread exited".
     #[tokio::test]
     async fn start_reports_a_panic_during_load() {
-        let err = LocalModel::start(32, || panic!("no Vulkan adapter found"))
+        let err = LocalModel::start(Arc::default(), || panic!("no Vulkan adapter found"))
             .await
             .unwrap_err();
         assert!(
@@ -1163,6 +1602,27 @@ mod tests {
             .err()
             .expect("Local without a model must not build");
         assert!(matches!(&err, CucaError::Config(m) if m == MODEL_REQUIRED));
+    }
+
+    /// The tiny vocabulary has a reasoning channel and the Gemma 4 tool
+    /// syntax; its template never reads `enable_thinking`, so reasoning cannot
+    /// be switched off.
+    #[tokio::test]
+    async fn capabilities_follow_the_format_and_the_template() {
+        let file = write_tiny_model();
+        let model = tiny_model(&file, 32).await;
+        let caps = model.capabilities();
+        assert!(caps.reasoning && caps.tools);
+        assert!(!caps.can_disable_thinking);
+        assert!(
+            ChatTemplate::new(
+                "{% if enable_thinking %}x{% endif %}".to_string(),
+                String::new(),
+                String::new()
+            )
+            .unwrap()
+            .reads_enable_thinking()
+        );
     }
 
     #[tokio::test]

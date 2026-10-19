@@ -1,26 +1,29 @@
-//! Chat prompt construction for the local Gemma 4 engine.
+//! Chat prompt construction for the local engine.
 //!
 //! [`chat_prompt`] maps a [`UnifiedRequest`] to the OpenAI-shaped `messages` and
-//! `tools` JSON the model's own Jinja chat template expects, and
-//! [`ChatTemplate`] renders that through minijinja. The template ships inside
-//! the GGUF (`tokenizer.chat_template`); its text is never modified here. Two
+//! `tools` JSON the model's own Jinja chat template expects,
+//! [`ChatTemplate`] renders that through minijinja, and [`ChatFormat`] derives
+//! from the GGUF what the output side needs: end-of-generation ids, reasoning
+//! markers and the tool-call syntax. The template ships inside the GGUF
+//! (`tokenizer.chat_template`); its text is never modified here (beyond
+//! neutralising HuggingFace's no-output `{% generation %}` tags). Two
 //! deliberate differences from the OpenAI wire mapping: tool-call `arguments`
-//! stay JSON objects (the template rejects strings), and `ImageBase64` blocks are
+//! stay JSON objects (templates reject strings), and `ImageBase64` blocks are
 //! refused because the engine is text-only.
 
-use minijinja::{Environment, Error, ErrorKind, Value, context};
+mod format;
+#[cfg(test)]
+mod golden;
+mod template;
+
+pub(crate) use self::format::{ChatFormat, ToolSyntax};
+pub(crate) use self::template::ChatTemplate;
+
 use serde_json::json;
 
 use crate::error::CucaError;
 use crate::request::UnifiedRequest;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
-
-/// Name under which the template is registered in the environment.
-const TEMPLATE_NAME: &str = "gemma4";
-/// Rendered text that closes a turn; a prompt ending here needs a model turn.
-const TURN_END: &str = "<turn|>\n";
-/// Opener appended when a rendered prompt ends with a closed turn.
-const MODEL_TURN: &str = "<|turn>model\n";
 
 /// Build a local-provider error.
 fn local_err(message: impl Into<String>) -> CucaError {
@@ -187,69 +190,11 @@ pub(crate) fn chat_prompt(req: &UnifiedRequest) -> Result<ChatPrompt, CucaError>
     })
 }
 
-/// A compiled Gemma 4 chat template.
-pub(crate) struct ChatTemplate {
-    /// Environment owning the compiled template.
-    env: Environment<'static>,
-    /// BOS text the template prepends (`<bos>`).
-    bos_token: String,
-}
-
-impl ChatTemplate {
-    /// Compile `source`, the Jinja chat template, for rendering with `bos_token`.
-    pub(crate) fn new(source: String, bos_token: String) -> Result<Self, CucaError> {
-        let template_err = |e: Error| local_err(format!("chat template: {e}"));
-        let mut env = Environment::new();
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
-        env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        env.add_function("raise_exception", |msg: String| -> Result<String, Error> {
-            Err(Error::new(ErrorKind::InvalidOperation, msg))
-        });
-        env.add_template_owned(TEMPLATE_NAME, source)
-            .map_err(template_err)?;
-        Ok(Self { env, bos_token })
-    }
-
-    /// Render `prompt` to the text fed to the tokenizer.
-    ///
-    /// The generation prompt is always requested; when the result still ends in
-    /// a closed turn (`<turn|>` plus newline), a model turn opener is appended.
-    pub(crate) fn render(&self, prompt: &ChatPrompt) -> Result<String, CucaError> {
-        let template_err = |e: Error| local_err(format!("chat template: {e}"));
-        let template = self.env.get_template(TEMPLATE_NAME).map_err(template_err)?;
-        let mut text = template
-            .render(context! {
-                messages => Value::from_serialize(&prompt.messages),
-                tools => Value::from_serialize(&prompt.tools),
-                add_generation_prompt => true,
-                enable_thinking => prompt.enable_thinking,
-                preserve_thinking => false,
-                bos_token => self.bos_token.as_str(),
-                eos_token => "<eos>",
-            })
-            .map_err(template_err)?;
-        if text.ends_with(TURN_END) {
-            text.push_str(MODEL_TURN);
-        }
-        Ok(text)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::request::ThinkingConfig;
     use crate::types::ToolDefinition;
-
-    /// The chat template embedded in the pinned GGUF (`tokenizer.chat_template` of
-    /// revision b4243c156154b6dca9324415f8c7ccc098b4aed1), byte-identical to
-    /// google/gemma-4-E2B-it `chat_template.jinja`; the engine renders this text.
-    const TEMPLATE: &str = include_str!("testdata/gemma4_chat_template.jinja");
-
-    fn template() -> ChatTemplate {
-        ChatTemplate::new(TEMPLATE.to_string(), "<bos>".to_string()).expect("template compiles")
-    }
 
     fn assistant_call(arguments: serde_json::Value) -> UnifiedMessage {
         UnifiedMessage {
@@ -428,138 +373,5 @@ mod tests {
             err.to_string()
                 .contains("the local engine is text-only; ImageBase64 blocks are not supported")
         );
-    }
-
-    #[test]
-    fn invalid_template_source_is_reported() {
-        let err = ChatTemplate::new("{% if %}".to_string(), "<bos>".to_string())
-            .err()
-            .expect("syntax error");
-        assert!(err.to_string().contains("chat template:"), "{err}");
-    }
-
-    #[test]
-    fn raise_exception_surfaces_as_a_template_error() {
-        let t = ChatTemplate::new(
-            "{{ raise_exception('boom') }}".to_string(),
-            "<bos>".to_string(),
-        )
-        .expect("compiles");
-        let prompt = chat_prompt(&UnifiedRequest::new("m")).expect("maps");
-        let err = t.render(&prompt).expect_err("raises");
-        assert!(err.to_string().contains("boom"), "{err}");
-    }
-
-    #[test]
-    fn closed_final_turn_gets_a_model_turn_appended() {
-        let source = "{{ 'x<turn|>\\n' }}".to_string();
-        let t = ChatTemplate::new(source, "<bos>".to_string()).expect("compiles");
-        let prompt = chat_prompt(&UnifiedRequest::new("m")).expect("maps");
-        assert_eq!(
-            t.render(&prompt).expect("renders"),
-            "x<turn|>\n<|turn>model\n"
-        );
-    }
-
-    /// The four golden requests, by case name.
-    fn golden_requests() -> Vec<(&'static str, UnifiedRequest)> {
-        let weather_tool = ToolDefinition {
-            name: "get_weather".into(),
-            description: "Look up the current weather".into(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "city": { "type": "string", "description": "City name" },
-                    "unit": { "type": "string", "enum": ["celsius", "fahrenheit"] },
-                },
-                "required": ["city"],
-            }),
-        };
-        let mut tool_turn = UnifiedRequest::new("m")
-            .add_user_message("What is the weather in Paris?")
-            .add_tool(weather_tool);
-        tool_turn.messages.push(UnifiedMessage {
-            role: MessageRole::Assistant,
-            content: vec![MessageContentBlock::ToolCall {
-                id: "call_1".into(),
-                name: "get_weather".into(),
-                arguments: json!({ "city": "Paris", "days": 3, "metric": true, "tags": ["a", "b"] }),
-            }],
-            name: None,
-            tool_call_id: None,
-        });
-        tool_turn.messages.push(UnifiedMessage {
-            role: MessageRole::Tool,
-            content: vec![MessageContentBlock::ToolResult {
-                tool_call_id: "call_1".into(),
-                output: "{\"temp\":18}".into(),
-            }],
-            name: Some("get_weather".into()),
-            tool_call_id: Some("call_1".into()),
-        });
-        let mut history = UnifiedRequest::new("m")
-            .add_system_message("You are a calculator.")
-            .add_user_message("What is 2+2?");
-        history.messages.push(UnifiedMessage::assistant("It is 4."));
-        history.messages.push(UnifiedMessage::user("And 3+3?"));
-        history.messages.push(UnifiedMessage::assistant("6."));
-        history.messages.push(UnifiedMessage::user("Thanks!"));
-        vec![
-            (
-                "system_user",
-                UnifiedRequest::new("m")
-                    .add_system_message("You are concise.")
-                    .add_user_message("Hello"),
-            ),
-            ("multi_turn", history),
-            ("tool_round_trip", tool_turn),
-            (
-                "thinking",
-                UnifiedRequest::new("m")
-                    .add_system_message("Reason carefully.")
-                    .add_user_message("Is 17 prime?")
-                    .with_thinking(ThinkingConfig::default()),
-            ),
-        ]
-    }
-
-    /// Expected renders, generated once with Python
-    /// `jinja2.sandbox.ImmutableSandboxedEnvironment(trim_blocks=True,
-    /// lstrip_blocks=True)` over the exact `messages`/`tools` JSON `chat_prompt`
-    /// produces for [`golden_requests`], with `bos_token="<bos>"`.
-    #[test]
-    fn golden_renders_match_reference_jinja() {
-        let expected: [(&str, &str); 4] = [
-            (
-                "system_user",
-                "<bos><|turn>system\nYou are concise.<turn|>\n<|turn>user\nHello<turn|>\n<|turn>model\n",
-            ),
-            (
-                "multi_turn",
-                "<bos><|turn>system\nYou are a calculator.<turn|>\n<|turn>user\nWhat is 2+2?<turn|>\n<|turn>model\nIt is 4.<turn|>\n<|turn>user\nAnd 3+3?<turn|>\n<|turn>model\n6.<turn|>\n<|turn>user\nThanks!<turn|>\n<|turn>model\n",
-            ),
-            (
-                "tool_round_trip",
-                "<bos><|turn>system\n<|tool>declaration:get_weather{description:<|\"|>Look up the current weather<|\"|>,parameters:{properties:{city:{description:<|\"|>City name<|\"|>,type:<|\"|>STRING<|\"|>},unit:{enum:[<|\"|>celsius<|\"|>,<|\"|>fahrenheit<|\"|>],type:<|\"|>STRING<|\"|>}},required:[<|\"|>city<|\"|>],type:<|\"|>OBJECT<|\"|>}}<tool|><turn|>\n<|turn>user\nWhat is the weather in Paris?<turn|>\n<|turn>model\n<|tool_call>call:get_weather{city:<|\"|>Paris<|\"|>,days:3,metric:true,tags:[<|\"|>a<|\"|>,<|\"|>b<|\"|>]}<tool_call|><|tool_response>response:get_weather{value:<|\"|>{\"temp\":18}<|\"|>}<tool_response|>",
-            ),
-            (
-                "thinking",
-                "<bos><|turn>system\n<|think|>\nReason carefully.<turn|>\n<|turn>user\nIs 17 prime?<turn|>\n<|turn>model\n",
-            ),
-        ];
-        let template = template();
-        for (name, req) in golden_requests() {
-            let want = expected
-                .iter()
-                .find(|(n, _)| *n == name)
-                .unwrap_or_else(|| panic!("no expectation for {name}"))
-                .1;
-            let prompt = chat_prompt(&req).expect("maps");
-            assert_eq!(
-                template.render(&prompt).expect("renders"),
-                want,
-                "case {name}"
-            );
-        }
     }
 }

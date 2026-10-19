@@ -94,6 +94,9 @@ path = "@/providers/lmstudio.md"
 [[extra.nav.items.children]]
 title = "Local (in-process)"
 path = "@/providers/local.md"
+[[extra.nav.items.children]]
+title = "Local models and formats"
+path = "@/providers/local-models.md"
 
 [[extra.nav]]
 label = "Plugins"
