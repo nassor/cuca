@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.5.2
+
+### Changed
+
+- Rust best-practices and performance review round: fewer clones and allocations in providers, the local engine, plugins and services.
+- Prompt-cache LRU eviction is now O(log n).
+- Lint suppressions moved to `#[expect]` with cleanups.
+
 ## 0.5.1
 
 ### Breaking
