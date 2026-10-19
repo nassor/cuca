@@ -1,10 +1,13 @@
 //! In-process Gemma 4 inference (`provider-local`).
 //!
-//! The engine is pure Rust on the CPU through candle 0.11: no llama.cpp, no FFI
+//! The engine is pure Rust: candle 0.11 on the CPU (the default), or burn
+//! 0.22 (CubeCL) on a GPU selected with [`LocalModelConfig::device`] and a
+//! `provider-local-{vulkan,metal,cuda,rocm}` feature. No llama.cpp, no FFI
 //! written by this crate, and no HTTP endpoint. (candle's dependency tree
-//! compiles a C crate, `onig_sys`, via `tokenizers`; cuca never calls it.)
-//! The model runs inside the application and is consumed
-//! through the library API only.
+//! compiles a C crate, `onig_sys`, via `tokenizers`, and CubeCL's compiles
+//! `simsimd` and `aegis`; cuca calls none of them. The CUDA and ROCm
+//! backends link a prebuilt LLVM.) The model runs inside the
+//! application and is consumed through the library API only.
 //!
 //! `LocalModel::load` resolves and loads the GGUF file and starts one engine
 //! thread; `CucaClientBuilder::with_local_model` attaches it to a client for
@@ -28,8 +31,9 @@
 //! - Single-slot FIFO engine: one request runs at a time, at most 16 queue
 //!   behind it (further callers wait), 64 output blocks buffered per request.
 //! - K/V cache memory is `context_length * 2 * 4 * sum(n_kv_head * head_dim)`
-//!   bytes over the layers that own K/V: `context_length * 36,864` for E2B
-//!   (302 MB at 8192), `context_length * 114,688` for E4B (939 MB at 8192).
+//!   bytes over the layers that own K/V, in RAM or device memory:
+//!   `context_length * 36,864` for E2B (302 MB at 8192),
+//!   `context_length * 114,688` for E4B (939 MB at 8192).
 //! - Per-layer embedding rows are read from disk per input token instead of
 //!   being held in RAM (5,040 bytes each and 1.32 GB saved in E2B Q4_0).
 //! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix.
@@ -43,6 +47,7 @@ mod sampler;
 mod tokenizer;
 
 use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -300,6 +305,115 @@ impl Default for SamplingConfig {
     }
 }
 
+/// Which GPU adapter a wgpu-backed device ([`LocalDevice::Vulkan`],
+/// [`LocalDevice::Metal`]) uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuAdapter {
+    /// The adapter the graphics API reports first (wgpu's default choice).
+    #[default]
+    Default,
+    /// The `n`-th discrete GPU, counting from 0.
+    Discrete(usize),
+    /// The `n`-th integrated GPU, counting from 0.
+    Integrated(usize),
+}
+
+/// Where a [`LocalModel`] runs its forward pass.
+///
+/// Every variant exists in every build; selecting a GPU backend whose cargo
+/// feature is off fails [`LocalModel::load`] with [`CucaError::Config`]
+/// naming the feature ([`LocalDevice::required_feature`]). The CPU runs on
+/// candle; the GPU backends run on burn (CubeCL). A device also parses from a
+/// string (`str::parse`, ASCII case-insensitive): `cpu`; `vulkan`,
+/// `vulkan:<n>` (the `n`-th discrete GPU) or `vulkan:integrated:<n>`;
+/// `metal` in the same three forms; `cuda` or `cuda:<n>`; `rocm` or
+/// `rocm:<n>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LocalDevice {
+    /// candle on the CPU (always available).
+    #[default]
+    Cpu,
+    /// burn's wgpu backend on Vulkan (`provider-local-vulkan`).
+    Vulkan(GpuAdapter),
+    /// burn's wgpu backend on Metal, Apple only at runtime
+    /// (`provider-local-metal`).
+    Metal(GpuAdapter),
+    /// burn's CUDA backend on the GPU with this index (`provider-local-cuda`).
+    Cuda(usize),
+    /// burn's ROCm (HIP) backend on the GPU with this index, Linux only
+    /// (`provider-local-rocm`).
+    Rocm(usize),
+}
+
+impl LocalDevice {
+    /// The cargo feature this device needs, `None` for [`LocalDevice::Cpu`].
+    pub fn required_feature(self) -> Option<&'static str> {
+        match self {
+            LocalDevice::Cpu => None,
+            LocalDevice::Vulkan(_) => Some("provider-local-vulkan"),
+            LocalDevice::Metal(_) => Some("provider-local-metal"),
+            LocalDevice::Cuda(_) => Some("provider-local-cuda"),
+            LocalDevice::Rocm(_) => Some("provider-local-rocm"),
+        }
+    }
+
+    /// Whether this build includes the backend the device needs.
+    fn is_compiled(self) -> bool {
+        match self {
+            LocalDevice::Cpu => true,
+            LocalDevice::Vulkan(_) => cfg!(feature = "provider-local-vulkan"),
+            LocalDevice::Metal(_) => cfg!(feature = "provider-local-metal"),
+            LocalDevice::Cuda(_) => cfg!(feature = "provider-local-cuda"),
+            LocalDevice::Rocm(_) => cfg!(feature = "provider-local-rocm"),
+        }
+    }
+}
+
+/// The [`CucaError::Config`] for a device whose backend is compiled out, or
+/// `None` when the device is available in this build.
+pub(crate) fn device_unavailable(device: LocalDevice) -> Option<CucaError> {
+    match device.required_feature() {
+        Some(feature) if !device.is_compiled() => Some(CucaError::Config(format!(
+            "device {device:?} requires the `{feature}` cargo feature"
+        ))),
+        _ => None,
+    }
+}
+
+/// Parses `cpu`, `vulkan[:<n>|:integrated:<n>]`, `metal[:<n>|:integrated:<n>]`,
+/// `cuda[:<n>]` or `rocm[:<n>]`, ASCII case-insensitive; see [`LocalDevice`].
+impl std::str::FromStr for LocalDevice {
+    type Err = CucaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let lower = s.to_ascii_lowercase();
+        let parts: Vec<&str> = lower.split(':').collect();
+        let index = |n: &str| n.parse::<usize>().ok();
+        let adapter = |rest: &[&str]| match rest {
+            [] => Some(GpuAdapter::Default),
+            [n] => index(n).map(GpuAdapter::Discrete),
+            ["integrated", n] => index(n).map(GpuAdapter::Integrated),
+            _ => None,
+        };
+        let device = match parts.split_first() {
+            Some((&"cpu", [])) => Some(LocalDevice::Cpu),
+            Some((&"vulkan", rest)) => adapter(rest).map(LocalDevice::Vulkan),
+            Some((&"metal", rest)) => adapter(rest).map(LocalDevice::Metal),
+            Some((&"cuda", [])) => Some(LocalDevice::Cuda(0)),
+            Some((&"cuda", [n])) => index(n).map(LocalDevice::Cuda),
+            Some((&"rocm", [])) => Some(LocalDevice::Rocm(0)),
+            Some((&"rocm", [n])) => index(n).map(LocalDevice::Rocm),
+            _ => None,
+        };
+        device.ok_or_else(|| {
+            CucaError::Config(format!(
+                "unknown local device `{s}`; expected cpu, vulkan[:<n>|:integrated:<n>], metal[...], cuda[:<n>] or rocm[:<n>]"
+            ))
+        })
+    }
+}
+
 /// Model download progress, reported to a [`DownloadProgressCallback`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DownloadProgress {
@@ -345,10 +459,13 @@ pub struct LocalModelConfig {
     /// cache capacity: it costs `context_length * 2 * 4 * sum(n_kv_head *
     /// head_dim)` bytes of RAM over the K/V-owning layers (E2B:
     /// `context_length * 36,864`; see [`LocalModel`]). Must be at least 1 and
-    /// at most the model's own maximum.
+    /// at most the model's own maximum. On a GPU device the cache lives in
+    /// device memory with the same size.
     pub context_length: usize,
     /// Default sampling parameters.
     pub sampling: SamplingConfig,
+    /// Where the forward pass runs; [`LocalDevice::Cpu`] by default.
+    pub device: LocalDevice,
     /// Optional download progress observer.
     pub on_download_progress: Option<DownloadProgressCallback>,
 }
@@ -361,6 +478,7 @@ impl Default for LocalModelConfig {
             hf_token: None,
             context_length: 8192,
             sampling: SamplingConfig::default(),
+            device: LocalDevice::Cpu,
             on_download_progress: None,
         }
     }
@@ -374,6 +492,7 @@ impl fmt::Debug for LocalModelConfig {
             .field("hf_token", &self.hf_token.as_ref().map(|_| "<redacted>"))
             .field("context_length", &self.context_length)
             .field("sampling", &self.sampling)
+            .field("device", &self.device)
             .field("on_download_progress", &self.on_download_progress)
             .finish()
     }
@@ -396,9 +515,9 @@ pub(crate) struct LocalModelInner {
 ///
 /// Load it with [`LocalModel::load`], attach it with
 /// `CucaClientBuilder::with_local_model`, and select
-/// `ProviderEndpoint::Local`. The model runs in this process on the CPU: no
-/// HTTP endpoint is involved. The engine thread ends once the last clone is
-/// dropped.
+/// `ProviderEndpoint::Local`. The model runs in this process, on the CPU or
+/// on the GPU [`LocalModelConfig::device`] selects: no HTTP endpoint is
+/// involved. The engine thread ends once the last clone is dropped.
 ///
 /// # Concurrency and memory
 ///
@@ -420,6 +539,11 @@ pub(crate) struct LocalModelInner {
 ///   per input token (5,040 bytes in E2B Q4_0) is read from the GGUF file,
 ///   usually from the OS page cache. Resident weights are therefore about
 ///   the file size minus that table (E2B Q4_0: 1.5 GB of 2.84 GB).
+/// - On a GPU device the weights and the K/V cache live in device memory.
+///   Q4_0 and Q8_0 weights stay quantized there; F32, F16 and BF16 weights
+///   (including `per_layer_model_proj`, 92 MB as f32 for E2B) are f32; any
+///   other weight dtype is rejected at load. Embedding rows are still read
+///   from the file on the host.
 ///
 /// # Behavior
 ///
@@ -437,7 +561,13 @@ pub(crate) struct LocalModelInner {
 /// candle selects its quantized SIMD kernels (Q4_0, Q8_0, ...) at compile
 /// time, so build for the host CPU, e.g. `RUSTFLAGS="-C target-cpu=native"
 /// cargo build --release --features provider-local`; generic builds are
-/// several times slower.
+/// several times slower. A GPU device needs its backend feature. Every GPU
+/// feature compiles C through CubeCL's dependencies (as `provider-local`
+/// already does for candle) and, on Windows, runs the SDK resource compiler;
+/// `provider-local-cuda` and `provider-local-rocm` also download and link a
+/// prebuilt LLVM on the first build (ROCm on Linux only). The first forward
+/// pass of each new input shape on a GPU is slow while CubeCL autotunes and
+/// compiles its kernels.
 #[derive(Clone)]
 pub struct LocalModel {
     inner: Arc<LocalModelInner>,
@@ -463,13 +593,16 @@ impl LocalModel {
     /// # Errors
     ///
     /// [`CucaError::Config`] for an invalid configuration (zero or oversized
-    /// `context_length`, non-finite `temperature`, `top_p` outside `(0, 1]`);
+    /// `context_length`, non-finite `temperature`, `top_p` outside `(0, 1]`,
+    /// a [`LocalDevice`] whose cargo feature is not enabled);
     /// [`CucaError::Io`] when the file is missing or unreadable or the thread
     /// cannot start; [`CucaError::Transport`] and [`CucaError::Http`] for
     /// download failures; [`CucaError::Provider`] for an unsupported or
     /// malformed GGUF file (another architecture, MoE, per-layer KV head
-    /// counts, a tensor dtype candle cannot read, a missing tensor or
-    /// metadata key) or a failed checksum.
+    /// counts, a tensor dtype candle cannot read, or on a GPU device a weight
+    /// dtype other than Q4_0, Q8_0, F32, F16 or BF16, a missing tensor or
+    /// metadata key), a failed checksum, or a GPU device that fails to
+    /// initialize (no such adapter, missing driver).
     pub async fn load(config: LocalModelConfig) -> Result<Self, CucaError> {
         validate(&config)?;
         let context_length = config.context_length;
@@ -494,7 +627,24 @@ impl LocalModel {
         std::thread::Builder::new()
             .name("cuca-local-engine".to_string())
             .spawn(move || {
-                let mut engine = match open() {
+                // GPU backends report a missing adapter or driver by
+                // panicking during device setup: catch it so the caller gets
+                // the message instead of a dead thread.
+                let opened = match catch_unwind(AssertUnwindSafe(open)) {
+                    Ok(opened) => opened,
+                    Err(payload) => {
+                        let msg = payload
+                            .downcast_ref::<&str>()
+                            .copied()
+                            .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+                            .unwrap_or("panic");
+                        Err(CucaError::provider(
+                            ProviderEndpoint::Local,
+                            format!("local engine failed to initialize: {msg}"),
+                        ))
+                    }
+                };
+                let mut engine = match opened {
                     Ok((engine, tokenizer, template)) => {
                         if ready_tx
                             .send(Ok((tokenizer, template, context_length)))
@@ -553,6 +703,9 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
         return Err(CucaError::Config(format!(
             "sampling.top_p must be in (0, 1], got {top_p}"
         )));
+    }
+    if let Some(e) = device_unavailable(config.device) {
+        return Err(e);
     }
     Ok(())
 }
@@ -906,6 +1059,72 @@ mod tests {
                 "{err}"
             );
         }
+    }
+
+    #[test]
+    fn local_device_parses_every_form() {
+        use GpuAdapter::{Default as Dflt, Discrete, Integrated};
+        for (text, device) in [
+            ("cpu", LocalDevice::Cpu),
+            (" CPU ", LocalDevice::Cpu),
+            ("vulkan", LocalDevice::Vulkan(Dflt)),
+            ("Vulkan:1", LocalDevice::Vulkan(Discrete(1))),
+            ("vulkan:integrated:0", LocalDevice::Vulkan(Integrated(0))),
+            ("metal", LocalDevice::Metal(Dflt)),
+            ("metal:2", LocalDevice::Metal(Discrete(2))),
+            ("METAL:Integrated:3", LocalDevice::Metal(Integrated(3))),
+            ("cuda", LocalDevice::Cuda(0)),
+            ("cuda:1", LocalDevice::Cuda(1)),
+            ("rocm", LocalDevice::Rocm(0)),
+            ("rocm:4", LocalDevice::Rocm(4)),
+        ] {
+            assert_eq!(text.parse::<LocalDevice>().unwrap(), device, "{text}");
+        }
+        for bad in [
+            "",
+            "gpu",
+            "cpu:0",
+            "vulkan:x",
+            "vulkan:integrated",
+            "vulkan:discrete:0",
+            "cuda:integrated:0",
+            "rocm:-1",
+            "metal:1:2",
+        ] {
+            let err = bad.parse::<LocalDevice>().unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains("unknown local device")),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "provider-local-vulkan"))]
+    #[tokio::test]
+    async fn validate_rejects_a_compiled_out_device() {
+        let config = LocalModelConfig {
+            device: LocalDevice::Vulkan(GpuAdapter::Default),
+            ..Default::default()
+        };
+        let err = LocalModel::load(config).await.unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("`provider-local-vulkan`")),
+            "{err}"
+        );
+    }
+
+    /// A GPU backend that cannot find its adapter panics during setup; the
+    /// caller must get that message, not an opaque "thread exited".
+    #[tokio::test]
+    async fn start_reports_a_panic_during_load() {
+        let err = LocalModel::start(32, || panic!("no Vulkan adapter found"))
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("local engine failed to initialize: no Vulkan adapter found"),
+            "{err}"
+        );
     }
 
     #[tokio::test]

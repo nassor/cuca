@@ -36,11 +36,11 @@ use candle_core::quantized::gguf_file;
 use tokio::sync::mpsc;
 
 use super::chat::ChatTemplate;
-use super::gemma4::{Gemma4, prefill_chunk};
+use super::gemma4::{Gemma4, Model, prefill_chunk};
 use super::output::{Markers, OutputParser};
 use super::sampler::{SplitMix64, random_seed, sample};
 use super::tokenizer::Tokenizer;
-use super::{LocalModelConfig, SamplingConfig};
+use super::{LocalDevice, LocalModelConfig, SamplingConfig};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
 use crate::request::{PromptCacheUsage, TokenUsage};
@@ -66,7 +66,7 @@ pub(crate) struct Job {
 
 /// The model plus the state that survives between jobs.
 pub(crate) struct Engine {
-    model: Gemma4,
+    model: Model,
     tokenizer: Arc<Tokenizer>,
     markers: Markers,
     sampling: SamplingConfig,
@@ -98,14 +98,21 @@ impl Engine {
     /// Read the GGUF file at `path` and build the engine, the tokenizer and
     /// the chat template from it.
     ///
+    /// The model lands on `config.device`: candle on the CPU, or burn on a
+    /// GPU. Either way it is owned by the calling (engine) thread for its
+    /// whole life; burn's device streams are per thread, so every forward
+    /// pass runs on the thread that loaded the weights.
+    ///
     /// # Errors
     ///
     /// [`CucaError::Io`] when the file cannot be opened or read,
     /// [`CucaError::Config`] when `config.context_length` exceeds the model
-    /// maximum, and [`CucaError::Provider`] for a file that is not a GGUF
-    /// file candle can parse (for example an unsupported tensor dtype such as
-    /// an IQ quantization), an unsupported checkpoint (wrong architecture,
-    /// MoE), a missing tensor or metadata key, or an unusable tokenizer.
+    /// maximum or `config.device` is compiled out, and
+    /// [`CucaError::Provider`] for a file that is not a GGUF file candle can
+    /// parse (for example an unsupported tensor dtype such as an IQ
+    /// quantization), an unsupported checkpoint (wrong architecture, MoE, a
+    /// weight dtype the GPU engine does not read), a missing tensor or
+    /// metadata key, or an unusable tokenizer.
     pub(crate) fn open(
         path: &Path,
         config: &LocalModelConfig,
@@ -136,7 +143,22 @@ impl Engine {
             )));
         }
 
-        let model = Gemma4::load(&content, path, config.context_length)?;
+        let model = match config.device {
+            LocalDevice::Cpu => Model::Cpu(Gemma4::load(&content, path, config.context_length)?),
+            #[cfg(feature = "provider-local-gpu")]
+            device => Model::Gpu(super::gemma4::gpu::GpuGemma4::load(
+                &content,
+                path,
+                config.context_length,
+                device,
+            )?),
+            #[cfg(not(feature = "provider-local-gpu"))]
+            device => {
+                return Err(super::device_unavailable(device).unwrap_or_else(|| {
+                    CucaError::Config(format!("device {device:?} is not available"))
+                }));
+            }
+        };
         let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
         let eos_id = md_u32(&content.metadata, "tokenizer.ggml.eos_token_id")?;
         let bos_id = md_u32(&content.metadata, "tokenizer.ggml.bos_token_id")?;
@@ -353,7 +375,7 @@ pub(crate) mod testing {
     ) -> Engine {
         let tokenizer = Arc::new(tiny_tokenizer());
         Engine {
-            model: load(model, context_length),
+            model: Model::Cpu(load(model, context_length)),
             markers: Markers::from_tokenizer(&tokenizer, 1).unwrap(),
             tokenizer,
             sampling: SamplingConfig {

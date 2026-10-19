@@ -1,5 +1,68 @@
 # Changelog
 
+## Unreleased
+
+### Breaking
+
+- `LocalModelConfig` has a new field, `device: LocalDevice` (default
+  `LocalDevice::Cpu`). Code that builds `LocalModelConfig` with an exhaustive
+  struct literal, without `..Default::default()`, must set it.
+
+### Added
+
+- `provider-local` runs on a GPU through burn 0.22 / CubeCL. Five new cargo
+  features: `provider-local-gpu` (the shared GPU engine; it selects no backend
+  alone) and `provider-local-vulkan`, `provider-local-metal`,
+  `provider-local-cuda` and `provider-local-rocm`, each of which enables
+  `provider-local-gpu` plus the matching burn backend. The graphics backends
+  (wgpu: SPIR-V for Vulkan, MSL for Metal) are Rust, but every GPU feature
+  compiles C: CubeCL's runtime pulls an embedded store (`turso`) that builds C
+  through `cc`, and on Windows a dependency's build script runs the SDK
+  resource compiler (`rc.exe`; `windres` on the GNU target). Metal runs on
+  Apple only but compiles everywhere.
+  CUDA and ROCm pull cubecl's LLVM backend: its build script downloads a
+  prebuilt LLVM on the first build (network needed once, cached) and links it
+  statically, and ROCm is Linux-only. The CPU path is unchanged (candle 0.11,
+  same API and throughput), and nothing selects a GPU automatically.
+- `LocalDevice` (`Cpu` default, `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`,
+  `Cuda(usize)`, `Rocm(usize)`) and `GpuAdapter` (`Default`,
+  `Discrete(usize)`, `Integrated(usize)`), re-exported from the crate root
+  under `provider-local`. `LocalDevice::required_feature` names the cargo
+  feature a device needs, and `LocalDevice` parses from `cpu`, `vulkan`,
+  `vulkan:<n>`, `vulkan:integrated:<n>`, the same three forms for `metal`, and
+  `cuda`, `cuda:<n>`, `rocm`, `rocm:<n>` (ASCII case-insensitive). Select one
+  with `LocalModelConfig::device`. Every variant exists in every build:
+  selecting a GPU whose feature is off fails `LocalModel::load` with a
+  `CucaError::Config` before any thread starts.
+- A GPU that cannot be opened (no adapter, missing driver) fails
+  `LocalModel::load` with a `CucaError::Provider`. The engine thread now
+  catches a panic during load and reports it as
+  `local engine failed to initialize: <message>` instead of the opaque
+  "local engine thread exited during load".
+- GPU weight dtypes: matmul weights must be Q4_0, Q8_0, F32, F16 or BF16.
+  Q4_0 and Q8_0 are repacked at load into burn's block-quantized layout and
+  stay quantized in device memory; float weights are uploaded as f32. Any other
+  dtype (K-quants, Q4_1, Q5_x) fails the load with an error naming the tensor;
+  the CPU still reads those. All four published presets qualify. Device memory
+  is about the file size minus the per-layer embedding table (still read from
+  the file per token on the host), except `per_layer_model_proj`, which is held
+  as f32 (92 MB for E2B), plus the K/V cache at the CPU formula.
+- GPU activations stay in f32, while candle's CPU quantized matmul rounds
+  activations to Q8_0, so GPU and CPU logits differ slightly; the greedy
+  outputs of the live suite are identical. On Windows with an AMD RX 9070 XT
+  over Vulkan, all five live `tests/provider_local.rs` scenarios pass. Metal,
+  CUDA and ROCm are compile-checked only.
+- `CUCA_LOCAL_DEVICE` (`LocalDevice` syntax) is read by `tests/provider_local.rs`
+  and `examples/local_gemma.rs`, not by the library, to set
+  `LocalModelConfig::device`; the example prints the device it loaded on. The
+  unit test `gpu_tiny_model_matches_cpu` runs only when it names a GPU.
+- docs.rs and CI feature lists: `[package.metadata.docs.rs]` lists every feature
+  explicitly instead of `all-features`, omitting `provider-local-cuda` and
+  `provider-local-rocm` (docs.rs builds have no network for the LLVM download).
+  CI uses the same list (`ALL_NO_LLVM`) in place of `--all-features` for
+  clippy, test and doc, and a new job, `local_gpu_llvm`, checks the CUDA and
+  ROCm features on Linux.
+
 ## 0.5.0
 
 ### Breaking

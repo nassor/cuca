@@ -1,5 +1,8 @@
 //! Gemma 4 dense (`gemma4` architecture) forward pass on candle CPU tensors,
-//! loaded from a GGUF file.
+//! loaded from a GGUF file. The burn GPU engine (`gpu`, `provider-local-gpu`)
+//! reproduces it on a device and shares the host-side pieces here
+//! ([`Gemma4Params`], [`RowTable`], RoPE tables, masks); [`Model`] is what
+//! the engine holds.
 //!
 //! Every dimension comes from the GGUF metadata and tensor shapes (layer
 //! count, widths, head counts and dimensions, per-layer FFN width, vocabulary,
@@ -67,6 +70,9 @@ use candle_nn::rotary_emb::rope;
 
 use crate::error::CucaError;
 use crate::types::ProviderEndpoint;
+
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) mod gpu;
 
 /// GGUF tensor names: the one table of the Gemma 4 naming scheme. Per-layer
 /// names are `blk.{layer}.{part}.weight`.
@@ -571,9 +577,14 @@ impl TokenEmbedding {
     }
 }
 
-/// The per-layer embedding table, read row by row from the GGUF file instead
-/// of being held in memory.
-struct PleTable {
+/// A 2-D tensor read row by row from the GGUF file instead of being held in
+/// memory: the per-layer embedding table on every device, and the token
+/// embedding lookups of the GPU engine.
+pub(crate) struct RowTable {
+    /// GGUF tensor name, for error messages.
+    tensor: &'static str,
+    /// What the rows are, for error messages ("per-layer embedding table").
+    label: &'static str,
     file: File,
     base: u64,
     dtype: GgmlDType,
@@ -583,19 +594,65 @@ struct PleTable {
     buf: Vec<u8>,
 }
 
-impl PleTable {
+impl RowTable {
+    /// Index the `[rows, row_len]` tensor `tensor` of the GGUF file at
+    /// `path`; no row is read yet.
+    pub(crate) fn open(
+        path: &Path,
+        content: &gguf_file::Content,
+        tensor: &'static str,
+        label: &'static str,
+        row_len: usize,
+    ) -> Result<Self, CucaError> {
+        let info = tensor_info(content, tensor)?;
+        let dims = info.shape.dims();
+        if dims.len() != 2 || dims[1] != row_len {
+            return Err(err(format!(
+                "tensor `{tensor}`: expected shape [rows, {row_len}], found {dims:?}"
+            )));
+        }
+        let dtype = info.ggml_dtype;
+        if !row_len.is_multiple_of(dtype.block_size()) {
+            return Err(err(format!(
+                "tensor `{tensor}`: row length {row_len} is not a multiple of the {dtype:?} block size {}",
+                dtype.block_size()
+            )));
+        }
+        let row_bytes = row_len / dtype.block_size() * dtype.type_size();
+        let base = content.tensor_data_offset + info.offset;
+        let file = File::open(path)?;
+        let end = base + (dims[0] * row_bytes) as u64;
+        if file.metadata()?.len() < end {
+            return Err(err(format!(
+                "tensor `{tensor}` extends past the end of the file: truncated GGUF"
+            )));
+        }
+        Ok(Self {
+            tensor,
+            label,
+            file,
+            base,
+            dtype,
+            rows: dims[0],
+            row_len,
+            row_bytes,
+            buf: vec![0u8; row_bytes],
+        })
+    }
+
     /// Rows of `tokens`, concatenated and multiplied by `scale`.
-    fn rows(&mut self, tokens: &[u32], scale: f32) -> Result<Vec<f32>, CucaError> {
+    pub(crate) fn rows(&mut self, tokens: &[u32], scale: f32) -> Result<Vec<f32>, CucaError> {
+        let tensor = self.tensor;
         let io_err = |e: std::io::Error| CucaError::Io {
-            message: format!("reading per-layer embeddings: {e}"),
+            message: format!("reading `{tensor}` rows: {e}"),
         };
         let mut out = vec![0f32; tokens.len() * self.row_len];
         for (&id, dst) in tokens.iter().zip(out.chunks_exact_mut(self.row_len)) {
             let id = id as usize;
             if id >= self.rows {
                 return Err(err(format!(
-                    "token id {id} outside the per-layer embedding table of {} rows",
-                    self.rows
+                    "token id {id} outside the {} of {} rows",
+                    self.label, self.rows
                 )));
             }
             self.file
@@ -606,6 +663,18 @@ impl PleTable {
         }
         Ok(out)
     }
+}
+
+/// The index entry of `tensor_name`, without reading its data.
+fn tensor_info<'a>(
+    content: &'a gguf_file::Content,
+    tensor_name: &str,
+) -> Result<&'a gguf_file::TensorInfo, CucaError> {
+    content.tensor_infos.get(tensor_name).ok_or_else(|| {
+        err(format!(
+            "tensor `{tensor_name}`: missing from the GGUF file"
+        ))
+    })
 }
 
 /// Weights of one transformer block.
@@ -644,6 +713,9 @@ struct KvCache {
 struct Loader<'a> {
     content: &'a gguf_file::Content,
     reader: BufReader<File>,
+    /// Hold matmul weights as dequantized f32 instead of quantized (test
+    /// reference only: candle's quantized matmul rounds activations to Q8).
+    dequantize: bool,
 }
 
 impl Loader<'_> {
@@ -662,8 +734,17 @@ impl Loader<'_> {
     }
 
     fn matmul(&mut self, tensor_name: &str, shape: &[usize]) -> Result<QMatMul, CucaError> {
-        let qt = self.qtensor(tensor_name, shape)?;
-        QMatMul::from_arc(Arc::new(qt)).map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
+        let qt = Arc::new(self.qtensor(tensor_name, shape)?);
+        self.to_matmul(qt, tensor_name)
+    }
+
+    fn to_matmul(&self, qt: Arc<QTensor>, tensor_name: &str) -> Result<QMatMul, CucaError> {
+        let matmul = if self.dequantize {
+            qt.dequantize(&Device::Cpu).map(QMatMul::Tensor)
+        } else {
+            QMatMul::from_arc(qt)
+        };
+        matmul.map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
     }
 
     fn vector(&mut self, tensor_name: &str, len: usize) -> Result<Tensor, CucaError> {
@@ -682,15 +763,7 @@ impl Loader<'_> {
 
     /// Shape of a tensor from the file's index, without reading its data.
     fn shape(&self, tensor_name: &str) -> Result<&[usize], CucaError> {
-        self.content
-            .tensor_infos
-            .get(tensor_name)
-            .map(|info| info.shape.dims())
-            .ok_or_else(|| {
-                err(format!(
-                    "tensor `{tensor_name}`: missing from the GGUF file"
-                ))
-            })
+        tensor_info(self.content, tensor_name).map(|info| info.shape.dims())
     }
 }
 
@@ -699,7 +772,7 @@ pub(crate) struct Gemma4 {
     params: Gemma4Params,
     context_length: usize,
     embed: TokenEmbedding,
-    ple: PleTable,
+    ple: RowTable,
     ple_proj: QMatMul,
     ple_proj_norm: Tensor,
     layers: Vec<LayerWeights>,
@@ -727,6 +800,26 @@ impl Gemma4 {
         path: &Path,
         context_length: usize,
     ) -> Result<Self, CucaError> {
+        Self::load_with(content, path, context_length, false)
+    }
+
+    /// [`Gemma4::load`] with every matmul weight dequantized to f32: the
+    /// exact-arithmetic reference the GPU engine is compared against.
+    #[cfg(all(test, feature = "provider-local-gpu"))]
+    pub(crate) fn load_dequantized(
+        content: &gguf_file::Content,
+        path: &Path,
+        context_length: usize,
+    ) -> Result<Self, CucaError> {
+        Self::load_with(content, path, context_length, true)
+    }
+
+    fn load_with(
+        content: &gguf_file::Content,
+        path: &Path,
+        context_length: usize,
+        dequantize: bool,
+    ) -> Result<Self, CucaError> {
         let params = Gemma4Params::from_metadata(&content.metadata)?;
         if context_length == 0 || context_length > params.model_ctx {
             return Err(CucaError::Config(format!(
@@ -737,6 +830,7 @@ impl Gemma4 {
         let mut loader = Loader {
             content,
             reader: BufReader::new(File::open(path)?),
+            dequantize,
         };
         let p = &params;
 
@@ -763,54 +857,17 @@ impl Gemma4 {
             rows: vocab,
             row_len: p.n_embd,
         };
-        let lm_head = QMatMul::from_arc(embd)
-            .map_err(|e| err(format!("tensor `{}`: {e}", name::TOKEN_EMBD)))?;
+        let lm_head = loader.to_matmul(embd, name::TOKEN_EMBD)?;
 
         // Per-layer embeddings: index only; rows are read on demand.
         let ple_row_len = p.n_layer * p.ple_dim;
-        let ple_info = content
-            .tensor_infos
-            .get(name::PER_LAYER_TOKEN_EMBD)
-            .ok_or_else(|| {
-                err(format!(
-                    "tensor `{}`: missing from the GGUF file",
-                    name::PER_LAYER_TOKEN_EMBD
-                ))
-            })?;
-        let ple_dims = ple_info.shape.dims();
-        if ple_dims.len() != 2 || ple_dims[1] != ple_row_len {
-            return Err(err(format!(
-                "tensor `{}`: expected shape [rows, {ple_row_len}], found {ple_dims:?}",
-                name::PER_LAYER_TOKEN_EMBD
-            )));
-        }
-        let ple_dtype = ple_info.ggml_dtype;
-        if !ple_row_len.is_multiple_of(ple_dtype.block_size()) {
-            return Err(err(format!(
-                "tensor `{}`: row length {ple_row_len} is not a multiple of the {ple_dtype:?} block size {}",
-                name::PER_LAYER_TOKEN_EMBD,
-                ple_dtype.block_size()
-            )));
-        }
-        let ple_row_bytes = ple_row_len / ple_dtype.block_size() * ple_dtype.type_size();
-        let ple_base = content.tensor_data_offset + ple_info.offset;
-        let ple_file = File::open(path)?;
-        let ple_end = ple_base + (ple_dims[0] * ple_row_bytes) as u64;
-        if ple_file.metadata()?.len() < ple_end {
-            return Err(err(format!(
-                "tensor `{}` extends past the end of the file: truncated GGUF",
-                name::PER_LAYER_TOKEN_EMBD
-            )));
-        }
-        let ple = PleTable {
-            file: ple_file,
-            base: ple_base,
-            dtype: ple_dtype,
-            rows: ple_dims[0],
-            row_len: ple_row_len,
-            row_bytes: ple_row_bytes,
-            buf: vec![0u8; ple_row_bytes],
-        };
+        let ple = RowTable::open(
+            path,
+            content,
+            name::PER_LAYER_TOKEN_EMBD,
+            "per-layer embedding table",
+            ple_row_len,
+        )?;
         let ple_proj = loader.matmul(name::PER_LAYER_MODEL_PROJ, &[ple_row_len, p.n_embd])?;
         let ple_proj_norm = loader.vector(name::PER_LAYER_PROJ_NORM, p.ple_dim)?;
         let output_norm = loader.vector(name::OUTPUT_NORM, p.n_embd)?;
@@ -1093,6 +1150,53 @@ impl Gemma4 {
             .get(il)
             .and_then(Option::as_ref)
             .ok_or_else(|| candle_core::Error::msg(format!("layer {il} owns no K/V cache")))
+    }
+}
+
+/// The loaded model on the device `LocalModelConfig::device` selected: candle
+/// on the CPU, or burn on a GPU. Both expose the same two calls the engine
+/// makes.
+// One `Model` exists per engine, so the size gap between the variants costs
+// nothing worth a box.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum Model {
+    Cpu(Gemma4),
+    #[cfg(feature = "provider-local-gpu")]
+    Gpu(gpu::GpuGemma4),
+}
+
+impl Model {
+    /// See [`Gemma4::forward`].
+    pub(crate) fn forward(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want_logits: bool,
+    ) -> Result<Option<Vec<f32>>, CucaError> {
+        match self {
+            Model::Cpu(m) => m.forward(tokens, start_pos, want_logits),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.forward(tokens, start_pos, want_logits),
+        }
+    }
+
+    /// See [`Gemma4::truncate_cache`].
+    pub(crate) fn truncate_cache(&mut self, len: usize) {
+        match self {
+            Model::Cpu(m) => m.truncate_cache(len),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.truncate_cache(len),
+        }
+    }
+
+    /// Number of cached positions (test-only).
+    #[cfg(test)]
+    pub(crate) fn cache_len(&self) -> usize {
+        match self {
+            Model::Cpu(m) => m.cache_len(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.cache_len(),
+        }
     }
 }
 

@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Twenty-six features, all opt-in: eight providers, twelve plugins, six services</dd>
+<dd>Thirty-one features, all opt-in: eight providers, five <code>provider-local</code> GPU features, twelve plugins, six services</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -40,6 +40,18 @@ that `cargo check --no-default-features` fails.
 | `provider-vllm` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-lmstudio` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-local` | `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:tokio`, `reqwest/rustls` |
+| `provider-local-gpu` | `provider-local`, `dep:burn` |
+| `provider-local-vulkan` | `provider-local-gpu`, `burn/vulkan` |
+| `provider-local-metal` | `provider-local-gpu`, `burn/metal` |
+| `provider-local-cuda` | `provider-local-gpu`, `burn/cuda` |
+| `provider-local-rocm` | `provider-local-gpu`, `burn/rocm` |
+
+`provider-local-gpu` is the shared GPU engine and selects no backend by itself;
+each backend feature enables it. None of the five is a provider: the provider gate
+counts only the eight `provider-*` adapters, and `provider-local` alone still runs
+the model on the CPU. `LocalDevice` and `GpuAdapter` exist in every `provider-local`
+build; selecting a backend whose feature is off fails `LocalModel::load` with a
+`CucaError::Config`.
 
 ## Plugin features
 
@@ -116,11 +128,22 @@ wire types, the SSE parser and the response stream contract.
 | `half` | `2` | default | `provider-local` |
 | `minijinja` | `2.24` | `loader` | `provider-local` |
 | `minijinja-contrib` | `2.24` | `pycompat` | `provider-local` |
+| `burn` | `0.22` | `std`, `fusion`, `autotune`; `default-features = false` | `provider-local-gpu` (backends: `burn/vulkan`, `burn/metal`, `burn/cuda`, `burn/rocm`) |
 
 `reqwest` is declared with `default-features = false`, so TLS arrives only
 through the `reqwest/rustls` entry that every provider feature and
 `plugin-web-search` carries. `candle-core` hard-depends on `tokenizers[onig]`,
-so `provider-local` also compiles C (`onig_sys`).
+so `provider-local` also compiles C (`onig_sys`). `burn` is declared with
+`default-features = false` because its defaults enable the optimizer and autodiff,
+which inference never uses. The graphics backends behind `provider-local-vulkan` and
+`provider-local-metal` are Rust (wgpu: SPIR-V, MSL), but every GPU feature compiles C:
+CubeCL's runtime pulls an embedded store (`turso`) that builds C through `cc`, and on
+Windows a dependency's build script runs the SDK resource compiler (`rc.exe`; `windres`
+on the GNU target). `provider-local-cuda` and `provider-local-rocm` pull
+cubecl's LLVM backend: its build script, `tracel-llvm-bundler`, downloads a prebuilt
+LLVM on the first build (network needed once, then cached) and links it statically,
+and ROCm (HIP bindings) is Linux-only. docs.rs builds have no network, so the
+`[package.metadata.docs.rs]` feature list names every feature except those two.
 `jsonschema` is declared with
 `default-features = false` because guardrails compiles inline schemas only and
 needs no `$ref` retrieval. `postcard` is declared with
@@ -177,11 +200,17 @@ need one or more plugin or service features on top, because what they demonstrat
 
 | Job | Feature list |
 |---|---|
-| `clippy`, `test` | `--no-default-features --features provider-openai`, and `--all-features` |
+| `clippy`, `test` | `--no-default-features --features provider-openai`, and `--no-default-features --features $ALL_NO_LLVM` |
 | `no_provider` | `--no-default-features`, asserted to fail |
-| `doc` | `--all-features` |
+| `doc` | `--no-default-features --features $ALL_NO_LLVM` |
+| `local_gpu_llvm` | `--all-targets --no-default-features --features provider-local-cuda,provider-local-rocm`, `cargo check` on ubuntu; the only job that downloads the LLVM bundle |
 | `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per each of the twelve plugin features |
 | `service_solo` | `--no-default-features --features provider-openai,<service>`, once per each of the six service features |
 | `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, references `crate::services`, or imports one of the `plugins::` paths the five moved modules left behind |
+
+`ALL_NO_LLVM` is a top-level `env` entry in `.github/workflows/ci.yml` (the same
+list as the docs.rs feature set): every feature except `provider-local-cuda` and
+`provider-local-rocm`. The run steps expand it as `$ALL_NO_LLVM`, and it replaces
+`--all-features` in the `clippy`, `test` and `doc` jobs.
 
 Next page: [Error types](@/reference/errors.md).

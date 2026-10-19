@@ -1,6 +1,6 @@
 +++
 title = "Local (in-process)"
-description = "The provider-local adapter: Gemma 4 (E2B, E4B, any dense gemma4 GGUF) on the CPU inside your process, engine code in pure Rust. Model presets, source and download, configuration, concurrency, memory and behavior."
+description = "The provider-local adapter: Gemma 4 (E2B, E4B, any dense gemma4 GGUF) on the CPU or a GPU (Vulkan, Metal, CUDA, ROCm) inside your process, engine code in pure Rust. Model presets, source and download, configuration, running on a GPU, concurrency, memory and behavior."
 template = "page.html"
 weight = 8
 +++
@@ -9,9 +9,9 @@ weight = 8
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Runs a dense Gemma 4 GGUF (E2B or E4B, Q4_0 or Q8_0 presets; any <code>gemma4</code> file loads) on the CPU inside your process, through candle, with no server and no HTTP endpoint.</dd>
+<dd>Runs a dense Gemma 4 GGUF (E2B or E4B, Q4_0 or Q8_0 presets; any <code>gemma4</code> file loads) on the CPU or a GPU inside your process, with no server and no HTTP endpoint. The CPU path uses candle; the GPU path uses burn and CubeCL.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature, disk for the one-time download (2.84 GB for the default E2B Q4_0, up to 8.03 GB for E4B Q8_0) or a GGUF file you already have, and RAM of roughly 2 GB (E2B Q4_0) to 6 GB (E4B Q8_0) including the K/V cache.</dd>
+<dd>The <code>provider-local</code> feature (CPU), or one of <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> and <code>provider-local-rocm</code> to run on a GPU; disk for the one-time download (2.84 GB for the default E2B Q4_0, up to 8.03 GB for E4B Q8_0) or a GGUF file you already have; and memory of roughly 2 GB (E2B Q4_0) to 6 GB (E4B Q8_0) including the K/V cache, in RAM on the CPU or in device memory on a GPU.</dd>
 <dt>Read this if</dt>
 <dd>You are routing requests through <code>ProviderEndpoint::Local</code>, or want a model with no external service to run.</dd>
 </dl>
@@ -75,15 +75,22 @@ CUCA_LOCAL_MODEL=gemma4-e4b-q4_0 RUSTFLAGS="-C target-cpu=native" cargo run --re
 
 | Fact | Value |
 |---|---|
-| Feature flag | `provider-local` |
+| Feature flag | `provider-local`; GPU: `provider-local-vulkan`, `provider-local-metal`, `provider-local-cuda`, `provider-local-rocm` (each enables `provider-local-gpu`, the shared GPU engine) |
+| Device | `LocalModelConfig::device`; `LocalDevice::Cpu` by default, no automatic selection |
 | `ProviderEndpoint` variant | `Local` |
 | Attached with | `CucaClientBuilder::with_local_model`; `build` fails without it |
 | Network use | only the one-time model download from Hugging Face |
-| Dependencies it owns | `candle-core` and `candle-nn` (0.11), `half`, `minijinja`, `minijinja-contrib`; it reuses `reqwest`, `sha2` and `tokio`, and does not use `tokio-stream` |
+| Dependencies it owns | `candle-core` and `candle-nn` (0.11), `half`, `minijinja`, `minijinja-contrib`; with a GPU feature also `burn` 0.22 (`std`, `fusion`, `autotune`); it reuses `reqwest`, `sha2` and `tokio`, and does not use `tokio-stream` |
 
 candle-core 0.11 hard-depends on `tokenizers[onig]`, so the dependency tree
 compiles C (`onig_sys`); the feature needs a C compiler.
 cuca never calls that crate; the engine code is pure Rust.
+
+Every GPU feature compiles C and needs a C compiler on top of the one `onig_sys`
+already requires: CubeCL's runtime pulls an embedded store (`turso`) that builds C,
+and on Windows a dependency's build script runs the SDK resource compiler (`rc.exe`;
+`windres` on the GNU target). `provider-local-cuda` and `provider-local-rocm`
+additionally link a prebuilt LLVM; see *Running on a GPU*.
 
 ## Choosing a model
 
@@ -96,7 +103,8 @@ the K-quants Q2_K to Q6_K), and the token and per-layer embedding tables in any
 of those. It rejects, with a `CucaError::Provider` that names the cause, another
 architecture, a Mixture-of-Experts checkpoint (`gemma4.expert_count` above 0),
 per-layer KV head counts that differ, key and value lengths that differ, and
-IQ-family quantizations (candle has no kernels for them).
+IQ-family quantizations (candle has no kernels for them). These are the CPU rules;
+a GPU device accepts fewer matrix-weight dtypes (see *Running on a GPU*).
 
 `LocalModelConfig::source` is a `ModelSource`. The presets are pinned to one
 Hugging Face commit and one SHA-256 each, and downloaded from the `ggml-org`
@@ -186,6 +194,7 @@ file lands at `<cache>/huggingface/<repo with / as -->/<revision>/<file>`.
 | `hf_token` | `None` | Hugging Face token; `None` falls back to `HF_TOKEN` |
 | `context_length` | `8192` | maximum prompt plus completion tokens per request, and the K/V cache size |
 | `sampling` | `SamplingConfig::default()` | default sampling parameters |
+| `device` | `LocalDevice::Cpu` | where the model runs; a GPU needs its cargo feature, see *Running on a GPU* |
 | `on_download_progress` | `None` | download progress observer |
 
 `SamplingConfig` defaults to `temperature` 1.0, `top_k` 64, `top_p` 0.95 and no
@@ -193,12 +202,105 @@ fixed seed. With `seed: Some(n)`, every request restarts the generator from the
 seed, so equal prompts sample equal tokens. `temperature` of `0.0` is greedy.
 
 `LocalModel::load` returns `CucaError::Config` for an invalid configuration (a
-zero or oversized `context_length`, a non-finite `temperature`, or a `top_p`
-outside `(0, 1]`), `CucaError::Io` for a missing or unreadable file,
+zero or oversized `context_length`, a non-finite `temperature`, a `top_p`
+outside `(0, 1]`, or a `device` whose cargo feature is not compiled in),
+`CucaError::Io` for a missing or unreadable file,
 `CucaError::Transport` or `CucaError::Http` for download failures, and
 `CucaError::Provider` for an unsupported or malformed GGUF file (another
 architecture, MoE, per-layer KV head counts, a tensor dtype candle cannot read,
-a missing tensor or metadata key) or a failed checksum.
+a missing tensor or metadata key), a failed checksum, or a GPU that cannot be
+opened or a weight dtype the GPU engine does not take.
+
+## Running on a GPU
+
+The model runs on the CPU unless `LocalModelConfig::device` says otherwise. A GPU
+device runs the forward pass through burn 0.22 and CubeCL, with the same math as
+the CPU engine; the CPU path (candle 0.11, same API, same throughput) is
+unchanged. The CPU stays the default: nothing selects a GPU for you, so callers
+opt in. The engine thread owns the device.
+
+| Feature | Backend | Build |
+|---|---|---|
+| `provider-local-gpu` | the shared GPU engine; selects no backend by itself | enabled by each feature below |
+| `provider-local-vulkan` | Vulkan | wgpu with SPIR-V shaders (Rust); C compiler needed, plus `rc.exe` on Windows |
+| `provider-local-metal` | Metal | wgpu with MSL shaders (Rust); C compiler needed, plus `rc.exe` on Windows; runs on Apple only, compiles everywhere |
+| `provider-local-cuda` | CUDA | links a prebuilt LLVM, which a build script downloads on the first build (network needed once, then cached) |
+| `provider-local-rocm` | ROCm | the same LLVM download; ROCm (HIP bindings) is Linux-only |
+
+Each backend feature enables `provider-local` and `provider-local-gpu`, so
+`cargo add cuca --features provider-local-vulkan` is enough. The GPU drivers
+themselves are system libraries loaded at runtime (the Vulkan loader, for
+example); the engine code stays pure Rust, with no HTTP endpoint and no llama.cpp.
+
+```rust,name=Running on a GPU
+use cuca::{GpuAdapter, LocalDevice, LocalModel, LocalModelConfig};
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Same model and the same API as on the CPU; only the device changes.
+    let model = LocalModel::load(LocalModelConfig {
+        device: LocalDevice::Vulkan(GpuAdapter::Default),
+        ..Default::default()
+    })
+    .await?;
+    println!("{model:?}");
+    Ok(())
+}
+```
+
+`LocalDevice` is `Cpu` (the default), `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`,
+`Cuda(usize)` or `Rocm(usize)`; `GpuAdapter` is `Default`, `Discrete(usize)` or
+`Integrated(usize)`. It also parses from text (ASCII case-insensitive), so
+`"vulkan:1".parse::<LocalDevice>()?` works:
+
+| Text | Device |
+|---|---|
+| `cpu` | `Cpu` |
+| `vulkan`, `metal` | `Vulkan(GpuAdapter::Default)`, `Metal(GpuAdapter::Default)` |
+| `vulkan:<n>`, `metal:<n>` | the n-th discrete GPU: `Discrete(n)` |
+| `vulkan:integrated:<n>`, `metal:integrated:<n>` | the n-th integrated GPU: `Integrated(n)` |
+| `cuda`, `cuda:<n>` | `Cuda(n)`; bare `cuda` is device 0 |
+| `rocm`, `rocm:<n>` | `Rocm(n)`; bare `rocm` is device 0 |
+
+Any other text is a `CucaError::Config` ("unknown local device ...").
+`LocalDevice::required_feature` returns the cargo feature a device needs
+(`None` for `Cpu`).
+
+- **Memory.** Device memory is about the file size minus the per-layer embedding
+  table. That table is never uploaded: its rows are still read from the GGUF file
+  per token on the host, as on the CPU. The token embedding is uploaded once as the
+  tied LM head, while embedding lookups read rows from the file on the host.
+  `per_layer_model_proj` is BF16 in the files and is held as f32 (92 MB for E2B).
+  The K/V cache lives in device memory with the same formula as on the CPU (see
+  *Concurrency and memory*; 302 MB at 8192 for E2B), and the RoPE tables are on
+  the device. E2B Q4_0 is about 1.5 GB of weights plus the K/V cache.
+- **Weight dtypes.** Matmul weights must be Q4_0, Q8_0, F32, F16 or BF16. Q4_0
+  and Q8_0 are repacked at load into burn's block-quantized layout and stay
+  quantized in device memory (dequantized inside the matmul kernel); float
+  weights are uploaded as f32. Any other dtype (K-quants, Q4_1, Q5_x) fails the
+  load with an error naming the tensor; the CPU reads those. All four published
+  presets qualify.
+- **Errors.** Every `LocalDevice` variant exists in every build. Selecting a GPU
+  whose feature is off fails `LocalModel::load` with a `CucaError::Config`, for
+  example ``device Vulkan(Default) requires the `provider-local-vulkan` cargo
+  feature``, before any thread starts. A GPU that cannot be opened (no adapter, a
+  missing driver) fails with a `CucaError::Provider`, either
+  `device ...: <wgpu error>` or, for a backend that panics during setup,
+  `local engine failed to initialize: <message>`: the engine thread catches
+  panics during load.
+- **Numerics.** GPU kernels keep activations in f32, while candle's CPU quantized
+  matmul rounds activations to Q8_0, so GPU and CPU logits differ slightly. On the
+  live test suite the greedy outputs are identical.
+- **Speed.** One machine: Windows, an AMD RX 9070 XT over Vulkan, E2B Q4_0, a
+  release build, steady state after the autotune warm-up, measured about 80 to 99
+  tokens/s of prefill and about 26 to 28 tokens/s of decode. The CPU path on the
+  same machine (`target-cpu=native`) measured about 70 to 85 and 27 to 29: on a
+  fast desktop CPU the GPU path is at parity, not ahead, and it frees the CPU. The
+  first forward pass of each new shape is slow: CubeCL autotune and shader
+  compilation take seconds.
+- **What was run.** Vulkan was exercised on that machine, where all five live
+  scenarios of `tests/provider_local.rs` pass with the same outputs as on the CPU.
+  Metal, CUDA and ROCm are compile-checked only.
 
 ## Concurrency and memory
 
@@ -222,6 +324,9 @@ a missing tensor or metadata key) or a failed checksum.
   loaded: one row per input token (5,040 bytes in E2B Q4_0) is read from the GGUF
   file, usually from the OS page cache. Resident weights are therefore about the
   file size minus that table, 1.5 GB of the 2.84 GB E2B Q4_0 file.
+- **GPU.** On a GPU device the weights and the K/V cache are in device memory
+  instead of RAM, at the sizes described in *Running on a GPU*; the engine and
+  its queue behave the same.
 - **Cloning.** A `LocalModel` is cheap to clone, and every clone shares the one
   engine thread. The thread ends when the last clone is dropped.
 
@@ -252,4 +357,22 @@ turns the skip into a panic.
 ```bash
 CUCA_LOCAL_DOWNLOAD=1 RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local
 CUCA_LOCAL_MODEL=gemma4-e4b-q4_0 RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local
+```
+
+Set `CUCA_LOCAL_DEVICE` (the `LocalDevice` text form above) to run the same
+scenarios on a GPU. The variable is read only by this test file and by
+`examples/local_gemma.rs`, not by the library, and a GPU device needs its feature:
+
+```bash
+CUCA_LOCAL_DEVICE=vulkan CUCA_LOCAL_DOWNLOAD=1 cargo test --release --features provider-local-vulkan --test provider_local
+CUCA_LOCAL_DEVICE=vulkan cargo run --release --example local_gemma --features provider-local-vulkan
+```
+
+The example prints `loaded on <device>`. The unit test `gpu_tiny_model_matches_cpu`
+compares the GPU engine to a dequantized-weight CPU reference on a tiny random
+model. It runs only when `CUCA_LOCAL_DEVICE` names a GPU, and otherwise prints
+`SKIP: set CUCA_LOCAL_DEVICE to a GPU device`:
+
+```bash
+CUCA_LOCAL_DEVICE=vulkan cargo test --release --no-default-features --features provider-local-vulkan --lib gpu_tiny_model_matches_cpu
 ```

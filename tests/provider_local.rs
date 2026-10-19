@@ -1,6 +1,6 @@
 //! Live tests for the in-process `provider-local` Gemma 4 engine.
 //!
-//! These run the real model on the CPU, so they need a Gemma 4 GGUF file:
+//! These run the real model in-process, so they need a Gemma 4 GGUF file:
 //!
 //! - `CUCA_LOCAL_MODEL_PATH=<file.gguf>` loads an existing file (any dense
 //!   `gemma4` checkpoint), or
@@ -13,11 +13,17 @@
 //!
 //! `CUCA_LOCAL_MODEL_PATH` wins when several are set. With none set, every
 //! test prints `SKIP: local model not available: ...` and passes, unless
-//! `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build for the host CPU,
-//! since candle's SIMD kernels are chosen at compile time:
+//! `CUCA_REQUIRE_LIVE=1` turns the skip into a panic.
+//!
+//! `CUCA_LOCAL_DEVICE` selects where the model runs (`LocalDevice` syntax):
+//! `cpu` (the default), `vulkan`, `vulkan:<n>`, `metal`, `cuda[:<n>]` or
+//! `rocm[:<n>]`; a GPU device needs its feature
+//! (`--features provider-local-vulkan`, ...). Build for the host CPU, since
+//! candle's SIMD kernels are chosen at compile time:
 //!
 //! ```sh
 //! CUCA_LOCAL_MODEL=gemma4-e4b-q4_0 RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local
+//! CUCA_LOCAL_DEVICE=vulkan CUCA_LOCAL_DOWNLOAD=1 cargo test --release --features provider-local-vulkan --test provider_local
 //! ```
 //!
 //! One model is loaded for the whole binary and the tests take turns on its
@@ -69,6 +75,14 @@ async fn model() -> Option<LocalModel> {
             let source = model_source()?;
             let config = LocalModelConfig {
                 source,
+                device: std::env::var("CUCA_LOCAL_DEVICE")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse()
+                            .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={s:?}: {e}"))
+                    })
+                    .unwrap_or_default(),
                 on_download_progress: Some(DownloadProgressCallback::new(|p| {
                     eprint!(
                         "\rdownloading: {} / {:?} bytes",

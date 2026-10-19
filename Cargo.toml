@@ -10,10 +10,42 @@ license = "Apache-2.0"
 authors = ["Nassor Frazier-Silva <nassor@gmail.com>"]
 
 # docs.rs builds with default features; default = [] would trip the lib.rs
-# no-provider compile_error, so the docs build enables everything. CI already
-# validates the --all-features build point.
+# no-provider compile_error, so the docs build enables an explicit feature list:
+# every feature except provider-local-cuda and provider-local-rocm, whose build
+# scripts download a prebuilt LLVM bundle (docs.rs builds have no network).
+# CI validates this same feature point (ALL_NO_LLVM in ci.yml).
 [package.metadata.docs.rs]
-all-features = true
+features = [
+    "provider-openai",
+    "provider-anthropic",
+    "provider-gemini",
+    "provider-deepseek",
+    "provider-llamacpp",
+    "provider-vllm",
+    "provider-lmstudio",
+    "provider-local",
+    "provider-local-gpu",
+    "provider-local-vulkan",
+    "provider-local-metal",
+    "plugin-mcp",
+    "plugin-sandbox",
+    "plugin-memory",
+    "plugin-guardrails",
+    "plugin-subagent",
+    "plugin-hitl",
+    "plugin-web-search",
+    "plugin-skills",
+    "plugin-telemetry",
+    "plugin-session-log",
+    "plugin-redaction",
+    "plugin-cost",
+    "service-entity-extraction",
+    "service-prompt-cache",
+    "service-rate-limit",
+    "service-replay",
+    "service-speculative",
+    "service-vector-store",
+]
 
 # The provider gate in lib.rs fails the plain lib build cargo performs for the
 # doctest pass, and this crate has no doctests, so that pass is disabled.
@@ -64,6 +96,20 @@ provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 # no HTTP endpoint, no llama.cpp. reqwest is used only for the one-time model download
 # (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file.
 provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:tokio", "reqwest/rustls"]
+# provider-local GPU backends (burn 0.22 / CubeCL). provider-local-gpu is the shared
+# engine; it selects no backend by itself and is enabled by each backend feature.
+# The graphics backends are Rust (wgpu: SPIR-V for vulkan, MSL for metal), but
+# CubeCL's runtime pulls an embedded store (turso) that compiles C (simsimd, aegis;
+# provider-local already needs a C compiler) and, on Windows, runs the SDK resource
+# compiler (rc.exe; windres on GNU) in a build script.
+# cuda/rocm link a prebuilt LLVM that tracel-llvm-bundler downloads on first build
+# (network required; excluded from docs.rs and from the CI all-features jobs; rocm
+# runs on Linux only).
+provider-local-gpu = ["provider-local", "dep:burn"]
+provider-local-vulkan = ["provider-local-gpu", "burn/vulkan"]
+provider-local-metal = ["provider-local-gpu", "burn/metal"]
+provider-local-cuda = ["provider-local-gpu", "burn/cuda"]
+provider-local-rocm = ["provider-local-gpu", "burn/rocm"]
 # Essential agentic & infrastructural capability plugins: each implements CucaPlugin
 # and runs on the request pipeline. The tier is flat — no plugin feature enables
 # another plugin feature, and none may name a service-* feature.
@@ -162,6 +208,10 @@ candle-nn = { version = "0.11.0", optional = true, default-features = false }
 half = { version = "2", optional = true }
 minijinja = { version = "2.24", optional = true, features = ["loader"] }
 minijinja-contrib = { version = "2.24", optional = true, features = ["pycompat"] }
+# provider-local-gpu: burn (CubeCL) runs the forward pass on a GPU. burn's `default`
+# features enable `optim`/`autodiff`, which inference never uses; the backend itself is
+# chosen by the provider-local-{vulkan,metal,cuda,rocm} features.
+burn = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune"] }
 
 # Test-only deps for the integration suite: `ctor` runs the `--mcp-echo-server`
 # interceptor in tests/plugin_mcp.rs before libtest's main (that test binary

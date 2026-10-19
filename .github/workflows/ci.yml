@@ -6,6 +6,12 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+# Every feature except provider-local-cuda and provider-local-rocm, whose builds
+# download a prebuilt LLVM bundle (checked alone in local_gpu_llvm). The same
+# list is the docs.rs feature set in Cargo.toml. Matrix values reference it as
+# $ALL_NO_LLVM, which the run step's shell expands.
+env:
+  ALL_NO_LLVM: "provider-openai,provider-anthropic,provider-gemini,provider-deepseek,provider-llamacpp,provider-vllm,provider-lmstudio,provider-local,provider-local-gpu,provider-local-vulkan,provider-local-metal,plugin-mcp,plugin-sandbox,plugin-memory,plugin-guardrails,plugin-subagent,plugin-hitl,plugin-web-search,plugin-skills,plugin-telemetry,plugin-session-log,plugin-redaction,plugin-cost,service-entity-extraction,service-prompt-cache,service-rate-limit,service-replay,service-speculative,service-vector-store"
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -18,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: ["--no-default-features --features provider-openai", "--all-features"]
+        features: ["--no-default-features --features provider-openai", "--no-default-features --features $ALL_NO_LLVM"]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -34,7 +40,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        features: ["--no-default-features --features provider-openai", "--all-features"]
+        features: ["--no-default-features --features provider-openai", "--no-default-features --features $ALL_NO_LLVM"]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -46,7 +52,17 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo doc --no-deps --all-features
+      - run: cargo doc --no-deps --no-default-features --features "$ALL_NO_LLVM"
+  local_gpu_llvm:
+    # The only job that builds the CUDA and ROCm backends: their build scripts
+    # download a prebuilt LLVM (tracel-llvm-bundler) and ROCm's HIP bindings
+    # build on Linux only.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --no-default-features --features provider-local-cuda,provider-local-rocm
   plugin_solo:
     runs-on: ubuntu-latest
     strategy:

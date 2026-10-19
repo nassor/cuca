@@ -45,8 +45,10 @@ without it a skipped test is indistinguishable from a passing one.
 `--test-threads=1` serialises the run because every live test talks to the same
 single `llama-server` instance.
 
-`--all-features` compiles the same set plus the six unused provider features. It
-works, and no additional test runs as a result.
+`--all-features` compiles the same set plus the other provider features, including
+`provider-local` and its GPU features. `provider-local-cuda` and `provider-local-rocm`
+download a prebuilt LLVM on the first build (and ROCm is Linux-only), which is why
+CI's own all-features points leave those two out. No additional test runs as a result.
 
 ## Step 3: read the skips
 
