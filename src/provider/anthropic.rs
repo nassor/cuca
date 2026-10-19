@@ -83,6 +83,11 @@ pub enum AnthropicAuth {
 /// `HeaderMap`: dynamic values (key, token, betas) may be invalid HTTP header
 /// values, and this crate's non-test code never panics, so they surface as
 /// [`CucaError::Config`] instead of being dropped or panicking.
+///
+/// # Errors
+///
+/// [`CucaError::Config`] when the key, token, or a beta value is not a valid
+/// HTTP header value.
 pub fn headers(auth: &AnthropicAuth, betas: &[&str]) -> Result<HeaderMap, CucaError> {
     let mut map = HeaderMap::new();
     map.insert(
@@ -177,6 +182,10 @@ fn pkce_challenge(verifier: &str) -> String {
 /// Deviation: the result is `Result<PkcePair, CucaError>`; `getrandom` can
 /// fail (no OS entropy source), and this crate's non-test code never panics,
 /// so the failure surfaces as [`CucaError::Io`].
+///
+/// # Errors
+///
+/// [`CucaError::Io`] when the OS entropy source is unavailable.
 #[cfg(feature = "provider-anthropic")]
 #[cfg_attr(
     not(test),
@@ -260,14 +269,18 @@ pub async fn exchange_code(
 /// scopes joined by `+`. Values are expected to be URL-safe (client ids are
 /// plain tokens, the challenge is base64url, state is caller-chosen).
 #[cfg(feature = "provider-anthropic")]
-#[cfg_attr(not(test), allow(dead_code))]
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "PKCE helper: only the test suite calls it so far")
+)]
 pub fn authorization_url(cfg: &OAuthPkceConfig, challenge: &str, state: &str) -> String {
     let mut url = format!(
         "{}?response_type=code&client_id={}&code_challenge={}&code_challenge_method=S256&state={}",
         cfg.authorize_url, cfg.client_id, challenge, state
     );
     if !cfg.scopes.is_empty() {
-        url.push_str(&format!("&scope={}", cfg.scopes.join("+")));
+        url.push_str("&scope=");
+        url.push_str(&cfg.scopes.join("+"));
     }
     url
 }
@@ -297,17 +310,22 @@ pub fn authorization_url(cfg: &OAuthPkceConfig, challenge: &str, state: &str) ->
 ///
 /// Deviation: auth headers are the [`headers`] function's concern, not the
 /// body builder's, so `build_anthropic_request` takes only the request.
+///
+/// # Errors
+///
+/// [`CucaError::Config`] when a prompt-cache breakpoint cannot be represented
+/// (see `cache_marks`).
 pub fn build_anthropic_request(req: &UnifiedRequest) -> Result<serde_json::Value, CucaError> {
     let marks = cache_marks(req)?;
     // `(text, cache-marked)` per system text block, in unified order.
-    let mut system: Vec<(String, bool)> = Vec::new();
+    let mut system: Vec<(&str, bool)> = Vec::new();
     let mut messages: Vec<serde_json::Value> = Vec::new();
     for (message_index, msg) in req.messages.iter().enumerate() {
         match msg.role {
             MessageRole::System => {
                 for (block_index, block) in msg.content.iter().enumerate() {
                     if let MessageContentBlock::Text(text) = block {
-                        system.push((text.clone(), marks.contains(&(message_index, block_index))));
+                        system.push((text.as_str(), marks.contains(&(message_index, block_index))));
                     }
                 }
             }
@@ -394,9 +412,9 @@ pub fn build_anthropic_request(req: &UnifiedRequest) -> Result<serde_json::Value
                 })
             })
             .collect();
-        body.insert("tools".to_string(), serde_json::json!(tools));
+        body.insert("tools".to_string(), serde_json::Value::Array(tools));
     }
-    body.insert("messages".to_string(), serde_json::json!(messages));
+    body.insert("messages".to_string(), serde_json::Value::Array(messages));
     Ok(serde_json::Value::Object(body))
 }
 
@@ -489,10 +507,10 @@ fn cache_marks(req: &UnifiedRequest) -> Result<HashSet<(usize, usize)>, CucaErro
 
 /// Render the `system` body value: the existing joined scalar unless a system
 /// breakpoint requires array-form text blocks.
-fn system_value(system: &[(String, bool)]) -> serde_json::Value {
+fn system_value(system: &[(&str, bool)]) -> serde_json::Value {
     if !system.iter().any(|(_, marked)| *marked) {
-        let joined: Vec<&str> = system.iter().map(|(text, _)| text.as_str()).collect();
-        return serde_json::json!(joined.join("\n"));
+        let joined: Vec<&str> = system.iter().map(|(text, _)| *text).collect();
+        return serde_json::Value::String(joined.join("\n"));
     }
     serde_json::Value::Array(
         system

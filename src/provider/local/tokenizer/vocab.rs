@@ -57,7 +57,7 @@ impl Vocab {
     ///
     /// Fails when the counts differ or the vocabulary does not fit 32-bit ids and
     /// offsets. Empty pieces are kept by id but are not findable by text.
-    pub(super) fn new(pieces: Vec<String>, types: Vec<i32>) -> Result<Self, CucaError> {
+    pub(super) fn new<S: AsRef<str>>(pieces: &[S], types: Vec<i32>) -> Result<Self, CucaError> {
         if pieces.len() != types.len() {
             return Err(local_err(format!(
                 "tokenizer has {} tokens but {} token types",
@@ -65,19 +65,18 @@ impl Vocab {
                 types.len()
             )));
         }
-        let total: usize = pieces.iter().map(String::len).sum();
+        let total: usize = pieces.iter().map(|p| p.as_ref().len()).sum();
         if u32::try_from(total).is_err() || pieces.len() >= EMPTY as usize {
             return Err(local_err("tokenizer vocabulary is too large"));
         }
         let mut text = String::with_capacity(total);
         let mut offsets = Vec::with_capacity(pieces.len() + 1);
         offsets.push(0);
-        for piece in &pieces {
-            text.push_str(piece);
+        for piece in pieces {
+            text.push_str(piece.as_ref());
             // `total` fits `u32`, checked above.
             offsets.push(text.len() as u32);
         }
-        drop(pieces);
 
         let slots = (offsets.len() * 2).next_power_of_two().max(8);
         let mut vocab = Self {
@@ -158,7 +157,7 @@ impl Vocab {
 
     /// Whether `id` is a control or unknown token.
     pub(super) fn is_control(&self, id: u32) -> bool {
-        matches!(self.token_type(id), Some(TYPE_CONTROL) | Some(TYPE_UNKNOWN))
+        matches!(self.token_type(id), Some(TYPE_CONTROL | TYPE_UNKNOWN))
     }
 }
 
@@ -177,8 +176,8 @@ mod tests {
 
     #[test]
     fn lookups_and_duplicates() {
-        let pieces = ["a", "b", "a", "", "<0x41>"].map(String::from).to_vec();
-        let v = Vocab::new(pieces, vec![1, 1, 1, 1, 6]).expect("valid");
+        let pieces = ["a", "b", "a", "", "<0x41>"];
+        let v = Vocab::new(&pieces, vec![1, 1, 1, 1, 6]).expect("valid");
         assert_eq!(v.len(), 5);
         assert_eq!(v.get("a"), Some(0), "first duplicate wins");
         assert_eq!(v.get("b"), Some(1));
@@ -195,6 +194,6 @@ mod tests {
 
     #[test]
     fn count_mismatch_is_an_error() {
-        assert!(Vocab::new(vec!["a".into()], vec![]).is_err());
+        assert!(Vocab::new(&["a"], vec![]).is_err());
     }
 }

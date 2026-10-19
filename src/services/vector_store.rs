@@ -104,7 +104,9 @@
 //! scored vector, then only the k survivors are sorted. Per query the store
 //! allocates one embedding `Vec` (skipped by
 //! [`InMemoryVectorStore::retrieve_embedding`]), one scored `Vec` of 16-byte
-//! tuples, and k message clones. Nothing else.
+//! `(score, entry index)` pairs, and k message clones. Nothing else. Entries
+//! sit in insertion order, so a higher index is a newer sequence and breaks
+//! score ties without a second key in the scored pair.
 //!
 //! Scores and ranking are bit-deterministic for a given build: lane order and
 //! accumulator order are fixed and the horizontal sum is a fixed-order tree
@@ -148,9 +150,6 @@
 //! nothing here can leak a turn to disk on CUCA's behalf.
 
 use std::collections::VecDeque;
-// Formatting straight into the output `String` instead of through a temporary
-// one. `write!` on a `String` cannot fail, so the `Result` is discarded rather
-// than unwrapped (this crate never panics outside tests).
 use std::fmt::Write as _;
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
@@ -712,8 +711,8 @@ impl InMemoryVectorStore {
     ) -> Result<RetrievalReport, VectorStoreError> {
         let dimensions = self.config.dimensions;
         let state = self.read_state()?;
-        // (score, sequence, index): 16 bytes, one allocation per query.
-        let mut scored: Vec<(f32, u64, usize)> = Vec::with_capacity(state.entries.len());
+        // (score, entry index): 16 bytes, one allocation per query.
+        let mut scored: Vec<(f32, usize)> = Vec::with_capacity(state.entries.len());
         for (index, entry) in state.entries.iter().enumerate() {
             // `Arc<str>` derefs to `str`, so the filter compares bytes and
             // allocates nothing.
@@ -726,11 +725,12 @@ impl InMemoryVectorStore {
             // A zero-norm entry is stored as zeros, so it scores 0.0 with no
             // branch in the hot loop.
             let score = dot(query, &state.arena[start..start + dimensions]);
-            scored.push((score, entry.sequence, index));
+            scored.push((score, index));
         }
         let scanned = scored.len();
-        let rank =
-            |a: &(f32, u64, usize), b: &(f32, u64, usize)| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1));
+        // Entries are in insertion order, so a higher index is a higher
+        // sequence: the index is the newest-first tiebreak.
+        let rank = |a: &(f32, usize), b: &(f32, usize)| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1));
         if scored.len() > k {
             // O(n) partition, then sort only the survivors: O(n + k log k).
             scored.select_nth_unstable_by(k - 1, rank);
@@ -739,12 +739,12 @@ impl InMemoryVectorStore {
         scored.sort_unstable_by(rank);
         let turns = scored
             .into_iter()
-            .filter_map(|(score, sequence, index)| {
+            .filter_map(|(score, index)| {
                 let entry = state.entries.get(index)?;
                 Some(RetrievedTurn {
                     message: entry.message.clone(),
                     score,
-                    sequence,
+                    sequence: entry.sequence,
                     session_hint: entry.session_hint.to_string(),
                 })
             })
@@ -800,21 +800,25 @@ impl VectorStore for InMemoryVectorStore {
         let kept = &turns[skipped..];
         let dimensions = self.config.dimensions;
         let mut staged: Vec<f32> = Vec::with_capacity(kept.len() * dimensions);
-        let mut zero_norms: Vec<bool> = Vec::with_capacity(kept.len());
+        // Cloned here, not at the commit, so the write lock never waits on a
+        // message copy.
+        let mut pending: Vec<(UnifiedMessage, bool)> = Vec::with_capacity(kept.len());
         for turn in kept {
             let mut vector = self.embedder.embed(&text_projection(turn))?;
             self.check_width(vector.len())?;
-            zero_norms.push(!normalize_in_place(&mut vector)?);
+            let zero_norm = !normalize_in_place(&mut vector)?;
             staged.extend_from_slice(&vector);
+            pending.push((turn.clone(), zero_norm));
         }
         // One allocation per batch; each entry keeps a refcount, not a copy.
         let hint: Arc<str> = Arc::from(session_hint);
 
-        let mut state = self.write_state()?;
+        let mut guard = self.write_state()?;
+        let state = &mut *guard;
         // The head never reached the arena, but the cap is what dropped it, so
         // it is an eviction like any other.
         state.evicted += skipped as u64;
-        for ((index, turn), zero_norm) in kept.iter().enumerate().zip(zero_norms) {
+        for (index, (message, zero_norm)) in pending.into_iter().enumerate() {
             let row = &staged[index * dimensions..(index + 1) * dimensions];
             let victim = if state.entries.len() >= self.config.max_entries {
                 state.entries.pop_front()
@@ -845,7 +849,7 @@ impl VectorStore for InMemoryVectorStore {
             let sequence = state.next_sequence;
             state.next_sequence += 1;
             state.entries.push_back(StoredTurn {
-                message: turn.clone(),
+                message,
                 slot,
                 zero_norm,
                 sequence,

@@ -38,10 +38,11 @@ pub enum ThinkingEffort {
 }
 
 /// Provider-specific thinking parameters: knobs with no unified equivalent.
-#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "provider", content = "params", rename_all = "snake_case")]
 pub enum ThinkingParams {
     /// No provider-specific parameters; the unified effort alone applies.
+    #[default]
     None,
     /// Anthropic: legacy budget mode (`type: "enabled"`) or the newer
     /// adaptive mode (`type: "adaptive"`).
@@ -65,13 +66,6 @@ pub enum ThinkingParams {
         /// Overrides the unified-effort map verbatim when `Some`.
         reasoning_effort: Option<String>,
     },
-}
-
-impl Default for ThinkingParams {
-    /// No provider-specific parameters by default.
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Optional thinking capability on a request.
@@ -144,22 +138,17 @@ pub struct PromptCacheBreakpoint {
 /// Treat the JSON as sensitive data; do not log or publish it. CUCA does not
 /// encrypt, redact, or write it. The caller owns access control, encryption,
 /// storage, and deletion.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum PromptCacheDirective {
-    /// Do not request provider prompt caching.
+    /// Do not request provider prompt caching; the default unless caching is
+    /// explicitly requested.
+    #[default]
     Disabled,
     /// Request ephemeral caching at the ordered content locations.
     Ephemeral {
         /// Breakpoints at which the provider may cache prompt content.
         breakpoints: Vec<PromptCacheBreakpoint>,
     },
-}
-
-impl Default for PromptCacheDirective {
-    /// Prompt caching is disabled unless explicitly requested.
-    fn default() -> Self {
-        Self::Disabled
-    }
 }
 
 /// Normalized provider prompt-cache token usage.

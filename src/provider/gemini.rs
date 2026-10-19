@@ -146,7 +146,7 @@ pub fn build_generate_content_body(req: &UnifiedRequest) -> Result<serde_json::V
             serde_json::json!({ "role": role, "parts": parts })
         })
         .collect();
-    body.insert("contents".to_string(), serde_json::json!(contents));
+    body.insert("contents".to_string(), serde_json::Value::Array(contents));
     if !req.tools.is_empty() {
         let declarations: Vec<serde_json::Value> = req
             .tools

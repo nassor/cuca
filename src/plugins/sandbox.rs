@@ -325,13 +325,14 @@ fn write_out(mut caller: Caller<'_, SandboxStoreData>, ptr: i32, len: i32) -> wa
     let end = start
         .checked_add(count)
         .ok_or_else(|| wasmtime::Error::msg("write_out: pointer overflow"))?;
-    let bytes = memory
-        .data(&caller)
+    // One copy, straight from guest memory into `stdout`: the split borrow
+    // lets the guest slice and the store data coexist, so no intermediate
+    // `Vec` is needed per call.
+    let (guest, state) = memory.data_and_store_mut(&mut caller);
+    let bytes = guest
         .get(start..end)
-        .ok_or_else(|| wasmtime::Error::msg("write_out: memory range out of bounds"))?
-        .to_vec();
-    let output_end = caller
-        .data()
+        .ok_or_else(|| wasmtime::Error::msg("write_out: memory range out of bounds"))?;
+    let output_end = state
         .stdout
         .len()
         .checked_add(bytes.len())
@@ -339,7 +340,7 @@ fn write_out(mut caller: Caller<'_, SandboxStoreData>, ptr: i32, len: i32) -> wa
     if output_end > MAX_OUTPUT_BYTES {
         return Err(wasmtime::Error::msg("write_out: output limit exceeded"));
     }
-    caller.data_mut().stdout.extend_from_slice(&bytes);
+    state.stdout.extend_from_slice(bytes);
     Ok(())
 }
 

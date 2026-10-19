@@ -28,8 +28,10 @@ use serde::{Serialize, Serializer};
 /// Object keys are sorted at every depth; arrays keep their order. The output
 /// is a single string value, so any format that can encode a string can carry
 /// it.
+#[cfg(any(feature = "plugin-session-log", feature = "service-prompt-cache"))]
 pub(crate) struct CanonicalValue<'a>(pub(crate) &'a serde_json::Value);
 
+#[cfg(any(feature = "plugin-session-log", feature = "service-prompt-cache"))]
 impl Serialize for CanonicalValue<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serde_json::to_string(&SortedKeys(self.0))
@@ -40,22 +42,23 @@ impl Serialize for CanonicalValue<'_> {
 
 /// Emits `value` with object keys sorted at every depth.
 ///
-/// Separate from [`CanonicalValue`] because this shape writes structured JSON,
-/// while [`CanonicalValue`] wraps the finished text in a string.
-struct SortedKeys<'a>(&'a serde_json::Value);
+/// Writes structured JSON; `CanonicalValue` wraps the finished text in a
+/// string instead. `crate::export` serializes through this directly.
+pub(crate) struct SortedKeys<'a>(pub(crate) &'a serde_json::Value);
 
 impl Serialize for SortedKeys<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self.0 {
             serde_json::Value::Object(map) => {
                 use serde::ser::SerializeMap;
-                // Sorting borrowed keys avoids rebuilding the map: only the
-                // pointer vector is allocated, never a second Value tree.
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort_unstable();
-                let mut out = serializer.serialize_map(Some(keys.len()))?;
-                for key in keys {
-                    out.serialize_entry(key, &SortedKeys(&map[key]))?;
+                // Sorting borrowed entries avoids rebuilding the map and a
+                // second lookup per key: only the pointer vector is
+                // allocated, never a second Value tree.
+                let mut entries: Vec<(&String, &serde_json::Value)> = map.iter().collect();
+                entries.sort_unstable_by_key(|(key, _)| *key);
+                let mut out = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    out.serialize_entry(key, &SortedKeys(value))?;
                 }
                 out.end()
             }
@@ -99,7 +102,10 @@ pub(crate) mod value_as_canonical_json {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    any(feature = "plugin-session-log", feature = "service-prompt-cache")
+))]
 mod tests {
     use super::*;
 

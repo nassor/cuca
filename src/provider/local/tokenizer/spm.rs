@@ -162,7 +162,7 @@ impl Spm {
             return;
         }
         // `prev` of the first symbol wrapped to `usize::MAX`, which is `NONE`.
-        let mut queue = BinaryHeap::new();
+        let mut queue = BinaryHeap::with_capacity(symbols.len());
         for right in 1..symbols.len() {
             self.try_add_bigram(vocab, text, &symbols, &mut queue, right - 1, right);
         }
@@ -211,7 +211,7 @@ mod tests {
             .iter()
             .map(|p| if p.starts_with("<0x") { 6 } else { 1 })
             .collect();
-        let vocab = Vocab::new(pieces, types).expect("valid vocabulary");
+        let vocab = Vocab::new(&pieces, types).expect("valid vocabulary");
         let spm = Spm::new(tokens.iter().map(|(_, s)| *s).collect(), prefix);
         (vocab, spm)
     }

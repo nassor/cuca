@@ -204,8 +204,8 @@ pub(crate) fn attention_mask(
             None => lo,
         };
         let last = query.min(hi.saturating_sub(1));
-        for p in first..=last {
-            row[p - lo] = 0.0;
+        if first <= last {
+            row[first - lo..=last - lo].fill(0.0);
         }
     }
     mask

@@ -10,7 +10,7 @@
 //! 2. `on_request` hooks run, in registration order, and may mutate the request
 //!    (inject context, enforce policies, count tokens).
 //! 3. Under `service-prompt-cache` with a configured cache: the digest of the
-//!    now-effective request is looked up. A hit returns a [`CacheHitStream`]
+//!    now-effective request is looked up. A hit returns a `CacheHitStream`
 //!    that replays the stored blocks and never reaches provider dispatch,
 //!    `execute_local_tool`, or `on_stream_chunk`, but still runs every
 //!    `on_response_complete` hook exactly once. A miss falls through to
@@ -401,14 +401,12 @@ impl CucaClientBuilder {
             return Err(CucaError::Config(MODEL_REQUIRED.into()));
         }
         #[cfg(feature = "service-prompt-cache")]
-        let prompt_cache = match self.prompt_cache_service {
-            Some(service) => Some(service),
-            None => match self.prompt_cache_config {
-                Some(config) => Some(Arc::new(
-                    PromptCache::new(config).map_err(map_prompt_cache_error)?,
-                )),
-                None => None,
-            },
+        let prompt_cache = match (self.prompt_cache_service, self.prompt_cache_config) {
+            (Some(service), _) => Some(service),
+            (None, Some(config)) => Some(Arc::new(
+                PromptCache::new(config).map_err(map_prompt_cache_error)?,
+            )),
+            (None, None) => None,
         };
         Ok(CucaClient {
             selected_provider,
@@ -628,7 +626,7 @@ impl CucaClient {
     ///
     /// When a speculative orchestrator is attached, the pipeline
     /// ends at `on_request`: the turn is handed to
-    /// [`ModelOrchestrator::execute_adaptive_turn`] and the provider dispatch
+    /// `ModelOrchestrator::execute_adaptive_turn` and the provider dispatch
     /// arms below are bypassed. The orchestrator's own stream carries its
     /// own instrumentation and never runs this client's top-level
     /// `on_stream_chunk`/`on_response_complete` hooks, with one asymmetry:
@@ -861,44 +859,7 @@ impl CucaClient {
                 ));
             }
         };
-        #[cfg(all(
-            feature = "service-prompt-cache",
-            any(
-                feature = "provider-openai",
-                feature = "provider-anthropic",
-                feature = "provider-deepseek",
-                feature = "provider-gemini",
-                feature = "provider-llamacpp",
-                feature = "provider-vllm",
-                feature = "provider-lmstudio",
-                feature = "provider-local",
-            )
-        ))]
-        return Ok(self.instrument(model, dispatch, cache_write, completed));
-        #[cfg(all(
-            not(feature = "service-prompt-cache"),
-            any(
-                feature = "provider-openai",
-                feature = "provider-anthropic",
-                feature = "provider-deepseek",
-                feature = "provider-gemini",
-                feature = "provider-llamacpp",
-                feature = "provider-vllm",
-                feature = "provider-lmstudio",
-                feature = "provider-local",
-            )
-        ))]
-        return Ok(self.instrument(model, dispatch, completed));
-    }
-
-    /// Wrap a provider stream with the plugin instrumentation: `on_stream_chunk`
-    /// per block, `on_response_complete` once at the end, the aggregated
-    /// [`UnifiedResponse`] token/content accounting, (when `cache_write`
-    /// is `Some`) a one-shot cache write after a fully successful completion,
-    /// and (when `completed` is `Some`) the hand-off of the terminal response.
-    #[cfg(all(
-        feature = "service-prompt-cache",
-        any(
+        #[cfg(any(
             feature = "provider-openai",
             feature = "provider-anthropic",
             feature = "provider-deepseek",
@@ -907,59 +868,40 @@ impl CucaClient {
             feature = "provider-vllm",
             feature = "provider-lmstudio",
             feature = "provider-local",
-        )
-    ))]
-    fn instrument(
-        &self,
-        model: String,
-        dispatch: ProviderDispatch,
-        cache_write: Option<(Arc<PromptCache>, UnifiedRequest)>,
-        completed: Option<ResponseHandle>,
-    ) -> AgentResponseStream {
-        Box::pin(PluginStream {
-            inner: dispatch.stream,
-            metadata: dispatch.metadata,
-            plugins: Arc::clone(&self.plugins),
-            started: std::time::Instant::now(),
-            response: UnifiedResponse {
-                model,
-                provider: self.selected_provider.clone(),
-                duration_secs: 0.0,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                finish_reason: None,
-                content: Vec::new(),
-                prompt_cache_usage: None,
-                usage: None,
-            },
-            done: false,
+        ))]
+        return Ok(self.instrument(
+            model,
+            dispatch,
+            #[cfg(feature = "service-prompt-cache")]
+            cache_write,
             completed,
-            cache_write: cache_write.map(|(cache, request)| CacheWriteSeam { cache, request }),
-            saw_error: false,
-        })
+        ));
     }
 
     /// Wrap a provider stream with the plugin instrumentation: `on_stream_chunk`
     /// per block, `on_response_complete` once at the end, the aggregated
-    /// [`UnifiedResponse`] token/content accounting, and (when `completed` is
+    /// [`UnifiedResponse`] token/content accounting, (under
+    /// `service-prompt-cache`, when `cache_write` is `Some`) a one-shot cache
+    /// write after a fully successful completion, and (when `completed` is
     /// `Some`) the hand-off of the terminal response.
-    #[cfg(all(
-        not(feature = "service-prompt-cache"),
-        any(
-            feature = "provider-openai",
-            feature = "provider-anthropic",
-            feature = "provider-deepseek",
-            feature = "provider-gemini",
-            feature = "provider-llamacpp",
-            feature = "provider-vllm",
-            feature = "provider-lmstudio",
-            feature = "provider-local",
-        )
+    #[cfg(any(
+        feature = "provider-openai",
+        feature = "provider-anthropic",
+        feature = "provider-deepseek",
+        feature = "provider-gemini",
+        feature = "provider-llamacpp",
+        feature = "provider-vllm",
+        feature = "provider-lmstudio",
+        feature = "provider-local",
     ))]
     fn instrument(
         &self,
         model: String,
         dispatch: ProviderDispatch,
+        #[cfg(feature = "service-prompt-cache")] cache_write: Option<(
+            Arc<PromptCache>,
+            UnifiedRequest,
+        )>,
         completed: Option<ResponseHandle>,
     ) -> AgentResponseStream {
         Box::pin(PluginStream {
@@ -980,6 +922,10 @@ impl CucaClient {
             },
             done: false,
             completed,
+            #[cfg(feature = "service-prompt-cache")]
+            cache_write: cache_write.map(|(cache, request)| CacheWriteSeam { cache, request }),
+            #[cfg(feature = "service-prompt-cache")]
+            saw_error: false,
         })
     }
 
@@ -1136,14 +1082,7 @@ impl Stream for PluginStream {
                     }
                     // `finish_reason` stays `None`; no provider adapter
                     // populates it.
-                    for plugin in this.plugins.iter() {
-                        if let Err(e) = plugin.on_response_complete(&this.response) {
-                            #[cfg(feature = "plugin-guardrails")]
-                            tracing::error!(target: "cuca::client", plugin = plugin.name(), error = %e, "response completion hook failed");
-                            #[cfg(not(feature = "plugin-guardrails"))]
-                            let _ = e;
-                        }
-                    }
+                    run_completion_hooks(&this.plugins, &this.response);
                     // One write, exactly here: only after a fully successful
                     // completion (never saw an item-level error) and only
                     // when a cache was actually configured for this stream.
@@ -1203,17 +1142,24 @@ impl Stream for CacheHitStream {
         if !this.done {
             this.done = true;
             this.response.duration_secs = this.started.elapsed().as_secs_f64();
-            for plugin in this.plugins.iter() {
-                if let Err(e) = plugin.on_response_complete(&this.response) {
-                    #[cfg(feature = "plugin-guardrails")]
-                    tracing::error!(target: "cuca::client", plugin = plugin.name(), error = %e, "response completion hook failed");
-                    #[cfg(not(feature = "plugin-guardrails"))]
-                    let _ = e;
-                }
-            }
+            run_completion_hooks(&this.plugins, &this.response);
             publish_response(&mut this.completed, &mut this.response);
         }
         Poll::Ready(None)
+    }
+}
+
+/// Run every plugin's `on_response_complete`. A failing hook is logged only
+/// when `plugin-guardrails` is enabled, and never stops the remaining hooks
+/// or fails the finished stream.
+fn run_completion_hooks(plugins: &[Arc<dyn CucaPlugin>], response: &UnifiedResponse) {
+    for plugin in plugins {
+        if let Err(e) = plugin.on_response_complete(response) {
+            #[cfg(feature = "plugin-guardrails")]
+            tracing::error!(target: "cuca::client", plugin = plugin.name(), error = %e, "response completion hook failed");
+            #[cfg(not(feature = "plugin-guardrails"))]
+            let _ = e;
+        }
     }
 }
 

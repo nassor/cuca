@@ -107,7 +107,10 @@ const DEFAULT_N_PREDICT: u32 = 128;
 /// [`build_chat_completion_body`](crate::provider::openai_compat::build_chat_completion_body).)
 pub fn build_completion_body(req: &UnifiedRequest, cfg: &LlamaCppConfig) -> serde_json::Value {
     let mut body = serde_json::Map::new();
-    body.insert("prompt".to_string(), json!(assemble_prompt(req)));
+    body.insert(
+        "prompt".to_string(),
+        serde_json::Value::String(assemble_prompt(req)),
+    );
     body.insert("stream".to_string(), json!(true));
     if let Some(temperature) = req.temperature {
         body.insert("temperature".to_string(), json!(temperature));
@@ -141,35 +144,30 @@ pub fn build_completion_body(req: &UnifiedRequest, cfg: &LlamaCppConfig) -> serd
 fn assemble_prompt(req: &UnifiedRequest) -> String {
     let mut prompt = String::new();
     for msg in &req.messages {
-        let text: Vec<&str> = msg
-            .content
-            .iter()
-            .filter_map(|b| match b {
-                MessageContentBlock::Text(t) => Some(t.as_str()),
-                _ => None,
-            })
-            .collect();
-        let text = text.join("\n");
-        if text.is_empty() {
+        let prefix = match msg.role {
+            MessageRole::System => "",
+            MessageRole::User => "### User:\n",
+            MessageRole::Assistant => "### Assistant:\n",
+            MessageRole::Tool => continue,
+        };
+        let mark = prompt.len();
+        prompt.push_str(prefix);
+        let text_start = prompt.len();
+        let texts = msg.content.iter().filter_map(|b| match b {
+            MessageContentBlock::Text(t) => Some(t.as_str()),
+            _ => None,
+        });
+        for (i, text) in texts.enumerate() {
+            if i > 0 {
+                prompt.push('\n');
+            }
+            prompt.push_str(text);
+        }
+        if prompt.len() == text_start {
+            prompt.truncate(mark);
             continue;
         }
-        match msg.role {
-            MessageRole::System => {
-                prompt.push_str(&text);
-                prompt.push('\n');
-            }
-            MessageRole::User => {
-                prompt.push_str("### User:\n");
-                prompt.push_str(&text);
-                prompt.push('\n');
-            }
-            MessageRole::Assistant => {
-                prompt.push_str("### Assistant:\n");
-                prompt.push_str(&text);
-                prompt.push('\n');
-            }
-            MessageRole::Tool => {}
-        }
+        prompt.push('\n');
     }
     prompt
 }

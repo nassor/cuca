@@ -79,7 +79,8 @@ impl Risk {
 /// model-native read tools. The keyword table below is a simple, tunable
 /// `match`-free list: extend it to tighten or relax the policy.
 pub fn classify_tool_call(name: &str) -> Risk {
-    let n = name.to_ascii_lowercase();
+    // Allocation-free: this runs for every streamed `ToolCall` block, and the
+    // vast majority are low-risk.
     const HIGH_KEYWORDS: [&str; 20] = [
         "shell",
         "exec",
@@ -102,7 +103,10 @@ pub fn classify_tool_call(name: &str) -> Risk {
         "put_",
         "delete_",
     ];
-    if HIGH_KEYWORDS.iter().any(|k| n.contains(k)) {
+    if HIGH_KEYWORDS
+        .iter()
+        .any(|k| contains_ignore_ascii_case(name, k))
+    {
         return Risk::High;
     }
     Risk::Low
@@ -393,8 +397,7 @@ impl CucaPlugin for HitlPlugin {
 /// and HTTP/API write → `"external_api_write"`. Returns `None` for a name that
 /// [`classify_tool_call`] deems low-risk.
 fn classify_action(name: &str) -> Option<&'static str> {
-    let n = name.to_ascii_lowercase();
-    let has = |needle: &str| n.contains(needle);
+    let has = |needle: &str| contains_ignore_ascii_case(name, needle);
     if ["shell", "exec", "bash", "run_command", "terminal"]
         .iter()
         .any(|k| has(k))
@@ -431,6 +434,15 @@ fn classify_action(name: &str) -> Option<&'static str> {
         return Some("external_api_write");
     }
     None
+}
+
+/// Whether `haystack` contains the lowercase ASCII `needle`, ignoring ASCII
+/// case, without building a lowercased copy of `haystack`.
+fn contains_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
+    haystack
+        .as_bytes()
+        .windows(needle.len())
+        .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 /// Render tool arguments as a JSON string truncated to ~200 chars.

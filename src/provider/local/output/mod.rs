@@ -419,8 +419,8 @@ impl OutputParser {
             };
             match found {
                 Some((pos, len, action)) => {
-                    let before: String = self.hold.drain(..pos).collect();
-                    self.hold.drain(..len);
+                    let before = self.hold[..pos].to_owned();
+                    self.hold.drain(..pos + len);
                     self.route(before, next_call_id, out);
                     self.apply(action, next_call_id, out);
                 }
@@ -454,7 +454,8 @@ impl OutputParser {
                 self.hold.drain(..len);
             }
             _ => {
-                let text: String = self.hold.drain(..len).collect();
+                let text = self.hold[..len].to_owned();
+                self.hold.drain(..len);
                 self.route(text, next_call_id, out);
             }
         }

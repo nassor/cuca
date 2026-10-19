@@ -256,6 +256,7 @@ impl DeltaKernel {
             .collect();
         let next = AtomicUsize::new(0);
         let work = |_: usize| {
+            let mut scratch = HeadScratch::new(d);
             loop {
                 let h = next.fetch_add(1, Ordering::Relaxed);
                 let Some(cell) = cells.get(h) else {
@@ -263,7 +264,7 @@ impl DeltaKernel {
                 };
                 let mut guard = cell.lock().unwrap_or_else(PoisonError::into_inner);
                 let (matrix, out) = &mut *guard;
-                self.scan_head(h, matrix, &window, rows, z, out);
+                self.scan_head(h, matrix, &window, rows, z, out, &mut scratch);
             }
         };
         if pooled {
@@ -316,6 +317,10 @@ impl DeltaKernel {
     /// One value head over all `rows`: `matrix` is its `[head_k_dim][head_v_dim]`
     /// state; `out` receives its `t x head_v_dim` gated-norm output when `z`
     /// is given.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one head's recurrence needs its state, its inputs and its scratch"
+    )]
     fn scan_head(
         &self,
         h: usize,
@@ -324,6 +329,7 @@ impl DeltaKernel {
         rows: &Rows<'_>,
         z: Option<&[f32]>,
         out: &mut Vec<f32>,
+        scratch: &mut HeadScratch,
     ) {
         let d = &self.spec;
         let (nv, dk, dv) = (d.n_v_heads, d.head_k_dim, d.head_v_dim);
@@ -334,21 +340,29 @@ impl DeltaKernel {
         let vd = d.value_dim();
         let sqrt_dk = (dk as f32).sqrt();
 
-        let mut q = vec![0.0f32; dk];
-        let mut k = vec![0.0f32; dk];
-        let mut v = vec![0.0f32; dv];
-        let mut kv_mem = vec![0.0f32; dv];
-        let mut delta = vec![0.0f32; dv];
-        let mut o = vec![0.0f32; dv];
+        let HeadScratch {
+            q,
+            k,
+            v,
+            kv_mem,
+            delta,
+            o,
+        } = scratch;
+        let (q, k, v) = (q.as_mut_slice(), k.as_mut_slice(), v.as_mut_slice());
+        let (kv_mem, delta, o) = (
+            kv_mem.as_mut_slice(),
+            delta.as_mut_slice(),
+            o.as_mut_slice(),
+        );
         if z.is_some() {
             out.clear();
             out.reserve(rows.t * dv);
         }
 
         for ti in 0..rows.t {
-            self.conv_slice(window, ti, k_at, &mut k);
-            self.conv_slice(window, ti, v_at, &mut v);
-            l2_normalise(&mut k);
+            self.conv_slice(window, ti, k_at, k);
+            self.conv_slice(window, ti, v_at, v);
+            l2_normalise(k);
             let (beta, decay) = (rows.beta[ti * nv + h], rows.decay[ti * nv + h]);
 
             // Decay the state and read what it predicts for `k`.
@@ -361,21 +375,21 @@ impl DeltaKernel {
                     *m += decayed * ki;
                 }
             }
-            for ((dj, &vj), &mj) in delta.iter_mut().zip(&v).zip(&kv_mem) {
+            for ((dj, &vj), &mj) in delta.iter_mut().zip(v.iter()).zip(kv_mem.iter()) {
                 *dj = (vj - mj) * beta;
             }
 
             // Write the correction and, when asked, read the output.
             if let Some(z) = z {
-                self.conv_slice(window, ti, q_at, &mut q);
-                l2_normalise(&mut q);
-                for x in &mut q {
+                self.conv_slice(window, ti, q_at, q);
+                l2_normalise(q);
+                for x in q.iter_mut() {
                     *x /= sqrt_dk;
                 }
                 o.fill(0.0);
-                for (i, (&ki, &qi)) in k.iter().zip(&q).enumerate() {
+                for (i, (&ki, &qi)) in k.iter().zip(q.iter()).enumerate() {
                     let row = &mut matrix[i * dv..(i + 1) * dv];
-                    for ((sv, &dj), oj) in row.iter_mut().zip(&delta).zip(o.iter_mut()) {
+                    for ((sv, &dj), oj) in row.iter_mut().zip(delta.iter()).zip(o.iter_mut()) {
                         let written = *sv + ki * dj;
                         *sv = written;
                         *oj += written * qi;
@@ -394,11 +408,36 @@ impl DeltaKernel {
             } else {
                 for (i, &ki) in k.iter().enumerate() {
                     let row = &mut matrix[i * dv..(i + 1) * dv];
-                    for (sv, &dj) in row.iter_mut().zip(&delta) {
+                    for (sv, &dj) in row.iter_mut().zip(delta.iter()) {
                         *sv += ki * dj;
                     }
                 }
             }
+        }
+    }
+}
+
+/// One worker's buffers for a head's recurrence, reused across the heads it
+/// claims: each is fully overwritten before it is read.
+struct HeadScratch {
+    q: Vec<f32>,
+    k: Vec<f32>,
+    v: Vec<f32>,
+    kv_mem: Vec<f32>,
+    delta: Vec<f32>,
+    o: Vec<f32>,
+}
+
+impl HeadScratch {
+    fn new(d: &DeltaSpec) -> Self {
+        let (dk, dv) = (d.head_k_dim, d.head_v_dim);
+        Self {
+            q: vec![0.0; dk],
+            k: vec![0.0; dk],
+            v: vec![0.0; dv],
+            kv_mem: vec![0.0; dv],
+            delta: vec![0.0; dv],
+            o: vec![0.0; dv],
         }
     }
 }

@@ -5,7 +5,7 @@
 //! map built once; a word is merged with a heap that always takes the lowest rank
 //! and, on equal rank, the leftmost pair, like llama.cpp's `llm_bigram_bpe`
 //! work queue. Per word the transient state is one symbol vector and one heap
-//! (both reused across the words of a fragment), so encoding allocates
+//! (both reused across every word of an `encode` call), so encoding allocates
 //! O(longest word) beyond the output.
 
 use std::cmp::Reverse;
@@ -65,10 +65,15 @@ impl Merges {
     /// otherwise such a rule is skipped, since it can never produce a token
     /// (real byte-level checkpoints with pruned or extended vocabularies carry
     /// them).
-    pub(super) fn new(vocab: &Vocab, rules: &[String], strict: bool) -> Result<Self, CucaError> {
+    pub(super) fn new<S: AsRef<str>>(
+        vocab: &Vocab,
+        rules: &[S],
+        strict: bool,
+    ) -> Result<Self, CucaError> {
         let mut table = HashMap::with_capacity_and_hasher(rules.len(), Default::default());
         let mut joined = String::new();
         for (rank, rule) in rules.iter().enumerate() {
+            let rule = rule.as_ref();
             let split = rule
                 .as_bytes()
                 .iter()
@@ -125,15 +130,13 @@ struct Symbol {
     alive: bool,
 }
 
-/// Reusable buffers for merging the words of one fragment.
+/// Reusable buffers for merging words.
 #[derive(Default)]
 pub(super) struct Scratch {
     /// Symbol list of the current word.
     symbols: Vec<Symbol>,
     /// Candidate merges, lowest `(rank, left)` first.
     heap: BinaryHeap<Reverse<(u32, usize, usize)>>,
-    /// The (byte-encoded) current word.
-    pub(super) word: String,
 }
 
 /// What to emit for a character that is not a vocabulary token.
@@ -161,21 +164,22 @@ impl Merges {
         }
     }
 
-    /// Merge `scratch.word` and append the resulting ids to `out`.
+    /// Merge `word` and append the resulting ids to `out`.
     pub(super) fn merge_word(
         &self,
         vocab: &Vocab,
         scratch: &mut Scratch,
+        word: &str,
         unknown: Unknown,
         out: &mut Vec<u32>,
     ) {
         scratch.symbols.clear();
         scratch.heap.clear();
-        for (start, c) in scratch.word.char_indices() {
+        for (start, c) in word.char_indices() {
             let end = start + c.len_utf8();
             let index = scratch.symbols.len();
             scratch.symbols.push(Symbol {
-                id: vocab.get(&scratch.word[start..end]),
+                id: vocab.get(&word[start..end]),
                 start,
                 end,
                 prev: if index == 0 { NONE } else { index - 1 },
@@ -224,7 +228,7 @@ impl Merges {
             match symbol.id {
                 Some(id) => out.push(id),
                 None if unknown == Unknown::ByteTokens => {
-                    vocab.push_byte_tokens(&scratch.word[symbol.start..symbol.end], out);
+                    vocab.push_byte_tokens(&word[symbol.start..symbol.end], out);
                 }
                 None => {}
             }
@@ -320,18 +324,13 @@ mod tests {
 
     /// A vocabulary with `a`, `b`, `c` and their merges.
     fn vocab(pieces: &[&str]) -> Vocab {
-        Vocab::new(
-            pieces.iter().map(|s| s.to_string()).collect(),
-            vec![1; pieces.len()],
-        )
-        .expect("valid vocabulary")
+        Vocab::new(pieces, vec![1; pieces.len()]).expect("valid vocabulary")
     }
 
     fn merge(vocab: &Vocab, merges: &Merges, word: &str, unknown: Unknown) -> Vec<u32> {
         let mut scratch = Scratch::default();
-        scratch.word.push_str(word);
         let mut out = Vec::new();
-        merges.merge_word(vocab, &mut scratch, unknown, &mut out);
+        merges.merge_word(vocab, &mut scratch, word, unknown, &mut out);
         out
     }
 
@@ -377,7 +376,7 @@ mod tests {
     #[test]
     fn unknown_characters_follow_the_scheme() {
         let v = vocab(&["a", "<0xC3>", "<0xA9>"]);
-        let m = Merges::new(&v, &[], true).expect("no rules");
+        let m = Merges::new(&v, &[] as &[&str], true).expect("no rules");
         assert_eq!(merge(&v, &m, "a\u{e9}", Unknown::ByteTokens), [0, 1, 2]);
         assert_eq!(merge(&v, &m, "a\u{e9}", Unknown::Drop), [0]);
     }

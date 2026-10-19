@@ -10,7 +10,7 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, LazyLock, Mutex, PoisonError};
 
 use candle_core::quantized::{GgmlDType, QMatMul as CandleMatMul, QTensor, gguf_file};
 use candle_core::{D, DType, Device, Module, Tensor};
@@ -275,9 +275,12 @@ struct RopeTable {
     sin: Tensor,
 }
 
+/// The key and value tensors of one K/V cache.
+type KvPair = (Tensor, Tensor);
+
 /// K/V cache of the layers that own K/V, plus the shared filled length.
 struct KvCache {
-    layers: Vec<Option<(Tensor, Tensor)>>,
+    layers: Vec<Option<KvPair>>,
     len: usize,
 }
 
@@ -382,11 +385,14 @@ impl Loader<'_> {
     }
 
     fn scalar(&mut self, tensor_name: &str) -> Result<f64, CucaError> {
-        let values = self
+        let value = self
             .vector(tensor_name, 1)?
             .to_vec1::<f32>()
-            .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
-        Ok(f64::from(values[0]))
+            .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?
+            .first()
+            .copied()
+            .ok_or_else(|| err(format!("tensor `{tensor_name}`: empty")))?;
+        Ok(f64::from(value))
     }
 
     /// The `[n_expert, rows, cols]` expert tensor `tensor_name`, split into
@@ -500,10 +506,8 @@ pub(crate) struct Forward {
 /// target's cache (candle tensors are handles), so the target's later writes
 /// are visible without copying.
 pub(crate) struct ExtKv {
-    sliding: (Tensor, Tensor),
-    full: (Tensor, Tensor),
-    /// Positions of the target cache the drafter may read.
-    len: usize,
+    sliding: KvPair,
+    full: KvPair,
 }
 
 /// One attention call: the rows it processes and the K/V storage it uses.
@@ -520,11 +524,13 @@ struct AttnCall<'a> {
     t: usize,
     /// The cache this layer stores its keys and values in (K/V-owning
     /// layers).
-    own: Option<&'a (Tensor, Tensor)>,
+    own: Option<&'a KvPair>,
     /// The cache the layer attends to: its own, or the layer's shared source;
     /// `None` for a drafter layer, which reads `ext`.
-    read: Option<&'a (Tensor, Tensor)>,
-    ext: Option<&'a ExtKv>,
+    read: Option<&'a KvPair>,
+    /// A drafter layer's source: the target's cache and the number of its
+    /// positions the layer may read.
+    ext: Option<(&'a ExtKv, usize)>,
 }
 
 /// A drafter's input and output projections: `pre` maps the concatenation of
@@ -556,6 +562,11 @@ impl Transformer {
     /// Load a multi-token-prediction drafter (`gemma4-assistant`): its
     /// layers own no K/V and read the target's cache through
     /// [`Transformer::draft`].
+    ///
+    /// # Errors
+    ///
+    /// As [`Transformer::load`], plus [`CucaError::Provider`] when the file
+    /// is not a drafter architecture.
     pub(crate) fn load_drafter(
         content: &gguf_file::Content,
         path: &Path,
@@ -663,8 +674,7 @@ impl Transformer {
 
         let mut layers = Vec::with_capacity(hp.n_layer);
         let mut kv_layers = Vec::with_capacity(hp.n_layer);
-        for il in 0..hp.n_layer {
-            let spec = &hp.layers[il];
+        for (il, spec) in hp.layers.iter().enumerate() {
             let layout = LayerLayout::read(&hp, il, spec, content)?;
             if spec.owns_kv(il) {
                 let shape = (1, spec.n_kv_head, context_length, spec.head_dim);
@@ -726,6 +736,13 @@ impl Transformer {
     /// [`Transformer::forward`] that also returns hidden-state rows (one per
     /// row of logits). With `exact`, every batch row equals, bit for bit,
     /// what a single-token step at its position computes (see [`RowExact`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for an empty `tokens`, a `start_pos` other
+    /// than the cache length, more positions than the context length, a
+    /// drafter model (it has no token embedding) or a failed pass; a hybrid
+    /// model then drops its cache and recurrent state.
     pub(crate) fn forward_ext(
         &mut self,
         tokens: &[u32],
@@ -798,7 +815,7 @@ impl Transformer {
     /// [`CucaError::Provider`] when the model has no sliding or no
     /// full-attention K/V-owning layer to share.
     pub(crate) fn ext_kv(&self) -> Result<ExtKv, CucaError> {
-        let source = |sliding: bool| -> Result<(Tensor, Tensor), CucaError> {
+        let source = |sliding: bool| -> Result<KvPair, CucaError> {
             let layer = self
                 .hp
                 .layers
@@ -816,7 +833,6 @@ impl Transformer {
         Ok(ExtKv {
             sliding: source(true)?,
             full: source(false)?,
-            len: 0,
         })
     }
 
@@ -837,6 +853,11 @@ impl Transformer {
 
     /// The `n_embd`-wide embedding row of `token` (scaled as the first layer
     /// sees it): a drafter's input half next to the target's hidden state.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a drafter model, which has no token
+    /// embedding.
     pub(crate) fn embedding_row(&self, token: u32) -> Result<Vec<f32>, CucaError> {
         self.embed
             .as_ref()
@@ -850,6 +871,11 @@ impl Transformer {
     /// `len` positions of the target's cache `ext`. Returns the drafter's logits
     /// over the vocabulary and the hidden state (`n_embd_out` floats) to feed
     /// the next step.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when the model is not a drafter, `input` has
+    /// the wrong width or a layer fails.
     pub(crate) fn draft(
         &self,
         ext: &ExtKv,
@@ -869,18 +895,13 @@ impl Transformer {
                 2 * hp.n_embd_out
             )));
         }
-        let ext = ExtKv {
-            sliding: ext.sliding.clone(),
-            full: ext.full.clone(),
-            len,
-        };
         let run = || -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
             let dev = &Device::Cpu;
             let eps = hp.eps as f32;
             let input = Tensor::from_vec(input.to_vec(), (1, 1, input.len()), dev)?;
             let mut x = nextn.pre.forward(&input)?;
             for il in 0..hp.n_layer {
-                x = self.layer(il, &x, None, pos, 1, Some(&ext), false)?;
+                x = self.layer(il, &x, None, pos, 1, Some((ext, len)), false)?;
             }
             let normed = rms(&x, &self.output_norm, eps)?;
             let logits = self.head(&normed)?;
@@ -1022,7 +1043,10 @@ impl Transformer {
         self.kv.len
     }
 
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one forward pass's inputs; a struct would only rename them"
+    )]
     fn forward_layers(
         &self,
         embeddings: Vec<f32>,
@@ -1120,7 +1144,10 @@ impl Transformer {
     /// One transformer block over `t` positions starting at `start`. With
     /// `record`, a delta-net layer keeps what cache rollback needs from this
     /// call (see [`Transformer::truncate_cache`]).
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one layer call's inputs; a struct would only rename them"
+    )]
     fn layer(
         &self,
         il: usize,
@@ -1128,7 +1155,7 @@ impl Transformer {
         ple: Option<&Tensor>,
         start: usize,
         t: usize,
-        ext: Option<&ExtKv>,
+        ext: Option<(&ExtKv, usize)>,
         record: bool,
     ) -> candle_core::Result<Tensor> {
         let lw = &self.layers[il];
@@ -1204,7 +1231,7 @@ impl Transformer {
         h: &Tensor,
         start: usize,
         t: usize,
-        ext: Option<&ExtKv>,
+        ext: Option<(&ExtKv, usize)>,
     ) -> candle_core::Result<Tensor> {
         let spec = &self.hp.layers[il];
         let own = if spec.owns_kv(il) {
@@ -1251,7 +1278,7 @@ impl Transformer {
         let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
         let hi = start + t;
 
-        let (q, k, v) = aw.project(h, nh, nkv, d)?;
+        let (q, kv) = aw.project(h, nh, nkv, d)?;
         // A full-width Q/K norm (OLMo 2) normalises the whole projection
         // before the heads are split.
         let full_qk = hp.behavior.qk_norm_full;
@@ -1282,7 +1309,7 @@ impl Transformer {
         let q = q.transpose(1, 2)?.contiguous()?;
         let q = self.rotate_rows(spec, &q, rope_start, t)?;
 
-        if let (Some(k), Some(v)) = (&k, &v) {
+        if let Some((k, v)) = &kv {
             self.store_kv(call, aw, k, v)?;
         }
 
@@ -1290,7 +1317,7 @@ impl Transformer {
         let (cache_k, cache_v, hi) = match read {
             Some((k, v)) => (k, v, hi),
             None => {
-                let e = ext.ok_or_else(|| {
+                let (e, len) = ext.ok_or_else(|| {
                     candle_core::Error::msg("a drafter layer needs the target's K/V")
                 })?;
                 ext_pair = if spec.window.is_some() {
@@ -1298,58 +1325,13 @@ impl Transformer {
                 } else {
                     &e.full
                 };
-                (&ext_pair.0, &ext_pair.1, e.len)
+                (&ext_pair.0, &ext_pair.1, len)
             }
         };
-        let window_lo = |query: usize, hi: usize| match spec.window {
-            Some(w) => query.saturating_sub(w - 1).min(hi.saturating_sub(1)),
-            None => 0,
-        };
         let attn = if ROW_EXACT.get() && t > 1 && ext.is_none() {
-            // Shape-stable mode: every query row attends over exactly the
-            // keys a decode step at its position would, in its own call.
-            // The rows are independent, so they run on scoped threads (each
-            // row's arithmetic is the same whichever thread computes it).
-            let one_row = |i: usize| -> candle_core::Result<Tensor> {
-                let hi = start + i + 1;
-                let lo = window_lo(start + i, hi);
-                attend(
-                    &q.narrow(2, i, 1)?.contiguous()?,
-                    &cache_k.narrow(2, lo, hi - lo)?,
-                    &cache_v.narrow(2, lo, hi - lo)?,
-                    None,
-                    spec.scale,
-                    hp.attn_softcap,
-                )
-            };
-            let threads = std::thread::available_parallelism()
-                .map_or(1, std::num::NonZeroUsize::get)
-                .min(t);
-            let per = t.div_ceil(threads);
-            let parts = std::thread::scope(|scope| {
-                let handles: Vec<_> = (0..threads)
-                    .map(|j| {
-                        let one_row = &one_row;
-                        scope.spawn(move || {
-                            (j * per..((j + 1) * per).min(t))
-                                .map(one_row)
-                                .collect::<candle_core::Result<Vec<_>>>()
-                        })
-                    })
-                    .collect();
-                handles
-                    .into_iter()
-                    .map(|h| {
-                        h.join().unwrap_or_else(|_| {
-                            Err(candle_core::Error::msg("attention worker panicked"))
-                        })
-                    })
-                    .collect::<candle_core::Result<Vec<_>>>()
-            })?;
-            let rows: Vec<Tensor> = parts.into_iter().flatten().collect();
-            Tensor::cat(&rows, 2)?
+            attend_rows_exact(spec, hp.attn_softcap, &q, (cache_k, cache_v), start, t)?
         } else {
-            let lo = window_lo(start, hi);
+            let lo = window_lo(spec, start, hi);
             let l = hi - lo;
             let k = cache_k.narrow(2, lo, l)?;
             let v = cache_v.narrow(2, lo, l)?;
@@ -1430,7 +1412,7 @@ impl Transformer {
         };
         let v = v.transpose(1, 2)?.contiguous()?;
         cache_k.slice_set(&k.contiguous()?, 2, call.start)?;
-        cache_v.slice_set(&v.contiguous()?, 2, call.start)?;
+        cache_v.slice_set(&v, 2, call.start)?;
         Ok(())
     }
 
@@ -1683,29 +1665,27 @@ impl DeltaWeights {
 impl AttnWeights {
     /// Query `(1, t, nh * d)` and, on K/V-owning layers, key and value
     /// `(1, t, nkv * d)` projections of `h`.
-    #[allow(clippy::type_complexity)]
     fn project(
         &self,
         h: &Tensor,
         nh: usize,
         nkv: usize,
         d: usize,
-    ) -> candle_core::Result<(Tensor, Option<Tensor>, Option<Tensor>)> {
+    ) -> candle_core::Result<(Tensor, Option<KvPair>)> {
         match &self.qkv {
             QkvWeights::Fused(w) => {
                 let y = w.forward(h)?;
                 let (q, k) = (nh * d, nkv * d);
                 Ok((
                     y.narrow(2, 0, q)?,
-                    Some(y.narrow(2, q, k)?),
-                    Some(y.narrow(2, q + k, k)?),
+                    Some((y.narrow(2, q, k)?, y.narrow(2, q + k, k)?)),
                 ))
             }
             QkvWeights::Split { q, kv } => {
                 let q = q.forward(h)?;
                 match kv {
-                    Some((k, v)) => Ok((q, Some(k.forward(h)?), Some(v.forward(h)?))),
-                    None => Ok((q, None, None)),
+                    Some((k, v)) => Ok((q, Some((k.forward(h)?, v.forward(h)?)))),
+                    None => Ok((q, None)),
                 }
             }
         }
@@ -1720,16 +1700,15 @@ impl AttnWeights {
         nh: usize,
         nkv: usize,
         d: usize,
-    ) -> candle_core::Result<(Tensor, Tensor)> {
+    ) -> candle_core::Result<KvPair> {
         match &self.qkv {
             QkvWeights::Split {
                 kv: Some((k, v)), ..
             } => Ok((k.forward(h)?, v.forward(h)?)),
-            _ => {
-                let (_, k, v) = self.project(h, nh, nkv, d)?;
-                k.zip(v)
-                    .ok_or_else(|| candle_core::Error::msg("this layer owns no K/V projections"))
-            }
+            _ => self
+                .project(h, nh, nkv, d)?
+                .1
+                .ok_or_else(|| candle_core::Error::msg("this layer owns no K/V projections")),
         }
     }
 }
@@ -1764,8 +1743,7 @@ impl FfnWeights {
                     if picks.is_empty() {
                         continue;
                     }
-                    let ids: Vec<u32> = picks.iter().map(|p| p.0).collect();
-                    let weights: Vec<f32> = picks.iter().map(|p| p.1).collect();
+                    let (ids, weights): (Vec<u32>, Vec<f32>) = picks.iter().copied().unzip();
                     let m = ids.len();
                     let ids = Tensor::from_vec(ids, m, f.device())?;
                     let weights = Tensor::from_vec(weights, (m, 1), f.device())?;
@@ -1852,6 +1830,71 @@ pub(crate) fn attend(
     softmax_last_dim(&scores.contiguous()?)?
         .matmul(v)?
         .reshape((1, n_head, t, d))
+}
+
+/// The first key a query at cache slot `query` attends to when `hi` slots are
+/// filled: a sliding window reaches back `window - 1` slots, a full-attention
+/// layer starts at the first.
+fn window_lo(spec: &LayerSpec, query: usize, hi: usize) -> usize {
+    match spec.window {
+        Some(w) => query.saturating_sub(w - 1).min(hi.saturating_sub(1)),
+        None => 0,
+    }
+}
+
+/// [`attend`] for the shape-stable mode ([`RowExact`]): every query row `i`
+/// of `q` `(1, n_head, t, d)` attends over exactly the keys a decode step at
+/// slot `start + i` would, in its own call. The rows are independent, so they
+/// run on scoped threads (each row's arithmetic is the same whichever thread
+/// computes it).
+fn attend_rows_exact(
+    spec: &LayerSpec,
+    softcap: Option<f64>,
+    q: &Tensor,
+    (cache_k, cache_v): (&Tensor, &Tensor),
+    start: usize,
+    t: usize,
+) -> candle_core::Result<Tensor> {
+    let one_row = |i: usize| -> candle_core::Result<Tensor> {
+        let hi = start + i + 1;
+        let lo = window_lo(spec, start + i, hi);
+        attend(
+            &q.narrow(2, i, 1)?.contiguous()?,
+            &cache_k.narrow(2, lo, hi - lo)?,
+            &cache_v.narrow(2, lo, hi - lo)?,
+            None,
+            spec.scale,
+            softcap,
+        )
+    };
+    // Queried once: `available_parallelism` reads the scheduler affinity and
+    // cgroup limits on every call, and this runs once per layer per pass.
+    static PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    });
+    let threads = (*PARALLELISM).min(t);
+    let per = t.div_ceil(threads);
+    let parts = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..threads)
+            .map(|j| {
+                let one_row = &one_row;
+                scope.spawn(move || {
+                    (j * per..((j + 1) * per).min(t))
+                        .map(one_row)
+                        .collect::<candle_core::Result<Vec<_>>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| {
+                h.join()
+                    .unwrap_or_else(|_| Err(candle_core::Error::msg("attention worker panicked")))
+            })
+            .collect::<candle_core::Result<Vec<_>>>()
+    })?;
+    let rows: Vec<Tensor> = parts.into_iter().flatten().collect();
+    Tensor::cat(&rows, 2)
 }
 
 #[cfg(test)]

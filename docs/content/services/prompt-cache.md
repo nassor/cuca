@@ -100,7 +100,7 @@ There is no default configuration. `PromptCacheConfig::new(capacity, ttl)` is th
 ## Caps and at-cap policy
 
 - Bound: `PromptCacheConfig::capacity` entries, each expiring `ttl` after insertion.
-- At-cap policy: deterministic LRU eviction. `insert` evicts the least recently used entry (rank `0`) until the cache fits. Recency order is an oldest first key list, never hash map order, so eviction is reproducible.
+- At-cap policy: deterministic LRU eviction. `insert` evicts the least recently used entry (rank `0`) until the cache fits. Recency order is an oldest first map keyed by a monotonic touch counter, never hash map order, so eviction is reproducible. A touch is O(log n).
 - Expiry: `insert` prunes expired entries first, and `lookup` removes an expired entry and reports a miss. Inserting under an existing digest refreshes its timestamps and recency without growing the cache.
 - Usage gauge: `PromptCache::len()` against `capacity()`. `len()` is an upper bound because it counts expired entries not yet pruned. `snapshot()` returns the exact live set and clones every entry.
 

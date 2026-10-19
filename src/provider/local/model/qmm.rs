@@ -170,8 +170,10 @@ impl Acts {
                 let id = if d != 0.0 { 1.0 / d } else { 0.0 };
                 scales[b * stride + j] = f16::from_f32(d).to_f32();
                 let dst = &mut qs[b * stride + j];
-                for (i, &v) in src.iter().enumerate() {
-                    dst[i / LANES][i % LANES] = i16::from(round_away(v * id) as i8);
+                for (half, vals) in dst.iter_mut().zip(src.as_chunks::<LANES>().0) {
+                    for (q, &v) in half.iter_mut().zip(vals) {
+                        *q = i16::from(round_away(v * id) as i8);
+                    }
                 }
             }
         }
@@ -453,9 +455,10 @@ fn run<F: Format>(data: &[u8], act: &Acts, n: usize, out: &mut [f32]) -> candle_
         (n / (threads * 4)).div_ceil(NR).max(1) * NR
     };
     let n_chunks = n.div_ceil(rows_per_chunk);
-    let dst: Vec<Vec<Mutex<&mut [f32]>>> = out
+    let dst: Vec<Mutex<&mut [f32]>> = out
         .chunks_mut(n)
-        .map(|row| row.chunks_mut(rows_per_chunk).map(Mutex::new).collect())
+        .flat_map(|row| row.chunks_mut(rows_per_chunk))
+        .map(Mutex::new)
         .collect();
 
     let next = AtomicUsize::new(0);
@@ -473,7 +476,7 @@ fn run<F: Format>(data: &[u8], act: &Acts, n: usize, out: &mut [f32]) -> candle_
                 act,
                 &mut res[..act.m * rows],
             );
-            for (j, row) in dst.iter().enumerate() {
+            for (j, row) in dst.chunks_exact(n_chunks).enumerate() {
                 row[c]
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)

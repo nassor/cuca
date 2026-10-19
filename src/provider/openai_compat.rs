@@ -95,7 +95,7 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
     let messages: Vec<serde_json::Value> = req.messages.iter().map(message_to_wire).collect();
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), serde_json::json!(req.model));
-    body.insert("messages".to_string(), serde_json::json!(messages));
+    body.insert("messages".to_string(), serde_json::Value::Array(messages));
     if let Some(temperature) = req.temperature {
         body.insert("temperature".to_string(), serde_json::json!(temperature));
     }
@@ -117,7 +117,7 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
                 })
             })
             .collect();
-        body.insert("tools".to_string(), serde_json::json!(tools));
+        body.insert("tools".to_string(), serde_json::Value::Array(tools));
     }
     body.insert("stream".to_string(), serde_json::Value::Bool(true));
     body.insert(
@@ -148,7 +148,10 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
                             .unwrap_or("medium")
                             .to_string(),
                     };
-                    body.insert("reasoning_effort".to_string(), serde_json::json!(effort));
+                    body.insert(
+                        "reasoning_effort".to_string(),
+                        serde_json::Value::String(effort),
+                    );
                 }
             }
         } else {
@@ -222,11 +225,11 @@ fn message_to_wire(msg: &UnifiedMessage) -> serde_json::Value {
         if let Some(id) = tool_call_id {
             wire.insert("tool_call_id".to_string(), serde_json::Value::String(id));
         }
-        let output: String = msg
+        let output = msg
             .content
             .iter()
             .filter_map(|b| match b {
-                MessageContentBlock::ToolResult { output, .. } => Some(output.clone()),
+                MessageContentBlock::ToolResult { output, .. } => Some(output.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -282,7 +285,7 @@ fn message_to_wire(msg: &UnifiedMessage) -> serde_json::Value {
                 _ => None,
             })
             .collect();
-        wire.insert("tool_calls".to_string(), serde_json::json!(calls));
+        wire.insert("tool_calls".to_string(), serde_json::Value::Array(calls));
     }
 
     // Content: an array of parts when an image is present, else the joined
@@ -308,13 +311,13 @@ fn message_to_wire(msg: &UnifiedMessage) -> serde_json::Value {
                 _ => None,
             })
             .collect();
-        serde_json::json!(parts)
+        serde_json::Value::Array(parts)
     } else {
-        let text: String = msg
+        let text = msg
             .content
             .iter()
             .filter_map(|b| match b {
-                MessageContentBlock::Text(t) => Some(t.clone()),
+                MessageContentBlock::Text(t) => Some(t.as_str()),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -322,7 +325,7 @@ fn message_to_wire(msg: &UnifiedMessage) -> serde_json::Value {
         if has_tool_calls && text.is_empty() {
             serde_json::Value::Null
         } else {
-            serde_json::json!(text)
+            serde_json::Value::String(text)
         }
     };
     wire.insert("content".to_string(), content);
@@ -483,22 +486,16 @@ impl ChatCompletionTranslator {
             .and_then(|i| i.as_u64())
             .map(|i| i as usize)
             .unwrap_or(0);
-        let id = entry.get("id").and_then(|i| i.as_str()).map(str::to_string);
         let function = entry.get("function");
-        let name = function
-            .and_then(|f| f.get("name"))
-            .and_then(|n| n.as_str())
-            .map(str::to_string);
         let arguments = function
             .and_then(|f| f.get("arguments"))
-            .and_then(|a| a.as_str())
-            .map(str::to_string);
+            .and_then(|a| a.as_str());
 
         match self.tool_acc.entry(index) {
             Entry::Occupied(mut slot) => match arguments {
                 // A non-empty fragment continues the accumulation.
                 Some(fragment) if !fragment.is_empty() => {
-                    slot.get_mut().2.push_str(&fragment);
+                    slot.get_mut().2.push_str(fragment);
                     None
                 }
                 // Empty or missing arguments after accumulation started: the
@@ -511,8 +508,16 @@ impl ChatCompletionTranslator {
                 // First frame for this index: seed the accumulator, which
                 // requires id + name. The initial arguments (usually "") start
                 // the fragment.
+                let id = entry.get("id").and_then(|i| i.as_str());
+                let name = function
+                    .and_then(|f| f.get("name"))
+                    .and_then(|n| n.as_str());
                 if let (Some(id), Some(name)) = (id, name) {
-                    slot.insert((id, name, arguments.unwrap_or_default()));
+                    slot.insert((
+                        id.to_string(),
+                        name.to_string(),
+                        arguments.unwrap_or_default().to_string(),
+                    ));
                 }
                 None
             }
@@ -547,10 +552,7 @@ impl ChatCompletionTranslator {
         indices.sort_unstable();
         for index in indices {
             if let Some((id, name, fragment)) = self.tool_acc.remove(&index) {
-                let arguments = match serde_json::from_str::<serde_json::Value>(&fragment) {
-                    Ok(value) => value,
-                    Err(_) => serde_json::Value::Null,
-                };
+                let arguments = serde_json::from_str(&fragment).unwrap_or_default();
                 self.pending.push_back(MessageContentBlock::ToolCall {
                     id,
                     name,

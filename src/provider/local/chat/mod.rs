@@ -93,11 +93,11 @@ fn message_to_json(msg: &UnifiedMessage) -> Result<serde_json::Value, CucaError>
                 "user"
             };
             wire.insert("role".into(), json!(role));
-            wire.insert("content".into(), json!(joined_text(msg)));
+            wire.insert("content".into(), joined_text(msg).into());
         }
         MessageRole::Assistant => {
             wire.insert("role".into(), json!("assistant"));
-            wire.insert("content".into(), json!(joined_text(msg)));
+            wire.insert("content".into(), joined_text(msg).into());
             let reasoning: Vec<&str> = msg
                 .content
                 .iter()
@@ -107,7 +107,7 @@ fn message_to_json(msg: &UnifiedMessage) -> Result<serde_json::Value, CucaError>
                 })
                 .collect();
             if !reasoning.is_empty() {
-                wire.insert("reasoning_content".into(), json!(reasoning.concat()));
+                wire.insert("reasoning_content".into(), reasoning.concat().into());
             }
             let mut calls = Vec::new();
             for block in &msg.content {
@@ -125,7 +125,7 @@ fn message_to_json(msg: &UnifiedMessage) -> Result<serde_json::Value, CucaError>
                 }
             }
             if !calls.is_empty() {
-                wire.insert("tool_calls".into(), json!(calls));
+                wire.insert("tool_calls".into(), calls.into());
             }
         }
         MessageRole::Tool => {
@@ -139,7 +139,7 @@ fn message_to_json(msg: &UnifiedMessage) -> Result<serde_json::Value, CucaError>
                 })
             });
             if let Some(id) = tool_call_id {
-                wire.insert("tool_call_id".into(), json!(id));
+                wire.insert("tool_call_id".into(), id.into());
             }
             if let Some(name) = &msg.name {
                 wire.insert("name".into(), json!(name));
@@ -153,7 +153,7 @@ fn message_to_json(msg: &UnifiedMessage) -> Result<serde_json::Value, CucaError>
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
-            wire.insert("content".into(), json!(output));
+            wire.insert("content".into(), output.into());
         }
     }
     Ok(serde_json::Value::Object(wire))
@@ -184,8 +184,8 @@ pub(crate) fn chat_prompt(req: &UnifiedRequest) -> Result<ChatPrompt, CucaError>
         })
         .collect();
     Ok(ChatPrompt {
-        messages: json!(messages),
-        tools: json!(tools),
+        messages: messages.into(),
+        tools: tools.into(),
         enable_thinking: req.thinking.as_ref().is_some_and(|t| t.enabled),
     })
 }

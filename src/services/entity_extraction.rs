@@ -37,7 +37,9 @@
 //! [`crate::plugins::memory::MemoryPlugin::replace_graph`] (wholesale
 //! replacement). Dropping the report discards the extraction.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -331,10 +333,12 @@ impl EntityExtractor {
             )?;
         }
 
+        // Ids are the map keys, so they are unique and an unstable sort is
+        // as deterministic as a stable one.
         let mut nodes: Vec<_> = nodes.into_values().collect();
-        nodes.sort_by(|left, right| left.id.cmp(&right.id));
+        nodes.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         let mut relationships: Vec<_> = relationships.into_values().collect();
-        relationships.sort_by(|left, right| left.id.cmp(&right.id));
+        relationships.sort_unstable_by(|left, right| left.id.cmp(&right.id));
 
         let mut delta = MemoryGraph::with_capacity(nodes.len(), relationships.len());
         for node in nodes {
@@ -489,6 +493,7 @@ fn validate_schema(schema: &EntityExtractionSchema) -> Result<(), PluginError> {
 
     Ok(())
 }
+
 fn validate_properties(
     schema: &EntityExtractionSchema,
     table_name: &str,
@@ -646,15 +651,17 @@ fn coalesce<T: PartialEq + HasId>(
     value: T,
     kind: &str,
 ) -> Result<(), PluginError> {
-    let id = value.id().to_owned();
-    match values.get(&id) {
-        Some(existing) if existing != &value => Err(validation_error(
+    match values.entry(value.id().to_owned()) {
+        Entry::Occupied(existing) if *existing.get() != value => Err(validation_error(
             schema,
-            format!("conflicting {kind} candidates share derived id `{id}`"),
+            format!(
+                "conflicting {kind} candidates share derived id `{}`",
+                existing.key()
+            ),
         )),
-        Some(_) => Ok(()),
-        None => {
-            values.insert(id, value);
+        Entry::Occupied(_) => Ok(()),
+        Entry::Vacant(slot) => {
+            slot.insert(value);
             Ok(())
         }
     }
@@ -698,9 +705,15 @@ fn relationship_id(
     id
 }
 
+/// Append `len` in decimal, formatted in place rather than through a
+/// temporary `String`.
+fn append_len(out: &mut String, len: usize) {
+    // Writing to a `String` cannot fail.
+    let _ = write!(out, "{len}:");
+}
+
 fn append_length_prefixed(out: &mut String, value: &str) {
-    out.push_str(&value.len().to_string());
-    out.push(':');
+    append_len(out, value.len());
     out.push_str(value);
 }
 
@@ -718,8 +731,7 @@ fn append_canonical_value(out: &mut String, value: &serde_json::Value) {
         }
         serde_json::Value::Array(values) => {
             out.push_str("array:");
-            out.push_str(&values.len().to_string());
-            out.push(':');
+            append_len(out, values.len());
             for value in values {
                 append_canonical_value(out, value);
             }
@@ -730,8 +742,7 @@ fn append_canonical_value(out: &mut String, value: &serde_json::Value) {
 
 fn append_canonical_map(out: &mut String, values: &serde_json::Map<String, serde_json::Value>) {
     out.push_str("object:");
-    out.push_str(&values.len().to_string());
-    out.push(':');
+    append_len(out, values.len());
     let mut entries: Vec<_> = values.iter().collect();
     entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
     for (key, value) in entries {

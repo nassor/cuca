@@ -15,8 +15,18 @@
 //! every method goes through the crate-private `CacheClock` the instance
 //! was built with (the production instance reads UNIX milliseconds; tests
 //! substitute a deterministic clock). LRU order is tracked independently of
-//! hash-map iteration order via an oldest-first key list (`lru_order`), so
-//! eviction and exported ranks are reproducible across runs.
+//! hash-map iteration order via a recency map (`lru_order`: a strictly
+//! increasing touch counter to digest, oldest first), so eviction and
+//! exported ranks are reproducible across runs.
+//!
+//! # Complexity
+//!
+//! A touch is one `BTreeMap` remove plus insert, so [`PromptCache::lookup`]
+//! and [`PromptCache::insert`] cost O(log n) beyond the entry clone and the
+//! digest. Expired entries are swept in one O(n) pass, but only when the
+//! earliest stored expiry has actually passed; every other insert skips it.
+//! [`PromptCache::snapshot`] is O(n log n) for its key sort. Each digest is
+//! one shared `Arc<str>` across the entry map and the recency map.
 //!
 //! # Digest input
 //!
@@ -29,7 +39,8 @@
 //! destructures the request exhaustively, so a field added to
 //! `UnifiedRequest` fails to compile rather than dropping out of the key.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::marker::PhantomData;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
@@ -176,14 +187,73 @@ impl CacheClock for SystemClock {
     }
 }
 
+/// One cached pair and its place in the recency map.
+struct CacheSlot {
+    entry: PromptCacheEntry,
+    /// This entry's key in [`PromptCacheState::lru_order`].
+    tick: u64,
+    /// The digest, shared with the map key and the recency map.
+    key: Arc<str>,
+}
+
 /// Internal mutable state guarded by [`PromptCache`]'s mutex.
 struct PromptCacheState {
     /// Entries keyed by digest.
-    entries: HashMap<String, PromptCacheEntry>,
-    /// Digest keys ordered oldest-first; the back is most recently used.
-    /// Exported `lru_rank`s are rebuilt from this order, never from hash-map
-    /// iteration.
-    lru_order: VecDeque<String>,
+    entries: HashMap<Arc<str>, CacheSlot>,
+    /// Touch counter to digest, oldest first; the last key is most recently
+    /// used. Exported `lru_rank`s are rebuilt from this order, never from
+    /// hash-map iteration.
+    lru_order: BTreeMap<u64, Arc<str>>,
+    /// Counter value the next touch takes; strictly increasing, so ticks never
+    /// collide.
+    next_tick: u64,
+    /// Lower bound on every stored `expires_at_unix_ms` (`u64::MAX` when
+    /// empty). Removals leave it stale-low, which only costs one extra sweep.
+    earliest_expiry: u64,
+}
+
+impl PromptCacheState {
+    fn empty() -> Self {
+        Self {
+            entries: HashMap::new(),
+            lru_order: BTreeMap::new(),
+            next_tick: 0,
+            earliest_expiry: u64::MAX,
+        }
+    }
+
+    /// Make `key` the most recently used and return its new tick.
+    fn push_recent(&mut self, key: Arc<str>) -> u64 {
+        let tick = self.next_tick;
+        self.next_tick += 1;
+        self.lru_order.insert(tick, key);
+        tick
+    }
+
+    /// Remove every entry whose `expires_at_unix_ms` is at or before `now_unix_ms`.
+    fn prune_expired(&mut self, now_unix_ms: u64) {
+        if now_unix_ms < self.earliest_expiry {
+            return;
+        }
+        let Self {
+            entries,
+            lru_order,
+            earliest_expiry,
+            ..
+        } = self;
+        let mut earliest = u64::MAX;
+        entries.retain(|_, slot| {
+            let expires = slot.entry.expires_at_unix_ms;
+            if expires <= now_unix_ms {
+                lru_order.remove(&slot.tick);
+                false
+            } else {
+                earliest = earliest.min(expires);
+                true
+            }
+        });
+        *earliest_expiry = earliest;
+    }
 }
 
 /// Client-owned bounded response cache: TTL expiry plus deterministic LRU
@@ -216,10 +286,7 @@ impl PromptCache {
         Self {
             config,
             clock,
-            state: Mutex::new(PromptCacheState {
-                entries: HashMap::new(),
-                lru_order: VecDeque::new(),
-            }),
+            state: Mutex::new(PromptCacheState::empty()),
         }
     }
 
@@ -242,22 +309,27 @@ impl PromptCache {
     pub fn lookup(&self, key: &str) -> Result<Option<PromptCacheEntry>, PromptCacheError> {
         let now = self.clock.now_unix_ms();
         let mut guard = self.lock_state()?;
-        // Reborrow through the guard once so `entries` and `lru_order` are
-        // borrowed as disjoint fields; without it every `state.<field>` access
-        // is a separate `DerefMut` and the entry has to be looked up twice.
-        let state = &mut *guard;
-        let Some(stored) = state.entries.get(key) else {
+        // Destructure once so the maps are borrowed as disjoint fields.
+        let PromptCacheState {
+            entries,
+            lru_order,
+            next_tick,
+            ..
+        } = &mut *guard;
+        let Some(slot) = entries.get_mut(key) else {
             return Ok(None);
         };
-        if stored.expires_at_unix_ms <= now {
-            state.entries.remove(key);
-            remove_from_order(&mut state.lru_order, key);
+        lru_order.remove(&slot.tick);
+        if slot.entry.expires_at_unix_ms <= now {
+            entries.remove(key);
             return Ok(None);
         }
-        let mut entry = stored.clone();
-        remove_from_order(&mut state.lru_order, key);
-        state.lru_order.push_back(key.to_string());
-        entry.lru_rank = rank_of(&state.lru_order, key);
+        slot.tick = *next_tick;
+        *next_tick += 1;
+        lru_order.insert(slot.tick, Arc::clone(&slot.key));
+        let mut entry = slot.entry.clone();
+        // The touched key is the newest, so its rank is the last position.
+        entry.lru_rank = lru_order.len() - 1;
         Ok(Some(entry))
     }
 
@@ -277,26 +349,35 @@ impl PromptCache {
     ) -> Result<(), PromptCacheError> {
         let key = digest_request(&request)?;
         let now = self.clock.now_unix_ms();
-        let mut state = self.lock_state()?;
-        prune_expired(&mut state, now);
+        let mut guard = self.lock_state()?;
+        let state = &mut *guard;
+        state.prune_expired(now);
 
         let expires_at = now.saturating_add(self.config.ttl.as_millis() as u64);
+        let shared: Arc<str> = Arc::from(key.as_str());
         let entry = PromptCacheEntry {
-            key: key.clone(),
+            key,
             request,
             response,
             stored_at_unix_ms: now,
             expires_at_unix_ms: expires_at,
             lru_rank: 0,
         };
-        state.entries.insert(key.clone(), entry);
-        remove_from_order(&mut state.lru_order, &key);
-        state.lru_order.push_back(key);
+        let tick = state.push_recent(Arc::clone(&shared));
+        let slot = CacheSlot {
+            entry,
+            tick,
+            key: Arc::clone(&shared),
+        };
+        if let Some(replaced) = state.entries.insert(shared, slot) {
+            state.lru_order.remove(&replaced.tick);
+        }
+        state.earliest_expiry = state.earliest_expiry.min(expires_at);
 
-        while state.lru_order.len() > self.config.capacity {
-            if let Some(oldest) = state.lru_order.pop_front() {
-                state.entries.remove(&oldest);
-            }
+        while state.entries.len() > self.config.capacity
+            && let Some((_, oldest)) = state.lru_order.pop_first()
+        {
+            state.entries.remove(&*oldest);
         }
         Ok(())
     }
@@ -354,21 +435,24 @@ impl PromptCache {
         let state = self.lock_state()?;
         // Renumber ranks contiguously from 0 over the live entries only,
         // ordered by their position in `lru_order` (oldest live first),
-        // mirroring `stage_snapshot`'s install renumbering. Deriving ranks
-        // straight from `rank_of` over the unpruned `lru_order` would leave
-        // gaps wherever an expired entry (excluded below) still occupies a
-        // slot in that order, producing ranks `validate_snapshot` rejects.
-        let mut entries: Vec<PromptCacheEntry> = state
-            .lru_order
-            .iter()
-            .filter_map(|key| state.entries.get(key))
-            .filter(|e| e.expires_at_unix_ms > now_unix_ms)
-            .cloned()
-            .collect();
+        // mirroring `stage_snapshot`'s install renumbering. Ranks taken from
+        // positions in the unpruned `lru_order` would leave gaps wherever an
+        // expired entry (excluded below) still occupies a slot in that order,
+        // producing ranks `validate_snapshot` rejects.
+        let mut entries: Vec<PromptCacheEntry> = Vec::with_capacity(state.entries.len());
+        entries.extend(
+            state
+                .lru_order
+                .values()
+                .filter_map(|key| state.entries.get(&**key))
+                .map(|slot| &slot.entry)
+                .filter(|e| e.expires_at_unix_ms > now_unix_ms)
+                .cloned(),
+        );
         for (rank, entry) in entries.iter_mut().enumerate() {
             entry.lru_rank = rank;
         }
-        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        entries.sort_unstable_by(|a, b| a.key.cmp(&b.key));
         Ok(PromptCacheSnapshot { entries })
     }
 
@@ -437,20 +521,27 @@ impl PromptCache {
 
         let capacity_evictions = live.len().saturating_sub(self.config.capacity);
         if capacity_evictions > 0 {
-            live.drain(0..capacity_evictions);
+            live.drain(..capacity_evictions);
         }
 
-        let mut lru_order = VecDeque::with_capacity(live.len());
-        let mut entries = HashMap::with_capacity(live.len());
+        let mut state = PromptCacheState::empty();
+        state.entries.reserve(live.len());
         for (rank, mut entry) in live.into_iter().enumerate() {
             entry.lru_rank = rank;
-            lru_order.push_back(entry.key.clone());
-            entries.insert(entry.key.clone(), entry);
+            let key: Arc<str> = Arc::from(entry.key.as_str());
+            state.earliest_expiry = state.earliest_expiry.min(entry.expires_at_unix_ms);
+            let tick = state.push_recent(Arc::clone(&key));
+            let slot = CacheSlot {
+                entry,
+                tick,
+                key: Arc::clone(&key),
+            };
+            state.entries.insert(key, slot);
         }
-        let imported_entries = entries.len();
+        let imported_entries = state.entries.len();
 
         Ok(StagedCacheState {
-            state: PromptCacheState { entries, lru_order },
+            state,
             report: PromptCacheImportReport {
                 imported_entries,
                 expired_entries,
@@ -468,8 +559,11 @@ impl PromptCache {
         &self,
         staged: StagedCacheState,
     ) -> Result<PromptCacheImportReport, PromptCacheError> {
-        let mut state = self.lock_state()?;
-        *state = staged.state;
+        let mut guard = self.lock_state()?;
+        let replaced = std::mem::replace(&mut *guard, staged.state);
+        // Free the displaced entries after the lock is released.
+        drop(guard);
+        drop(replaced);
         Ok(staged.report)
     }
 }
@@ -482,33 +576,6 @@ impl PromptCache {
 pub(crate) struct StagedCacheState {
     state: PromptCacheState,
     report: PromptCacheImportReport,
-}
-
-/// Remove `key` from `order` wherever it currently sits (no-op if absent).
-fn remove_from_order(order: &mut VecDeque<String>, key: &str) {
-    if let Some(pos) = order.iter().position(|k| k == key) {
-        order.remove(pos);
-    }
-}
-
-/// Current oldest-first position of `key` in `order`; `0` if absent (should
-/// only be queried for keys known to be present).
-fn rank_of(order: &VecDeque<String>, key: &str) -> usize {
-    order.iter().position(|k| k == key).unwrap_or(0)
-}
-
-/// Remove every entry whose `expires_at_unix_ms` is at or before `now_unix_ms`.
-fn prune_expired(state: &mut PromptCacheState, now_unix_ms: u64) {
-    let expired: Vec<String> = state
-        .entries
-        .iter()
-        .filter(|(_, e)| e.expires_at_unix_ms <= now_unix_ms)
-        .map(|(k, _)| k.clone())
-        .collect();
-    for key in expired {
-        state.entries.remove(&key);
-        remove_from_order(&mut state.lru_order, &key);
-    }
 }
 
 /// Structural validation for an imported snapshot: run before any lock is
@@ -526,7 +593,7 @@ fn validate_snapshot(snapshot: &PromptCacheSnapshot) -> Result<(), PromptCacheEr
                 message: "key must be a lowercase 64-character SHA-256 hex digest".to_string(),
             });
         }
-        if !seen_keys.insert(entry.key.clone()) {
+        if !seen_keys.insert(entry.key.as_str()) {
             return Err(PromptCacheError::Validation {
                 field: format!("entries[{}].key", entry.key),
                 message: "duplicate key in imported snapshot".to_string(),
@@ -566,9 +633,7 @@ fn validate_snapshot(snapshot: &PromptCacheSnapshot) -> Result<(), PromptCacheEr
 
 /// Whether `s` is exactly 64 lowercase hex characters (a SHA-256 digest).
 fn is_lowercase_sha256_hex(s: &str) -> bool {
-    s.len() == 64
-        && s.chars()
-            .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    s.len() == 64 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// Borrowed digest view of [`MessageContentBlock`].
@@ -635,11 +700,33 @@ impl<'a> From<&'a MessageContentBlock> for BlockDigest<'a> {
     }
 }
 
+/// A slice serialized as a sequence of borrowed digest views.
+///
+/// The views are built while serializing, so no `Vec` of them is allocated per
+/// message or content block. The wire bytes equal a `Vec<D>`'s: the exact
+/// length prefix, then each element in order.
+struct DigestSeq<'a, S, D>(&'a [S], PhantomData<fn() -> D>);
+
+impl<'a, S, D> DigestSeq<'a, S, D> {
+    fn new(items: &'a [S]) -> Self {
+        Self(items, PhantomData)
+    }
+}
+
+impl<'a, S, D> serde::Serialize for DigestSeq<'a, S, D>
+where
+    D: From<&'a S> + serde::Serialize,
+{
+    fn serialize<Ser: serde::Serializer>(&self, serializer: Ser) -> Result<Ser::Ok, Ser::Error> {
+        serializer.collect_seq(self.0.iter().map(D::from))
+    }
+}
+
 /// Borrowed digest view of [`UnifiedMessage`].
 #[derive(serde::Serialize)]
 struct MessageDigest<'a> {
     role: &'a MessageRole,
-    content: Vec<BlockDigest<'a>>,
+    content: DigestSeq<'a, MessageContentBlock, BlockDigest<'a>>,
     name: Option<&'a str>,
     tool_call_id: Option<&'a str>,
 }
@@ -656,7 +743,7 @@ impl<'a> From<&'a UnifiedMessage> for MessageDigest<'a> {
         } = message;
         Self {
             role,
-            content: content.iter().map(BlockDigest::from).collect(),
+            content: DigestSeq::new(content),
             name: name.as_deref(),
             tool_call_id: tool_call_id.as_deref(),
         }
@@ -698,12 +785,12 @@ impl<'a> From<&'a ToolDefinition> for ToolDigest<'a> {
 struct RequestDigest<'a> {
     model: &'a str,
     provider: &'a crate::types::ProviderEndpoint,
-    messages: Vec<MessageDigest<'a>>,
+    messages: DigestSeq<'a, UnifiedMessage, MessageDigest<'a>>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
     stream: bool,
     thinking: Option<&'a crate::request::ThinkingConfig>,
-    tools: Vec<ToolDigest<'a>>,
+    tools: DigestSeq<'a, ToolDefinition, ToolDigest<'a>>,
     prompt_cache: &'a crate::request::PromptCacheDirective,
 }
 
@@ -725,12 +812,12 @@ impl<'a> From<&'a UnifiedRequest> for RequestDigest<'a> {
         Self {
             model,
             provider,
-            messages: messages.iter().map(MessageDigest::from).collect(),
+            messages: DigestSeq::new(messages),
             temperature: *temperature,
             max_tokens: *max_tokens,
             stream: *stream,
             thinking: thinking.as_ref(),
-            tools: tools.iter().map(ToolDigest::from).collect(),
+            tools: DigestSeq::new(tools),
             prompt_cache,
         }
     }
@@ -823,6 +910,17 @@ mod tests {
 
     use super::*;
     use crate::types::{MessageContentBlock, ProviderEndpoint, ToolDefinition};
+
+    impl PromptCacheState {
+        /// Digests oldest first.
+        fn order(&self) -> Vec<&str> {
+            self.lru_order.values().map(|key| &**key).collect()
+        }
+
+        fn entry(&self, key: &str) -> Option<&PromptCacheEntry> {
+            self.entries.get(key).map(|slot| &slot.entry)
+        }
+    }
 
     /// Deterministic clock for LRU/TTL tests: starts at `start` and only
     /// moves when explicitly advanced or set.
@@ -1157,7 +1255,7 @@ mod tests {
             .unwrap();
         let key = digest_request(&sample_request("a")).unwrap();
         let state = cache.state.lock().unwrap();
-        let entry = state.entries.get(&key).unwrap();
+        let entry = state.entry(&key).unwrap();
         assert_eq!(entry.stored_at_unix_ms, 1_000);
         assert_eq!(entry.expires_at_unix_ms, 1_100);
     }
@@ -1175,10 +1273,10 @@ mod tests {
 
         let state = cache.state.lock().unwrap();
         assert!(
-            !state.entries.contains_key(&key),
+            !state.entries.contains_key(key.as_str()),
             "expired entry must be physically removed by lookup, not just filtered"
         );
-        assert!(!state.lru_order.contains(&key));
+        assert!(!state.order().contains(&key.as_str()));
     }
 
     #[test]
@@ -1196,7 +1294,7 @@ mod tests {
 
         let state = cache.state.lock().unwrap();
         assert!(
-            !state.entries.contains_key(&key_a),
+            !state.entries.contains_key(key_a.as_str()),
             "insert must prune expired entries even without a lookup"
         );
     }
@@ -1215,20 +1313,20 @@ mod tests {
 
         {
             let state = cache.state.lock().unwrap();
-            assert_eq!(state.lru_order, vec![key_a.clone(), key_b.clone()]);
+            assert_eq!(state.order(), [key_a.as_str(), key_b.as_str()]);
         }
 
         // Live hit on a: a moves to the back (most recently used).
         cache.lookup(&key_a).unwrap();
         {
             let state = cache.state.lock().unwrap();
-            assert_eq!(state.lru_order, vec![key_b.clone(), key_a.clone()]);
+            assert_eq!(state.order(), [key_b.as_str(), key_a.as_str()]);
         }
 
         // Miss on an unknown key changes nothing.
         cache.lookup("does-not-exist").unwrap();
         let state = cache.state.lock().unwrap();
-        assert_eq!(state.lru_order, vec![key_b, key_a]);
+        assert_eq!(state.order(), [key_b.as_str(), key_a.as_str()]);
     }
 
     #[test]
@@ -1254,8 +1352,8 @@ mod tests {
             2,
             "replacement must not grow the cache"
         );
-        assert_eq!(state.lru_order, vec![key_b, key_a.clone()]);
-        let refreshed = state.entries.get(&key_a).unwrap();
+        assert_eq!(state.order(), [key_b.as_str(), key_a.as_str()]);
+        let refreshed = state.entry(&key_a).unwrap();
         assert_eq!(refreshed.stored_at_unix_ms, 500);
         assert_eq!(refreshed.response.model, "a-v2");
     }
@@ -1279,10 +1377,10 @@ mod tests {
 
         let state = cache.state.lock().unwrap();
         assert!(
-            !state.entries.contains_key(&key_a),
+            !state.entries.contains_key(key_a.as_str()),
             "rank-0 (oldest) must be evicted"
         );
-        assert_eq!(state.lru_order, vec![key_b, key_c]);
+        assert_eq!(state.order(), [key_b.as_str(), key_c.as_str()]);
     }
 
     #[test]
@@ -1420,9 +1518,9 @@ mod tests {
         // Live entries and their relative recency order are preserved: "b"
         // (older) then "c" (newer).
         let state = cache.state.lock().unwrap();
-        assert_eq!(state.lru_order, vec![b_key.clone(), c_key.clone()]);
-        assert_eq!(state.entries.get(&b_key).unwrap().lru_rank, 0);
-        assert_eq!(state.entries.get(&c_key).unwrap().lru_rank, 1);
+        assert_eq!(state.order(), [b_key.as_str(), c_key.as_str()]);
+        assert_eq!(state.entry(&b_key).unwrap().lru_rank, 0);
+        assert_eq!(state.entry(&c_key).unwrap().lru_rank, 1);
     }
 
     #[test]
@@ -1550,16 +1648,13 @@ mod tests {
         assert_eq!(report.expired_entries, 0);
 
         let state = cache.state.lock().unwrap();
-        assert!(!state.entries.contains_key(&oldest.key));
-        assert!(state.entries.contains_key(&middle.key));
-        assert!(state.entries.contains_key(&newest.key));
-        assert_eq!(
-            state.lru_order,
-            vec![middle.key.clone(), newest.key.clone()]
-        );
+        assert!(!state.entries.contains_key(oldest.key.as_str()));
+        assert!(state.entries.contains_key(middle.key.as_str()));
+        assert!(state.entries.contains_key(newest.key.as_str()));
+        assert_eq!(state.order(), [middle.key.as_str(), newest.key.as_str()]);
         // Ranks renumbered contiguously from 0.
-        assert_eq!(state.entries.get(&middle.key).unwrap().lru_rank, 0);
-        assert_eq!(state.entries.get(&newest.key).unwrap().lru_rank, 1);
+        assert_eq!(state.entry(&middle.key).unwrap().lru_rank, 0);
+        assert_eq!(state.entry(&newest.key).unwrap().lru_rank, 1);
     }
 
     #[test]

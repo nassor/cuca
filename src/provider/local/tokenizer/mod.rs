@@ -36,10 +36,10 @@
 //! open-addressing table ([`vocab`]) and the merge map holds 16 bytes per rule;
 //! all of it is read-only afterwards and shared by cloning the `Arc` the engine
 //! keeps. Per `encode` call the transient state is the output vector, one 8 KiB
-//! bit set for the special-token prefilter, the fragment list, and per fragment
-//! one scratch for the longest word (symbol list and heap) plus two range
-//! vectors for the pre-tokenizer: all bounded by the input length and freed on
-//! return.
+//! bit set for the special-token prefilter, the fragment list, and one buffer
+//! set shared by all fragments (the longest word's symbol list and heap, the
+//! word text and two range vectors for the pre-tokenizer): all bounded by the
+//! input length and freed on return.
 
 mod bpe;
 mod pretok;
@@ -51,6 +51,7 @@ pub(crate) mod golden;
 
 use std::collections::HashMap;
 use std::fmt;
+use std::ops::Range;
 
 use candle_core::quantized::gguf_file::{self, Value};
 
@@ -93,6 +94,20 @@ enum Engine {
         /// Word splitting scheme.
         words: Words,
     },
+}
+
+/// Buffers reused across the fragments of one `encode` call.
+#[derive(Default)]
+struct Buffers {
+    /// Word byte ranges the pre-tokenizer produced.
+    ranges: Vec<Range<usize>>,
+    /// Second range buffer of the pre-tokenizer's stage chain.
+    stage_ranges: Vec<Range<usize>>,
+    /// Symbol list and heap of the BPE merger.
+    scratch: Scratch,
+    /// The text being cut into words: the current GPT-2-alphabet word (byte-level
+    /// BPE) or the whole space-escaped fragment (`gemma4`).
+    text: String,
 }
 
 /// A text fragment during special-token partitioning.
@@ -215,12 +230,12 @@ impl<'a> Metadata<'a> {
     }
 
     /// A required array of strings.
-    fn strings(&self, key: &str) -> Result<Vec<String>, CucaError> {
+    fn strings(&self, key: &str) -> Result<Vec<&'a str>, CucaError> {
         self.array(key)?
             .ok_or_else(|| local_err(format!("GGUF lacks `{key}`")))?
             .iter()
             .map(|v| match v {
-                Value::String(s) => Ok(s.clone()),
+                Value::String(s) => Ok(s.as_str()),
                 _ => Err(local_err(format!("GGUF `{key}` holds a non-string entry"))),
             })
             .collect()
@@ -266,7 +281,7 @@ impl Tokenizer {
         token_types: Vec<i32>,
         merges: &[String],
     ) -> Result<Self, CucaError> {
-        let vocab = Vocab::new(pieces, token_types)?;
+        let vocab = Vocab::new(&pieces, token_types)?;
         let merges = Merges::new(&vocab, merges, true)?;
         Ok(Self::assemble(
             vocab,
@@ -334,7 +349,7 @@ impl Tokenizer {
                 })
                 .collect::<Result<Vec<_>, _>>()?,
         };
-        let vocab = Vocab::new(pieces, token_types)?;
+        let vocab = Vocab::new(&pieces, token_types)?;
 
         let (default_bos, default_eos) = match kind {
             Kind::Spm => (true, false),
@@ -441,6 +456,7 @@ impl Tokenizer {
     /// `add_space_prefix` is set.
     pub(crate) fn encode(&self, text: &str) -> Vec<u32> {
         let mut out = Vec::with_capacity(text.len() / 3 + 2);
+        let mut buffers = Buffers::default();
         let mut after_special = true;
         for fragment in self.partition_specials(text) {
             match fragment {
@@ -449,7 +465,7 @@ impl Tokenizer {
                     after_special = true;
                 }
                 Fragment::Raw(raw) => {
-                    self.encode_raw(raw, after_special, &mut out);
+                    self.encode_raw(raw, after_special, &mut buffers, &mut out);
                     after_special = false;
                 }
             }
@@ -482,23 +498,26 @@ impl Tokenizer {
         match ty {
             TYPE_NORMAL | TYPE_UNUSED | TYPE_UNDEFINED => {
                 let mut buf = [0u8; 4];
-                let byte_level = matches!(
+                if matches!(
                     self.engine,
                     Engine::Bpe {
                         words: Words::Byte(_),
                         ..
                     }
-                );
-                for c in text.chars() {
-                    if byte_level {
+                ) {
+                    for c in text.chars() {
                         match char_to_byte(c) {
                             Some(byte) => out.push(byte),
                             None => out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes()),
                         }
-                    } else if c == SPACE_MARK {
-                        out.push(b' ');
-                    } else {
-                        out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                    }
+                } else {
+                    for c in text.chars() {
+                        if c == SPACE_MARK {
+                            out.push(b' ');
+                        } else {
+                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+                        }
                     }
                 }
             }
@@ -539,11 +558,14 @@ impl Tokenizer {
         for &Special { id, lstrip, rstrip } in &self.specials {
             let special = self.vocab.piece(id);
             let sb = special.as_bytes();
-            if !first[sb[0] as usize] {
+            let Some(&lead) = sb.first() else {
+                continue;
+            };
+            if !first[lead as usize] {
                 continue;
             }
             if let Some(&second) = sb.get(1) {
-                let key = (usize::from(sb[0]) << 8) | usize::from(second);
+                let key = (usize::from(lead) << 8) | usize::from(second);
                 if pairs[key >> 6] & (1 << (key & 63)) == 0 {
                     continue;
                 }
@@ -584,37 +606,50 @@ impl Tokenizer {
     }
 
     /// Encode a special-free fragment with the scheme's algorithm.
-    fn encode_raw(&self, raw: &str, after_special: bool, out: &mut Vec<u32>) {
+    fn encode_raw(
+        &self,
+        raw: &str,
+        after_special: bool,
+        buffers: &mut Buffers,
+        out: &mut Vec<u32>,
+    ) {
         match &self.engine {
             Engine::Spm(spm) => spm.encode_fragment(&self.vocab, raw, after_special, out),
             Engine::Bpe {
                 merges,
                 words: Words::Byte(pre),
             } => {
-                let (mut ranges, mut scratch_ranges) = (Vec::new(), Vec::new());
-                pre.split(raw, &mut ranges, &mut scratch_ranges);
-                let mut scratch = Scratch::default();
-                for range in &ranges {
-                    scratch.word.clear();
-                    scratch
-                        .word
-                        .extend(raw[range.clone()].bytes().map(byte_to_char));
+                let Buffers {
+                    ranges,
+                    stage_ranges,
+                    scratch,
+                    text: word,
+                } = buffers;
+                pre.split(raw, ranges, stage_ranges);
+                for range in ranges.iter() {
+                    word.clear();
+                    word.extend(raw[range.clone()].bytes().map(byte_to_char));
                     if pre.ignore_merges()
-                        && let Some(id) = self.vocab.get(&scratch.word)
+                        && let Some(id) = self.vocab.get(word)
                     {
                         out.push(id);
                         continue;
                     }
-                    merges.merge_word(&self.vocab, &mut scratch, Unknown::Drop, out);
+                    merges.merge_word(&self.vocab, scratch, word, Unknown::Drop, out);
                 }
             }
             Engine::Bpe {
                 merges,
                 words: Words::Escaped,
             } => {
-                let text = raw.replace(' ', "\u{2581}");
-                let mut scratch = Scratch::default();
-                let mut rest = text.as_str();
+                let Buffers {
+                    scratch,
+                    text: escaped,
+                    ..
+                } = buffers;
+                escaped.clear();
+                escaped.extend(raw.chars().map(|c| if c == ' ' { SPACE_MARK } else { c }));
+                let mut rest = escaped.as_str();
                 while let Some(first) = rest.chars().next() {
                     let newline = first == '\n';
                     let end = rest
@@ -626,9 +661,7 @@ impl Tokenizer {
                         out.push(id);
                         continue;
                     }
-                    scratch.word.clear();
-                    scratch.word.push_str(word);
-                    merges.merge_word(&self.vocab, &mut scratch, Unknown::ByteTokens, out);
+                    merges.merge_word(&self.vocab, scratch, word, Unknown::ByteTokens, out);
                 }
             }
         }

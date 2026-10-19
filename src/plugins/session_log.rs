@@ -216,7 +216,10 @@ impl SessionBackend for InMemoryBackend {
 
     fn fork(&self, session_id: &str, point_id: &str) -> Result<String, PluginError> {
         let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
-        let records = inner.sessions.get(session_id).cloned().unwrap_or_default();
+        let records = inner
+            .sessions
+            .get(session_id)
+            .map_or(&[][..], Vec::as_slice);
         let index = records
             .iter()
             .position(|r| r.point_id() == point_id)
@@ -239,13 +242,18 @@ impl SessionBackend for InMemoryBackend {
 
         // The new trajectory is the prefix up to and including the fork point,
         // re-labelled so every record belongs to the new session.
+        // Built from borrowed records: cloning the whole session first (as a
+        // `.cloned()` would) copies every record after the fork point too.
         let prefix: Vec<SessionRecord> = records[..=index]
             .iter()
             .map(|r| SessionRecord {
                 session_id: new_id.clone(),
-                ..r.clone()
+                sequence: r.sequence,
+                timestamp_ms: r.timestamp_ms,
+                event: r.event.clone(),
             })
             .collect();
+        let tail_sequence = records.len() as u64;
         let replaced = inner.sessions.insert(new_id.clone(), prefix);
         debug_assert!(
             replaced.is_none(),
@@ -255,7 +263,7 @@ impl SessionBackend for InMemoryBackend {
         // Auditability: sequence the Fork record at the original's current tail.
         let fork_rec = SessionRecord {
             session_id: session_id.to_string(),
-            sequence: records.len() as u64,
+            sequence: tail_sequence,
             timestamp_ms: now_ms(),
             event: SessionEvent::Fork {
                 from_point: point_id.to_string(),
@@ -973,15 +981,26 @@ impl SessionLogPlugin {
         // The store is authoritative over sequence numbers: the record lands
         // at the session's next value and keeps the caller's timestamp.
         let mut seqs = self.sequence.lock().unwrap_or_else(|p| p.into_inner());
-        let next = seqs.get(session_id).copied().unwrap_or(0);
+        // `get_mut` on the hot path: `insert(session_id.to_string(), ..)` would
+        // allocate a fresh key `String` for every streamed chunk.
+        let next = match seqs.get_mut(session_id) {
+            Some(slot) => {
+                let next = *slot;
+                *slot += 1;
+                next
+            }
+            None => {
+                seqs.insert(session_id.to_string(), 1);
+                0
+            }
+        };
+        drop(seqs);
         let sequenced = SessionRecord {
             session_id: session_id.to_string(),
             sequence: next,
             timestamp_ms,
             event,
         };
-        seqs.insert(session_id.to_string(), next + 1);
-        drop(seqs);
         self.backend.append(&sequenced)
     }
 }

@@ -435,10 +435,24 @@ impl MemoryPlugin {
             .lock()
             .map_err(|e| PluginError::Internal(format!("tiktoken encoder lock poisoned: {e}")))?;
         let mut total = 0usize;
+        // One scratch buffer reused for every message: the former
+        // `Vec<&str>` + joined `String` + `format!` cost three allocations
+        // per message on every request.
+        let mut serialized = String::new();
         for msg in messages {
-            let text = joined_text(msg);
-            // One allocation per message.
-            let serialized = format!("{} {}", role_label(msg.role), text);
+            serialized.clear();
+            serialized.push_str(role_label(msg.role));
+            serialized.push(' ');
+            let mut first = true;
+            for block in &msg.content {
+                if let MessageContentBlock::Text(t) = block {
+                    if !first {
+                        serialized.push(' ');
+                    }
+                    first = false;
+                    serialized.push_str(t);
+                }
+            }
             total += encoder.encode_ordinary(&serialized).len();
         }
         Ok(total as u32)
@@ -814,7 +828,7 @@ impl MemoryPlugin {
         tool_name: &str,
         messages: &mut [UnifiedMessage],
     ) -> Result<Option<CompressionAction>, PluginError> {
-        let mut seen: HashSet<(String, String)> = HashSet::new();
+        let mut seen: HashSet<String> = HashSet::new();
         let mut blanked = false;
         // Newest to oldest: the first (newest) read of a path records it; older
         // reads of a path read again later have their superseded output blanked.
@@ -836,9 +850,8 @@ impl MemoryPlugin {
                 })
                 .collect();
             for (call_id, path) in calls {
-                let key = (tool_name.to_string(), path);
                 if let Some(location) = find_result_location(messages, &call_id)
-                    && !seen.insert(key)
+                    && !seen.insert(path)
                 {
                     blanked |= blank_result(messages, location);
                 }
@@ -1093,10 +1106,9 @@ fn role_label(role: MessageRole) -> &'static str {
     }
 }
 
-/// Concatenate the `Text` content blocks of a message.
-///
-/// Image and tool metadata are excluded from the estimate to keep the counter
-/// fast; this is a documented approximation.
+/// Concatenate the `Text` content blocks of a message (test assertions only;
+/// `count_tokens` builds the same text in a reused buffer).
+#[cfg(test)]
 fn joined_text(msg: &UnifiedMessage) -> String {
     let mut parts = Vec::new();
     for block in &msg.content {
@@ -1130,12 +1142,19 @@ fn removable_turn_indices(messages: &[UnifiedMessage], cap: usize) -> Vec<usize>
     out
 }
 
-/// Remove messages by ascending index; removing in reverse keeps earlier
-/// indices valid.
+/// Remove messages by ascending index in one `retain` pass (`O(n)`, not one
+/// `Vec::remove` shift per index).
 fn remove_indices(messages: &mut Vec<UnifiedMessage>, idxs: &[usize]) {
-    for &i in idxs.iter().rev() {
-        messages.remove(i);
-    }
+    let mut next = idxs.iter().copied().peekable();
+    let mut i = 0usize;
+    messages.retain(|_| {
+        let drop = next.peek() == Some(&i);
+        if drop {
+            next.next();
+        }
+        i += 1;
+        !drop
+    });
 }
 
 /// Pairing-closure of a drop set: add every message that carries the result of

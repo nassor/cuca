@@ -167,16 +167,16 @@ impl ClientPool {
     /// Return the cached client for `(provider, base_url)`, building and
     /// caching a new one on first use.
     ///
+    /// `api_key` is applied only when `Some`; pass `None` to use a provider's
+    /// default auth. A provider feature that is not compiled does not fail
+    /// here: the builder succeeds and the missing feature surfaces as
+    /// [`CucaError::ProviderNotEnabled`] at `generate_stream` time.
+    ///
     /// # Errors
     ///
     /// [`CucaError::Config`] when the pool lock is poisoned, plus whatever
     /// [`crate::client::CucaClientBuilder::build`] rejects for the requested
     /// provider.
-    ///
-    /// `api_key` is applied only when `Some`; pass `None` to use a provider's
-    /// default auth. A provider feature that is not compiled does not fail
-    /// here: the builder succeeds and the missing feature surfaces as
-    /// [`CucaError::ProviderNotEnabled`] at `generate_stream` time.
     pub fn get_or_create(
         &self,
         provider: &ProviderEndpoint,
@@ -209,8 +209,9 @@ impl ClientPool {
 
     /// Number of unique `(provider, base_url)` entries cached.
     pub fn len(&self) -> usize {
-        self.clients.lock().map(|c| c.len()).unwrap_or_else(|_| 0)
+        self.clients.lock().map_or(0, |clients| clients.len())
     }
+
     /// Whether the pool holds no cached clients.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
@@ -301,14 +302,31 @@ fn block_tokens(block: &MessageContentBlock) -> usize {
         MessageContentBlock::ToolCall { arguments, .. } => {
             // `Value` always serializes; on the (impossible) failure treat it
             // as zero tokens rather than panicking.
-            serde_json::to_string(arguments)
-                .map(|s| approx_tokens(s.chars().count()))
-                .unwrap_or(0)
+            let mut counter = CharCounter(0);
+            serde_json::to_writer(&mut counter, arguments).map_or(0, |()| approx_tokens(counter.0))
         }
         // An image contributes no measurable token volume in this heuristic.
         MessageContentBlock::ImageBase64 { .. } => 0,
         // A tool result carries output text; count a single token.
         MessageContentBlock::ToolResult { .. } => 1,
+    }
+}
+
+/// Counts the `char`s written through it without keeping the bytes, so a tool
+/// call's serialized arguments are measured with no intermediate `String`.
+struct CharCounter(usize);
+
+impl std::io::Write for CharCounter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Each `char` has exactly one byte that is not a UTF-8 continuation
+        // byte (`0b10xx_xxxx`), so counting those counts chars however the
+        // writer splits its output.
+        self.0 += buf.iter().filter(|&&byte| byte & 0xC0 != 0x80).count();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -474,8 +492,7 @@ impl TurnExecutor for PoolTurnExecutor {
         self.tier
     }
 
-    fn execute(&self, request: UnifiedRequest) -> Result<AgentResponseStream, CucaError> {
-        let mut request = request;
+    fn execute(&self, mut request: UnifiedRequest) -> Result<AgentResponseStream, CucaError> {
         request.model = self.model_id.clone();
         let provider = self.provider.clone();
         let base_url = self.base_url.clone();

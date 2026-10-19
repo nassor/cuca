@@ -1,4 +1,5 @@
-/target
+/target*
+/smoke*
 /.agents
 /graphify*
 /.omp

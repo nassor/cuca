@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 /// This is the canonical, provider-agnostic identifier used across the crate.
 /// Each variant maps to a concrete upstream service; [`Self::Custom`] lets
 /// callers address a bespoke gateway without adding a first-class variant.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderEndpoint {
     /// llama.cpp server.
@@ -16,7 +16,9 @@ pub enum ProviderEndpoint {
     Vllm,
     /// LM Studio local server.
     LmStudio,
-    /// OpenAI-compatible API.
+    /// OpenAI-compatible API; the default endpoint, being the most commonly
+    /// used provider. Callers that need a different default opt in explicitly.
+    #[default]
     OpenAi,
     /// Anthropic API.
     Anthropic,
@@ -28,14 +30,6 @@ pub enum ProviderEndpoint {
     Local,
     /// A bespoke gateway, identified by its opaque key.
     Custom(String),
-}
-
-impl Default for ProviderEndpoint {
-    /// The default endpoint is [`ProviderEndpoint::OpenAi`], the most commonly
-    /// used provider; callers that need a different default opt in explicitly.
-    fn default() -> Self {
-        ProviderEndpoint::OpenAi
-    }
 }
 
 impl std::fmt::Display for ProviderEndpoint {

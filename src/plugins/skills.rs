@@ -442,16 +442,28 @@ impl CucaPlugin for SkillsPlugin {
         if !self.config.inject_catalog || self.skills.is_empty() {
             return Ok(());
         }
-        let mut catalog = String::from(
-            "You have access to agent skills via three tools:\n\
+        const HEADER: &str = "You have access to agent skills via three tools:\n\
              - `skill {name}`: loads a skill's full instructions by name.\n\
              - `skill_read {skill, file}`: reads a reference file bundled with a skill.\n\
              - `skill_search {query}`: finds skills by description.\n\
              Use `skill_search` first when unsure which skill applies.\n\
-             Available skills:\n",
-        );
+             Available skills:\n";
+        // Pre-sized from the entries (`"- " + name + ": " + description + "\n"`),
+        // pushed piecewise: a `format!` per skill would allocate a temporary
+        // `String` per skill on every request.
+        let body: usize = self
+            .skills
+            .iter()
+            .map(|s| s.name.len() + s.description.len() + 5)
+            .sum();
+        let mut catalog = String::with_capacity(HEADER.len() + body);
+        catalog.push_str(HEADER);
         for skill in &self.skills {
-            catalog.push_str(&format!("- {}: {}\n", skill.name, skill.description));
+            catalog.push_str("- ");
+            catalog.push_str(&skill.name);
+            catalog.push_str(": ");
+            catalog.push_str(&skill.description);
+            catalog.push('\n');
         }
         req.messages.push(UnifiedMessage::system(catalog));
         Ok(())

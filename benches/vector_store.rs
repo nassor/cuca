@@ -109,19 +109,18 @@ fn filled_store(count: usize, dimensions: usize) -> InMemoryVectorStore {
 
 /// The scalar counterpart of the store's scan: serial dot products plus the
 /// identical exact top-k ranking.
-fn scalar_scan(rows: &[f32], query: &[f32], dimensions: usize, k: usize) -> Vec<(f32, u64, usize)> {
+fn scalar_scan(rows: &[f32], query: &[f32], dimensions: usize, k: usize) -> Vec<(f32, usize)> {
     let count = rows.len() / dimensions;
-    let mut scored: Vec<(f32, u64, usize)> = Vec::with_capacity(count);
+    let mut scored: Vec<(f32, usize)> = Vec::with_capacity(count);
     for slot in 0..count {
         let row = &rows[slot * dimensions..(slot + 1) * dimensions];
         let mut sum = 0.0f32;
         for (x, y) in query.iter().zip(row) {
             sum += x * y;
         }
-        scored.push((sum, slot as u64, slot));
+        scored.push((sum, slot));
     }
-    let rank =
-        |a: &(f32, u64, usize), b: &(f32, u64, usize)| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1));
+    let rank = |a: &(f32, usize), b: &(f32, usize)| b.0.total_cmp(&a.0).then(b.1.cmp(&a.1));
     if scored.len() > k {
         scored.select_nth_unstable_by(k - 1, rank);
         scored.truncate(k);

@@ -381,7 +381,7 @@ impl SessionReplay {
             let SessionRecord {
                 sequence, event, ..
             } = record;
-            let mut turn = current.take().unwrap_or_else(|| TurnBuilder::new(sequence));
+            let turn = current.get_or_insert_with(|| TurnBuilder::new(sequence));
             turn.last_sequence = sequence;
 
             // Exhaustive on purpose (no `_ =>` arm): a new `SessionEvent`
@@ -445,10 +445,10 @@ impl SessionReplay {
             // The terminator is the record completing the Latency+TokenUsage
             // pair; for a trajectory this crate recorded that is the
             // `TokenUsage` record, since the hook appends them in that order.
-            if turn.is_terminated() {
-                turns.push(turn.finish(&session_id, self.config.max_turn_blocks)?);
-            } else {
-                current = Some(turn);
+            if turn.is_terminated()
+                && let Some(done) = current.take()
+            {
+                turns.push(done.finish(&session_id, self.config.max_turn_blocks)?);
             }
         }
         // Trailing records without a terminator: their own incomplete turn.
@@ -622,11 +622,8 @@ impl ReplayTrajectory {
                 ),
             });
         }
-        let blocks: Vec<MessageContentBlock> = self
-            .turns
-            .into_iter()
-            .flat_map(|turn| turn.blocks)
-            .collect();
+        let mut blocks: Vec<MessageContentBlock> = Vec::with_capacity(self.usage.blocks);
+        blocks.extend(self.turns.into_iter().flat_map(|turn| turn.blocks));
         Ok(Box::pin(ReplayStream {
             blocks: blocks.into_iter(),
         }))

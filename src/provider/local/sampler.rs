@@ -3,8 +3,9 @@
 //! Implements the HuggingFace logits-warper order over a raw logits slice:
 //! temperature scaling, top-k, softmax, top-p (nucleus), then a single draw
 //! from a seedable [`SplitMix64`] generator. Temperature `<= 0` selects the
-//! argmax (first maximum wins). The sampler allocates only a candidate vector
-//! of at most `top_k` entries (the whole vocabulary when `top_k == 0`).
+//! argmax (first maximum wins). Candidates are built in a caller-owned
+//! [`Scratch`], so sampling a token allocates nothing once it has grown to the
+//! vocabulary size.
 
 use std::cmp::Ordering;
 use std::collections::hash_map::RandomState;
@@ -66,11 +67,25 @@ pub(crate) struct Dist {
     candidates: Vec<(f32, u32)>,
 }
 
+/// Reusable candidate buffer for [`sample`] and [`Dist::warp`]: it keeps its
+/// capacity (up to the vocabulary size) between tokens.
+#[derive(Debug, Default)]
+pub(crate) struct Scratch(Vec<(f32, u32)>);
+
 impl Dist {
     /// Warp `logits` (scaled in place by `temperature`): top-k, softmax,
-    /// top-p. `temperature` must be positive.
-    pub(crate) fn warp(logits: &mut [f32], temperature: f32, top_k: usize, top_p: f32) -> Self {
-        let mut candidates = warp_candidates(logits, temperature, top_k, top_p);
+    /// top-p. `temperature` must be positive. The returned distribution owns
+    /// only the surviving candidates; `scratch` keeps the full-vocabulary
+    /// working buffer.
+    pub(crate) fn warp(
+        logits: &mut [f32],
+        temperature: f32,
+        top_k: usize,
+        top_p: f32,
+        scratch: &mut Scratch,
+    ) -> Self {
+        warp_candidates(logits, temperature, top_k, top_p, &mut scratch.0);
+        let mut candidates = scratch.0.clone();
         let total: f32 = candidates.iter().map(|c| c.0).sum();
         for c in &mut candidates {
             c.0 /= total;
@@ -124,24 +139,22 @@ impl Dist {
     }
 }
 
-/// Temperature, top-k, softmax and top-p over `logits`: the surviving
-/// candidates with unnormalised (post-softmax, pre-renormalisation)
+/// Temperature, top-k, softmax and top-p over `logits`: leaves in `candidates`
+/// the survivors with unnormalised (post-softmax, pre-renormalisation)
 /// probabilities, most likely first.
 fn warp_candidates(
     logits: &mut [f32],
     temperature: f32,
     top_k: usize,
     top_p: f32,
-) -> Vec<(f32, u32)> {
+    candidates: &mut Vec<(f32, u32)>,
+) {
     for l in logits.iter_mut() {
         *l /= temperature;
     }
 
-    let mut candidates: Vec<(f32, u32)> = logits
-        .iter()
-        .enumerate()
-        .map(|(i, &l)| (l, i as u32))
-        .collect();
+    candidates.clear();
+    candidates.extend(logits.iter().enumerate().map(|(i, &l)| (l, i as u32)));
     if top_k > 0 && top_k < candidates.len() {
         candidates.select_nth_unstable_by(top_k - 1, by_logit_desc);
         candidates.truncate(top_k);
@@ -168,7 +181,6 @@ fn warp_candidates(
         }
     }
     candidates.truncate(keep);
-    candidates
 }
 
 /// Sample one token id from `logits`.
@@ -184,15 +196,17 @@ pub(crate) fn sample(
     top_k: usize,
     top_p: f32,
     rng: &mut SplitMix64,
+    scratch: &mut Scratch,
 ) -> u32 {
     if temperature <= 0.0 || logits.len() <= 1 {
         return argmax(logits);
     }
-    let candidates = warp_candidates(logits, temperature, top_k, top_p);
+    let candidates = &mut scratch.0;
+    warp_candidates(logits, temperature, top_k, top_p, candidates);
     let total: f32 = candidates.iter().map(|c| c.0).sum();
     let target = rng.next_f32() * total;
     let mut acc = 0.0f32;
-    for c in &candidates {
+    for c in candidates.iter() {
         acc += c.0;
         if target < acc {
             return c.1;
@@ -234,20 +248,37 @@ mod tests {
     #[test]
     fn zero_temperature_is_argmax() {
         let mut rng = SplitMix64(1);
-        assert_eq!(sample(&mut logits(), 0.0, 0, 1.0, &mut rng), 1);
+        let mut scratch = Scratch::default();
+        assert_eq!(
+            sample(&mut logits(), 0.0, 0, 1.0, &mut rng, &mut scratch),
+            1
+        );
     }
 
     #[test]
     fn argmax_first_max_wins() {
         let mut rng = SplitMix64(1);
-        assert_eq!(sample(&mut [1.0, 3.0, 3.0, 2.0], 0.0, 0, 1.0, &mut rng), 1);
+        let mut scratch = Scratch::default();
+        let id = sample(
+            &mut [1.0, 3.0, 3.0, 2.0],
+            0.0,
+            0,
+            1.0,
+            &mut rng,
+            &mut scratch,
+        );
+        assert_eq!(id, 1);
     }
 
     #[test]
     fn top_k_one_is_argmax_for_any_seed() {
+        let mut scratch = Scratch::default();
         for seed in 0..64 {
             let mut rng = SplitMix64(seed);
-            assert_eq!(sample(&mut logits(), 1.5, 1, 1.0, &mut rng), 1);
+            assert_eq!(
+                sample(&mut logits(), 1.5, 1, 1.0, &mut rng, &mut scratch),
+                1
+            );
         }
     }
 
@@ -255,8 +286,9 @@ mod tests {
     fn same_seed_same_sequence() {
         let run = |seed| {
             let mut rng = SplitMix64(seed);
+            let mut scratch = Scratch::default();
             (0..32)
-                .map(|_| sample(&mut logits(), 1.0, 5, 0.95, &mut rng))
+                .map(|_| sample(&mut logits(), 1.0, 5, 0.95, &mut rng, &mut scratch))
                 .collect::<Vec<_>>()
         };
         assert_eq!(run(7), run(7));
@@ -265,24 +297,29 @@ mod tests {
 
     #[test]
     fn tiny_top_p_is_argmax() {
+        let mut scratch = Scratch::default();
         for seed in 0..64 {
             let mut rng = SplitMix64(seed);
-            assert_eq!(sample(&mut logits(), 1.0, 0, 1e-6, &mut rng), 1);
+            assert_eq!(
+                sample(&mut logits(), 1.0, 0, 1e-6, &mut rng, &mut scratch),
+                1
+            );
         }
     }
 
     #[test]
     fn top_k_restricts_candidates() {
         let mut rng = SplitMix64(3);
+        let mut scratch = Scratch::default();
         for _ in 0..200 {
-            let id = sample(&mut logits(), 5.0, 3, 1.0, &mut rng);
+            let id = sample(&mut logits(), 5.0, 3, 1.0, &mut rng, &mut scratch);
             assert!([1, 3, 5].contains(&id), "id {id} outside the top 3");
         }
     }
 
     #[test]
     fn dist_matches_the_sampler_pipeline() {
-        let d = Dist::warp(&mut logits(), 1.0, 3, 1.0);
+        let d = Dist::warp(&mut logits(), 1.0, 3, 1.0, &mut Scratch::default());
         let probs: Vec<f32> = [1u32, 5, 3].iter().map(|&i| d.prob(i)).collect();
         assert!((probs.iter().sum::<f32>() - 1.0).abs() < 1e-6);
         assert!(probs[0] > probs[1] && probs[1] > probs[2]);

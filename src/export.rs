@@ -43,6 +43,8 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::canonical::SortedKeys;
+
 /// The only accepted value of [`CucaExport::format`].
 pub const CUCA_EXPORT_FORMAT: &str = "cuca-export";
 
@@ -102,6 +104,14 @@ impl std::fmt::Display for CucaExportError {
 }
 
 impl std::error::Error for CucaExportError {}
+
+impl From<serde_json::Error> for CucaExportError {
+    fn from(e: serde_json::Error) -> Self {
+        CucaExportError::Json {
+            message: e.to_string(),
+        }
+    }
+}
 
 /// The `graph` section: [`crate::plugins::memory::GraphSnapshot`] when
 /// `plugin-memory` is enabled.
@@ -234,12 +244,8 @@ impl CucaExport {
     /// serialization fails.
     pub fn to_json_bytes(&self) -> Result<Vec<u8>, CucaExportError> {
         self.validate()?;
-        let value = serde_json::to_value(self).map_err(|e| CucaExportError::Json {
-            message: e.to_string(),
-        })?;
-        serde_json::to_vec(&canonical_value(value)).map_err(|e| CucaExportError::Json {
-            message: e.to_string(),
-        })
+        let value = serde_json::to_value(self)?;
+        Ok(serde_json::to_vec(&SortedKeys(&value))?)
     }
 
     /// Decode and validate JSON bytes held in memory.
@@ -250,9 +256,7 @@ impl CucaExport {
     /// unknown field, or a wrong type; otherwise whatever [`Self::validate`]
     /// returns.
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self, CucaExportError> {
-        let export: Self = serde_json::from_slice(bytes).map_err(|e| CucaExportError::Json {
-            message: e.to_string(),
-        })?;
+        let export: Self = serde_json::from_slice(bytes)?;
         export.validate()?;
         Ok(export)
     }
@@ -298,12 +302,8 @@ impl CucaExport {
         memory: &crate::plugins::memory::MemoryPlugin,
         cache: &crate::services::prompt_cache::PromptCache,
     ) -> Result<Self, CucaExportError> {
-        let graph = memory.snapshot().map_err(|e| CucaExportError::State {
-            message: e.to_string(),
-        })?;
-        let prompt_cache = cache.snapshot().map_err(|e| CucaExportError::State {
-            message: e.to_string(),
-        })?;
+        let graph = memory.snapshot().map_err(state_error)?;
+        let prompt_cache = cache.snapshot().map_err(state_error)?;
         Ok(Self::new(graph, prompt_cache))
     }
 
@@ -357,18 +357,10 @@ impl CucaExport {
             .map_err(cache_stage_error)?;
 
         // --- phase 2: commit in fixed graph-then-cache order ---
-        let graph_report =
-            memory
-                .commit_staged_graph(staged_graph)
-                .map_err(|e| CucaExportError::State {
-                    message: e.to_string(),
-                })?;
-        let cache_report =
-            cache
-                .commit_staged(staged_cache)
-                .map_err(|e| CucaExportError::State {
-                    message: e.to_string(),
-                })?;
+        let graph_report = memory
+            .commit_staged_graph(staged_graph)
+            .map_err(state_error)?;
+        let cache_report = cache.commit_staged(staged_cache).map_err(state_error)?;
 
         Ok(CucaImportReport {
             graph_nodes: graph_report.nodes,
@@ -405,27 +397,12 @@ fn cache_stage_error(error: crate::services::prompt_cache::PromptCacheError) -> 
     }
 }
 
-/// Rebuild `value` with every object's keys in sorted order.
-///
-/// `serde_json::Map` is `BTreeMap`-backed unless `preserve_order` is enabled
-/// somewhere in the dependency graph; sorting explicitly makes canonical bytes
-/// independent of that build detail and of any map's insertion order.
-fn canonical_value(value: serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut pairs: Vec<(String, serde_json::Value)> = map.into_iter().collect();
-            pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
-            serde_json::Value::Object(
-                pairs
-                    .into_iter()
-                    .map(|(k, v)| (k, canonical_value(v)))
-                    .collect(),
-            )
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.into_iter().map(canonical_value).collect())
-        }
-        other => other,
+/// Wrap a component's live-state failure (e.g. a poisoned lock) as
+/// [`CucaExportError::State`].
+#[cfg(all(feature = "plugin-memory", feature = "service-prompt-cache"))]
+fn state_error(error: impl std::fmt::Display) -> CucaExportError {
+    CucaExportError::State {
+        message: error.to_string(),
     }
 }
 

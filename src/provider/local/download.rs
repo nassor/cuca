@@ -151,7 +151,7 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// Hash the first `len` bytes of `path` into `hasher`.
+/// Hash the whole of `path` into `hasher`.
 fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<(), CucaError> {
     let mut file = File::open(path)?;
     let mut buf = vec![0u8; MIB];
@@ -211,7 +211,10 @@ async fn error_body(mut response: reqwest::Response) -> String {
 /// every 1 MiB, and at the end. A download that receives no data for 60 seconds
 /// fails with [`CucaError::Transport`], keeping the partial file for a later
 /// resume.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "every argument is an independent input of one download; a parameter struct would only restate them"
+)]
 pub(crate) async fn ensure_downloaded(
     client: &reqwest::Client,
     endpoint: &str,

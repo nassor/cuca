@@ -69,17 +69,19 @@ pub(crate) fn dequant_row(
                     // d, 16 bytes of nibbles: low nibbles are elements 0..16,
                     // high nibbles 16..32, each minus 8.
                     GgmlDType::Q4_0 => {
-                        for (j, &q) in b[2..18].iter().enumerate() {
-                            o[j] = f32::from(i16::from(q & 0x0F) - 8) * d;
-                            o[j + 16] = f32::from(i16::from(q >> 4) - 8) * d;
+                        let (lo, hi) = o.split_at_mut(16);
+                        for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[2..18]) {
+                            *lo = f32::from(i16::from(q & 0x0F) - 8) * d;
+                            *hi = f32::from(i16::from(q >> 4) - 8) * d;
                         }
                     }
                     // d, m, nibbles: element = nibble * d + m.
                     GgmlDType::Q4_1 => {
                         let m = f16_at(b, 2);
-                        for (j, &q) in b[4..20].iter().enumerate() {
-                            o[j] = f32::from(q & 0x0F) * d + m;
-                            o[j + 16] = f32::from(q >> 4) * d + m;
+                        let (lo, hi) = o.split_at_mut(16);
+                        for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[4..20]) {
+                            *lo = f32::from(q & 0x0F) * d + m;
+                            *hi = f32::from(q >> 4) * d + m;
                         }
                     }
                     // d, 32 high bits, nibbles: a 5-bit quant minus 16. High
@@ -87,20 +89,26 @@ pub(crate) fn dequant_row(
                     // extends high-nibble element j + 16.
                     GgmlDType::Q5_0 => {
                         let qh = u32::from_le_bytes([b[2], b[3], b[4], b[5]]);
-                        for (j, &q) in b[6..22].iter().enumerate() {
-                            let (lo, hi) = q5_pair(q, qh, j);
-                            o[j] = f32::from(lo - 16) * d;
-                            o[j + 16] = f32::from(hi - 16) * d;
+                        let (lo, hi) = o.split_at_mut(16);
+                        for (j, ((o_lo, o_hi), &q)) in
+                            lo.iter_mut().zip(hi).zip(&b[6..22]).enumerate()
+                        {
+                            let (q_lo, q_hi) = q5_pair(q, qh, j);
+                            *o_lo = f32::from(q_lo - 16) * d;
+                            *o_hi = f32::from(q_hi - 16) * d;
                         }
                     }
                     // d, m, 32 high bits, nibbles: element = 5-bit quant * d + m.
                     GgmlDType::Q5_1 => {
                         let m = f16_at(b, 2);
                         let qh = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-                        for (j, &q) in b[8..24].iter().enumerate() {
-                            let (lo, hi) = q5_pair(q, qh, j);
-                            o[j] = f32::from(lo) * d + m;
-                            o[j + 16] = f32::from(hi) * d + m;
+                        let (lo, hi) = o.split_at_mut(16);
+                        for (j, ((o_lo, o_hi), &q)) in
+                            lo.iter_mut().zip(hi).zip(&b[8..24]).enumerate()
+                        {
+                            let (q_lo, q_hi) = q5_pair(q, qh, j);
+                            *o_lo = f32::from(q_lo) * d + m;
+                            *o_hi = f32::from(q_hi) * d + m;
                         }
                     }
                     // d, 32 signed bytes.
@@ -182,7 +190,13 @@ impl TokenEmbedding {
                     self.rows
                 )));
             }
-            let row = &data[id * self.row_bytes..(id + 1) * self.row_bytes];
+            let row = data
+                .get(id * self.row_bytes..(id + 1) * self.row_bytes)
+                .ok_or_else(|| {
+                    err(format!(
+                        "token embedding row {id} lies outside the tensor data"
+                    ))
+                })?;
             dequant_row(self.dtype, row, scale, dst)?;
         }
         Ok(out)

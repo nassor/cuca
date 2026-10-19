@@ -421,7 +421,9 @@ impl MemoryGraph {
         if self.nodes.remove(id).is_none() {
             return false;
         }
-        let mut incident: HashSet<String> = HashSet::new();
+        // A `Vec`, not a set: a self-loop appears in both lists, and the
+        // second `remove_relationship` of the same id is a no-op.
+        let mut incident: Vec<String> = Vec::new();
         if let Some(list) = self.outgoing.get(id) {
             incident.extend(list.iter().cloned());
         }
@@ -531,20 +533,22 @@ impl MemoryGraph {
         if !self.nodes.contains_key(from) || !self.nodes.contains_key(to) {
             return false;
         }
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut frontier: Vec<String> = vec![from.to_string()];
-        visited.insert(from.to_string());
+        // Ids are borrowed from `self`, so a probe or a revisit allocates
+        // nothing (a cloned `String` per examined edge otherwise).
+        let mut visited: HashSet<&str> = HashSet::new();
+        let mut frontier: Vec<&str> = vec![from];
+        visited.insert(from);
         while !frontier.is_empty() {
-            let mut next: Vec<String> = Vec::new();
+            let mut next: Vec<&str> = Vec::new();
             for node in &frontier {
-                if let Some(rels) = self.outgoing.get(node) {
+                if let Some(rels) = self.outgoing.get(*node) {
                     for rid in rels {
                         if let Some(rel) = self.relationships.get(rid) {
                             if rel.to == to {
                                 return true;
                             }
-                            if visited.insert(rel.to.clone()) {
-                                next.push(rel.to.clone());
+                            if visited.insert(rel.to.as_str()) {
+                                next.push(rel.to.as_str());
                             }
                         }
                     }
@@ -569,36 +573,38 @@ impl MemoryGraph {
         if !self.nodes.contains_key(start) {
             return Vec::new();
         }
-        let mut visited: HashSet<String> = HashSet::new();
+        // Ids are borrowed from `self` for the visited set and frontier; only
+        // a newly reached node is cloned, into `out`.
+        let mut visited: HashSet<&str> = HashSet::new();
         let mut out: Vec<String> = vec![start.to_string()];
-        visited.insert(start.to_string());
-        let mut frontier: Vec<String> = vec![start.to_string()];
+        visited.insert(start);
+        let mut frontier: Vec<&str> = vec![start];
         for _ in 0..max_depth {
-            let mut next: Vec<String> = Vec::new();
+            let mut next: Vec<&str> = Vec::new();
             for node in &frontier {
                 let mut enqueue = |rels: Option<&Vec<String>>, incoming: bool| {
                     if let Some(rels) = rels {
                         for rid in rels {
                             if let Some(rel) = self.relationships.get(rid) {
                                 let neighbor = if incoming { &rel.from } else { &rel.to };
-                                if visited.insert(neighbor.clone()) {
-                                    next.push(neighbor.clone());
+                                if visited.insert(neighbor.as_str()) {
+                                    next.push(neighbor.as_str());
                                 }
                             }
                         }
                     }
                 };
                 match direction {
-                    GraphDirection::Outgoing => enqueue(self.outgoing.get(node), false),
-                    GraphDirection::Incoming => enqueue(self.incoming.get(node), true),
+                    GraphDirection::Outgoing => enqueue(self.outgoing.get(*node), false),
+                    GraphDirection::Incoming => enqueue(self.incoming.get(*node), true),
                     GraphDirection::Any => {
-                        enqueue(self.outgoing.get(node), false);
-                        enqueue(self.incoming.get(node), true);
+                        enqueue(self.outgoing.get(*node), false);
+                        enqueue(self.incoming.get(*node), true);
                     }
                 }
             }
             next.sort_unstable();
-            out.extend(next.iter().cloned());
+            out.extend(next.iter().map(|id| (*id).to_string()));
             frontier = next;
         }
         out
@@ -614,39 +620,39 @@ impl MemoryGraph {
     /// preserved unchanged (ids are unique within the parent, hence within the
     /// subgraph). Clones nodes and relationships.
     pub fn subgraph(&self, roots: &[String], max_depth: usize) -> MemoryGraph {
-        let mut ids: HashSet<String> = HashSet::new();
-        let mut frontier: Vec<String> = Vec::new();
+        let mut ids: HashSet<&str> = HashSet::new();
+        let mut frontier: Vec<&str> = Vec::new();
         for root in roots {
-            if self.nodes.contains_key(root) && ids.insert(root.clone()) {
-                frontier.push(root.clone());
+            if self.nodes.contains_key(root) && ids.insert(root.as_str()) {
+                frontier.push(root.as_str());
             }
         }
         for _ in 0..max_depth {
-            let mut next: Vec<String> = Vec::new();
+            let mut next: Vec<&str> = Vec::new();
             for node in &frontier {
                 let mut enqueue = |rels: Option<&Vec<String>>, incoming: bool| {
                     if let Some(rels) = rels {
                         for rid in rels {
                             if let Some(rel) = self.relationships.get(rid) {
                                 let neighbor = if incoming { &rel.from } else { &rel.to };
-                                if ids.insert(neighbor.clone()) {
-                                    next.push(neighbor.clone());
+                                if ids.insert(neighbor.as_str()) {
+                                    next.push(neighbor.as_str());
                                 }
                             }
                         }
                     }
                 };
-                enqueue(self.outgoing.get(node), false);
-                enqueue(self.incoming.get(node), true);
+                enqueue(self.outgoing.get(*node), false);
+                enqueue(self.incoming.get(*node), true);
             }
             frontier = next;
         }
         let mut out = MemoryGraph::with_capacity(ids.len(), ids.len().saturating_mul(2));
-        let mut sorted_ids: Vec<&String> = ids.iter().collect();
-        sorted_ids.sort();
+        let mut sorted_ids: Vec<&str> = ids.iter().copied().collect();
+        sorted_ids.sort_unstable();
         for id in sorted_ids {
             if let Some(node) = self.nodes.get(id) {
-                out.nodes.insert(id.clone(), node.clone());
+                out.nodes.insert(id.to_string(), node.clone());
             }
         }
         let mut rel_ids: Vec<&String> = self
@@ -654,7 +660,7 @@ impl MemoryGraph {
             .keys()
             .filter(|rid| {
                 let rel = &self.relationships[*rid];
-                ids.contains(&rel.from) && ids.contains(&rel.to)
+                ids.contains(rel.from.as_str()) && ids.contains(rel.to.as_str())
             })
             .collect();
         rel_ids.sort();

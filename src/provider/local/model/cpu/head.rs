@@ -87,6 +87,7 @@
 //! per position for the 0.8B model: 33.5 MB at 8192 positions) and the
 //! bookkeeping is 8 bytes per slot plus one hidden row (4 KB).
 
+use std::borrow::Cow;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -296,9 +297,9 @@ impl Transformer {
                 let mut rows = Vec::with_capacity(n * d);
                 rows.extend_from_slice(prev);
                 rows.extend_from_slice(&hidden[..(n - 1) * d]);
-                (pos - 1, rows, tokens)
+                (pos - 1, Cow::Owned(rows), tokens)
             }
-            None => (pos, hidden[..(n - 1) * d].to_vec(), &tokens[1..]),
+            None => (pos, Cow::Borrowed(&hidden[..(n - 1) * d]), &tokens[1..]),
         };
         head.drop_from(first);
         let m = ids.len();
@@ -384,7 +385,7 @@ impl Transformer {
             )));
         }
         let mut drafts = Vec::with_capacity(k);
-        let mut hidden = hidden.to_vec();
+        let mut hidden = Cow::Borrowed(hidden);
         let mut token = first;
         for step in 0..k {
             let emb = self.embedding_rows(&[token])?;
@@ -393,7 +394,7 @@ impl Transformer {
                 .map_err(candle_err)?;
             token = pick(&mut logits);
             drafts.push(token);
-            hidden = next;
+            hidden = Cow::Owned(next);
         }
         Ok(drafts)
     }

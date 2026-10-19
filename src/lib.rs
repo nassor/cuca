@@ -15,22 +15,17 @@
 )))]
 compile_error!("CUCA requires one provider-* feature; enable the adapter for the backend you use.");
 
-/// Core unified wire types shared by every provider adapter.
 pub mod types;
 
 /// Client-facing and plugin-facing error types.
 pub mod error;
 
-/// Normalized request/response contracts for the unified abstraction.
 pub mod request;
 
-/// Append-only session audit-trail model.
 pub mod session;
 
-/// Zero-allocation SSE stream parser engine.
 pub mod sse;
 
-/// Plugin trait layer: `CucaPlugin` and `SessionStorePlugin`.
 pub mod plugin;
 
 /// Feature-gated plugin implementations; one submodule per `plugin-*` feature.
@@ -41,15 +36,19 @@ pub mod plugins;
 /// `CucaPlugin`.
 pub mod services;
 
-/// Client core: builder, client, and the plugin-instrumented stream pipeline.
 pub mod client;
 
 /// Provider adapter layer: per-provider dispatch implementations.
 pub(crate) mod provider;
 
 /// Canonical JSON encoding for `serde_json::Value` leaves carried inside
-/// postcard-encoded storage records and digest input.
-#[cfg(any(feature = "plugin-session-log", feature = "service-prompt-cache"))]
+/// postcard-encoded storage records, digest input, and the `cuca-export`
+/// envelope.
+#[cfg(any(
+    feature = "plugin-memory",
+    feature = "plugin-session-log",
+    feature = "service-prompt-cache"
+))]
 pub(crate) mod canonical;
 
 /// tiktoken-rs encoder resolution shared by the token-counting plugins.

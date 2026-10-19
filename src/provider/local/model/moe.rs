@@ -21,14 +21,17 @@ pub(crate) fn route(logits: &[f32], t: usize, spec: &MoeSpec) -> Routing {
     let n = spec.n_expert;
     let mut per_expert = vec![Vec::new(); n];
     let mut order: Vec<usize> = Vec::with_capacity(n);
+    let mut probs: Vec<f32> = Vec::with_capacity(n);
     for (token, row) in logits.chunks_exact(n).take(t).enumerate() {
         let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let probs: Vec<f32> = row.iter().map(|&l| (l - max).exp()).collect();
+        probs.clear();
+        probs.extend(row.iter().map(|&l| (l - max).exp()));
         let total: f32 = probs.iter().sum();
         order.clear();
         order.extend(0..n);
-        // Largest probability first; the lower expert index wins ties.
-        order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]).then(a.cmp(&b)));
+        // Largest probability first; the lower expert index wins ties, so the
+        // order is total and an unstable sort gives the stable sort's result.
+        order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]).then(a.cmp(&b)));
         let kept = &order[..spec.n_used];
         let denominator = if spec.norm_weights {
             kept.iter().map(|&e| probs[e]).sum::<f32>()

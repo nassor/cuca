@@ -167,60 +167,58 @@ impl SseStreamParser {
         let mut retry: Option<u64> = None;
 
         let mut pos = 0usize;
-        while pos < frame.len() {
-            let nl = match memchr(b'\n', &frame[pos..]) {
-                Some(rel) => pos + rel,
-                None => break,
-            };
+        // `frame` ends right after a `\n`, so the loop stops once `pos`
+        // reaches its end.
+        while let Some(rel) = memchr(b'\n', &frame[pos..]) {
+            let nl = pos + rel;
             let mut line_end = nl;
             if line_end > pos && frame[line_end - 1] == b'\r' {
                 line_end -= 1;
             }
             let line = &frame[pos..line_end];
 
-            // Comment lines (`: ...`) are ignored entirely.
-            if line.first() != Some(&b':') {
-                // The colon is required for a field line.
-                if let Some(sep) = memchr(b':', line) {
-                    let field = &line[..sep];
-                    let value = line[sep + 1..]
-                        .strip_prefix(b" ")
-                        .unwrap_or(&line[sep + 1..]);
-                    match field {
-                        b"event" => {
-                            let s = std::str::from_utf8(value).map_err(|e| {
-                                CucaError::SseParse(format!("event field is not valid UTF-8: {e}"))
-                            })?;
-                            event_name = Some(s.to_string());
-                        }
-                        b"data" => {
-                            let s = std::str::from_utf8(value).map_err(|e| {
-                                CucaError::SseParse(format!("data field is not valid UTF-8: {e}"))
-                            })?;
-                            if !data.is_empty() {
-                                data.push('\n');
-                            }
-                            data.push_str(s);
-                        }
-                        b"id" => {
-                            let s = std::str::from_utf8(value).map_err(|e| {
-                                CucaError::SseParse(format!("id field is not valid UTF-8: {e}"))
-                            })?;
-                            // Empty ids and ids containing a NUL are ignored.
-                            if !s.is_empty() && !s.contains('\0') {
-                                current_id = Some(s.to_string());
-                            }
-                        }
-                        b"retry" => {
-                            // Malformed retry values are ignored (kept None),
-                            // never fatal.
-                            if let Ok(s) = std::str::from_utf8(value) {
-                                retry = s.trim().parse::<u64>().ok();
-                            }
-                        }
-                        // Unknown fields are ignored for forward compat.
-                        _ => {}
+            // The colon is required for a field line. A comment line
+            // (`: ...`) has an empty field name and falls into the ignored
+            // arm below.
+            if let Some(sep) = memchr(b':', line) {
+                let field = &line[..sep];
+                let value = line[sep + 1..]
+                    .strip_prefix(b" ")
+                    .unwrap_or(&line[sep + 1..]);
+                match field {
+                    b"event" => {
+                        let s = std::str::from_utf8(value).map_err(|e| {
+                            CucaError::SseParse(format!("event field is not valid UTF-8: {e}"))
+                        })?;
+                        event_name = Some(s.to_string());
                     }
+                    b"data" => {
+                        let s = std::str::from_utf8(value).map_err(|e| {
+                            CucaError::SseParse(format!("data field is not valid UTF-8: {e}"))
+                        })?;
+                        if !data.is_empty() {
+                            data.push('\n');
+                        }
+                        data.push_str(s);
+                    }
+                    b"id" => {
+                        let s = std::str::from_utf8(value).map_err(|e| {
+                            CucaError::SseParse(format!("id field is not valid UTF-8: {e}"))
+                        })?;
+                        // Empty ids and ids containing a NUL are ignored.
+                        if !s.is_empty() && !s.contains('\0') {
+                            current_id = Some(s.to_string());
+                        }
+                    }
+                    b"retry" => {
+                        // Malformed retry values are ignored (kept None),
+                        // never fatal.
+                        if let Ok(s) = std::str::from_utf8(value) {
+                            retry = s.trim().parse::<u64>().ok();
+                        }
+                    }
+                    // Unknown fields are ignored for forward compat.
+                    _ => {}
                 }
             }
 

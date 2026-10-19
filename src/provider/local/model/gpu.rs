@@ -285,9 +285,10 @@ fn open_wgpu(
     api: burn::tensor::wgpu::WgpuBackend,
     shared: fn(burn::tensor::DeviceKind) -> Device,
 ) -> Result<Device, CucaError> {
-    use crate::provider::local::GpuAdapter;
     use burn::tensor::DeviceKind;
     use burn::tensor::wgpu::WgpuInitError;
+
+    use crate::provider::local::GpuAdapter;
 
     let kind = || match adapter {
         GpuAdapter::Default => DeviceKind::DefaultDevice,
@@ -428,20 +429,21 @@ struct QuantShape {
 impl QuantShape {
     /// Rows of the largest chunk the weight is split into.
     fn part_rows(&self) -> usize {
-        let stored = match self.class {
+        (MAX_PART_BYTES / stored_row_bytes(Some(self.stored()), self.cols))
+            .clamp(1, self.rows.max(1))
+    }
+
+    /// The GGUF layout the weight is kept in on the device.
+    fn stored(&self) -> GgmlDType {
+        match self.class {
             SchemeClass::Q4 => GgmlDType::Q4_0,
             SchemeClass::Q8 => GgmlDType::Q8_0,
-        };
-        (MAX_PART_BYTES / stored_row_bytes(Some(stored), self.cols)).clamp(1, self.rows.max(1))
+        }
     }
 
     /// Bytes on the device.
     fn bytes(&self) -> usize {
-        let stored = match self.class {
-            SchemeClass::Q4 => GgmlDType::Q4_0,
-            SchemeClass::Q8 => GgmlDType::Q8_0,
-        };
-        self.rows * stored_row_bytes(Some(stored), self.cols)
+        self.rows * stored_row_bytes(Some(self.stored()), self.cols)
     }
 
     /// Whether burn's matmul autotune may give the two weights one key. The
@@ -534,7 +536,10 @@ fn plan_dense(own: &[(String, QuantShape)], peers: &[QuantShape]) -> HashSet<Str
 /// - with `dense`, any dtype is dequantized to f32 (exact), whatever the
 ///   rules above say: [`plan_dense`] picks the weights that must not share
 ///   an autotune key with a weight of the other quantization scheme.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "tensor identity, shape, destination and the two upload policies are all independent"
+)]
 fn upload_matrix_with(
     tensor_name: &str,
     dtype: GgmlDType,
@@ -587,7 +592,6 @@ fn upload_matrix_with(
                 DType::QFloat(scheme),
             ),
             (Some(layout), Some(scheme)) => {
-                // Requantize to Q8_0.
                 let mut q8 = Vec::with_capacity(n * (cols / 32) * 34);
                 for row in src.chunks_exact(row_bytes.max(1)) {
                     dequant_row(dtype, row, 1.0, &mut values).map_err(context)?;
@@ -807,6 +811,9 @@ enum QkvWeights {
     Split { q: Proj, kv: Option<(Proj, Proj)> },
 }
 
+/// The key and value projections `[t, nkv * d]` of a layer that owns K/V.
+type KvProj = (Tensor<2>, Tensor<2>);
+
 /// Attention weights of one layer.
 struct AttnWeights {
     qkv: QkvWeights,
@@ -818,8 +825,6 @@ struct AttnWeights {
 }
 
 /// Gate and up projections of a dense FFN.
-// See `QkvWeights`: one value per layer.
-#[allow(clippy::large_enum_variant)]
 enum GateUp {
     Split {
         gate: Weight,
@@ -832,8 +837,6 @@ enum GateUp {
     },
 }
 
-// See `QkvWeights`: one value per layer.
-#[allow(clippy::large_enum_variant)]
 enum FfnWeights {
     Dense {
         gate_up: GateUp,
@@ -1123,6 +1126,13 @@ impl GpuTransformer {
     /// steps only up to float rounding (the matmul kernels differ by shape),
     /// so a speculative greedy run can pick a different token than plain
     /// decoding where two logits are within that rounding.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when `hidden` is neither `None` nor
+    /// `PostNorm`, `tokens` is empty, `start_pos` is not the cache length,
+    /// the pass exceeds the context length or a device operation fails;
+    /// [`CucaError::Io`] when an embedding row cannot be read.
     pub(crate) fn forward_ext(
         &mut self,
         tokens: &[u32],
@@ -1192,6 +1202,10 @@ impl GpuTransformer {
 
     /// The `n_embd`-wide embedding row of `token`, scaled as the first layer
     /// sees it: a drafter's input half next to the target's hidden state.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Io`] when the row cannot be read from the file.
     pub(crate) fn embedding_row(&self, token: u32) -> Result<Vec<f32>, CucaError> {
         self.embed
             .lock()
@@ -1548,7 +1562,10 @@ fn load_layer(
 }
 
 impl Weights {
-    #[allow(clippy::too_many_arguments)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one pass's inputs, each used once; a struct would only rename them"
+    )]
     fn forward_layers(
         &self,
         kv: &mut KvLayers,
@@ -1595,10 +1612,15 @@ impl Weights {
             Want::All => x,
         };
         let normed = rms(rows, Some(&self.output_norm), eps);
-        let hidden = (hidden == Hidden::PostNorm)
-            .then(|| read_f32(normed.clone(), "hidden states"))
-            .transpose()?;
-        let logits = read_f32(self.head(normed), "logits")?;
+        // The head is queued before the hidden-state readback so the device
+        // keeps working through it instead of idling at that sync point.
+        let (hidden, logits) = if hidden == Hidden::PostNorm {
+            let logits = self.head(normed.clone());
+            (Some(read_f32(normed, "hidden states")?), logits)
+        } else {
+            (None, self.head(normed))
+        };
+        let logits = read_f32(logits, "logits")?;
         Ok(Forward {
             logits: Some(logits),
             hidden,
@@ -1811,14 +1833,13 @@ impl Weights {
 impl AttnWeights {
     /// Query `[t, nh * d]` and, on K/V-owning layers, key and value
     /// `[t, nkv * d]` projections of `h`.
-    #[allow(clippy::type_complexity)]
     fn project(
         &self,
         h: Tensor<2>,
         nh: usize,
         nkv: usize,
         d: usize,
-    ) -> (Tensor<2>, Option<(Tensor<2>, Tensor<2>)>) {
+    ) -> (Tensor<2>, Option<KvProj>) {
         match &self.qkv {
             QkvWeights::Fused(w) => {
                 let y = w.forward(h);

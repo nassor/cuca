@@ -47,7 +47,7 @@ use super::model::cpu::Hidden;
 use super::model::mtp::Drafter;
 use super::model::{Model, Want, prefill_chunk};
 use super::output::OutputParser;
-use super::sampler::{Dist, SplitMix64, greedy, random_seed, sample};
+use super::sampler::{Dist, Scratch, SplitMix64, greedy, random_seed, sample};
 use super::tokenizer::Tokenizer;
 use super::{LocalModelConfig, SamplingConfig};
 use crate::client::ResponseMetadataHandle;
@@ -571,6 +571,9 @@ impl Engine {
         let mut next_call_id = || format!("call_{:016x}", id_rng.next_u64());
         let mut items = Vec::new();
         let mut completion = 0usize;
+        let mut scratch = Scratch::default();
+        // The pending token followed by the drafts, refilled every round.
+        let mut batch: Vec<u32> = Vec::new();
         let greedy_mode = temperature <= 0.0;
         // The token a rejected speculative draft was resampled to: the next
         // token, taken instead of sampling the verified logits.
@@ -583,7 +586,7 @@ impl Engine {
         'decode: while completion < budget {
             let id = match forced.take() {
                 Some(id) => id,
-                None => sample(&mut logits, temperature, top_k, top_p, rng),
+                None => sample(&mut logits, temperature, top_k, top_p, rng, &mut scratch),
             };
             if self.format.is_eog(id) {
                 break;
@@ -629,7 +632,7 @@ impl Engine {
                     if greedy_mode {
                         greedy(l)
                     } else {
-                        let q = Dist::warp(l, temperature, top_k, top_p);
+                        let q = Dist::warp(l, temperature, top_k, top_p, &mut scratch);
                         let d = q.draw(rng);
                         q_dists.push(q);
                         d
@@ -646,7 +649,7 @@ impl Engine {
             }
 
             // Verify: one forward over the pending token and the drafts.
-            let mut batch = Vec::with_capacity(1 + drafts.len());
+            batch.clear();
             batch.push(id);
             batch.extend_from_slice(&drafts);
             let want = if drafts.is_empty() {
@@ -682,7 +685,7 @@ impl Engine {
                 let agrees = if greedy_mode {
                     greedy(row) == d
                 } else {
-                    let p = Dist::warp(row, temperature, top_k, top_p);
+                    let p = Dist::warp(row, temperature, top_k, top_p, &mut scratch);
                     let q = &q_dists[j];
                     let ratio = p.prob(d) / q.prob(d);
                     if rng.next_f32() < ratio.min(1.0) {

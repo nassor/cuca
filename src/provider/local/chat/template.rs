@@ -30,6 +30,7 @@
 //! specific to one model family.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -283,7 +284,7 @@ fn strip_generation_tags(source: &str) -> String {
             Some(keyword) => {
                 let left = if inner.starts_with('-') { "-" } else { "" };
                 let right = if inner.ends_with('-') { "-" } else { "" };
-                out.push_str(&format!("{{%{left} {keyword} {right}%}}"));
+                let _ = write!(out, "{{%{left} {keyword} {right}%}}");
             }
             None => out.push_str(&rest[open..open + 2 + close + 2]),
         }
@@ -376,7 +377,9 @@ fn py_repr_str(text: &str, out: &mut String) {
                 out.push('\\');
                 out.push(c);
             }
-            c if c < ' ' || c == '\u{7f}' => out.push_str(&format!("\\x{:02x}", c as u32)),
+            c if c < ' ' || c == '\u{7f}' => {
+                let _ = write!(out, "\\x{:02x}", c as u32);
+            }
             c => out.push(c),
         }
     }
@@ -497,7 +500,7 @@ impl JsonDumper {
                 c if c < ' ' || (self.ensure_ascii && !c.is_ascii()) => {
                     let mut units = [0u16; 2];
                     for unit in c.encode_utf16(&mut units) {
-                        out.push_str(&format!("\\u{unit:04x}"));
+                        let _ = write!(out, "\\u{unit:04x}");
                     }
                 }
                 c => out.push(c),
@@ -570,21 +573,41 @@ fn strftime(format: &str, unix_secs: i64) -> String {
         let month_name = MONTHS[(month - 1) as usize];
         let weekday_name = WEEKDAYS[weekday];
         match directive {
-            'Y' => out.push_str(&year.to_string()),
-            'y' => out.push_str(&format!("{:02}", year.rem_euclid(100))),
-            'm' => out.push_str(&format!("{month:02}")),
-            'd' => out.push_str(&format!("{day:02}")),
-            'e' => out.push_str(&format!("{day:2}")),
-            'H' => out.push_str(&format!("{hour:02}")),
-            'I' => out.push_str(&format!("{:02}", (hour + 11) % 12 + 1)),
-            'M' => out.push_str(&format!("{minute:02}")),
-            'S' => out.push_str(&format!("{second:02}")),
+            'Y' => {
+                let _ = write!(out, "{year}");
+            }
+            'y' => {
+                let _ = write!(out, "{:02}", year.rem_euclid(100));
+            }
+            'm' => {
+                let _ = write!(out, "{month:02}");
+            }
+            'd' => {
+                let _ = write!(out, "{day:02}");
+            }
+            'e' => {
+                let _ = write!(out, "{day:2}");
+            }
+            'H' => {
+                let _ = write!(out, "{hour:02}");
+            }
+            'I' => {
+                let _ = write!(out, "{:02}", (hour + 11) % 12 + 1);
+            }
+            'M' => {
+                let _ = write!(out, "{minute:02}");
+            }
+            'S' => {
+                let _ = write!(out, "{second:02}");
+            }
             'p' => out.push_str(if hour < 12 { "AM" } else { "PM" }),
             'b' | 'h' => out.push_str(&month_name[..3]),
             'B' => out.push_str(month_name),
             'a' => out.push_str(&weekday_name[..3]),
             'A' => out.push_str(weekday_name),
-            'j' => out.push_str(&format!("{day_of_year:03}")),
+            'j' => {
+                let _ = write!(out, "{day_of_year:03}");
+            }
             'Z' => out.push_str("UTC"),
             'z' => out.push_str("+0000"),
             '%' => out.push('%'),
