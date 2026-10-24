@@ -33,7 +33,9 @@ The policies differ. Some structures evict the oldest entry, some refuse the cal
 | In-memory session records | `DEFAULT_MAX_RECORDS`, `65_536` | refuse the append or fork with `PluginError::Internal` | `len()` against `max_records()` |
 | Replay trajectory | `ReplayConfig::max_records` `65_536`<br>`ReplayConfig::max_turn_blocks` `4_096` | refuse the load with `PluginError::Validation` | `usage()` |
 | Rate limiter queue | `RateLimitConfig::max_waiters`, caller set, non-zero | refuse the acquire with `RateLimitError::QueueFull` | `usage()` |
+| Scheduler queue | `SchedulerConfig::max_waiting`, default `256`, non-zero | refuse the call with `SchedulerError::QueueFull` | `SchedulerSnapshot` |
 | Cost per-model breakdown | `CostConfig::max_tracked_models`, default `64` | fold into one overflow bucket | `usage()`, `breakdown()` |
+| Scheduler call kinds | `MAX_KINDS`, `32` | fold into the kind `"other"` | `SchedulerSnapshot::totals` |
 
 The split is one question: if this entry disappears, does anything become wrong, or only slower?
 
@@ -45,7 +47,9 @@ The split is one question: if this entry disappears, does anything become wrong,
 - A replayed trajectory that was truncated would be a wrong fixture, so replay refuses.
 - The subagent pending registry holds live receivers for running child processes. Dropping the oldest would abandon a running child's result while it keeps consuming resources.
 - A rate limiter queue refuses at `max_waiters` because queueing past the bound would grow the semaphore's own waiter list.
+- A scheduler queue refuses at `max_waiting` because the caller can route the call to another backend or back off, and a silently dropped call would never answer.
 - The cost breakdown folds because totals stay exact. Only per-model attribution degrades, and `CostUsage::overflow_turns` counts the folded turns.
+- The scheduler's kind totals fold the 33rd and later kinds into `"other"`, so the call counts stay exact and only the per-kind attribution degrades.
 
 Refusing is the less convenient policy. The design chooses it where eviction would lose a record or abandon live work.
 

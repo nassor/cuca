@@ -1,6 +1,6 @@
 [package]
 name = "cuca"
-version = "0.5.2"
+version = "0.6.0"
 edition = "2024"
 rust-version = "1.98"
 description = "Compact Universal Client for Agents: an asynchronous LLM client that parses multi-modal SSE streams into typed blocks behind one unified request/response abstraction."
@@ -43,6 +43,7 @@ features = [
     "service-prompt-cache",
     "service-rate-limit",
     "service-replay",
+    "service-scheduler",
     "service-speculative",
     "service-vector-store",
 ]
@@ -160,6 +161,12 @@ service-rate-limit = ["dep:tokio"]
 # AgentResponseStream. Reads through plugin-session-log's `SessionBackend` seam;
 # adds no dependency of its own.
 service-replay = ["plugin-session-log"]
+# service-scheduler: the explicit-call LLM call pipeline (per-backend priority
+# scheduler, adaptive parallelism tuner, multi-backend dispatcher). Reuses the
+# already-optional tokio (`sync` for Notify/watch/OnceCell, `time` for hold
+# timers, `rt` for the hold sleeper and lazy-build JoinSet) and owns `tracing`
+# for its `cuca::scheduler` spans (same shape as plugin-redaction).
+service-scheduler = ["dep:tokio", "dep:tracing"]
 # service-speculative: the fast/slow orchestrator. Reuses the already-optional
 # tokio (spawned tier turns, latency deadlines) and tokio-stream. Its edge to
 # plugin-session-log is documented-optional, not a feature edge:
@@ -275,6 +282,13 @@ required-features = ["provider-llamacpp", "plugin-cost", "plugin-telemetry"]
 name = "rate_limit"
 path = "examples/rate_limit.rs"
 required-features = ["provider-llamacpp", "service-rate-limit"]
+
+# scheduler additionally needs the service feature the dispatcher lives behind:
+# `Dispatcher` only exists when `service-scheduler` is enabled.
+[[example]]
+name = "scheduler"
+path = "examples/scheduler.rs"
+required-features = ["provider-llamacpp", "service-scheduler"]
 
 # redaction additionally needs the plugin feature the scrubber lives behind:
 # `RedactionPlugin` only exists when `plugin-redaction` is enabled.

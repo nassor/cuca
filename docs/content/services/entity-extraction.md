@@ -135,4 +135,4 @@ cargo run --example entity_extraction --features "provider-llamacpp service-enti
 
 - [Memory](@/plugins/memory.md) is the plugin whose working graph receives the delta.
 - [Plugins and services](@/concepts/plugin-layering.md) explains why the edge is one way.
-- [Services overview](@/services/_index.md) lists all six services.
+- [Services overview](@/services/_index.md) lists all seven services.

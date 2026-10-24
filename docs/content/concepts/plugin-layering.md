@@ -16,7 +16,7 @@ weight = 3
 <dd>You are adding a capability and need its tier and attachment point, or you want to know why <code>register_plugin</code> refuses a service</dd>
 </dl>
 
-CUCA has eighteen non-provider features: twelve plugins and six services. Every plugin implements `CucaPlugin` and registers on the builder. A service never implements `CucaPlugin`, so registering one is a compile error. Five services are called directly, and one replaces the dispatch stage.
+CUCA has nineteen non-provider features: twelve plugins and seven services. Every plugin implements `CucaPlugin` and registers on the builder. A service never implements `CucaPlugin`, so registering one is a compile error. Six services are called directly, and one replaces the dispatch stage.
 
 Tier and attachment are separate questions. The tier decides the feature namespace and the dependency rules. The attachment is how the client drives the capability.
 
@@ -25,7 +25,7 @@ Tier and attachment are separate questions. The tier decides the feature namespa
 | Tier | Attachment | Members |
 |---|---|---|
 | Plugin | hook, through `register_plugin` | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost`, `plugin-redaction` |
-| Service | explicit call | `service-prompt-cache`, `service-entity-extraction`, `service-replay`, `service-rate-limit`, `service-vector-store` |
+| Service | explicit call | `service-prompt-cache`, `service-entity-extraction`, `service-replay`, `service-rate-limit`, `service-vector-store`, `service-scheduler` |
 | Service | dispatch replacement, through `with_orchestrator` | `service-speculative` |
 
 - A hook fires at a fixed point in every turn, in registration order. The pipeline drives a plugin.
@@ -40,7 +40,7 @@ Tier and attachment are separate questions. The tier decides the feature namespa
 <div class="dgm-scroll">
 <svg viewBox="0 0 660 150" role="img" aria-labelledby="layer-title layer-desc">
   <title id="layer-title">Dependency direction between services, plugins and core</title>
-  <desc id="layer-desc">Three blocks, left to right: six services, twelve plugins, and core. An arrow runs from services to plugins, labeled as declared features only, and an arrow runs from plugins to core, labeled as core only. No arrow runs between plugins or from a plugin back to a service.</desc>
+  <desc id="layer-desc">Three blocks, left to right: seven services, twelve plugins, and core. An arrow runs from services to plugins, labeled as declared features only, and an arrow runs from plugins to core, labeled as core only. No arrow runs between plugins or from a plugin back to a service.</desc>
   <defs>
     <marker id="layer-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -49,7 +49,7 @@ Tier and attachment are separate questions. The tier decides the feature namespa
   </defs>
   <text class="t-title" x="6" y="20">Dependencies point left to right only</text>
   <rect class="blk blk-ctl" x="6" y="44" width="188" height="66" rx="6"/>
-  <text class="t-sm t-mid t-ctl" x="100" y="68">services (6)</text>
+  <text class="t-sm t-mid t-ctl" x="100" y="68">services (7)</text>
   <text class="t-sm t-mid" x="100" y="84">explicit call</text>
   <text class="t-sm t-mid" x="100" y="98">or dispatch replacement</text>
   <rect class="blk blk-ctl" x="236" y="44" width="188" height="66" rx="6"/>
@@ -101,6 +101,7 @@ A service could carry a `CucaPlugin` impl with empty hook bodies and a comment s
 - `PromptCache` must look up after `on_request` has finished mutating the request, because the digest covers the request that is actually sent. A hit skips provider dispatch, `execute_local_tool` and `on_stream_chunk`, and still runs `on_response_complete` once. No hook fires at the lookup position, so `CucaClient` calls the cache itself.
 - `EntityExtractor` produces a graph delta that has no effect until the application merges it into a `MemoryPlugin` with `merge_graph`. No moment in a turn makes applying the delta obviously right, so the caller decides. The feature declares `service-entity-extraction = ["plugin-memory"]` because the delta is a `MemoryGraph`.
 - `SessionReplay` drives a recorded session. A turn has no live request to mutate and no arriving chunk to annotate, and no hook signature returns a stream. Its work is caller-triggered backend reads through `SessionReplay::load` and its streaming methods. The feature declares `service-replay = ["plugin-session-log"]` because it reads a trajectory through the `SessionBackend` seam.
+- `Dispatcher` waits for a slot, and a hook cannot wait. A queue that orders calls from many callers needs `.await` on the caller's task, so the capability is a method the caller awaits.
 
 ## The orchestrator replaces dispatch
 
@@ -122,6 +123,7 @@ service-vector-store = ["plugin-memory", "dep:wide"]
 
 - `plugin-memory` and `plugin-session-log` build and work with no knowledge that a dependent service exists.
 - `service-speculative` has no Cargo edge to `plugin-session-log`. `ModelOrchestrator::with_session_store` exists only when `plugin-session-log` is also enabled, and then records `SessionEvent::ModelSwap`.
+- `service-scheduler` declares no plugin dependency; it owns `tokio` and `tracing` itself.
 - `service-prompt-cache` and `service-rate-limit` declare no plugin dependency.
 
 A plugin never names a service in any form: no `use crate::services`, no `cfg(feature = "service-...")`, no runtime lookup. The CI `plugin_layering` job greps `src/plugins/` for `service-`, `crate::services`, and `plugins::` paths ending in `prompt_cache`, `entity_extraction`, `replay` or `rate_limit`. A `cfg(all(...))` reverse edge compiles in both the solo and all-features builds, so only inspection catches it. The `plugin_solo` and `service_solo` jobs build each feature alone on `provider-openai`, which catches undeclared forward edges.

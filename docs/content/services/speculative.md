@@ -158,4 +158,4 @@ cargo run --example speculative --features "provider-llamacpp service-speculativ
 - [Speculative fast/slow routing](@/concepts/speculative-routing.md) explains why the tiers escalate.
 - [Session log](@/plugins/session-log.md) records the `ModelSwap` events.
 - [Prompt cache](@/services/prompt-cache.md) interacts with the orchestrator path.
-- [Services overview](@/services/_index.md) lists all six services.
+- [Services overview](@/services/_index.md) lists all seven services.

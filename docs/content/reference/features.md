@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Thirty-one opt-in features: eight providers, five <code>provider-local</code> GPU features, twelve plugins, six services</dd>
+<dd>Thirty-two opt-in features: eight providers, five <code>provider-local</code> GPU features, twelve plugins, seven services</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -85,7 +85,7 @@ No plugin feature enables another plugin feature, and none names a service: the 
 
 ## Service features
 
-Six features. A service is driven by direct method calls and never implements `CucaPlugin`.
+Seven features. A service is driven by direct method calls and never implements `CucaPlugin`.
 
 | Feature | Enables |
 |---|---|
@@ -95,6 +95,7 @@ Six features. A service is driven by direct method calls and never implements `C
 | `service-prompt-cache` | `dep:sha2`, `dep:postcard` |
 | `service-rate-limit` | `dep:tokio` |
 | `service-vector-store` | `plugin-memory`, `dep:wide` |
+| `service-scheduler` | `dep:tokio`, `dep:tracing` |
 
 ## Feature edges
 
@@ -106,7 +107,7 @@ Three hard edges, all service to plugin:
 
 One optional edge, not a Cargo feature: `ModelOrchestrator::with_session_store` exists only when `service-speculative` and `plugin-session-log` are both enabled.
 
-`service-prompt-cache` and `service-rate-limit` declare no plugin dependency. A plugin never depends on, or names, a service.
+`service-prompt-cache`, `service-rate-limit` and `service-scheduler` declare no plugin dependency. A plugin never depends on, or names, a service.
 
 ## Unconditional dependencies
 
@@ -125,7 +126,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | Crate | Version | Declared features | Owned by |
 |---|---|---|---|
 | `reqwest` | `0.13` | `json`, `stream`, `form`; no defaults | the eight `provider-*`, `plugin-web-search` |
-| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; no defaults | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit` |
+| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; no defaults | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit`, `service-scheduler` |
 | `tokio-stream` | `0.1` | default | the seven HTTP `provider-*`, `service-speculative` |
 | `sha2` | `0.11` | default | `provider-anthropic`, `provider-local`, `service-prompt-cache` |
 | `getrandom` | `0.4` | default | `provider-anthropic` |
@@ -136,7 +137,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `jsonschema` | `0.52` | no defaults | `plugin-guardrails` |
 | `opentelemetry` | `0.32` | default | `plugin-telemetry` |
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
-| `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
+| `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction`, `service-scheduler` |
 | `postcard` | `1` | `use-std`; no defaults | `plugin-session-log`, `service-prompt-cache` |
 | `wide` | `1.7` | default | `service-vector-store` |
 | `candle-core` | `0.11.0` | no defaults | `provider-local` |
@@ -176,7 +177,7 @@ Every other public module compiles unconditionally: `types`, `error`, `request`,
 | Field | Value |
 |---|---|
 | Package name | `cuca` |
-| Version | `0.5.2` |
+| Version | `0.6.0` |
 | Edition | `2024` |
 | `rust-version` | `1.98` |
 | Pinned toolchain | `1.98.0`, from `rust-toolchain.toml` |
@@ -188,7 +189,7 @@ Every other public module compiles unconditionally: `types`, `error`, `request`,
 
 ## Example targets
 
-Twenty-three examples. All but `local_model` require `provider-llamacpp`. Run one with `cargo run --example <name> --features <list>`.
+Twenty-four examples. All but `local_model` require `provider-llamacpp`. Run one with `cargo run --example <name> --features <list>`.
 
 | Example | Required features |
 |---|---|
@@ -208,6 +209,7 @@ Twenty-three examples. All but `local_model` require `provider-llamacpp`. Run on
 | `sandbox` | `provider-llamacpp`, `plugin-sandbox` |
 | `session_log` | `provider-llamacpp`, `plugin-session-log` |
 | `skills` | `provider-llamacpp`, `plugin-skills` |
+| `scheduler` | `provider-llamacpp`, `service-scheduler` |
 | `speculative` | `provider-llamacpp`, `service-speculative` |
 | `subagent` | `provider-llamacpp`, `plugin-subagent` |
 | `telemetry` | `provider-llamacpp`, `plugin-telemetry` |
@@ -229,7 +231,7 @@ Examples live in `examples/<name>.rs`.
 | `doc` | `--no-default-features --features $ALL_NO_LLVM` |
 | `local_gpu_llvm` | `--all-targets --no-default-features --features provider-local-cuda,provider-local-rocm`, `cargo check` on Ubuntu; the only job that downloads the LLVM bundle |
 | `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per plugin feature (twelve) |
-| `service_solo` | `--no-default-features --features provider-openai,<service>`, once per service feature (six) |
+| `service_solo` | `--no-default-features --features provider-openai,<service>`, once per service feature (seven) |
 | `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, a `crate::services` path, or a `plugins::` path for `prompt_cache`, `entity_extraction`, `replay` or `rate_limit` |
 
 `ALL_NO_LLVM` is a top-level `env` entry in `.github/workflows/ci.yml`, the same list as the docs.rs feature set: every feature except `provider-local-cuda` and `provider-local-rocm`. The run steps expand it as `$ALL_NO_LLVM`.

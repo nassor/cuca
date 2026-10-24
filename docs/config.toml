@@ -185,6 +185,9 @@ path = "@/services/rate-limit.md"
 [[extra.nav.items]]
 title = "Vector store"
 path = "@/services/vector-store.md"
+[[extra.nav.items]]
+title = "Scheduler"
+path = "@/services/scheduler.md"
 
 [[extra.nav]]
 label = "How-to guides"

@@ -84,6 +84,7 @@ There are 131, in 21 groups.
 | `service-prompt-cache` | `PromptCache`, `PromptCacheConfig`, `PromptCacheEntry`, `PromptCacheError`, `PromptCacheImportReport`, `PromptCacheSnapshot` |
 | `service-rate-limit` | `RateLimitConfig`, `RateLimitError`, `RateLimitObserver`, `RateLimitPermit`, `RateLimitUsage`, `RateLimiter` |
 | `service-replay` | `ReplayCompletion`, `ReplayConfig`, `ReplayNote`, `ReplayTrajectory`, `ReplayTurn`, `ReplayUsage`, `SessionReplay` |
+| `service-scheduler` | `Backend`, `BackendClient`, `BackendId`, `BackendRegistry`, `BackendSpec`, `BucketSnapshot`, `CallMeta`, `CallOutcome`, `CallReport`, `CallSlot`, `ChangeReason`, `ClientFactory`, `Clock`, `CompletedCall`, `Completion`, `Direction`, `DispatchError`, `DispatchGate`, `Dispatcher`, `DispatcherConfig`, `KindTotals`, `KindTotalsEntry`, `Lane`, `LevelChange`, `Load`, `Metric`, `OpenGate`, `Priority`, `RunningCall`, `Scheduler`, `SchedulerConfig`, `SchedulerError`, `SchedulerPool`, `SchedulerSnapshot`, `SystemClock`, `TunerPhase`, `TunerSnapshot`, `WaitingCall` |
 | `service-speculative` | `ClientPool`, `Complexity`, `ComplexityEvaluator`, `DraftValidator`, `JsonToolDraftValidator`, `ModelOrchestrator`, `SwappableModelPair`, `TurnExecutor` |
 | `service-vector-store` | `Embedder`, `InMemoryVectorStore`, `RECALL_RENDER_MARKER`, `RecallInjection`, `RetrievalReport`, `RetrievedTurn`, `VectorStoreConfig`, `VectorStoreError`, `VectorStoreUsage` |
 | `plugin-memory` or `service-prompt-cache` | `CUCA_EXPORT_FORMAT`, `CUCA_EXPORT_VERSION`, `CucaExport`, `CucaExportError`, `CucaImportReport`, `GraphExportSection`, `PromptCacheExportSection` |
@@ -147,4 +148,4 @@ There are 131, in 21 groups.
 
 ## The re-export contract is tested
 
-`tests/public_exports.rs` imports from `cuca` by name and constructs the types it names, so a removed or renamed re-export fails compilation. Its own gate is `any(provider-openai, provider-llamacpp)`. Its nested modules are gated on `service-prompt-cache`, `service-rate-limit`, `plugin-redaction`, `plugin-memory`, `plugin-cost`, the combination of cost and telemetry, either of memory or prompt cache, `service-replay` and `service-vector-store`.
+`tests/public_exports.rs` imports from `cuca` by name and constructs the types it names, so a removed or renamed re-export fails compilation. Its own gate is `any(provider-openai, provider-llamacpp)`. Its nested modules are gated on `service-prompt-cache`, `service-rate-limit`, `service-scheduler`, `plugin-redaction`, `plugin-memory`, `plugin-cost`, the combination of cost and telemetry, either of memory or prompt cache, `service-replay` and `service-vector-store`.

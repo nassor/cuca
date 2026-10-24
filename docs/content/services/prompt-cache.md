@@ -153,4 +153,4 @@ cargo run --example prompt_cache --features "provider-llamacpp service-prompt-ca
 - [Memory discipline](@/concepts/memory-discipline.md) lists the cache bound beside every other cap.
 - [Speculative](@/services/speculative.md) describes the orchestrator path, where a cache miss is instrumented.
 - [Session log](@/plugins/session-log.md) records the completion events a hit still produces.
-- [Services overview](@/services/_index.md) lists all six services.
+- [Services overview](@/services/_index.md) lists all seven services.

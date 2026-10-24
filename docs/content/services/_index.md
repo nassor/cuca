@@ -1,6 +1,6 @@
 +++
 title = "Services"
-description = "Six explicit-call service features that never implement CucaPlugin, and the plugin feature each one depends on."
+description = "Seven explicit-call service features that never implement CucaPlugin, and the plugin feature each one depends on."
 template = "section.html"
 sort_by = "weight"
 
@@ -10,14 +10,14 @@ kicker = "Reference"
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Six <code>service-*</code> features. Each is driven by direct method calls or a client builder attachment, never by plugin hooks.</dd>
+<dd>Seven <code>service-*</code> features. Each is driven by direct method calls or a client builder attachment, never by plugin hooks.</dd>
 <dt>You need</dt>
 <dd>The service features you want, named explicitly. None is enabled by default.</dd>
 <dt>Read this if</dt>
 <dd>You need a service's feature flag, entry type, plugin dependency, configuration, caps or errors.</dd>
 </dl>
 
-## The six features
+## The seven features
 
 | Feature | Entry type | Required plugin feature |
 |---|---|---|
@@ -27,6 +27,7 @@ kicker = "Reference"
 | [`service-replay`](@/services/replay.md) | `SessionReplay` | `plugin-session-log`, hard |
 | [`service-rate-limit`](@/services/rate-limit.md) | `RateLimiter` | none |
 | [`service-vector-store`](@/services/vector-store.md) | `InMemoryVectorStore` | `plugin-memory`, hard |
+| [`service-scheduler`](@/services/scheduler.md) | `Dispatcher` | none |
 
 ## Service tier rules
 
@@ -54,7 +55,7 @@ service-vector-store = ["plugin-memory", "dep:wide"]
 - `replay` to `session-log`, hard: replay reads a recorded trajectory through the session log's `SessionBackend` seam.
 - `vector-store` to `memory`, hard: the store implements the memory plugin's `VectorStore` offload seam, wired through `MemoryPlugin::with_extensions`, and hands recalled turns back through `RetrievalReport::inject`.
 - `speculative` to `session-log`, documented-optional: it declares no feature edge. `ModelOrchestrator::with_session_store` exists only when `plugin-session-log` is also enabled, and records `SessionEvent::ModelSwap`.
-- `prompt-cache` and `rate-limit` declare no plugin dependency.
+- `prompt-cache`, `rate-limit` and `scheduler` declare no plugin dependency.
 
 ## Page layout
 

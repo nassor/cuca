@@ -18,7 +18,7 @@ Nothing is compiled by default. You pick Cargo features, and the build fails unt
 
 - [Providers](https://nassor.github.io/cuca/providers/): `provider-openai` (also Ollama and other OpenAI-compatible servers), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm` and `provider-lmstudio` over HTTP, and `provider-local`, which runs a GGUF model inside your process.
 - [Plugins](https://nassor.github.io/cuca/plugins/) watch the request and the stream: MCP, WASM sandbox, memory, guardrails, subagents, human approval, web search, skills, telemetry, session log, cost accounting and redaction.
-- [Services](https://nassor.github.io/cuca/services/) are called directly: prompt cache, entity extraction, session replay, speculative fast/slow routing, rate limiting and a vector store.
+- [Services](https://nassor.github.io/cuca/services/) are called directly: prompt cache, entity extraction, session replay, speculative fast/slow routing, rate limiting, a vector store and a call scheduler.
 - Thinking: one effort level, `minimal` to `xhigh`, maps onto each provider's native reasoning control. Providers without one ignore it.
 
 Start with the [Quick start](#quick-start) below, or read the [documentation site](https://nassor.github.io/cuca/).
@@ -145,7 +145,7 @@ let client = CucaClient::builder()
 With a chat model on `http://127.0.0.1:1234` (a llama.cpp server works), run this on Linux, macOS and Windows (PowerShell):
 
 ```
-cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit service-vector-store plugin-redaction" -- --nocapture --test-threads=1
+cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit service-vector-store plugin-redaction service-scheduler" -- --nocapture --test-threads=1
 ```
 
 Without a reachable server, the tests print `SKIP` and pass. The environment variables are in the [integration tests guide](https://nassor.github.io/cuca/guides/integration-tests/).

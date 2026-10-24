@@ -1,6 +1,6 @@
 +++
 title = "Error types"
-description = "Every variant of CucaError, PluginError, PromptCacheError, RateLimitError, CucaExportError and VectorStoreError, with its Display text and its conversions."
+description = "Every variant of CucaError, PluginError, PromptCacheError, RateLimitError, SchedulerError, DispatchError, CucaExportError and VectorStoreError, with its Display text and its conversions."
 template = "page.html"
 weight = 2
 +++
@@ -16,7 +16,7 @@ weight = 2
 <dd>You are matching on a failure, or reading a message and looking for its source</dd>
 </dl>
 
-Each section below gives the feature gate, the variants with their fields and `Display` text, the source, and the conversions. Every enum derives `Debug` and `Clone`; `CucaExportError` also derives `PartialEq` and `Eq`.
+Each section below gives the feature gate, the variants with their fields and `Display` text, the source, and the conversions. Every enum derives `Debug` and `Clone`; `CucaExportError` and `SchedulerError` also derive `PartialEq` and `Eq`.
 
 ## `CucaError`
 
@@ -120,6 +120,7 @@ Gate: none. Five variants, none feature-gated.
 | `From<reqwest::Error> for CucaError` | `CucaError::Transport { message }` | any of the eight `provider-*` features |
 | `From<RateLimitError> for PluginError` | see `RateLimitError` | `service-rate-limit` |
 | `From<VectorStoreError> for PluginError` | see `VectorStoreError` | `service-vector-store` |
+| `From<SchedulerError> for DispatchError` | `Config`, `QueueFull` and `InputsChanged` keep their variant | `service-scheduler` |
 
 The `reqwest` conversion formats through `Display`, because `reqwest::Error` is not `Clone` and `CucaError` is. The other `Io`, `Json` and `Transport` conversions format the same way.
 
@@ -146,6 +147,31 @@ Gate: `service-rate-limit`. Six variants. `From<RateLimitError> for PluginError`
 | `Exhausted` | `retry_after: Duration` | `rate limit token bucket is exhausted; retry after {ms} ms` | no token within the wait budget, or an empty bucket in `try_acquire` |
 | `Observer` | `PluginError` | `rate limit observer refused the acquire: {err}` | a `RateLimitObserver` returned an error; the slot is released |
 | `Lock` | `String` | `rate limit lock error: {msg}` | a poisoned bucket mutex |
+
+## `SchedulerError`
+
+Gate: `service-scheduler`. Three variants. It is not a `CucaError` variant and has no `From` impl into one. It implements `std::error::Error` with no `source()`.
+
+| Variant | Fields | `Display` | Condition |
+|---|---|---|---|
+| `Config` | `String` | `scheduler config: {message}` | a `ceiling` of 0 or above 64, a zero `max_waiting`, or a zero `reserved_lane_from_level` |
+| `QueueFull` | `backend: BackendId`, `max_waiting: usize` | `backend {backend} already has {max_waiting} calls waiting` | `Scheduler::enqueue` with the queue at `max_waiting`; the call is not queued |
+| `InputsChanged` | none | `the call's inputs changed while it waited` | the `DispatchGate` reported the waiting call's task stale; the call left the queue unsent |
+
+## `DispatchError`
+
+Gate: `service-scheduler`. Eight variants. It is not a `CucaError` variant and has no `From` impl into one. `From<SchedulerError> for DispatchError` maps `Config`, `QueueFull` and `InputsChanged` to the variant of the same name. `source()` returns the inner error for `Call` and `None` for the rest.
+
+| Variant | Fields | `Display` | Condition |
+|---|---|---|---|
+| `Config` | `String` | `dispatcher configuration error: {message}` | an invalid `SchedulerConfig`, a zero `unreachable_cooldown`, a backend listed twice in one list, or more than 64 backends in one registry |
+| `QueueFull` | `backend: BackendId` | `the queue of backend {backend} is full` | the chosen backend already holds `max_waiting` calls |
+| `Unreachable` | `detail: String` | `no backend is reachable: {detail}` | every admitting backend failed to connect, a lazy client failed to build, every breaker is open, or the list is empty |
+| `Timeout` | `seconds: u64` | `the call timed out after {seconds}s` | the call ran past `DispatcherConfig::timeout` |
+| `Empty` | none | `the backend returned no text` | the stream ended with no text and no reasoning |
+| `ReasoningOnly` | `reasoning_chars: usize` | `the backend returned only reasoning ({reasoning_chars} characters) and no text` | the stream held reasoning and no text |
+| `InputsChanged` | none | `the call's inputs changed while it waited` | the `DispatchGate` reported the task stale |
+| `Call` | `CucaError` | `the backend call failed: {error}` | any other provider error, or an error item in the middle of the stream; no failover |
 
 ## `CucaExportError`
 

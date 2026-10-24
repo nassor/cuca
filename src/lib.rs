@@ -150,6 +150,15 @@ pub use crate::services::replay::{
     ReplayCompletion, ReplayConfig, ReplayNote, ReplayTrajectory, ReplayTurn, ReplayUsage,
     SessionReplay,
 };
+#[cfg(feature = "service-scheduler")]
+pub use crate::services::scheduler::{
+    Backend, BackendClient, BackendId, BackendRegistry, BackendSpec, BucketSnapshot, CallMeta,
+    CallOutcome, CallReport, CallSlot, ChangeReason, ClientFactory, Clock, CompletedCall,
+    Completion, Direction, DispatchError, DispatchGate, Dispatcher, DispatcherConfig, KindTotals,
+    KindTotalsEntry, Lane, LevelChange, Load, Metric, OpenGate, Priority, RunningCall, Scheduler,
+    SchedulerConfig, SchedulerError, SchedulerPool, SchedulerSnapshot, SystemClock, TunerPhase,
+    TunerSnapshot, WaitingCall,
+};
 #[cfg(feature = "service-vector-store")]
 pub use crate::services::vector_store::{
     Embedder, InMemoryVectorStore, RECALL_RENDER_MARKER, RecallInjection, RetrievalReport,

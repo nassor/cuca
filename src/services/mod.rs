@@ -30,6 +30,9 @@
 //!   implements the memory plugin's `VectorStore` offload seam and hands
 //!   recalled turns back through `vector_store::RetrievalReport::inject`.
 //!
+//! `service-scheduler = ["dep:tokio", "dep:tracing"]` depends on core only: no
+//! plugin feature, no other service.
+//!
 //! The direction is one-way. A plugin MUST NEVER name a service in any form: no
 //! `use crate::services::…`, no `cfg(feature = "service-…")` (including inside
 //! a `cfg(all(…))`), no Cargo feature edge, no runtime lookup. A
@@ -53,5 +56,7 @@ pub mod prompt_cache;
 pub mod rate_limit;
 #[cfg(feature = "service-replay")]
 pub mod replay;
+#[cfg(feature = "service-scheduler")]
+pub mod scheduler;
 #[cfg(feature = "service-vector-store")]
 pub mod vector_store;

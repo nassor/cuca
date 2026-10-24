@@ -654,3 +654,120 @@ mod vector_store_surface {
         assert!(!error.to_string().is_empty());
     }
 }
+
+#[cfg(feature = "service-scheduler")]
+mod scheduler_surface {
+    use std::sync::Arc;
+
+    use cuca::{
+        Backend, BackendClient, BackendId, BackendRegistry, BackendSpec, BucketSnapshot, CallMeta,
+        CallOutcome, CallReport, CallSlot, ChangeReason, ClientFactory, Clock, CompletedCall,
+        Completion, Direction, DispatchError, DispatchGate, Dispatcher, DispatcherConfig,
+        KindTotals, KindTotalsEntry, Lane, LevelChange, Load, Metric, OpenGate, Priority,
+        RunningCall, Scheduler, SchedulerConfig, SchedulerError, SchedulerPool, SchedulerSnapshot,
+        SystemClock, TunerPhase, TunerSnapshot, WaitingCall,
+    };
+
+    #[test]
+    fn config_and_error_are_root_exported() {
+        let error = SchedulerConfig::new(0).expect_err("a zero ceiling must be rejected");
+        assert!(matches!(error, SchedulerError::Config(_)));
+        assert!(!error.to_string().is_empty());
+
+        let config = SchedulerConfig::new(2).expect("a valid ceiling");
+        assert_eq!(
+            (config.max_waiting, config.reserved_lane_from_level),
+            (256, 4)
+        );
+    }
+
+    #[test]
+    fn call_meta_builders_are_root_exported() {
+        let meta = CallMeta::new("event", Priority::Medium, "subject")
+            .with_lane(Lane::Reserved)
+            .with_reference("ref")
+            .with_task(7)
+            .with_reruns(1);
+        assert_eq!(meta.effective_priority(), Priority::Urgent);
+        assert_eq!(meta.lane, Lane::Reserved);
+    }
+
+    #[derive(Debug)]
+    struct NeverBuilt;
+
+    impl ClientFactory for NeverBuilt {
+        fn build(
+            &self,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<Arc<cuca::CucaClient>, cuca::CucaError>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async { Err(cuca::CucaError::Config("not built in this test".to_owned())) })
+        }
+    }
+
+    #[tokio::test]
+    async fn a_dispatcher_joins_a_lazy_backend_without_building_it() {
+        let gate: Arc<dyn DispatchGate> = Arc::new(OpenGate::default());
+        let mut registry = BackendRegistry::new(gate, Arc::new(tokio::sync::watch::Sender::new(0)));
+        let spec = BackendSpec {
+            id: BackendId::parse("http://127.0.0.1:1234/v1"),
+            client: BackendClient::Lazy(Arc::new(NeverBuilt)),
+            model: None,
+            thinking: None,
+        };
+        let config = DispatcherConfig::new(SchedulerConfig::new(2).expect("a valid ceiling"));
+
+        let dispatcher =
+            Dispatcher::new(&mut registry, vec![spec], config).expect("one backend joins");
+
+        let backends: Vec<Arc<Backend>> = dispatcher.backends();
+        assert_eq!((backends.len(), dispatcher.ceiling()), (1, 2));
+        let _: Option<&Completion> = None;
+        let error = DispatchError::Config("x".to_owned());
+        assert!(!error.to_string().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_slot_is_taken_finished_and_counted() {
+        let gate: Arc<dyn DispatchGate> = Arc::new(OpenGate::default());
+        let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+        let scheduler = Arc::new(Scheduler::new(
+            BackendId::parse("http://127.0.0.1:1234/v1"),
+            SchedulerConfig::new(1).expect("a valid ceiling"),
+            clock,
+            gate,
+            Arc::new(tokio::sync::watch::Sender::new(0)),
+            Arc::new(SchedulerPool::new()),
+        ));
+
+        let slot: CallSlot = scheduler
+            .acquire(CallMeta::new("event", Priority::Low, "subject"))
+            .await
+            .expect("an idle scheduler dispatches at once");
+        let load: Load = scheduler.load();
+        assert_eq!(load.calls, 1);
+        slot.finish(CallReport::empty(CallOutcome::Ok));
+
+        let snapshot: SchedulerSnapshot = scheduler.snapshot();
+        let _: &[BucketSnapshot] = &snapshot.buckets;
+        let _: &[WaitingCall] = &snapshot.waiting;
+        let _: Option<&RunningCall> = snapshot.buckets.first().and_then(|b| b.call.as_ref());
+        let recent: &CompletedCall = snapshot.recent.first().expect("one completed call");
+        assert_eq!(recent.kind, "event");
+        let entry: &KindTotalsEntry = snapshot.totals.first().expect("one kind");
+        let totals: KindTotals = entry.totals;
+        assert_eq!(totals.calls, 1);
+        let tuner: &TunerSnapshot = &snapshot.tuner;
+        assert_eq!(tuner.phase, TunerPhase::Steady);
+        let _: &[LevelChange] = &tuner.history;
+        let _ = (
+            Direction::Up,
+            ChangeReason::Trial,
+            Metric::CompletionTokensPerSecond,
+        );
+    }
+}

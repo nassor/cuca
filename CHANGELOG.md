@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.6.0
+
+### Added
+
+- `service-scheduler` feature (owns `tokio` and `tracing`): a per-backend call
+  scheduler and a dispatcher over several backends, in
+  `services::scheduler`. It is an explicit-call service, so it never
+  implements `CucaPlugin`.
+- `Scheduler`, `SchedulerConfig`, `SchedulerError`: a priority queue per
+  backend with aging (a waiting call gains one point per completed call),
+  `Priority` (`Low`, `Medium`, `High`, `Urgent`), a reserved `Lane` served
+  first from a configurable running level, `max_waiting` refusal with
+  `SchedulerError::QueueFull`, and `SchedulerSnapshot` with running, waiting
+  and recent calls, buckets and per-kind totals (at most 32 kinds, the rest
+  counted as `"other"`).
+- Adaptive parallelism tuner per backend, reported by `TunerSnapshot`,
+  `TunerPhase`, `LevelChange`, `ChangeReason`, `Direction` and `Metric`.
+- `CallMeta`, `CallSlot`, `CallReport`, `CallOutcome`: the call description
+  and the slot a caller must finish.
+- `DispatchGate` and `OpenGate`: a caller-owned pause and stale-task check
+  shared by every queue. `Clock` and `SystemClock` make time injectable.
+- `Dispatcher`, `DispatcherConfig`, `DispatchError`, `Completion`:
+  least-load placement over `BackendRegistry` backends, failover when a
+  backend is unreachable, a circuit breaker with an unreachable cooldown,
+  periodic `rebalance` of waiting calls, `set_backends` to swap the list, and
+  a per-call timeout.
+- `BackendSpec`, `BackendClient`, `ClientFactory`, `Backend`: a backend holds
+  a ready `CucaClient` or a factory that builds it once before the first
+  slot is reserved, with an optional model tag and thinking override.
+- `tracing` debug spans `scheduler.wait` and `scheduler.stream` under the
+  target `cuca::scheduler`.
+- `examples/scheduler.rs`, `tests/service_scheduler.rs` and the Scheduler
+  page of the documentation site.
+
 ## 0.5.2
 
 ### Changed

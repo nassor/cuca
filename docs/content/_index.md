@@ -1,6 +1,6 @@
 +++
 title = "What CUCA is"
-description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, eight provider adapters, twelve plugins and six services."
+description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, eight provider adapters, twelve plugins and seven services."
 template = "section.html"
 sort_by = "weight"
 
@@ -71,7 +71,7 @@ The same five variants arrive from Anthropic's Messages API, Gemini's `streamGen
 
 ## Nothing compiles by default
 
-The crate sets `default = []`. Its eight provider adapters each sit behind a `provider-*` feature, and there are twelve `plugin-*` features and six `service-*` features. `src/lib.rs` stops the build with a `compile_error!` until at least one `provider-*` feature is on.
+The crate sets `default = []`. Its eight provider adapters each sit behind a `provider-*` feature, and there are twelve `plugin-*` features and seven `service-*` features. `src/lib.rs` stops the build with a `compile_error!` until at least one `provider-*` feature is on.
 
 ```text,name=src/lib.rs
 CUCA requires one provider-* feature; enable the adapter for the backend you use.
@@ -85,7 +85,7 @@ No backend and no dependency is implicit. `reqwest`, `tokio`, `wasmtime`, `rmcp`
 - [The unified request and stream](@/concepts/unified-request.md): the design behind the request and block types.
 - [Providers](@/providers/_index.md): eight adapters, each with its default base URL, auth header, route and behavior.
 - [Plugins](@/plugins/_index.md): twelve pipeline capabilities, each with its feature flag, entry type, hooks, config defaults and caps.
-- [Services](@/services/_index.md): six explicit-call capabilities, driven by direct method calls instead of hooks.
+- [Services](@/services/_index.md): seven explicit-call capabilities, driven by direct method calls instead of hooks.
 - [How-to guides](@/guides/other-openai-server.md): point the client at another server, write a plugin, run the live suite.
 - [Reference](@/reference/features.md): the feature matrix, error types, environment variables and the public API surface.
 - Rustdoc holds signatures, field docs and generic bounds for each item.

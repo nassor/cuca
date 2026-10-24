@@ -118,9 +118,9 @@ Eight optional crates are enabled by more than one feature. A shared crate is a 
 | Crate | Enabled by |
 |---|---|
 | `reqwest` with `rustls` | The seven HTTP `provider-*` features, `provider-local` and `plugin-web-search` |
-| `tokio` | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit` |
+| `tokio` | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit`, `service-scheduler` |
 | `tokio-stream` | The seven HTTP `provider-*` features and `service-speculative` |
-| `tracing` | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction` |
+| `tracing` | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction`, `service-scheduler` |
 | `base64` | `provider-anthropic`, `plugin-sandbox` |
 | `sha2` | `provider-anthropic`, `provider-local`, `service-prompt-cache` |
 | `postcard` | `plugin-session-log`, `service-prompt-cache` |
