@@ -223,6 +223,37 @@ enum ExpertBank {
     },
 }
 
+/// The shared expert of a Qwen 3.5 MoE layer: a dense gated FFN every token
+/// runs, scaled per token by `sigmoid(gate_inp . x)`.
+struct SharedExpert {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+    /// `ffn_gate_inp_shexp`, `n_embd` floats.
+    gate_inp: Vec<f32>,
+}
+
+impl SharedExpert {
+    /// The shared expert's output for the rows `flat` `(t, n_embd)`.
+    ///
+    /// The scalar gate is a sequential host dot product per row, so a row's
+    /// value never depends on how many rows share the call.
+    fn forward(&self, flat: &Tensor, act: Act) -> candle_core::Result<Tensor> {
+        let (t, n_embd) = flat.dims2()?;
+        let hidden = (activate(&self.gate.forward(flat)?, act)? * self.up.forward(flat)?)?;
+        let y = self.down.forward(&hidden)?;
+        let rows = flat.flatten_all()?.to_vec1::<f32>()?;
+        let gates: Vec<f32> = rows
+            .chunks_exact(n_embd)
+            .map(|x| {
+                let dot: f32 = x.iter().zip(&self.gate_inp).map(|(a, b)| a * b).sum();
+                1.0 / (1.0 + (-dot).exp())
+            })
+            .collect();
+        y.broadcast_mul(&Tensor::from_vec(gates, (t, 1), flat.device())?)
+    }
+}
+
 enum FfnWeights {
     Dense {
         gate_up: GateUp,
@@ -232,6 +263,7 @@ enum FfnWeights {
         spec: MoeSpec,
         router: QMatMul,
         experts: ExpertBank,
+        shared: Option<SharedExpert>,
     },
 }
 
@@ -549,7 +581,7 @@ fn open_expert_store(
     })?;
     let mut layers = Vec::new();
     for (il, ls) in hp.layers.iter().enumerate() {
-        if let Ffn::Moe { ff } = LayerLayout::read(hp, il, ls, content)?.ffn {
+        if let Ffn::Moe { ff, .. } = LayerLayout::read(hp, il, ls, content)?.ffn {
             let slice = |part: &str, rows, cols| {
                 ExpertSlice::read(content, &name::blk(il, part), spec.n_expert, rows, cols)
             };
@@ -1770,10 +1802,19 @@ fn load_layer(
             },
             down: loader.matmul(&blk(name::FFN_DOWN), &[n_embd, ff])?,
         },
-        (Ffn::Moe { ff }, Some(spec)) => FfnWeights::Moe {
+        (Ffn::Moe { ff, shared_ff }, Some(spec)) => FfnWeights::Moe {
             spec,
             router: loader.matmul(&blk(name::FFN_GATE_INP), &[spec.n_expert, n_embd])?,
             experts: loader.expert_bank(il, spec.n_expert, ff, n_embd, tiers)?,
+            shared: match shared_ff {
+                Some(sff) => Some(SharedExpert {
+                    gate: loader.matmul(&blk(name::FFN_GATE_SHEXP), &[sff, n_embd])?,
+                    up: loader.matmul(&blk(name::FFN_UP_SHEXP), &[sff, n_embd])?,
+                    down: loader.matmul(&blk(name::FFN_DOWN_SHEXP), &[n_embd, sff])?,
+                    gate_inp: loader.floats(&blk(name::FFN_GATE_INP_SHEXP), &[n_embd])?,
+                }),
+                None => None,
+            },
         },
         (Ffn::Moe { .. }, None) => return Err(err("expert tensors without an expert count")),
     };
@@ -2043,6 +2084,7 @@ impl FfnWeights {
                 spec,
                 router,
                 experts,
+                shared,
             } => {
                 let (_, t, n_embd) = f.dims3()?;
                 let flat = f.reshape((t, n_embd))?;
@@ -2089,6 +2131,9 @@ impl FfnWeights {
                         (activate(&x.gate.forward(&rows)?, act)? * x.up.forward(&rows)?)?;
                     let y = x.down.forward(&hidden)?.broadcast_mul(&weights)?;
                     out = out.index_add(&ids, &y, 0)?;
+                }
+                if let Some(shared) = shared {
+                    out = (out + shared.forward(&flat, act)?)?;
                 }
                 out.reshape((1, t, n_embd))
             }
@@ -2239,8 +2284,8 @@ mod tests {
 
     use super::super::rope::{RopeKind, rotate_reference};
     use super::super::tiny::{
-        PROMPT, TinyOptions, TinySpec, VOCAB, assert_close, load, write_spec, write_tiny_model,
-        write_tiny_model_with,
+        PROMPT, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB, assert_close, load,
+        write_qwen35, write_spec, write_tiny_model, write_tiny_model_with,
     };
     use super::*;
 
@@ -2546,6 +2591,7 @@ mod tests {
             spec,
             router,
             experts: ExpertBank::Resident(experts),
+            shared: None,
         } = &lw.ffn
         else {
             panic!("granitemoe FFN is a mixture of resident experts");
@@ -2587,6 +2633,151 @@ mod tests {
         // and each token went to exactly two experts.
         let routed: usize = routing.per_expert.iter().map(Vec::len).sum();
         assert_eq!(routed, t * spec.n_used);
+    }
+
+    fn q35moe() -> TinyQwen35 {
+        TinyQwen35 {
+            moe: Some(TinyMoe {
+                n_expert: 8,
+                n_used: 2,
+                ff: 64,
+                shared_ff: 32,
+            }),
+            ..TinyQwen35::default()
+        }
+    }
+
+    /// Qwen 3.5 MoE: the FFN is the routed experts (softmax over every
+    /// expert, top-k, renormalised) plus the shared expert scaled by
+    /// `sigmoid(ffn_gate_inp_shexp . x)`, checked against a per-token f64
+    /// reference built from the raw tensors.
+    #[test]
+    fn qwen35moe_ffn_adds_the_gated_shared_expert() {
+        let model = write_qwen35(&q35moe());
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let hp = read_hparams(&content).unwrap();
+        assert_eq!(hp.arch.name(), "qwen35moe");
+        let moe = hp.moe.unwrap();
+        assert!(moe.norm_weights);
+        let mut loader = Loader {
+            content: &content,
+            reader: BufReader::new(File::open(&model.path).unwrap()),
+            dequantize: true,
+            requantize: false,
+        };
+        let layout = LayerLayout::read(&hp, 0, &hp.layers[0], &content).unwrap();
+        assert_eq!(
+            layout.ffn,
+            Ffn::Moe {
+                ff: 64,
+                shared_ff: Some(32)
+            }
+        );
+        let lw = load_layer(&mut loader, &hp, 0, &hp.layers[0], &layout, None).unwrap();
+        let t = 6;
+        let values: Vec<f32> = (0..t * 64)
+            .map(|i| ((i * 29 % 19) as f32 - 9.0) * 0.12)
+            .collect();
+        let f = Tensor::from_vec(values.clone(), (1, t, 64), &Device::Cpu).unwrap();
+        let got = lw.ffn.forward(&f, Act::Silu).unwrap();
+        let FfnWeights::Moe {
+            spec,
+            router,
+            experts: ExpertBank::Resident(experts),
+            shared: Some(shared),
+        } = &lw.ffn
+        else {
+            panic!("qwen35moe FFN is resident experts plus a shared expert");
+        };
+        let flat = f.reshape((t, 64)).unwrap();
+        let vec_of = |x: Tensor| x.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let routing = route(&vec_of(router.forward(&flat).unwrap()), t, spec);
+        let mut want = vec![0f64; t * 64];
+        for (e, picks) in routing.per_expert.iter().enumerate() {
+            for &(token, weight) in picks {
+                let row = flat.narrow(0, token as usize, 1).unwrap();
+                let h = (experts[e].gate.forward(&row).unwrap().silu().unwrap()
+                    * experts[e].up.forward(&row).unwrap())
+                .unwrap();
+                let y = vec_of(experts[e].down.forward(&h).unwrap());
+                for (o, v) in want[token as usize * 64..][..64].iter_mut().zip(&y) {
+                    *o += f64::from(weight) * f64::from(*v);
+                }
+            }
+        }
+        // The routing weights of a token sum to one.
+        for token in 0..t as u32 {
+            let sum: f32 = routing
+                .per_expert
+                .iter()
+                .flatten()
+                .filter(|(tk, _)| *tk == token)
+                .map(|(_, w)| *w)
+                .sum();
+            assert!((sum - 1.0).abs() < 1e-5, "token {token}: {sum}");
+        }
+        for token in 0..t {
+            let row = flat.narrow(0, token, 1).unwrap();
+            let h = (shared.gate.forward(&row).unwrap().silu().unwrap()
+                * shared.up.forward(&row).unwrap())
+            .unwrap();
+            let y = vec_of(shared.down.forward(&h).unwrap());
+            let dot: f64 = values[token * 64..][..64]
+                .iter()
+                .zip(&shared.gate_inp)
+                .map(|(a, b)| f64::from(*a) * f64::from(*b))
+                .sum();
+            let gate = 1.0 / (1.0 + (-dot).exp());
+            for (o, v) in want[token * 64..][..64].iter_mut().zip(&y) {
+                *o += gate * f64::from(*v);
+            }
+        }
+        for (a, b) in vec_of(got).iter().zip(&want) {
+            assert!((f64::from(*a) - b).abs() < 1e-4, "{a} vs {b}");
+        }
+    }
+
+    /// The trunk loads without reading the prediction block's experts, and
+    /// the in-trunk head of an MoE model fails loudly instead of silently.
+    #[test]
+    fn qwen35moe_loads_and_refuses_the_in_trunk_head() {
+        let model = write_qwen35(&q35moe());
+        let m = load(&model, 32);
+        assert!(m.is_hybrid());
+        assert_eq!((m.hp.n_layer, m.hp.nextn_predict_layers), (5, 1));
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let e = m.load_head(&content, &model.path).err().unwrap();
+        assert!(
+            matches!(&e, CucaError::Config(msg) if msg.contains("qwen35moe") && msg.contains("mixture-of-experts")),
+            "{e:?}"
+        );
+    }
+
+    /// A hybrid MoE model under tiered placement computes the resident
+    /// model's logits bit for bit, at the minimum budget and at one that
+    /// holds a few experts per layer.
+    #[test]
+    fn qwen35moe_tiered_experts_match_resident_bit_for_bit() {
+        let model = write_qwen35(&q35moe());
+        let per_index = expert_bytes(&model);
+        let want = greedy_run(&mut load(&model, 32));
+        for experts in [2u64, 5] {
+            let budget = experts * per_index;
+            let mut tiered = load_tiered(&model, budget, None).unwrap();
+            assert_eq!(greedy_run(&mut tiered), want, "{experts} experts");
+            let stats = tiered.expert_tiers().unwrap().stats();
+            assert!(stats.disk_reads > 0, "{stats:?}");
+            assert!(stats.ram_resident_bytes <= budget, "{stats:?}");
+        }
+        let e = load_tiered(&model, 2 * per_index - 1, None).err().unwrap();
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains(&format!("at least 2 ({} bytes)", 2 * per_index))),
+            "{e:?}"
+        );
     }
 
     #[test]

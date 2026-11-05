@@ -19,7 +19,7 @@
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
 //! `gemma2`, `llama` (Llama 1-3.x and compatible), `qwen2`, `qwen3`, `phi3`
 //! (Phi 3, 3.5, 4-mini), `smollm3`, `granite`, `granitemoe`, `qwen3moe`,
-//! `olmoe`, `olmo2`, `ernie4_5` or `qwen35` (CPU only) runs: the loader reads every
+//! `olmoe`, `olmo2`, `ernie4_5`, `qwen35` or `qwen35moe` runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
 //! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
@@ -229,7 +229,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 25] = [
+const PRESET_TABLE: [ModelPreset; 26] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -445,6 +445,15 @@ const PRESET_TABLE: [ModelPreset; 25] = [
         "c54f8b67069c70085b98440de696b44da8250250ac69a961b41133def876e262",
         833_592_736,
         "qwen35",
+    ),
+    preset(
+        "qwen3.6-35b-a3b-q4_0",
+        "bartowski/Qwen_Qwen3.6-35B-A3B-GGUF",
+        "5c2410d71524f4f72b023ce8daf7a80528226d5f",
+        "Qwen_Qwen3.6-35B-A3B-Q4_0.gguf",
+        "52312daa5b2190c1f5723d33c3315c01c55af4206f6c6e6eb63f3d8dd52bb85e",
+        20_836_243_072,
+        "qwen35moe",
     ),
     ModelPreset {
         drafter: true,

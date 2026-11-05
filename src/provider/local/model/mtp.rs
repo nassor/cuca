@@ -51,8 +51,8 @@
 //! except that the logits it hands to `pick` cover only the first token ids
 //! of the vocabulary (a draft step ranks a 65,536-id prefix; an index is
 //! still a token id).
-//! The head runs on the CPU only (the trunk it belongs to does not run on a
-//! GPU) and only proposes: verification keeps the output equal to plain
+//! The head runs on the CPU only (a hybrid trunk can run on a GPU, but the
+//! head is not implemented there) and only proposes: verification keeps the output equal to plain
 //! decoding whatever the head computes.
 //!
 //! The cache stays consistent with the trunk by one rule: the head holds a

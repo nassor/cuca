@@ -5,7 +5,8 @@
 //! constant-size state per sequence: the last `conv_kernel - 1` inputs of a
 //! causal depthwise convolution and, per value head, a `head_k_dim x
 //! head_v_dim` f32 matrix `S`. For every token `t` and value head (query/key
-//! head `h / (n_v_heads / n_k_heads)`, the key heads repeat-interleaved):
+//! head `h % n_k_heads`: the key heads are tiled across the value heads, the
+//! order llama.cpp's converter writes, `ggml_repeat`):
 //!
 //! ```text
 //! x      = silu(sum_i conv[i] * mixed[t - (K-1) + i])      per channel
@@ -334,8 +335,8 @@ impl DeltaKernel {
         let d = &self.spec;
         let (nv, dk, dv) = (d.n_v_heads, d.head_k_dim, d.head_v_dim);
         let kd = d.key_dim();
-        // Repeat-interleave: consecutive value heads share a key head.
-        let hk = h / (nv / d.n_k_heads);
+        // Tiled: value head `h` reads key head `h % n_k_heads`.
+        let hk = h % d.n_k_heads;
         let (q_at, k_at, v_at) = (hk * dk, kd + hk * dk, 2 * kd + h * dv);
         let vd = d.value_dim();
         let sqrt_dk = (dk as f32).sqrt();
@@ -649,7 +650,6 @@ pub(crate) mod tests {
             spec.conv_kernel,
         );
         let kd = spec.key_dim();
-        let rep = nv / spec.n_k_heads;
         let silu = |x: f64| x / (1.0 + (-x).exp());
         // x_t[c], zero before the start.
         let x = |ti: isize, c: usize| -> f64 {
@@ -677,7 +677,7 @@ pub(crate) mod tests {
         let mut out = vec![0f64; t * spec.value_dim()];
         for ti in 0..t {
             for h in 0..nv {
-                let hk = h / rep;
+                let hk = h % spec.n_k_heads;
                 let q: Vec<f64> = (0..dk).map(|j| conv(ti, hk * dk + j)).collect();
                 let k: Vec<f64> = (0..dk).map(|j| conv(ti, kd + hk * dk + j)).collect();
                 let v: Vec<f64> = (0..dv).map(|j| conv(ti, 2 * kd + h * dv + j)).collect();

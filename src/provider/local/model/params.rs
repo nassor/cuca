@@ -131,8 +131,9 @@ pub(crate) enum LayerKind {
 /// names in parentheses).
 ///
 /// A layer keeps `n_v_heads` states of shape `[head_k_dim, head_v_dim]`; the
-/// `n_k_heads` query/key heads are shared by `n_v_heads / n_k_heads`
-/// consecutive value heads (repeat-interleave).
+/// `n_k_heads` query/key heads are tiled across the `n_v_heads` value heads
+/// (value head `h` reads key head `h % n_k_heads`, llama.cpp's `ggml_repeat`
+/// order: its converter permutes the HF value heads into it).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct DeltaSpec {
     /// Taps of the causal depthwise convolution (`ssm.conv_kernel`); the

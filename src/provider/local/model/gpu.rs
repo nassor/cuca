@@ -228,9 +228,9 @@ use candle_core::quantized::{GgmlDType, gguf_file};
 
 use super::arch::{Act, Arch};
 use super::cpu::{Forward, Hidden};
-use super::layout::{Ffn, LayerLayout, Qkv, name, tensor_info};
+use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
 use super::moe::{Routing, route};
-use super::params::{Hparams, LayerSpec, MoeSpec};
+use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
 use super::quant::{RowTable, dequant_row};
 use super::rope::{RopeKind, RopeSpec};
 use super::tier::{
@@ -405,6 +405,10 @@ fn require_index(
 /// 2.46 GB buffer, so a conservative 1 GiB is assumed everywhere.
 const MAX_PART_BYTES: usize = 1 << 30;
 
+/// Tokens of a delta-net scan between two waits for the device (see
+/// [`DeltaWeights::forward`]).
+const SCAN_DRAIN: usize = 16;
+
 /// A `[rows, cols]` matmul weight on the device as one or more row chunks
 /// (one unless the weight would exceed [`MAX_PART_BYTES`], as a large tied
 /// LM head does); [`linear`] concatenates the chunks' outputs, which is exact.
@@ -501,6 +505,9 @@ struct QuantShape {
     rows: usize,
     cols: usize,
     class: SchemeClass,
+    /// Matrices of this shape the tensor holds: the experts of a stacked
+    /// expert tensor, else 1.
+    copies: usize,
 }
 
 impl QuantShape {
@@ -518,9 +525,14 @@ impl QuantShape {
         }
     }
 
-    /// Bytes on the device.
+    /// Bytes on the device of one matrix.
     fn bytes(&self) -> usize {
         self.rows * stored_row_bytes(Some(self.stored()), self.cols)
+    }
+
+    /// Bytes on the device of every matrix of the tensor.
+    fn total_bytes(&self) -> usize {
+        self.bytes() * self.copies
     }
 
     /// Whether burn's matmul autotune may give the two weights one key. The
@@ -550,11 +562,20 @@ fn quant_shapes(content: &gguf_file::Content) -> Vec<(String, QuantShape)> {
         })
         .filter_map(|(tensor, info)| {
             let class = scheme_class(info.ggml_dtype)?;
-            let (rows, cols) = match info.shape.dims() {
-                [rows, cols] | [_, rows, cols] => (*rows, *cols),
+            let (rows, cols, copies) = match info.shape.dims() {
+                [rows, cols] => (*rows, *cols, 1),
+                [experts, rows, cols] => (*rows, *cols, *experts),
                 _ => return None,
             };
-            Some((tensor.clone(), QuantShape { rows, cols, class }))
+            Some((
+                tensor.clone(),
+                QuantShape {
+                    rows,
+                    cols,
+                    class,
+                    copies,
+                },
+            ))
         })
         .collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -578,7 +599,7 @@ fn plan_dense(own: &[(String, QuantShape)], peers: &[QuantShape]) -> HashSet<Str
             .map(|(_, s)| s)
             .chain(peers)
             .filter(|s| s.class == class)
-            .map(QuantShape::bytes)
+            .map(QuantShape::total_bytes)
             .sum::<usize>()
     };
     let minority = if total(SchemeClass::Q4) < total(SchemeClass::Q8) {
@@ -1010,6 +1031,17 @@ impl WeightReader<'_> {
         Ok(out)
     }
 
+    /// The values of the (float or quantized) tensor `tensor_name`, whose
+    /// shape must be `shape`, as row-major f32.
+    fn host_floats(&mut self, tensor_name: &str, shape: &[usize]) -> Result<Vec<f32>, CucaError> {
+        let len: usize = shape.iter().product();
+        let dtype = self.read(tensor_name, shape)?;
+        let mut out = vec![0f32; len];
+        dequant_row(dtype, &self.buf, 1.0, &mut out)
+            .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
+        Ok(out)
+    }
+
     /// A 1-D f32 tensor on the device.
     fn vector(&mut self, tensor_name: &str, len: usize) -> Result<Tensor<1>, CucaError> {
         let values = self.host_vector(tensor_name, len)?;
@@ -1094,6 +1126,8 @@ enum GateUp {
     },
 }
 
+// One value per layer, built at load and only read afterwards.
+#[allow(clippy::large_enum_variant)]
 enum FfnWeights {
     Dense {
         gate_up: GateUp,
@@ -1103,7 +1137,71 @@ enum FfnWeights {
         spec: MoeSpec,
         router: Weight,
         experts: GpuExpertBank,
+        shared: Option<GpuShared>,
     },
+}
+
+/// The shared expert of a Qwen 3.5 MoE layer: a dense gated FFN every token
+/// runs, scaled per token by `sigmoid(gate_inp . x)`.
+struct GpuShared {
+    gate: Weight,
+    up: Weight,
+    down: Weight,
+    /// `ffn_gate_inp_shexp` as `[1, n_embd]`.
+    gate_inp: Tensor<2>,
+}
+
+/// Gated delta-net weights of one layer (see [`super::delta`] for the
+/// algorithm; this is its device form).
+struct DeltaWeights {
+    spec: DeltaSpec,
+    /// `attn_qkv`: the convolution inputs `[q | k | v]`.
+    qkv: Weight,
+    /// `attn_gate`: the output gate `z`.
+    gate: Weight,
+    /// `ssm_beta`.
+    beta: Weight,
+    /// `ssm_alpha`.
+    alpha: Weight,
+    /// `ssm_out`.
+    out: Weight,
+    /// The convolution taps, `[conv_kernel, conv_dim]`.
+    conv: Tensor<2>,
+    /// `ssm_norm`, `[head_v_dim]`.
+    norm: Tensor<1>,
+    /// `ssm_a`, `[n_v_heads]`.
+    a: Tensor<1>,
+    /// `ssm_dt.bias`, `[n_v_heads]`.
+    dt_bias: Tensor<1>,
+}
+
+/// The recurrent state of one delta-net layer on the device. Device tensors
+/// are immutable values, so a pass builds the next state and a checkpoint is
+/// just another handle to an earlier one.
+#[derive(Clone)]
+struct DeltaState {
+    /// The last `conv_kernel - 1` convolution inputs, `[conv_kernel - 1,
+    /// conv_dim]`.
+    conv: Tensor<2>,
+    /// One `[head_k_dim, head_v_dim]` matrix per value head.
+    s: Tensor<3>,
+}
+
+impl DeltaState {
+    fn zeros(spec: &DeltaSpec, device: &Device) -> Self {
+        Self {
+            conv: Tensor::zeros([spec.conv_kernel - 1, spec.conv_dim()], device),
+            s: Tensor::zeros([spec.n_v_heads, spec.head_k_dim, spec.head_v_dim], device),
+        }
+    }
+}
+
+/// What mixes the tokens of one layer.
+// One value per layer, built at load and only read afterwards.
+#[allow(clippy::large_enum_variant)]
+enum Mixer {
+    Attention(AttnWeights),
+    Delta(Box<DeltaWeights>),
 }
 
 /// One routed expert's three projections on the device.
@@ -1386,7 +1484,7 @@ struct PleLayer {
 struct LayerWeights {
     /// The pre-attention norm; `None` when the architecture has no pre-norms.
     attn_norm: Option<Tensor<1>>,
-    attn: AttnWeights,
+    mixer: Mixer,
     post_attn_norm: Option<Tensor<1>>,
     ffn_norm: Option<Tensor<1>>,
     ffn: FfnWeights,
@@ -1483,6 +1581,14 @@ pub(crate) struct GpuTransformer {
     ple_table: Option<RowTable>,
     kv: KvLayers,
     kv_len: usize,
+    /// The recurrent state of every delta-net layer (`None` for attention
+    /// layers), live at `kv_len`.
+    delta: Vec<Option<DeltaState>>,
+    /// The one checkpoint a hybrid model can return to: its position and
+    /// the states there.
+    checkpoint: Option<(usize, Vec<Option<DeltaState>>)>,
+    /// The model has delta-net layers.
+    hybrid: bool,
     /// The weights held quantized, for a drafter's [`plan_dense`].
     peers: Vec<QuantShape>,
     /// Counters and heat of the expert tiers, with `ExpertPlacement::Tiered`.
@@ -1502,6 +1608,8 @@ fn return_device_memory(device: &Device) {
 impl Drop for GpuTransformer {
     fn drop(&mut self) {
         self.kv.clear();
+        self.delta.clear();
+        self.checkpoint = None;
         self.weights.release();
         return_device_memory(&self.weights.device);
     }
@@ -1530,7 +1638,7 @@ impl Weights {
         hp: Hparams,
         context_length: usize,
         tiers: Option<&TierPlan>,
-    ) -> Result<(Self, KvLayers), CucaError> {
+    ) -> Result<(Self, KvLayers, Vec<Option<DeltaState>>), CucaError> {
         let content = reader.content;
         let device = reader.device.clone();
         let n_embd = hp.n_embd;
@@ -1570,9 +1678,11 @@ impl Weights {
 
         let mut layers = Vec::with_capacity(hp.n_layer);
         let mut kv: KvLayers = Vec::with_capacity(hp.n_layer);
+        let mut delta: Vec<Option<DeltaState>> = Vec::with_capacity(hp.n_layer);
         for il in 0..hp.n_layer {
             let spec = &hp.layers[il];
             let layout = LayerLayout::read(&hp, il, spec, content)?;
+            delta.push(spec.delta().map(|d| DeltaState::zeros(d, &device)));
             if spec.owns_kv(il) {
                 let slots = kv_slots(spec.window, context_length);
                 let shape = [1, spec.n_kv_head, slots, spec.head_dim];
@@ -1598,6 +1708,7 @@ impl Weights {
                 ropes,
             },
             kv,
+            delta,
         ))
     }
 }
@@ -1618,7 +1729,7 @@ fn tier_layout(
     let mut layers = Vec::new();
     let mut flags = vec![[false; 3]; hp.n_layer];
     for (il, layer_spec) in hp.layers.iter().enumerate() {
-        let Ffn::Moe { ff } = LayerLayout::read(hp, il, layer_spec, content)?.ffn else {
+        let Ffn::Moe { ff, .. } = LayerLayout::read(hp, il, layer_spec, content)?.ffn else {
             continue;
         };
         let slice = |part: &str, rows, cols| {
@@ -1784,12 +1895,7 @@ impl GpuTransformer {
                 hp.arch.name()
             )));
         }
-        if hp.behavior.hybrid_delta_net {
-            return Err(err(format!(
-                "`{}`: recurrent (gated delta-net) layers are not implemented on GPU devices; use LocalDevice::Cpu",
-                hp.arch.name()
-            )));
-        }
+        let hybrid = hp.behavior.hybrid_delta_net;
         check_context(&hp, context_length)?;
         let device = open_device(device)?;
 
@@ -1832,7 +1938,7 @@ impl GpuTransformer {
             dense,
         };
         let plan = tiers.as_ref().map(|(_, plan)| plan);
-        let (weights, kv) = Weights::load(&mut reader, path, hp, context_length, plan)?;
+        let (weights, kv, delta) = Weights::load(&mut reader, path, hp, context_length, plan)?;
         drop(reader);
         if let Some((tiers, plan)) = &tiers
             && let Some(heat) = &tiers.warm_from
@@ -1848,6 +1954,9 @@ impl GpuTransformer {
             ple_table,
             kv,
             kv_len: 0,
+            delta,
+            checkpoint: None,
+            hybrid,
             peers,
             tiers: tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
         })
@@ -1928,15 +2037,26 @@ impl GpuTransformer {
             (Some(table), Some(dim)) => Some(table.rows(tokens, (dim as f32).sqrt())?),
             _ => None,
         };
-        let out = self.weights.forward_layers(
+        let out = match self.weights.forward_layers(
             &mut self.kv,
+            &mut self.delta,
             embeddings,
             per_layer,
             tokens.len(),
             start_pos,
             want,
             hidden,
-        )?;
+        ) {
+            Ok(out) => out,
+            Err(e) => {
+                // A half-advanced recurrent state cannot be repaired: as on
+                // the CPU, the cache is emptied.
+                if self.hybrid {
+                    self.discard_state();
+                }
+                return Err(e);
+            }
+        };
         self.kv_len = hi;
         Ok(out)
     }
@@ -2061,20 +2181,94 @@ impl GpuTransformer {
         })
     }
 
-    /// Drop every cached position from `len` on and return how many remain
-    /// (`min(len, current length)`: K/V rows are positional); the next
-    /// `forward` must start there. Positions at or past it are overwritten,
-    /// not cleared. A `len` below the floor of a compacted sliding-window
+    /// Drop every cached position from `len` on and return how many remain;
+    /// the next `forward` must start there. K/V rows are positional
+    /// (`min(len, current length)` for an attention-only model); a hybrid
+    /// model retains only positions it holds a recurrent state for: the
+    /// current end and the [`GpuTransformer::checkpoint`], else the largest
+    /// of those not above `len`, else `0` (the zero state). Unlike the CPU
+    /// engine it keeps no verify record (no drafter can pair with a hybrid
+    /// model on a GPU). A `len` below the floor of a compacted sliding-window
     /// slab empties the cache and returns 0, as on the CPU.
     pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
         let len = if len < self.ring_floor() { 0 } else { len };
-        self.kv_len = len.min(self.kv_len);
-        if self.kv_len == 0 {
+        let kept = self.truncate_positions(len);
+        if kept == 0 {
             for slab in self.kv.iter_mut().flatten() {
                 slab.base = 0;
             }
         }
-        self.kv_len
+        kept
+    }
+
+    /// [`GpuTransformer::truncate_cache`] without the sliding-window floor.
+    fn truncate_positions(&mut self, len: usize) -> usize {
+        if !self.hybrid {
+            self.kv_len = len.min(self.kv_len);
+            return self.kv_len;
+        }
+        if len == 0 {
+            self.discard_state();
+            return 0;
+        }
+        if len >= self.kv_len {
+            return self.kv_len;
+        }
+        let kept = match &self.checkpoint {
+            Some((at, _)) if *at <= len => *at,
+            _ => 0,
+        };
+        match &self.checkpoint {
+            Some((at, states)) if *at == kept && kept > 0 => self.delta = states.clone(),
+            _ => self.zero_state(),
+        }
+        if self.checkpoint.as_ref().is_some_and(|(at, _)| *at > kept) {
+            self.checkpoint = None;
+        }
+        self.kv_len = kept;
+        kept
+    }
+
+    /// Every delta-net layer's state back to zeros.
+    fn zero_state(&mut self) {
+        let device = &self.weights.device;
+        for (state, spec) in self.delta.iter_mut().zip(&self.weights.hp.layers) {
+            if let Some(d) = spec.delta() {
+                *state = Some(DeltaState::zeros(d, device));
+            }
+        }
+    }
+
+    /// An empty cache: the zero state, no checkpoint, no positions.
+    fn discard_state(&mut self) {
+        self.zero_state();
+        self.checkpoint = None;
+        self.kv_len = 0;
+        for slab in self.kv.iter_mut().flatten() {
+            slab.base = 0;
+        }
+    }
+
+    /// Keep the recurrent state at the current end as the one checkpoint
+    /// [`GpuTransformer::truncate_cache`] can return to, replacing the
+    /// previous one. A no-op for an attention-only model and an empty cache.
+    /// Free: the states are immutable device tensors, so this keeps handles.
+    pub(crate) fn checkpoint(&mut self) {
+        if self.hybrid && self.kv_len > 0 {
+            self.checkpoint = Some((self.kv_len, self.delta.clone()));
+        }
+    }
+
+    /// Whether the model has recurrent layers.
+    pub(crate) fn is_hybrid(&self) -> bool {
+        self.hybrid
+    }
+
+    /// Most rows of one forward call whose every intermediate position can
+    /// be returned to: unbounded for an attention-only model, 1 for a hybrid
+    /// one (no verify record is kept).
+    pub(crate) fn rollback_rows(&self) -> usize {
+        if self.hybrid { 1 } else { usize::MAX }
     }
 
     /// Number of cached positions (test-only).
@@ -2194,7 +2388,7 @@ impl GpuDrafter {
         };
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
-        let (net, _) = Weights::load(&mut reader, path, hp, context_length, None)?;
+        let (net, _, _) = Weights::load(&mut reader, path, hp, context_length, None)?;
         if net.lm_head.rows() != target.vocab() {
             return Err(err(format!(
                 "drafter vocabulary {} differs from the target's {}",
@@ -2262,7 +2456,9 @@ impl GpuDrafter {
             let x = Tensor::<2>::from_data(TensorData::new(input, [1, width]), &self.net.device);
             let mut x = linear(x, &self.pre);
             for il in 0..hp.n_layer {
-                x = self.net.layer(il, x, &pass, &mut no_cache, Some(&ext))?;
+                x = self
+                    .net
+                    .layer(il, x, &pass, &mut no_cache, &mut [], Some(&ext))?;
             }
             let normed = rms(x, Some(&self.net.output_norm), hp.eps);
             let next = linear(normed.clone(), &self.post);
@@ -2278,19 +2474,23 @@ impl GpuDrafter {
     }
 }
 
-/// Read every weight of layer `il`; with `tiers`, the layer's experts stay in
-/// the file.
-fn load_layer(
+/// Read the attention weights of layer `il` (a gated attention packs
+/// `[query | gate]` per head into its query projection, twice the width).
+fn load_attention(
     reader: &mut WeightReader<'_>,
     hp: &Hparams,
     il: usize,
     spec: &LayerSpec,
     layout: &LayerLayout,
-    tiers: Option<&TierPlan>,
-) -> Result<LayerWeights, CucaError> {
+) -> Result<AttnWeights, CucaError> {
     let n_embd = hp.n_embd;
     let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
     let q_width = nh * d;
+    let q_rows = if hp.behavior.gated_attention {
+        2 * q_width
+    } else {
+        q_width
+    };
     let kv_width = nkv * d;
     let blk = |part: &str| name::blk(il, part);
     let owns = spec.owns_kv(il);
@@ -2310,7 +2510,7 @@ fn load_layer(
             )?)
         }
         Qkv::Split => QkvWeights::Split {
-            q: reader.proj(il, name::ATTN_Q, [q_width, n_embd], layout.biases.q)?,
+            q: reader.proj(il, name::ATTN_Q, [q_rows, n_embd], layout.biases.q)?,
             kv: if owns {
                 Some((
                     reader.proj(il, name::ATTN_K, [kv_width, n_embd], layout.biases.k)?,
@@ -2321,7 +2521,7 @@ fn load_layer(
             },
         },
     };
-    let attn = AttnWeights {
+    Ok(AttnWeights {
         qkv,
         q_norm: reader.opt_vector(
             layout.q_norm,
@@ -2339,6 +2539,58 @@ fn load_layer(
         )?,
         v_norm: hp.behavior.gemma4_extras && owns,
         wo: reader.proj(il, name::ATTN_OUTPUT, [n_embd, q_width], layout.biases.o)?,
+    })
+}
+
+/// Read the gated delta-net weights of layer `il`.
+fn load_delta(
+    reader: &mut WeightReader<'_>,
+    hp: &Hparams,
+    il: usize,
+    spec: &DeltaSpec,
+) -> Result<DeltaWeights, CucaError> {
+    let n_embd = hp.n_embd;
+    let (cd, taps, nv) = (spec.conv_dim(), spec.conv_kernel, spec.n_v_heads);
+    let blk = |part: &str| name::blk(il, part);
+    // Stored `[conv_dim][conv_kernel]`; the taps go to the device as
+    // `[conv_kernel, conv_dim]` so one tap is a contiguous row.
+    let stored = reader.host_floats(&blk(name::SSM_CONV1D), &[cd, taps])?;
+    let mut conv = vec![0f32; taps * cd];
+    for c in 0..cd {
+        for i in 0..taps {
+            conv[i * cd + c] = stored[c * taps + i];
+        }
+    }
+    Ok(DeltaWeights {
+        spec: *spec,
+        qkv: reader.matrix(&blk(name::ATTN_QKV), cd, n_embd)?,
+        gate: reader.matrix(&blk(name::ATTN_GATE), spec.value_dim(), n_embd)?,
+        beta: reader.matrix(&blk(name::SSM_BETA), nv, n_embd)?,
+        alpha: reader.matrix(&blk(name::SSM_ALPHA), nv, n_embd)?,
+        out: reader.matrix(&blk(name::SSM_OUT), n_embd, spec.value_dim())?,
+        conv: Tensor::from_data(TensorData::new(conv, [taps, cd]), reader.device),
+        norm: reader.vector(&blk(name::SSM_NORM), spec.head_v_dim)?,
+        a: reader.vector(&name::blk_bare(il, name::SSM_A), nv)?,
+        dt_bias: reader.vector(&name::blk_bias(il, name::SSM_DT), nv)?,
+    })
+}
+
+/// Read every weight of layer `il`; with `tiers`, the layer's experts stay in
+/// the file.
+fn load_layer(
+    reader: &mut WeightReader<'_>,
+    hp: &Hparams,
+    il: usize,
+    spec: &LayerSpec,
+    layout: &LayerLayout,
+    tiers: Option<&TierPlan>,
+) -> Result<LayerWeights, CucaError> {
+    let n_embd = hp.n_embd;
+    let blk = |part: &str| name::blk(il, part);
+
+    let mixer = match spec.delta() {
+        Some(delta) => Mixer::Delta(Box::new(load_delta(reader, hp, il, delta)?)),
+        None => Mixer::Attention(load_attention(reader, hp, il, spec, layout)?),
     };
 
     let ffn = match (layout.ffn, hp.moe) {
@@ -2356,10 +2608,25 @@ fn load_layer(
             },
             down: reader.matrix(&blk(name::FFN_DOWN), n_embd, ff)?,
         },
-        (Ffn::Moe { ff }, Some(spec)) => FfnWeights::Moe {
+        (Ffn::Moe { ff, shared_ff }, Some(spec)) => FfnWeights::Moe {
             spec,
             router: reader.matrix(&blk(name::FFN_GATE_INP), spec.n_expert, n_embd)?,
             experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, tiers)?,
+            shared: match shared_ff {
+                Some(sff) => {
+                    let gate_inp = reader.host_vector(&blk(name::FFN_GATE_INP_SHEXP), n_embd)?;
+                    Some(GpuShared {
+                        gate: reader.matrix(&blk(name::FFN_GATE_SHEXP), sff, n_embd)?,
+                        up: reader.matrix(&blk(name::FFN_UP_SHEXP), sff, n_embd)?,
+                        down: reader.matrix(&blk(name::FFN_DOWN_SHEXP), n_embd, sff)?,
+                        gate_inp: Tensor::from_data(
+                            TensorData::new(gate_inp, [1, n_embd]),
+                            reader.device,
+                        ),
+                    })
+                }
+                None => None,
+            },
         },
         (Ffn::Moe { .. }, None) => return Err(err("expert tensors without an expert count")),
     };
@@ -2380,13 +2647,17 @@ fn load_layer(
 
     Ok(LayerWeights {
         attn_norm: reader.opt_vector(hp.behavior.pre_norms, &blk(name::ATTN_NORM), n_embd)?,
-        attn,
+        mixer,
         post_attn_norm: reader.opt_vector(
             layout.post_attn_norm,
             &blk(name::POST_ATTENTION_NORM),
             n_embd,
         )?,
-        ffn_norm: reader.opt_vector(hp.behavior.pre_norms, &blk(name::FFN_NORM), n_embd)?,
+        ffn_norm: reader.opt_vector(
+            hp.behavior.pre_norms,
+            &blk(ffn_norm_part(hp.behavior.ffn_norm_is_post_attention)),
+            n_embd,
+        )?,
         ffn,
         post_ffw_norm: reader.opt_vector(
             layout.post_ffw_norm,
@@ -2406,6 +2677,7 @@ impl Weights {
     fn forward_layers(
         &self,
         kv: &mut KvLayers,
+        delta: &mut [Option<DeltaState>],
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
         t: usize,
@@ -2435,7 +2707,7 @@ impl Weights {
 
         let pass = self.pass(ple, start, t);
         for il in 0..hp.n_layer {
-            x = self.layer(il, x, &pass, kv, None)?;
+            x = self.layer(il, x, &pass, kv, delta, None)?;
         }
 
         let rows = match want {
@@ -2530,6 +2802,7 @@ impl Weights {
         x: Tensor<2>,
         pass: &Pass,
         kv: &mut KvLayers,
+        delta: &mut [Option<DeltaState>],
         ext: Option<&GpuExtKv>,
     ) -> Result<Tensor<2>, CucaError> {
         let hp = &self.hp;
@@ -2555,92 +2828,120 @@ impl Weights {
             Some(w) => rms(x.clone(), Some(w), eps),
             None => x.clone(),
         };
-        let (q, kv_proj) = lw.attn.project(h, nh, nkv, d);
-        let full_qk = hp.behavior.qk_norm_full;
-        let q = match &lw.attn.q_norm {
-            Some(w) if full_qk => rms(q, Some(w), eps),
-            _ => q,
-        };
-        let q = q.reshape([1, t, nh, d]);
-        let q = match &lw.attn.q_norm {
-            Some(w) if !full_qk => rms(q, Some(w), eps),
-            _ => q,
-        };
-        let q = rotate(q.swap_dims(1, 2));
+        let mut attn = match &lw.mixer {
+            Mixer::Delta(dw) => {
+                let state = delta
+                    .get_mut(il)
+                    .and_then(Option::as_mut)
+                    .ok_or_else(|| err(format!("layer {il} has no recurrent state")))?;
+                let (y, next) = dw.forward(h, state, eps);
+                *state = next;
+                y
+            }
+            Mixer::Attention(aw) => {
+                let (q, kv_proj) = aw.project(h, nh, nkv, d);
+                let full_qk = hp.behavior.qk_norm_full;
+                let q = match &aw.q_norm {
+                    Some(w) if full_qk => rms(q, Some(w), eps),
+                    _ => q,
+                };
+                // A gated attention packs `[query | gate]` per head into the query
+                // projection (each head's `2 * d` values contiguous).
+                let (q, gate) = if hp.behavior.gated_attention {
+                    let packed = q.reshape([t, nh, 2 * d]);
+                    (
+                        packed.clone().narrow(2, 0, d).reshape([1, t, nh, d]),
+                        Some(packed.narrow(2, d, d).reshape([t, nh * d])),
+                    )
+                } else {
+                    (q.reshape([1, t, nh, d]), None)
+                };
+                let q = match &aw.q_norm {
+                    Some(w) if !full_qk => rms(q, Some(w), eps),
+                    _ => q,
+                };
+                let q = rotate(q.swap_dims(1, 2));
 
-        if let Some((k, v)) = kv_proj {
-            let k = match &lw.attn.k_norm {
-                Some(w) if full_qk => rms(k, Some(w), eps),
-                _ => k,
-            };
-            let k = k.reshape([1, t, nkv, d]);
-            let k = match &lw.attn.k_norm {
-                Some(w) if !full_qk => rms(k, Some(w), eps),
-                _ => k,
-            };
-            let k = rotate(k.swap_dims(1, 2));
-            let v = v.reshape([1, t, nkv, d]);
-            let v = if lw.attn.v_norm { rms(v, None, eps) } else { v };
-            let v = v.swap_dims(1, 2);
-            // Take the cache out so the assignment owns the only handle and
-            // writes in place.
-            let mut slab = kv
-                .get_mut(il)
-                .and_then(Option::take)
-                .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
-            let at = cache_ranges(nkv, slot(start, slab.base)?..slot(hi, slab.base)?, d);
-            slab.k = slab.k.slice_assign(at.clone(), k);
-            slab.v = slab.v.slice_assign(at, v);
-            kv[il] = Some(slab);
-        }
+                if let Some((k, v)) = kv_proj {
+                    let k = match &aw.k_norm {
+                        Some(w) if full_qk => rms(k, Some(w), eps),
+                        _ => k,
+                    };
+                    let k = k.reshape([1, t, nkv, d]);
+                    let k = match &aw.k_norm {
+                        Some(w) if !full_qk => rms(k, Some(w), eps),
+                        _ => k,
+                    };
+                    let k = rotate(k.swap_dims(1, 2));
+                    let v = v.reshape([1, t, nkv, d]);
+                    let v = if aw.v_norm { rms(v, None, eps) } else { v };
+                    let v = v.swap_dims(1, 2);
+                    // Take the cache out so the assignment owns the only handle and
+                    // writes in place.
+                    let mut slab = kv
+                        .get_mut(il)
+                        .and_then(Option::take)
+                        .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
+                    let at = cache_ranges(nkv, slot(start, slab.base)?..slot(hi, slab.base)?, d);
+                    slab.k = slab.k.slice_assign(at.clone(), k);
+                    slab.v = slab.v.slice_assign(at, v);
+                    kv[il] = Some(slab);
+                }
 
-        let src = spec.kv_source;
-        let attn = if src == usize::MAX {
-            // A drafter layer: attend to the first `ext.len` positions of the
-            // target's cache (the sliding layers to the window before the
-            // query), with no mask since the drafter has a single query.
-            let ext = ext.ok_or_else(|| {
-                err(format!(
-                    "layer {il}: a drafter layer needs the target's K/V"
-                ))
-            })?;
-            let ((cache_k, cache_v), base) = if spec.window.is_some() {
-                (&ext.sliding, ext.sliding_base)
-            } else {
-                (&ext.full, 0)
-            };
-            let lo = match spec.window {
-                Some(w) => start.saturating_sub(w - 1).min(ext.len.saturating_sub(1)),
-                None => 0,
-            };
-            let at = cache_ranges(nkv, slot(lo, base)?..slot(ext.len, base)?, d);
-            let k = cache_k.clone().slice(at.clone());
-            let v = cache_v.clone().slice(at);
-            attend(q, k, v, None, spec.scale, hp.attn_softcap)
-        } else {
-            let visible = pass
-                .masks
-                .iter()
-                .find(|m| m.window == spec.window)
-                .ok_or_else(|| err(format!("layer {il}: no attention mask for its window")))?;
-            let slab = kv
-                .get(src)
-                .and_then(Option::as_ref)
-                .ok_or_else(|| err(format!("layer {src} owns no K/V cache")))?;
-            let (cache_k, cache_v) = (&slab.k, &slab.v);
-            let src_spec = hp
-                .layers
-                .get(src)
-                .ok_or_else(|| err(format!("layer {il}: K/V source layer {src} out of range")))?;
-            let rows = slot(visible.lo, slab.base)?..slot(hi, slab.base)?;
-            let at = cache_ranges(src_spec.n_kv_head, rows, src_spec.head_dim);
-            let k = cache_k.clone().slice(at.clone());
-            let v = cache_v.clone().slice(at);
-            attend(q, k, v, visible.mask.clone(), spec.scale, hp.attn_softcap)
-        }
-        .swap_dims(1, 2)
-        .reshape([t, nh * d]);
-        let mut attn = lw.attn.wo.forward(attn);
+                let src = spec.kv_source;
+                let attn = if src == usize::MAX {
+                    // A drafter layer: attend to the first `ext.len` positions of the
+                    // target's cache (the sliding layers to the window before the
+                    // query), with no mask since the drafter has a single query.
+                    let ext = ext.ok_or_else(|| {
+                        err(format!(
+                            "layer {il}: a drafter layer needs the target's K/V"
+                        ))
+                    })?;
+                    let ((cache_k, cache_v), base) = if spec.window.is_some() {
+                        (&ext.sliding, ext.sliding_base)
+                    } else {
+                        (&ext.full, 0)
+                    };
+                    let lo = match spec.window {
+                        Some(w) => start.saturating_sub(w - 1).min(ext.len.saturating_sub(1)),
+                        None => 0,
+                    };
+                    let at = cache_ranges(nkv, slot(lo, base)?..slot(ext.len, base)?, d);
+                    let k = cache_k.clone().slice(at.clone());
+                    let v = cache_v.clone().slice(at);
+                    attend(q, k, v, None, spec.scale, hp.attn_softcap)
+                } else {
+                    let visible = pass
+                        .masks
+                        .iter()
+                        .find(|m| m.window == spec.window)
+                        .ok_or_else(|| {
+                            err(format!("layer {il}: no attention mask for its window"))
+                        })?;
+                    let slab = kv
+                        .get(src)
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| err(format!("layer {src} owns no K/V cache")))?;
+                    let (cache_k, cache_v) = (&slab.k, &slab.v);
+                    let src_spec = hp.layers.get(src).ok_or_else(|| {
+                        err(format!("layer {il}: K/V source layer {src} out of range"))
+                    })?;
+                    let rows = slot(visible.lo, slab.base)?..slot(hi, slab.base)?;
+                    let at = cache_ranges(src_spec.n_kv_head, rows, src_spec.head_dim);
+                    let k = cache_k.clone().slice(at.clone());
+                    let v = cache_v.clone().slice(at);
+                    attend(q, k, v, visible.mask.clone(), spec.scale, hp.attn_softcap)
+                }
+                .swap_dims(1, 2)
+                .reshape([t, nh * d]);
+                let attn = match gate {
+                    Some(gate) => attn * activation::sigmoid(gate),
+                    None => attn,
+                };
+                aw.wo.forward(attn)
+            }
+        };
         if let Some(w) = &lw.post_attn_norm {
             attn = rms(attn, Some(w), eps);
         }
@@ -2716,6 +3017,7 @@ impl FfnWeights {
                 spec,
                 router,
                 experts,
+                shared,
             } => {
                 let [t, n_embd] = f.dims();
                 let logits = read_f32(linear(f.clone(), router), "router logits")?;
@@ -2791,9 +3093,108 @@ impl FfnWeights {
                     };
                     out = out.select_assign(0, ids, y, IndexingUpdateOp::Add);
                 }
+                if let Some(sh) = shared {
+                    // The shared expert, scaled per token by
+                    // `sigmoid(gate_inp . x)`: the dot product is an
+                    // elementwise product and a row sum, not a matmul.
+                    let hidden =
+                        activate(linear(f.clone(), &sh.gate), act) * linear(f.clone(), &sh.up);
+                    let y = linear(hidden, &sh.down);
+                    let gate = activation::sigmoid((f * sh.gate_inp.clone()).sum_dim(1));
+                    out = out + y * gate;
+                }
                 Ok(out)
             }
         }
+    }
+}
+
+/// `x` scaled to unit length per head (the last dimension), with the
+/// reference's epsilon inside the root.
+fn l2_normalise(x: Tensor<3>) -> Tensor<3> {
+    let inv = x
+        .clone()
+        .square()
+        .sum_dim(2)
+        .add_scalar(1e-6)
+        .sqrt()
+        .recip();
+    x * inv
+}
+
+impl DeltaWeights {
+    /// The layer's output `[t, n_embd]` for the normed input `h [t, n_embd]`
+    /// and the state before it, with the state after it (see
+    /// [`super::delta`]: the same recurrence, run per token on the device).
+    fn forward(&self, h: Tensor<2>, state: &DeltaState, eps: f64) -> (Tensor<2>, DeltaState) {
+        let d = &self.spec;
+        let [t, _] = h.dims();
+        let device = h.device();
+        let (nk, nv, dk, dv) = (d.n_k_heads, d.n_v_heads, d.head_k_dim, d.head_v_dim);
+        let (kd, vd, taps) = (d.key_dim(), d.value_dim(), d.conv_kernel);
+
+        let mixed = linear(h.clone(), &self.qkv);
+        let z = linear(h.clone(), &self.gate);
+        let beta = activation::sigmoid(linear(h.clone(), &self.beta));
+        // exp(ssm_a * softplus(alpha + dt_bias)), softplus linear above 20.
+        let pre = linear(h, &self.alpha) + self.dt_bias.clone().unsqueeze::<2>();
+        let soft = pre.clone().exp().log1p();
+        let soft = soft.mask_where(pre.clone().greater_elem(20.0), pre);
+        let decay = (soft * self.a.clone().unsqueeze::<2>()).exp();
+
+        // Causal depthwise convolution over `history ++ mixed`, then silu.
+        let padded = Tensor::cat(vec![state.conv.clone(), mixed], 0);
+        let tap = |i: usize| padded.clone().narrow(0, i, t) * self.conv.clone().narrow(0, i, 1);
+        let mut conv = tap(0);
+        for i in 1..taps {
+            conv = conv + tap(i);
+        }
+        let x = activation::silu(conv);
+        let next_conv = padded.narrow(0, t, taps - 1);
+
+        let q = x.clone().narrow(1, 0, kd).reshape([t, nk, dk]);
+        let k = x.clone().narrow(1, kd, kd).reshape([t, nk, dk]);
+        let v = x.narrow(1, 2 * kd, vd).reshape([t, nv, dv]);
+        let q = l2_normalise(q).mul_scalar(1.0 / (dk as f64).sqrt());
+        let k = l2_normalise(k);
+        // Tiled: value head `h` reads key head `h % n_k_heads`.
+        let rep = nv / nk;
+        let (q, k) = if rep > 1 {
+            (Tensor::cat(vec![q; rep], 1), Tensor::cat(vec![k; rep], 1))
+        } else {
+            (q, k)
+        };
+
+        // The delta rule, one token at a time: decay the state, read what
+        // it predicts for `k`, write the correction, read the output.
+        let mut s = state.s.clone();
+        let mut rows = Vec::with_capacity(t);
+        for ti in 0..t {
+            let kt = k.clone().narrow(0, ti, 1).reshape([nv, dk, 1]);
+            let qt = q.clone().narrow(0, ti, 1).reshape([nv, dk, 1]);
+            let vt = v.clone().narrow(0, ti, 1).reshape([nv, 1, dv]);
+            let bt = beta.clone().narrow(0, ti, 1).reshape([nv, 1, 1]);
+            let gt = decay.clone().narrow(0, ti, 1).reshape([nv, 1, 1]);
+            s = s * gt;
+            let kv_mem = (s.clone() * kt.clone()).sum_dim(1);
+            let delta = (vt - kv_mem) * bt;
+            s = s + kt * delta;
+            rows.push((s.clone() * qt).sum_dim(1).reshape([1, nv, dv]));
+            // Each token queues a few state-sized temporaries (2 MB for
+            // Qwen3.6-35B-A3B): without a drain a 256-token prefill chunk
+            // holds hundreds of MB of them at once. Best effort: a failed
+            // wait surfaces at the next readback.
+            if (ti + 1) % SCAN_DRAIN == 0 && ti + 1 < t {
+                let _ = device.sync();
+            }
+        }
+        let o = Tensor::cat(rows, 0);
+
+        // Gated RMSNorm per head: rms(o) * weight * silu(z).
+        let z = z.reshape([t, nv, dv]);
+        let y = rms(o, Some(&self.norm), eps) * activation::silu(z);
+        let out = linear(y.reshape([t, vd]), &self.out);
+        (out, DeltaState { conv: next_conv, s })
     }
 }
 
@@ -3005,7 +3406,8 @@ mod tests {
 
     use super::super::cpu::Transformer;
     use super::super::tiny::{
-        PROMPT, TinyModel, TinyOptions, TinySpec, VOCAB, write_spec, write_tiny_model_with,
+        PROMPT, TinyModel, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB, write_qwen35,
+        write_spec, write_tiny_model_with,
     };
     use super::*;
 
@@ -3252,6 +3654,89 @@ mod tests {
         for spec in TinySpec::all() {
             check_model(&write_spec(&spec), device, spec.arch);
         }
+        for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
+            check_hybrid_model(&write_qwen35(&spec), device, label);
+        }
+    }
+
+    fn tiny_qwen35() -> TinyQwen35 {
+        TinyQwen35::default()
+    }
+
+    fn tiny_qwen35moe() -> TinyQwen35 {
+        TinyQwen35 {
+            moe: Some(TinyMoe {
+                n_expert: 8,
+                n_used: 2,
+                ff: 64,
+                shared_ff: 32,
+            }),
+            ..TinyQwen35::default()
+        }
+    }
+
+    /// A hybrid model (delta-net + gated attention, with a shared-expert MoE
+    /// FFN for `qwen35moe`): the GPU engine reproduces the CPU engine
+    /// through prefill, decode, chunked prefill, the checkpoint and the
+    /// fallback of `truncate_cache`, which retains the same positions.
+    fn check_hybrid_model(model: &TinyModel, device: LocalDevice, label: &str) {
+        let n = PROMPT.len();
+        let (mut cpu, mut gpu) = load_both(model, device);
+        assert!(gpu.is_hybrid() && cpu.is_hybrid(), "{label}");
+        compare(&mut cpu, &mut gpu, &PROMPT, 0, Want::Last, label);
+        compare(&mut cpu, &mut gpu, &[7], n, Want::Last, label);
+        compare(&mut cpu, &mut gpu, &[9, 2], n + 1, Want::All, label);
+
+        // Chunked prefill, with a checkpoint after the first chunks.
+        let (mut cpu, mut gpu) = load_both(model, device);
+        for (start, chunk) in [(0, &PROMPT[..3]), (3, &PROMPT[3..6])] {
+            assert!(gpu.forward(chunk, start, Want::None).unwrap().is_none());
+            cpu.forward(chunk, start, Want::None).unwrap();
+        }
+        cpu.checkpoint();
+        gpu.checkpoint();
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &PROMPT[6..],
+            6,
+            Want::Last,
+            &format!("{label} chunked"),
+        );
+        assert_eq!(gpu.cache_len(), n);
+
+        // A length without a state falls back to the checkpoint; both
+        // engines retain the same positions and continue identically.
+        assert_eq!(gpu.truncate_cache(9), cpu.truncate_cache(9), "{label}");
+        assert_eq!(gpu.cache_len(), 6, "{label}: the checkpoint");
+        assert!(
+            gpu.forward(&PROMPT[8..], 8, Want::Last).is_err(),
+            "{label}: gap after truncate"
+        );
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &[11, 13, 15],
+            6,
+            Want::Last,
+            &format!("{label} after the checkpoint"),
+        );
+        // The end of the cache is retained as is; below the checkpoint
+        // there is no state, so both engines fall back to the zero state.
+        assert_eq!(gpu.truncate_cache(99), cpu.truncate_cache(99), "{label}");
+        assert_eq!(gpu.truncate_cache(7), cpu.truncate_cache(7), "{label}");
+        assert_eq!(gpu.cache_len(), 6, "{label}: the checkpoint again");
+        assert_eq!(gpu.truncate_cache(5), cpu.truncate_cache(5), "{label}");
+        assert_eq!(gpu.cache_len(), 0, "{label}: no state at 5");
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &PROMPT,
+            0,
+            Want::Last,
+            &format!("{label} from the zero state"),
+        );
+        assert_eq!(gpu.truncate_cache(0), 0);
     }
 
     /// Device bytes of one expert summed over the MoE layers of `model`, as
@@ -3313,20 +3798,28 @@ mod tests {
             println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
-        for spec in [
+        let qwen35moe = write_qwen35(&tiny_qwen35moe());
+        let models: Vec<(&str, TinyModel)> = [
             TinySpec::granitemoe(),
             TinySpec::qwen3moe(),
             TinySpec::olmoe(),
-        ] {
+        ]
+        .into_iter()
+        .map(|spec| {
             let arch = spec.arch;
             let model = write_spec(&TinySpec {
                 moe: Some((8, 2)),
                 n_layer: 4,
                 ..spec
             });
-            let min = 2 * expert_device_bytes(&model) as u64;
+            (arch, model)
+        })
+        .chain([("qwen35moe", qwen35moe)])
+        .collect();
+        for (arch, model) in &models {
+            let min = 2 * expert_device_bytes(model) as u64;
             let want = greedy_run(
-                &mut load_placed_gpu(&model, device, &ExpertPlacement::Resident).unwrap(),
+                &mut load_placed_gpu(model, device, &ExpertPlacement::Resident).unwrap(),
             );
             let tiers = |ram_bytes, warm_from| {
                 ExpertPlacement::Tiered(ExpertTiers {
@@ -3338,7 +3831,7 @@ mod tests {
             };
             let mut heat = None;
             for ram_bytes in [0, min] {
-                let mut tiered = load_placed_gpu(&model, device, &tiers(ram_bytes, None)).unwrap();
+                let mut tiered = load_placed_gpu(model, device, &tiers(ram_bytes, None)).unwrap();
                 let got = greedy_run(&mut tiered);
                 assert_eq!(got, want, "{arch} ram={ram_bytes}");
                 let stats = tiered.expert_tiers().unwrap().stats();
@@ -3354,7 +3847,7 @@ mod tests {
             }
             // The warm start fills the device tier at load and changes no
             // logit.
-            let mut warm = load_placed_gpu(&model, device, &tiers(min, heat)).unwrap();
+            let mut warm = load_placed_gpu(model, device, &tiers(min, heat)).unwrap();
             let loaded = warm.expert_tiers().unwrap().stats();
             assert!(loaded.device_resident_bytes > 0, "{arch}: {loaded:?}");
             assert!(loaded.device_resident_bytes <= min, "{arch}: {loaded:?}");
@@ -3370,7 +3863,7 @@ mod tests {
                 loader_threads: 2,
                 ..ExpertTiers::default()
             });
-            let e = load_placed_gpu(&model, device, &below).err().unwrap();
+            let e = load_placed_gpu(model, device, &below).err().unwrap();
             assert!(
                 matches!(&e, CucaError::Config(m) if m.contains(&format!("at least 2 ({min} bytes)"))),
                 "{arch}: {e:?}"
@@ -3816,7 +4309,12 @@ mod tests {
     }
 
     fn shape(rows: usize, cols: usize, class: SchemeClass) -> QuantShape {
-        QuantShape { rows, cols, class }
+        QuantShape {
+            rows,
+            cols,
+            class,
+            copies: 1,
+        }
     }
 
     fn named(shapes: &[(&str, QuantShape)]) -> Vec<(String, QuantShape)> {
@@ -3994,7 +4492,15 @@ mod tests {
                 .enumerate()
                 .map(|(i, &(rows, cols, d))| {
                     let class = scheme_class(d).unwrap();
-                    (format!("{family}.{i}"), QuantShape { rows, cols, class })
+                    (
+                        format!("{family}.{i}"),
+                        QuantShape {
+                            rows,
+                            cols,
+                            class,
+                            copies: 1,
+                        },
+                    )
                 })
                 .collect();
             let dense = plan_dense(&shapes, &[]);
@@ -4316,6 +4822,7 @@ mod tests {
                     })
                     .collect(),
             ),
+            shared: None,
         };
         let input = |t: usize, step: usize| -> Vec<f32> {
             (0..t * n_embd)
@@ -4363,5 +4870,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// An expert tensor weighs all its experts when `plan_dense` picks the
+    /// minority scheme: a MoE model whose Q8 weights (a big LM head, shared
+    /// experts) outweigh one expert of each Q4 tensor still holds the Q8
+    /// weights that collide with the Q4 experts as f32, never the experts
+    /// (Qwen3.6-35B-A3B: its experts would cost 7x the device memory).
+    #[test]
+    fn plan_dense_weighs_every_expert_of_a_stacked_tensor() {
+        let q4 = |rows, cols, copies| QuantShape {
+            rows,
+            cols,
+            class: SchemeClass::Q4,
+            copies,
+        };
+        let q8 = |rows, cols| QuantShape {
+            rows,
+            cols,
+            class: SchemeClass::Q8,
+            copies: 1,
+        };
+        let own = vec![
+            ("experts".to_string(), q4(512, 2048, 1024)),
+            ("shared".to_string(), q8(512, 2048)),
+            ("head".to_string(), q8(248_320, 2048)),
+        ];
+        let dense = plan_dense(&own, &[]);
+        assert_eq!(dense, HashSet::from(["shared".to_string()]));
     }
 }

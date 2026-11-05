@@ -684,7 +684,19 @@ pub(crate) const Q35_DK: usize = 8;
 pub(crate) const Q35_DV: usize = 16;
 pub(crate) const Q35_FF: usize = 96;
 
-/// A tiny `qwen35` model. The defaults give five trunk layers (delta-net,
+/// The mixture-of-experts FFN of a tiny `qwen35moe` model: `n_expert`
+/// routed experts of width `ff` (`n_used` per token) and a shared expert of
+/// width `shared_ff`, in every block, the prediction block included.
+#[derive(Clone, Copy)]
+pub(crate) struct TinyMoe {
+    pub(crate) n_expert: usize,
+    pub(crate) n_used: usize,
+    pub(crate) ff: usize,
+    pub(crate) shared_ff: usize,
+}
+
+/// A tiny `qwen35` model (`qwen35moe` with [`TinyQwen35::moe`] set). The
+/// defaults give five trunk layers (delta-net,
 /// delta-net, delta-net, attention, delta-net) and one trailing
 /// multi-token-prediction block (block 5, with its `nextn.*` tensors); four
 /// value heads share two query/key heads, so the repeat-interleave is
@@ -698,8 +710,12 @@ pub(crate) struct TinyQwen35 {
     pub(crate) n_v_heads: usize,
     pub(crate) conv_kernel: usize,
     pub(crate) dtype: GgmlDType,
-    /// Metadata keys (relative to `qwen35.`) written over the defaults.
+    /// Metadata keys (relative to the architecture prefix) written over the
+    /// defaults.
     pub(crate) meta: Vec<(String, Value)>,
+    /// `Some`: the FFN of every block is a mixture of experts plus a shared
+    /// expert, and the architecture is `qwen35moe`.
+    pub(crate) moe: Option<TinyMoe>,
 }
 
 impl Default for TinyQwen35 {
@@ -713,6 +729,7 @@ impl Default for TinyQwen35 {
             conv_kernel: 4,
             dtype: GgmlDType::Q8_0,
             meta: Vec::new(),
+            moe: None,
         }
     }
 }
@@ -739,7 +756,12 @@ impl TinyQwen35 {
 
 /// Write the model `s` describes.
 pub(crate) fn write_qwen35(s: &TinyQwen35) -> TinyModel {
-    let path = temp_path("qwen35");
+    let p = if s.moe.is_some() {
+        "qwen35moe"
+    } else {
+        "qwen35"
+    };
+    let path = temp_path(p);
     let mut rng = Lcg(35);
     let dt = s.dtype;
     let (nv, conv_dim, value_dim) = (s.n_v_heads, s.conv_dim(), s.value_dim());
@@ -810,15 +832,46 @@ pub(crate) fn write_qwen35(s: &TinyQwen35) -> TinyModel {
                 f32_tensor(rng.values(nv, 1.0)),
             );
         }
-        add(
-            b("ffn_gate"),
-            quantized(&mut rng, &[Q35_FF, N_EMBD], dt, 0.3),
-        );
-        add(b("ffn_up"), quantized(&mut rng, &[Q35_FF, N_EMBD], dt, 0.3));
-        add(
-            b("ffn_down"),
-            quantized(&mut rng, &[N_EMBD, Q35_FF], dt, 0.3),
-        );
+        if let Some(m) = s.moe {
+            add(
+                b("ffn_gate_inp"),
+                quantized(&mut rng, &[m.n_expert, N_EMBD], GgmlDType::F32, 0.8),
+            );
+            for part in ["ffn_gate_exps", "ffn_up_exps"] {
+                add(
+                    b(part),
+                    quantized(&mut rng, &[m.n_expert, m.ff, N_EMBD], GgmlDType::Q4_0, 0.3),
+                );
+            }
+            add(
+                b("ffn_down_exps"),
+                quantized(&mut rng, &[m.n_expert, N_EMBD, m.ff], GgmlDType::Q4_0, 0.3),
+            );
+            for part in ["ffn_gate_shexp", "ffn_up_shexp"] {
+                add(
+                    b(part),
+                    quantized(&mut rng, &[m.shared_ff, N_EMBD], dt, 0.3),
+                );
+            }
+            add(
+                b("ffn_down_shexp"),
+                quantized(&mut rng, &[N_EMBD, m.shared_ff], dt, 0.3),
+            );
+            add(
+                b("ffn_gate_inp_shexp"),
+                quantized(&mut rng, &[N_EMBD], GgmlDType::F32, 0.8),
+            );
+        } else {
+            add(
+                b("ffn_gate"),
+                quantized(&mut rng, &[Q35_FF, N_EMBD], dt, 0.3),
+            );
+            add(b("ffn_up"), quantized(&mut rng, &[Q35_FF, N_EMBD], dt, 0.3));
+            add(
+                b("ffn_down"),
+                quantized(&mut rng, &[N_EMBD, Q35_FF], dt, 0.3),
+            );
+        }
         if il >= s.trunk_layers {
             add(
                 b("nextn.eh_proj"),
@@ -831,32 +884,47 @@ pub(crate) fn write_qwen35(s: &TinyQwen35) -> TinyModel {
     }
 
     let mut meta = vec![
-        kv("general.architecture", Value::String("qwen35".into())),
-        kv("qwen35.block_count", u(s.trunk_layers + s.nextn_layers)),
-        kv("qwen35.context_length", u(CONTEXT)),
-        kv("qwen35.embedding_length", u(N_EMBD)),
-        kv("qwen35.feed_forward_length", u(Q35_FF)),
-        kv("qwen35.attention.head_count", u(Q35_N_HEAD)),
-        kv("qwen35.attention.head_count_kv", u(Q35_N_KV)),
-        kv("qwen35.attention.key_length", u(Q35_HEAD)),
-        kv("qwen35.attention.value_length", u(Q35_HEAD)),
-        kv("qwen35.attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
+        kv("general.architecture", Value::String(p.into())),
         kv(
-            "qwen35.rope.dimension_sections",
+            &format!("{p}.block_count"),
+            u(s.trunk_layers + s.nextn_layers),
+        ),
+        kv(&format!("{p}.context_length"), u(CONTEXT)),
+        kv(&format!("{p}.embedding_length"), u(N_EMBD)),
+        kv(&format!("{p}.feed_forward_length"), u(Q35_FF)),
+        kv(&format!("{p}.attention.head_count"), u(Q35_N_HEAD)),
+        kv(&format!("{p}.attention.head_count_kv"), u(Q35_N_KV)),
+        kv(&format!("{p}.attention.key_length"), u(Q35_HEAD)),
+        kv(&format!("{p}.attention.value_length"), u(Q35_HEAD)),
+        kv(
+            &format!("{p}.attention.layer_norm_rms_epsilon"),
+            Value::F32(1e-6),
+        ),
+        kv(
+            &format!("{p}.rope.dimension_sections"),
             Value::Array(vec![u(2), u(1), u(1), u(0)]),
         ),
-        kv("qwen35.rope.freq_base", Value::F32(1e7)),
-        kv("qwen35.rope.dimension_count", u(Q35_ROPE_DIMS)),
-        kv("qwen35.ssm.conv_kernel", u(s.conv_kernel)),
-        kv("qwen35.ssm.state_size", u(Q35_DK)),
-        kv("qwen35.ssm.group_count", u(s.n_k_heads)),
-        kv("qwen35.ssm.time_step_rank", u(s.n_v_heads)),
-        kv("qwen35.ssm.inner_size", u(value_dim)),
-        kv("qwen35.full_attention_interval", u(s.interval)),
-        kv("qwen35.nextn_predict_layers", u(s.nextn_layers)),
+        kv(&format!("{p}.rope.freq_base"), Value::F32(1e7)),
+        kv(&format!("{p}.rope.dimension_count"), u(Q35_ROPE_DIMS)),
+        kv(&format!("{p}.ssm.conv_kernel"), u(s.conv_kernel)),
+        kv(&format!("{p}.ssm.state_size"), u(Q35_DK)),
+        kv(&format!("{p}.ssm.group_count"), u(s.n_k_heads)),
+        kv(&format!("{p}.ssm.time_step_rank"), u(s.n_v_heads)),
+        kv(&format!("{p}.ssm.inner_size"), u(value_dim)),
+        kv(&format!("{p}.full_attention_interval"), u(s.interval)),
+        kv(&format!("{p}.nextn_predict_layers"), u(s.nextn_layers)),
     ];
+    if let Some(m) = s.moe {
+        meta.push(kv(&format!("{p}.expert_count"), u(m.n_expert)));
+        meta.push(kv(&format!("{p}.expert_used_count"), u(m.n_used)));
+        meta.push(kv(&format!("{p}.expert_feed_forward_length"), u(m.ff)));
+        meta.push(kv(
+            &format!("{p}.expert_shared_feed_forward_length"),
+            u(m.shared_ff),
+        ));
+    }
     for (key, value) in &s.meta {
-        let full = format!("qwen35.{key}");
+        let full = format!("{p}.{key}");
         match meta.iter_mut().find(|(k, _)| *k == full) {
             Some(entry) => entry.1 = value.clone(),
             None => meta.push((full, value.clone())),

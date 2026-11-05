@@ -42,7 +42,7 @@
 //!   [`mtp::Drafter::InTrunk`] drives (module docs of [`cpu::NextnHead`]). The
 //!   final-norm hidden rows it reads, one per position, come from
 //!   `forward_ext(.., Hidden::PostNormAll, ..)`. The GPU engine does not run
-//!   it: loading it on a GPU is an error.
+//!   it: `DrafterSource::InTrunk` on a GPU is a configuration error.
 //!
 //! # Cache rollback
 //!
@@ -72,6 +72,13 @@
 //! cache (a partly advanced state cannot be repaired). A prefill in any
 //! chunking, a token-by-token run and a restore-and-replay produce the same
 //! logits and state bit for bit.
+//!
+//! The GPU engine follows the same rules for the live state and the
+//! checkpoint (its states are immutable device tensors, so a checkpoint is a
+//! set of handles and costs nothing) but keeps no verify record
+//! ([`Model::rollback_rows`] is 1 for a hybrid GPU model): on a GPU the
+//! batched rows equal single steps only up to float rounding, and no drafter
+//! can pair with a hybrid model there.
 //!
 //! The engine consumes the returned length: it keeps `cached` to the retained
 //! prefix, prefills from there and reports that as the reused prompt tokens.
@@ -441,12 +448,13 @@ impl Model {
     /// Keep the recurrent state at the current end of the cache as the one
     /// checkpoint [`Model::truncate_cache`] can return to, replacing the
     /// previous one. A no-op for models that can truncate anywhere
-    /// (attention-only, and every GPU model).
+    /// (attention-only). On a GPU the checkpoint is a set of handles to the
+    /// current immutable state tensors, so it costs nothing.
     pub(crate) fn checkpoint(&mut self) {
         match self {
             Model::Cpu(m) => m.checkpoint(),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(_) => {}
+            Model::Gpu(m) => m.checkpoint(),
         }
     }
 
@@ -457,18 +465,19 @@ impl Model {
         match self {
             Model::Cpu(m) => m.is_hybrid(),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(_) => false,
+            Model::Gpu(m) => m.is_hybrid(),
         }
     }
 
     /// Most rows of one `Want::All` forward call after which every
     /// intermediate length can still be returned to with
-    /// [`Model::truncate_cache`]: unbounded unless the model is hybrid.
+    /// [`Model::truncate_cache`]: unbounded unless the model is hybrid. A
+    /// hybrid GPU model keeps no verify record (1: only the end of a call).
     pub(crate) fn rollback_rows(&self) -> usize {
         match self {
             Model::Cpu(m) => m.rollback_rows(),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(_) => usize::MAX,
+            Model::Gpu(m) => m.rollback_rows(),
         }
     }
 
@@ -529,28 +538,5 @@ mod tests {
         assert_eq!(prefill_chunk(32768), 64);
         assert_eq!(prefill_chunk(131_072), 16);
         assert_eq!(prefill_chunk(1), 256);
-    }
-
-    /// A GPU device refuses a hybrid model with a clear error before it
-    /// opens any device (so no GPU is needed to see it).
-    #[cfg(feature = "provider-local-gpu")]
-    #[test]
-    fn a_gpu_rejects_recurrent_layers_with_a_clear_error() {
-        use super::tiny::{TinyQwen35, write_qwen35};
-        let model = write_qwen35(&TinyQwen35::default());
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
-        let resident = ExpertPlacement::Resident;
-        let e = Model::load(&content, &model.path, 32, LocalDevice::Cuda(0), &resident)
-            .err()
-            .unwrap();
-        assert!(matches!(e, CucaError::Provider { .. }), "{e:?}");
-        let msg = e.to_string();
-        assert!(
-            msg.contains("recurrent (gated delta-net) layers are not implemented on GPU devices")
-                && msg.contains("LocalDevice::Cpu")
-                && msg.contains("qwen35"),
-            "{msg}"
-        );
     }
 }

@@ -1930,4 +1930,44 @@ mod tests {
             );
         }
     }
+
+    /// `DrafterSource::InTrunk` on a `qwen35moe` model fails with
+    /// [`CucaError::Config`] naming the mixture-of-experts FFN; without a
+    /// drafter the same file opens and generates.
+    #[test]
+    fn in_trunk_head_on_a_moe_model_fails_loudly_and_plain_decoding_works() {
+        let model = write_qwen35(&TinyQwen35 {
+            moe: Some(crate::provider::local::model::tiny::TinyMoe {
+                n_expert: 8,
+                n_used: 2,
+                ff: 64,
+                shared_ff: 32,
+            }),
+            ..TinyQwen35::default()
+        });
+        let config = LocalModelConfig {
+            context_length: Some(32),
+            drafter: Some(super::super::DrafterSource::InTrunk),
+            ..LocalModelConfig::default()
+        };
+        let result = Engine::open(
+            &model.path,
+            Some(&ResolvedDrafter::InTrunk),
+            Arc::default(),
+            &config,
+        );
+        let e = match result {
+            Err(e) => e,
+            Ok(_) => panic!("opened an in-trunk head over experts"),
+        };
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("mixture-of-experts")),
+            "{e}"
+        );
+        let mut plain = engine(&model, 32, 0.0, None);
+        let out = run(&mut plain, &PROMPT, Some(4));
+        let usage = out.metadata.token_usage.expect("usage reported");
+        assert_eq!(usage.prompt_tokens, 6);
+        assert!(usage.completion_tokens <= 4);
+    }
 }

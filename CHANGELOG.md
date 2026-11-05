@@ -1,5 +1,33 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `provider-local`: architecture `qwen35moe` (Qwen3.6-35B-A3B): the `qwen35`
+  hybrid stack with a mixture of experts in every layer (softmax router,
+  renormalised top-k) plus a shared expert scaled by a sigmoid gate. It runs
+  on the CPU and on a GPU, with resident or tiered experts; the prediction block in the file
+  is ignored, and `DrafterSource::InTrunk` on it fails with
+  `CucaError::Config`. Preset `qwen3.6-35b-a3b-q4_0`.
+- `provider-local-gpu`: gated delta-net (hybrid `qwen35` and `qwen35moe`)
+  layers, gated attention and the shared expert run on the GPU. The
+  recurrent state is kept on the device with a free checkpoint and the CPU's
+  `truncate_cache` fallback (no verify record). The `qwen35` GPU load error
+  is gone.
+
+### Fixed
+
+- `provider-local`: gated delta-net layers with fewer key heads than value
+  heads (`ssm.group_count` < `ssm.time_step_rank`) read key head `h %
+  group_count` for value head `h`, the tiled order llama.cpp's converter
+  writes; they used the HuggingFace grouped order before. Qwen3.5 0.8B has
+  equal head counts and is unaffected.
+- `provider-local-gpu`: `plan_dense` weighs every expert of a stacked expert
+  tensor, so a MoE model whose Q8 weights outweigh one expert of each Q4
+  tensor converts those Q8 weights to f32 instead of its Q4 experts (the
+  Qwen3.6-35B-A3B experts would have cost 7 times the device memory).
+
 ## 0.6.1
 
 ### Added

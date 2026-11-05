@@ -42,7 +42,8 @@ Nothing here is specific to one model family. The loader reads every dimension f
 | `llama` | Llama 3.2, SmolLM 2, TinyLlama; other models published as `llama` | CPU, GPU |
 | `qwen2` | Qwen 2.5, DeepSeek-R1-Distill-Qwen | CPU, GPU |
 | `qwen3` | Qwen 3 | CPU, GPU |
-| `qwen35` | Qwen 3.5 (0.8B) | CPU only |
+| `qwen35` | Qwen 3.5 (0.8B) | CPU, GPU (tiny-model tests only on the GPU) |
+| `qwen35moe` | Qwen 3.6 MoE (Qwen3.6-35B-A3B) | CPU, GPU |
 | `phi3` | Phi 3.5 mini, Phi 4 mini | CPU, GPU |
 | `smollm3` | SmolLM 3 | CPU, GPU |
 | `granite` | Granite 3.3 (dense) | CPU, GPU |
@@ -70,22 +71,24 @@ What each architecture adds to the common forward pass:
 - `olmo2`: no pre-norms, only post-attention and post-FFN norms, and a Q/K RMSNorm that spans the whole projection.
 - `ernie4_5`: Llama-style layers with a head size larger than the width divided by the head count.
 - `qwen35`: a hybrid stack; see [Hybrid models](#hybrid-models).
+- `qwen35moe`: the `qwen35` hybrid stack with a mixture of experts in every layer: a softmax over all experts, the top k, the selected weights renormalised to sum to one, plus a shared expert (a dense gated FFN every token runs) whose output is scaled by `sigmoid(ffn_gate_inp_shexp . x)` and added to the routed output. The routed experts honor `ExpertPlacement`; the shared expert and the router stay resident.
 - `gemma4-assistant`: a four-layer, query-only decoder that reads the K/V cache of a `gemma4` target. It pairs only with a `gemma4` model of the same hidden width and vocabulary.
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
 
-Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, gemma2, llama, qwen2, qwen3, phi3, smollm3, granite, granitemoe, qwen3moe, olmoe, qwen35, olmo2, ernie4_5, gemma4-assistant``.
+Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, gemma2, llama, qwen2, qwen3, phi3, smollm3, granite, granitemoe, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, gemma4-assistant``.
 
 ### Hybrid models
 
-Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-net layer keeps a causal convolution and a recurrent state per sequence instead of a K/V cache. Every `full_attention_interval`-th layer (every fourth in the 0.8B model) is gated full attention with partial NEOX RoPE. A `*-MTP` file adds a trailing prediction block that `DrafterSource::InTrunk` drafts with.
+Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-net layer keeps a causal convolution and a recurrent state per sequence instead of a K/V cache. Every `full_attention_interval`-th layer (every fourth in the 0.8B model) is gated full attention with partial NEOX RoPE. A `*-MTP` file adds a trailing prediction block that `DrafterSource::InTrunk` drafts with. When a layer has fewer key heads than value heads (`ssm.group_count` below `ssm.time_step_rank`, as in `qwen35moe`: 16 and 32), value head `h` reads key head `h % ssm.group_count`: llama.cpp's converter permutes the HuggingFace value heads into that tiled order and the engine reads the file the same way.
 
 - Memory for the 0.8B model: 24,576 bytes of K/V per position (6 attention layers with 2 K/V heads of 256), plus a recurrent state of 20.2 MB that does not grow with the context.
 - The state cannot be truncated. Prefix reuse restarts from one checkpoint that the engine takes while prefilling, right after the last end-of-turn token of the prompt (the end of the last complete message). The next turn of a conversation re-prefills the few tokens after that point, and its output equals a cold run's.
 - The prompt cache usage a request reports counts what was reused.
 - There is one checkpoint slot: a new checkpoint replaces the one before it.
 - Rolling back a speculative verification keeps a copy of the state from before the call plus the per-row inputs of the recurrence. A verification call covers at most 17 rows (the pending token and 16 drafts). For the 0.8B model the total is about 61 MB (live state, checkpoint and pre-call copy) plus 445 KB per verified row, none of it growing with the context.
-- A hybrid model cannot run on a GPU device: the load fails with `recurrent (gated delta-net) layers are not implemented on GPU devices; use LocalDevice::Cpu`.
+- On a GPU a hybrid model keeps the same state, checkpoint and cache fallback (see [Hybrid models on a GPU](@/providers/local/gpu.md#verified-and-compile-checked)); it keeps no verify record, since the in-trunk head and every drafter are CPU only or pair with `gemma4`. The delta-net recurrence runs token by token on the device, so a hybrid model decodes more slowly on the GPU than on the CPU today (Qwen3.6-35B-A3B with tiered experts: about 3 to 4 tokens per second on Vulkan against 7 to 17 on the CPU).
+- The trailing prediction block of a `qwen35moe` file is not loaded (the trunk ignores it). `DrafterSource::InTrunk` on such a file fails with a `CucaError::Config` that names the mixture-of-experts FFN: the in-trunk head supports a dense block only.
 
 ## Weight formats
 
@@ -250,12 +253,14 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 | `qwen3-30b-a3b-q4_0` | `qwen3moe` | `unsloth/Qwen3-30B-A3B-GGUF` | 17.38 GB | 1.61 GB |
 | `olmoe-1b-7b-q4_0` | `olmoe` | `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF` | 3.94 GB | 1.07 GB (4,096 maximum) |
 | `qwen3.5-0.8b-q8_0` | `qwen35` | `unsloth/Qwen3.5-0.8B-MTP-GGUF` | 0.83 GB | 201 MB, plus a 20.2 MB recurrent state |
+| `qwen3.6-35b-a3b-q4_0` | `qwen35moe` | `bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` | 20.84 GB | 336 MB, plus a 65.9 MB recurrent state |
 | `gemma4-e2b-mtp-f16` | `gemma4-assistant` | `unsloth/gemma-4-E2B-it-GGUF` | 0.17 GB | none: a drafter, reads the target's cache |
 
 - The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position, and a sliding-window layer holds only its window plus 1,280 positions (the Gemma presets). Phi 3.5 mini has 32 K/V heads and needs 6.44 GB of cache at 8,192 positions for a 2.18 GB file. Lower `context_length` to shrink it.
 - A model trained on fewer positions loads at its maximum by default (OLMo 2: 4,096; TinyLlama: 2,048). An explicit larger value fails with `context_length N exceeds the model maximum M`.
 - `gemma4-e2b-mtp-f16` has `drafter: true`: it loads only through `LocalModelConfig::drafter` and cannot be the main model.
 - `qwen3.5-0.8b-q8_0` carries the in-trunk prediction head, so `DrafterSource::InTrunk` works with it.
+- `qwen3.6-35b-a3b-q4_0` has 256 experts per layer in 40 layers, 8 used, so every layer is MoE; resident it holds about 18.9 GiB of RAM, with `tiered:ram=4g` about 6 GiB and with `tiered:ram=600m` (the minimum, 8 experts per layer) about 2.4 GiB. Its file carries a prediction block that the engine ignores; see [Hybrid models](#hybrid-models).
 - Presets pin both the revision and the SHA-256; see [Model sources and presets](@/providers/local/model-sources.md#model-sources-and-presets) for the source types.
 
 ## Verification
@@ -264,15 +269,16 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 Three kinds of evidence back this page, from strongest to weakest:
 
-- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `granitemoe`, `qwen3moe`, `olmoe`, `gemma3`, `gemma2`, `granite`, `olmo2`, `ernie4_5`; `gemma4` and `qwen35` have their own builders).
+- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `granitemoe`, `qwen3moe`, `olmoe`, `gemma3`, `gemma2`, `granite`, `olmo2`, `ernie4_5`; `gemma4`, `qwen35` and `qwen35moe` have their own builders).
 - The live suite `tests/provider_local.rs` runs one real preset per invocation. CI compiles it and every test prints a skip line, so the live results below come from recorded local runs, not from CI.
 - Oracle runs against HuggingFace `transformers` (f32, CPU) use dumps under `.omp/local-models/ref/`, which is gitignored. Those results are reproducible only with that tooling, not from a clean checkout.
 
 Per architecture:
 
-- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `gemma2`, `llama`, `qwen2`, `qwen3`, `qwen35`, `phi3`, `smollm3`, `granite`, `granitemoe`, `qwen3moe`, `olmoe`, `olmo2`.
+- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `gemma2`, `llama`, `qwen2`, `qwen3`, `qwen35`, `qwen35moe`, `phi3`, `smollm3`, `granite`, `granitemoe`, `qwen3moe`, `olmoe`, `olmo2`.
 - Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `llama` (Llama 3.2 1B), `phi3` (Phi 3.5 mini), `gemma2`, `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` (Qwen3-30B-A3B with tiered experts).
 - `ernie4_5`: tiny-model tests and a recorded oracle run only. It has no preset and has not run in the live suite.
+- `qwen35moe` against HuggingFace `transformers` in f32 (`Qwen3_5MoeForCausalLM`, GGUF dequantized by `gguf`, routed experts dequantized per use): a 4-layer cut of the real Qwen3.6-35B-A3B file matches with the engine's dequantized weights to 1e-5 on the top-10 logits, top-1 equal and greedy output equal for 24 of 24 tokens on two prompts and 8 of 8 on a 321-token prompt. The full 40-layer file under the production Q4_0 path keeps the top-1 token on all three prompts, with a maximum absolute difference of 0.13 to 0.62 on the top-k logits. The oracle answers `The capital of France is **Paris**.`. Reading the value heads in grouped (HuggingFace) order instead of tiled order breaks the 4-layer match (top-10 overlap 0 to 2 of 10), which is how the tiled order was confirmed.
 - `olmoe` against HuggingFace `transformers` in f32: the engine with dequantized weights matches the reference logits to a maximum absolute difference of 2e-5 and picks the same greedy tokens. `qwen3moe`: a 4-layer cut of the real Qwen3-30B-A3B weights matches to 1e-5, and the production Q4_0 engine's top-1 token differs from the oracle's only where two candidates are within a margin of 0.073. On Vulkan, both reproduced their reference replies with tiered experts (see [Tiered expert placement](@/providers/local/expert-tiers.md#output-guarantee)).
 - `gemma4-assistant`: verified by `tests/provider_local_mtp.rs` as a drafter, and by tiny-model tests on the CPU and the GPU (the GPU ones only when `CUCA_LOCAL_DEVICE` names a GPU).
 - Compile-checked only: every GPU backend other than Vulkan; see [Verified and compile-checked](@/providers/local/gpu.md#verified-and-compile-checked).
@@ -296,7 +302,8 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `granite3.1-moe-1b-q4_0` | no | yes | all scenarios pass |
 | `qwen3-30b-a3b-q4_0` | on and off | yes | all seven pass |
 | `olmoe-1b-7b-q4_0` | no | no syntax | greedy text and usage, long-context retrieval and prefix reuse pass; the thinking and tool scenarios skip |
-| `qwen3.5-0.8b-q8_0` | on and off | yes, XML | all seven pass, CPU only |
+| `qwen3.5-0.8b-q8_0` | on and off | yes, XML | all seven pass on the CPU; not run on Vulkan |
+| `qwen3.6-35b-a3b-q4_0` | on and off | yes, XML | all seven pass on the CPU, resident and with `tiered:ram=4g`, and on Vulkan with `tiered:device=4g,ram=12g` and `tiered:device=6g,ram=12g` |
 | `gemma2-2b-q4_0`, `olmo2-1b-q4_0` | no | no syntax | all applicable scenarios pass, on the CPU and on Vulkan |
 | `granite3.3-2b-q4_0` | switched on by the request | yes | all pass except long-context retrieval, a known limit |
 | `smollm2-360m-q8_0` | no | no syntax | all applicable scenarios pass |
@@ -331,6 +338,8 @@ Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on 
 | Production quantized CPU path against `transformers`, the 13 first models | top-1 token kept on all 48 prompt cases; maximum absolute logit difference between 0.05 and 1.13, the cost of quantized weights |
 | The same, the six later models | top-1 token kept on all 24 prompt cases |
 | Qwen 3.5 0.8B Q8_0, reference arithmetic | maximum absolute logit difference below 5e-5; the production path keeps the top-1 token |
+| Qwen 3.6 35B-A3B Q4_0 (`qwen35moe`), 4-layer cut, reference arithmetic | maximum absolute logit difference 1e-5, greedy output equal for 24 of 24 and 8 of 8 tokens |
+| The same file, 40 layers, production path | top-1 token kept on all three prompts; maximum absolute logit difference 0.13 to 0.62 |
 | GPU (Vulkan) against the CPU dequantized reference | relative error 2e-6 to 2e-5, greedy token ids equal, on Qwen 3 0.6B and 1.7B, Qwen 2.5 0.5B, Llama 3.2 1B, Gemma 3 270M and 1B, SmolLM 3, Phi 3.5, Granite 3.1 MoE, Gemma 4 E2B and the R1 distill |
 
 On the CPU, every Q4_0 and Q8_0 matrix multiplication runs through cuca's own batch-invariant quantized kernel, written in safe Rust; other dtypes use candle. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output.

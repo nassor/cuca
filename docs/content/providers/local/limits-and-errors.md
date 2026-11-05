@@ -62,7 +62,6 @@ weight = 3
   - An unsupported GGUF: an unknown architecture, tokenizer model or pre-tokenizer, an IQ quantization, a missing tensor or metadata key (`tokenizer.chat_template` included), or no end-of-generation token. The message names the cause.
   - A drafter that does not match its target, or `InTrunk` on a file without a prediction head.
   - A chat template that does not compile: `chat template: ...`.
-  - `qwen35` on a GPU device: `recurrent (gated delta-net) layers are not implemented on GPU devices; use LocalDevice::Cpu`.
   - A GPU that cannot be opened: `device ...: <wgpu error>`, or `local engine failed to initialize: <message>` when the backend panics during setup.
   - The engine thread exits during load: `local engine thread exited during load`.
 

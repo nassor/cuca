@@ -57,6 +57,8 @@ Worked numbers for `qwen3-30b-a3b-q4_0` on the CPU, with 128 experts per layer, 
 
 For `olmoe-1b-7b-q4_0` (64 experts, 8 used, 16 layers) `per_expert` is 56,885,248 bytes and the minimum is 455,081,984 bytes. `ram=500m` gives 9 slots per layer.
 
+For `qwen3.6-35b-a3b-q4_0` (256 experts, 8 used, 40 layers, all of them with experts) one expert is 1,769,472 bytes in the 35 layers whose down matrices are Q4_0 and 1,835,008 bytes in the 5 layers whose down matrices are Q4_1. `per_expert` is 71,106,560 bytes and the minimum is 568,852,480 bytes. `ram=600m` gives the minimum 8 slots per layer and `ram=4g` gives 60. The shared expert and the router are dense weights and stay resident under any placement.
+
 A GPU device tier counts packed bytes, and f32 for a weight the engine holds as f32; see [Weight formats](@/providers/local/models.md#weight-formats). The minimum printed by a failed load is the number to use.
 
 ## Tiers
@@ -190,8 +192,13 @@ Tiered placement trades speed for memory. These runs used `tests/provider_local_
 | `qwen3-30b-a3b-q4_0` | resident, 17.4 GB of RAM | 12.3 | not applicable |
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=4g`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.641 cold, 0.686 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=1100m`, 9 of 128 experts per layer | 6.2 cold, 5.3 warm | 0.381 cold, 0.383 warm |
+| `qwen3.6-35b-a3b-q4_0` | resident, 18.9 GiB peak resident set | 14.7 and 14.9 | not applicable |
+| `qwen3.6-35b-a3b-q4_0` | `tiered:ram=4g`, 60 of 256 experts per layer | 7.4 cold, 7.1 warm | 0.661 cold, 0.708 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered:ram=600m`, 8 of 256 experts per layer | 6.3 cold, 6.2 warm | 0.307 cold, 0.308 warm |
 
 These runs read the model from the OS page cache. Reads of an uncached file from disk are not measured.
+
+For `qwen3.6-35b-a3b-q4_0` the cold runs read 18,861 experts (33.6 GB) at `ram=4g` and 38,510 (68.5 GB) at `ram=600m`, out of 55,597 lookups. A single 1,024-token reply (`examples/local_model.rs`) peaked at 18.8 GiB of resident set with resident experts, 5.95 GiB at `ram=4g` and 2.43 GiB at `ram=600m`, and the model loaded in 8.3 s resident against 0.8 s tiered. The 20.8 GB file was in the OS page cache for all of these runs, so the disk reads are memory copies, not reads from the drive.
 
 The same test on Vulkan (AMD RX 9070 XT, Windows, release build) gave the rates below. They include the first-use kernel tuning of each new matrix shape, which a short run does not amortize.
 
@@ -201,8 +208,15 @@ The same test on Vulkan (AMD RX 9070 XT, Windows, release build) gave the rates 
 | `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 3.3 cold, 3.5 warm | 0.437 cold, 0.464 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:device=2g,ram=0` | 1.3 | 0.356 |
 | `qwen3-30b-a3b-q4_0` | `tiered:device=6g,ram=12g` | 2.5 cold, 2.6 warm | 0.880 cold, 0.992 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=0` (the reference) | 1.8 to 2.0 | 0.406 |
+| `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=4g` | 3.1 cold, 3.2 warm | 0.611 cold, 0.735 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered:device=4g,ram=12g` | 2.9 cold, 3.2 warm | 0.846 cold, 0.978 warm |
 
 With `device=6g` the card's dedicated memory stayed flat at about 9.5 GB for the whole run, the desktop's own 1.4 GB included.
+
+For `qwen3.6-35b-a3b-q4_0` on the GPU one expert of every layer is 88,801,280 device bytes, so the minimum is 710,410,240 bytes (the 5 layers with Q4_1 down matrices hold those as f32; see [Verified and compile-checked](@/providers/local/gpu.md#verified-and-compile-checked)). `device=2g` gives 24 slots per layer, `4g` gives 48 and `6g` gives 72. In the 4g run the cold start read 8,546 experts from the file, 15,244 hits came from the RAM tier and 31,815 from the device tier, out of 55,605 lookups. The `tiered:device=1g,ram=0` run (12 slots, 0.288 hit rate) ran at 1.7 tokens per second for the reference and 2.5 cold and warm. One 1,024-token reply with `tiered:device=6g,ram=12g` (`examples/local_model.rs`, `loaded on Vulkan(Default)`) ran at about 4 tokens per second, loaded in 3.6 s and peaked at 12.96 GiB of resident set and 13.8 GiB of dedicated GPU memory; its lookups were 82.7 percent device hits, 12.6 percent RAM hits and 4.7 percent file reads.
+
+GPU memory is shared with the desktop, which held 2.4 to 3.2 GiB of the card's 15.9 GiB during these runs. Dedicated memory of the whole card, desktop included, peaked at 10.5 GiB through the full suite at `device=4g,ram=12g` and at 14.6 GiB at `device=6g,ram=12g`. `tests/provider_local_tiers.rs` loads its reference model first and a model that has been dropped keeps about 2.8 GiB of device pages, so at `device=6g` it runs out of device memory ("out of device memory allocating 542113792 bytes") while the suite, which holds one model, passes; the tiered replies equal the reference's at `device=4g,ram=12g` and `device=2g,ram=4g`.
 
 ## Errors
 

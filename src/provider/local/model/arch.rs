@@ -53,6 +53,11 @@ pub(crate) enum Arch {
     /// token are equal, which reduces the interleaved multimodal rotation to
     /// plain NEOX over the first `rope.dimension_count` dimensions.
     Qwen35,
+    /// Qwen 3.5 MoE (`qwen35moe`): the [`Arch::Qwen35`] hybrid stack with a
+    /// mixture-of-experts FFN in every layer (softmax over all experts,
+    /// top-k, renormalised) plus a shared expert scaled by a sigmoid gate
+    /// (transformers `Qwen3_5MoeSparseMoeBlock`).
+    Qwen35Moe,
     /// OLMo 2: no pre-norms, post-attention and post-FFN norms, full-width
     /// Q/K RMSNorm.
     Olmo2,
@@ -165,6 +170,11 @@ pub(crate) struct Behavior {
     /// Renormalise the selected experts' softmax weights to sum to one
     /// (llama.cpp `norm_w`). Only read when `moe` is set.
     pub(crate) moe_norm_weights: bool,
+    /// Every MoE layer also runs a shared expert (`ffn_{gate,up,down}_shexp`)
+    /// whose output is scaled by `sigmoid(ffn_gate_inp_shexp . x)` and added
+    /// to the routed experts' output (Qwen 3.5 MoE). Only read when `moe` is
+    /// set.
+    pub(crate) shared_expert: bool,
 }
 
 const DEFAULT: Behavior = Behavior {
@@ -185,11 +195,12 @@ const DEFAULT: Behavior = Behavior {
     pre_norms: true,
     qk_norm_full: false,
     moe_norm_weights: true,
+    shared_expert: false,
 };
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 16] = [
+    pub(crate) const ALL: [Arch; 17] = [
         Arch::Gemma4,
         Arch::Gemma3,
         Arch::Gemma2,
@@ -203,6 +214,7 @@ impl Arch {
         Arch::Qwen3Moe,
         Arch::Olmoe,
         Arch::Qwen35,
+        Arch::Qwen35Moe,
         Arch::Olmo2,
         Arch::Ernie4_5,
         Arch::Gemma4Assistant,
@@ -225,6 +237,7 @@ impl Arch {
             Arch::Qwen3Moe => "qwen3moe",
             Arch::Olmoe => "olmoe",
             Arch::Qwen35 => "qwen35",
+            Arch::Qwen35Moe => "qwen35moe",
             Arch::Olmo2 => "olmo2",
             Arch::Ernie4_5 => "ernie4_5",
             Arch::Gemma4Assistant => "gemma4-assistant",
@@ -330,6 +343,16 @@ impl Arch {
                 nextn_blocks: true,
                 ..DEFAULT
             },
+            Arch::Qwen35Moe => Behavior {
+                rope: RopeKind::Neox,
+                hybrid_delta_net: true,
+                gated_attention: true,
+                ffn_norm_is_post_attention: true,
+                nextn_blocks: true,
+                moe: true,
+                shared_expert: true,
+                ..DEFAULT
+            },
         }
     }
 }
@@ -363,6 +386,7 @@ mod tests {
             Arch::Qwen2,
             Arch::Qwen3,
             Arch::Qwen35,
+            Arch::Qwen35Moe,
             Arch::Phi3,
             Arch::Qwen3Moe,
             Arch::Olmoe,
@@ -372,15 +396,26 @@ mod tests {
     }
 
     #[test]
-    fn only_qwen35_is_hybrid_gated_and_embeds_prediction_blocks() {
+    fn only_qwen35_family_is_hybrid_gated_and_embeds_prediction_blocks() {
         for arch in Arch::ALL {
             let b = arch.behavior();
-            let qwen35 = arch == Arch::Qwen35;
+            let qwen35 = matches!(arch, Arch::Qwen35 | Arch::Qwen35Moe);
             assert_eq!(b.hybrid_delta_net, qwen35, "{arch:?}");
             assert_eq!(b.gated_attention, qwen35, "{arch:?}");
             assert_eq!(b.ffn_norm_is_post_attention, qwen35, "{arch:?}");
             assert_eq!(b.nextn_blocks, qwen35, "{arch:?}");
         }
         assert!(!Arch::Qwen35.is_drafter());
+    }
+
+    #[test]
+    fn only_qwen35moe_has_a_shared_expert_and_it_renormalises() {
+        for arch in Arch::ALL {
+            let b = arch.behavior();
+            assert_eq!(b.shared_expert, arch == Arch::Qwen35Moe, "{arch:?}");
+        }
+        let b = Arch::Qwen35Moe.behavior();
+        assert!(b.moe && b.moe_norm_weights);
+        assert!(!Arch::Qwen35.behavior().moe);
     }
 }

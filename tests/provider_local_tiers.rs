@@ -132,6 +132,14 @@ async fn phase(
     (replies, at_load.zip(stats), model)
 }
 
+/// Drop `model` and give its engine thread time to hand the device memory
+/// back before the next load: on a GPU two models of this size do not fit
+/// the device together.
+fn release(model: LocalModel) {
+    drop(model);
+    std::thread::sleep(std::time::Duration::from_secs(5));
+}
+
 #[tokio::test]
 async fn tiered_experts_reproduce_the_reference_replies() {
     let source = if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
@@ -160,7 +168,7 @@ async fn tiered_experts_reproduce_the_reference_replies() {
         .unwrap_or_default();
 
     let (want, _, model) = phase("reference", &source, device, reference).await;
-    drop(model);
+    release(model);
 
     let (cold, stats, model) = phase("cold", &source, device, tested).await;
     let (_, cold_stats) = stats.expect("a tiered model reports tier stats");
@@ -176,7 +184,7 @@ async fn tiered_experts_reproduce_the_reference_replies() {
         "{cold_stats:?}"
     );
     let heat = model.expert_heat().expect("a tiered model exports heat");
-    drop(model);
+    release(model);
 
     let warm_tiers = cuca::ExpertTiers {
         warm_from: Some(heat),

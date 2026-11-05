@@ -196,6 +196,12 @@ impl Transformer {
                 n = hp.nextn_predict_layers
             )));
         };
+        if hp.moe.is_some() {
+            return Err(CucaError::Config(format!(
+                "the in-trunk multi-token-prediction head of `{}` has a mixture-of-experts FFN, which the head does not support; run without a drafter",
+                hp.arch.name()
+            )));
+        }
         let il = hp.n_layer;
         let n_embd = hp.n_embd;
         let layout = LayerLayout::read(hp, il, spec, content)?;

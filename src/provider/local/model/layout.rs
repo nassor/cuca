@@ -42,6 +42,12 @@ pub(crate) mod name {
     pub(crate) const FFN_GATE_EXPS: &str = "ffn_gate_exps";
     pub(crate) const FFN_UP_EXPS: &str = "ffn_up_exps";
     pub(crate) const FFN_DOWN_EXPS: &str = "ffn_down_exps";
+    // Shared expert of Qwen 3.5 MoE: a dense gated FFN every token runs,
+    // scaled by `sigmoid(ffn_gate_inp_shexp . x)` (a vector of `n_embd`).
+    pub(crate) const FFN_GATE_SHEXP: &str = "ffn_gate_shexp";
+    pub(crate) const FFN_UP_SHEXP: &str = "ffn_up_shexp";
+    pub(crate) const FFN_DOWN_SHEXP: &str = "ffn_down_shexp";
+    pub(crate) const FFN_GATE_INP_SHEXP: &str = "ffn_gate_inp_shexp";
     pub(crate) const POST_FFW_NORM: &str = "post_ffw_norm";
     pub(crate) const INP_GATE: &str = "inp_gate";
     pub(crate) const PROJ: &str = "proj";
@@ -122,8 +128,9 @@ pub(crate) enum Ffn {
     /// Gated dense FFN of width `ff`; `fused` when `ffn_up` holds the gate
     /// rows followed by the up rows.
     Dense { ff: usize, fused: bool },
-    /// Mixture of experts, each of width `ff`.
-    Moe { ff: usize },
+    /// Mixture of experts, each of width `ff`, plus a shared expert of width
+    /// `shared_ff` when the layer has one.
+    Moe { ff: usize, shared_ff: Option<usize> },
 }
 
 /// Optional tensors of the attention block that this layer has.
@@ -191,7 +198,19 @@ impl LayerLayout {
                     "tensor `{gate}`: expected a rank-3 expert tensor, found {d:?}"
                 )));
             };
-            Ffn::Moe { ff: *ff }
+            let shared_ff = if hp.behavior.shared_expert {
+                let shared = name::blk(il, name::FFN_DOWN_SHEXP);
+                let d = dims(content, &shared)?;
+                let [_, sff] = d else {
+                    return Err(err(format!(
+                        "tensor `{shared}`: expected a matrix, found {d:?}"
+                    )));
+                };
+                Some(*sff)
+            } else {
+                None
+            };
+            Ffn::Moe { ff: *ff, shared_ff }
         } else {
             let down = name::blk(il, name::FFN_DOWN);
             let d = dims(content, &down)?;
