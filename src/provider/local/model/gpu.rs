@@ -80,6 +80,10 @@
 //!   device bytes) and the repacked copy of that chunk; per forward pass it
 //!   holds the embedding rows, the attention masks and, per MoE layer, the
 //!   router logits (`tokens * n_expert` f32).
+//! - Dropping a [`GpuTransformer`] or [`GpuDrafter`] waits for the device
+//!   and returns the freed pages to the driver (`Device::memory_cleanup`):
+//!   burn keeps freed pages in its pools otherwise, and a model loaded after
+//!   a dropped one in the same process ran out of device memory.
 //!
 //! # MoE
 //!
@@ -87,17 +91,23 @@
 //! synchronization point), [`route`] picks the experts and their weights, then
 //! each expert runs on the rows of its own tokens: gathered with `select`,
 //! scaled by their routing weights, and accumulated with `select_assign(Add)`.
-//! A single token skips the gather and scatter.
+//! An expert with one row (every expert of a single-token pass, and the
+//! one-row experts of a longer pass) reads it as a slice instead of a gather.
 //!
-//! Routing weights are applied in two ways. A pass over several rows scales
-//! the gathered hidden rows by a device tensor of routing weights before the
-//! down projection (the projection is linear, so the result is the same):
-//! multiplying the projection's output by that tensor made a fused kernel lose
-//! the Vulkan device on the tiny Granite MoE test, and any host readback
-//! inside the expert chain avoided the loss; the mechanism was not
-//! established. A single token multiplies the expert's output by the routing
+//! Routing weights are applied in two ways. An expert with two rows or more
+//! scales the gathered hidden rows by a device tensor of routing weights
+//! before the down projection (the projection is linear, so the result is
+//! the same): multiplying the projection's output by that tensor made a fused
+//! kernel lose the Vulkan device on the tiny Granite MoE test, and any host
+//! readback inside the expert chain avoided the loss; the mechanism was not
+//! established. An expert with one row multiplies its output by the routing
 //! weight as a host scalar (`mul_scalar`); that form ran through the Granite
 //! MoE live suite on Vulkan, every decode step included, without device loss.
+//! The gather-and-tensor form on one row lost the device in a pass whose
+//! experts all had one row, after earlier passes had tuned the kernels
+//! (Qwen3-30B-A3B shapes; `gpu_moe_one_row_experts_match_single_tokens`), and
+//! no per-expert flush or sync avoided it, only synchronizing every
+//! operation did.
 //!
 //! # Tiered experts
 //!
@@ -145,6 +155,10 @@
 //! `n_used` in a single-token one), and the host holds the packed copy being
 //! uploaded. The accumulation order (ascending expert, `select_assign`) and
 //! the two routing-weight rules above are the resident mode's.
+//!
+//! A warm start (`ExpertTiers::warm_from`) uploads the hottest experts of
+//! each layer's device tier at load and waits for the device after every
+//! layer, so at most one layer's uploads are queued at a time.
 //!
 //! # Speculative drafting
 //!
@@ -1263,7 +1277,9 @@ impl GpuExpertBank {
 
     /// Fill the device table of a tiered bank with the hottest experts of
     /// `heat` (at most its slots), read through the loader pool and uploaded
-    /// here; a resident bank has nothing to load.
+    /// here, then wait for the uploads: a warm start queues one layer's
+    /// uploads at a time instead of the whole device tier at once. A
+    /// resident bank has nothing to load.
     fn warm(&self, heat: &ExpertHeat, device: &Device) -> Result<(), CucaError> {
         let Self::Tiered {
             il,
@@ -1277,12 +1293,16 @@ impl GpuExpertBank {
         };
         let ids: Vec<u32> = heat.ranked(*il).into_iter().take(*device_slots).collect();
         let built = store.fetch(*il, &ids)?;
-        let mut table = locked(table);
-        for (e, packed) in ids.into_iter().zip(built) {
-            table.insert(e, Arc::new(upload_expert(packed, device)));
-            add(&store.shared().device_resident_bytes, *stored_bytes as u64);
+        {
+            let mut table = locked(table);
+            for (e, packed) in ids.into_iter().zip(built) {
+                table.insert(e, Arc::new(upload_expert(packed, device)));
+                add(&store.shared().device_resident_bytes, *stored_bytes as u64);
+            }
         }
-        Ok(())
+        device
+            .sync()
+            .map_err(|e| err(format!("layer {il}: uploading warm experts: {e}")))
     }
 }
 
@@ -1469,7 +1489,34 @@ pub(crate) struct GpuTransformer {
     tiers: Option<Arc<TierShared>>,
 }
 
+/// Wait for `device`'s queued work, then hand the pages no live tensor uses
+/// back to the driver. burn keeps freed pages in its pools for reuse, so
+/// without this a dropped model's device memory stays reserved by the
+/// process and a model loaded after it can run out of device memory.
+fn return_device_memory(device: &Device) {
+    // Best effort: a lost device fails the wait, and dropping must not fail.
+    let _ = device.sync();
+    device.memory_cleanup();
+}
+
+impl Drop for GpuTransformer {
+    fn drop(&mut self) {
+        self.kv.clear();
+        self.weights.release();
+        return_device_memory(&self.weights.device);
+    }
+}
+
 impl Weights {
+    /// Drop the device tensors (all but the final norm vector), so that
+    /// [`return_device_memory`] finds their pages free.
+    fn release(&mut self) {
+        self.layers.clear();
+        self.ple = None;
+        self.lm_head.parts.clear();
+        self.ropes.clear();
+    }
+
     /// Read every weight of the model `hp` describes through `reader` (onto
     /// the reader's device) and allocate its K/V cache: the layers, the final
     /// norm, the LM head (`output.weight`, else the token embedding), the
@@ -2072,6 +2119,15 @@ pub(crate) struct GpuDrafter {
     context_length: usize,
 }
 
+impl Drop for GpuDrafter {
+    fn drop(&mut self) {
+        self.pre.parts.clear();
+        self.post.parts.clear();
+        self.net.release();
+        return_device_memory(&self.net.device);
+    }
+}
+
 impl GpuDrafter {
     /// Load the drafter at `path` (index `content`) onto the device of
     /// `target`, with RoPE tables for `context_length` positions.
@@ -2664,14 +2720,16 @@ impl FfnWeights {
                 let [t, n_embd] = f.dims();
                 let logits = read_f32(linear(f.clone(), router), "router logits")?;
                 let routing = route(&logits, t, spec);
-                // One expert on `x`; `weights` (one per row, multi-row passes
-                // only) scale the rows of the hidden state, which commutes
-                // with the linear down projection. Multiplying the down
-                // projection's output by that device tensor made a fused
+                // One expert on `x`; `weights` (one per row, passes of two
+                // rows or more) scale the rows of the hidden state, which
+                // commutes with the linear down projection. Multiplying the
+                // down projection's output by that device tensor made a fused
                 // kernel lose the Vulkan device (burn 0.22, tiny Granite MoE
-                // test), so the scale stays upstream of the last matmul. The
-                // single-token branch below multiplies the output by a host
-                // scalar instead, a form the live suite ran without loss.
+                // test), so the scale stays upstream of the last matmul. An
+                // expert with a single row (every single-token pass, and the
+                // one-row experts of a longer pass) multiplies its output by
+                // the routing weight as a host scalar instead, a form the
+                // live suite ran without loss.
                 let expert =
                     |ex: &GpuExpert, x: Tensor<2>, weights: Option<Tensor<2>>| -> Tensor<2> {
                         let hidden = activate(linear(x.clone(), &ex.gate), act) * linear(x, &ex.up);
@@ -2713,11 +2771,24 @@ impl FfnWeights {
                         continue;
                     }
                     let ids: Vec<i32> = picks.iter().map(|p| p.0 as i32).collect();
-                    let weights: Vec<f32> = picks.iter().map(|p| p.1).collect();
                     let m = ids.len();
                     let ids = Tensor::<1, Int>::from_ints(TensorData::new(ids, [m]), device);
-                    let weights = Tensor::<2>::from_data(TensorData::new(weights, [m, 1]), device);
-                    let y = expert(&picked, f.clone().select(0, ids.clone()), Some(weights));
+                    let y = if m == 1 {
+                        // The single-token form on a slice of `f`. The gather
+                        // plus `[1, 1]` weight form lost the Vulkan device on
+                        // a pass whose experts all had one row, once the
+                        // kernels of earlier passes were tuned (burn 0.22,
+                        // Qwen3-30B-A3B shapes; see
+                        // `gpu_moe_one_row_experts_match_single_tokens`).
+                        let row = picks[0].0 as usize;
+                        expert(&picked, f.clone().narrow(0, row, 1), None)
+                            .mul_scalar(f64::from(weight))
+                    } else {
+                        let weights: Vec<f32> = picks.iter().map(|p| p.1).collect();
+                        let weights =
+                            Tensor::<2>::from_data(TensorData::new(weights, [m, 1]), device);
+                        expert(&picked, f.clone().select(0, ids.clone()), Some(weights))
+                    };
                     out = out.select_assign(0, ids, y, IndexingUpdateOp::Add);
                 }
                 Ok(out)
@@ -4168,5 +4239,129 @@ mod tests {
             net.draft(&gpu, &hidden, 1, 5, 2, &mut pick).unwrap().len(),
             2
         );
+    }
+
+    /// A Qwen3-30B-A3B-shaped MoE layer (128 experts, top 8, Q4_0 gate and
+    /// up `[768, 2048]`, Q8_0 down `[2048, 768]`) over a pass whose experts
+    /// each get one row, after longer and single-token passes have tuned the
+    /// kernels: every row equals the same row's single-token pass. Gathering
+    /// the one row and scaling it by a `[1, 1]` device tensor lost the Vulkan
+    /// device on this sequence (burn 0.22, RX 9070 XT).
+    #[test]
+    fn gpu_moe_one_row_experts_match_single_tokens() {
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let device = open_device(device).unwrap();
+        let raw_of = |dtype: GgmlDType, out: usize, inn: usize, seed: usize| {
+            let mut raw = Vec::new();
+            if dtype == GgmlDType::F32 {
+                for i in 0..out * inn {
+                    let v = (((i + seed) * 13 + 1) % 17) as f32 * 0.002 - 0.015;
+                    raw.extend(v.to_le_bytes());
+                }
+            } else {
+                for b in 0..out * inn / 32 {
+                    raw.extend(f16_bytes(0.005 + ((b + seed) % 7) as f32 * 0.001));
+                    raw.extend(
+                        (0..dtype.type_size() - 2)
+                            .map(|j| (((b + seed) * 31 + j * 17 + 5) % 251) as u8),
+                    );
+                }
+            }
+            raw
+        };
+        let upload = |dtype, out, inn, seed| {
+            upload_matrix(
+                "w",
+                dtype,
+                &raw_of(dtype, out, inn, seed),
+                out,
+                inn,
+                &device,
+            )
+            .unwrap()
+        };
+        let (n_embd, ff, n_expert) = (2048usize, 768usize, 128usize);
+        let sets: Vec<GpuExpert> = (0..8)
+            .map(|s| GpuExpert {
+                gate: upload(GgmlDType::Q4_0, ff, n_embd, s),
+                up: upload(GgmlDType::Q4_0, ff, n_embd, s + 50),
+                down: upload(GgmlDType::Q8_0, n_embd, ff, s + 90),
+            })
+            .collect();
+        let share = |w: &Weight| Weight {
+            parts: w.parts.clone(),
+        };
+        let spec = MoeSpec {
+            n_expert,
+            n_used: 8,
+            norm_weights: true,
+        };
+        let router = upload(GgmlDType::F32, n_expert, n_embd, 3);
+        let router_parts = router.parts.clone();
+        let layer = FfnWeights::Moe {
+            spec,
+            router,
+            experts: GpuExpertBank::Resident(
+                (0..n_expert)
+                    .map(|e| {
+                        let s = &sets[e % sets.len()];
+                        GpuExpert {
+                            gate: share(&s.gate),
+                            up: share(&s.up),
+                            down: share(&s.down),
+                        }
+                    })
+                    .collect(),
+            ),
+        };
+        let input = |t: usize, step: usize| -> Vec<f32> {
+            (0..t * n_embd)
+                .map(|i| (((i + step * 11) * 7 + 3) % 13) as f32 * 0.1 - 0.6)
+                .collect()
+        };
+        let run = |x: &[f32], t: usize| -> Vec<f32> {
+            let x = Tensor::<2>::from_data(TensorData::new(x.to_vec(), [t, n_embd]), &device);
+            read_f32(layer.forward(x, Act::Silu, &device).unwrap(), "ffn").unwrap()
+        };
+        // A longer pass and two single-token passes tune the kernels first.
+        for (step, t) in [(0, 30), (1, 1), (2, 1)] {
+            assert!(run(&input(t, step), t).iter().all(|v| v.is_finite()));
+        }
+        let x = input(4, 3);
+        let xt = Tensor::<2>::from_data(TensorData::new(x.clone(), [4, n_embd]), &device);
+        let logits = read_f32(
+            linear(
+                xt,
+                &Weight {
+                    parts: router_parts,
+                },
+            ),
+            "router",
+        )
+        .unwrap();
+        assert!(
+            route(&logits, 4, &spec)
+                .per_expert
+                .iter()
+                .any(|p| p.len() == 1),
+            "the pass must route single rows to experts"
+        );
+        let rows = run(&x, 4);
+        for (r, (got, x)) in rows
+            .chunks_exact(n_embd)
+            .zip(x.chunks_exact(n_embd))
+            .enumerate()
+        {
+            let want = run(x, 1);
+            for (g, w) in got.iter().zip(&want) {
+                assert!(
+                    (g - w).abs() <= 1e-4 * (1.0 + w.abs()),
+                    "row {r}: {g} vs {w}"
+                );
+            }
+        }
     }
 }

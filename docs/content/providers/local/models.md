@@ -271,9 +271,9 @@ Three kinds of evidence back this page, from strongest to weakest:
 Per architecture:
 
 - Verified in the live suite on the CPU: `gemma4`, `gemma3`, `gemma2`, `llama`, `qwen2`, `qwen3`, `qwen35`, `phi3`, `smollm3`, `granite`, `granitemoe`, `qwen3moe`, `olmoe`, `olmo2`.
-- Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `llama` (Llama 3.2 1B), `phi3` (Phi 3.5 mini), `gemma2`, `olmo2`, `granite` (Granite 3.3 2B).
+- Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `llama` (Llama 3.2 1B), `phi3` (Phi 3.5 mini), `gemma2`, `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` (Qwen3-30B-A3B with tiered experts).
 - `ernie4_5`: tiny-model tests and a recorded oracle run only. It has no preset and has not run in the live suite.
-- `olmoe` against HuggingFace `transformers` in f32: the engine with dequantized weights matches the reference logits to a maximum absolute difference of 2e-5 and picks the same greedy tokens. `qwen3moe`: a 4-layer cut of the real Qwen3-30B-A3B weights matches to 1e-5, and the production Q4_0 engine's top-1 token differs from the oracle's only where two candidates are within a margin of 0.073. Neither architecture has run a real model on a GPU; a tiered Qwen3-30B-A3B run on Vulkan lost the device (see [Tiered expert placement](@/providers/local/expert-tiers.md#output-guarantee)).
+- `olmoe` against HuggingFace `transformers` in f32: the engine with dequantized weights matches the reference logits to a maximum absolute difference of 2e-5 and picks the same greedy tokens. `qwen3moe`: a 4-layer cut of the real Qwen3-30B-A3B weights matches to 1e-5, and the production Q4_0 engine's top-1 token differs from the oracle's only where two candidates are within a margin of 0.073. On Vulkan, both reproduced their reference replies with tiered experts (see [Tiered expert placement](@/providers/local/expert-tiers.md#output-guarantee)).
 - `gemma4-assistant`: verified by `tests/provider_local_mtp.rs` as a drafter, and by tiny-model tests on the CPU and the GPU (the GPU ones only when `CUCA_LOCAL_DEVICE` names a GPU).
 - Compile-checked only: every GPU backend other than Vulkan; see [Verified and compile-checked](@/providers/local/gpu.md#verified-and-compile-checked).
 

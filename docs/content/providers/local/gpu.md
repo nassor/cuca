@@ -83,6 +83,7 @@ Any other text is a `CucaError::Config`: ``unknown local device `...` ``.
 - The K/V cache lives in device memory with the same formula as on the CPU. The RoPE tables are on the device.
 - A weight over 1 GiB is split into row chunks, because wgpu cannot allocate a single buffer that large.
 - Dtype handling is in [Weight formats](@/providers/local/models.md#weight-formats).
+- Dropping the last clone of a `LocalModel` on a GPU returns its device memory to the driver, so another model can load in the same process.
 - The first forward pass of each new input shape is slow while CubeCL autotunes and compiles kernels.
 
 ### Numerics
@@ -94,7 +95,7 @@ Any other text is a `CucaError::Config`: ``unknown local device `...` ``.
 
 ### Verified and compile-checked
 
-- Verified on Vulkan (AMD RX 9070 XT, Windows): the live suite `tests/provider_local.rs` ran for Gemma 4 E2B Q4_0, Llama 3.2 1B, Phi 3.5 mini, Gemma 2 2B, OLMo 2 1B and Granite 3.3 2B. Every applicable scenario passed, with the same known limits as on the CPU. The other presets ran on the CPU.
-- The unit tests `gpu_matches_cpu_on_the_tiny_gemma4`, `gpu_matches_cpu_on_every_architecture` and `gpu_matches_cpu_on_other_weight_dtypes` compare the GPU engine with a CPU reference on tiny random models, and `gpu_drafter_matches_cpu_drafter` does the same for the drafter. They run only when `CUCA_LOCAL_DEVICE` names a GPU; otherwise they print `SKIP: set CUCA_LOCAL_DEVICE to a GPU device`.
-- Tiered experts on a GPU are checked only by the unit test `gpu_tiered_experts_match_gpu_resident` on tiny models, under the same `CUCA_LOCAL_DEVICE` condition. `qwen3-30b-a3b-q4_0` and `olmoe-1b-7b-q4_0` have not run on a GPU. A tiered Qwen3-30B-A3B run on Vulkan lost the device after a CubeCL kernel-expansion panic; see [Output guarantee](@/providers/local/expert-tiers.md#output-guarantee).
+- Verified on Vulkan (AMD RX 9070 XT, Windows): the live suite `tests/provider_local.rs` ran for Gemma 4 E2B Q4_0, Llama 3.2 1B, Phi 3.5 mini, Gemma 2 2B, OLMo 2 1B and Granite 3.3 2B, and for Qwen3-30B-A3B with tiered experts (`tiered:device=6g,ram=12g`). Every applicable scenario passed, with the same known limits as on the CPU. The other presets ran on the CPU.
+- The unit tests `gpu_matches_cpu_on_the_tiny_gemma4`, `gpu_matches_cpu_on_every_architecture` and `gpu_matches_cpu_on_other_weight_dtypes` compare the GPU engine with a CPU reference on tiny random models, and `gpu_drafter_matches_cpu_drafter` does the same for the drafter. `gpu_moe_one_row_experts_match_single_tokens` runs a Qwen3-30B-A3B-shaped MoE layer over a pass whose experts each get one row. They run only when `CUCA_LOCAL_DEVICE` names a GPU; otherwise they print `SKIP: set CUCA_LOCAL_DEVICE to a GPU device`.
+- Tiered experts on a GPU: `gpu_tiered_experts_match_gpu_resident` checks them on tiny models, and `tests/provider_local_tiers.rs` reproduced the reference replies on Vulkan for OLMoE 1B-7B and Qwen3-30B-A3B; see [Output guarantee](@/providers/local/expert-tiers.md#output-guarantee).
 - Compile-checked only: Metal (builds in the CI jobs that use `ALL_NO_LLVM`, which run on Linux), CUDA and ROCm (the CI job `local_gpu_llvm` runs `cargo check` for both).

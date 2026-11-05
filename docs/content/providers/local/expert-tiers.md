@@ -121,7 +121,7 @@ A prefill that scans many cold experts evicts them among themselves and leaves t
 
 Placement decides speed only. An expert is built from the same file bytes as in the resident load, and a layer pass accumulates its experts in the same ascending order. The output equals the resident load's on the same device, bit for bit on the CPU.
 
-On a GPU the logits equal those of a resident load on the same device, because the experts use the same packing and the same kernels. That is checked only by the unit test `gpu_tiered_experts_match_gpu_resident` on tiny models, which runs when `CUCA_LOCAL_DEVICE` names a GPU. `qwen3-30b-a3b-q4_0` and `olmoe-1b-7b-q4_0` have not run on a GPU, resident or tiered. A tiered `qwen3-30b-a3b-q4_0` run on Vulkan (`tiered:device=2g,ram=0`, AMD RX 9070 XT) lost the device after a CubeCL kernel-expansion panic in `cubecl-std` 0.11 (`quant/view.rs`: a quantized view's vector size is not a multiple of `num_quants`).
+On a GPU the logits equal those of a resident load on the same device, because the experts use the same packing and the same kernels. The unit test `gpu_tiered_experts_match_gpu_resident` checks that on tiny models when `CUCA_LOCAL_DEVICE` names a GPU. On Vulkan (AMD RX 9070 XT, Windows), `tests/provider_local_tiers.rs` reproduced the reference replies for `olmoe-1b-7b-q4_0` (resident reference, `tiered:device=1g,ram=0`) and for `qwen3-30b-a3b-q4_0` (`tiered:device=2g,ram=0` reference, `tiered:device=6g,ram=12g` cold and warm). The live suite passed all seven scenarios for `qwen3-30b-a3b-q4_0` at `tiered:device=6g,ram=12g`.
 
 ## Statistics and heat
 
@@ -191,7 +191,18 @@ Tiered placement trades speed for memory. These runs used `tests/provider_local_
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=4g`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.641 cold, 0.686 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=1100m`, 9 of 128 experts per layer | 6.2 cold, 5.3 warm | 0.381 cold, 0.383 warm |
 
-These runs read the model from the OS page cache. Reads of an uncached file from disk are not measured, and no model has a speed measured on a GPU device.
+These runs read the model from the OS page cache. Reads of an uncached file from disk are not measured.
+
+The same test on Vulkan (AMD RX 9070 XT, Windows, release build) gave the rates below. They include the first-use kernel tuning of each new matrix shape, which a short run does not amortize.
+
+| Model | Placement | Tokens per second | Hit rate |
+|---|---|---|---|
+| `olmoe-1b-7b-q4_0` | resident | 4.5 | not applicable |
+| `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 3.3 cold, 3.5 warm | 0.437 cold, 0.464 warm |
+| `qwen3-30b-a3b-q4_0` | `tiered:device=2g,ram=0` | 1.3 | 0.356 |
+| `qwen3-30b-a3b-q4_0` | `tiered:device=6g,ram=12g` | 2.5 cold, 2.6 warm | 0.880 cold, 0.992 warm |
+
+With `device=6g` the card's dedicated memory stayed flat at about 9.5 GB for the whole run, the desktop's own 1.4 GB included.
 
 ## Errors
 
