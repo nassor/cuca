@@ -34,6 +34,22 @@
 - `examples/scheduler.rs`, `tests/service_scheduler.rs` and the Scheduler
   page of the documentation site.
 
+### Changed
+
+- Local provider: a speculative round always verifies its first draft and
+  adds each further one only while the drafter's calibrated confidence makes
+  it pay for its measured verification cost. `LocalModelConfig::draft_tokens`
+  is now the cap, default 5 (was 3). A seeded sampling run still drafts the
+  full cap.
+- Local provider: sliding-window layers hold at most `window - 1 + 1280`
+  positions (CPU and GPU) and are compacted before they overflow; a
+  truncation below a compacted layer's floor empties the cache.
+  `LocalModel::kv_cache_bytes` reports the bounded size (Gemma 4 E2B at 8192
+  positions: 145 MB, was 302 MB).
+- Local provider: row-exact attention runs on candle's worker pool instead
+  of spawning threads per call, and `top_k = 0` sampling no longer sorts the
+  vocabulary.
+
 ## 0.5.2
 
 ### Changed
