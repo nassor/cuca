@@ -117,6 +117,9 @@ path = "@/providers/local/drafting.md"
 title = "Run on a GPU"
 path = "@/providers/local/gpu.md"
 [[extra.nav.items.children]]
+title = "Tiered expert placement"
+path = "@/providers/local/expert-tiers.md"
+[[extra.nav.items.children]]
 title = "Build requirements and tests"
 path = "@/providers/local/build-and-tests.md"
 

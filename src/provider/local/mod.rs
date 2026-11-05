@@ -18,8 +18,8 @@
 //!
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
 //! `gemma2`, `llama` (Llama 1-3.x and compatible), `qwen2`, `qwen3`, `phi3`
-//! (Phi 3, 3.5, 4-mini), `smollm3`, `granite`, `granitemoe`, `olmo2`,
-//! `ernie4_5` or `qwen35` (CPU only) runs: the loader reads every
+//! (Phi 3, 3.5, 4-mini), `smollm3`, `granite`, `granitemoe`, `qwen3moe`,
+//! `olmoe`, `olmo2`, `ernie4_5` or `qwen35` (CPU only) runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
 //! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
@@ -47,8 +47,11 @@
 //!   KV heads needs a smaller `context_length`).
 //! - Gemma 4's per-layer embedding rows are read from disk per input token
 //!   instead of being held in RAM (5,040 bytes each and 1.32 GB saved in E2B
-//!   Q4_0). A mixture-of-experts model keeps every expert resident (file
-//!   size); a pass only computes the experts its tokens route to.
+//!   Q4_0). A mixture-of-experts model keeps every expert resident by default
+//!   (file size; a pass only computes the experts its tokens route to);
+//!   [`ExpertPlacement::Tiered`] keeps the experts in the file instead and
+//!   streams them through RAM (and, on a GPU, device-memory) caches of a
+//!   configured byte size, with the same output.
 //! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix.
 //!
 //! # Determinism
@@ -131,6 +134,7 @@ use futures_core::Stream;
 use tokio::sync::{mpsc, oneshot};
 
 use self::chat::{ChatFormat, ChatTemplate, chat_prompt};
+pub use self::model::tier::{ExpertHeat, ExpertTierStats};
 use self::tokenizer::Tokenizer;
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
@@ -225,7 +229,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 23] = [
+const PRESET_TABLE: [ModelPreset; 25] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -414,6 +418,24 @@ const PRESET_TABLE: [ModelPreset; 23] = [
         "642a83a3e38607015d14ccc0cb8069d02b94a32d4bf8fd18b958ead08d4b6e0e",
         771_466_560,
         "granitemoe",
+    ),
+    preset(
+        "qwen3-30b-a3b-q4_0",
+        "unsloth/Qwen3-30B-A3B-GGUF",
+        "d5b1d57bd0b504ac62ae6c725904e96ef228dc74",
+        "Qwen3-30B-A3B-Q4_0.gguf",
+        "8b8e9febb6ed326d91a016f5d465cf5b55a0b328d157a43e2242fda71fde9c40",
+        17_379_988_032,
+        "qwen3moe",
+    ),
+    preset(
+        "olmoe-1b-7b-q4_0",
+        "bartowski/OLMoE-1B-7B-0924-Instruct-GGUF",
+        "7448e4317d367a3d6838fe367fe996758da6fc6e",
+        "OLMoE-1B-7B-0924-Instruct-Q4_0.gguf",
+        "e6fe22c3beb101a0679e49647f57c159f87b4a5547f0b444ae7f6b90f09d23d8",
+        3_944_815_424,
+        "olmoe",
     ),
     preset(
         "qwen3.5-0.8b-q8_0",
@@ -733,6 +755,143 @@ impl From<ModelSource> for DrafterSource {
     }
 }
 
+/// Where a mixture-of-experts model's routed experts live
+/// ([`LocalModelConfig::experts`]); see [`ExpertTiers`].
+///
+/// Also parses from a string (`str::parse`, ASCII case-insensitive):
+/// `resident`, or `tiered:` followed by comma-separated `ram=<size>`,
+/// `device=<size>` and `threads=<n>` in any order (each at most once), where
+/// `<size>` is a byte count with an optional `k`, `m` or `g` suffix (powers
+/// of 1024): `tiered:ram=4g`, `tiered:device=6g,ram=12g,threads=8`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ExpertPlacement {
+    /// Every expert is loaded at startup and stays in RAM (CPU) or device
+    /// memory (GPU): memory is the file size.
+    #[default]
+    Resident,
+    /// The experts stay in the GGUF file and are loaded on demand through
+    /// bounded caches; mixture-of-experts models only.
+    Tiered(ExpertTiers),
+}
+
+/// The caches of [`ExpertPlacement::Tiered`].
+///
+/// The dense weights (attention, norms, routers, embeddings, head) stay
+/// where [`ExpertPlacement::Resident`] puts them. Each routed expert (the
+/// gate, up and down matrices of one expert of one layer) is read from the
+/// GGUF file the first time a token routes to it, by a pool of
+/// `loader_threads` reader threads, and kept in a cache:
+///
+/// - on [`LocalDevice::Cpu`], one RAM tier of `ram_bytes`, holding the
+///   quantized matmul weights (an expert costs its file bytes);
+/// - on a GPU device, a device tier of `device_bytes` holding the uploaded
+///   weights, in front of an optional RAM tier of `ram_bytes` holding
+///   upload-ready host copies (`0` reads every device miss from the file).
+///
+/// A budget becomes the same number of slots in every MoE layer: `budget /
+/// (bytes of one expert summed over the MoE layers)`, at most the expert
+/// count. A tier must hold the model's experts-per-token (`n_used`) in
+/// every layer; a smaller budget fails [`LocalModel::load`] with
+/// [`CucaError::Config`] naming the minimum. A full tier evicts the expert
+/// with the lowest learned heat (decaying pick counts) that the running layer
+/// pass no longer needs, then the least recently used. The tiers never hold
+/// more than their budget; an expert a layer pass is computing may outlive
+/// its eviction for that pass (one on the CPU; on a GPU up to `n_used` in a
+/// single-token pass, whose experts are all uploaded before it computes).
+///
+/// Placement only decides speed: an expert is built from the same file
+/// bytes and computed in the same order as in the resident mode, so the
+/// output is the resident mode's on the same device (bit for bit on the
+/// CPU). [`LocalModel::expert_tier_stats`] reports hits, reads and resident
+/// bytes; [`LocalModel::expert_heat`] exports the learned heat, which
+/// `warm_from` feeds back in a later session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpertTiers {
+    /// Bytes of RAM for cached experts. Required on [`LocalDevice::Cpu`]
+    /// (at least `n_used` experts per layer); on a GPU device `0` disables
+    /// the RAM tier, any other value must hold `n_used` experts per layer.
+    pub ram_bytes: u64,
+    /// Bytes of device memory for cached experts on a GPU device (required
+    /// there, at least `n_used` experts per layer); must be `0` on
+    /// [`LocalDevice::Cpu`].
+    pub device_bytes: u64,
+    /// Disk reader threads, `1..=64` (default 4).
+    pub loader_threads: usize,
+    /// Heat from an earlier session of the same model
+    /// ([`LocalModel::expert_heat`]): it seeds the learned heat, and the
+    /// hottest experts of every layer are loaded at startup (device tier
+    /// first, then RAM). `None` (the default) starts cold.
+    pub warm_from: Option<ExpertHeat>,
+}
+
+/// Default [`ExpertTiers::loader_threads`].
+const DEFAULT_LOADER_THREADS: usize = 4;
+/// Largest accepted [`ExpertTiers::loader_threads`].
+const MAX_LOADER_THREADS: usize = 64;
+
+impl Default for ExpertTiers {
+    fn default() -> Self {
+        Self {
+            ram_bytes: 0,
+            device_bytes: 0,
+            loader_threads: DEFAULT_LOADER_THREADS,
+            warm_from: None,
+        }
+    }
+}
+
+/// Parses `resident` or `tiered:<key>=<value>,...`; see [`ExpertPlacement`].
+impl std::str::FromStr for ExpertPlacement {
+    type Err = CucaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        let bad = || {
+            CucaError::Config(format!(
+                "unknown expert placement `{s}`; expected resident or tiered:ram=<size>[,device=<size>][,threads=<n>]"
+            ))
+        };
+        let lower = s.to_ascii_lowercase();
+        if lower == "resident" {
+            return Ok(Self::Resident);
+        }
+        let rest = lower.strip_prefix("tiered:").ok_or_else(bad)?;
+        let size = |v: &str| -> Option<u64> {
+            let (digits, shift) = match v.as_bytes().last()? {
+                b'k' => (&v[..v.len() - 1], 10),
+                b'm' => (&v[..v.len() - 1], 20),
+                b'g' => (&v[..v.len() - 1], 30),
+                _ => (v, 0),
+            };
+            digits.parse::<u64>().ok()?.checked_mul(1u64 << shift)
+        };
+        let mut tiers = ExpertTiers::default();
+        let (mut ram, mut device, mut threads) = (false, false, false);
+        for part in rest.split(',') {
+            let (key, value) = part.split_once('=').ok_or_else(bad)?;
+            match key {
+                "ram" if !ram => {
+                    ram = true;
+                    tiers.ram_bytes = size(value).ok_or_else(bad)?;
+                }
+                "device" if !device => {
+                    device = true;
+                    tiers.device_bytes = size(value).ok_or_else(bad)?;
+                }
+                "threads" if !threads => {
+                    threads = true;
+                    tiers.loader_threads = value.parse().map_err(|_| bad())?;
+                }
+                _ => return Err(bad()),
+            }
+        }
+        if !(ram || device) {
+            return Err(bad());
+        }
+        Ok(Self::Tiered(tiers))
+    }
+}
+
 /// Configuration for [`LocalModel::load`].
 ///
 /// `Debug` redacts `hf_token`.
@@ -780,6 +939,12 @@ pub struct LocalModelConfig {
     pub draft_tokens: usize,
     /// Optional download progress observer.
     pub on_download_progress: Option<DownloadProgressCallback>,
+    /// Where a mixture-of-experts model's experts live:
+    /// [`ExpertPlacement::Resident`] (the default) keeps every expert in
+    /// memory; [`ExpertPlacement::Tiered`] streams them from the file
+    /// through bounded caches ([`ExpertTiers`]). Tiered placement on a model
+    /// without experts fails [`LocalModel::load`] with [`CucaError::Config`].
+    pub experts: ExpertPlacement,
 }
 
 impl Default for LocalModelConfig {
@@ -794,6 +959,7 @@ impl Default for LocalModelConfig {
             drafter: None,
             draft_tokens: DEFAULT_DRAFT_TOKENS,
             on_download_progress: None,
+            experts: ExpertPlacement::Resident,
         }
     }
 }
@@ -810,13 +976,24 @@ impl fmt::Debug for LocalModelConfig {
             .field("drafter", &self.drafter)
             .field("draft_tokens", &self.draft_tokens)
             .field("on_download_progress", &self.on_download_progress)
+            .field("experts", &self.experts)
             .finish()
     }
 }
 
 /// What a loaded engine hands back to `load`: the pieces the request path
 /// needs without touching the engine thread.
-type Ready = Result<(Arc<Tokenizer>, ChatTemplate, ChatFormat, usize, u64), CucaError>;
+type Ready = Result<
+    (
+        Arc<Tokenizer>,
+        ChatTemplate,
+        ChatFormat,
+        usize,
+        u64,
+        Option<Arc<model::tier::TierShared>>,
+    ),
+    CucaError,
+>;
 
 /// State shared by every clone of a [`LocalModel`].
 pub(crate) struct LocalModelInner {
@@ -828,6 +1005,9 @@ pub(crate) struct LocalModelInner {
     context_length: usize,
     kv_cache_bytes: u64,
     draft_stats: Arc<engine::DraftCounters>,
+    /// Counters and heat of the expert tiers; `None` unless
+    /// [`ExpertPlacement::Tiered`].
+    tiers: Option<Arc<model::tier::TierShared>>,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -857,7 +1037,8 @@ pub(crate) struct LocalModelInner {
 ///   `prompt_cache_usage`.
 /// - Weights stay quantized (a mixture-of-experts model keeps every expert,
 ///   split per expert, so memory is the file size; a pass computes only the
-///   routed experts). Gemma 4's per-layer embedding table
+///   routed experts; [`ExpertPlacement::Tiered`] bounds the expert memory to
+///   configured RAM and device budgets instead). Gemma 4's per-layer embedding table
 ///   (`per_layer_token_embd`: 1.32 GB in the E2B Q4_0 file, 1.59 GB in E4B
 ///   Q4_0) is not loaded: one row
 ///   per input token (5,040 bytes in E2B Q4_0) is read from the GGUF file,
@@ -978,6 +1159,19 @@ impl LocalModel {
         self.inner.draft_stats.snapshot()
     }
 
+    /// Expert tier counters (hits per tier, file reads, resident bytes);
+    /// `None` unless the model loaded with [`ExpertPlacement::Tiered`].
+    pub fn expert_tier_stats(&self) -> Option<ExpertTierStats> {
+        self.inner.tiers.as_ref().map(|t| t.stats())
+    }
+
+    /// The expert heat learned so far, for [`ExpertTiers::warm_from`] in a
+    /// later session (it serializes with serde); `None` unless the model
+    /// loaded with [`ExpertPlacement::Tiered`].
+    pub fn expert_heat(&self) -> Option<ExpertHeat> {
+        self.inner.tiers.as_ref().map(|t| t.heat())
+    }
+
     /// Load the model described by `config`: resolve or download the file,
     /// read the weights, tokenizer and chat template, and start the engine
     /// thread.
@@ -990,7 +1184,9 @@ impl LocalModel {
     ///
     /// [`CucaError::Config`] for an invalid configuration (zero or oversized
     /// `context_length`, non-finite `temperature`, `top_p` outside `(0, 1]`,
-    /// a [`LocalDevice`] whose cargo feature is not enabled);
+    /// a [`LocalDevice`] whose cargo feature is not enabled, an
+    /// [`ExpertPlacement::Tiered`] whose budgets do not fit the device or the
+    /// model, or that is set on a model without experts);
     /// [`CucaError::Io`] when the file is missing or unreadable or the thread
     /// cannot start; [`CucaError::Transport`] and [`CucaError::Http`] for
     /// download failures; [`CucaError::Provider`] for an unsupported or
@@ -1059,6 +1255,7 @@ impl LocalModel {
                                 format,
                                 engine.context_length(),
                                 engine.kv_cache_bytes(),
+                                engine.expert_tiers(),
                             )))
                             .is_err()
                         {
@@ -1080,7 +1277,7 @@ impl LocalModel {
             })?;
 
         match ready_rx.await {
-            Ok(Ok((tokenizer, template, format, context_length, kv_cache_bytes))) => {
+            Ok(Ok((tokenizer, template, format, context_length, kv_cache_bytes, tiers))) => {
                 Ok(LocalModel {
                     inner: Arc::new(LocalModelInner {
                         jobs: jobs_tx,
@@ -1090,6 +1287,7 @@ impl LocalModel {
                         context_length,
                         kv_cache_bytes,
                         draft_stats,
+                        tiers,
                     }),
                 })
             }
@@ -1135,6 +1333,32 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
             "draft_tokens must be in 1..={MAX_DRAFT_TOKENS}, got {}",
             config.draft_tokens
         )));
+    }
+    if let ExpertPlacement::Tiered(t) = &config.experts {
+        if !(1..=MAX_LOADER_THREADS).contains(&t.loader_threads) {
+            return Err(CucaError::Config(format!(
+                "experts.loader_threads must be in 1..={MAX_LOADER_THREADS}, got {}",
+                t.loader_threads
+            )));
+        }
+        if config.device == LocalDevice::Cpu {
+            if t.device_bytes != 0 {
+                return Err(CucaError::Config(
+                    "experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu"
+                        .into(),
+                ));
+            }
+            if t.ram_bytes == 0 {
+                return Err(CucaError::Config(
+                    "experts.ram_bytes must be greater than 0 on LocalDevice::Cpu".into(),
+                ));
+            }
+        } else if t.device_bytes == 0 {
+            return Err(CucaError::Config(format!(
+                "experts.device_bytes must be greater than 0 on {:?}",
+                config.device
+            )));
+        }
     }
     Ok(())
 }
@@ -1343,6 +1567,8 @@ mod tests {
         assert_eq!(revision.len(), 40);
         assert_eq!(file, "gemma-4-E2B-it-Q4_0.gguf");
         assert_eq!(sha256.map(|s| s.len()), Some(64));
+        assert_eq!(config.experts, ExpertPlacement::Resident);
+        assert_eq!(ExpertTiers::default().loader_threads, 4);
     }
 
     #[test]
@@ -1476,11 +1702,89 @@ mod tests {
                 },
                 "top_p",
             ),
+            (
+                LocalModelConfig {
+                    experts: ExpertPlacement::Tiered(ExpertTiers {
+                        ram_bytes: 1 << 30,
+                        loader_threads: 0,
+                        ..ExpertTiers::default()
+                    }),
+                    ..Default::default()
+                },
+                "experts.loader_threads must be in 1..=64, got 0",
+            ),
+            (
+                LocalModelConfig {
+                    experts: ExpertPlacement::Tiered(ExpertTiers {
+                        ram_bytes: 1 << 30,
+                        device_bytes: 1 << 30,
+                        ..ExpertTiers::default()
+                    }),
+                    ..Default::default()
+                },
+                "experts.device_bytes is for GPU devices",
+            ),
+            (
+                LocalModelConfig {
+                    experts: ExpertPlacement::Tiered(ExpertTiers::default()),
+                    ..Default::default()
+                },
+                "experts.ram_bytes must be greater than 0",
+            ),
         ] {
             let err = LocalModel::load(config).await.unwrap_err();
             assert!(
                 matches!(&err, CucaError::Config(m) if m.contains(needle)),
                 "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn expert_placement_parses_every_form() {
+        let tiers = |ram_bytes, device_bytes, loader_threads| {
+            ExpertPlacement::Tiered(ExpertTiers {
+                ram_bytes,
+                device_bytes,
+                loader_threads,
+                warm_from: None,
+            })
+        };
+        for (text, placement) in [
+            ("resident", ExpertPlacement::Resident),
+            (" Resident ", ExpertPlacement::Resident),
+            ("tiered:ram=4g", tiers(4 << 30, 0, 4)),
+            ("tiered:ram=1100M", tiers(1100 << 20, 0, 4)),
+            ("tiered:ram=512k,threads=8", tiers(512 << 10, 0, 8)),
+            ("tiered:ram=123", tiers(123, 0, 4)),
+            ("TIERED:device=6g,ram=12g", tiers(12 << 30, 6 << 30, 4)),
+            ("tiered:device=2g,ram=0", tiers(0, 2 << 30, 4)),
+            ("tiered:device=1g", tiers(0, 1 << 30, 4)),
+        ] {
+            assert_eq!(
+                text.parse::<ExpertPlacement>().unwrap(),
+                placement,
+                "{text}"
+            );
+        }
+        for bad in [
+            "",
+            "tiered",
+            "tiered:",
+            "tiered:threads=2",
+            "tiered:ram=4t",
+            "tiered:ram=",
+            "tiered:ram=-1",
+            "tiered:ram=1g,ram=2g",
+            "tiered:ram=1g,disk=2g",
+            "tiered:ram=1g,threads=x",
+            "tiered:ram=99999999999g",
+            "resident:ram=1g",
+        ] {
+            let err = bad.parse::<ExpertPlacement>().unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains("unknown expert placement")),
+                "{bad}: {err}"
             );
         }
     }

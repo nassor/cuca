@@ -26,7 +26,7 @@ weight = 4
 - `ModelSource::default_model()` is the preset `gemma4-e2b-q4_0`.
 - `"name".parse::<ModelSource>()?` accepts a preset name (ASCII case-insensitive) or `repo:revision:file`, where none of the three parts contains `:`. The result of `repo:revision:file` has no checksum.
 
-`ModelSource::PRESETS` has 23 entries, each pinned to one Hugging Face commit and one SHA-256. A `ModelPreset` has `name`, `repo`, `revision`, `file`, `sha256`, `size_bytes`, `architecture` and `drafter`. `preset.source()` returns its pinned `ModelSource`, and `ModelSource::preset(name)` finds one by name. A preset with `drafter: true` is used through `LocalModelConfig::drafter` and cannot be loaded as the main model. The table with sizes and K/V cost is on [Local models and formats](@/providers/local/models.md#presets).
+`ModelSource::PRESETS` has 25 entries, each pinned to one Hugging Face commit and one SHA-256. A `ModelPreset` has `name`, `repo`, `revision`, `file`, `sha256`, `size_bytes`, `architecture` and `drafter`. `preset.source()` returns its pinned `ModelSource`, and `ModelSource::preset(name)` finds one by name. A preset with `drafter: true` is used through `LocalModelConfig::drafter` and cannot be loaded as the main model. The table with sizes and K/V cost is on [Local models and formats](@/providers/local/models.md#presets).
 
 ```rust,name=List the presets
 use cuca::ModelSource;

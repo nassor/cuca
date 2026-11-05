@@ -2,7 +2,7 @@
 title = "Build requirements and tests"
 description = "The dependencies provider-local owns, the C compiler and download needs of each feature, and the live test suites."
 template = "page.html"
-weight = 8
+weight = 9
 +++
 
 # Build requirements and tests
@@ -38,3 +38,5 @@ The scenarios:
 - `prefix_reuse_hits_and_matches_cold`: the warm prefix is read from the cache, an unrelated request shrinks it, and the warm and cold greedy outputs are identical.
 
 `tests/provider_local_mtp.rs` is the drafter check described under [Verified](@/providers/local/drafting.md#verified). Which models and devices these suites covered is on [Local models and formats](@/providers/local/models.md#verification).
+
+`tests/provider_local_tiers.rs` runs a mixture-of-experts model on a tiered placement and compares its greedy replies with a reference placement; it is described under [Run it](@/providers/local/expert-tiers.md#run-it).

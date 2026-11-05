@@ -205,7 +205,7 @@ impl Transformer {
             dequantize,
             requantize: false,
         };
-        let block = load_layer(&mut loader, hp, il, spec, &layout)?;
+        let block = load_layer(&mut loader, hp, il, spec, &layout, None)?;
         if !matches!(block.mixer, Mixer::Attention(_)) {
             return Err(err(
                 "the multi-token-prediction block must be an attention block",

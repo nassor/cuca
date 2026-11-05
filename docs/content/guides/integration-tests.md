@@ -81,7 +81,7 @@ The reason comes from a probe of `GET {base_url}/models` with a two second timeo
 
 Two files never call the probe: `tests/service_prompt_cache.rs` drives in-process mock SSE servers on ephemeral loopback ports, and `tests/public_exports.rs` constructs types and never dispatches. Every other llama.cpp file has more tests than live gates, so a subset of each runs with no server up.
 
-`tests/provider_local.rs` and `tests/provider_local_mtp.rs` need no server. They print `SKIP: local model not available: ...` until you select a model; see [Environment variables](@/reference/environment.md).
+`tests/provider_local.rs` and `tests/provider_local_mtp.rs` need no server. They print `SKIP: local model not available: ...` until you select a model; see [Environment variables](@/reference/environment.md). `tests/provider_local_tiers.rs` needs no server either and prints a `SKIP:` line until you select a model and set `CUCA_LOCAL_EXPERTS`.
 
 Result: you can tell which tests skipped and why.
 

@@ -669,7 +669,7 @@ impl Hparams {
             Some(MoeSpec {
                 n_expert,
                 n_used,
-                norm_weights: true,
+                norm_weights: behavior.moe_norm_weights,
             })
         } else if k.usize_opt("expert_count")?.is_some_and(|n| n > 0) {
             return Err(err(format!(
@@ -1179,6 +1179,50 @@ mod tests {
         let mut bad = meta.clone();
         bad.insert("granitemoe.expert_used_count".into(), U32(9));
         assert!(Hparams::from_metadata(&bad, &none).is_err());
+    }
+
+    /// Minimal metadata of a mixture-of-experts `arch` with 8 experts, top 2.
+    fn moe_metadata(arch: &str) -> Metadata {
+        md(&[
+            ("general.architecture", Str(arch.into())),
+            (&format!("{arch}.block_count"), U32(2)),
+            (&format!("{arch}.context_length"), U32(4096)),
+            (&format!("{arch}.embedding_length"), U32(64)),
+            (&format!("{arch}.attention.head_count"), U32(4)),
+            (&format!("{arch}.attention.head_count_kv"), U32(2)),
+            (
+                &format!("{arch}.attention.layer_norm_rms_epsilon"),
+                F32(1e-6),
+            ),
+            (&format!("{arch}.expert_count"), U32(8)),
+            (&format!("{arch}.expert_used_count"), U32(2)),
+        ])
+    }
+
+    #[test]
+    fn qwen3moe_reads_experts() {
+        let p = Hparams::from_metadata(&moe_metadata("qwen3moe"), &none).unwrap();
+        assert_eq!(
+            p.moe,
+            Some(MoeSpec {
+                n_expert: 8,
+                n_used: 2,
+                norm_weights: true
+            })
+        );
+    }
+
+    #[test]
+    fn olmoe_reads_experts_without_renormalisation() {
+        let p = Hparams::from_metadata(&moe_metadata("olmoe"), &none).unwrap();
+        assert_eq!(
+            p.moe,
+            Some(MoeSpec {
+                n_expert: 8,
+                n_used: 2,
+                norm_weights: false
+            })
+        );
     }
 
     /// The published Qwen3.5-0.8B metadata.

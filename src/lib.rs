@@ -116,9 +116,9 @@ pub use crate::plugins::web_search::{
 };
 #[cfg(feature = "provider-local")]
 pub use crate::provider::local::{
-    DownloadProgress, DownloadProgressCallback, DraftStats, DrafterSource, GpuAdapter,
-    LocalCapabilities, LocalDevice, LocalModel, LocalModelConfig, ModelPreset, ModelSource,
-    SamplingConfig,
+    DownloadProgress, DownloadProgressCallback, DraftStats, DrafterSource, ExpertHeat,
+    ExpertPlacement, ExpertTierStats, ExpertTiers, GpuAdapter, LocalCapabilities, LocalDevice,
+    LocalModel, LocalModelConfig, ModelPreset, ModelSource, SamplingConfig,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,

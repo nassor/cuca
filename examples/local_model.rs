@@ -49,6 +49,10 @@
 //! - `CUCA_LOCAL_DEVICE`: where the model runs: `cpu` (default), `vulkan`,
 //!   `vulkan:<n>`, `metal`, `cuda[:<n>]` or `rocm[:<n>]` (see `LocalDevice`).
 //!   A GPU needs its feature, e.g. `--features provider-local-vulkan`.
+//! - `CUCA_LOCAL_EXPERTS`: where a mixture-of-experts model's experts live
+//!   (see `ExpertPlacement`): `resident` (default) or tiered caches such as
+//!   `tiered:ram=600m` (CPU) or `tiered:device=4g,ram=8g` (GPU); the tier
+//!   counters print at the end.
 //! - `CUCA_CACHE_DIR`: download cache directory, defaults to the platform cache
 //!   directory.
 //! - `HF_TOKEN`: Hugging Face token, only needed for gated mirrors.
@@ -114,6 +118,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         config.device = device.parse()?;
     }
+    if let Ok(experts) = std::env::var("CUCA_LOCAL_EXPERTS")
+        && !experts.is_empty()
+    {
+        config.experts = experts.parse()?;
+    }
     let device = config.device;
     let model = LocalModel::load(config).await?;
     let stats_handle = model.clone();
@@ -168,6 +177,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             rate * 100.0,
             stats.rounds
         );
+    }
+    if let Some(tiers) = stats_handle.expert_tier_stats() {
+        eprintln!("expert tiers: {tiers:?}");
     }
     Ok(())
 }

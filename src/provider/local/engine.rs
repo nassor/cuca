@@ -420,7 +420,7 @@ impl Engine {
     /// maximum or `config.device` is compiled out, and
     /// [`CucaError::Provider`] for a file that is not a GGUF file candle can
     /// parse (for example an unsupported tensor dtype such as an IQ
-    /// quantization), an unsupported checkpoint (wrong architecture, MoE, a
+    /// quantization), an unsupported checkpoint (wrong architecture, a
     /// weight dtype the GPU engine does not read), a missing tensor or
     /// metadata key, a drafter that does not match the model (an in-trunk
     /// head the file does not carry, or one asked for on a GPU), or an
@@ -450,7 +450,13 @@ impl Engine {
         let hp = super::model::read_hparams(&content)?;
         let context_length = super::resolve_context_length(config.context_length, hp.n_ctx_train);
         let kv_cache_bytes = hp.kv_cache_bytes(context_length);
-        let model = Model::load(&content, path, context_length, config.device)?;
+        let model = Model::load(
+            &content,
+            path,
+            context_length,
+            config.device,
+            &config.experts,
+        )?;
         let drafter = drafter
             .map(|source| -> Result<Drafter, CucaError> {
                 match source {
@@ -516,6 +522,12 @@ impl Engine {
     /// K/V cache bytes of the loaded model at its context length.
     pub(crate) fn kv_cache_bytes(&self) -> u64 {
         self.kv_cache_bytes
+    }
+
+    /// Counters and heat of the expert tiers; `None` unless the model loaded
+    /// with `ExpertPlacement::Tiered`.
+    pub(crate) fn expert_tiers(&self) -> Option<Arc<super::model::tier::TierShared>> {
+        self.model.expert_tiers()
     }
 
     /// Run one job to completion on the calling (engine) thread.
@@ -1875,8 +1887,9 @@ mod tests {
         let resolved = super::super::resolve_context_length(None, hp.n_ctx_train);
         assert_eq!(resolved, 32);
         let device = super::super::LocalDevice::Cpu;
-        assert!(Model::load(&content, &model.path, resolved, device).is_ok());
-        let e = Model::load(&content, &model.path, 33, device).err();
+        let resident = super::super::ExpertPlacement::Resident;
+        assert!(Model::load(&content, &model.path, resolved, device, &resident).is_ok());
+        let e = Model::load(&content, &model.path, 33, device, &resident).err();
         assert!(
             e.is_some_and(|e| e.to_string().contains("exceeds the model maximum")),
             "an explicit value above the maximum fails loudly"

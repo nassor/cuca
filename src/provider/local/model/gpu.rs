@@ -58,9 +58,12 @@
 //!   token's row of `token_embd` (and, for Gemma 4, of `per_layer_token_embd`)
 //!   from the GGUF file ([`RowTable`]) and uploads the dequantized rows. The
 //!   per-layer table is never uploaded.
-//! - Expert tensors are read and uploaded one expert at a time (a `[n_expert,
-//!   rows, cols]` tensor becomes `n_expert` 2-D device weights), so the host
-//!   buffer is one expert and the device memory is the dtype rule above.
+//! - Resident experts (the default) are read and uploaded one expert at a
+//!   time (a `[n_expert, rows, cols]` tensor becomes `n_expert` 2-D device
+//!   weights), so the host buffer is one expert and the device memory is the
+//!   dtype rule above for every expert of every layer.
+//!   `ExpertPlacement::Tiered` reads no expert at load: see "Tiered experts"
+//!   below.
 //! - The K/V cache lives on the device, preallocated as on the CPU: a
 //!   full-attention layer holds `context_length` positions, a sliding-window
 //!   layer the bounded slab of [`kv_slots`], compacted before a call that
@@ -95,6 +98,53 @@
 //! established. A single token multiplies the expert's output by the routing
 //! weight as a host scalar (`mul_scalar`); that form ran through the Granite
 //! MoE live suite on Vulkan, every decode step included, without device loss.
+//!
+//! # Tiered experts
+//!
+//! With `ExpertPlacement::Tiered` everything above stays resident except the
+//! experts, which stay in the GGUF file and reach the device on demand (the
+//! tiers, the heat and the eviction policy are described in the
+//! [`tier`](super::tier) module docs). Placement only decides speed: an
+//! expert's device weights are built by the same [`PackPlan`] (layout and row
+//! chunking) as a resident one, so the logits equal the resident load's on the
+//! same device.
+//!
+//! - **Device tier**: per MoE layer a table of at most `device_slots`
+//!   experts ([`GpuExpertBank::Tiered`]), with `device_slots = min(n_expert,
+//!   device_bytes / per_expert)` where `per_expert` is the packed size of one
+//!   expert of every MoE layer (the dtype rule above, f32 for a weight
+//!   [`plan_dense`] holds dense). A budget below `n_used` experts per layer
+//!   fails the load with `CucaError::Config` naming the minimum.
+//! - **RAM tier** (`ram_bytes > 0`): the packed host copies of experts
+//!   ([`PackedExpert`]: per projection one [`PackedMatrix`], the bytes
+//!   [`upload_packed`] hands to the device). They are converted on the loader
+//!   threads, never on the engine thread. `ram_bytes == 0` disables the tier.
+//! - **Disk**: a pool of loader threads reads the three matrices of a missing
+//!   expert with positional reads and converts them.
+//!
+//! Per MoE layer pass the routing gives the ascending experts to compute. The
+//! device hits are counted first; the experts missing on the device walk
+//! through the lower tiers in the same ascending order (reads in flight count
+//! against the RAM slots) and each is uploaded on the engine thread (burn's
+//! device streams are per thread) when the walk reaches it. A multi-row pass
+//! interleaves the walk with the expert compute, so an expert is uploaded
+//! just before its turn. A single-token pass resolves all its experts (at
+//! most `n_used`, which fit the device table) before queuing any compute:
+//! uploads between experts changed how burn fuses the elementwise ops of the
+//! accumulation, by float rounding, so this keeps the op stream after the
+//! routing readback the resident mode's and the logits bit-equal to it.
+//!
+//! A miss evicts the device table's victim: the resident expert not needed
+//! later in the pass with the lowest `(heat, last use)`; when every resident
+//! expert is needed later in the pass (only possible in a multi-row pass,
+//! whose experts can outnumber the slots) the miss is computed without being
+//! cached instead of evicting an expert that would be fetched again. A table
+//! never holds more than `device_slots` experts; an expert being computed
+//! outlives its eviction (or was never admitted), so a layer pass can have
+//! more experts on the device than slots (one in a multi-row pass, up to
+//! `n_used` in a single-token one), and the host holds the packed copy being
+//! uploaded. The accumulation order (ascending expert, `select_assign`) and
+//! the two routing-weight rules above are the resident mode's.
 //!
 //! # Speculative drafting
 //!
@@ -154,9 +204,9 @@ use std::collections::HashSet;
 use std::f64::consts::FRAC_1_SQRT_2;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use burn::tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 use burn::tensor::{DType, Device, IndexingUpdateOp, Int, Tensor, TensorData, activation};
@@ -165,16 +215,22 @@ use candle_core::quantized::{GgmlDType, gguf_file};
 use super::arch::{Act, Arch};
 use super::cpu::{Forward, Hidden};
 use super::layout::{Ffn, LayerLayout, Qkv, name, tensor_info};
-use super::moe::route;
+use super::moe::{Routing, route};
 use super::params::{Hparams, LayerSpec, MoeSpec};
 use super::quant::{RowTable, dequant_row};
 use super::rope::{RopeKind, RopeSpec};
+use super::tier::{
+    BuildFn, ExpertSlice, ExpertStore, LayerExperts, Pass as TierPass, SlotTable, TierShared, add,
+    sub, tier_slots,
+};
 use super::{
     RING_ROLLBACK, RING_ROWS, Want, attention_mask, build_rope_tables, check_context, err,
     kv_slots, read_hparams,
 };
 use crate::error::CucaError;
-use crate::provider::local::{LocalDevice, device_unavailable};
+use crate::provider::local::{
+    ExpertHeat, ExpertPlacement, ExpertTiers, LocalDevice, device_unavailable,
+};
 
 /// burn's quantization scheme equivalent to a GGUF block dtype, `None` for
 /// every dtype the GPU engine does not keep quantized.
@@ -530,6 +586,220 @@ fn plan_dense(own: &[(String, QuantShape)], peers: &[QuantShape]) -> HashSet<Str
     dense
 }
 
+/// One row chunk of a weight, converted on the host to what the device takes.
+#[derive(Clone)]
+enum PackedData {
+    /// burn's block-quantized layout under the scheme ([`pack_blocks`]).
+    Quant(Vec<u8>, QuantScheme),
+    /// f32 values, row-major.
+    Float(Vec<f32>),
+}
+
+/// One chunk of `rows` rows of a [`PackedMatrix`].
+#[derive(Clone)]
+struct PackedPart {
+    rows: usize,
+    data: PackedData,
+}
+
+impl PackedPart {
+    /// The chunk as a device tensor `[rows, cols]`.
+    fn upload(self, cols: usize, device: &Device) -> Tensor<2> {
+        let shape = [self.rows, cols];
+        let data = match self.data {
+            PackedData::Quant(bytes, scheme) => {
+                TensorData::from_bytes_vec(bytes, shape, DType::QFloat(scheme))
+            }
+            PackedData::Float(values) => TensorData::new(values, shape),
+        };
+        Tensor::from_data(data, device)
+    }
+}
+
+/// A `[rows, cols]` weight converted on the host ([`pack_matrix`]) to what
+/// the device takes, in the row chunks of a [`Weight`]; [`upload_packed`] puts
+/// it on the device. It holds no device tensor, so loader threads build it and
+/// the RAM tier keeps it.
+struct PackedMatrix {
+    cols: usize,
+    parts: Vec<PackedPart>,
+    /// Bytes the weight occupies on the device, and here.
+    bytes: usize,
+}
+
+impl PackedMatrix {
+    /// The weight on the device, moving the host bytes.
+    fn upload(self, device: &Device) -> Weight {
+        let cols = self.cols;
+        Weight {
+            parts: self
+                .parts
+                .into_iter()
+                .map(|part| part.upload(cols, device))
+                .collect(),
+        }
+    }
+}
+
+/// The weight `packed` on the device, copying the host bytes (the packed
+/// matrix stays usable, as in the RAM tier).
+fn upload_packed(packed: &PackedMatrix, device: &Device) -> Weight {
+    Weight {
+        parts: packed
+            .parts
+            .iter()
+            .map(|part| part.clone().upload(packed.cols, device))
+            .collect(),
+    }
+}
+
+/// The layout a `dtype` weight takes on the device: `None` (f32) when
+/// `dense`, else [`stored_layout`].
+fn device_layout(dtype: GgmlDType, dense: bool) -> Option<GgmlDType> {
+    if dense { None } else { stored_layout(dtype) }
+}
+
+/// Device bytes of a `[rows, cols]` weight of GGUF dtype `dtype`.
+fn device_bytes(dtype: GgmlDType, rows: usize, cols: usize, dense: bool) -> usize {
+    rows * stored_row_bytes(device_layout(dtype, dense), cols)
+}
+
+/// How a `[rows, cols]` weight of GGUF dtype `dtype` reaches the device: the
+/// layout it takes there and the row chunks it is split into. Shared by
+/// [`upload_matrix_with`] and [`pack_matrix`], so a resident and a tiered
+/// weight are the same device tensors.
+struct PackPlan<'a> {
+    tensor_name: &'a str,
+    dtype: GgmlDType,
+    rows: usize,
+    cols: usize,
+    /// The GGUF layout kept on the device, `None` for f32.
+    stored: Option<GgmlDType>,
+    /// File bytes per row.
+    row_bytes: usize,
+    /// Rows of every chunk but the last, which may be shorter.
+    chunk: usize,
+}
+
+impl<'a> PackPlan<'a> {
+    /// Plan the `[rows, cols]` weight `tensor_name` whose file bytes are
+    /// `raw_len` long, in chunks of at most `limit` device bytes.
+    fn new(
+        tensor_name: &'a str,
+        dtype: GgmlDType,
+        raw_len: usize,
+        rows: usize,
+        cols: usize,
+        limit: usize,
+        dense: bool,
+    ) -> Result<Self, CucaError> {
+        let block = dtype.block_size();
+        if !cols.is_multiple_of(block) {
+            return Err(err(format!(
+                "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size {block}"
+            )));
+        }
+        let row_bytes = cols / block * dtype.type_size();
+        if raw_len != rows * row_bytes {
+            return Err(err(format!(
+                "tensor `{tensor_name}`: {raw_len} bytes do not hold a [{rows}, {cols}] {dtype:?} tensor"
+            )));
+        }
+        // The layout the weight takes on the device, and its bytes per row.
+        let stored = device_layout(dtype, dense);
+        if stored == Some(GgmlDType::Q8_0) && !cols.is_multiple_of(32) {
+            return Err(err(format!(
+                "tensor `{tensor_name}`: row length {cols} is not a multiple of the 32-element Q8_0 block"
+            )));
+        }
+        let mut chunk = (limit / stored_row_bytes(stored, cols)).clamp(1, rows.max(1));
+        if chunk < rows && chunk >= 64 {
+            // Keep chunk widths multiples of the plane width, which the
+            // single-row kernel needs ([`vecmat_fits`]).
+            chunk -= chunk % 64;
+        }
+        Ok(Self {
+            tensor_name,
+            dtype,
+            rows,
+            cols,
+            stored,
+            row_bytes,
+            chunk,
+        })
+    }
+
+    /// Device bytes of the whole weight.
+    fn bytes(&self) -> usize {
+        self.rows * stored_row_bytes(self.stored, self.cols)
+    }
+
+    /// The row ranges of the chunks.
+    fn chunks(&self) -> impl Iterator<Item = Range<usize>> + use<> {
+        let (rows, chunk) = (self.rows, self.chunk);
+        (0..rows)
+            .step_by(chunk)
+            .map(move |start| start..(start + chunk).min(rows))
+    }
+
+    /// Convert the rows `rows` of the weight, whose file bytes are `raw`.
+    fn pack(&self, raw: &[u8], rows: Range<usize>) -> Result<PackedPart, CucaError> {
+        let context = |e: CucaError| err(format!("tensor `{}`: {e}", self.tensor_name));
+        let (dtype, cols, row_bytes) = (self.dtype, self.cols, self.row_bytes);
+        let n = rows.len();
+        let src = &raw[rows.start * row_bytes..rows.end * row_bytes];
+        let data = match (self.stored, quant_scheme(self.stored.unwrap_or(dtype))) {
+            (Some(layout), Some(scheme)) if layout == dtype => {
+                PackedData::Quant(pack_blocks(dtype, src, n, cols).map_err(context)?, scheme)
+            }
+            (Some(layout), Some(scheme)) => {
+                let mut values = vec![0f32; cols];
+                let mut q8 = Vec::with_capacity(n * (cols / 32) * 34);
+                for row in src.chunks_exact(row_bytes.max(1)) {
+                    dequant_row(dtype, row, 1.0, &mut values).map_err(context)?;
+                    quantize_q8_0(&values, &mut q8);
+                }
+                PackedData::Quant(pack_blocks(layout, &q8, n, cols).map_err(context)?, scheme)
+            }
+            _ => {
+                let mut floats = vec![0f32; n * cols];
+                for (row, dst) in src
+                    .chunks_exact(row_bytes.max(1))
+                    .zip(floats.chunks_exact_mut(cols.max(1)))
+                {
+                    dequant_row(dtype, row, 1.0, dst).map_err(context)?;
+                }
+                PackedData::Float(floats)
+            }
+        };
+        Ok(PackedPart { rows: n, data })
+    }
+}
+
+/// The `[rows, cols]` weight whose GGUF bytes are `raw`, converted on the host
+/// as [`upload_matrix_with`] does but kept for a later [`upload_packed`]: all
+/// its chunks at once.
+fn pack_matrix(
+    tensor_name: &str,
+    dtype: GgmlDType,
+    raw: &[u8],
+    rows: usize,
+    cols: usize,
+    limit: usize,
+    dense: bool,
+) -> Result<PackedMatrix, CucaError> {
+    let plan = PackPlan::new(tensor_name, dtype, raw.len(), rows, cols, limit, dense)?;
+    let parts = plan
+        .chunks()
+        .map(|range| plan.pack(raw, range))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(PackedMatrix {
+        cols,
+        parts,
+        bytes: plan.bytes(),
+    })
+}
+
 /// The `[rows, cols]` weight whose GGUF bytes are `raw`, on the device, in
 /// row chunks of at most `limit` device bytes:
 ///
@@ -543,6 +813,10 @@ fn plan_dense(own: &[(String, QuantShape)], peers: &[QuantShape]) -> HashSet<Str
 /// - with `dense`, any dtype is dequantized to f32 (exact), whatever the
 ///   rules above say: [`plan_dense`] picks the weights that must not share
 ///   an autotune key with a weight of the other quantization scheme.
+///
+/// Chunks are converted and uploaded one at a time (the host holds one
+/// converted chunk, not the whole weight); [`pack_matrix`] followed by
+/// [`upload_packed`] yields the same tensors.
 #[expect(
     clippy::too_many_arguments,
     reason = "tensor identity, shape, destination and the two upload policies are all independent"
@@ -557,73 +831,11 @@ fn upload_matrix_with(
     limit: usize,
     dense: bool,
 ) -> Result<Weight, CucaError> {
-    let context = |e: CucaError| err(format!("tensor `{tensor_name}`: {e}"));
-    let block = dtype.block_size();
-    if !cols.is_multiple_of(block) {
-        return Err(err(format!(
-            "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size {block}"
-        )));
-    }
-    let row_bytes = cols / block * dtype.type_size();
-    if raw.len() != rows * row_bytes {
-        return Err(err(format!(
-            "tensor `{tensor_name}`: {} bytes do not hold a [{rows}, {cols}] {dtype:?} tensor",
-            raw.len()
-        )));
-    }
-    // The layout the weight takes on the device, and its bytes per row.
-    let stored = if dense { None } else { stored_layout(dtype) };
-    if stored == Some(GgmlDType::Q8_0) && !cols.is_multiple_of(32) {
-        return Err(err(format!(
-            "tensor `{tensor_name}`: row length {cols} is not a multiple of the 32-element Q8_0 block"
-        )));
-    }
-    let mut chunk = (limit / stored_row_bytes(stored, cols)).clamp(1, rows.max(1));
-    if chunk < rows && chunk >= 64 {
-        // Keep chunk widths multiples of the plane width, which the
-        // single-row kernel needs ([`vecmat_fits`]).
-        chunk -= chunk % 64;
-    }
-
-    let mut parts = Vec::with_capacity(rows.div_ceil(chunk));
-    let mut values = vec![0f32; cols];
-    let mut start = 0;
-    while start < rows {
-        let end = (start + chunk).min(rows);
-        let n = end - start;
-        let src = &raw[start * row_bytes..end * row_bytes];
-        let data = match (stored, quant_scheme(stored.unwrap_or(dtype))) {
-            (Some(layout), Some(scheme)) if layout == dtype => TensorData::from_bytes_vec(
-                pack_blocks(dtype, src, n, cols).map_err(context)?,
-                [n, cols],
-                DType::QFloat(scheme),
-            ),
-            (Some(layout), Some(scheme)) => {
-                let mut q8 = Vec::with_capacity(n * (cols / 32) * 34);
-                for row in src.chunks_exact(row_bytes.max(1)) {
-                    dequant_row(dtype, row, 1.0, &mut values).map_err(context)?;
-                    quantize_q8_0(&values, &mut q8);
-                }
-                TensorData::from_bytes_vec(
-                    pack_blocks(layout, &q8, n, cols).map_err(context)?,
-                    [n, cols],
-                    DType::QFloat(scheme),
-                )
-            }
-            _ => {
-                let mut floats = vec![0f32; n * cols];
-                for (row, dst) in src
-                    .chunks_exact(row_bytes.max(1))
-                    .zip(floats.chunks_exact_mut(cols.max(1)))
-                {
-                    dequant_row(dtype, row, 1.0, dst).map_err(context)?;
-                }
-                TensorData::new(floats, [n, cols])
-            }
-        };
-        parts.push(Tensor::from_data(data, device));
-        start = end;
-    }
+    let plan = PackPlan::new(tensor_name, dtype, raw.len(), rows, cols, limit, dense)?;
+    let parts = plan
+        .chunks()
+        .map(|range| plan.pack(raw, range).map(|part| part.upload(cols, device)))
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(Weight { parts })
 }
 
@@ -711,44 +923,68 @@ impl WeightReader<'_> {
 
     /// The `[n_expert, rows, cols]` expert tensor `tensor_name`, one device
     /// weight per expert, read one expert at a time.
-    fn experts(
+    fn expert_matrices(
         &mut self,
         tensor_name: &str,
         n_expert: usize,
         rows: usize,
         cols: usize,
     ) -> Result<Vec<Weight>, CucaError> {
-        let info = tensor_info(self.content, tensor_name)?;
-        if info.shape.dims() != [n_expert, rows, cols] {
-            return Err(err(format!(
-                "tensor `{tensor_name}`: expected shape {:?}, found {:?}",
-                [n_expert, rows, cols],
-                info.shape.dims()
-            )));
-        }
-        let dtype = info.ggml_dtype;
-        if !cols.is_multiple_of(dtype.block_size()) {
-            return Err(err(format!(
-                "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size {}",
-                dtype.block_size()
-            )));
-        }
-        let expert_bytes = rows * (cols / dtype.block_size() * dtype.type_size());
+        let slice = ExpertSlice::read(self.content, tensor_name, n_expert, rows, cols)?;
+        let dense = self.dense.contains(tensor_name);
         let mut out = Vec::with_capacity(n_expert);
         for e in 0..n_expert {
-            self.read_at(tensor_name, e * expert_bytes, expert_bytes)?;
+            self.read_at(tensor_name, e * slice.file_bytes, slice.file_bytes)?;
             out.push(upload_matrix_with(
                 tensor_name,
-                dtype,
+                slice.dtype,
                 &self.buf,
                 rows,
                 cols,
                 self.device,
                 MAX_PART_BYTES,
-                self.dense.contains(tensor_name),
+                dense,
             )?);
         }
         Ok(out)
+    }
+
+    /// The experts of MoE layer `il` (FFN width `ff`): every expert read and
+    /// uploaded now, or, with `tiers`, left in the file for the tiers to
+    /// load.
+    fn expert_bank(
+        &mut self,
+        il: usize,
+        n_expert: usize,
+        ff: usize,
+        n_embd: usize,
+        tiers: Option<&TierPlan>,
+    ) -> Result<GpuExpertBank, CucaError> {
+        if let Some(plan) = tiers {
+            let stored_bytes = plan
+                .store
+                .layer(il)
+                .ok_or_else(|| err(format!("layer {il} has no experts in the expert store")))?
+                .stored_bytes;
+            return Ok(GpuExpertBank::Tiered {
+                il,
+                device: Mutex::new(SlotTable::new(plan.device_slots)),
+                device_slots: plan.device_slots,
+                stored_bytes,
+                store: Arc::clone(&plan.store),
+            });
+        }
+        let blk = |part: &str| name::blk(il, part);
+        let gate = self.expert_matrices(&blk(name::FFN_GATE_EXPS), n_expert, ff, n_embd)?;
+        let up = self.expert_matrices(&blk(name::FFN_UP_EXPS), n_expert, ff, n_embd)?;
+        let down = self.expert_matrices(&blk(name::FFN_DOWN_EXPS), n_expert, n_embd, ff)?;
+        Ok(GpuExpertBank::Resident(
+            gate.into_iter()
+                .zip(up)
+                .zip(down)
+                .map(|((gate, up), down)| GpuExpert { gate, up, down })
+                .collect(),
+        ))
     }
 
     /// A 1-D tensor dequantized on the host.
@@ -852,10 +1088,271 @@ enum FfnWeights {
     Moe {
         spec: MoeSpec,
         router: Weight,
-        gate: Vec<Weight>,
-        up: Vec<Weight>,
-        down: Vec<Weight>,
+        experts: GpuExpertBank,
     },
+}
+
+/// One routed expert's three projections on the device.
+struct GpuExpert {
+    gate: Weight,
+    up: Weight,
+    down: Weight,
+}
+
+/// One routed expert converted on the host and ready to upload: the item of
+/// the RAM tier, built on the loader threads (it holds no device tensor).
+struct PackedExpert {
+    gate: PackedMatrix,
+    up: PackedMatrix,
+    down: PackedMatrix,
+}
+
+/// The device weights of `packed`: its host bytes move when this is the last
+/// handle to it (no RAM tier holds it) and are copied otherwise.
+fn upload_expert(packed: Arc<PackedExpert>, device: &Device) -> GpuExpert {
+    match Arc::try_unwrap(packed) {
+        Ok(owned) => GpuExpert {
+            gate: owned.gate.upload(device),
+            up: owned.up.upload(device),
+            down: owned.down.upload(device),
+        },
+        Err(shared) => GpuExpert {
+            gate: upload_packed(&shared.gate, device),
+            up: upload_packed(&shared.up, device),
+            down: upload_packed(&shared.down, device),
+        },
+    }
+}
+
+/// Lock `mutex`, ignoring poisoning: the tables stay consistent between
+/// operations, so a panic elsewhere does not invalidate them.
+fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The experts of one MoE layer.
+enum GpuExpertBank {
+    /// Every expert on the device.
+    Resident(Vec<GpuExpert>),
+    /// The experts stay in the file; `device` holds at most `device_slots`
+    /// of them on the device, the rest come through the `store`'s tiers.
+    Tiered {
+        il: usize,
+        device: Mutex<SlotTable<GpuExpert>>,
+        device_slots: usize,
+        /// Device bytes of one expert of this layer.
+        stored_bytes: usize,
+        store: Arc<ExpertStore<PackedExpert>>,
+    },
+}
+
+/// The tiers of a tiered load: the expert store (RAM tier and disk) and the
+/// device tier's slots per layer.
+struct TierPlan {
+    store: Arc<ExpertStore<PackedExpert>>,
+    device_slots: usize,
+}
+
+impl TierPlan {
+    /// Seed the heat from `heat` and load the hottest experts: the device
+    /// tier of every layer first, then the RAM tier with the next ones.
+    fn warm(&self, weights: &Weights, heat: &ExpertHeat) -> Result<(), CucaError> {
+        self.store.shared().seed(heat);
+        for layer in &weights.layers {
+            if let FfnWeights::Moe { experts, .. } = &layer.ffn {
+                experts.warm(heat, &weights.device)?;
+            }
+        }
+        self.store
+            .warm(heat, self.device_slots, self.store.ram_slots())
+    }
+}
+
+/// A MoE layer's expert, resident or fetched for this pass.
+enum Picked<'a> {
+    Resident(&'a GpuExpert),
+    Tiered(Arc<GpuExpert>),
+}
+
+impl Deref for Picked<'_> {
+    type Target = GpuExpert;
+
+    fn deref(&self) -> &GpuExpert {
+        match self {
+            Picked::Resident(expert) => expert,
+            Picked::Tiered(expert) => expert,
+        }
+    }
+}
+
+/// One MoE layer pass over its experts; see [`GpuExpertBank::walk`].
+// One value per layer pass on the stack: the size gap between the variants
+// costs nothing worth an allocation per pass.
+#[allow(clippy::large_enum_variant)]
+enum ExpertWalk<'a> {
+    Resident(&'a [GpuExpert]),
+    Tiered(TieredWalk<'a>),
+}
+
+/// The pass of a tiered layer: the device table in front of the store's
+/// [`TierPass`] over the experts the device lacks.
+struct TieredWalk<'a> {
+    il: usize,
+    device: &'a Mutex<SlotTable<GpuExpert>>,
+    device_slots: usize,
+    stored_bytes: usize,
+    store: &'a ExpertStore<PackedExpert>,
+    /// The RAM tier and disk walk over the experts missing on the device.
+    lower: TierPass<'a, PackedExpert>,
+    /// The ascending experts the layer computes.
+    needed: Vec<u32>,
+    /// Index into `needed` of the next expert to compute.
+    cursor: usize,
+    /// The layer's heat, read at the first eviction of the pass.
+    heat: Option<Vec<u32>>,
+}
+
+impl GpuExpertBank {
+    /// Start the pass over the experts `routing` (`t` rows) picks, which the
+    /// caller then asks for in ascending order ([`ExpertWalk::next`]). A
+    /// tiered bank also records the routing in the heat and the counters and
+    /// starts reading the experts that are not on the device.
+    fn walk(&self, routing: &Routing, t: usize) -> ExpertWalk<'_> {
+        match self {
+            Self::Resident(experts) => ExpertWalk::Resident(experts),
+            Self::Tiered {
+                il,
+                device,
+                device_slots,
+                stored_bytes,
+                store,
+            } => {
+                let needed: Vec<u32> = routing
+                    .per_expert
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, picks)| !picks.is_empty())
+                    .map(|(e, _)| e as u32)
+                    .collect();
+                let shared = store.shared();
+                shared.record(*il, routing, t);
+                add(&shared.lookups, needed.len() as u64);
+                let missing: Vec<u32> = {
+                    let table = locked(device);
+                    needed
+                        .iter()
+                        .copied()
+                        .filter(|&e| !table.contains(e))
+                        .collect()
+                };
+                add(&shared.device_hits, (needed.len() - missing.len()) as u64);
+                ExpertWalk::Tiered(TieredWalk {
+                    il: *il,
+                    device,
+                    device_slots: *device_slots,
+                    stored_bytes: *stored_bytes,
+                    store,
+                    lower: store.pass(*il, &missing),
+                    needed,
+                    cursor: 0,
+                    heat: None,
+                })
+            }
+        }
+    }
+
+    /// Fill the device table of a tiered bank with the hottest experts of
+    /// `heat` (at most its slots), read through the loader pool and uploaded
+    /// here; a resident bank has nothing to load.
+    fn warm(&self, heat: &ExpertHeat, device: &Device) -> Result<(), CucaError> {
+        let Self::Tiered {
+            il,
+            device: table,
+            device_slots,
+            stored_bytes,
+            store,
+        } = self
+        else {
+            return Ok(());
+        };
+        let ids: Vec<u32> = heat.ranked(*il).into_iter().take(*device_slots).collect();
+        let built = store.fetch(*il, &ids)?;
+        let mut table = locked(table);
+        for (e, packed) in ids.into_iter().zip(built) {
+            table.insert(e, Arc::new(upload_expert(packed, device)));
+            add(&store.shared().device_resident_bytes, *stored_bytes as u64);
+        }
+        Ok(())
+    }
+}
+
+impl<'a> ExpertWalk<'a> {
+    /// Expert `e`, the next of the pass (ascending, only experts the routing
+    /// picked), ready to compute on `device`.
+    fn next(&mut self, e: usize, device: &Device) -> Result<Picked<'a>, CucaError> {
+        match self {
+            Self::Resident(experts) => {
+                let experts: &'a [GpuExpert] = experts;
+                experts
+                    .get(e)
+                    .map(Picked::Resident)
+                    .ok_or_else(|| err(format!("expert {e} out of range")))
+            }
+            Self::Tiered(walk) => walk.next(e as u32, device).map(Picked::Tiered),
+        }
+    }
+}
+
+impl TieredWalk<'_> {
+    /// Expert `e` on the device: from the device table, else built from the
+    /// lower tiers and uploaded, evicting the table's victim for room. The
+    /// table lock is never held while waiting for a read or uploading.
+    fn next(&mut self, e: u32, device: &Device) -> Result<Arc<GpuExpert>, CucaError> {
+        let shared = self.store.shared();
+        let at = self.needed[self.cursor..]
+            .iter()
+            .position(|&n| n == e)
+            .ok_or_else(|| {
+                err(format!(
+                    "expert {e} is not next in layer {} of the pass",
+                    self.il
+                ))
+            })?;
+        self.cursor += at + 1;
+        let resident = locked(self.device).get(e);
+        if let Some(resident) = resident {
+            return Ok(resident);
+        }
+        let packed = self.lower.next(e)?;
+        let later = &self.needed[self.cursor..];
+        // Room for the new expert: a free slot, else the table's victim, and
+        // never an expert the pass still computes (then the new expert is
+        // computed without being cached).
+        let admit = {
+            let mut table = locked(self.device);
+            if table.len() < self.device_slots {
+                true
+            } else {
+                let heat = self
+                    .heat
+                    .get_or_insert_with(|| shared.heat_snapshot(self.il));
+                match table.victim(heat, later) {
+                    Some(victim) if later.binary_search(&victim).is_err() => {
+                        table.remove(victim);
+                        sub(&shared.device_resident_bytes, self.stored_bytes as u64);
+                        true
+                    }
+                    _ => false,
+                }
+            }
+        };
+        let expert = Arc::new(upload_expert(packed, device));
+        if admit {
+            locked(self.device).insert(e, Arc::clone(&expert));
+            add(&shared.device_resident_bytes, self.stored_bytes as u64);
+        }
+        Ok(expert)
+    }
 }
 
 /// Per-layer-embedding block of one layer (Gemma 4).
@@ -968,6 +1465,8 @@ pub(crate) struct GpuTransformer {
     kv_len: usize,
     /// The weights held quantized, for a drafter's [`plan_dense`].
     peers: Vec<QuantShape>,
+    /// Counters and heat of the expert tiers, with `ExpertPlacement::Tiered`.
+    tiers: Option<Arc<TierShared>>,
 }
 
 impl Weights {
@@ -976,11 +1475,14 @@ impl Weights {
     /// norm, the LM head (`output.weight`, else the token embedding), the
     /// per-layer-embedding projection and the RoPE tables. A drafter's cache
     /// is empty: it reads the target's.
+    /// With `tiers`, the experts of the MoE layers stay in the file (their
+    /// banks hold the tiers) instead of being read.
     fn load(
         reader: &mut WeightReader<'_>,
         path: &Path,
         hp: Hparams,
         context_length: usize,
+        tiers: Option<&TierPlan>,
     ) -> Result<(Self, KvLayers), CucaError> {
         let content = reader.content;
         let device = reader.device.clone();
@@ -1036,7 +1538,7 @@ impl Weights {
             } else {
                 kv.push(None);
             }
-            layers.push(load_layer(reader, &hp, il, spec, &layout)?);
+            layers.push(load_layer(reader, &hp, il, spec, &layout, tiers)?);
         }
         Ok((
             Self {
@@ -1053,23 +1555,180 @@ impl Weights {
     }
 }
 
+/// Where every MoE layer's experts live in the file and what one occupies in
+/// the RAM and device tiers (its packed bytes), and per layer which of its
+/// three expert tensors [`plan_dense`] holds as f32.
+///
+/// # Errors
+///
+/// The loader's errors for missing or malformed expert tensors.
+fn tier_layout(
+    content: &gguf_file::Content,
+    hp: &Hparams,
+    spec: MoeSpec,
+    dense: &HashSet<String>,
+) -> Result<(Vec<LayerExperts>, Vec<[bool; 3]>), CucaError> {
+    let mut layers = Vec::new();
+    let mut flags = vec![[false; 3]; hp.n_layer];
+    for (il, layer_spec) in hp.layers.iter().enumerate() {
+        let Ffn::Moe { ff } = LayerLayout::read(hp, il, layer_spec, content)?.ffn else {
+            continue;
+        };
+        let slice = |part: &str, rows, cols| {
+            ExpertSlice::read(content, &name::blk(il, part), spec.n_expert, rows, cols)
+        };
+        let gate = slice(name::FFN_GATE_EXPS, ff, hp.n_embd)?;
+        let up = slice(name::FFN_UP_EXPS, ff, hp.n_embd)?;
+        let down = slice(name::FFN_DOWN_EXPS, hp.n_embd, ff)?;
+        let is_dense = |part: &str| dense.contains(&name::blk(il, part));
+        let flag = [
+            is_dense(name::FFN_GATE_EXPS),
+            is_dense(name::FFN_UP_EXPS),
+            is_dense(name::FFN_DOWN_EXPS),
+        ];
+        let stored = |s: &ExpertSlice, dense| device_bytes(s.dtype, s.rows, s.cols, dense);
+        layers.push(LayerExperts {
+            il,
+            gate,
+            up,
+            down,
+            stored_bytes: stored(&gate, flag[0]) + stored(&up, flag[1]) + stored(&down, flag[2]),
+        });
+        flags[il] = flag;
+    }
+    Ok((layers, flags))
+}
+
+/// Convert one expert of `layer` from its three matrices' file bytes, as the
+/// resident loader converts it; `dense` says per projection (gate, up, down)
+/// whether the weight is held as f32.
+fn build_packed_expert(
+    dense: &[[bool; 3]],
+    layer: &LayerExperts,
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+) -> Result<PackedExpert, CucaError> {
+    let flags = dense.get(layer.il).copied().unwrap_or_default();
+    let one = |slice: &ExpertSlice, bytes: &[u8], part: &str, dense: bool| {
+        pack_matrix(
+            &name::blk(layer.il, part),
+            slice.dtype,
+            bytes,
+            slice.rows,
+            slice.cols,
+            MAX_PART_BYTES,
+            dense,
+        )
+    };
+    let expert = PackedExpert {
+        gate: one(&layer.gate, gate, name::FFN_GATE_EXPS, flags[0])?,
+        up: one(&layer.up, up, name::FFN_UP_EXPS, flags[1])?,
+        down: one(&layer.down, down, name::FFN_DOWN_EXPS, flags[2])?,
+    };
+    debug_assert_eq!(
+        expert.gate.bytes + expert.up.bytes + expert.down.bytes,
+        layer.stored_bytes
+    );
+    Ok(expert)
+}
+
+/// The tiers of a tiered model (`ExpertPlacement::Tiered`): the experts of
+/// every MoE layer located in the file, the device tier's slots and the RAM
+/// tier behind it sized by `tiers`.
+///
+/// # Errors
+///
+/// [`CucaError::Config`] for a model without experts, a device or RAM budget
+/// below `n_used` experts per layer or heat of another shape; the loader's
+/// errors for unreadable expert tensors.
+fn open_tiers(
+    content: &gguf_file::Content,
+    path: &Path,
+    hp: &Hparams,
+    tiers: &ExpertTiers,
+    dense: &HashSet<String>,
+) -> Result<TierPlan, CucaError> {
+    let spec = hp.moe.ok_or_else(|| {
+        CucaError::Config(format!(
+            "expert tiers need a mixture-of-experts model; `{}` has no experts",
+            hp.arch.name()
+        ))
+    })?;
+    let (layers, flags) = tier_layout(content, hp, spec, dense)?;
+    let per_expert: usize = layers.iter().map(|l| l.stored_bytes).sum();
+    let device_slots = tier_slots(
+        "device",
+        tiers.device_bytes,
+        per_expert,
+        spec.n_expert,
+        spec.n_used,
+    )?;
+    let shared = Arc::new(TierShared::new(hp.n_layer, spec.n_expert));
+    if let Some(heat) = &tiers.warm_from {
+        shared.check(heat)?;
+    }
+    let build: Arc<BuildFn<PackedExpert>> = Arc::new(
+        move |layer: &LayerExperts, gate: &[u8], up: &[u8], down: &[u8]| {
+            build_packed_expert(&flags, layer, gate, up, down)
+        },
+    );
+    let store = ExpertStore::open(
+        path,
+        hp.n_layer,
+        layers,
+        spec.n_expert,
+        spec.n_used,
+        tiers.ram_bytes,
+        true,
+        tiers.loader_threads,
+        build,
+        shared,
+    )?;
+    Ok(TierPlan {
+        store: Arc::new(store),
+        device_slots,
+    })
+}
+
 impl GpuTransformer {
-    /// Load the model from the GGUF file at `path`, whose index `content`
-    /// was read already, onto `device` with a K/V cache for
-    /// `context_length` positions.
-    ///
-    /// # Errors
-    ///
-    /// [`CucaError::Config`] when `context_length` is zero or above the
-    /// checkpoint maximum or `device` is not a GPU compiled into this build;
-    /// [`CucaError::Provider`] for unsupported or malformed checkpoints and a
-    /// device that fails to open; [`CucaError::Io`] when the file cannot be
-    /// read.
+    /// [`GpuTransformer::load_placed`] with every expert resident (tests).
+    #[cfg(test)]
     pub(crate) fn load(
         content: &gguf_file::Content,
         path: &Path,
         context_length: usize,
         device: LocalDevice,
+    ) -> Result<Self, CucaError> {
+        Self::load_placed(
+            content,
+            path,
+            context_length,
+            device,
+            &ExpertPlacement::Resident,
+        )
+    }
+
+    /// Load the model from the GGUF file at `path`, whose index `content`
+    /// was read already, onto `device` with a K/V cache for
+    /// `context_length` positions, its experts placed as `experts` says
+    /// (`Tiered`: left in the file, see the module docs).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] when `context_length` is zero or above the
+    /// checkpoint maximum, `device` is not a GPU compiled into this build, or
+    /// the `experts` budgets do not fit the model (no experts, a device or
+    /// RAM tier below `n_used` experts per layer, heat of another shape);
+    /// [`CucaError::Provider`] for unsupported or malformed checkpoints and a
+    /// device that fails to open; [`CucaError::Io`] when the file cannot be
+    /// read.
+    pub(crate) fn load_placed(
+        content: &gguf_file::Content,
+        path: &Path,
+        context_length: usize,
+        device: LocalDevice,
+        experts: &ExpertPlacement,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         if hp.arch.is_drafter() {
@@ -1086,6 +1745,13 @@ impl GpuTransformer {
         }
         check_context(&hp, context_length)?;
         let device = open_device(device)?;
+
+        let shapes = quant_shapes(content);
+        let dense = plan_dense(&shapes, &[]);
+        let tiers = match experts {
+            ExpertPlacement::Resident => None,
+            ExpertPlacement::Tiered(t) => Some((t, open_tiers(content, path, &hp, t, &dense)?)),
+        };
 
         let embed = RowTable::open(
             path,
@@ -1106,8 +1772,6 @@ impl GpuTransformer {
             None => None,
         };
 
-        let shapes = quant_shapes(content);
-        let dense = plan_dense(&shapes, &[]);
         let peers = shapes
             .iter()
             .filter(|(tensor, _)| !dense.contains(tensor))
@@ -1120,8 +1784,14 @@ impl GpuTransformer {
             device: &device,
             dense,
         };
-        let (weights, kv) = Weights::load(&mut reader, path, hp, context_length)?;
+        let plan = tiers.as_ref().map(|(_, plan)| plan);
+        let (weights, kv) = Weights::load(&mut reader, path, hp, context_length, plan)?;
         drop(reader);
+        if let Some((tiers, plan)) = &tiers
+            && let Some(heat) = &tiers.warm_from
+        {
+            plan.warm(&weights, heat)?;
+        }
 
         Ok(Self {
             weights,
@@ -1132,7 +1802,14 @@ impl GpuTransformer {
             kv,
             kv_len: 0,
             peers,
+            tiers: tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
         })
+    }
+
+    /// Counters and heat of the expert tiers; `None` unless loaded with
+    /// `ExpertPlacement::Tiered`.
+    pub(crate) fn expert_tiers(&self) -> Option<Arc<TierShared>> {
+        self.tiers.clone()
     }
 
     /// Run `tokens` through the model at positions `start_pos..`, appending
@@ -1461,7 +2138,7 @@ impl GpuDrafter {
         };
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
-        let (net, _) = Weights::load(&mut reader, path, hp, context_length)?;
+        let (net, _) = Weights::load(&mut reader, path, hp, context_length, None)?;
         if net.lm_head.rows() != target.vocab() {
             return Err(err(format!(
                 "drafter vocabulary {} differs from the target's {}",
@@ -1545,13 +2222,15 @@ impl GpuDrafter {
     }
 }
 
-/// Read every weight of layer `il`.
+/// Read every weight of layer `il`; with `tiers`, the layer's experts stay in
+/// the file.
 fn load_layer(
     reader: &mut WeightReader<'_>,
     hp: &Hparams,
     il: usize,
     spec: &LayerSpec,
     layout: &LayerLayout,
+    tiers: Option<&TierPlan>,
 ) -> Result<LayerWeights, CucaError> {
     let n_embd = hp.n_embd;
     let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
@@ -1624,9 +2303,7 @@ fn load_layer(
         (Ffn::Moe { ff }, Some(spec)) => FfnWeights::Moe {
             spec,
             router: reader.matrix(&blk(name::FFN_GATE_INP), spec.n_expert, n_embd)?,
-            gate: reader.experts(&blk(name::FFN_GATE_EXPS), spec.n_expert, ff, n_embd)?,
-            up: reader.experts(&blk(name::FFN_UP_EXPS), spec.n_expert, ff, n_embd)?,
-            down: reader.experts(&blk(name::FFN_DOWN_EXPS), spec.n_expert, n_embd, ff)?,
+            experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, tiers)?,
         },
         (Ffn::Moe { .. }, None) => return Err(err("expert tensors without an expert count")),
     };
@@ -1982,9 +2659,7 @@ impl FfnWeights {
             FfnWeights::Moe {
                 spec,
                 router,
-                gate,
-                up,
-                down,
+                experts,
             } => {
                 let [t, n_embd] = f.dims();
                 let logits = read_f32(linear(f.clone(), router), "router logits")?;
@@ -1997,32 +2672,43 @@ impl FfnWeights {
                 // test), so the scale stays upstream of the last matmul. The
                 // single-token branch below multiplies the output by a host
                 // scalar instead, a form the live suite ran without loss.
-                let expert = |e: usize,
-                              x: Tensor<2>,
-                              weights: Option<Tensor<2>>|
-                 -> Result<Tensor<2>, CucaError> {
-                    let (gate, up, down) = gate
-                        .get(e)
-                        .zip(up.get(e))
-                        .zip(down.get(e))
-                        .map(|((g, u), d)| (g, u, d))
-                        .ok_or_else(|| err(format!("expert {e} out of range")))?;
-                    let hidden = activate(linear(x.clone(), gate), act) * linear(x, up);
-                    let hidden = match weights {
-                        Some(w) => hidden * w,
-                        None => hidden,
+                let expert =
+                    |ex: &GpuExpert, x: Tensor<2>, weights: Option<Tensor<2>>| -> Tensor<2> {
+                        let hidden = activate(linear(x.clone(), &ex.gate), act) * linear(x, &ex.up);
+                        let hidden = match weights {
+                            Some(w) => hidden * w,
+                            None => hidden,
+                        };
+                        linear(hidden, &ex.down)
                     };
-                    Ok(linear(hidden, down))
-                };
+                let mut walk = experts.walk(&routing, t);
+                // A single token's experts (at most `n_used`) all fit the
+                // device table: bring every one to the device before queuing
+                // any compute, so the op stream after the router readback is
+                // the resident mode's (uploads between experts changed how
+                // burn fused the elementwise ops, by float rounding).
+                let mut ready = Vec::new();
+                if t == 1 {
+                    for (e, picks) in routing.per_expert.iter().enumerate() {
+                        if !picks.is_empty() {
+                            ready.push(walk.next(e, device)?);
+                        }
+                    }
+                }
+                let mut ready = ready.into_iter();
                 let mut out = Tensor::<2>::zeros([t, n_embd], device);
                 for (e, picks) in routing.per_expert.iter().enumerate() {
                     let Some(&(_, weight)) = picks.first() else {
                         continue;
                     };
+                    let picked = match ready.next() {
+                        Some(picked) => picked,
+                        None => walk.next(e, device)?,
+                    };
                     if t == 1 {
                         // The one token reaches the expert whole: no gather
                         // and no scatter.
-                        let y = expert(e, f.clone(), None)?;
+                        let y = expert(&picked, f.clone(), None);
                         out = out + y.mul_scalar(f64::from(weight));
                         continue;
                     }
@@ -2031,7 +2717,7 @@ impl FfnWeights {
                     let m = ids.len();
                     let ids = Tensor::<1, Int>::from_ints(TensorData::new(ids, [m]), device);
                     let weights = Tensor::<2>::from_data(TensorData::new(weights, [m, 1]), device);
-                    let y = expert(e, f.clone().select(0, ids.clone()), Some(weights))?;
+                    let y = expert(&picked, f.clone().select(0, ids.clone()), Some(weights));
                     out = out.select_assign(0, ids, y, IndexingUpdateOp::Add);
                 }
                 Ok(out)
@@ -2248,7 +2934,7 @@ mod tests {
 
     use super::super::cpu::Transformer;
     use super::super::tiny::{
-        PROMPT, TinyModel, TinyOptions, TinySpec, write_spec, write_tiny_model_with,
+        PROMPT, TinyModel, TinyOptions, TinySpec, VOCAB, write_spec, write_tiny_model_with,
     };
     use super::*;
 
@@ -2497,6 +3183,141 @@ mod tests {
         }
     }
 
+    /// Device bytes of one expert summed over the MoE layers of `model`, as
+    /// the loader counts them.
+    fn expert_device_bytes(model: &TinyModel) -> usize {
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let hp = read_hparams(&content).unwrap();
+        let dense = plan_dense(&quant_shapes(&content), &[]);
+        let (layers, _) = tier_layout(&content, &hp, hp.moe.unwrap(), &dense).unwrap();
+        layers.iter().map(|l| l.stored_bytes).sum()
+    }
+
+    fn load_placed_gpu(
+        model: &TinyModel,
+        device: LocalDevice,
+        experts: &ExpertPlacement,
+    ) -> Result<GpuTransformer, CucaError> {
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        GpuTransformer::load_placed(&content, &model.path, 32, device, experts)
+    }
+
+    /// A 24-token prompt in chunks of 16 then 8 greedy steps: the logits of
+    /// every call.
+    fn greedy_run(m: &mut GpuTransformer) -> Vec<Vec<f32>> {
+        let prompt: Vec<u32> = (0..24u32).map(|i| (i * 5 + 3) % VOCAB as u32).collect();
+        let mut out: Vec<Vec<f32>> = Vec::new();
+        let mut at = 0;
+        for chunk in prompt.chunks(16) {
+            out.push(m.forward(chunk, at, Want::Last).unwrap().unwrap());
+            at += chunk.len();
+        }
+        for _ in 0..8 {
+            let last = out.last().unwrap();
+            let next = (0..last.len())
+                .max_by(|&a, &b| last[a].total_cmp(&last[b]))
+                .unwrap() as u32;
+            out.push(m.forward(&[next], at, Want::Last).unwrap().unwrap());
+            at += 1;
+        }
+        out
+    }
+
+    /// Placement only decides speed: with the smallest device budget (two of
+    /// eight experts per layer, so nearly every routing evicts), with and
+    /// without a RAM tier, and warm-started from the heat of a run, the
+    /// logits equal the resident GPU load's bit for bit, for every MoE
+    /// architecture (same kernels, same packed bytes; a single-token pass
+    /// uploads its missing experts before queuing any compute, as burn fuses
+    /// elementwise ops differently, by float rounding, when uploads
+    /// interleave with them). All loads share one process, so burn's
+    /// autotune picks are shared.
+    #[test]
+    fn gpu_tiered_experts_match_gpu_resident() {
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        for spec in [
+            TinySpec::granitemoe(),
+            TinySpec::qwen3moe(),
+            TinySpec::olmoe(),
+        ] {
+            let arch = spec.arch;
+            let model = write_spec(&TinySpec {
+                moe: Some((8, 2)),
+                n_layer: 4,
+                ..spec
+            });
+            let min = 2 * expert_device_bytes(&model) as u64;
+            let want = greedy_run(
+                &mut load_placed_gpu(&model, device, &ExpertPlacement::Resident).unwrap(),
+            );
+            let tiers = |ram_bytes, warm_from| {
+                ExpertPlacement::Tiered(ExpertTiers {
+                    ram_bytes,
+                    device_bytes: min,
+                    loader_threads: 2,
+                    warm_from,
+                })
+            };
+            let mut heat = None;
+            for ram_bytes in [0, min] {
+                let mut tiered = load_placed_gpu(&model, device, &tiers(ram_bytes, None)).unwrap();
+                let got = greedy_run(&mut tiered);
+                assert_eq!(got, want, "{arch} ram={ram_bytes}");
+                let stats = tiered.expert_tiers().unwrap().stats();
+                assert!(stats.disk_reads > 0, "{arch}: {stats:?}");
+                assert!(stats.device_resident_bytes <= min, "{arch}: {stats:?}");
+                assert!(stats.ram_resident_bytes <= ram_bytes, "{arch}: {stats:?}");
+                assert_eq!(
+                    stats.lookups,
+                    stats.device_hits + stats.ram_hits + stats.disk_reads,
+                    "{arch}: {stats:?}"
+                );
+                heat = Some(tiered.expert_tiers().unwrap().heat());
+            }
+            // The warm start fills the device tier at load and changes no
+            // logit.
+            let mut warm = load_placed_gpu(&model, device, &tiers(min, heat)).unwrap();
+            let loaded = warm.expert_tiers().unwrap().stats();
+            assert!(loaded.device_resident_bytes > 0, "{arch}: {loaded:?}");
+            assert!(loaded.device_resident_bytes <= min, "{arch}: {loaded:?}");
+            let got = greedy_run(&mut warm);
+            assert_eq!(got, want, "{arch} warm");
+            let stats = warm.expert_tiers().unwrap().stats();
+            assert!(stats.device_resident_bytes <= min, "{arch}: {stats:?}");
+            assert!(stats.device_hits > 0, "{arch}: {stats:?}");
+
+            // A budget below `n_used` experts per layer names the minimum.
+            let below = ExpertPlacement::Tiered(ExpertTiers {
+                device_bytes: min - 1,
+                loader_threads: 2,
+                ..ExpertTiers::default()
+            });
+            let e = load_placed_gpu(&model, device, &below).err().unwrap();
+            assert!(
+                matches!(&e, CucaError::Config(m) if m.contains(&format!("at least 2 ({min} bytes)"))),
+                "{arch}: {e:?}"
+            );
+        }
+        let dense = write_spec(&TinySpec::llama());
+        let placement = ExpertPlacement::Tiered(ExpertTiers {
+            device_bytes: 1 << 30,
+            loader_threads: 2,
+            ..ExpertTiers::default()
+        });
+        let e = load_placed_gpu(&dense, device, &placement).err().unwrap();
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("`llama` has no experts")),
+            "{e:?}"
+        );
+    }
+
     /// Past a sliding slab's bound (the tiny Gemma 3 at 1400 positions: 1283
     /// slots per sliding layer) the GPU compaction, the reads after it and
     /// the truncation floor agree with the CPU engine's.
@@ -2741,6 +3562,40 @@ mod tests {
                 assert!((g - e).abs() <= 1e-6, "{dtype:?} element {i}: {g} vs {e}");
             }
         }
+    }
+
+    /// A packed weight is cut into the chunks the resident upload cuts, and
+    /// its `bytes` are its device bytes, quantized or dense.
+    #[test]
+    fn pack_matrix_chunks_and_sizes_like_the_resident_upload() {
+        let raw = q4_0_row().repeat(200);
+        let packed = pack_matrix("t", GgmlDType::Q4_0, &raw, 200, 64, 100 * 36, false).unwrap();
+        let rows: Vec<usize> = packed.parts.iter().map(|p| p.rows).collect();
+        // 100 rows fit the limit; chunks are multiples of the plane width.
+        assert_eq!(rows, [64, 64, 64, 8]);
+        assert_eq!(packed.bytes, 200 * 36);
+        for part in &packed.parts {
+            let PackedData::Quant(bytes, _) = &part.data else {
+                panic!("a Q4_0 weight stays quantized");
+            };
+            assert_eq!(bytes.len(), part.rows * 36);
+        }
+
+        let dense = pack_matrix("t", GgmlDType::Q4_0, &raw, 200, 64, 100 * 256, true).unwrap();
+        let rows: Vec<usize> = dense.parts.iter().map(|p| p.rows).collect();
+        assert_eq!(rows, [64, 64, 64, 8]);
+        assert_eq!(dense.bytes, 200 * 256);
+        for part in &dense.parts {
+            let PackedData::Float(values) = &part.data else {
+                panic!("a dense weight is f32");
+            };
+            assert_eq!(values.len(), part.rows * 64);
+        }
+
+        let e = pack_matrix("t", GgmlDType::Q4_0, &raw[1..], 200, 64, 1 << 30, false)
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("do not hold a [200, 64]"), "{e}");
     }
 
     /// Q8_0 quantization is within half a step of the input, per block, plus

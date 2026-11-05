@@ -37,7 +37,7 @@ weight = 3
 - K/V cost varies by model. At 8,192 positions it is 145 MB for Gemma 4 E2B and 6.44 GB for Phi 3.5 mini, which has 32 K/V heads and no sliding-window layers; the preset table on [Local models and formats](@/providers/local/models.md#presets) lists the value for each preset.
 - Weights stay quantized and are consumed by the engine's quantized matmul kernel (Q4_0 and Q8_0) or candle's (other dtypes). Norm vectors, biases and float weights are held as f32. Resident weights are about the file size.
 - Gemma 4's per-layer embedding table (`per_layer_token_embd`: 1.32 GB in E2B Q4_0, 1.59 GB in E4B Q4_0) is not loaded. The engine reads one row per input token from the GGUF file, usually from the OS page cache, so E2B Q4_0 holds 1.5 GB of its 2.84 GB file.
-- Mixture of experts: expert tensors are split once at load into one quantized 2-D weight per expert. Memory is the file size, and a pass computes only the experts its tokens route to.
+- Mixture of experts: by default expert tensors are split once at load into one quantized 2-D weight per expert. Memory is the file size, and a pass computes only the experts its tokens route to. With `ExpertPlacement::Tiered` the experts stay in the GGUF file and memory is the dense weights plus the RAM and device budgets you set; see [Tiered expert placement](@/providers/local/expert-tiers.md).
 - Hybrid models (Qwen 3.5) keep a recurrent state of fixed size next to the K/V cache. For the 0.8B model it is 20.2 MB, about 61 MB with the one checkpoint slot and the rollback copy, plus 445 KB per verified row. See [Architectures](@/providers/local/models.md#architectures).
 - On a GPU the weights and the K/V cache are in device memory instead of RAM, at the sizes in [Devices and GPU features](@/providers/local/gpu.md#devices-and-gpu-features).
 
@@ -52,6 +52,7 @@ weight = 3
   - A `device` whose cargo feature is off, for example ``device Vulkan(Default) requires the `provider-local-vulkan` cargo feature``.
   - `DrafterSource::InTrunk` with a GPU device.
   - A repo, revision or file with an empty, `.`, `..` or `:` segment, a backslash or a leading `/`.
+  - An `experts` placement outside its rules (`loader_threads` outside `1..=64`, `device_bytes` on the CPU, `ram_bytes` of 0 on the CPU, `device_bytes` of 0 on a GPU), a budget below the model's `n_used` experts per layer, `warm_from` heat of another shape, or `Tiered` on a model without experts. The messages are on [Tiered expert placement](@/providers/local/expert-tiers.md#errors).
   - No resolvable cache directory: set `cache_dir` or `CUCA_CACHE_DIR`.
 - `CucaError::Io` for a missing or unreadable model file, or when the engine thread cannot start.
 - `CucaError::Transport` for a download that fails, stalls for 60 seconds, ends short of the reported size, or gets an unusable range response.

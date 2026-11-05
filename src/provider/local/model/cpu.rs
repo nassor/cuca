@@ -27,11 +27,13 @@ use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
 use super::qmm::QmmWeight;
 use super::quant::{RowTable, TokenEmbedding};
 use super::rope::RopeKind;
+use super::tier::{BuildFn, ExpertSlice, ExpertStore, LayerExperts, TierShared, add};
 use super::{
     RING_ROLLBACK, RING_ROWS, Want, attention_mask, build_rope_tables, candle_err, check_context,
     err, kv_slots, read_hparams,
 };
 use crate::error::CucaError;
+use crate::provider::local::{ExpertPlacement, ExpertTiers};
 
 mod head;
 pub(crate) use head::NextnHead;
@@ -202,6 +204,25 @@ enum GateUp {
     },
 }
 
+/// One routed expert's three matmul weights.
+pub(crate) struct CpuExpert {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+}
+
+/// The experts of one MoE layer.
+enum ExpertBank {
+    /// Every expert in RAM (`ExpertPlacement::Resident`).
+    Resident(Vec<CpuExpert>),
+    /// In the file, behind the RAM tier of the store
+    /// (`ExpertPlacement::Tiered`).
+    Tiered {
+        il: usize,
+        store: Arc<ExpertStore<CpuExpert>>,
+    },
+}
+
 enum FfnWeights {
     Dense {
         gate_up: GateUp,
@@ -210,9 +231,7 @@ enum FfnWeights {
     Moe {
         spec: MoeSpec,
         router: QMatMul,
-        gate: Vec<QMatMul>,
-        up: Vec<QMatMul>,
-        down: Vec<QMatMul>,
+        experts: ExpertBank,
     },
 }
 
@@ -431,40 +450,143 @@ impl Loader<'_> {
         rows: usize,
         cols: usize,
     ) -> Result<Vec<QMatMul>, CucaError> {
-        let info = tensor_info(self.content, tensor_name)?;
-        if info.shape.dims() != [n_expert, rows, cols] {
-            return Err(err(format!(
-                "tensor `{tensor_name}`: expected shape {:?}, found {:?}",
-                [n_expert, rows, cols],
-                info.shape.dims()
-            )));
-        }
-        let dtype: GgmlDType = info.ggml_dtype;
-        if !cols.is_multiple_of(dtype.block_size()) {
-            return Err(err(format!(
-                "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size"
-            )));
-        }
-        let expert_bytes = rows * (cols / dtype.block_size() * dtype.type_size());
-        let mut raw = vec![0u8; n_expert * expert_bytes];
-        let start = self.content.tensor_data_offset + info.offset;
+        let slice = ExpertSlice::read(self.content, tensor_name, n_expert, rows, cols)?;
+        let mut raw = vec![0u8; n_expert * slice.file_bytes];
         let io = |e: std::io::Error| err(format!("tensor `{tensor_name}`: {e}"));
-        self.reader.seek(SeekFrom::Start(start)).map_err(io)?;
+        self.reader
+            .seek(SeekFrom::Start(slice.offset(0)))
+            .map_err(io)?;
         self.reader.read_exact(&mut raw).map_err(io)?;
-        raw.chunks_exact(expert_bytes)
+        raw.chunks_exact(slice.file_bytes.max(1))
             .map(|chunk| {
-                let info = gguf_file::TensorInfo {
-                    ggml_dtype: dtype,
-                    shape: (rows, cols).into(),
-                    offset: 0,
-                };
-                let qt = info
-                    .read(&mut Cursor::new(chunk), 0, &Device::Cpu)
+                let qt = expert_qtensor(&slice, chunk)
                     .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
                 self.to_matmul(Arc::new(qt), tensor_name)
             })
             .collect()
     }
+
+    /// The experts of MoE layer `il` (FFN width `ff`): every expert read and
+    /// split now, or, with `tiers`, left in the file for the store to load.
+    fn expert_bank(
+        &mut self,
+        il: usize,
+        n_expert: usize,
+        ff: usize,
+        n_embd: usize,
+        tiers: Option<&Arc<ExpertStore<CpuExpert>>>,
+    ) -> Result<ExpertBank, CucaError> {
+        if let Some(store) = tiers {
+            return Ok(ExpertBank::Tiered {
+                il,
+                store: Arc::clone(store),
+            });
+        }
+        let blk = |part: &str| name::blk(il, part);
+        let gate = self.experts(&blk(name::FFN_GATE_EXPS), n_expert, ff, n_embd)?;
+        let up = self.experts(&blk(name::FFN_UP_EXPS), n_expert, ff, n_embd)?;
+        let down = self.experts(&blk(name::FFN_DOWN_EXPS), n_expert, n_embd, ff)?;
+        Ok(ExpertBank::Resident(
+            gate.into_iter()
+                .zip(up)
+                .zip(down)
+                .map(|((gate, up), down)| CpuExpert { gate, up, down })
+                .collect(),
+        ))
+    }
+}
+
+/// One expert's `[rows, cols]` matrix of `slice` from its file bytes.
+fn expert_qtensor(slice: &ExpertSlice, bytes: &[u8]) -> candle_core::Result<QTensor> {
+    gguf_file::TensorInfo {
+        ggml_dtype: slice.dtype,
+        shape: (slice.rows, slice.cols).into(),
+        offset: 0,
+    }
+    .read(&mut Cursor::new(bytes), 0, &Device::Cpu)
+}
+
+/// Build one expert of `layer` from its three matrices' file bytes, as the
+/// resident loader builds it (`Loader::to_matmul` without the test modes).
+fn build_cpu_expert(
+    layer: &LayerExperts,
+    gate: &[u8],
+    up: &[u8],
+    down: &[u8],
+) -> Result<CpuExpert, CucaError> {
+    let one = |slice: &ExpertSlice, bytes: &[u8], part: &str| {
+        expert_qtensor(slice, bytes)
+            .and_then(|qt| QMatMul::from_arc_row_batched(Arc::new(qt)))
+            .map_err(|e| err(format!("tensor `{}`: {e}", name::blk(layer.il, part))))
+    };
+    Ok(CpuExpert {
+        gate: one(&layer.gate, gate, name::FFN_GATE_EXPS)?,
+        up: one(&layer.up, up, name::FFN_UP_EXPS)?,
+        down: one(&layer.down, down, name::FFN_DOWN_EXPS)?,
+    })
+}
+
+/// The expert store of a tiered model (`ExpertPlacement::Tiered`): every
+/// MoE layer's experts located in the file, the RAM tier sized by `tiers`,
+/// warmed from `tiers.warm_from`.
+///
+/// # Errors
+///
+/// [`CucaError::Config`] for a model without experts, a RAM budget below
+/// `n_used` experts per layer or heat of another shape; the loader's errors
+/// for unreadable expert tensors.
+fn open_expert_store(
+    content: &gguf_file::Content,
+    path: &Path,
+    hp: &Hparams,
+    tiers: &ExpertTiers,
+) -> Result<Arc<ExpertStore<CpuExpert>>, CucaError> {
+    let spec = hp.moe.ok_or_else(|| {
+        CucaError::Config(format!(
+            "expert tiers need a mixture-of-experts model; `{}` has no experts",
+            hp.arch.name()
+        ))
+    })?;
+    let mut layers = Vec::new();
+    for (il, ls) in hp.layers.iter().enumerate() {
+        if let Ffn::Moe { ff } = LayerLayout::read(hp, il, ls, content)?.ffn {
+            let slice = |part: &str, rows, cols| {
+                ExpertSlice::read(content, &name::blk(il, part), spec.n_expert, rows, cols)
+            };
+            let gate = slice(name::FFN_GATE_EXPS, ff, hp.n_embd)?;
+            let up = slice(name::FFN_UP_EXPS, ff, hp.n_embd)?;
+            let down = slice(name::FFN_DOWN_EXPS, hp.n_embd, ff)?;
+            layers.push(LayerExperts {
+                il,
+                gate,
+                up,
+                down,
+                stored_bytes: gate.file_bytes + up.file_bytes + down.file_bytes,
+            });
+        }
+    }
+    let shared = Arc::new(TierShared::new(hp.n_layer, spec.n_expert));
+    if let Some(heat) = &tiers.warm_from {
+        shared.check(heat)?;
+    }
+    let build: Arc<BuildFn<CpuExpert>> = Arc::new(build_cpu_expert);
+    let store = ExpertStore::open(
+        path,
+        hp.n_layer,
+        layers,
+        spec.n_expert,
+        spec.n_used,
+        tiers.ram_bytes,
+        false,
+        tiers.loader_threads,
+        build,
+        Arc::clone(&shared),
+    )?;
+    if let Some(heat) = &tiers.warm_from {
+        shared.seed(heat);
+        store.warm(heat, 0, store.ram_slots())?;
+    }
+    Ok(Arc::new(store))
 }
 
 /// Most rows of one `Want::All` call whose intermediate positions a hybrid
@@ -506,6 +628,8 @@ pub(crate) struct Transformer {
     /// Whether any layer is a delta-net layer (has a recurrent state).
     hybrid: bool,
     rollback: Rollback,
+    /// Counters and heat of the expert tiers (`ExpertPlacement::Tiered`).
+    tiers: Option<Arc<TierShared>>,
 }
 
 /// Which hidden-state rows a forward pass returns next to the logits.
@@ -588,20 +712,34 @@ struct Nextn {
 }
 
 impl Transformer {
-    /// Load the model from the GGUF file at `path`, whose index `content`
-    /// was read already, with a K/V cache for `context_length` positions.
-    ///
-    /// # Errors
-    ///
-    /// [`CucaError::Config`] when `context_length` is zero or above the
-    /// checkpoint maximum; [`CucaError::Provider`] for unsupported or
-    /// malformed checkpoints; [`CucaError::Io`] when the file cannot be read.
+    /// [`Transformer::load_placed`] with every expert resident (tests).
+    #[cfg(test)]
     pub(crate) fn load(
         content: &gguf_file::Content,
         path: &Path,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        Self::load_with(content, path, context_length, false, false)
+        Self::load_placed(content, path, context_length, &ExpertPlacement::Resident)
+    }
+
+    /// Load the model from the GGUF file at `path`, whose index `content`
+    /// was read already, with a K/V cache for `context_length` positions and
+    /// the experts of a mixture-of-experts model placed as `experts` says.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] when `context_length` is zero or above the
+    /// checkpoint maximum, or for tiered placement on a model without
+    /// experts or with budgets below what the model needs;
+    /// [`CucaError::Provider`] for unsupported or malformed checkpoints;
+    /// [`CucaError::Io`] when the file cannot be read.
+    pub(crate) fn load_placed(
+        content: &gguf_file::Content,
+        path: &Path,
+        context_length: usize,
+        experts: &ExpertPlacement,
+    ) -> Result<Self, CucaError> {
+        Self::load_with(content, path, context_length, false, false, experts)
     }
 
     /// Load a multi-token-prediction drafter (`gemma4-assistant`): its
@@ -610,14 +748,21 @@ impl Transformer {
     ///
     /// # Errors
     ///
-    /// As [`Transformer::load`], plus [`CucaError::Provider`] when the file
+    /// As [`Transformer::load_placed`], plus [`CucaError::Provider`] when the file
     /// is not a drafter architecture.
     pub(crate) fn load_drafter(
         content: &gguf_file::Content,
         path: &Path,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        Self::load_with(content, path, context_length, false, true)
+        Self::load_with(
+            content,
+            path,
+            context_length,
+            false,
+            true,
+            &ExpertPlacement::Resident,
+        )
     }
 
     /// [`Transformer::load`] with every matmul weight dequantized to f32: the
@@ -628,12 +773,25 @@ impl Transformer {
         path: &Path,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        Self::load_with(content, path, context_length, true, false)
+        Self::load_with(
+            content,
+            path,
+            context_length,
+            true,
+            false,
+            &ExpertPlacement::Resident,
+        )
     }
 
     /// Vocabulary size.
     pub(crate) fn vocab(&self) -> usize {
         self.vocab
+    }
+
+    /// Counters and heat of the expert tiers; `None` unless the model loaded
+    /// with `ExpertPlacement::Tiered`.
+    pub(crate) fn expert_tiers(&self) -> Option<Arc<TierShared>> {
+        self.tiers.clone()
     }
 
     fn load_with(
@@ -642,6 +800,7 @@ impl Transformer {
         context_length: usize,
         dequantize: bool,
         drafter: bool,
+        experts: &ExpertPlacement,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         match (drafter, hp.arch.is_drafter()) {
@@ -660,6 +819,15 @@ impl Transformer {
             _ => {}
         }
         check_context(&hp, context_length)?;
+        let store = match experts {
+            ExpertPlacement::Resident => None,
+            ExpertPlacement::Tiered(_) if dequantize || drafter => {
+                return Err(CucaError::Config(
+                    "expert tiers apply to a quantized main model only".into(),
+                ));
+            }
+            ExpertPlacement::Tiered(tiers) => Some(open_expert_store(content, path, &hp, tiers)?),
+        };
         let mut loader = Loader {
             content,
             reader: BufReader::new(File::open(path)?),
@@ -729,7 +897,14 @@ impl Transformer {
             } else {
                 kv_layers.push(None);
             }
-            layers.push(load_layer(&mut loader, &hp, il, spec, &layout)?);
+            layers.push(load_layer(
+                &mut loader,
+                &hp,
+                il,
+                spec,
+                &layout,
+                store.as_ref(),
+            )?);
         }
 
         let nextn = if drafter {
@@ -759,6 +934,7 @@ impl Transformer {
             },
             hybrid,
             rollback: Rollback::default(),
+            tiers: store.map(|s| Arc::clone(s.shared())),
         })
     }
 
@@ -1562,13 +1738,15 @@ impl Transformer {
     }
 }
 
-/// Read every weight of layer `il`.
+/// Read every weight of layer `il`; a MoE layer's experts stay in the file
+/// when `tiers` is set.
 fn load_layer(
     loader: &mut Loader<'_>,
     hp: &Hparams,
     il: usize,
     spec: &LayerSpec,
     layout: &LayerLayout,
+    tiers: Option<&Arc<ExpertStore<CpuExpert>>>,
 ) -> Result<LayerWeights, CucaError> {
     let n_embd = hp.n_embd;
     let blk = |part: &str| name::blk(il, part);
@@ -1595,9 +1773,7 @@ fn load_layer(
         (Ffn::Moe { ff }, Some(spec)) => FfnWeights::Moe {
             spec,
             router: loader.matmul(&blk(name::FFN_GATE_INP), &[spec.n_expert, n_embd])?,
-            gate: loader.experts(&blk(name::FFN_GATE_EXPS), spec.n_expert, ff, n_embd)?,
-            up: loader.experts(&blk(name::FFN_UP_EXPS), spec.n_expert, ff, n_embd)?,
-            down: loader.experts(&blk(name::FFN_DOWN_EXPS), spec.n_expert, n_embd, ff)?,
+            experts: loader.expert_bank(il, spec.n_expert, ff, n_embd, tiers)?,
         },
         (Ffn::Moe { .. }, None) => return Err(err("expert tensors without an expert count")),
     };
@@ -1866,27 +2042,52 @@ impl FfnWeights {
             FfnWeights::Moe {
                 spec,
                 router,
-                gate,
-                up,
-                down,
+                experts,
             } => {
                 let (_, t, n_embd) = f.dims3()?;
                 let flat = f.reshape((t, n_embd))?;
                 let logits = router.forward(&flat)?.flatten_all()?.to_vec1::<f32>()?;
                 let routing = route(&logits, t, spec);
+                let mut pass = match experts {
+                    ExpertBank::Resident(_) => None,
+                    ExpertBank::Tiered { il, store } => {
+                        let shared = store.shared();
+                        shared.record(*il, &routing, t);
+                        let needed: Vec<u32> = (0..routing.per_expert.len() as u32)
+                            .filter(|&e| !routing.per_expert[e as usize].is_empty())
+                            .collect();
+                        add(&shared.lookups, needed.len() as u64);
+                        Some(store.pass(*il, &needed))
+                    }
+                };
                 let mut out = Tensor::zeros((t, n_embd), DType::F32, f.device())?;
                 for (e, picks) in routing.per_expert.iter().enumerate() {
                     if picks.is_empty() {
                         continue;
                     }
+                    // Experts run in ascending order in both placements, so
+                    // the accumulation order (and the output) is the same.
+                    let fetched;
+                    let x = match (experts, pass.as_mut()) {
+                        (ExpertBank::Resident(all), _) => &all[e],
+                        (ExpertBank::Tiered { .. }, Some(pass)) => {
+                            fetched = pass
+                                .next(e as u32)
+                                .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+                            &*fetched
+                        }
+                        (ExpertBank::Tiered { .. }, None) => {
+                            return Err(candle_core::Error::msg("tiered experts without a pass"));
+                        }
+                    };
                     let (ids, weights): (Vec<u32>, Vec<f32>) = picks.iter().copied().unzip();
                     let m = ids.len();
                     let ids = Tensor::from_vec(ids, m, f.device())?;
                     let weights = Tensor::from_vec(weights, (m, 1), f.device())?;
                     let rows = flat.index_select(&ids, 0)?;
                     let hidden =
-                        (activate(&gate[e].forward(&rows)?, act)? * up[e].forward(&rows)?)?;
-                    let y = down[e].forward(&hidden)?.broadcast_mul(&weights)?;
+                        (activate(&x.gate.forward(&rows)?, act)? * x.up.forward(&rows)?)?;
+                    let y = x.down.forward(&hidden)?.broadcast_mul(&weights)?;
                     out = out.index_add(&ids, &y, 0)?;
                 }
                 out.reshape((1, t, n_embd))
@@ -2334,7 +2535,7 @@ mod tests {
             requantize: false,
         };
         let layout = LayerLayout::read(&hp, 0, &hp.layers[0], &content).unwrap();
-        let lw = load_layer(&mut loader, &hp, 0, &hp.layers[0], &layout).unwrap();
+        let lw = load_layer(&mut loader, &hp, 0, &hp.layers[0], &layout, None).unwrap();
         let t = 5;
         let values: Vec<f32> = (0..t * 64)
             .map(|i| ((i * 31 % 17) as f32 - 8.0) * 0.1)
@@ -2344,12 +2545,10 @@ mod tests {
         let FfnWeights::Moe {
             spec,
             router,
-            gate,
-            up,
-            down,
+            experts: ExpertBank::Resident(experts),
         } = &lw.ffn
         else {
-            panic!("granitemoe FFN is a mixture of experts");
+            panic!("granitemoe FFN is a mixture of resident experts");
         };
         let flat = f.reshape((t, 64)).unwrap();
         let logits = router
@@ -2364,10 +2563,11 @@ mod tests {
         for (e, picks) in routing.per_expert.iter().enumerate() {
             for &(token, weight) in picks {
                 let row = flat.narrow(0, token as usize, 1).unwrap();
-                let h = (gate[e].forward(&row).unwrap().silu().unwrap()
-                    * up[e].forward(&row).unwrap())
+                let h = (experts[e].gate.forward(&row).unwrap().silu().unwrap()
+                    * experts[e].up.forward(&row).unwrap())
                 .unwrap();
-                let y = down[e]
+                let y = experts[e]
+                    .down
                     .forward(&h)
                     .unwrap()
                     .flatten_all()
@@ -2527,6 +2727,156 @@ mod tests {
         let e = Transformer::load(&content, &model.path, 32).err().unwrap();
         assert!(e.to_string().contains("`mamba2`"), "{e}");
     }
+
+    /// A tiny MoE model of `spec`'s family with eight experts (two used) in
+    /// four layers.
+    fn moe_spec(spec: TinySpec) -> TinySpec {
+        TinySpec {
+            moe: Some((8, 2)),
+            n_layer: 4,
+            ..spec
+        }
+    }
+
+    /// Bytes of one expert summed over the MoE layers of `model`.
+    fn expert_bytes(model: &super::super::tiny::TinyModel) -> u64 {
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let hp = read_hparams(&content).unwrap();
+        let n_expert = hp.moe.unwrap().n_expert;
+        (0..hp.n_layer)
+            .flat_map(|il| {
+                [name::FFN_GATE_EXPS, name::FFN_UP_EXPS, name::FFN_DOWN_EXPS].map(|part| {
+                    let info = tensor_info(&content, &name::blk(il, part)).unwrap();
+                    let [_, rows, cols] = info.shape.dims() else {
+                        panic!("expert tensors are 3-D");
+                    };
+                    ExpertSlice::read(&content, &name::blk(il, part), n_expert, *rows, *cols)
+                        .unwrap()
+                        .file_bytes as u64
+                })
+            })
+            .sum()
+    }
+
+    fn load_tiered(
+        model: &super::super::tiny::TinyModel,
+        ram_bytes: u64,
+        warm_from: Option<crate::provider::local::ExpertHeat>,
+    ) -> Result<Transformer, CucaError> {
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let tiers = ExpertTiers {
+            ram_bytes,
+            loader_threads: 2,
+            warm_from,
+            ..ExpertTiers::default()
+        };
+        Transformer::load_placed(&content, &model.path, 32, &ExpertPlacement::Tiered(tiers))
+    }
+
+    /// A 24-token prompt in chunks of 16 then 8 greedy steps: the logits of
+    /// every call.
+    fn greedy_run(m: &mut Transformer) -> Vec<Vec<f32>> {
+        let prompt: Vec<u32> = (0..24u32).map(|i| (i * 5 + 3) % VOCAB as u32).collect();
+        let mut out: Vec<Vec<f32>> = Vec::new();
+        let mut at = 0;
+        for chunk in prompt.chunks(16) {
+            let f = m.forward_ext(chunk, at, Want::Last, Hidden::None, true);
+            out.push(f.unwrap().logits.unwrap());
+            at += chunk.len();
+        }
+        for _ in 0..8 {
+            let last = out.last().unwrap();
+            let next = (0..last.len())
+                .max_by(|&a, &b| last[a].total_cmp(&last[b]))
+                .unwrap() as u32;
+            let f = m.forward_ext(&[next], at, Want::Last, Hidden::None, true);
+            out.push(f.unwrap().logits.unwrap());
+            at += 1;
+        }
+        out
+    }
+
+    /// Placement only decides speed: at the smallest RAM budget (two of
+    /// eight experts per layer, so nearly every routing evicts) the logits
+    /// equal the resident load's bit for bit, for every MoE architecture.
+    #[test]
+    fn tiered_experts_match_resident_bit_for_bit() {
+        for spec in [
+            TinySpec::granitemoe(),
+            TinySpec::qwen3moe(),
+            TinySpec::olmoe(),
+        ] {
+            let arch = spec.arch;
+            let model = write_spec(&moe_spec(spec));
+            let min = 2 * expert_bytes(&model);
+            let want = greedy_run(&mut load(&model, 32));
+            let mut tiered = load_tiered(&model, min, None).unwrap();
+            assert_eq!(greedy_run(&mut tiered), want, "{arch}");
+            let stats = tiered.expert_tiers().unwrap().stats();
+            assert!(stats.disk_reads > 0, "{arch}: {stats:?}");
+            assert!(stats.ram_resident_bytes <= min, "{arch}: {stats:?}");
+            assert_eq!(
+                stats.lookups,
+                stats.ram_hits + stats.disk_reads,
+                "{arch}: {stats:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tiered_load_rejects_a_budget_below_n_used() {
+        let model = write_spec(&moe_spec(TinySpec::granitemoe()));
+        let min = 2 * expert_bytes(&model);
+        let e = load_tiered(&model, min - 1, None).err().unwrap();
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains(&format!("at least 2 ({min} bytes)"))),
+            "{e:?}"
+        );
+        let dense = write_spec(&TinySpec::llama());
+        let e = load_tiered(&dense, 1 << 30, None).err().unwrap();
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("`llama` has no experts")),
+            "{e:?}"
+        );
+    }
+
+    /// Heat exported from one run, fed to the next load, preloads the hot
+    /// experts: the first forward pass reads fewer from the file.
+    #[test]
+    fn warm_from_loads_the_hottest_experts_first() {
+        let model = write_spec(&moe_spec(TinySpec::granitemoe()));
+        let budget = 4 * expert_bytes(&model);
+        let first_pass_reads = |m: &mut Transformer| {
+            let before = m.expert_tiers().unwrap().stats().disk_reads;
+            let prompt: Vec<u32> = (0..24u32).map(|i| (i * 5 + 3) % VOCAB as u32).collect();
+            m.forward_ext(&prompt[..16], 0, Want::Last, Hidden::None, true)
+                .unwrap();
+            m.expert_tiers().unwrap().stats().disk_reads - before
+        };
+        let mut cold = load_tiered(&model, budget, None).unwrap();
+        let cold_reads = first_pass_reads(&mut cold);
+        cold.truncate_cache(0);
+        greedy_run(&mut cold);
+        let heat = cold.expert_tiers().unwrap().heat();
+        drop(cold);
+        let mut warm = load_tiered(&model, budget, Some(heat)).unwrap();
+        assert!(warm.expert_tiers().unwrap().stats().ram_resident_bytes > 0);
+        let warm_reads = first_pass_reads(&mut warm);
+        assert!(warm_reads < cold_reads, "{warm_reads} vs {cold_reads}");
+
+        let other: crate::provider::local::ExpertHeat =
+            serde_json::from_str(r#"{"n_layer":1,"n_expert":8,"counts":[1,0,0,0,0,0,0,0]}"#)
+                .unwrap();
+        let e = load_tiered(&model, budget, Some(other)).err().unwrap();
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("1x8") && m.contains("4x8")),
+            "{e:?}"
+        );
+    }
 }
 
 /// The hybrid (gated delta-net) architecture: arithmetic against direct f64
@@ -2548,7 +2898,15 @@ mod hybrid_tests {
 
     /// The model with every matmul weight dequantized to f32.
     pub(super) fn load_dequantized(model: &TinyModel) -> Transformer {
-        Transformer::load_with(&content_of(model), &model.path, CONTEXT, true, false).unwrap()
+        Transformer::load_with(
+            &content_of(model),
+            &model.path,
+            CONTEXT,
+            true,
+            false,
+            &ExpertPlacement::Resident,
+        )
+        .unwrap()
     }
 
     /// Run `tokens` at `start` without asking for logits.

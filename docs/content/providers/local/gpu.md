@@ -78,6 +78,7 @@ Any other text is a `CucaError::Config`: ``unknown local device `...` ``.
 ### Device memory
 
 - Device memory is about the file size, minus any table the engine reads from the file instead of uploading (Gemma 4's per-layer embedding table), plus the K/V cache.
+- A mixture-of-experts model can keep its experts in the GGUF file with `ExpertPlacement::Tiered`: `device_bytes` bounds the device memory they use and an optional RAM tier (`ram_bytes`) holds packed copies. See [Tiered expert placement](@/providers/local/expert-tiers.md).
 - The token embedding is uploaded once, as the LM head, only when it is tied to it. Embedding lookups read rows from the file on the host.
 - The K/V cache lives in device memory with the same formula as on the CPU. The RoPE tables are on the device.
 - A weight over 1 GiB is split into row chunks, because wgpu cannot allocate a single buffer that large.
@@ -95,4 +96,5 @@ Any other text is a `CucaError::Config`: ``unknown local device `...` ``.
 
 - Verified on Vulkan (AMD RX 9070 XT, Windows): the live suite `tests/provider_local.rs` ran for Gemma 4 E2B Q4_0, Llama 3.2 1B, Phi 3.5 mini, Gemma 2 2B, OLMo 2 1B and Granite 3.3 2B. Every applicable scenario passed, with the same known limits as on the CPU. The other presets ran on the CPU.
 - The unit tests `gpu_matches_cpu_on_the_tiny_gemma4`, `gpu_matches_cpu_on_every_architecture` and `gpu_matches_cpu_on_other_weight_dtypes` compare the GPU engine with a CPU reference on tiny random models, and `gpu_drafter_matches_cpu_drafter` does the same for the drafter. They run only when `CUCA_LOCAL_DEVICE` names a GPU; otherwise they print `SKIP: set CUCA_LOCAL_DEVICE to a GPU device`.
+- Tiered experts on a GPU are checked only by the unit test `gpu_tiered_experts_match_gpu_resident` on tiny models, under the same `CUCA_LOCAL_DEVICE` condition. `qwen3-30b-a3b-q4_0` and `olmoe-1b-7b-q4_0` have not run on a GPU. A tiered Qwen3-30B-A3B run on Vulkan lost the device after a CubeCL kernel-expansion panic; see [Output guarantee](@/providers/local/expert-tiers.md#output-guarantee).
 - Compile-checked only: Metal (builds in the CI jobs that use `ALL_NO_LLVM`, which run on Linux), CUDA and ROCm (the CI job `local_gpu_llvm` runs `cargo check` for both).

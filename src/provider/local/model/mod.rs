@@ -92,7 +92,10 @@
 //!   expert, so a mixture-of-experts model also costs its file size, and the
 //!   transient memory of a forward pass is independent of the expert count:
 //!   tokens are grouped by expert, each expert runs on its own tokens
-//!   only, and the FFN transient is `tokens * n_embd` f32.
+//!   only, and the FFN transient is `tokens * n_embd` f32. With
+//!   `ExpertPlacement::Tiered` the experts are not loaded: [`tier`] reads
+//!   them from the file on demand into bounded per-layer caches (RAM, and
+//!   device memory on a GPU), so expert memory is the configured budgets.
 //! - The token embedding is held once (quantized) and shared with the tied
 //!   LM head. `per_layer_token_embd` (Gemma 4, 1.32 GB in E2B Q4_0) is never
 //!   loaded: each token's row is read from the GGUF file with a seek and
@@ -148,6 +151,7 @@ pub(crate) mod params;
 pub(crate) mod qmm;
 pub(crate) mod quant;
 pub(crate) mod rope;
+pub(crate) mod tier;
 #[cfg(test)]
 pub(crate) mod tiny;
 
@@ -161,7 +165,7 @@ use candle_core::quantized::gguf_file;
 use self::layout::name;
 use self::params::Hparams;
 use self::rope::{CosSin, Factors};
-use super::LocalDevice;
+use super::{ExpertPlacement, LocalDevice};
 use crate::error::CucaError;
 use crate::types::ProviderEndpoint;
 
@@ -332,32 +336,46 @@ impl Model {
     /// # Errors
     ///
     /// [`CucaError::Config`] when `context_length` is zero or above the
-    /// checkpoint maximum or `device` is compiled out; [`CucaError::Provider`]
-    /// for unsupported or malformed checkpoints; [`CucaError::Io`] when the
-    /// file cannot be read.
+    /// checkpoint maximum, `device` is compiled out, or the `experts`
+    /// budgets do not fit the model; [`CucaError::Provider`] for unsupported
+    /// or malformed checkpoints; [`CucaError::Io`] when the file cannot be
+    /// read.
     pub(crate) fn load(
         content: &gguf_file::Content,
         path: &Path,
         context_length: usize,
         device: LocalDevice,
+        experts: &ExpertPlacement,
     ) -> Result<Self, CucaError> {
         match device {
-            LocalDevice::Cpu => Ok(Model::Cpu(cpu::Transformer::load(
+            LocalDevice::Cpu => Ok(Model::Cpu(cpu::Transformer::load_placed(
                 content,
                 path,
                 context_length,
+                experts,
             )?)),
             #[cfg(feature = "provider-local-gpu")]
-            device => Ok(Model::Gpu(gpu::GpuTransformer::load(
+            device => Ok(Model::Gpu(gpu::GpuTransformer::load_placed(
                 content,
                 path,
                 context_length,
                 device,
+                experts,
             )?)),
             #[cfg(not(feature = "provider-local-gpu"))]
             device => Err(super::device_unavailable(device).unwrap_or_else(|| {
                 CucaError::Config(format!("device {device:?} is not available"))
             })),
+        }
+    }
+
+    /// Counters and heat of the expert tiers; `None` unless the model loaded
+    /// with `ExpertPlacement::Tiered`.
+    pub(crate) fn expert_tiers(&self) -> Option<std::sync::Arc<tier::TierShared>> {
+        match self {
+            Model::Cpu(m) => m.expert_tiers(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.expert_tiers(),
         }
     }
 
@@ -522,7 +540,8 @@ mod tests {
         let model = write_qwen35(&TinyQwen35::default());
         let mut reader = BufReader::new(File::open(&model.path).unwrap());
         let content = gguf_file::Content::read(&mut reader).unwrap();
-        let e = Model::load(&content, &model.path, 32, LocalDevice::Cuda(0))
+        let resident = ExpertPlacement::Resident;
+        let e = Model::load(&content, &model.path, 32, LocalDevice::Cuda(0), &resident)
             .err()
             .unwrap();
         assert!(matches!(e, CucaError::Provider { .. }), "{e:?}");

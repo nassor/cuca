@@ -17,7 +17,10 @@
 //! `CUCA_LOCAL_DEVICE` selects where the model runs (`LocalDevice` syntax):
 //! `cpu` (the default), `vulkan`, `vulkan:<n>`, `metal`, `cuda[:<n>]` or
 //! `rocm[:<n>]`; a GPU device needs its feature
-//! (`--features provider-local-vulkan`, ...). Build for the host CPU, since
+//! (`--features provider-local-vulkan`, ...). `CUCA_LOCAL_EXPERTS` sets
+//! `LocalModelConfig::experts` (`ExpertPlacement` syntax, e.g.
+//! `tiered:ram=4g`; unset = resident), so the whole matrix runs on tiered
+//! experts. Build for the host CPU, since
 //! candle's SIMD kernels are chosen at compile time:
 //!
 //! ```sh
@@ -259,6 +262,14 @@ async fn loaded() -> Option<Loaded> {
                     .map(|s| {
                         s.parse()
                             .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={s:?}: {e}"))
+                    })
+                    .unwrap_or_default(),
+                experts: std::env::var("CUCA_LOCAL_EXPERTS")
+                    .ok()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| {
+                        s.parse()
+                            .unwrap_or_else(|e| panic!("CUCA_LOCAL_EXPERTS={s:?}: {e}"))
                     })
                     .unwrap_or_default(),
                 on_download_progress: Some(DownloadProgressCallback::new(|p| {

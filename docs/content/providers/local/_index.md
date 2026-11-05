@@ -13,7 +13,7 @@ kicker = "Reference"
 <dt>In one line</dt>
 <dd>Runs a GGUF language model of a supported architecture (see <a href="@/providers/local/models.md">Local models and formats</a>) on the CPU or a GPU inside your process, with no server and no HTTP endpoint.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature for the CPU, or <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> for a GPU. A GGUF file, or disk for the one-time download (0.29 GB to 8.03 GB across the presets, 2.84 GB for the default). Memory of about the file size plus the K/V cache.</dd>
+<dd>The <code>provider-local</code> feature for the CPU, or <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> for a GPU. A GGUF file, or disk for the one-time download (0.29 GB to 17.38 GB across the presets, 2.84 GB for the default). Memory of about the file size plus the K/V cache, or less for a mixture-of-experts model on <a href="@/providers/local/expert-tiers.md">tiered expert placement</a>.</dd>
 <dt>Read this if</dt>
 <dd>You are routing requests through <code>ProviderEndpoint::Local</code>, or you want a model that needs no external service.</dd>
 </dl>
@@ -44,6 +44,7 @@ There is no API key and no auth header. The one credential is the optional Huggi
 - `CucaClientBuilder::with_local_model(LocalModel)` attaches the model. `CucaClient::local_model()` returns `Option<&LocalModel>`.
 - `LocalModel` is cheap to clone. Every clone and every client built from a clone shares the one engine thread, which ends when the last clone is dropped.
 - `LocalModel::kv_cache_bytes()` returns the K/V cache size in bytes. `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`. `LocalModel::draft_stats()` returns the drafter counters.
+- `LocalModel::expert_tier_stats()` and `LocalModel::expert_heat()` return the expert cache counters and the learned heat, `None` unless `LocalModelConfig::experts` is `ExpertPlacement::Tiered`.
 - `ModelSource::PRESETS`, `ModelSource::preset(name)`, `ModelSource::default_model()` and `ModelSource::hugging_face(repo, revision, file)` describe model sources. `ModelSource` and `LocalDevice` also implement `FromStr`.
 
 <div class="dgm">

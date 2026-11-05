@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>LocalModelConfig</code> holds the model source, cache, context length, sampling, device and drafter; <code>SamplingConfig</code> holds the sampler defaults.</dd>
+<dd><code>LocalModelConfig</code> holds the model source, cache, context length, sampling, device, drafter and expert placement; <code>SamplingConfig</code> holds the sampler defaults.</dd>
 <dt>You need</dt>
 <dd>The <code>provider-local</code> feature. Entry points are on <a href="@/providers/local/_index.md">Local (in-process)</a>.</dd>
 <dt>Read this if</dt>
@@ -30,11 +30,13 @@ weight = 1
 | `device` | `LocalDevice::Cpu` | where the forward pass runs |
 | `drafter` | `None` | optional multi-token-prediction drafter, an `Option<DrafterSource>` |
 | `draft_tokens` | `5` | most tokens the drafter proposes per round, `1..=16`; ignored without a drafter |
+| `experts` | `ExpertPlacement::Resident` | where a mixture-of-experts model's experts live: in memory (`Resident`) or streamed from the file through bounded caches (`Tiered`) |
 | `on_download_progress` | `None` | download progress observer |
 
 - `source` defaults to the preset `gemma4-e2b-q4_0`.
 - `context_length` of `None` resolves to the smaller of 8,192 and the model's own maximum, so a model trained for 4,096 positions loads without configuration. An explicit value must be at least 1 and at most the model's maximum.
 - `device` needs the matching cargo feature for a GPU; see [Devices and GPU features](@/providers/local/gpu.md#devices-and-gpu-features).
+- `experts` matters only for models with experts. `Tiered` needs a RAM budget on the CPU and a device budget on a GPU, and parses from text such as `tiered:ram=4g`; the fields, rules and errors are on [Tiered expert placement](@/providers/local/expert-tiers.md).
 - `Debug` for `LocalModelConfig` prints `hf_token` as `<redacted>`.
 
 `SamplingConfig` fields:
@@ -71,5 +73,6 @@ The example `examples/local_model.rs` reads these; the library never does:
 | `CUCA_LOCAL_DEVICE` | `LocalDevice` text form; default `cpu` |
 | `CUCA_LOCAL_DRAFTER` | drafter preset name, or `in-trunk` |
 | `CUCA_LOCAL_DRAFTER_PATH` | path of a drafter GGUF file |
+| `CUCA_LOCAL_EXPERTS` | `ExpertPlacement` text form, for example `tiered:ram=4g`; default `resident` |
 
-The live tests read the same variables. Their other variables and run commands are in `AGENTS.md`.
+The live tests read the same variables. `tests/provider_local_tiers.rs` also reads `CUCA_LOCAL_EXPERTS_REF`, the reference placement it compares against. Their other variables and run commands are in `AGENTS.md`.

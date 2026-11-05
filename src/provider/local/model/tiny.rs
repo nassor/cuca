@@ -384,6 +384,27 @@ impl TinySpec {
         s
     }
 
+    /// Qwen 3 MoE: the Qwen 3 attention with four experts, two used.
+    pub(crate) fn qwen3moe() -> Self {
+        let mut s = Self::qwen3();
+        s.arch = "qwen3moe";
+        s.moe = Some((4, 2));
+        s.ff = 64;
+        s
+    }
+
+    /// OLMoE: pre-norms, full-width Q/K norms, NEOX RoPE, four experts, two
+    /// used, selected weights not renormalised.
+    pub(crate) fn olmoe() -> Self {
+        let mut s = Self::base("olmoe");
+        s.qk_norm = true;
+        s.qk_norm_full = true;
+        s.moe = Some((4, 2));
+        s.ff = 64;
+        s.meta.push(kv("rope.freq_base", Value::F32(10_000.0)));
+        s
+    }
+
     /// Granite dense: the Granite scales without experts.
     pub(crate) fn granite() -> Self {
         let mut s = Self::base("granite");
@@ -458,6 +479,8 @@ impl TinySpec {
             Self::phi3(),
             Self::smollm3(),
             Self::granitemoe(),
+            Self::qwen3moe(),
+            Self::olmoe(),
             Self::gemma3(),
             Self::gemma2(),
             Self::granite(),

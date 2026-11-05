@@ -33,10 +33,12 @@ Everything else below is read by `examples/`, `tests/` or unit-test fixtures in 
 | `CUCA_SEARCH_BASE_URL` | `examples/web_search.rs` | `https://api.firecrawl.dev` |
 | `CUCA_CACHE_DIR` | the library (`provider-local`), the tokenizer and chat golden unit tests | the platform cache directory |
 | `HF_TOKEN` | the library (`provider-local`) | none; anonymous access |
-| `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, both local test files, the gemma4 golden unit tests | none |
-| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, both local test files | `gemma4-e2b-q4_0` |
-| `CUCA_LOCAL_DOWNLOAD` | both local test files | unset |
-| `CUCA_LOCAL_DEVICE` | `examples/local_model.rs`, both local test files, the `gpu_` unit tests | `cpu` |
+| `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the gemma4 golden unit tests | none |
+| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs` | `gemma4-e2b-q4_0`; `tests/provider_local_tiers.rs` has no default and skips without a model |
+| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs`, `tests/provider_local_mtp.rs` | unset |
+| `CUCA_LOCAL_DEVICE` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the `gpu_` unit tests | `cpu` |
+| `CUCA_LOCAL_EXPERTS` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_tiers.rs` | `resident` |
+| `CUCA_LOCAL_EXPERTS_REF` | `tests/provider_local_tiers.rs` | `resident` |
 | `CUCA_LOCAL_DRAFTER_PATH` | `examples/local_model.rs`, `tests/provider_local_mtp.rs` | none |
 | `CUCA_LOCAL_DRAFTER` | `examples/local_model.rs`, `tests/provider_local_mtp.rs` | none |
 | `CUCA_LOCAL_DRAFT_TOKENS` | `tests/provider_local_mtp.rs` | `3` |
@@ -121,6 +123,12 @@ With none of them set, `LocalModel::load` fails with `CucaError::Config`. Downlo
 - Accepted forms, ASCII case-insensitive: `cpu`, `vulkan`, `vulkan:<n>`, `vulkan:integrated:<n>`, `metal` (same forms), `cuda[:<n>]`, `rocm[:<n>]`.
 - A GPU device needs its Cargo feature, for example `provider-local-vulkan`. Without it the load fails with `CucaError::Config`.
 - The library never reads this variable. The `gpu_` unit tests read it and panic on an unparseable value.
+
+### Expert placement
+
+- `CUCA_LOCAL_EXPERTS` sets `LocalModelConfig::experts`, parsed with `ExpertPlacement::from_str`: `resident`, or `tiered:` with `ram=<size>`, `device=<size>` and `threads=<n>`, where `<size>` takes a `k`, `m` or `g` suffix. Empty counts as unset. `tests/provider_local_tiers.rs` needs it and prints `SKIP` without it.
+- `CUCA_LOCAL_EXPERTS_REF` is the placement `tests/provider_local_tiers.rs` compares the tiered run against. Default: `resident`.
+- The library never reads these variables. Details are on [Tiered expert placement](@/providers/local/expert-tiers.md).
 
 ### Drafter (multi-token prediction)
 

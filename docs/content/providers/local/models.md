@@ -47,6 +47,8 @@ Nothing here is specific to one model family. The loader reads every dimension f
 | `smollm3` | SmolLM 3 | CPU, GPU |
 | `granite` | Granite 3.3 (dense) | CPU, GPU |
 | `granitemoe` | Granite 3.1 MoE | CPU, GPU |
+| `qwen3moe` | Qwen 3 MoE (Qwen3-30B-A3B) | CPU, GPU |
+| `olmoe` | OLMoE (OLMoE-1B-7B) | CPU, GPU |
 | `olmo2` | OLMo 2 | CPU, GPU |
 | `ernie4_5` | ERNIE 4.5 (dense) | CPU, GPU |
 | `gemma4-assistant` | the Gemma 4 multi-token-prediction drafter | only through `LocalModelConfig::drafter` |
@@ -63,6 +65,8 @@ What each architecture adds to the common forward pass:
 - `smollm3`: Llama-style layers where every fourth layer applies no RoPE.
 - `granite`: embedding, attention, residual and logit scales.
 - `granitemoe`: the Granite scales and a top-k mixture of experts.
+- `qwen3moe`: Qwen 3 attention (a Q/K RMSNorm per head, NEOX RoPE) and a top-k mixture of experts whose selected weights are renormalised to sum to one.
+- `olmoe`: pre-norms, a Q/K RMSNorm that spans the whole projection, NEOX RoPE and a top-k mixture of experts whose selected weights are not renormalised.
 - `olmo2`: no pre-norms, only post-attention and post-FFN norms, and a Q/K RMSNorm that spans the whole projection.
 - `ernie4_5`: Llama-style layers with a head size larger than the width divided by the head count.
 - `qwen35`: a hybrid stack; see [Hybrid models](#hybrid-models).
@@ -70,7 +74,7 @@ What each architecture adds to the common forward pass:
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
 
-Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, gemma2, llama, qwen2, qwen3, phi3, smollm3, granite, granitemoe, qwen35, olmo2, ernie4_5, gemma4-assistant``.
+Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, gemma2, llama, qwen2, qwen3, phi3, smollm3, granite, granitemoe, qwen3moe, olmoe, qwen35, olmo2, ernie4_5, gemma4-assistant``.
 
 ### Hybrid models
 
@@ -99,7 +103,7 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 - A GPU file that mixes Q4_0 and Q8_0 weights, as the Llama 3.2 and Phi 3.5 presets do, keeps the weights of the scheme with fewer bytes as f32 where the two have similar shapes. That is exact and costs extra device memory.
 - A weight over 1 GiB on the GPU is split into row chunks.
 - Measured on Vulkan with `phi4-mini-q4_k_m` (AMD RX 9070 XT, Windows): the top-1 token equals the CPU's and the relative logit error against the dequantized CPU reference is 1.8e-2.
-- Mixture of experts: expert tensors are split once at load into one quantized 2-D weight per expert.
+- Mixture of experts: by default expert tensors are split once at load into one quantized 2-D weight per expert, so memory is the file size. `LocalModelConfig::experts` can leave them in the file instead; see [Tiered expert placement](@/providers/local/expert-tiers.md).
 
 ## Tokenizers
 
@@ -218,7 +222,7 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 ## Presets
 
-`ModelSource::PRESETS` has 23 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units. Weights are resident at about the file size on top of it.
+`ModelSource::PRESETS` has 25 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
 
 | Preset | Architecture | Repository | Size | K/V |
 |---|---|---|---|---|
@@ -243,6 +247,8 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 | `smollm2-360m-q8_0` | `llama` | `bartowski/SmolLM2-360M-Instruct-GGUF` | 0.39 GB | 671 MB |
 | `tinyllama-1.1b-q4_0` | `llama` | `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` | 0.64 GB | 92 MB (2,048 maximum) |
 | `granite3.1-moe-1b-q4_0` | `granitemoe` | `bartowski/granite-3.1-1b-a400m-instruct-GGUF` | 0.77 GB | 805 MB |
+| `qwen3-30b-a3b-q4_0` | `qwen3moe` | `unsloth/Qwen3-30B-A3B-GGUF` | 17.38 GB | 1.61 GB |
+| `olmoe-1b-7b-q4_0` | `olmoe` | `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF` | 3.94 GB | 1.07 GB (4,096 maximum) |
 | `qwen3.5-0.8b-q8_0` | `qwen35` | `unsloth/Qwen3.5-0.8B-MTP-GGUF` | 0.83 GB | 201 MB, plus a 20.2 MB recurrent state |
 | `gemma4-e2b-mtp-f16` | `gemma4-assistant` | `unsloth/gemma-4-E2B-it-GGUF` | 0.17 GB | none: a drafter, reads the target's cache |
 
@@ -258,15 +264,16 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 Three kinds of evidence back this page, from strongest to weakest:
 
-- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `granitemoe`, `gemma3`, `gemma2`, `granite`, `olmo2`, `ernie4_5`; `gemma4` and `qwen35` have their own builders).
+- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `granitemoe`, `qwen3moe`, `olmoe`, `gemma3`, `gemma2`, `granite`, `olmo2`, `ernie4_5`; `gemma4` and `qwen35` have their own builders).
 - The live suite `tests/provider_local.rs` runs one real preset per invocation. CI compiles it and every test prints a skip line, so the live results below come from recorded local runs, not from CI.
 - Oracle runs against HuggingFace `transformers` (f32, CPU) use dumps under `.omp/local-models/ref/`, which is gitignored. Those results are reproducible only with that tooling, not from a clean checkout.
 
 Per architecture:
 
-- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `gemma2`, `llama`, `qwen2`, `qwen3`, `qwen35`, `phi3`, `smollm3`, `granite`, `granitemoe`, `olmo2`.
+- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `gemma2`, `llama`, `qwen2`, `qwen3`, `qwen35`, `phi3`, `smollm3`, `granite`, `granitemoe`, `qwen3moe`, `olmoe`, `olmo2`.
 - Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `llama` (Llama 3.2 1B), `phi3` (Phi 3.5 mini), `gemma2`, `olmo2`, `granite` (Granite 3.3 2B).
 - `ernie4_5`: tiny-model tests and a recorded oracle run only. It has no preset and has not run in the live suite.
+- `olmoe` against HuggingFace `transformers` in f32: the engine with dequantized weights matches the reference logits to a maximum absolute difference of 2e-5 and picks the same greedy tokens. `qwen3moe`: a 4-layer cut of the real Qwen3-30B-A3B weights matches to 1e-5, and the production Q4_0 engine's top-1 token differs from the oracle's only where two candidates are within a margin of 0.073. Neither architecture has run a real model on a GPU; a tiered Qwen3-30B-A3B run on Vulkan lost the device (see [Tiered expert placement](@/providers/local/expert-tiers.md#output-guarantee)).
 - `gemma4-assistant`: verified by `tests/provider_local_mtp.rs` as a drafter, and by tiny-model tests on the CPU and the GPU (the GPU ones only when `CUCA_LOCAL_DEVICE` names a GPU).
 - Compile-checked only: every GPU backend other than Vulkan; see [Verified and compile-checked](@/providers/local/gpu.md#verified-and-compile-checked).
 
@@ -287,6 +294,8 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `phi3.5-mini-q4_0`, `phi4-mini-q4_0`, `phi4-mini-q4_k_m` | no | no syntax | all applicable scenarios pass |
 | `r1-distill-qwen-1.5b-q4_0` | always | no syntax | thinking and prefix reuse pass; long-context retrieval is a known limit |
 | `granite3.1-moe-1b-q4_0` | no | yes | all scenarios pass |
+| `qwen3-30b-a3b-q4_0` | on and off | yes | all seven pass |
+| `olmoe-1b-7b-q4_0` | no | no syntax | greedy text and usage, long-context retrieval and prefix reuse pass; the thinking and tool scenarios skip |
 | `qwen3.5-0.8b-q8_0` | on and off | yes, XML | all seven pass, CPU only |
 | `gemma2-2b-q4_0`, `olmo2-1b-q4_0` | no | no syntax | all applicable scenarios pass, on the CPU and on Vulkan |
 | `granite3.3-2b-q4_0` | switched on by the request | yes | all pass except long-context retrieval, a known limit |

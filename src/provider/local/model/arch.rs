@@ -37,6 +37,12 @@ pub(crate) enum Arch {
     /// Granite 3 MoE: Llama-style attention with Granite scales and a top-k
     /// mixture of experts.
     GraniteMoe,
+    /// Qwen 3 MoE: Qwen 3 attention (QK-norm) with a top-k mixture of
+    /// experts in every layer.
+    Qwen3Moe,
+    /// OLMoE: Llama-style pre-norm layers with full-width Q/K RMSNorm and a
+    /// top-k mixture of experts whose selected weights are not renormalised.
+    Olmoe,
     /// Qwen 3.5 (`qwen35`): a hybrid stack of gated delta-net layers
     /// (linear attention with a recurrent state) and, every
     /// `full_attention_interval`-th layer, gated full attention with partial
@@ -156,6 +162,9 @@ pub(crate) struct Behavior {
     /// head_dim`, `n_kv_head * head_dim`) and normalise before the heads are
     /// split, instead of one `head_dim` weight per head (OLMo 2).
     pub(crate) qk_norm_full: bool,
+    /// Renormalise the selected experts' softmax weights to sum to one
+    /// (llama.cpp `norm_w`). Only read when `moe` is set.
+    pub(crate) moe_norm_weights: bool,
 }
 
 const DEFAULT: Behavior = Behavior {
@@ -175,11 +184,12 @@ const DEFAULT: Behavior = Behavior {
     nextn_blocks: false,
     pre_norms: true,
     qk_norm_full: false,
+    moe_norm_weights: true,
 };
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 14] = [
+    pub(crate) const ALL: [Arch; 16] = [
         Arch::Gemma4,
         Arch::Gemma3,
         Arch::Gemma2,
@@ -190,6 +200,8 @@ impl Arch {
         Arch::Smollm3,
         Arch::Granite,
         Arch::GraniteMoe,
+        Arch::Qwen3Moe,
+        Arch::Olmoe,
         Arch::Qwen35,
         Arch::Olmo2,
         Arch::Ernie4_5,
@@ -210,6 +222,8 @@ impl Arch {
             Arch::Smollm3 => "smollm3",
             Arch::Granite => "granite",
             Arch::GraniteMoe => "granitemoe",
+            Arch::Qwen3Moe => "qwen3moe",
+            Arch::Olmoe => "olmoe",
             Arch::Qwen35 => "qwen35",
             Arch::Olmo2 => "olmo2",
             Arch::Ernie4_5 => "ernie4_5",
@@ -296,6 +310,18 @@ impl Arch {
                 moe: true,
                 ..DEFAULT
             },
+            Arch::Qwen3Moe => Behavior {
+                rope: RopeKind::Neox,
+                moe: true,
+                ..DEFAULT
+            },
+            Arch::Olmoe => Behavior {
+                rope: RopeKind::Neox,
+                qk_norm_full: true,
+                moe: true,
+                moe_norm_weights: false,
+                ..DEFAULT
+            },
             Arch::Qwen35 => Behavior {
                 rope: RopeKind::Neox,
                 hybrid_delta_net: true,
@@ -338,6 +364,8 @@ mod tests {
             Arch::Qwen3,
             Arch::Qwen35,
             Arch::Phi3,
+            Arch::Qwen3Moe,
+            Arch::Olmoe,
         ] {
             assert_eq!(arch.behavior().rope, RopeKind::Neox, "{arch:?}");
         }
