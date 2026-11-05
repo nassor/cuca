@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.6.1
+
+### Added
+
+- `provider-local`: tiered expert placement for mixture-of-experts models
+  (`LocalModelConfig::experts`, `ExpertPlacement::{Resident, Tiered}`,
+  `ExpertTiers`). Routed experts stay in the GGUF file and load on demand
+  through bounded RAM and (on a GPU) device caches with learned heat; output
+  equals the resident mode on the same device. `LocalModel::expert_tier_stats`
+  and `LocalModel::expert_heat` (`ExpertTierStats`, `ExpertHeat`, reusable via
+  `ExpertTiers::warm_from`).
+- `provider-local`: architectures `qwen3moe` and `olmoe`, presets
+  `qwen3-30b-a3b-q4_0` and `olmoe-1b-7b-q4_0`.
+
+### Fixed
+
+- GPU: an expert with one row in a multi-row pass no longer loses the Vulkan
+  device; dropping a GPU model returns its device memory to the driver.
+- CI: the test job builds without debug info so it fits the runner's disk.
+
 ## 0.6.0
 
 ### Added
