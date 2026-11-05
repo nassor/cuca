@@ -53,7 +53,6 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::ErrorKind;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -75,7 +74,7 @@ pub(crate) const HEAT_DECAY_ROWS: u32 = 4096;
 ///
 /// # Errors
 ///
-/// The I/O error; [`ErrorKind::UnexpectedEof`] when the file ends first.
+/// The I/O error; [`std::io::ErrorKind::UnexpectedEof`] when the file ends first.
 pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     {
@@ -88,9 +87,9 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io
         let mut done = 0;
         while done < buf.len() {
             match file.seek_read(&mut buf[done..], offset + done as u64) {
-                Ok(0) => return Err(ErrorKind::UnexpectedEof.into()),
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
                 Ok(n) => done += n,
-                Err(e) if e.kind() == ErrorKind::Interrupted => {}
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                 Err(e) => return Err(e),
             }
         }
@@ -100,7 +99,7 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io
     {
         let _ = (file, offset, buf);
         Err(std::io::Error::new(
-            ErrorKind::Unsupported,
+            std::io::ErrorKind::Unsupported,
             "positional file reads are not available on this platform",
         ))
     }
@@ -964,7 +963,7 @@ mod tests {
         read_exact_at(&file, 3, &mut buf[..2]).unwrap();
         assert_eq!(&buf[..2], &[3, 4]);
         let e = read_exact_at(&file, 250, &mut buf).unwrap_err();
-        assert_eq!(e.kind(), ErrorKind::UnexpectedEof);
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[test]
