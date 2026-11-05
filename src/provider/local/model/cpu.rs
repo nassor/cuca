@@ -10,9 +10,11 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::{Arc, LazyLock, Mutex, PoisonError};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use candle_core::quantized::{GgmlDType, QMatMul as CandleMatMul, QTensor, gguf_file};
+use candle_core::utils::barrier_pool;
 use candle_core::{D, DType, Device, Module, Tensor};
 use candle_nn::ops::{rms_norm, sigmoid, softmax_last_dim};
 use candle_nn::rotary_emb::{rope, rope_i};
@@ -26,7 +28,8 @@ use super::qmm::QmmWeight;
 use super::quant::{RowTable, TokenEmbedding};
 use super::rope::RopeKind;
 use super::{
-    Want, attention_mask, build_rope_tables, candle_err, check_context, err, read_hparams,
+    RING_ROLLBACK, RING_ROWS, Want, attention_mask, build_rope_tables, candle_err, check_context,
+    err, kv_slots, read_hparams,
 };
 use crate::error::CucaError;
 
@@ -278,9 +281,33 @@ struct RopeTable {
 /// The key and value tensors of one K/V cache.
 type KvPair = (Tensor, Tensor);
 
+/// The K/V cache of one K/V-owning layer: `slots` slots holding the
+/// contiguous positions `base..base + slots` (position `p` at slot `p -
+/// base`). `base` stays 0 unless the layer is a bounded sliding-window layer
+/// ([`kv_slots`] below `context_length`) that was compacted
+/// ([`Transformer::make_room`]).
+struct KvSlab {
+    kv: KvPair,
+    base: usize,
+    slots: usize,
+}
+
+impl KvSlab {
+    /// An empty slab of `slots` slots for the K/V-owning layer `spec`.
+    fn zeros(spec: &LayerSpec, slots: usize) -> Result<Self, CucaError> {
+        let shape = (1, spec.n_kv_head, slots, spec.head_dim);
+        let zeros = || Tensor::zeros(shape, DType::F32, &Device::Cpu).map_err(candle_err);
+        Ok(Self {
+            kv: (zeros()?, zeros()?),
+            base: 0,
+            slots,
+        })
+    }
+}
+
 /// K/V cache of the layers that own K/V, plus the shared filled length.
 struct KvCache {
-    layers: Vec<Option<KvPair>>,
+    layers: Vec<Option<KvSlab>>,
     len: usize,
 }
 
@@ -504,9 +531,13 @@ pub(crate) struct Forward {
 
 /// The target's K/V tensors a drafter attends to, sharing storage with the
 /// target's cache (candle tensors are handles), so the target's later writes
-/// are visible without copying.
+/// are visible without copying. Valid until the target's next forward call,
+/// which may compact the sliding slab and move `sliding_base`: take a fresh
+/// one per draft.
 pub(crate) struct ExtKv {
     sliding: KvPair,
+    /// Position held by slot 0 of `sliding` (see [`KvSlab`]).
+    sliding_base: usize,
     full: KvPair,
 }
 
@@ -517,7 +548,8 @@ pub(crate) struct ExtKv {
 #[derive(Clone, Copy)]
 struct AttnCall<'a> {
     spec: &'a LayerSpec,
-    /// Cache slot of the first row: the call's `t` rows fill `start..`.
+    /// Cache index of the first row: the call's `t` rows fill `start..`,
+    /// stored at slots `start - base..`.
     start: usize,
     /// RoPE position of the first row (the rows are consecutive positions).
     rope_start: usize,
@@ -528,9 +560,22 @@ struct AttnCall<'a> {
     /// The cache the layer attends to: its own, or the layer's shared source;
     /// `None` for a drafter layer, which reads `ext`.
     read: Option<&'a KvPair>,
+    /// Index held by slot 0 of `own` and `read` (one cache: an owning layer
+    /// reads its own); a drafter layer takes it from `ext` instead.
+    base: usize,
     /// A drafter layer's source: the target's cache and the number of its
     /// positions the layer may read.
     ext: Option<(&'a ExtKv, usize)>,
+}
+
+/// The slot of cache index `index` in a slab whose slot 0 holds `base`: an
+/// error, not a wrap, when the index was evicted.
+fn slot(index: usize, base: usize) -> candle_core::Result<usize> {
+    index.checked_sub(base).ok_or_else(|| {
+        candle_core::Error::msg(format!(
+            "position {index} was evicted from a sliding-window cache that starts at {base}"
+        ))
+    })
 }
 
 /// A drafter's input and output projections: `pre` maps the concatenation of
@@ -677,9 +722,10 @@ impl Transformer {
         for (il, spec) in hp.layers.iter().enumerate() {
             let layout = LayerLayout::read(&hp, il, spec, content)?;
             if spec.owns_kv(il) {
-                let shape = (1, spec.n_kv_head, context_length, spec.head_dim);
-                let zeros = || Tensor::zeros(shape, DType::F32, &Device::Cpu).map_err(candle_err);
-                kv_layers.push(Some((zeros()?, zeros()?)));
+                kv_layers.push(Some(KvSlab::zeros(
+                    spec,
+                    kv_slots(spec.window, context_length),
+                )?));
             } else {
                 kv_layers.push(None);
             }
@@ -768,6 +814,8 @@ impl Transformer {
                 self.context_length
             )));
         }
+        // A drafter (no token embedding) is rejected below; it owns no K/V.
+        self.make_room(start_pos, tokens.len())?;
         let embed = self
             .embed
             .as_ref()
@@ -805,6 +853,49 @@ impl Transformer {
         Ok(out)
     }
 
+    /// Compact every bounded sliding-window slab that cannot take the rows
+    /// `start..start + t` in place: its last `window - 1 + RING_ROLLBACK`
+    /// positions before `start` move to its front (a copy, so the move never
+    /// overlaps itself) and its `base` advances. Runs before any layer, so a
+    /// call reads and writes only contiguous slots.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when a call writes more rows than a compacted
+    /// slab holds ([`RING_ROWS`]), or a tensor operation fails.
+    fn make_room(&mut self, start: usize, t: usize) -> Result<(), CucaError> {
+        for (il, slab) in self.kv.layers.iter_mut().enumerate() {
+            let (Some(slab), Some(w)) = (slab, self.hp.layers[il].window) else {
+                continue;
+            };
+            if start + t <= slab.base + slab.slots {
+                continue;
+            }
+            let keep = (w - 1 + RING_ROLLBACK).min(start - slab.base);
+            let from = start - keep - slab.base;
+            if from > 0 {
+                if keep > 0 {
+                    for cache in [&slab.kv.0, &slab.kv.1] {
+                        // A narrow over one KV head is already contiguous and
+                        // would share the slab's storage: force the copy.
+                        let moved = cache
+                            .narrow(2, from, keep)
+                            .and_then(|m| m.force_contiguous())
+                            .map_err(candle_err)?;
+                        cache.slice_set(&moved, 2, 0).map_err(candle_err)?;
+                    }
+                }
+                slab.base = start - keep;
+            }
+            if start + t > slab.base + slab.slots {
+                return Err(err(format!(
+                    "a bounded sliding-window cache takes at most {RING_ROWS} rows per call, got {t}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// The target's K/V tensors a drafter reads: the cache of the last
     /// sliding-window layer's source and of the last full-attention layer's
     /// source (the layers Gemma 4's shared-K/V layers read), sharing storage
@@ -815,7 +906,7 @@ impl Transformer {
     /// [`CucaError::Provider`] when the model has no sliding or no
     /// full-attention K/V-owning layer to share.
     pub(crate) fn ext_kv(&self) -> Result<ExtKv, CucaError> {
-        let source = |sliding: bool| -> Result<KvPair, CucaError> {
+        let source = |sliding: bool| -> Result<&KvSlab, CucaError> {
             let layer = self
                 .hp
                 .layers
@@ -828,11 +919,13 @@ impl Transformer {
                         if sliding { "sliding-window" } else { "full" }
                     ))
                 })?;
-            self.cache(layer.kv_source).cloned().map_err(candle_err)
+            self.cache(layer.kv_source).map_err(candle_err)
         };
+        let sliding = source(true)?;
         Ok(ExtKv {
-            sliding: source(true)?,
-            full: source(false)?,
+            sliding: sliding.kv.clone(),
+            sliding_base: sliding.base,
+            full: source(false)?.kv.clone(),
         })
     }
 
@@ -920,7 +1013,11 @@ impl Transformer {
     ///
     /// An attention-only model retains exactly `min(len, current length)`:
     /// K/V rows are positional, rows at or past the new length are
-    /// overwritten, not cleared.
+    /// overwritten, not cleared. The exception is a `len` below the floor of
+    /// a compacted sliding-window slab (`base + window - 1`, at least
+    /// [`RING_ROLLBACK`] positions behind the call that compacted it): the
+    /// window such a prefix needs was evicted, so the cache is emptied and 0
+    /// returned.
     ///
     /// A hybrid model keeps, besides K/V rows, a recurrent state that is not
     /// positional (it summarises everything before the current end and
@@ -940,6 +1037,34 @@ impl Transformer {
     /// retained length is dropped, because the positions it covers are about
     /// to be overwritten.
     pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
+        let len = if len < self.ring_floor() { 0 } else { len };
+        let kept = self.truncate_positions(len);
+        if kept == 0 {
+            for slab in self.kv.layers.iter_mut().flatten() {
+                slab.base = 0;
+            }
+        }
+        kept
+    }
+
+    /// The smallest length every compacted sliding-window slab can still
+    /// serve: `base + window - 1` over the slabs whose `base` moved, 0 when
+    /// none did.
+    fn ring_floor(&self) -> usize {
+        self.kv
+            .layers
+            .iter()
+            .zip(&self.hp.layers)
+            .filter_map(|(slab, spec)| match (slab, spec.window) {
+                (Some(slab), Some(w)) if slab.base > 0 => Some(slab.base + w - 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// [`Transformer::truncate_cache`] without the sliding-window floor.
+    fn truncate_positions(&mut self, len: usize) -> usize {
         // An empty cache always means the zero state, even when a pass that
         // died half-way left some layers' state advanced past `kv.len`.
         if self.hybrid && len == 0 {
@@ -1235,14 +1360,15 @@ impl Transformer {
     ) -> candle_core::Result<Tensor> {
         let spec = &self.hp.layers[il];
         let own = if spec.owns_kv(il) {
-            Some(self.cache(il)?)
+            Some(&self.cache(il)?.kv)
         } else {
             None
         };
-        let read = if spec.kv_source == usize::MAX {
-            None
+        let (read, base) = if spec.kv_source == usize::MAX {
+            (None, 0)
         } else {
-            Some(self.cache(spec.kv_source)?)
+            let slab = self.cache(spec.kv_source)?;
+            (Some(&slab.kv), slab.base)
         };
         let call = AttnCall {
             spec,
@@ -1251,6 +1377,7 @@ impl Transformer {
             t,
             own,
             read,
+            base,
             ext,
         };
         self.attention_in(&call, aw, h)
@@ -1271,6 +1398,7 @@ impl Transformer {
             rope_start,
             t,
             read,
+            base,
             ext,
             ..
         } = *call;
@@ -1313,28 +1441,35 @@ impl Transformer {
             self.store_kv(call, aw, k, v)?;
         }
 
-        let ext_pair;
-        let (cache_k, cache_v, hi) = match read {
-            Some((k, v)) => (k, v, hi),
+        let (cache_k, cache_v, hi, base) = match read {
+            Some((k, v)) => (k, v, hi, base),
             None => {
                 let (e, len) = ext.ok_or_else(|| {
                     candle_core::Error::msg("a drafter layer needs the target's K/V")
                 })?;
-                ext_pair = if spec.window.is_some() {
-                    &e.sliding
+                let (pair, ext_base) = if spec.window.is_some() {
+                    (&e.sliding, e.sliding_base)
                 } else {
-                    &e.full
+                    (&e.full, 0)
                 };
-                (&ext_pair.0, &ext_pair.1, len)
+                (&pair.0, &pair.1, len, ext_base)
             }
         };
         let attn = if ROW_EXACT.get() && t > 1 && ext.is_none() {
-            attend_rows_exact(spec, hp.attn_softcap, &q, (cache_k, cache_v), start, t)?
+            attend_rows_exact(
+                spec,
+                hp.attn_softcap,
+                &q,
+                (cache_k, cache_v),
+                start,
+                t,
+                base,
+            )?
         } else {
             let lo = window_lo(spec, start, hi);
             let l = hi - lo;
-            let k = cache_k.narrow(2, lo, l)?;
-            let v = cache_v.narrow(2, lo, l)?;
+            let k = cache_k.narrow(2, slot(lo, base)?, l)?;
+            let v = cache_v.narrow(2, slot(lo, base)?, l)?;
             let mask = if t > 1 {
                 let mask = attention_mask(start, t, lo, hi, spec.window);
                 Some(Tensor::from_vec(mask, (t, l), &Device::Cpu)?)
@@ -1379,8 +1514,8 @@ impl Transformer {
     }
 
     /// Normalise, rotate and store the key and value projections `k` and `v`
-    /// `(1, t, n_kv * d)` of a K/V-owning layer into slots `call.start..` of
-    /// its cache.
+    /// `(1, t, n_kv * d)` of a K/V-owning layer into cache indices
+    /// `call.start..` (slots `call.start - call.base..`) of its cache.
     fn store_kv(
         &self,
         call: &AttnCall<'_>,
@@ -1411,13 +1546,14 @@ impl Transformer {
             None => v,
         };
         let v = v.transpose(1, 2)?.contiguous()?;
-        cache_k.slice_set(&k.contiguous()?, 2, call.start)?;
-        cache_v.slice_set(&v, 2, call.start)?;
+        let at = slot(call.start, call.base)?;
+        cache_k.slice_set(&k.contiguous()?, 2, at)?;
+        cache_v.slice_set(&v, 2, at)?;
         Ok(())
     }
 
-    /// The K and V cache tensors of the K/V-owning layer `il`.
-    fn cache(&self, il: usize) -> candle_core::Result<&(Tensor, Tensor)> {
+    /// The K/V slab of the K/V-owning layer `il`.
+    fn cache(&self, il: usize) -> candle_core::Result<&KvSlab> {
         self.kv
             .layers
             .get(il)
@@ -1844,9 +1980,10 @@ fn window_lo(spec: &LayerSpec, query: usize, hi: usize) -> usize {
 
 /// [`attend`] for the shape-stable mode ([`RowExact`]): every query row `i`
 /// of `q` `(1, n_head, t, d)` attends over exactly the keys a decode step at
-/// slot `start + i` would, in its own call. The rows are independent, so they
-/// run on scoped threads (each row's arithmetic is the same whichever thread
-/// computes it).
+/// cache index `start + i` would, in its own call; slot 0 of the cache holds
+/// index `base`. The rows are independent, so they run on candle's barrier
+/// pool, so a verification round spawns no threads (each row's arithmetic is
+/// the same whichever worker computes it).
 fn attend_rows_exact(
     spec: &LayerSpec,
     softcap: Option<f64>,
@@ -1854,46 +1991,44 @@ fn attend_rows_exact(
     (cache_k, cache_v): (&Tensor, &Tensor),
     start: usize,
     t: usize,
+    base: usize,
 ) -> candle_core::Result<Tensor> {
     let one_row = |i: usize| -> candle_core::Result<Tensor> {
         let hi = start + i + 1;
         let lo = window_lo(spec, start + i, hi);
+        let from = slot(lo, base)?;
         attend(
             &q.narrow(2, i, 1)?.contiguous()?,
-            &cache_k.narrow(2, lo, hi - lo)?,
-            &cache_v.narrow(2, lo, hi - lo)?,
+            &cache_k.narrow(2, from, hi - lo)?,
+            &cache_v.narrow(2, from, hi - lo)?,
             None,
             spec.scale,
             softcap,
         )
     };
-    // Queried once: `available_parallelism` reads the scheduler affinity and
-    // cgroup limits on every call, and this runs once per layer per pass.
-    static PARALLELISM: LazyLock<usize> = LazyLock::new(|| {
-        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    // `attend` runs float matmuls and a softmax only, never a pooled job, so
+    // the pool is not re-entered from its own workers.
+    let next = AtomicUsize::new(0);
+    let rows: Vec<Mutex<Option<candle_core::Result<Tensor>>>> =
+        (0..t).map(|_| Mutex::new(None)).collect();
+    barrier_pool().execute(|_| {
+        loop {
+            let i = next.fetch_add(1, Ordering::Relaxed);
+            if i >= t {
+                break;
+            }
+            let row = one_row(i);
+            *rows[i].lock().unwrap_or_else(PoisonError::into_inner) = Some(row);
+        }
     });
-    let threads = (*PARALLELISM).min(t);
-    let per = t.div_ceil(threads);
-    let parts = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..threads)
-            .map(|j| {
-                let one_row = &one_row;
-                scope.spawn(move || {
-                    (j * per..((j + 1) * per).min(t))
-                        .map(one_row)
-                        .collect::<candle_core::Result<Vec<_>>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .map(|h| {
-                h.join()
-                    .unwrap_or_else(|_| Err(candle_core::Error::msg("attention worker panicked")))
-            })
-            .collect::<candle_core::Result<Vec<_>>>()
-    })?;
-    let rows: Vec<Tensor> = parts.into_iter().flatten().collect();
+    let rows = rows
+        .into_iter()
+        .map(|row| {
+            row.into_inner()
+                .unwrap_or_else(PoisonError::into_inner)
+                .unwrap_or_else(|| Err(candle_core::Error::msg("attention row not computed")))
+        })
+        .collect::<candle_core::Result<Vec<_>>>()?;
     Tensor::cat(&rows, 2)
 }
 
@@ -2256,16 +2391,130 @@ mod tests {
 
     #[test]
     fn kv_cache_bytes_follow_the_general_formula() {
-        // Gemma 4 tiny: 3 owners (sliding 32, sliding 32, full 64), one KV head.
+        // Gemma 4 tiny: 3 owners (sliding 32, sliding 32, full 64), one KV
+        // head; no layer is bounded at 32 positions.
         let model = write_tiny_model();
         let m = load(&model, 32);
-        assert_eq!(m.hp.kv_bytes_per_position(), 2 * 4 * (32 + 32 + 64));
+        assert_eq!(m.hp.kv_cache_bytes(32), 32 * 2 * 4 * (32 + 32 + 64));
         // Llama tiny: 4 layers x 2 KV heads x 16 dims.
         let m = load(&write_spec(&TinySpec::llama()), 32);
-        assert_eq!(m.hp.kv_bytes_per_position(), 4 * 2 * 4 * 2 * 16);
+        assert_eq!(m.hp.kv_cache_bytes(32), 32 * 4 * 2 * 4 * 2 * 16);
         // Qwen 3: head dim 32 differs from the embedding split.
         let m = load(&write_spec(&TinySpec::qwen3()), 32);
-        assert_eq!(m.hp.kv_bytes_per_position(), 4 * 2 * 4 * 2 * 32);
+        assert_eq!(m.hp.kv_cache_bytes(32), 32 * 4 * 2 * 4 * 2 * 32);
+        // Gemma 3 tiny at 4096 positions: its four sliding owners (window 4)
+        // hold 3 + 1024 + 256 = 1283 slots, its two full owners 4096; one KV
+        // head of 32 dims.
+        let m = load(&write_spec(&TinySpec::gemma3()), 32);
+        assert_eq!(
+            m.hp.kv_cache_bytes(4096),
+            2 * 4 * 32 * (4 * 1283 + 2 * 4096)
+        );
+    }
+
+    impl Transformer {
+        /// Give every K/V-owning layer `context_length` slots: the cache
+        /// keeps every position, the reference a bounded slab must match.
+        fn unbound_cache(&mut self) {
+            for (il, slab) in self.kv.layers.iter_mut().enumerate() {
+                if slab.is_some() {
+                    *slab = Some(KvSlab::zeros(&self.hp.layers[il], self.context_length).unwrap());
+                }
+            }
+        }
+    }
+
+    /// The Gemma 3 tiny model loaded for 1400 positions twice: with its
+    /// bounded sliding slabs (1283 slots) and with every slab unbounded.
+    fn bounded_and_unbounded() -> (Transformer, Transformer) {
+        let model = write_spec(&TinySpec {
+            context: 1400,
+            ..TinySpec::gemma3()
+        });
+        let bounded = load(&model, 1400);
+        let mut unbounded = load(&model, 1400);
+        unbounded.unbound_cache();
+        assert!(
+            bounded
+                .kv
+                .layers
+                .iter()
+                .flatten()
+                .any(|slab| slab.slots == 1283)
+        );
+        (bounded, unbounded)
+    }
+
+    /// A bounded sliding-window cache computes what keeping every position
+    /// computes, bit for bit, across compactions; it truncates back within
+    /// its rollback headroom and empties itself below its floor.
+    #[test]
+    fn bounded_sliding_cache_matches_unbounded() {
+        let (mut bounded, mut unbounded) = bounded_and_unbounded();
+        let tokens: Vec<u32> = (0..1350u32)
+            .map(|i| (i * 7 + i / 5) % VOCAB as u32)
+            .collect();
+        let step = |m: &mut Transformer, chunk: &[u32], at: usize| {
+            m.forward_ext(chunk, at, Want::Last, Hidden::None, true)
+                .unwrap()
+                .logits
+                .unwrap()
+        };
+        for (i, chunk) in tokens.chunks(256).enumerate() {
+            let at = i * 256;
+            assert_eq!(
+                step(&mut bounded, chunk, at),
+                step(&mut unbounded, chunk, at),
+                "chunk at {at}"
+            );
+        }
+        // The slab starting at 0 overflowed at the chunk starting at 1280.
+        assert!(bounded.ring_floor() > 0, "the prefill compacted the slabs");
+        for (j, &token) in [3u32, 9, 1, 14, 6, 2, 11, 8, 5, 12].iter().enumerate() {
+            let at = 1350 + j;
+            assert_eq!(
+                step(&mut bounded, &[token], at),
+                step(&mut unbounded, &[token], at),
+                "step at {at}"
+            );
+        }
+        assert_eq!(bounded.truncate_cache(1300), 1300);
+        assert_eq!(unbounded.truncate_cache(1300), 1300);
+        assert_eq!(
+            step(&mut bounded, &[4], 1300),
+            step(&mut unbounded, &[4], 1300)
+        );
+        assert_eq!(bounded.truncate_cache(100), 0, "below the floor: emptied");
+        assert_eq!(unbounded.truncate_cache(100), 100);
+        assert_eq!(bounded.ring_floor(), 0);
+        // Refilled from scratch, the bounded model agrees again.
+        for (i, chunk) in tokens[..101].chunks(64).enumerate() {
+            step(&mut bounded, chunk, i * 64);
+        }
+        step(&mut unbounded, &tokens[100..101], 100);
+        assert_eq!(
+            step(&mut bounded, &[7], 101),
+            step(&mut unbounded, &[7], 101)
+        );
+    }
+
+    /// A call that needs a compaction may write at most `RING_ROWS` rows into
+    /// a bounded slab: more is an error naming the limit, not a panic.
+    #[test]
+    fn bounded_cache_rejects_oversized_calls() {
+        let (mut bounded, _) = bounded_and_unbounded();
+        let tokens: Vec<u32> = (0..1100u32).map(|i| i % VOCAB as u32).collect();
+        for (i, chunk) in tokens.chunks(256).enumerate() {
+            bounded
+                .forward_ext(chunk, i * 256, Want::None, Hidden::None, false)
+                .unwrap();
+        }
+        let more: Vec<u32> = (0..300u32).map(|i| i % VOCAB as u32).collect();
+        let e = bounded
+            .forward_ext(&more, 1100, Want::Last, Hidden::None, false)
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("at most 256 rows"), "{e}");
     }
 
     #[test]
@@ -2840,7 +3089,7 @@ mod hybrid_tests {
         assert_eq!(spec.state_floats(), 3 * 96 + 4 * Q35_DK * Q35_DV);
         assert_eq!(m.hp.recurrent_state_bytes(), 4 * 4 * spec.state_floats());
         // One attention layer (layer 3) owns K/V.
-        assert_eq!(m.hp.kv_bytes_per_position(), 2 * 4 * Q35_N_KV * Q35_HEAD);
+        assert_eq!(m.hp.kv_cache_bytes(1), (2 * 4 * Q35_N_KV * Q35_HEAD) as u64);
         assert_eq!(m.hp.kv_owners().count(), 1);
 
         let state = 4 * spec.state_floats();

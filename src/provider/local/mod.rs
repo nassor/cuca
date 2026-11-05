@@ -38,12 +38,13 @@
 //!
 //! - Single-slot FIFO engine: one request runs at a time, at most 16 queue
 //!   behind it (further callers wait), 64 output blocks buffered per request.
-//! - K/V cache memory is `context_length * 2 * 4 * sum(n_kv_head * head_dim)`
-//!   bytes over the layers that own K/V ([`LocalModel::kv_cache_bytes`]), in
-//!   RAM or device memory: per position 36,864 bytes for Gemma 4 E2B (302 MB
-//!   at 8192), 114,688 for E4B, 229,376 for Qwen3-0.6B and 786,432 for
-//!   Phi-3.5-mini (6.44 GB at 8192: a full-attention model with 32 KV heads
-//!   needs a smaller `context_length`).
+//! - K/V cache memory is `2 * 4 * n_kv_head * head_dim` bytes per slot over
+//!   the layers that own K/V ([`LocalModel::kv_cache_bytes`]), in RAM or
+//!   device memory, with `context_length` slots for a full-attention layer
+//!   and `min(context_length, window - 1 + 1280)` for a sliding-window layer.
+//!   At 8192 positions: 145 MB for Gemma 4 E2B, 415 MB for E4B, 1.88 GB for
+//!   Qwen3-0.6B and 6.44 GB for Phi-3.5-mini (a full-attention model with 32
+//!   KV heads needs a smaller `context_length`).
 //! - Gemma 4's per-layer embedding rows are read from disk per input token
 //!   instead of being held in RAM (5,040 bytes each and 1.32 GB saved in E2B
 //!   Q4_0). A mixture-of-experts model keeps every expert resident (file
@@ -55,7 +56,7 @@
 //! On the CPU a token's logits do not depend on how the prompt was split:
 //! prefill and speculative verification run in a row-exact mode (float
 //! matmuls per row, attention per query row) that equals single-token decoding
-//! bit for bit (per-row attention on scoped threads, float matmuls per row,
+//! bit for bit (per-row attention on candle's worker pool, float matmuls per row,
 //! and a safe Q4_0/Q8_0 matmul kernel whose rows are independent of their
 //! batch), at no cost in prefill throughput. A request that
 //! reuses a cached prefix therefore generates what a cold request generates.
@@ -69,21 +70,28 @@
 //! drafter proposes up to [`LocalModelConfig::draft_tokens`] tokens from the
 //! target's last hidden state, sharing the target's K/V cache; the target
 //! verifies them in one batched pass and keeps the longest prefix it agrees
-//! with. At temperature 0 the output equals plain greedy decoding; above 0 the
+//! with. A speculative round always verifies its first draft and adds each
+//! further one only while it pays: the engine predicts a draft's acceptance
+//! from the drafter's own chained token probabilities (calibrated against
+//! the acceptance it observes) and keeps it while it raises the round's
+//! expected tokens per second under the measured verification cost per row
+//! count, up to `draft_tokens`.
+//! At temperature 0 the output equals plain greedy decoding; above 0 the
 //! standard speculative-sampling acceptance rule (accept with
 //! `min(1, p/q)`, resample the rejection from `max(0, p - q)`) preserves the
 //! target's sampling distribution. An engine-side governor measures the
 //! tokens per second of plain and speculative rounds and drafts only while
 //! speculation is faster, re-probing with exponential back-off, so the worst
-//! case stays near plain decoding (a seeded sampling run always drafts, so equal
-//! prompts still reproduce equal tokens). Measured on Gemma 4 E2B Q4_0 with the
-//! E2B assistant (128-token replies, quiet development machine, speed against
-//! plain decoding on the same device): CPU 1.17x on a code prompt, 1.37x on a
-//! list, 1.00x on prose; Vulkan (RX 9070 XT) 0.97x,
-//! 0.95x and 0.96x: GPU single-token decoding is host-bound (35 tok/s), so
-//! the drafter's own launches cost as much as the verification saves, and the
-//! governor keeps the run within about 5 % of plain decoding. Drafting is off
-//! by default; it pays on the CPU.
+//! case stays near plain decoding (a seeded sampling run always drafts the
+//! full `draft_tokens`, so equal prompts still reproduce equal tokens).
+//! Measured on Gemma 4 E2B Q4_0 with the E2B assistant at the default
+//! `draft_tokens` 5 (128-token replies, quiet development machine, speed
+//! against plain decoding on the same device): CPU 1.32x on a code prompt,
+//! 1.31x on a list, 1.01x on prose; Vulkan (RX 9070 XT) 0.97x, 0.97x and
+//! 1.00x: GPU single-token decoding is host-bound (38 tok/s), so the
+//! drafter's own launches cost as much as the verification saves, and the
+//! governor keeps the run within about 3 % of plain decoding. Drafting is
+//! off by default; it pays on the CPU.
 //!
 //! `DrafterSource::InTrunk` drafts with the prediction head embedded in a
 //! Qwen 3.5 `*-MTP` file (for example `unsloth/Qwen3.5-0.8B-MTP-GGUF`): no
@@ -94,14 +102,14 @@
 //! back. The target verifies and rolls back exactly as above (a hybrid model
 //! rolls back at most 16 drafts, one verification call), so greedy output
 //! equals plain decoding bit for bit. Measured on Qwen3.5-0.8B Q8_0 (128-token
-//! replies, two runs on a quiet CPU, plain decoding 52-53 tok/s): a code
-//! prompt 1.36-1.40x at one draft per round, 1.21x at two and 1.57-1.63x at
-//! three or four; a list 1.05-1.41x; creative prose 0.96-1.07x (its text is
-//! hard to predict, so the governor keeps drafting mostly off); the three
-//! together 1.11-1.24x for one to four drafts (drafted tokens accepted: 75 %,
-//! 60 %, 51 %, 50 %). A draft step costs 1.05 ms against a 19-22 ms trunk
-//! step because it ranks only the first 65,536 of the 248,320 token ids: 5x
-//! cheaper than the whole vocabulary for 4 % fewer accepted tokens per round.
+//! replies, quiet CPU, plain decoding 55 tok/s): at the default five drafts
+//! per round a code prompt 1.59x, a list 1.40x, creative prose 0.98x (its
+//! text is hard to predict, so the governor keeps drafting mostly off), the
+//! three together 1.26x (67 % of drafted tokens accepted); at three drafts
+//! 1.86x, 1.37x, 0.99x and 1.32x. A draft step costs about 1 ms against a
+//! 19-22 ms trunk step because it ranks only the first 65,536 of the 248,320
+//! token ids: 5x cheaper than the whole vocabulary for 4 % fewer accepted
+//! tokens per round.
 
 mod chat;
 mod download;
@@ -148,9 +156,9 @@ pub(crate) fn resolve_context_length(configured: Option<usize>, model_max: usize
 }
 
 /// Default [`LocalModelConfig::draft_tokens`].
-const DEFAULT_DRAFT_TOKENS: usize = 3;
+const DEFAULT_DRAFT_TOKENS: usize = 5;
 /// Largest accepted [`LocalModelConfig::draft_tokens`].
-const MAX_DRAFT_TOKENS: usize = 16;
+pub(crate) const MAX_DRAFT_TOKENS: usize = 16;
 /// Connect timeout of the one-off download client.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -739,11 +747,13 @@ pub struct LocalModelConfig {
     /// environment variable, then to anonymous access.
     pub hf_token: Option<String>,
     /// Maximum tokens of prompt plus completion per request, also the K/V
-    /// cache capacity: it costs `context_length * 2 * 4 * sum(n_kv_head *
-    /// head_dim)` bytes of RAM over the K/V-owning layers (Gemma 4 E2B
-    /// 36,864 per position, Qwen3-0.6B 229,376, Phi-3.5-mini 786,432, i.e.
-    /// 6.44 GB at 8192: size it for the model; [`LocalModel::kv_cache_bytes`]
-    /// reports the result; see [`LocalModel`]). `None` (the default)
+    /// cache capacity: a full-attention K/V-owning layer costs
+    /// `context_length * 2 * 4 * n_kv_head * head_dim` bytes of RAM, a
+    /// sliding-window layer at most `window - 1 + 1280` positions of that
+    /// (Gemma 4 E2B 145 MB at 8192, Qwen3-0.6B 229,376 bytes per position,
+    /// Phi-3.5-mini 786,432, i.e. 6.44 GB at 8192: size it for the model;
+    /// [`LocalModel::kv_cache_bytes`] reports the result; see [`LocalModel`]).
+    /// `None` (the default)
     /// resolves to the smaller of 8192 and the model's own maximum, so a
     /// model trained for 2048 or 4096 positions loads without configuration.
     /// An explicit value must be at least 1 and at most the model's maximum,
@@ -762,9 +772,11 @@ pub struct LocalModelConfig {
     /// guarantee and measured speedups. `None` (the default) keeps plain
     /// decoding.
     pub drafter: Option<DrafterSource>,
-    /// Tokens the drafter proposes per verification round, `1..=16`; ignored
-    /// without a drafter. Longer rounds win more on predictable text and
-    /// waste more verification work on unpredictable text.
+    /// Most tokens the drafter proposes per verification round, `1..=16`
+    /// (default 5); ignored without a drafter. The engine drafts fewer when
+    /// the drafter's confidence makes another draft not worth its
+    /// verification cost, measured on the running device; a run with a fixed
+    /// `seed` and a temperature above 0 always drafts exactly `draft_tokens`.
     pub draft_tokens: usize,
     /// Optional download progress observer.
     pub on_download_progress: Option<DownloadProgressCallback>,
@@ -804,7 +816,7 @@ impl fmt::Debug for LocalModelConfig {
 
 /// What a loaded engine hands back to `load`: the pieces the request path
 /// needs without touching the engine thread.
-type Ready = Result<(Arc<Tokenizer>, ChatTemplate, ChatFormat, usize, usize), CucaError>;
+type Ready = Result<(Arc<Tokenizer>, ChatTemplate, ChatFormat, usize, u64), CucaError>;
 
 /// State shared by every clone of a [`LocalModel`].
 pub(crate) struct LocalModelInner {
@@ -814,7 +826,7 @@ pub(crate) struct LocalModelInner {
     template: ChatTemplate,
     format: ChatFormat,
     context_length: usize,
-    kv_bytes_per_position: usize,
+    kv_cache_bytes: u64,
     draft_stats: Arc<engine::DraftCounters>,
 }
 
@@ -833,13 +845,13 @@ pub(crate) struct LocalModelInner {
 ///   `generate_stream` waits for a free queue slot (backpressure, not an
 ///   error). A running request streams through a bounded 64-block channel, so
 ///   a slow consumer paces generation, and dropping the stream stops it.
-/// - The K/V cache is preallocated for `context_length` positions and costs
-///   `context_length * 2 * 4 * sum(n_kv_head * head_dim)` bytes over the layers
-///   that own K/V (each layer's head count and head dimension come from the
-///   file; [`LocalModel::kv_cache_bytes`] reports the total): Gemma 4 E2B
-///   `context_length * 36,864` bytes (302 MB at the default 8192), E4B
-///   `context_length * 114,688` (939 MB at 8192), Qwen3-0.6B
-///   `context_length * 229,376` (28 layers, 8 KV heads of 128). It is
+/// - The K/V cache is preallocated and costs `2 * 4 * n_kv_head * head_dim`
+///   bytes per slot over the layers that own K/V (each layer's head count and
+///   head dimension come from the file; [`LocalModel::kv_cache_bytes`]
+///   reports the total): a full-attention layer holds `context_length`
+///   slots, a sliding-window layer `min(context_length, window - 1 + 1280)`.
+///   At the default 8192 that is 145 MB for Gemma 4 E2B, 415 MB for E4B and
+///   1.88 GB for Qwen3-0.6B (28 full-attention layers, 8 KV heads of 128). It is
 ///   reused across requests: a prompt that shares a prefix with the previous
 ///   one only prefills the new tokens, reported as the response's
 ///   `prompt_cache_usage`.
@@ -934,14 +946,18 @@ impl DraftStats {
 }
 
 impl LocalModel {
-    /// Bytes the K/V cache occupies: `context_length * 2 * 4 * sum(n_kv_head
-    /// * head_dim)` over the layers that own K/V, in RAM or device memory.
+    /// Bytes the K/V cache occupies, in RAM or device memory: `2 * 4 *
+    /// n_kv_head * head_dim` bytes per slot over the layers that own K/V,
+    /// with `context_length` slots for a full-attention layer and
+    /// `min(context_length, window - 1 + 1280)` for a sliding-window layer
+    /// (the window plus rollback headroom and one call's rows; see the
+    /// local-provider module docs).
     ///
     /// A hybrid model (Qwen 3.5) owns K/V only in its attention layers, and
     /// besides keeps a recurrent state of fixed size (about 20 MB for the
     /// 0.8B model, three copies while speculating) that is not counted here.
     pub fn kv_cache_bytes(&self) -> u64 {
-        (self.inner.context_length as u64) * (self.inner.kv_bytes_per_position as u64)
+        self.inner.kv_cache_bytes
     }
 
     /// What this model supports: reasoning, switching it off, tool calls.
@@ -1042,7 +1058,7 @@ impl LocalModel {
                                 template,
                                 format,
                                 engine.context_length(),
-                                engine.kv_bytes_per_position(),
+                                engine.kv_cache_bytes(),
                             )))
                             .is_err()
                         {
@@ -1064,7 +1080,7 @@ impl LocalModel {
             })?;
 
         match ready_rx.await {
-            Ok(Ok((tokenizer, template, format, context_length, kv_bytes_per_position))) => {
+            Ok(Ok((tokenizer, template, format, context_length, kv_cache_bytes))) => {
                 Ok(LocalModel {
                     inner: Arc::new(LocalModelInner {
                         jobs: jobs_tx,
@@ -1072,7 +1088,7 @@ impl LocalModel {
                         template,
                         format,
                         context_length,
-                        kv_bytes_per_position,
+                        kv_cache_bytes,
                         draft_stats,
                     }),
                 })

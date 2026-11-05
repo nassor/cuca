@@ -61,11 +61,15 @@
 //! - Expert tensors are read and uploaded one expert at a time (a `[n_expert,
 //!   rows, cols]` tensor becomes `n_expert` 2-D device weights), so the host
 //!   buffer is one expert and the device memory is the dtype rule above.
-//! - The K/V cache lives on the device, preallocated for `context_length`
-//!   positions as on the CPU ([`Hparams::kv_bytes_per_position`] bytes per
-//!   position). Writes are in place: a layer takes its cache tensors out of
-//!   the cache, assigns the new positions, and puts them back, and attention
-//!   views are dropped before the next write, so no write copies the cache.
+//! - The K/V cache lives on the device, preallocated as on the CPU: a
+//!   full-attention layer holds `context_length` positions, a sliding-window
+//!   layer the bounded slab of [`kv_slots`], compacted before a call that
+//!   would write past its end (see the model module docs;
+//!   [`Hparams::kv_cache_bytes`] counts it). Writes are in place: a layer
+//!   takes its cache tensors out of the cache, assigns the new positions, and
+//!   puts them back, and attention views are dropped before the next write,
+//!   so no write copies the cache (a compaction, once per `RING_ROLLBACK`
+//!   positions, does).
 //! - RoPE cos/sin tables for `context_length` positions, one pair per distinct
 //!   rotary embedding, live on the device.
 //! - During load the host holds the read buffer of the whole tensor (its file
@@ -165,7 +169,10 @@ use super::moe::route;
 use super::params::{Hparams, LayerSpec, MoeSpec};
 use super::quant::{RowTable, dequant_row};
 use super::rope::{RopeKind, RopeSpec};
-use super::{Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
+use super::{
+    RING_ROLLBACK, RING_ROWS, Want, attention_mask, build_rope_tables, check_context, err,
+    kv_slots, read_hparams,
+};
 use crate::error::CucaError;
 use crate::provider::local::{LocalDevice, device_unavailable};
 
@@ -883,9 +890,30 @@ struct RopeTable {
     sin: Tensor<2>,
 }
 
-/// K and V cache tensors, `[1, n_kv_head, context_length, head_dim]`, of
-/// every layer (`None` for layers that share another layer's cache).
-type KvLayers = Vec<Option<(Tensor<4>, Tensor<4>)>>;
+/// One K/V-owning layer's cache on the device, `[1, n_kv_head, slots,
+/// head_dim]` K and V holding the positions `base..base + slots` (position
+/// `p` at slot `p - base`; `base` moves only for a bounded sliding-window
+/// layer, see the CPU engine's `KvSlab`).
+struct GpuKvSlab {
+    k: Tensor<4>,
+    v: Tensor<4>,
+    base: usize,
+    slots: usize,
+}
+
+/// The K/V slab of every layer (`None` for layers that share another
+/// layer's cache).
+type KvLayers = Vec<Option<GpuKvSlab>>;
+
+/// The slot of position `pos` in a slab whose slot 0 holds `base`: an error,
+/// not a wrap, when the position was evicted.
+fn slot(pos: usize, base: usize) -> Result<usize, CucaError> {
+    pos.checked_sub(base).ok_or_else(|| {
+        err(format!(
+            "position {pos} was evicted from a sliding-window cache that starts at {base}"
+        ))
+    })
+}
 
 /// The RoPE rows of the new positions: `[1, 1, t, n_dims / 2]`.
 struct RopeRows {
@@ -997,11 +1025,14 @@ impl Weights {
             let spec = &hp.layers[il];
             let layout = LayerLayout::read(&hp, il, spec, content)?;
             if spec.owns_kv(il) {
-                let shape = [1, spec.n_kv_head, context_length, spec.head_dim];
-                kv.push(Some((
-                    Tensor::zeros(shape, &device),
-                    Tensor::zeros(shape, &device),
-                )));
+                let slots = kv_slots(spec.window, context_length);
+                let shape = [1, spec.n_kv_head, slots, spec.head_dim];
+                kv.push(Some(GpuKvSlab {
+                    k: Tensor::zeros(shape, &device),
+                    v: Tensor::zeros(shape, &device),
+                    base: 0,
+                    slots,
+                }));
             } else {
                 kv.push(None);
             }
@@ -1162,6 +1193,7 @@ impl GpuTransformer {
                 self.context_length
             )));
         }
+        self.make_room(start_pos, tokens.len())?;
         let hp = &self.weights.hp;
         let embeddings = self
             .embed
@@ -1183,6 +1215,63 @@ impl GpuTransformer {
         )?;
         self.kv_len = hi;
         Ok(out)
+    }
+
+    /// Compact every bounded sliding-window slab that cannot take the rows
+    /// `start..start + t` in place, as the CPU engine does: its last `window
+    /// - 1 + RING_ROLLBACK` positions before `start` move to its front and its
+    /// `base` advances.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when a call writes more rows than a compacted
+    /// slab holds ([`RING_ROWS`]).
+    fn make_room(&mut self, start: usize, t: usize) -> Result<(), CucaError> {
+        for (il, entry) in self.kv.iter_mut().enumerate() {
+            let spec = &self.weights.hp.layers[il];
+            let (Some(w), Some(slab)) = (spec.window, entry.as_mut()) else {
+                continue;
+            };
+            if start + t <= slab.base + slab.slots {
+                continue;
+            }
+            let keep = (w - 1 + RING_ROLLBACK).min(start - slab.base);
+            let from = start - keep - slab.base;
+            if from > 0 {
+                if keep > 0 {
+                    let (nkv, d) = (spec.n_kv_head, spec.head_dim);
+                    let src = cache_ranges(nkv, from..from + keep, d);
+                    let dst = cache_ranges(nkv, 0..keep, d);
+                    // The slice holds a second handle, so the assignment
+                    // copies the slab instead of overlapping itself.
+                    let moved = slab.k.clone().slice(src.clone());
+                    slab.k = slab.k.clone().slice_assign(dst.clone(), moved);
+                    let moved = slab.v.clone().slice(src);
+                    slab.v = slab.v.clone().slice_assign(dst, moved);
+                }
+                slab.base = start - keep;
+            }
+            if start + t > slab.base + slab.slots {
+                return Err(err(format!(
+                    "a bounded sliding-window cache takes at most {RING_ROWS} rows per call, got {t}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The smallest length every compacted sliding-window slab can still
+    /// serve (`base + window - 1`), 0 when none was compacted.
+    fn ring_floor(&self) -> usize {
+        self.kv
+            .iter()
+            .zip(&self.weights.hp.layers)
+            .filter_map(|(slab, spec)| match (slab, spec.window) {
+                (Some(slab), Some(w)) if slab.base > 0 => Some(slab.base + w - 1),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
     }
 
     /// Vocabulary size.
@@ -1220,7 +1309,7 @@ impl GpuTransformer {
     /// drafting call, since a K/V write while another handle to the cache
     /// exists copies the whole cache instead of writing in place.
     fn ext_kv(&self, len: usize) -> Result<GpuExtKv, CucaError> {
-        let source = |sliding: bool| -> Result<(Tensor<4>, Tensor<4>), CucaError> {
+        let source = |sliding: bool| -> Result<&GpuKvSlab, CucaError> {
             let layer = self
                 .weights
                 .hp
@@ -1237,12 +1326,13 @@ impl GpuTransformer {
             self.kv
                 .get(layer.kv_source)
                 .and_then(Option::as_ref)
-                .cloned()
                 .ok_or_else(|| err(format!("layer {} owns no K/V cache", layer.kv_source)))
         };
+        let (sliding, full) = (source(true)?, source(false)?);
         Ok(GpuExtKv {
-            sliding: source(true)?,
-            full: source(false)?,
+            sliding: (sliding.k.clone(), sliding.v.clone()),
+            sliding_base: sliding.base,
+            full: (full.k.clone(), full.v.clone()),
             len,
         })
     }
@@ -1250,9 +1340,16 @@ impl GpuTransformer {
     /// Drop every cached position from `len` on and return how many remain
     /// (`min(len, current length)`: K/V rows are positional); the next
     /// `forward` must start there. Positions at or past it are overwritten,
-    /// not cleared.
+    /// not cleared. A `len` below the floor of a compacted sliding-window
+    /// slab empties the cache and returns 0, as on the CPU.
     pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
+        let len = if len < self.ring_floor() { 0 } else { len };
         self.kv_len = len.min(self.kv_len);
+        if self.kv_len == 0 {
+            for slab in self.kv.iter_mut().flatten() {
+                slab.base = 0;
+            }
+        }
         self.kv_len
     }
 
@@ -1267,6 +1364,8 @@ impl GpuTransformer {
 /// [`GpuTransformer::ext_kv`].
 struct GpuExtKv {
     sliding: (Tensor<4>, Tensor<4>),
+    /// Position held by slot 0 of `sliding`.
+    sliding_base: usize,
     full: (Tensor<4>, Tensor<4>),
     /// Positions of the target cache the drafter may read.
     len: usize,
@@ -1378,13 +1477,15 @@ impl GpuDrafter {
         })
     }
 
-    /// Draft `k` tokens after the pending token `first`, as the CPU drafter.
+    /// Draft at most `k` tokens after the pending token `first`, as the CPU
+    /// drafter.
     ///
     /// `hidden` is the target's final-norm hidden state at its last cached
     /// position (`Hidden::PostNorm` of its last forward pass), `len` the
     /// number of cached positions (`first` sits at position `len` and is not
-    /// cached). Each step's logits go to `pick`, which chooses (and may
-    /// record) the drafted token; every step uses the position `len`.
+    /// cached). Each step's logits go to `pick`, which chooses the token or
+    /// ends the chain with `None`; the returned drafts are the tokens `pick`
+    /// accepted. Every step uses the position `len`.
     ///
     /// # Errors
     ///
@@ -1398,7 +1499,7 @@ impl GpuDrafter {
         first: u32,
         len: usize,
         k: usize,
-        pick: &mut dyn FnMut(&mut [f32]) -> u32,
+        pick: &mut dyn FnMut(&mut [f32]) -> Option<u32>,
     ) -> Result<Vec<u32>, CucaError> {
         let hp = &self.net.hp;
         if hidden.len() != hp.n_embd_out {
@@ -1433,8 +1534,11 @@ impl GpuDrafter {
             let normed = rms(x, Some(&self.net.output_norm), hp.eps);
             let next = linear(normed.clone(), &self.post);
             let mut logits = read_f32(self.net.head(normed), "drafter logits")?;
+            let Some(next_token) = pick(&mut logits) else {
+                break;
+            };
             hidden = read_f32(next, "drafter hidden state")?;
-            token = pick(&mut logits);
+            token = next_token;
             drafts.push(token);
         }
         Ok(drafts)
@@ -1747,15 +1851,14 @@ impl Weights {
             let v = v.swap_dims(1, 2);
             // Take the cache out so the assignment owns the only handle and
             // writes in place.
-            let (cache_k, cache_v) = kv
+            let mut slab = kv
                 .get_mut(il)
                 .and_then(Option::take)
                 .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
-            let at = cache_ranges(nkv, start..hi, d);
-            kv[il] = Some((
-                cache_k.slice_assign(at.clone(), k),
-                cache_v.slice_assign(at, v),
-            ));
+            let at = cache_ranges(nkv, slot(start, slab.base)?..slot(hi, slab.base)?, d);
+            slab.k = slab.k.slice_assign(at.clone(), k);
+            slab.v = slab.v.slice_assign(at, v);
+            kv[il] = Some(slab);
         }
 
         let src = spec.kv_source;
@@ -1768,16 +1871,16 @@ impl Weights {
                     "layer {il}: a drafter layer needs the target's K/V"
                 ))
             })?;
-            let (cache_k, cache_v) = if spec.window.is_some() {
-                &ext.sliding
+            let ((cache_k, cache_v), base) = if spec.window.is_some() {
+                (&ext.sliding, ext.sliding_base)
             } else {
-                &ext.full
+                (&ext.full, 0)
             };
             let lo = match spec.window {
                 Some(w) => start.saturating_sub(w - 1).min(ext.len.saturating_sub(1)),
                 None => 0,
             };
-            let at = cache_ranges(nkv, lo..ext.len, d);
+            let at = cache_ranges(nkv, slot(lo, base)?..slot(ext.len, base)?, d);
             let k = cache_k.clone().slice(at.clone());
             let v = cache_v.clone().slice(at);
             attend(q, k, v, None, spec.scale, hp.attn_softcap)
@@ -1787,15 +1890,17 @@ impl Weights {
                 .iter()
                 .find(|m| m.window == spec.window)
                 .ok_or_else(|| err(format!("layer {il}: no attention mask for its window")))?;
-            let (cache_k, cache_v) = kv
+            let slab = kv
                 .get(src)
                 .and_then(Option::as_ref)
                 .ok_or_else(|| err(format!("layer {src} owns no K/V cache")))?;
+            let (cache_k, cache_v) = (&slab.k, &slab.v);
             let src_spec = hp
                 .layers
                 .get(src)
                 .ok_or_else(|| err(format!("layer {il}: K/V source layer {src} out of range")))?;
-            let at = cache_ranges(src_spec.n_kv_head, visible.lo..hi, src_spec.head_dim);
+            let rows = slot(visible.lo, slab.base)?..slot(hi, slab.base)?;
+            let at = cache_ranges(src_spec.n_kv_head, rows, src_spec.head_dim);
             let k = cache_k.clone().slice(at.clone());
             let v = cache_v.clone().slice(at);
             attend(q, k, v, visible.mask.clone(), spec.scale, hp.attn_softcap)
@@ -2390,6 +2495,62 @@ mod tests {
         for spec in TinySpec::all() {
             check_model(&write_spec(&spec), device, spec.arch);
         }
+    }
+
+    /// Past a sliding slab's bound (the tiny Gemma 3 at 1400 positions: 1283
+    /// slots per sliding layer) the GPU compaction, the reads after it and
+    /// the truncation floor agree with the CPU engine's.
+    #[test]
+    fn gpu_matches_cpu_on_a_bounded_sliding_cache() {
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let model = write_spec(&TinySpec {
+            context: 1400,
+            ..TinySpec::gemma3()
+        });
+        let mut reader = BufReader::new(File::open(&model.path).unwrap());
+        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let mut cpu = Transformer::load_dequantized(&content, &model.path, 1400).unwrap();
+        let mut gpu = GpuTransformer::load(&content, &model.path, 1400, device).unwrap();
+        let tokens: Vec<u32> = (0..1350u32).map(|i| (i * 7 + i / 5) % 16).collect();
+        for (i, chunk) in tokens.chunks(256).enumerate() {
+            let at = i * 256;
+            compare(
+                &mut cpu,
+                &mut gpu,
+                chunk,
+                at,
+                Want::Last,
+                &format!("chunk at {at}"),
+            );
+        }
+        assert!(gpu.ring_floor() > 0, "the prefill compacted the slabs");
+        for (j, token) in [3u32, 9, 1, 14, 6].into_iter().enumerate() {
+            let at = 1350 + j;
+            compare(
+                &mut cpu,
+                &mut gpu,
+                &[token],
+                at,
+                Want::Last,
+                &format!("step at {at}"),
+            );
+        }
+        assert_eq!(gpu.truncate_cache(1300), 1300);
+        assert_eq!(cpu.truncate_cache(1300), 1300);
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &[4, 8],
+            1300,
+            Want::All,
+            "after rollback",
+        );
+        assert_eq!(gpu.truncate_cache(100), 0, "below the floor: emptied");
+        assert_eq!(cpu.truncate_cache(100), 0);
+        compare(&mut cpu, &mut gpu, &tokens[..40], 0, Want::Last, "refilled");
     }
 
     /// A model whose matmul weights are float or Q8_0 matches the dequantized
@@ -3026,10 +3187,10 @@ mod tests {
         fn recorder<'a>(
             picked: &'a mut Vec<Vec<f32>>,
             schedule: &'a [u32],
-        ) -> impl FnMut(&mut [f32]) -> u32 + 'a {
+        ) -> impl FnMut(&mut [f32]) -> Option<u32> + 'a {
             move |logits| {
                 picked.push(logits.to_vec());
-                schedule.get(picked.len() - 1).copied().unwrap_or(0)
+                Some(schedule.get(picked.len() - 1).copied().unwrap_or(0))
             }
         }
 
@@ -3133,7 +3294,7 @@ mod tests {
         assert!(e.to_string().contains("drafter"), "{e}");
 
         let net = GpuDrafter::open(&drafter_content, &drafter.path, &gpu, 32).unwrap();
-        let mut pick = |_: &mut [f32]| 0u32;
+        let mut pick = |_: &mut [f32]| Some(0u32);
         let hidden = vec![0.1f32; gpu.n_embd()];
         gpu.forward(&PROMPT[..5], 0, Want::None).unwrap();
         assert!(

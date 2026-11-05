@@ -29,7 +29,7 @@ weight = 1
 | `sampling` | `SamplingConfig::default()` | default sampling parameters |
 | `device` | `LocalDevice::Cpu` | where the forward pass runs |
 | `drafter` | `None` | optional multi-token-prediction drafter, an `Option<DrafterSource>` |
-| `draft_tokens` | `3` | tokens the drafter proposes per round, `1..=16`; ignored without a drafter |
+| `draft_tokens` | `5` | most tokens the drafter proposes per round, `1..=16`; ignored without a drafter |
 | `on_download_progress` | `None` | download progress observer |
 
 - `source` defaults to the preset `gemma4-e2b-q4_0`.

@@ -59,11 +59,12 @@ fn by_logit_desc(a: &(f32, u32), b: &(f32, u32)) -> Ordering {
 
 /// The sampling distribution a set of logits defines under the warper
 /// order of [`sample`]: the surviving candidates with their normalised
-/// probabilities, most likely first. Speculative sampling needs both the
-/// target's and the drafter's distribution of the same token.
+/// probabilities. Speculative sampling needs both the target's and the
+/// drafter's distribution of the same token.
 #[derive(Debug, Clone)]
 pub(crate) struct Dist {
-    /// `(probability, id)`, descending; probabilities sum to one.
+    /// `(probability, id)` of the surviving candidates (in no particular
+    /// order); probabilities sum to one.
     candidates: Vec<(f32, u32)>,
 }
 
@@ -139,9 +140,21 @@ impl Dist {
     }
 }
 
+/// Candidates the nucleus search of a whole-vocabulary warp ranks first; it
+/// widens fourfold while their mass stays below `top_p`.
+const NUCLEUS_FIRST: usize = 256;
+
 /// Temperature, top-k, softmax and top-p over `logits`: leaves in `candidates`
 /// the survivors with unnormalised (post-softmax, pre-renormalisation)
-/// probabilities, most likely first.
+/// probabilities of the full distribution. A top-p cut leaves them most likely
+/// first; without one (whole vocabulary, `top_p >= 1`) they stay in
+/// vocabulary order, which [`sample`] and [`Dist`] do not depend on.
+///
+/// With `top_k` set, the `top_k` best are selected and sorted. Without it the
+/// vocabulary is never sorted: the softmax runs over every logit, and a top-p
+/// cut ranks only the best [`NUCLEUS_FIRST`] (widening while their mass falls
+/// short of `top_p`), so the probabilities stay those of the full
+/// distribution.
 fn warp_candidates(
     logits: &mut [f32],
     temperature: f32,
@@ -158,19 +171,55 @@ fn warp_candidates(
     if top_k > 0 && top_k < candidates.len() {
         candidates.select_nth_unstable_by(top_k - 1, by_logit_desc);
         candidates.truncate(top_k);
+        candidates.sort_unstable_by(by_logit_desc);
+        let max = candidates[0].0;
+        let mut sum = 0.0f32;
+        for c in candidates.iter_mut() {
+            c.0 = (c.0 - max).exp();
+            sum += c.0;
+        }
+        for c in candidates.iter_mut() {
+            c.0 /= sum;
+        }
+        cut_top_p(candidates, top_p);
+        return;
     }
+
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+    if top_p >= 1.0 {
+        for c in candidates.iter_mut() {
+            c.0 = (c.0 - max).exp() / sum;
+        }
+        return;
+    }
+    let v = candidates.len();
+    let mut m = NUCLEUS_FIRST.min(v);
+    loop {
+        if m < v {
+            candidates.select_nth_unstable_by(m - 1, by_logit_desc);
+        }
+        let mass = candidates[..m]
+            .iter()
+            .map(|c| (c.0 - max).exp())
+            .sum::<f32>()
+            / sum;
+        if mass >= top_p || m >= v {
+            break;
+        }
+        m = (m * 4).min(v);
+    }
+    candidates.truncate(m);
     candidates.sort_unstable_by(by_logit_desc);
-
-    let max = candidates[0].0;
-    let mut sum = 0.0f32;
     for c in candidates.iter_mut() {
-        c.0 = (c.0 - max).exp();
-        sum += c.0;
+        c.0 = (c.0 - max).exp() / sum;
     }
-    for c in candidates.iter_mut() {
-        c.0 /= sum;
-    }
+    cut_top_p(candidates, top_p);
+}
 
+/// Keep the shortest prefix of `candidates` (most likely first) whose
+/// cumulative probability reaches `top_p`, at least one candidate.
+fn cut_top_p(candidates: &mut Vec<(f32, u32)>, top_p: f32) {
     let mut cumulative = 0.0f32;
     let mut keep = candidates.len();
     for (i, c) in candidates.iter().enumerate() {
@@ -218,6 +267,35 @@ pub(crate) fn sample(
 /// Index of the first maximum of `logits` (the greedy choice).
 pub(crate) fn greedy(logits: &[f32]) -> u32 {
     argmax(logits)
+}
+
+/// The greedy choice of `logits` (as [`greedy`]) and its probability under a
+/// softmax at temperature 1, in one pass over the logits (0 when no logit is
+/// finite).
+pub(crate) fn greedy_with_prob(logits: &[f32]) -> (u32, f32) {
+    let mut best = 0usize;
+    let mut max = f32::NEG_INFINITY;
+    // Running `Σ exp(l - max)`, rescaled whenever the maximum grows.
+    let mut sum = 0.0f32;
+    for (i, &v) in logits.iter().enumerate() {
+        if v > max {
+            sum = if sum > 0.0 {
+                sum * (max - v).exp()
+            } else {
+                0.0
+            } + 1.0;
+            max = v;
+            best = i;
+        } else if v > f32::NEG_INFINITY {
+            sum += (v - max).exp();
+        }
+    }
+    let prob = if sum.is_finite() && sum > 0.0 && max.is_finite() {
+        1.0 / sum
+    } else {
+        0.0
+    };
+    (best as u32, prob)
 }
 
 #[cfg(test)]
@@ -379,5 +457,56 @@ mod tests {
     #[test]
     fn random_seed_varies() {
         assert_ne!(random_seed(), random_seed());
+    }
+
+    /// The full-sort warper `warp_candidates` replaced for `top_k = 0`.
+    fn reference_warp(logits: &[f32], top_p: f32) -> Vec<(f32, u32)> {
+        let mut candidates: Vec<(f32, u32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (l, i as u32))
+            .collect();
+        candidates.sort_unstable_by(by_logit_desc);
+        let max = candidates[0].0;
+        let mut sum = 0.0f32;
+        for c in candidates.iter_mut() {
+            c.0 = (c.0 - max).exp();
+            sum += c.0;
+        }
+        for c in candidates.iter_mut() {
+            c.0 /= sum;
+        }
+        if top_p < 1.0 {
+            cut_top_p(&mut candidates, top_p);
+        }
+        candidates
+    }
+
+    /// Without `top_k` the warper keeps the full-sort survivors and their
+    /// probabilities, whether the nucleus fits the first ranked candidates
+    /// (a peaked distribution) or needs the search to widen (a flat one).
+    #[test]
+    fn top_k_zero_matches_full_sort() {
+        let mut rng = SplitMix64(17);
+        for spread in [12.0f32, 1.0] {
+            let logits: Vec<f32> = (0..4096).map(|_| rng.next_f32() * spread).collect();
+            for top_p in [0.5f32, 0.95, 1.0] {
+                let mut got = Vec::new();
+                warp_candidates(&mut logits.clone(), 1.0, 0, top_p, &mut got);
+                let want = reference_warp(&logits, top_p);
+                let by_id = |c: &[(f32, u32)]| {
+                    let mut c = c.to_vec();
+                    c.sort_unstable_by_key(|&(_, id)| id);
+                    c
+                };
+                let (got, want) = (by_id(&got), by_id(&want));
+                assert_eq!(got.len(), want.len(), "spread {spread}, top_p {top_p}");
+                for ((p, id), (q, jd)) in got.iter().zip(&want) {
+                    assert_eq!(id, jd, "spread {spread}, top_p {top_p}");
+                    // The two sum 4096 terms in different orders.
+                    assert!((p - q).abs() <= 1e-5 * q, "{id}: {p} vs {q}");
+                }
+            }
+        }
     }
 }

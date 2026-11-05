@@ -24,7 +24,7 @@ weight = 3
 | Output channel | 64 blocks | the engine waits for the consumer, so a slow consumer paces generation |
 | Prompt | fewer than `context_length` tokens | `CucaError::Provider`: `prompt has N tokens; context_length is M` |
 | Completion | `max_tokens` and the remaining context | generation stops |
-| K/V cache | `context_length` positions, preallocated | no growth; the cache is reused across requests |
+| K/V cache | `context_length` positions per full-attention layer, at most `window - 1 + 1280` per sliding-window layer, preallocated | no growth; a full sliding-window layer moves its recent positions to the front; the cache is reused across requests |
 | `draft_tokens` | `1..=16` with a drafter | `CucaError::Config` at load |
 | Prefill chunk | 256 tokens at most | a longer prompt prefills in chunks |
 | Download stall | 60 seconds without data | `CucaError::Transport`; the partial file stays for a later resume |
@@ -32,8 +32,9 @@ weight = 3
 
 - The engine is a single slot: it runs one request at a time, in arrival order.
 - The prefill chunk is `2,097,152 / context_length`, clamped to between 16 and 256 tokens: 256 at 8,192 positions, 64 at 32,768 and 16 at 131,072. The chunk size bounds the transient attention score matrix.
-- The K/V cache costs `context_length * 2 * 4 * sum(n_kv_head * head_dim)` bytes (f32 keys and values), summed over the layers that own K/V, with each layer's own head count and head dimension. `LocalModel::kv_cache_bytes` reports the total, so you can compare a `context_length` with your memory before the first request.
-- K/V cost varies by model. At 8,192 positions it is 302 MB for Gemma 4 E2B and 6.44 GB for Phi 3.5 mini, which has 32 K/V heads; the preset table on [Local models and formats](@/providers/local/models.md#presets) lists the value for each preset.
+- The K/V cache costs `2 * 4 * n_kv_head * head_dim` bytes per slot (f32 keys and values), summed over the layers that own K/V, with each layer's own head count and head dimension. A full-attention layer holds `context_length` slots. A sliding-window layer holds at most `window - 1 + 1280`: its window plus 1,024 positions of rollback room and one call's 256 rows. `LocalModel::kv_cache_bytes` reports the total, so you can compare a `context_length` with your memory before the first request.
+- When a sliding-window layer fills its slots, the engine moves its last `window - 1 + 1024` positions to the front before the next call. A request that reuses a prefix more than about 1,024 positions behind that point re-prefills its whole prompt instead (the reported `prompt_cache_usage` shows 0 reused tokens).
+- K/V cost varies by model. At 8,192 positions it is 145 MB for Gemma 4 E2B and 6.44 GB for Phi 3.5 mini, which has 32 K/V heads and no sliding-window layers; the preset table on [Local models and formats](@/providers/local/models.md#presets) lists the value for each preset.
 - Weights stay quantized and are consumed by the engine's quantized matmul kernel (Q4_0 and Q8_0) or candle's (other dtypes). Norm vectors, biases and float weights are held as f32. Resident weights are about the file size.
 - Gemma 4's per-layer embedding table (`per_layer_token_embd`: 1.32 GB in E2B Q4_0, 1.59 GB in E4B Q4_0) is not loaded. The engine reads one row per input token from the GGUF file, usually from the OS page cache, so E2B Q4_0 holds 1.5 GB of its 2.84 GB file.
 - Mixture of experts: expert tensors are split once at load into one quantized 2-D weight per expert. Memory is the file size, and a pass computes only the experts its tokens route to.

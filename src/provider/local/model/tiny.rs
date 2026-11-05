@@ -276,6 +276,8 @@ pub(crate) struct TinySpec {
     pub(crate) meta: Vec<(String, Value)>,
     pub(crate) rope_freqs: Option<Vec<f32>>,
     pub(crate) rope_long_short: Option<(Vec<f32>, Vec<f32>)>,
+    /// `context_length` metadata: the most positions the model loads with.
+    pub(crate) context: usize,
 }
 
 impl TinySpec {
@@ -302,6 +304,7 @@ impl TinySpec {
             meta: Vec::new(),
             rope_freqs: None,
             rope_long_short: None,
+            context: CONTEXT,
         }
     }
 
@@ -601,7 +604,7 @@ pub(crate) fn write_spec(s: &TinySpec) -> TinyModel {
     let mut meta = vec![
         kv("general.architecture", Value::String(p.into())),
         kv(&format!("{p}.block_count"), u(s.n_layer)),
-        kv(&format!("{p}.context_length"), u(CONTEXT)),
+        kv(&format!("{p}.context_length"), u(s.context)),
         kv(&format!("{p}.embedding_length"), u(N_EMBD)),
         kv(&format!("{p}.attention.head_count"), u(nh)),
         kv(&format!("{p}.attention.head_count_kv"), u(nkv)),

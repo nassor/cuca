@@ -349,15 +349,18 @@ impl Transformer {
             t: m,
             own: Some(&head.kv),
             read: Some(&head.kv),
+            base: 0,
             ext: None,
         };
         self.store_kv(&call, aw, &k, &v)
     }
 
-    /// Draft `k` tokens after the pending token `first`: `hidden` is the
-    /// trunk's final-norm hidden row at its last cached position and `len`
+    /// Draft at most `k` tokens after the pending token `first`: `hidden` is
+    /// the trunk's final-norm hidden row at its last cached position and `len`
     /// the number of cached positions (`first` sits at position `len`, not
-    /// cached). Each step's logits go to `pick`, which chooses the token.
+    /// cached). Each step's logits go to `pick`, which chooses the token or
+    /// ends the chain with `None`; the returned drafts are the tokens `pick`
+    /// accepted.
     /// Nothing is committed: see the [module docs](self).
     ///
     /// # Errors
@@ -371,7 +374,7 @@ impl Transformer {
         first: u32,
         len: usize,
         k: usize,
-        pick: &mut dyn FnMut(&mut [f32]) -> u32,
+        pick: &mut dyn FnMut(&mut [f32]) -> Option<u32>,
     ) -> Result<Vec<u32>, CucaError> {
         if len == 0 || hidden.len() != self.hp.n_embd {
             return Err(err("head draft: needs the hidden row of the last position"));
@@ -389,12 +392,13 @@ impl Transformer {
         let mut token = first;
         for step in 0..k {
             let emb = self.embedding_rows(&[token])?;
-            let (mut logits, next) = self
+            let (mut logits, next_hidden) = self
                 .head_step(head, emb, &hidden, slot + step, len - 1 + step)
                 .map_err(candle_err)?;
-            token = pick(&mut logits);
+            let Some(next) = pick(&mut logits) else { break };
+            token = next;
             drafts.push(token);
-            hidden = Cow::Owned(next);
+            hidden = Cow::Owned(next_hidden);
         }
         Ok(drafts)
     }
@@ -421,6 +425,7 @@ impl Transformer {
             t: 1,
             own: Some(&head.kv),
             read: Some(&head.kv),
+            base: 0,
             ext: None,
         };
         let y = self.block(&head.block, &x, None, 1, |h| {
@@ -489,7 +494,7 @@ mod tests {
         let mut seen = Vec::new();
         m.head_draft(head, h, first, len, k, &mut |l: &mut [f32]| {
             seen.push(l.to_vec());
-            greedy(l)
+            Some(greedy(l))
         })
         .unwrap();
         seen
@@ -742,7 +747,7 @@ mod tests {
         // Bad input is an error, not a panic.
         assert!(m.head_observe(&mut head, 0, &[], &[]).is_err());
         assert!(m.head_observe(&mut head, 0, &tokens, &hidden[1..]).is_err());
-        let mut pick = |l: &mut [f32]| greedy(l);
+        let mut pick = |l: &mut [f32]| Some(greedy(l));
         assert!(
             m.head_draft(&head, &hidden[..D - 1], 3, n, 1, &mut pick)
                 .is_err()
@@ -774,7 +779,7 @@ mod tests {
         m.head_draft(&part, last, 4, n, 4, &mut |l: &mut [f32]| {
             let t = greedy(l);
             drafted.push(t);
-            t
+            Some(t)
         })
         .unwrap();
         assert_eq!(drafted.len(), 4);

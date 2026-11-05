@@ -97,12 +97,20 @@
 //!   LM head. `per_layer_token_embd` (Gemma 4, 1.32 GB in E2B Q4_0) is never
 //!   loaded: each token's row is read from the GGUF file with a seek and
 //!   dequantized by [`quant::dequant_row`].
-//! - The KV cache is preallocated for `context_length` positions: only the
-//!   layers that own K/V store them, [`params::Hparams::kv_bytes_per_position`]
-//!   `= 2 * 4 * sum(n_kv_head * head_dim)` bytes per position in f32, the sum
-//!   running over the K/V-owning layers with that layer's own head count and
-//!   head dimension. Sliding layers keep every position, not a ring, so a
-//!   sliding layer reads a `window`-long slice at the end of its cache.
+//! - The KV cache is preallocated: only the layers that own K/V store them,
+//!   `2 * 4 * n_kv_head * head_dim` bytes per slot in f32 per K/V-owning
+//!   layer, with that layer's own head count and head dimension. A
+//!   full-attention layer holds `context_length` slots; a sliding-window
+//!   layer holds [`kv_slots`] `= min(context_length, window - 1 +
+//!   RING_ROLLBACK + RING_ROWS)`, the window plus [`RING_ROLLBACK`] positions
+//!   of rollback headroom plus one call's [`RING_ROWS`]
+//!   ([`params::Hparams::kv_cache_bytes`] sums it all). Such a bounded slab
+//!   holds the contiguous positions `base..base + slots`: when a forward call
+//!   would write past its end, the slab is compacted first, keeping the last
+//!   `window - 1 + RING_ROLLBACK` positions before the call at its front, so
+//!   every read stays one contiguous slice and masks keep absolute
+//!   positions. A truncation below a compacted slab's floor (`base + window -
+//!   1`) empties the cache instead (the caller re-prefills).
 //! - A hybrid model's recurrent state is independent of the context length:
 //!   [`params::Hparams::recurrent_state_bytes`] is 4 bytes times the sum, over
 //!   the delta-net layers, of `(conv_kernel - 1) * conv_dim + n_v_heads *
@@ -114,8 +122,8 @@
 //!   layers of the 0.8B model, 7.6 MB for 17). In all that is about three
 //!   times the recurrent state (61 MB for the 0.8B model).
 //! - The K/V cache of a hybrid model covers its attention layers only:
-//!   `kv_bytes_per_position` counts just the K/V-owning layers (24,576 bytes
-//!   per position for the 0.8B model: 6 attention layers with 2 KV heads of
+//!   `kv_cache_bytes` counts just the K/V-owning layers (24,576 bytes per
+//!   position for the 0.8B model: 6 attention layers with 2 KV heads of
 //!   256).
 //! - The multi-token-prediction head of a Qwen 3.5 `*-MTP` file, when the
 //!   engine drafts with it, adds its block's quantized weights (21.7 MB for
@@ -215,6 +223,24 @@ pub(crate) fn attention_mask(
 /// (`n_head * chunk * context_length` f32 per full-attention layer).
 pub(crate) fn prefill_chunk(context_length: usize) -> usize {
     (2_097_152 / context_length.max(1)).clamp(16, 256)
+}
+
+/// Positions behind the current end a bounded sliding-window cache can always
+/// roll back to (prefix reuse of a regenerated reply, a drafter's rollback).
+pub(crate) const RING_ROLLBACK: usize = 1024;
+/// Most rows one forward call writes into a bounded sliding-window cache (the
+/// largest [`prefill_chunk`]; a verification call has at most
+/// [`cpu::MAX_VERIFY_ROWS`]).
+pub(crate) const RING_ROWS: usize = 256;
+
+/// Slots a K/V-owning layer with `window` allocates for `context_length`
+/// positions: every position for a full-attention layer, the window plus the
+/// rollback headroom and one call's rows for a sliding-window layer.
+pub(crate) fn kv_slots(window: Option<usize>, context_length: usize) -> usize {
+    match window {
+        Some(w) => context_length.min(w.saturating_sub(1) + RING_ROLLBACK + RING_ROWS),
+        None => context_length,
+    }
 }
 
 /// The per-pair factors of `spec`, read from the tensor its [`Factors`]
@@ -376,7 +402,10 @@ impl Model {
     /// the cache retains: at most `len` and at most the current length. The
     /// next `forward` must start at the returned length.
     ///
-    /// An attention-only model retains exactly `min(len, current length)`. A
+    /// An attention-only model retains exactly `min(len, current length)`,
+    /// unless `len` is below the floor of a bounded sliding-window cache
+    /// ([`RING_ROLLBACK`] positions behind its last compaction), which
+    /// empties the cache (returns `0`). A
     /// hybrid model (recurrent layers) retains only positions it holds a
     /// state for: the current end, the [`Model::checkpoint`] and the rows of
     /// the last multi-row `Want::All` call; otherwise it falls back to the

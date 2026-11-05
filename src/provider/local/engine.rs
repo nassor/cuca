@@ -47,9 +47,9 @@ use super::model::cpu::Hidden;
 use super::model::mtp::Drafter;
 use super::model::{Model, Want, prefill_chunk};
 use super::output::OutputParser;
-use super::sampler::{Dist, Scratch, SplitMix64, greedy, random_seed, sample};
+use super::sampler::{Dist, Scratch, SplitMix64, greedy, greedy_with_prob, random_seed, sample};
 use super::tokenizer::Tokenizer;
-use super::{LocalModelConfig, SamplingConfig};
+use super::{LocalModelConfig, MAX_DRAFT_TOKENS, SamplingConfig};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
 use crate::request::{PromptCacheUsage, TokenUsage};
@@ -96,17 +96,21 @@ pub(crate) struct Engine {
     id_rng: SplitMix64,
     /// The multi-token-prediction drafter, when one is configured.
     drafter: Option<Drafter>,
-    /// Tokens drafted per verification round.
+    /// Most tokens drafted per verification round.
     draft_tokens: usize,
-    /// K/V cache bytes per context position of the loaded model.
-    kv_bytes_per_position: usize,
+    /// K/V cache bytes of the loaded model at its context length.
+    kv_cache_bytes: u64,
     /// Speculation counters shared with `LocalModel::draft_stats`.
     stats: Arc<DraftCounters>,
     /// Cost-aware on/off switch of speculation, kept across requests.
     governor: Governor,
+    /// Measured costs that set each round's draft length, kept across
+    /// requests.
+    cost: CostModel,
 }
 
-/// Exponential moving average of a throughput (tokens per second).
+/// Exponential moving average of a measurement (a throughput, a duration, a
+/// count).
 #[derive(Debug, Clone, Copy, Default)]
 struct Ema {
     value: f64,
@@ -119,22 +123,136 @@ struct Ema {
 impl Ema {
     const ALPHA: f64 = 0.3;
 
-    fn record(&mut self, tokens: usize, secs: f64) {
+    fn record(&mut self, value: f64) {
         if !self.skipped {
             self.skipped = true;
             return;
         }
-        if secs <= 0.0 {
-            return;
-        }
-        let tps = tokens as f64 / secs;
         self.value = if self.n == 0 {
-            tps
+            value
         } else {
-            self.value + Self::ALPHA * (tps - self.value)
+            self.value + Self::ALPHA * (value - self.value)
         };
         self.n += 1;
     }
+}
+
+/// Cost model of a speculative round: verification seconds by row count,
+/// drafter-step seconds, and how the drafter's confidence calibrates against
+/// realised acceptance. It sets how many drafts a round verifies
+/// ([`take_draft`]); the [`Governor`] decides whether a round drafts at all.
+#[derive(Debug, Clone, Default)]
+struct CostModel {
+    /// Seconds of one verification forward over `n` rows at index `n - 1`
+    /// (`n` in `1..=MAX_DRAFT_TOKENS + 1`), rollback and head upkeep included.
+    verify: [Ema; MAX_DRAFT_TOKENS + 1],
+    /// Seconds of one drafter step.
+    draft: Ema,
+    /// Predicted (the drafter's chained confidence summed over the verified
+    /// drafts, uncalibrated) and realised accepted drafts per round; their
+    /// ratio calibrates the confidence.
+    predicted: Ema,
+    accepted: Ema,
+    /// Test-only: record nothing, so every proposal is drafted.
+    #[cfg(test)]
+    frozen: bool,
+}
+
+impl CostModel {
+    /// Estimated seconds of one verification over `n` rows (`n >= 1`).
+    ///
+    /// A measured count returns its average; otherwise the nearest measured
+    /// counts are interpolated linearly, extrapolated upward from the two
+    /// largest with a slope floored at 0, or held flat from the nearest one.
+    /// With nothing measured every count costs the same (`1.0`), so the
+    /// first rounds draft the full cap and fill the table.
+    fn verify_secs(&self, n: usize) -> f64 {
+        let i = n.saturating_sub(1).min(MAX_DRAFT_TOKENS);
+        let measured = |j: usize| (self.verify[j].n > 0).then_some(self.verify[j].value);
+        if let Some(v) = measured(i) {
+            return v;
+        }
+        let below = (0..i).rev().find_map(|j| measured(j).map(|v| (j, v)));
+        let above = (i + 1..=MAX_DRAFT_TOKENS).find_map(|j| measured(j).map(|v| (j, v)));
+        match (below, above) {
+            (Some((a, va)), Some((b, vb))) => va + (vb - va) * (i - a) as f64 / (b - a) as f64,
+            (Some((b, vb)), None) => match (0..b).rev().find_map(|j| measured(j).map(|v| (j, v))) {
+                Some((a, va)) => vb + ((vb - va) / (b - a) as f64).max(0.0) * (i - b) as f64,
+                None => vb,
+            },
+            (None, Some((_, vb))) => vb,
+            (None, None) => 1.0,
+        }
+    }
+
+    /// Estimated seconds of one drafter step (0 before any measurement).
+    fn draft_secs(&self) -> f64 {
+        self.draft.value
+    }
+
+    /// Factor turning the drafter's chained confidence into a predicted
+    /// acceptance: realised over predicted accepted drafts per round.
+    fn calibration(&self) -> f64 {
+        if self.predicted.n == 0 || self.predicted.value <= 0.0 {
+            1.0
+        } else {
+            (self.accepted.value / self.predicted.value).clamp(0.25, 4.0)
+        }
+    }
+
+    /// Record a finished round: a verification over `rows` rows took
+    /// `verify_secs`; `draft_steps` drafter steps took `draft_secs`; the
+    /// verified drafts carried `predicted` summed confidence and `accepted`
+    /// of them were accepted.
+    fn record_round(
+        &mut self,
+        rows: usize,
+        verify_secs: f64,
+        draft_steps: usize,
+        draft_secs: f64,
+        predicted: f64,
+        accepted: usize,
+    ) {
+        #[cfg(test)]
+        if self.frozen {
+            return;
+        }
+        if let Some(slot) = self.verify.get_mut(rows.wrapping_sub(1)) {
+            slot.record(verify_secs);
+        }
+        if draft_steps > 0 {
+            self.draft.record(draft_secs / draft_steps as f64);
+        }
+        // Only a round that verified drafts says how the confidence
+        // calibrates.
+        if rows > 1 {
+            self.predicted.record(predicted);
+            self.accepted.record(accepted as f64);
+        }
+    }
+}
+
+#[cfg(test)]
+impl CostModel {
+    /// A cost model that never learns: verification costs the same for
+    /// every row count and drafting is free, so every round drafts the full
+    /// cap whatever the drafter's confidence and the tiny model's timings.
+    fn always_drafting() -> Self {
+        Self {
+            frozen: true,
+            ..Self::default()
+        }
+    }
+}
+
+/// Whether draft `j` (1-based) is worth verifying: `a_j` is its predicted
+/// acceptance, `e_prev` the expected tokens of the round without it
+/// (`1 + a_1 + .. + a_{j-1}`), `t_j` and `t_next` the verification seconds
+/// over `j` and `j + 1` rows and `d` the seconds of one drafter step. True
+/// when adding the draft raises the round's expected tokens per second:
+/// `(e_prev + a_j) / (t_next + j d) > e_prev / (t_j + (j - 1) d)`.
+fn take_draft(a_j: f64, e_prev: f64, j: usize, t_j: f64, t_next: f64, d: f64) -> bool {
+    a_j * (t_j + (j - 1) as f64 * d) > e_prev * (t_next - t_j + d)
 }
 
 /// Decides, round by round, whether to draft: speculation runs only while its
@@ -207,21 +325,24 @@ impl Governor {
 
     /// Record a finished round: `tokens` advanced in `secs`.
     fn record(&mut self, spec: bool, tokens: usize, secs: f64) {
+        if secs <= 0.0 {
+            return;
+        }
+        let tps = tokens as f64 / secs;
         let was_probe = spec && self.spec.value < self.plain.value * Self::MARGIN;
         if spec {
             // A round more than `OUTLIER` times slower than plain decoding is
             // a first-shape compile (GPU autotune, shader build), not a cost
             // the next rounds will pay: keep it out of the estimate.
             if self.plain.n >= Self::MIN_SAMPLES
-                && secs > 0.0
-                && tokens as f64 / secs * Self::OUTLIER < self.plain.value
+                && tps * Self::OUTLIER < self.plain.value
                 && self.spec.n < Self::MIN_SAMPLES
             {
                 return;
             }
-            self.spec.record(tokens, secs);
+            self.spec.record(tps);
         } else {
-            self.plain.record(tokens, secs);
+            self.plain.record(tps);
         }
         // A probe that fails doubles the interval before the next one.
         if was_probe
@@ -327,8 +448,8 @@ impl Engine {
         drop(reader);
 
         let hp = super::model::read_hparams(&content)?;
-        let kv_bytes_per_position = hp.kv_bytes_per_position();
         let context_length = super::resolve_context_length(config.context_length, hp.n_ctx_train);
+        let kv_cache_bytes = hp.kv_cache_bytes(context_length);
         let model = Model::load(&content, path, context_length, config.device)?;
         let drafter = drafter
             .map(|source| -> Result<Drafter, CucaError> {
@@ -378,9 +499,10 @@ impl Engine {
             id_rng: SplitMix64(random_seed()),
             drafter,
             draft_tokens: config.draft_tokens,
-            kv_bytes_per_position,
+            kv_cache_bytes,
             stats,
             governor: Governor::default(),
+            cost: CostModel::default(),
         };
         Ok((engine, tokenizer, template, format))
     }
@@ -391,9 +513,9 @@ impl Engine {
         self.context_length
     }
 
-    /// K/V cache bytes per context position of the loaded model.
-    pub(crate) fn kv_bytes_per_position(&self) -> usize {
-        self.kv_bytes_per_position
+    /// K/V cache bytes of the loaded model at its context length.
+    pub(crate) fn kv_cache_bytes(&self) -> u64 {
+        self.kv_cache_bytes
     }
 
     /// Run one job to completion on the calling (engine) thread.
@@ -605,12 +727,11 @@ impl Engine {
             // Draft: `id` sits at position `cached.len()` and is not cached.
             let room = self.context_length - self.cached.len() - 1;
             // Draft only while the governor measures speculation as faster
-            // than plain decoding (a fixed k keeps the batch shape, and so the
-            // GPU kernels, the same from round to round).
+            // than plain decoding.
             let round_start = std::time::Instant::now();
             // A seeded sampling run must reproduce its tokens, and a timing
-            // dependent on/off decision would change how many random numbers
-            // are drawn: it always drafts.
+            // dependent on/off decision or draft length would change how many
+            // random numbers are drawn: it always drafts the full cap.
             let reproducible = !greedy_mode && seed_fixed;
             let spec_round = self.drafter.is_some() && (reproducible || self.governor.want_spec());
             let k = if spec_round {
@@ -625,19 +746,52 @@ impl Engine {
             };
             let mut drafts: Vec<u32> = Vec::new();
             let mut q_dists: Vec<Dist> = Vec::new();
+            // Drafter forwards run, their seconds, and the chained confidence
+            // summed over the kept drafts.
+            let mut draft_steps = 0usize;
+            let mut draft_secs = 0.0f64;
+            let mut predicted = 0.0f64;
             if k > 0
                 && let (Some(drafter), Some(h)) = (&self.drafter, hidden.as_deref())
             {
-                let mut pick = |l: &mut [f32]| -> u32 {
-                    if greedy_mode {
-                        greedy(l)
+                // Draft `j` is kept while its predicted acceptance (the
+                // drafter's chained confidence, calibrated) makes the round's
+                // expected tokens per second rise (`take_draft`); `k` is the
+                // cap.
+                let adaptive = !reproducible;
+                let cost = &self.cost;
+                let kappa = cost.calibration();
+                let step_secs = cost.draft_secs();
+                let mut chained = 1.0f64;
+                let mut expected = 1.0f64;
+                let mut pick = |l: &mut [f32]| -> Option<u32> {
+                    draft_steps += 1;
+                    let j = draft_steps;
+                    let (d, q) = if greedy_mode {
+                        greedy_with_prob(l)
                     } else {
-                        let q = Dist::warp(l, temperature, top_k, top_p, &mut scratch);
-                        let d = q.draw(rng);
-                        q_dists.push(q);
-                        d
+                        let dist = Dist::warp(l, temperature, top_k, top_p, &mut scratch);
+                        let d = dist.draw(rng);
+                        let q = dist.prob(d);
+                        q_dists.push(dist);
+                        (d, q)
+                    };
+                    chained *= f64::from(q);
+                    // The first draft of a speculative round is always
+                    // verified: the governor already decided that the round
+                    // drafts, and its acceptance keeps the calibration live.
+                    if adaptive {
+                        let a = (kappa * chained).min(1.0);
+                        let (t_j, t_next) = (cost.verify_secs(j), cost.verify_secs(j + 1));
+                        if j > 1 && !take_draft(a, expected, j, t_j, t_next, step_secs) {
+                            return None;
+                        }
+                        expected += a;
                     }
+                    predicted += chained;
+                    Some(d)
                 };
+                let draft_start = std::time::Instant::now();
                 match drafter.draft(&self.model, h, id, self.cached.len(), k, &mut pick) {
                     Ok(d) => drafts = d,
                     Err(e) => {
@@ -646,6 +800,7 @@ impl Engine {
                         return;
                     }
                 }
+                draft_secs = draft_start.elapsed().as_secs_f64();
             }
 
             // Verify: one forward over the pending token and the drafts.
@@ -658,6 +813,7 @@ impl Engine {
                 Want::All
             };
             let start = self.cached.len();
+            let verify_start = std::time::Instant::now();
             let forward = match self.model.forward_ext(&batch, start, want, tap, true) {
                 Ok(f) => f,
                 Err(e) => {
@@ -744,6 +900,7 @@ impl Engine {
                     return;
                 }
             }
+            let verify_secs = verify_start.elapsed().as_secs_f64();
             // The verified row after the last kept token seeds the next round:
             // moved to the front of its buffer, not copied into a new one.
             rows.copy_within(accepted * vocab..(accepted + 1) * vocab, 0);
@@ -758,12 +915,22 @@ impl Engine {
 
             // The measured round includes the cache rollback and the head's
             // upkeep: what speculation really costs per round.
-            if self.drafter.is_some() && (!drafts.is_empty() || !spec_round) {
-                self.governor.record(
-                    !drafts.is_empty(),
-                    1 + accepted,
-                    round_start.elapsed().as_secs_f64(),
+            if self.drafter.is_some() {
+                self.cost.record_round(
+                    batch.len(),
+                    verify_secs,
+                    draft_steps,
+                    draft_secs,
+                    predicted,
+                    accepted,
                 );
+                if !drafts.is_empty() || !spec_round {
+                    self.governor.record(
+                        !drafts.is_empty(),
+                        1 + accepted,
+                        round_start.elapsed().as_secs_f64(),
+                    );
+                }
             }
 
             // Emit the accepted drafts like sampled tokens.
@@ -882,9 +1049,10 @@ pub(crate) mod testing {
             id_rng: SplitMix64(2),
             drafter: None,
             draft_tokens: 0,
-            kv_bytes_per_position: 0,
+            kv_cache_bytes: 0,
             stats: Arc::default(),
             governor: Governor::default(),
+            cost: CostModel::default(),
         }
     }
 
@@ -907,8 +1075,9 @@ pub(crate) mod testing {
     }
 
     /// [`engine`] drafting with the prediction head inside `model`'s own
-    /// file (a tiny `qwen35`), `draft_tokens` per round, and a governor that
-    /// always drafts.
+    /// file (a tiny `qwen35`), `draft_tokens` per round, and a governor and
+    /// cost model that always draft the full cap (the tiny head's
+    /// confidence would end most chains early).
     pub(crate) fn engine_in_trunk(
         model: &TinyModel,
         context_length: usize,
@@ -923,6 +1092,7 @@ pub(crate) mod testing {
         e.drafter = Some(Drafter::open_in_trunk(&content, &model.path, &e.model).unwrap());
         e.draft_tokens = draft_tokens;
         e.governor = Governor::always_speculating();
+        e.cost = CostModel::always_drafting();
         e
     }
 }
@@ -1201,6 +1371,65 @@ mod tests {
             }
         }
         assert!(spec_late > 800, "{spec_late}");
+    }
+
+    /// The verification-cost table answers every row count: flat before any
+    /// measurement, from the one measured count, then interpolated between
+    /// and extrapolated beyond the measured counts (never downward).
+    #[test]
+    fn cost_model_interpolates_and_bootstraps() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        let mut c = CostModel::default();
+        for n in 1..=MAX_DRAFT_TOKENS + 1 {
+            assert_eq!(c.verify_secs(n), 1.0);
+        }
+        // The first sample of a row count is a warm-up and is skipped.
+        c.record_round(1, 0.5, 0, 0.0, 0.0, 0);
+        assert_eq!(c.verify_secs(3), 1.0);
+        c.record_round(1, 0.010, 0, 0.0, 0.0, 0);
+        for n in 1..=MAX_DRAFT_TOKENS + 1 {
+            assert!(close(c.verify_secs(n), 0.010), "{n}");
+        }
+        let mut rising = c.clone();
+        rising.record_round(4, 0.5, 0, 0.0, 0.0, 0);
+        rising.record_round(4, 0.016, 0, 0.0, 0.0, 0);
+        assert!(close(rising.verify_secs(2), 0.012));
+        assert!(close(rising.verify_secs(6), 0.020));
+        let mut falling = c.clone();
+        falling.record_round(4, 0.5, 0, 0.0, 0.0, 0);
+        falling.record_round(4, 0.008, 0, 0.0, 0.0, 0);
+        assert!(close(falling.verify_secs(6), 0.008));
+
+        // Calibration: realised over predicted accepted drafts, bounded.
+        assert_eq!(c.calibration(), 1.0);
+        c.record_round(3, 0.1, 2, 0.002, 2.0, 1);
+        c.record_round(3, 0.1, 2, 0.002, 2.0, 1);
+        assert!(close(c.calibration(), 0.5));
+        assert!(close(c.draft_secs(), 0.001));
+        let mut eager = CostModel::default();
+        eager.record_round(2, 0.1, 1, 0.001, 0.01, 1);
+        eager.record_round(2, 0.1, 1, 0.001, 0.01, 1);
+        assert_eq!(eager.calibration(), 4.0);
+    }
+
+    /// With an affine verification cost the chain stops at the first draft
+    /// whose chained confidence no longer pays for its row.
+    #[test]
+    fn draft_rule_stops_when_confidence_drops() {
+        let t = |n: usize| 0.010 + 0.002 * (n - 1) as f64;
+        let d = 0.001;
+        let (mut chained, mut expected, mut taken) = (1.0, 1.0, 0);
+        for (i, q) in [0.9, 0.9, 0.2, 0.9].into_iter().enumerate() {
+            let j = i + 1;
+            chained *= q;
+            let a = f64::min(chained, 1.0);
+            if !take_draft(a, expected, j, t(j), t(j + 1), d) {
+                break;
+            }
+            expected += a;
+            taken += 1;
+        }
+        assert_eq!(taken, 2);
     }
 
     /// Speculative decoding with a drafter must not change greedy output: the

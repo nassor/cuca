@@ -258,7 +258,7 @@ pub(crate) struct Hparams {
     /// Geometry of the first prediction block, block `n_layer` (an
     /// attention block that owns its K/V; `None` without prediction
     /// blocks). It is not part of [`Hparams::layers`], so the trunk's K/V
-    /// accounting ([`Hparams::kv_bytes_per_position`]) leaves it out.
+    /// accounting ([`Hparams::kv_cache_bytes`]) leaves it out.
     pub(crate) nextn: Option<LayerSpec>,
 }
 
@@ -275,10 +275,15 @@ impl Hparams {
             .filter(|(il, l)| l.owns_kv(*il))
     }
 
-    /// K/V cache bytes per context position (f32 keys and values).
-    pub(crate) fn kv_bytes_per_position(&self) -> usize {
+    /// K/V cache bytes for `context_length` positions (f32 keys and values):
+    /// each K/V-owning layer's [`super::kv_slots`] slots, so a sliding-window
+    /// layer counts its bounded slab.
+    pub(crate) fn kv_cache_bytes(&self, context_length: usize) -> u64 {
         self.kv_owners()
-            .map(|(_, l)| 2 * 4 * l.n_kv_head * l.head_dim)
+            .map(|(_, l)| {
+                (2 * 4 * l.n_kv_head * l.head_dim) as u64
+                    * super::kv_slots(l.window, context_length) as u64
+            })
             .sum()
     }
 
@@ -870,7 +875,11 @@ mod tests {
         assert_eq!(swa.base, 1e4);
         assert_eq!(p.layers[20].kv_source, 13);
         // E2B: 12 sliding (256) and 3 full (512) owners, one KV head.
-        assert_eq!(p.kv_bytes_per_position(), 36_864);
+        assert_eq!(p.kv_cache_bytes(1), 36_864);
+        // At 8192 positions the 12 sliding owners (window 512) hold
+        // 511 + 1024 + 256 = 1791 slots each, the 3 full owners every position.
+        assert_eq!(p.kv_cache_bytes(8192), 3 * 4096 * 8192 + 12 * 2048 * 1791);
+        assert_eq!(p.kv_cache_bytes(8192), 144_678_912);
     }
 
     #[test]
@@ -972,7 +981,7 @@ mod tests {
                 .iter()
                 .all(|l| l.window.is_none() && l.rope == Some(0))
         );
-        assert_eq!(p.kv_bytes_per_position(), 4 * 2 * 4 * 2 * 8);
+        assert_eq!(p.kv_cache_bytes(1), 4 * 2 * 4 * 2 * 8);
     }
 
     #[test]
@@ -1238,7 +1247,7 @@ mod tests {
         assert_eq!(p.ropes[0].kind, RopeKind::Neox);
         assert_eq!((p.ropes[0].n_dims, p.ropes[0].base), (64, 1e7));
         // Only the six attention layers store K/V: 6 x (2 x 4 x 2 x 256).
-        assert_eq!(p.kv_bytes_per_position(), 6 * 4096);
+        assert_eq!(p.kv_cache_bytes(1), 6 * 4096);
         // The prediction block (block 24) is a full-attention block of the
         // same geometry that owns its K/V and shares the trunk's rope; it is
         // not a trunk layer, so the count above leaves it out.

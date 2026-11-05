@@ -67,7 +67,7 @@ use std::path::Path;
 use candle_core::quantized::gguf_file;
 
 use super::arch::Arch;
-use super::cpu::{ExtKv, NextnHead, Transformer};
+use super::cpu::{NextnHead, Transformer};
 #[cfg(feature = "provider-local-gpu")]
 use super::gpu::GpuDrafter;
 use super::{Model, err};
@@ -79,8 +79,8 @@ use crate::error::CucaError;
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Drafter {
     /// A separate `gemma4-assistant` drafter on the CPU, sharing the target's
-    /// K/V cache.
-    Cpu { net: Transformer, ext: ExtKv },
+    /// K/V cache (read per draft: the cache's slot base moves over time).
+    Cpu { net: Transformer },
     #[cfg(feature = "provider-local-gpu")]
     Gpu(GpuDrafter),
     /// The prediction head embedded in the target's own file (CPU only).
@@ -123,10 +123,10 @@ impl Drafter {
                         target.vocab()
                     )));
                 }
-                Ok(Self::Cpu {
-                    ext: target.ext_kv()?,
-                    net,
-                })
+                // The target must have the caches a draft reads; each draft
+                // takes fresh handles.
+                target.ext_kv()?;
+                Ok(Self::Cpu { net })
             }
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(target) => Ok(Self::Gpu(GpuDrafter::open(
@@ -211,12 +211,13 @@ impl Drafter {
         }
     }
 
-    /// Draft `k` tokens after the pending token `first`.
+    /// Draft at most `k` tokens after the pending token `first`.
     ///
     /// `hidden` is the target's final-norm hidden state at its last cached
     /// position, `len` the number of cached positions (`first` sits at
     /// position `len` and is not cached). Each step's logits go to `pick`,
-    /// which chooses (and may record) the drafted token.
+    /// which chooses the token or ends the chain with `None`; the returned
+    /// drafts are the tokens `pick` accepted, at most `k`.
     ///
     /// # Errors
     ///
@@ -229,18 +230,20 @@ impl Drafter {
         first: u32,
         len: usize,
         k: usize,
-        pick: &mut dyn FnMut(&mut [f32]) -> u32,
+        pick: &mut dyn FnMut(&mut [f32]) -> Option<u32>,
     ) -> Result<Vec<u32>, CucaError> {
         match (self, target) {
-            (Self::Cpu { net, ext }, Model::Cpu(target)) => {
+            (Self::Cpu { net }, Model::Cpu(target)) => {
+                let ext = target.ext_kv()?;
                 let mut drafts = Vec::with_capacity(k);
                 let mut hidden = hidden.to_vec();
                 let mut token = first;
                 for _ in 0..k {
                     let mut input = target.embedding_row(token)?;
                     input.extend_from_slice(&hidden);
-                    let (mut logits, next_hidden) = net.draft(ext, len, &input, len)?;
-                    token = pick(&mut logits);
+                    let (mut logits, next_hidden) = net.draft(&ext, len, &input, len)?;
+                    let Some(next) = pick(&mut logits) else { break };
+                    token = next;
                     drafts.push(token);
                     hidden = next_hidden;
                 }

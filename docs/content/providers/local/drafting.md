@@ -44,11 +44,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ### Rounds and acceptance
 
-- Each round the drafter proposes `draft_tokens` tokens, fewer near `max_tokens`, near the context limit and, for a hybrid model, past the rollback limit of 16 drafts per verification call.
+- Each round the drafter proposes at most `draft_tokens` tokens (default 5), fewer near `max_tokens`, near the context limit and, for a hybrid model, past the rollback limit of 16 drafts per verification call.
+- Within that cap, a speculative round always verifies its first draft and adds each further one only while it pays. The engine predicts that draft `j` is accepted with probability `a_j`, the product of the drafter's own probabilities of its proposals so far, scaled by the ratio of accepted to predicted drafts it has observed. It keeps draft `j` while `a_j * T_j > E_{j-1} * dT`: `T_j` is the measured cost of a round verifying `j` drafts, `dT` what one more draft adds to it (a verification row and a drafter step), and `E_{j-1}` the expected tokens of the round without it.
 - At temperature `0.0` a draft is accepted when it equals the target's greedy token. On the CPU the output equals plain decoding bit for bit.
 - Above `0.0` a draft is accepted with probability `min(1, p/q)`, where `p` and `q` are the target's and the drafter's distributions after temperature, `top_k` and `top_p`. A rejected draft is replaced by a token drawn from the residual distribution `max(0, p - q)`, which preserves the target's sampling distribution.
 - `LocalModel::draft_stats()` returns `DraftStats { rounds, drafted, accepted }`, summed over every request. `DraftStats::acceptance_rate()` returns the accepted fraction, `None` before the first round.
-- A longer round gains more on predictable text and wastes more verification on unpredictable text, so `draft_tokens` is worth tuning on your own prompts.
+- `draft_tokens` is only the cap: the rule above sets the length per round from the drafter's confidence and the verification cost it measures on the running device.
 - The in-trunk head ranks only the first 65,536 token ids in a draft step, which is about five times cheaper than ranking the whole vocabulary for 4 percent fewer accepted tokens per round (Qwen 3.5 0.8B, whose vocabulary has 248,320 ids).
 
 ### Governor
@@ -58,15 +59,15 @@ An engine-side governor drafts only while drafting is measurably faster than pla
 - It measures plain decoding first, then speculative rounds, as moving averages of tokens per second.
 - It keeps drafting while speculation is at least 1.02 times as fast as plain decoding, and refreshes the plain estimate with two plain rounds every 64 rounds.
 - While plain decoding is faster, it re-probes with two speculative rounds after 32 plain rounds. Each failed probe doubles the interval, up to 512 rounds.
-- A run with a fixed `seed` and a temperature above `0.0` always drafts, so equal prompts still reproduce equal tokens.
+- A run with a fixed `seed` and a temperature above `0.0` always drafts the full `draft_tokens`, so equal prompts still reproduce equal tokens.
 - The governor state is kept across requests.
 
 ### Measured speedups
 
-Speedup is speculative throughput over plain decoding on the same device, in release builds, CPU builds with `-C target-cpu=native`, 128-token replies, on a 32-core CPU and an AMD RX 9070 XT (Windows).
+Speedup is speculative throughput over plain decoding on the same device, in release builds, CPU builds with `-C target-cpu=native`, 128-token replies, at the default `draft_tokens` of 5, on a 32-core CPU and an AMD RX 9070 XT (Windows).
 
-- Gemma 4 E2B Q4_0 with `gemma4-e2b-mtp-f16`: on the CPU 1.17x on a code prompt, 1.37x on a list and 1.00x on prose; on Vulkan 0.95x to 0.97x, because single-token GPU decoding is bound by the host and the governor keeps the run near plain decoding. The drafter pays on the CPU.
-- Qwen 3.5 0.8B Q8_0 with the in-trunk head, CPU, three drafts per round: 1.62x on code, 1.18x on a list and 0.98x on prose. Prose text is hard to predict, so the governor mostly turns drafting off there.
+- Gemma 4 E2B Q4_0 with `gemma4-e2b-mtp-f16`: on the CPU 1.32x on a code prompt, 1.31x on a list and 1.01x on prose; on Vulkan 0.97x to 1.00x, because single-token GPU decoding is bound by the host and the governor keeps the run near plain decoding. The drafter pays on the CPU.
+- Qwen 3.5 0.8B Q8_0 with the in-trunk head, CPU: 1.59x on code, 1.40x on a list and 0.98x on prose; with `draft_tokens` 3, 1.86x, 1.37x and 0.99x. Prose text is hard to predict, so the governor mostly turns drafting off there.
 
 ### Verified
 
