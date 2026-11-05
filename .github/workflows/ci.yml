@@ -38,6 +38,13 @@ jobs:
       - run: if cargo check --no-default-features; then echo "expected provider selection to fail"; exit 1; fi
   test:
     runs-on: ubuntu-latest
+    # Every test, example and the lib test link the whole $ALL_NO_LLVM tree
+    # (burn, wgpu, wasmtime, candle): with debug info that is 0.7 to 2 GB per
+    # binary over 73 binaries and the runner runs out of disk mid-link
+    # (rust-lld dies with SIGBUS). Without it the target is 12 GB. Panic
+    # messages keep their file and line; backtraces keep function names.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: 0
     strategy:
       matrix:
         features: ["--no-default-features --features provider-openai", "--no-default-features --features $ALL_NO_LLVM"]
