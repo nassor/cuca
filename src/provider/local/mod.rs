@@ -58,7 +58,20 @@
 //! `LocalModelConfig::on_download_progress` as tensors converted out of the
 //! tensor count.
 //!
+//! # Split GGUF files
+//!
+//! A model published as llama.cpp splits (`<base>-00001-of-0000N.gguf`) is
+//! merged once into one cached GGUF: [`ModelSource::File`] naming any part
+//! merges the set into `<cache>/merged/`, and a Hugging Face source whose file
+//! is a split name downloads and verifies every part
+//! ([`ModelSource::HuggingFace`]'s `parts`, [`ModelPreset::parts`]), merges
+//! them into `<base>.gguf` next to where they were downloaded and deletes the
+//! parts. The merge needs about twice the model's size free until the parts
+//! are deleted, streams the tensor data, and is reported through
+//! `LocalModelConfig::on_download_progress` as bytes copied.
+//!
 //! # Bounds
+//!
 //!
 //! - Continuous batching ([`BatchingConfig`]): up to `max_sequences` requests
 //!   (4 by default) run at once, each decode step one forward pass over a row
@@ -242,6 +255,24 @@ pub struct ModelPreset {
     /// [`LocalModelConfig::drafter`] next to its target model and cannot be
     /// loaded as the main model.
     pub drafter: bool,
+    /// The parts of a model published as a split GGUF (`llama-gguf-split`):
+    /// every `<base>-0000i-of-0000N.gguf` file with its digest and size, in
+    /// part order. Empty for a single-file preset. For a split preset `file`
+    /// and `sha256` are those of the first part and `size_bytes` is the sum of
+    /// the parts; loading downloads and verifies every part, merges them into
+    /// one cached `<base>.gguf` and deletes the parts.
+    pub parts: &'static [PresetPart],
+}
+
+/// One file of a split preset, see [`ModelPreset::parts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresetPart {
+    /// File name inside the repository.
+    pub file: &'static str,
+    /// Lowercase hex SHA-256 of the file (the `lfs.oid` of that revision).
+    pub sha256: &'static str,
+    /// Size of the file in bytes.
+    pub size_bytes: u64,
 }
 
 impl ModelPreset {
@@ -252,6 +283,14 @@ impl ModelPreset {
             revision: self.revision.to_string(),
             file: self.file.to_string(),
             sha256: Some(self.sha256.to_string()),
+            parts: self
+                .parts
+                .iter()
+                .map(|p| ModelPart {
+                    file: p.file.to_string(),
+                    sha256: Some(p.sha256.to_string()),
+                })
+                .collect(),
         }
     }
 }
@@ -276,6 +315,7 @@ const fn preset(
         size_bytes,
         architecture,
         drafter: false,
+        parts: &[],
     }
 }
 
@@ -490,8 +530,19 @@ pub enum ModelSource {
         file: String,
         /// Expected lowercase hex SHA-256 of the file; `None` skips the check.
         sha256: Option<String>,
+        /// The parts of a split GGUF with their digests, in part order; empty
+        /// for a single file. When `file` is a split name
+        /// (`<base>-00001-of-0000N.gguf`), loading downloads every part
+        /// (named by `parts`, or derived from `file` and unverified when
+        /// `parts` is empty), merges them into `<base>.gguf` next to where
+        /// the parts were downloaded and deletes the parts. `parts[0]` must
+        /// be `file`.
+        parts: Vec<ModelPart>,
     },
-    /// A GGUF file already on disk; nothing is downloaded.
+    /// A GGUF file already on disk; nothing is downloaded. A file named like a
+    /// split part (`<base>-00001-of-0000N.gguf`; any part names the set) is
+    /// merged with its siblings in the same directory into one GGUF under
+    /// `<cache>/merged/`, and that file is loaded; the parts stay in place.
     File(PathBuf),
     /// A Hugging Face safetensors checkpoint (`config.json`, the weight
     /// shards, the tokenizer files), downloaded into the cache pinned to
@@ -507,6 +558,16 @@ pub enum ModelSource {
     /// The conversion is keyed by the directory's path and the size and
     /// modification time of its `config.json` and weight shards.
     Dir(PathBuf),
+}
+
+/// One file of a split GGUF set on Hugging Face, see
+/// [`ModelSource::HuggingFace::parts`](ModelSource).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelPart {
+    /// File name inside the repository.
+    pub file: String,
+    /// Expected lowercase hex SHA-256 of the file; `None` skips the check.
+    pub sha256: Option<String>,
 }
 
 impl ModelSource {
@@ -548,6 +609,7 @@ impl ModelSource {
             revision: revision.into(),
             file: file.into(),
             sha256: None,
+            parts: Vec::new(),
         }
     }
 }
@@ -1726,23 +1788,88 @@ fn resolve_model_path(
                     message: format!("model file `{}` does not exist", path.display()),
                 });
             }
-            Ok(path.clone())
+            let is_part = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .and_then(convert::gguf_merge::SplitName::parse)
+                .is_some();
+            if !is_part {
+                return Ok(path.clone());
+            }
+            let cache_dir = cache_dir()?;
+            let Some(plan) = convert::gguf_merge::plan_local(&cache_dir, path)? else {
+                return Ok(path.clone());
+            };
+            convert::gguf_merge::merge(
+                &plan.parts,
+                &plan.merged,
+                config.on_download_progress.as_ref(),
+            )?;
+            Ok(plan.merged)
         }
         ModelSource::HuggingFace {
             repo,
             revision,
             file,
             sha256,
+            parts,
         } => {
             let cache_dir = cache_dir()?;
-            let final_path = download::cached_path(&cache_dir, repo, revision, file)?;
-            if !final_path.exists() {
+            let split = convert::gguf_merge::repo_parts(file);
+            if split.is_none() && !parts.is_empty() {
+                return Err(CucaError::Config(format!(
+                    "`{file}` is not named like a split GGUF part (`<base>-00001-of-0000N.gguf`) but the source lists {} parts",
+                    parts.len()
+                )));
+            }
+            let runtime = || -> Result<_, CucaError> {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
                 let client = reqwest::Client::builder()
                     .connect_timeout(CONNECT_TIMEOUT)
                     .build()?;
+                Ok((runtime, client))
+            };
+            if let Some((names, merged_file)) = split {
+                let wanted: Vec<(String, Option<String>)> = if parts.is_empty() {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(i, n)| (n.clone(), if i == 0 { sha256.clone() } else { None }))
+                        .collect()
+                } else {
+                    let listed: Vec<&str> = parts.iter().map(|p| p.file.as_str()).collect();
+                    if listed != names.iter().map(String::as_str).collect::<Vec<_>>() {
+                        return Err(CucaError::Config(format!(
+                            "the parts of `{file}` must be {names:?} in order, got {listed:?}"
+                        )));
+                    }
+                    parts
+                        .iter()
+                        .map(|p| (p.file.clone(), p.sha256.clone()))
+                        .collect()
+                };
+                let merged = download::cached_path(&cache_dir, repo, revision, &merged_file)?;
+                if !merged.exists() {
+                    let (runtime, client) = runtime()?;
+                    runtime.block_on(download::ensure_split_downloaded(
+                        &client,
+                        download::HF_ENDPOINT,
+                        &cache_dir,
+                        repo,
+                        revision,
+                        &wanted,
+                        &merged,
+                        hf_token(config).as_deref(),
+                        config.on_download_progress.as_ref(),
+                    ))?;
+                }
+                return Ok(merged);
+            }
+            let final_path = download::cached_path(&cache_dir, repo, revision, file)?;
+            if !final_path.exists() {
+                let (runtime, client) = runtime()?;
                 runtime.block_on(download::ensure_downloaded(
                     &client,
                     download::HF_ENDPOINT,
@@ -1967,6 +2094,7 @@ mod tests {
             revision,
             file,
             sha256,
+            ..
         } = ModelSource::default_model()
         else {
             panic!("default source is a Hugging Face file");
@@ -2018,6 +2146,126 @@ mod tests {
         for name in ["qwen3-0.6b-q8_0", "phi4-mini-q4_0", "olmoe-1b-7b-q4_0"] {
             assert!(ModelSource::preset(name).is_some(), "{name}");
         }
+    }
+
+    #[test]
+    fn a_file_naming_a_split_part_resolves_to_the_merged_gguf() {
+        use super::convert::gguf_merge::fixtures::{load, split, temp_dir};
+
+        let model = super::model::tiny::write_tiny_model();
+        let dir = temp_dir("source");
+        let parts = split(&model, &dir, 3, 3, |i| i % 3);
+        let cache = dir.join("cache");
+        let resolve = |path: &std::path::Path| {
+            let config = LocalModelConfig {
+                source: ModelSource::File(path.to_path_buf()),
+                cache_dir: Some(cache.clone()),
+                ..LocalModelConfig::default()
+            };
+            resolve_model_path(&config, &config.source)
+        };
+        // Any part names the set; the merged file is the same one.
+        let merged = resolve(&parts[1]).unwrap();
+        assert!(merged.starts_with(cache.join("merged")), "{merged:?}");
+        assert_eq!(merged.file_name().unwrap(), "tiny.gguf");
+        assert_eq!(load(&merged).1.len(), load(&model.path).1.len());
+        assert_eq!(resolve(&parts[0]).unwrap(), merged);
+        assert!(parts.iter().all(|p| p.exists()), "the user's parts stay");
+        // A file that is not a split part loads as it is.
+        assert_eq!(resolve(&model.path).unwrap(), model.path);
+        // A missing sibling names the file.
+        std::fs::remove_file(&parts[2]).unwrap();
+        let err = resolve(&parts[0]).unwrap_err().to_string();
+        assert!(err.contains("tiny-00003-of-00003.gguf"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_split_preset_pins_every_part() {
+        const PARTS: &[PresetPart] = &[
+            PresetPart {
+                file: "m-Q4_0-00001-of-00002.gguf",
+                sha256: "a",
+                size_bytes: 10,
+            },
+            PresetPart {
+                file: "m-Q4_0-00002-of-00002.gguf",
+                sha256: "b",
+                size_bytes: 20,
+            },
+        ];
+        let preset = ModelPreset {
+            file: PARTS[0].file,
+            sha256: PARTS[0].sha256,
+            size_bytes: 30,
+            parts: PARTS,
+            ..ModelSource::PRESETS[0]
+        };
+        let ModelSource::HuggingFace {
+            file,
+            sha256,
+            parts,
+            ..
+        } = preset.source()
+        else {
+            panic!("presets are Hugging Face files");
+        };
+        assert_eq!(file, "m-Q4_0-00001-of-00002.gguf");
+        assert_eq!(sha256.as_deref(), Some("a"));
+        assert_eq!(
+            parts,
+            [
+                ModelPart {
+                    file: "m-Q4_0-00001-of-00002.gguf".into(),
+                    sha256: Some("a".into())
+                },
+                ModelPart {
+                    file: "m-Q4_0-00002-of-00002.gguf".into(),
+                    sha256: Some("b".into())
+                }
+            ]
+        );
+        // Single-file presets list no parts.
+        assert!(ModelSource::PRESETS.iter().all(|p| p.parts.is_empty()));
+    }
+
+    #[test]
+    fn split_sources_validate_their_parts_before_any_download() {
+        let source = |file: &str, parts: &[&str]| ModelSource::HuggingFace {
+            repo: "org/model".into(),
+            revision: "rev".into(),
+            file: file.into(),
+            sha256: None,
+            parts: parts
+                .iter()
+                .map(|f| ModelPart {
+                    file: (*f).into(),
+                    sha256: None,
+                })
+                .collect(),
+        };
+        let config = |source| LocalModelConfig {
+            source,
+            cache_dir: Some(std::env::temp_dir().join("cuca-unused-cache")),
+            ..LocalModelConfig::default()
+        };
+        // Parts listed for a file that is not a split part.
+        let c = config(source("model.gguf", &["model.gguf"]));
+        let err = resolve_model_path(&c, &c.source).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("model.gguf")),
+            "{err:?}"
+        );
+        // Parts that are not the set `file` names.
+        let c = config(source(
+            "m-00001-of-00002.gguf",
+            &["m-00001-of-00002.gguf", "m-00002-of-00003.gguf"],
+        ));
+        let err = resolve_model_path(&c, &c.source).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("m-00002-of-00002.gguf")),
+            "{err:?}"
+        );
     }
 
     #[test]

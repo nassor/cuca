@@ -30,7 +30,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 
-use super::{DownloadProgress, DownloadProgressCallback};
+use super::{DownloadProgress, DownloadProgressCallback, convert};
 use crate::error::CucaError;
 use crate::types::ProviderEndpoint;
 
@@ -230,6 +230,70 @@ pub(crate) async fn ensure_downloaded(
         client, endpoint, repo, revision, file, sha256, final_path, token, progress,
     )
     .await
+}
+
+/// Make sure `merged` holds the merge of a split GGUF set: download and verify
+/// every `(file, sha256)` part (resuming partial files), merge them into
+/// `merged` and delete the parts, so the merged file is the cache entry.
+///
+/// An exclusive `<merged>.lock` is held for the whole operation, so a
+/// concurrent loader waits and then finds `merged` instead of downloading
+/// parts that the first loader is about to delete. A failed merge leaves the
+/// verified parts for a retry. `progress` receives each part's download, then
+/// the merge's copied bytes.
+///
+/// # Errors
+///
+/// Those of [`ensure_downloaded`] and of the merge ([`CucaError::Config`]
+/// naming the offending part).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "same inputs as ensure_downloaded, plus the cache and the parts"
+)]
+pub(crate) async fn ensure_split_downloaded(
+    client: &reqwest::Client,
+    endpoint: &str,
+    cache_dir: &Path,
+    repo: &str,
+    revision: &str,
+    parts: &[(String, Option<String>)],
+    merged: &Path,
+    token: Option<&str>,
+    progress: Option<&DownloadProgressCallback>,
+) -> Result<(), CucaError> {
+    if merged.exists() {
+        return Ok(());
+    }
+    let lock = convert::lock_output(merged)?;
+    // Another loader may have merged while this one waited for the lock.
+    if merged.exists() {
+        return Ok(());
+    }
+    let mut paths = Vec::with_capacity(parts.len());
+    for (file, sha256) in parts {
+        let path = cached_path(cache_dir, repo, revision, file)?;
+        ensure_downloaded(
+            client,
+            endpoint,
+            repo,
+            revision,
+            file,
+            sha256.as_deref(),
+            &path,
+            token,
+            progress,
+        )
+        .await?;
+        paths.push(path);
+    }
+    convert::build_locked(&lock, merged, |partial| {
+        convert::gguf_merge::merge_to(&paths, partial, progress)
+    })?;
+    for path in &paths {
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(with_suffix(path, ".lock"));
+    }
+    Ok(())
 }
 
 /// [`ensure_downloaded`] for a file the repository may not have: `Ok(false)`
@@ -832,6 +896,181 @@ mod tests {
             .expect("restart succeeds");
         assert_eq!(std::fs::read(&path).expect("final"), data);
         assert_eq!(stub.ranges.lock().expect("lock").len(), 2);
+    }
+
+    /// A stub that serves `routes` (`(path suffix, body)`) with plain 200s.
+    async fn spawn_routes(routes: Vec<(String, Vec<u8>)>) -> Stub {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind stub");
+        let base = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("addr").port()
+        );
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 2048];
+                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => raw.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&raw).to_string();
+                let path = head
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .unwrap_or("")
+                    .to_string();
+                let found = routes
+                    .iter()
+                    .find(|(suffix, _)| path.ends_with(suffix.as_str()));
+                let (status, payload): (&str, &[u8]) = match found {
+                    Some((_, body)) => ("200 OK", body),
+                    None => ("404 Not Found", b"nope"),
+                };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+                let _ = socket.write_all(payload).await;
+                let _ = socket.shutdown().await;
+            }
+        });
+        Stub { base, ranges, task }
+    }
+
+    /// A tiny model cut into three parts (the first without tensors): the
+    /// part names with their bytes.
+    fn split_parts() -> (Vec<(String, Vec<u8>)>, usize) {
+        use super::super::convert::gguf_merge::fixtures::{load, split, temp_dir};
+        let model = crate::provider::local::model::tiny::write_tiny_model();
+        let src = temp_dir("dl-src");
+        let paths = split(&model, &src, 3, 3, |i| 1 + i % 2);
+        let parts = paths
+            .iter()
+            .map(|p| {
+                (
+                    p.file_name().expect("name").to_string_lossy().into_owned(),
+                    std::fs::read(p).expect("part"),
+                )
+            })
+            .collect();
+        let _ = std::fs::remove_dir_all(src);
+        (parts, load(&model.path).1.len())
+    }
+
+    #[tokio::test]
+    async fn a_split_set_downloads_verifies_merges_and_deletes_its_parts() {
+        use super::super::convert::gguf_merge::fixtures::load;
+        let (parts, n_tensors) = split_parts();
+        let stub = spawn_routes(
+            parts
+                .iter()
+                .map(|(name, body)| (format!("/{name}"), body.clone()))
+                .collect(),
+        )
+        .await;
+        let dir = TempDir::new();
+        let merged = cached_path(&dir.0, "org/model", "rev1", "tiny.gguf").expect("path");
+        let wanted: Vec<(String, Option<String>)> = parts
+            .iter()
+            .map(|(name, body)| (name.clone(), Some(sha_of(body))))
+            .collect();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let cb = DownloadProgressCallback::new(move |p| sink.lock().expect("lock").push(p));
+        ensure_split_downloaded(
+            &client(),
+            &stub.base,
+            &dir.0,
+            "org/model",
+            "rev1",
+            &wanted,
+            &merged,
+            None,
+            Some(&cb),
+        )
+        .await
+        .expect("split download succeeds");
+        assert_eq!(load(&merged).1.len(), n_tensors);
+        for (name, _) in &parts {
+            let part = cached_path(&dir.0, "org/model", "rev1", name).expect("path");
+            assert!(!part.exists(), "{name} is deleted after the merge");
+            assert!(!with_suffix(&part, ".partial").exists());
+        }
+        assert!(!with_suffix(&merged, ".partial").exists());
+        let last = events
+            .lock()
+            .expect("lock")
+            .last()
+            .copied()
+            .expect("events");
+        assert_eq!(
+            Some(last.downloaded_bytes),
+            last.total_bytes,
+            "merge reports its end"
+        );
+        // The merged file is the cache entry: nothing is fetched again.
+        drop(stub);
+        ensure_split_downloaded(
+            &client(),
+            "http://127.0.0.1:1",
+            &dir.0,
+            "org/model",
+            "rev1",
+            &wanted,
+            &merged,
+            None,
+            None,
+        )
+        .await
+        .expect("a present merged file skips the network");
+    }
+
+    #[tokio::test]
+    async fn a_part_with_the_wrong_digest_fails_before_the_merge() {
+        let (parts, _) = split_parts();
+        let stub = spawn_routes(
+            parts
+                .iter()
+                .map(|(name, body)| (format!("/{name}"), body.clone()))
+                .collect(),
+        )
+        .await;
+        let dir = TempDir::new();
+        let merged = cached_path(&dir.0, "org/model", "rev1", "tiny.gguf").expect("path");
+        let mut wanted: Vec<(String, Option<String>)> = parts
+            .iter()
+            .map(|(name, body)| (name.clone(), Some(sha_of(body))))
+            .collect();
+        wanted[1].1 = Some("0".repeat(64));
+        let err = ensure_split_downloaded(
+            &client(),
+            &stub.base,
+            &dir.0,
+            "org/model",
+            "rev1",
+            &wanted,
+            &merged,
+            None,
+            None,
+        )
+        .await
+        .expect_err("digest mismatch must fail");
+        assert!(err.to_string().contains(&parts[1].0), "{err}");
+        assert!(!merged.exists());
+        assert!(!with_suffix(&merged, ".partial").exists());
+        // The verified first part stays for the retry.
+        let first = cached_path(&dir.0, "org/model", "rev1", &parts[0].0).expect("path");
+        assert!(first.exists());
     }
 
     #[tokio::test]

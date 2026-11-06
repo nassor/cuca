@@ -149,18 +149,29 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> Result<(), CucaError> {
     .map_err(io)
 }
 
+/// A tensor copied as it is stored in another GGUF file: its dimensions in
+/// GGUF order (fastest-varying first), the raw GGML type id (any, known to
+/// this engine or not) and the number of data bytes it occupies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RawTensorSpec {
+    pub(crate) name: String,
+    pub(crate) gguf_dims: Vec<u64>,
+    pub(crate) ggml_type: u32,
+    pub(crate) bytes: u64,
+}
+
 /// Streams a GGUF file: header first, then tensor data in the order the
-/// [`TensorSpec`]s were given.
+/// tensors were given.
 pub(crate) struct GgufWriter<W: Write> {
     out: W,
     /// Bytes written so far.
     pos: u64,
     /// Tensors still to be written, with the bytes each still needs.
-    pending: VecDeque<(String, usize)>,
+    pending: VecDeque<(String, u64)>,
     /// Bytes still needed by the tensor being written.
-    left: usize,
+    left: u64,
     /// Padding bytes owed after the current tensor.
-    pad: usize,
+    pad: u64,
 }
 
 impl<W: Write> GgufWriter<W> {
@@ -169,9 +180,35 @@ impl<W: Write> GgufWriter<W> {
     /// `general.alignment` is appended to `metadata`. The tensor data follows
     /// with [`GgufWriter::write`], tensor by tensor in `tensors` order.
     pub(crate) fn start(
-        mut out: W,
+        out: W,
         metadata: &[(String, Value)],
         tensors: &[TensorSpec],
+    ) -> Result<Self, CucaError> {
+        let mut raw = Vec::with_capacity(tensors.len());
+        for t in tensors {
+            let cols = t.dims.last().copied().unwrap_or(0);
+            if !t.dims.is_empty() && !cols.is_multiple_of(t.dtype.block_size()) {
+                return Err(CucaError::Config(format!(
+                    "tensor `{}`: row length {cols} is not a multiple of the {:?} block size",
+                    t.name, t.dtype
+                )));
+            }
+            raw.push(RawTensorSpec {
+                name: t.name.clone(),
+                gguf_dims: t.dims.iter().rev().map(|&d| d as u64).collect(),
+                ggml_type: t.dtype.ggml_id(),
+                bytes: t.byte_len() as u64,
+            });
+        }
+        Self::start_raw(out, metadata, &raw)
+    }
+
+    /// [`GgufWriter::start`] for tensors described by their stored form
+    /// (a merge of split files copies tensors of any GGML type).
+    pub(crate) fn start_raw(
+        mut out: W,
+        metadata: &[(String, Value)],
+        tensors: &[RawTensorSpec],
     ) -> Result<Self, CucaError> {
         let mut pos = 0u64;
         let alignment = Value::U32(ALIGNMENT as u32);
@@ -195,38 +232,29 @@ impl<W: Write> GgufWriter<W> {
         }
         let mut offset = 0u64;
         for t in tensors {
-            if t.dims.is_empty() || t.dims.len() > MAX_DIMS {
+            if t.gguf_dims.is_empty() || t.gguf_dims.len() > MAX_DIMS {
                 return Err(CucaError::Config(format!(
                     "tensor `{}` has {} dimensions; GGUF stores 1 to {MAX_DIMS}",
                     t.name,
-                    t.dims.len()
-                )));
-            }
-            let cols = t.dims.last().copied().unwrap_or(0);
-            if !cols.is_multiple_of(t.dtype.block_size()) {
-                return Err(CucaError::Config(format!(
-                    "tensor `{}`: row length {cols} is not a multiple of the {:?} block size",
-                    t.name, t.dtype
+                    t.gguf_dims.len()
                 )));
             }
             scratch.clear();
             write_str(&mut scratch, &t.name)?;
-            scratch.extend_from_slice(&(t.dims.len() as u32).to_le_bytes());
-            for &d in t.dims.iter().rev() {
-                scratch.extend_from_slice(&(d as u64).to_le_bytes());
+            scratch.extend_from_slice(&(t.gguf_dims.len() as u32).to_le_bytes());
+            for d in &t.gguf_dims {
+                scratch.extend_from_slice(&d.to_le_bytes());
             }
-            scratch.extend_from_slice(&t.dtype.ggml_id().to_le_bytes());
+            scratch.extend_from_slice(&t.ggml_type.to_le_bytes());
             scratch.extend_from_slice(&offset.to_le_bytes());
             put(&mut out, &mut pos, &scratch)?;
-            offset += pad_to(t.byte_len() as u64);
+            offset += pad_to(t.bytes);
         }
         let padding = (pad_to(pos) - pos) as usize;
         put(&mut out, &mut pos, &vec![0u8; padding])?;
 
-        let pending: VecDeque<(String, usize)> = tensors
-            .iter()
-            .map(|t| (t.name.clone(), t.byte_len()))
-            .collect();
+        let pending: VecDeque<(String, u64)> =
+            tensors.iter().map(|t| (t.name.clone(), t.bytes)).collect();
         let mut writer = Self {
             out,
             pos,
@@ -242,18 +270,17 @@ impl<W: Write> GgufWriter<W> {
     fn advance(&mut self) -> Result<(), CucaError> {
         while self.left == 0 {
             if self.pad > 0 {
-                self.out.write_all(&vec![0u8; self.pad]).map_err(io)?;
-                self.pos += self.pad as u64;
+                self.out
+                    .write_all(&vec![0u8; self.pad as usize])
+                    .map_err(io)?;
+                self.pos += self.pad;
                 self.pad = 0;
             }
             let Some((_, len)) = self.pending.pop_front() else {
                 return Ok(());
             };
             self.left = len;
-            self.pad = (pad_to(len as u64) - len as u64) as usize;
-            if len == 0 {
-                continue;
-            }
+            self.pad = pad_to(len) - len;
         }
         Ok(())
     }
@@ -268,10 +295,12 @@ impl<W: Write> GgufWriter<W> {
                     "converter wrote more tensor data than it declared".into(),
                 ));
             }
-            let n = bytes.len().min(self.left);
+            let n = bytes
+                .len()
+                .min(usize::try_from(self.left).unwrap_or(usize::MAX));
             self.out.write_all(&bytes[..n]).map_err(io)?;
             self.pos += n as u64;
-            self.left -= n;
+            self.left -= n as u64;
             bytes = &bytes[n..];
             if self.left == 0 {
                 self.advance()?;

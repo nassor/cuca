@@ -26,6 +26,7 @@
 pub(crate) mod arch;
 pub(crate) mod chktxt;
 pub(crate) mod config;
+pub(crate) mod gguf_merge;
 pub(crate) mod gguf_writer;
 pub(crate) mod hf;
 #[cfg(test)]
@@ -176,6 +177,19 @@ pub(crate) fn convert(
     quant: WeightQuant,
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<(), CucaError> {
+    write_atomically(out, |partial| {
+        convert_locked(checkpoint, partial, quant, progress)
+    })
+}
+
+/// The exclusive `<out>.lock` file of an output, released on drop.
+pub(crate) struct OutputLock {
+    _file: File,
+}
+
+/// Take the exclusive `<out>.lock` file of `out` (creating the directory and
+/// the empty lock file), waiting for another loader that holds it.
+pub(crate) fn lock_output(out: &Path) -> Result<OutputLock, CucaError> {
     let parent = out.parent().ok_or_else(|| {
         CucaError::Config(format!(
             "output `{}` has no parent directory",
@@ -191,23 +205,44 @@ pub(crate) fn convert(
         .truncate(false)
         .open(PathBuf::from(lock_name))?;
     lock.lock()?;
-    // Another loader may have converted while this one waited for the lock.
+    Ok(OutputLock { _file: lock })
+}
+
+/// Produce the file `out` with `build`, which writes the path it is given.
+///
+/// Writes `<out>.partial` and renames it into place under an exclusive
+/// `<out>.lock` file (the pattern of the model download), so concurrent
+/// loaders build once and a present `out` is always complete. An existing
+/// `out` is left alone and `build` is not called; a failed build removes the
+/// partial file.
+pub(crate) fn write_atomically(
+    out: &Path,
+    build: impl FnOnce(&Path) -> Result<(), CucaError>,
+) -> Result<(), CucaError> {
+    let lock = lock_output(out)?;
+    build_locked(&lock, out, build)
+}
+
+/// [`write_atomically`] for a caller that already holds `out`'s lock.
+pub(crate) fn build_locked(
+    _lock: &OutputLock,
+    out: &Path,
+    build: impl FnOnce(&Path) -> Result<(), CucaError>,
+) -> Result<(), CucaError> {
+    // Another loader may have built the file while this one waited.
     if out.exists() {
         return Ok(());
     }
     let mut partial_name = out.as_os_str().to_owned();
     partial_name.push(".partial");
     let partial = PathBuf::from(partial_name);
-    let result = convert_locked(checkpoint, &partial, quant, progress);
-    match result {
+    match build(&partial) {
         Ok(()) => std::fs::rename(&partial, out)?,
         Err(e) => {
             let _ = std::fs::remove_file(&partial);
-            drop(lock);
             return Err(e);
         }
     }
-    drop(lock);
     Ok(())
 }
 

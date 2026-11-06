@@ -9,6 +9,7 @@
   (`unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF`, Q4_0, 4.68 GB), so the `llama`
   architecture keeps a live test; its embedded chat template equals the
   Hugging Face one (the bartowski file's lacks the trailing `<think>`).
+- `provider-local`: split GGUF files (`llama-gguf-split`, `<base>-00001-of-0000N.gguf`) load. `ModelSource::File` naming any part merges the set into one cached GGUF under `<cache>/merged/`; a Hugging Face source whose file is a split name downloads and verifies every part, merges them into `<base>.gguf` in the repository's cache directory and deletes the parts. `ModelSource::HuggingFace` gains `parts: Vec<ModelPart>`, `ModelPreset` gains `parts: &[PresetPart]` (empty for every current preset), and `on_download_progress` reports the merge. A merge needs about twice the model's size free and a deleted merged file means a re-download; see the model sources page.
 
 ### Changed
 

@@ -20,14 +20,14 @@ weight = 4
 
 `LocalModelConfig::source` is a `ModelSource`:
 
-- `ModelSource::File(path)` is a GGUF file already on disk; nothing is downloaded.
-- `ModelSource::HuggingFace { repo, revision, file, sha256 }` is a file on Hugging Face. `sha256: None` skips the checksum.
-- `ModelSource::hugging_face(repo, revision, file)` builds the same value with `sha256: None`, so the download is not verified. Use a commit hash as the revision, because the cache is keyed by it and a moving ref such as `main` pins a stale file.
+- `ModelSource::File(path)` is a GGUF file already on disk; nothing is downloaded. A file named like a split part (`<base>-00001-of-0000N.gguf`) is merged with its siblings, see [Split GGUF files](#split-gguf-files).
+- `ModelSource::HuggingFace { repo, revision, file, sha256, parts }` is a file on Hugging Face. `sha256: None` skips the checksum. `parts` is empty for a single file; for a split GGUF it lists every part with its digest (see [Split GGUF files](#split-gguf-files)).
+- `ModelSource::hugging_face(repo, revision, file)` builds the same value with `sha256: None`, so the download is not verified (`parts` is empty). Use a commit hash as the revision, because the cache is keyed by it and a moving ref such as `main` pins a stale file.
 - `ModelSource::default_model()` is the preset `gemma4-e2b-q4_0`.
 - `ModelSource::Checkpoint { repo, revision }` is a Hugging Face safetensors checkpoint, and `ModelSource::Dir(path)` a checkpoint directory on disk. Both are converted to a cached GGUF (see [Checkpoints](#checkpoints)).
 - `"name".parse::<ModelSource>()?` accepts a preset name (ASCII case-insensitive), `repo:revision:file` (a GGUF, none of the three parts contains `:`), or `repo:revision` (a checkpoint: `repo` is `owner/name`). The result of `repo:revision:file` has no checksum; a checkpoint is pinned by its revision only. Anything else fails with `` unknown model `…`: expected a preset (…), `repo:revision:file` (a GGUF), or `repo:revision` (a checkpoint) ``.
 
-`ModelSource::PRESETS` has 25 entries, each pinned to one Hugging Face commit and one SHA-256. A `ModelPreset` has `name`, `repo`, `revision`, `file`, `sha256`, `size_bytes`, `architecture` and `drafter`. `preset.source()` returns its pinned `ModelSource`, and `ModelSource::preset(name)` finds one by name. A preset with `drafter: true` is used through `LocalModelConfig::drafter` and cannot be loaded as the main model. The table with sizes and K/V cost is on [Local models and formats](@/providers/local/models.md#presets).
+`ModelSource::PRESETS` has 25 entries, each pinned to one Hugging Face commit and one SHA-256. A `ModelPreset` has `name`, `repo`, `revision`, `file`, `sha256`, `size_bytes`, `architecture`, `drafter` and `parts` (empty unless the model is a split GGUF; a `PresetPart` is `file`, `sha256`, `size_bytes`). `preset.source()` returns its pinned `ModelSource`, and `ModelSource::preset(name)` finds one by name. A preset with `drafter: true` is used through `LocalModelConfig::drafter` and cannot be loaded as the main model. The table with sizes and K/V cost is on [Local models and formats](@/providers/local/models.md#presets).
 
 ```rust,name=List the presets
 use cuca::ModelSource;
@@ -96,6 +96,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The conversion is a port of llama.cpp's `convert_hf_to_gguf.py` (commit `67107ac34f62882d8b53ea41ad68010ea635b9be`) and was verified against it: the script was run on the same checkpoints and the two GGUF files compared key by key and tensor by tensor. The F16 files were identical for SmolLM 2, TinyLlama, Gemma 3, Gemma 4, OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 3, Qwen 2.5, Phi 3.5 and Phi 4 mini, and for synthetic Qwen 3 MoE, OLMoE, Qwen 3.5 and Qwen 3.5 MoE checkpoints; Q8_0 matched byte for byte for SmolLM 2. The remaining differences are one-ulp `f32` rounding in two generated tensors (Llama 3 `rope_freqs`, Qwen 3.5 `ssm_a`), a tied `lm_head` that is not written again, and the Qwen 3.5 prediction-block count, which is read from the tensors present instead of `config.json`.
 
+## Split GGUF files
+
+`llama-gguf-split` cuts a model of more than about 50 GB into `<base>-00001-of-0000N.gguf` files. Each part is a GGUF with `split.no` (from 0), `split.count` and `split.tensors.count`; the first part holds the metadata (and in some sets no tensor at all), the others hold tensors. The engine reads one file, so a set is merged once, like `llama-gguf-split --merge`:
+
+- The merged file has the metadata of part 1 without the `split.*` keys, every tensor of every part with recomputed offsets, and the tensor data copied part by part (never more than 8 MiB in memory). Tensor types the engine cannot load (the IQ family, MXFP4) are copied as they are; the loader rejects them as for any file.
+- A Hugging Face source whose `file` is a split name (a preset or `repo:revision:dir/base-00001-of-0000N.gguf`) downloads every part, merges them into `<cache>/huggingface/<repo>/<revision>/<dir>/<base>.gguf` and deletes the parts, so the merged file is the cache entry. A preset pins every part's SHA-256 and size (`ModelPreset::parts`), and each part is verified as it downloads; a source from a string verifies none.
+- `ModelSource::File(path)` naming any part merges the parts in the same directory into `<cache>/merged/<key>/<base>.gguf`. The key covers the directory and the name, length and modification time of every part, so a changed part merges again. The parts stay where they are.
+- The merge writes `<merged>.partial` and renames it under `<merged>.lock`, as the converter does, so concurrent loaders merge once. A Hugging Face source holds the lock from the first download to the end of the merge.
+- Disk use: while merging, the parts and the merged file coexist, so a download needs about twice the model's size free (a 67.7 GB Q4_0 needs about 135 GB) until the parts are deleted; afterwards the cache holds the merged file only. A merged file that is deleted means a new download of every part. Parts that failed verification or merging stay for a retry (a verified part is not downloaded again).
+- `on_download_progress` reports each part's download, then the merge as bytes copied out of the bytes to copy.
+- A missing part (`CucaError::Io` naming it), a part whose `split.count`, `split.no` or `split.tensors.count` disagree with the set, a file that is not a split part, or a tensor that appears in two parts (`CucaError::Config` naming the file) fail the load; nothing is left at the merged path.
+
 ## Download and cache
 
 A Hugging Face source is downloaded once from `https://huggingface.co/{repo}/resolve/{revision}/{file}` into the cache directory.
@@ -108,6 +120,6 @@ A Hugging Face source is downloaded once from `https://huggingface.co/{repo}/res
 - The verified file is renamed into place atomically, so a final file that exists is complete.
 - An exclusive lock file, `<file>.lock`, serializes concurrent loaders in this process or another. The empty file stays in the cache on purpose: deleting it after unlock would race with a process still blocked on it.
 - Memory use during the download is bounded by a 1 MiB write buffer and one network chunk.
-- `LocalModelConfig::on_download_progress` takes a `DownloadProgressCallback` that receives `DownloadProgress { downloaded_bytes, total_bytes }` at the start, about every mebibyte and at the end. `total_bytes` is `None` when the server reports no size. The callback runs on the engine thread during `load`, so keep it cheap. A checkpoint conversion reports tensors converted out of the tensor count in the same fields.
+- `LocalModelConfig::on_download_progress` takes a `DownloadProgressCallback` that receives `DownloadProgress { downloaded_bytes, total_bytes }` at the start, about every mebibyte and at the end. `total_bytes` is `None` when the server reports no size. The callback runs on the engine thread during `load`, so keep it cheap. A checkpoint conversion reports tensors converted out of the tensor count in the same fields, and a split merge reports bytes copied out of the bytes to copy.
 - `hf_token`, or `HF_TOKEN` when it is `None`, is sent as a bearer token; the pinned preset files download anonymously.
 - The download uses a private HTTP client and runtime, separate from the `CucaClient` one.
