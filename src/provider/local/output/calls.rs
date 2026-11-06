@@ -4,7 +4,8 @@
 //! [`parse_json_calls`] reads `{"name": ..., "arguments"|"parameters": ...}`
 //! objects, alone or in a JSON list; [`parse_xml_call`] reads the
 //! `<function=name><parameter=key>value</parameter></function>` blocks of
-//! Qwen 3.5. All return a description of the first
+//! Qwen 3.5; [`parse_args_call`] reads Mistral's `name[ARGS]{json}` (with an
+//! optional `[CALL_ID]id` after the name). All return a description of the first
 //! problem on malformed input; the caller wraps it into a provider error that
 //! quotes the raw body.
 
@@ -305,6 +306,33 @@ pub(crate) fn parse_json_calls(body: &str) -> Result<Vec<(String, Value)>, Strin
     }
 }
 
+/// Parse a Mistral tool-call body: `name[ARGS]{"key": value}`, or
+/// `name[CALL_ID]id[ARGS]{...}` when `call_id` names that marker. Returns the
+/// id the model wrote (if any), the name, and the arguments, which must be
+/// one JSON object.
+pub(crate) fn parse_args_call(
+    body: &str,
+    args_marker: &str,
+    call_id_marker: Option<&str>,
+) -> Result<(Option<String>, String, Value), String> {
+    let (head, args) = body
+        .split_once(args_marker)
+        .ok_or_else(|| format!("missing `{args_marker}`"))?;
+    let (name, id) = match call_id_marker.and_then(|marker| head.split_once(marker)) {
+        Some((name, id)) => (name, Some(id.trim()).filter(|id| !id.is_empty())),
+        None => (head, None),
+    };
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("empty tool name".to_string());
+    }
+    let arguments: Value = serde_json::from_str(args.trim()).map_err(|e| e.to_string())?;
+    if !arguments.is_object() {
+        return Err("arguments are not a JSON object".to_string());
+    }
+    Ok((id.map(str::to_string), name.to_string(), arguments))
+}
+
 /// Read one tool-call object.
 ///
 /// The name comes from `name`, from a string `function` (`{"function": "f",
@@ -530,6 +558,57 @@ mod tests {
                 .expect("parses"),
             [("a".to_string(), json!({}))]
         );
+    }
+
+    #[test]
+    fn args_calls_read_name_id_and_one_json_object() {
+        let want = json!({ "arg1": 1 });
+        assert_eq!(
+            parse_args_call(r#"special_function[ARGS]{"arg1":1}"#, "[ARGS]", None),
+            Ok((None, "special_function".to_string(), want.clone()))
+        );
+        // Whitespace around the pieces is dropped; the id is kept verbatim.
+        assert_eq!(
+            parse_args_call(
+                "f \n[CALL_ID] 000000001 [ARGS] {\"arg1\": 1}\n",
+                "[ARGS]",
+                Some("[CALL_ID]")
+            ),
+            Ok((
+                Some("000000001".to_string()),
+                "f".to_string(),
+                json!({ "arg1": 1 })
+            ))
+        );
+        // Without a call-id marker configured, `[CALL_ID]` stays in the name.
+        assert_eq!(
+            parse_args_call("f[CALL_ID]1[ARGS]{}", "[ARGS]", None)
+                .unwrap()
+                .1,
+            "f[CALL_ID]1"
+        );
+        // A call id marker with no id after it, and the empty object.
+        assert_eq!(
+            parse_args_call("f[CALL_ID][ARGS]{}", "[ARGS]", Some("[CALL_ID]")),
+            Ok((None, "f".to_string(), json!({})))
+        );
+        for bad in [
+            "",
+            "f",
+            "f[ARGS]",
+            "[ARGS]{}",
+            " [ARGS]{}",
+            "f[ARGS]{",
+            "f[ARGS]{} tail",
+            "f[ARGS][1]",
+            "f[ARGS]\"text\"",
+            "f[ARGS]null",
+        ] {
+            assert!(
+                parse_args_call(bad, "[ARGS]", Some("[CALL_ID]")).is_err(),
+                "should reject {bad:?}"
+            );
+        }
     }
 
     #[test]

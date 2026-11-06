@@ -241,6 +241,7 @@ mod real_models {
                 ToolSyntax::Gemma4 { .. } => "gemma4",
                 ToolSyntax::TaggedJson { .. } => "tagged",
                 ToolSyntax::TaggedXml { .. } => "xml",
+                ToolSyntax::MistralArgs { .. } => "mistral",
             };
             assert_eq!(kind, expect.tools, "{id}: tool syntax");
             for text in expect.eog {

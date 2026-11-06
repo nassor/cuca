@@ -4,9 +4,10 @@
 //! and [`ChatFormat`] (derived from the GGUF, see `chat::format`) says which of
 //! these [`OutputParser`] looks for:
 //!
-//! - a **reasoning block** (`<|channel>thought\n…<channel|>` or
-//!   `<think>…</think>`), which becomes [`MessageContentBlock::Thinking`]; a
-//!   header word such as `thought` and the whitespace after it are dropped;
+//! - a **reasoning block** (`<|channel>thought\n…<channel|>`,
+//!   `<think>…</think>` or `[THINK]…[/THINK]`), which becomes
+//!   [`MessageContentBlock::Thinking`]; a header word such as `thought` and
+//!   the whitespace after it are dropped;
 //! - **tool calls**, whose body is buffered whole and parsed into
 //!   [`MessageContentBlock::ToolCall`]s, or reported as a provider error
 //!   (`malformed tool call: <body>`) when malformed:
@@ -15,7 +16,10 @@
 //!   "arguments": …}</tool_call>`, also a JSON list, with or without a closing
 //!   tag), the XML style of Qwen 3.5 (`<tool_call><function=name>
 //!   <parameter=key>value</parameter></function></tool_call>`,
-//!   [`calls::parse_xml_call`]);
+//!   [`calls::parse_xml_call`]), Mistral's `[TOOL_CALLS]name[ARGS]{json}`
+//!   (repeated per call, no closing marker: a call ends at the next opener or
+//!   at the end of generation, [`calls::parse_args_call`]; an opener inside
+//!   reasoning is reasoning text);
 //! - everything else is [`MessageContentBlock::Text`].
 //!
 //! Markers are matched on **text**, not ids, so a marker that the vocabulary
@@ -39,7 +43,7 @@ mod atem;
 mod calls;
 
 use self::atem::AtemParser;
-use self::calls::{parse_json_calls, parse_tool_call, parse_xml_call};
+use self::calls::{parse_args_call, parse_json_calls, parse_tool_call, parse_xml_call};
 use super::chat::{ChatFormat, ToolSyntax};
 use super::tokenizer::Tokenizer;
 use crate::error::CucaError;
@@ -58,6 +62,9 @@ enum Action {
     OpenTool,
     /// End the current tool-call body.
     CloseTool,
+    /// End the current tool-call body and start the next one (a format whose
+    /// calls have no closing marker).
+    NextTool,
 }
 
 /// A marker text and its action.
@@ -148,6 +155,15 @@ impl OutputParser {
                 markers.content.push(open_tool(open));
                 markers.thinking.push(open_tool(open));
                 markers.tool.push(close_tool(close));
+            }
+            // The opener is not a marker inside reasoning: a model may write
+            // it there as text.
+            ToolSyntax::MistralArgs { open, .. } => {
+                markers.content.push(open_tool(open));
+                markers.tool.push(Marker {
+                    text: open.clone(),
+                    action: Action::NextTool,
+                });
             }
             ToolSyntax::TaggedJson {
                 open,
@@ -435,6 +451,14 @@ impl OutputParser {
                 };
                 self.finish_tool_call(body, next_call_id, out);
             }
+            Action::NextTool => {
+                let State::ToolCall(body) =
+                    std::mem::replace(&mut self.state, State::ToolCall(String::new()))
+                else {
+                    return;
+                };
+                self.finish_tool_call(body, next_call_id, out);
+            }
         }
     }
 
@@ -538,15 +562,20 @@ impl OutputParser {
     ) {
         self.trim_leading_ws = true;
         let parsed = match self.format.tool_syntax() {
-            ToolSyntax::Gemma4 { .. } => parse_tool_call(&body).map(|call| vec![call]),
-            ToolSyntax::TaggedXml { .. } => parse_xml_call(&body).map(|call| vec![call]),
-            _ => parse_json_calls(&body),
+            ToolSyntax::Gemma4 { .. } => parse_tool_call(&body).map(|call| vec![(None, call)]),
+            ToolSyntax::TaggedXml { .. } => parse_xml_call(&body).map(|call| vec![(None, call)]),
+            ToolSyntax::MistralArgs { args, call_id, .. } => {
+                parse_args_call(&body, args, call_id.as_deref())
+                    .map(|(id, name, arguments)| vec![(id, (name, arguments))])
+            }
+            _ => parse_json_calls(&body)
+                .map(|calls| calls.into_iter().map(|call| (None, call)).collect()),
         };
         match parsed {
             Ok(calls) => {
-                for (name, arguments) in calls {
+                for (id, (name, arguments)) in calls {
                     out.push(Ok(MessageContentBlock::ToolCall {
-                        id: next_call_id(),
+                        id: id.unwrap_or_else(&mut *next_call_id),
                         name,
                         arguments,
                     }));
@@ -672,6 +701,42 @@ mod tests {
     /// Template text for the Hermes-style format.
     const HERMES_TEMPLATE: &str = "<think> </think> <tool_call> </tool_call>";
 
+    /// Mistral-style vocabulary: the `[THINK]`, `[TOOL_CALLS]`, `[ARGS]` and
+    /// `[CALL_ID]` control tokens, and the pieces of llama.cpp's Ministral 3
+    /// and Mistral Small 3.2 parser fixtures.
+    const MISTRAL_VOCAB: &[(&str, i32)] = &[
+        ("</s>", 3),
+        ("[THINK]", 3),
+        ("[/THINK]", 3),
+        ("[TOOL_CALLS]", 3),
+        ("[ARGS]", 3),
+        ("[CALL_ID]", 3),
+        ("Hello, world!", 1),
+        ("\n", 1),
+        ("What's up?", 1),
+        ("I'm", 1),
+        ("thinking", 1),
+        ("special_function", 1),
+        ("special_function_with_opt", 1),
+        ("{\"arg1\":1}", 1),
+        ("{\"arg1\": 1}", 1),
+        ("{\"arg1\": 1, \"arg2\": 2}", 1),
+        ("Let me think about ", 1),
+        (" and more", 1),
+        ("123456789", 1),
+        ("000000001", 1),
+        ("000000002", 1),
+        ("{\"arg1\"", 1),
+        (": 1}", 1),
+        ("{not json}", 1),
+        ("spec", 1),
+        ("ial_function", 1),
+    ];
+    /// Template text that makes detection pick `[TOOL_CALLS]name[ARGS]json`.
+    const MISTRAL_TEMPLATE: &str = "[THINK] [/THINK] [TOOL_CALLS] [ARGS]";
+    /// The same with Mistral Small 3.2's `[CALL_ID]`.
+    const MISTRAL_ID_TEMPLATE: &str = "[TOOL_CALLS] [CALL_ID] [ARGS]";
+
     /// A parser over a synthetic vocabulary, fed token texts.
     struct Rig {
         tokenizer: Tokenizer,
@@ -767,6 +832,287 @@ mod tests {
             name: name.to_string(),
             arguments,
         }
+    }
+
+    /// Adjacent text blocks (and adjacent thinking blocks) joined: a model's
+    /// words arrive token by token.
+    fn merged(blocks: Vec<MessageContentBlock>) -> Vec<MessageContentBlock> {
+        let mut out: Vec<MessageContentBlock> = Vec::new();
+        for block in blocks {
+            match (out.last_mut(), block) {
+                (Some(MessageContentBlock::Text(a)), MessageContentBlock::Text(b)) => {
+                    a.push_str(&b)
+                }
+                (
+                    Some(MessageContentBlock::Thinking { reasoning: a, .. }),
+                    MessageContentBlock::Thinking { reasoning: b, .. },
+                ) => a.push_str(&b),
+                (_, block) => out.push(block),
+            }
+        }
+        out
+    }
+
+    fn mistral(template: &str, texts: &[&str]) -> (Vec<MessageContentBlock>, u32) {
+        let mut rig = Rig::new(MISTRAL_VOCAB, template, false, false);
+        rig.push(texts);
+        let (out, reasoning) = rig.finish();
+        (merged(ok(out)), reasoning)
+    }
+
+    // llama.cpp's Ministral 3 parser fixtures (tests/test-chat.cpp, "Ministral-3-14B-Reasoning-2512"),
+    // Devstral's and Mistral Small 3.2's, over the same token spellings.
+
+    #[test]
+    fn mistral_plain_answer() {
+        let (out, reasoning) = mistral(MISTRAL_TEMPLATE, &["Hello, world!", "\n", "What's up?"]);
+        assert_eq!(out, [text("Hello, world!\nWhat's up?")]);
+        assert_eq!(reasoning, 0);
+    }
+
+    #[test]
+    fn mistral_think_block_then_answer() {
+        let (out, reasoning) = mistral(
+            MISTRAL_TEMPLATE,
+            &[
+                "[THINK]",
+                "I'm",
+                "\n",
+                "thinking",
+                "[/THINK]",
+                "Hello, world!",
+                "\n",
+                "What's up?",
+            ],
+        );
+        assert_eq!(
+            out,
+            [thinking("I'm\nthinking"), text("Hello, world!\nWhat's up?")]
+        );
+        assert_eq!(reasoning, 5);
+    }
+
+    #[test]
+    fn mistral_single_call() {
+        let (out, _) = mistral(
+            MISTRAL_TEMPLATE,
+            &["[TOOL_CALLS]", "special_function", "[ARGS]", "{\"arg1\":1}"],
+        );
+        assert_eq!(
+            out,
+            [call("call_1", "special_function", json!({ "arg1": 1 }))]
+        );
+    }
+
+    #[test]
+    fn mistral_think_then_call() {
+        let (out, _) = mistral(
+            MISTRAL_TEMPLATE,
+            &[
+                "[THINK]",
+                "I'm",
+                "\n",
+                "thinking",
+                "[/THINK]",
+                "[TOOL_CALLS]",
+                "special_function",
+                "[ARGS]",
+                "{\"arg1\":1}",
+            ],
+        );
+        assert_eq!(
+            out,
+            [
+                thinking("I'm\nthinking"),
+                call("call_1", "special_function", json!({ "arg1": 1 }))
+            ]
+        );
+    }
+
+    #[test]
+    fn mistral_parallel_calls_end_at_the_next_opener_and_at_the_end() {
+        let (out, _) = mistral(
+            MISTRAL_TEMPLATE,
+            &[
+                "[TOOL_CALLS]",
+                "special_function",
+                "[ARGS]",
+                "{\"arg1\": 1}",
+                "[TOOL_CALLS]",
+                "special_function_with_opt",
+                "[ARGS]",
+                "{\"arg1\": 1, \"arg2\": 2}",
+            ],
+        );
+        assert_eq!(
+            out,
+            [
+                call("call_1", "special_function", json!({ "arg1": 1 })),
+                call(
+                    "call_2",
+                    "special_function_with_opt",
+                    json!({ "arg1": 1, "arg2": 2 })
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn mistral_opener_inside_reasoning_is_reasoning_text() {
+        let (out, reasoning) = mistral(
+            MISTRAL_TEMPLATE,
+            &[
+                "[THINK]",
+                "Let me think about ",
+                "[TOOL_CALLS]",
+                "special_function",
+                "[ARGS]",
+                "{\"arg1\":1}",
+                " and more",
+                "[/THINK]",
+                "[TOOL_CALLS]",
+                "special_function",
+                "[ARGS]",
+                "{\"arg1\": 1}",
+            ],
+        );
+        assert_eq!(
+            out,
+            [
+                thinking(
+                    "Let me think about [TOOL_CALLS]special_function[ARGS]{\"arg1\":1} and more"
+                ),
+                call("call_1", "special_function", json!({ "arg1": 1 }))
+            ]
+        );
+        assert_eq!(reasoning, 8);
+    }
+
+    #[test]
+    fn mistral_answer_text_before_a_call() {
+        // Devstral: content, then the call.
+        let (out, _) = mistral(
+            MISTRAL_TEMPLATE,
+            &[
+                "Hello, world!",
+                "\n",
+                "What's up?",
+                "[TOOL_CALLS]",
+                "special_function",
+                "[ARGS]",
+                "{\"arg1\": 1}",
+            ],
+        );
+        assert_eq!(
+            out,
+            [
+                text("Hello, world!\nWhat's up?"),
+                call("call_1", "special_function", json!({ "arg1": 1 }))
+            ]
+        );
+    }
+
+    #[test]
+    fn mistral_small_3_2_calls_carry_the_models_ids() {
+        let (out, _) = mistral(
+            MISTRAL_ID_TEMPLATE,
+            &[
+                "[TOOL_CALLS]",
+                "special_function",
+                "[CALL_ID]",
+                "000000001",
+                "[ARGS]",
+                "{\"arg1\": 1}",
+                "[TOOL_CALLS]",
+                "special_function_with_opt",
+                "[CALL_ID]",
+                "000000002",
+                "[ARGS]",
+                "{\"arg1\": 1, \"arg2\": 2}",
+            ],
+        );
+        assert_eq!(
+            out,
+            [
+                call("000000001", "special_function", json!({ "arg1": 1 })),
+                call(
+                    "000000002",
+                    "special_function_with_opt",
+                    json!({ "arg1": 1, "arg2": 2 })
+                ),
+            ]
+        );
+        // A template without `[CALL_ID]` leaves the parser without that
+        // marker: the id text stays in the name.
+        let (out, _) = mistral(
+            MISTRAL_TEMPLATE,
+            &[
+                "[TOOL_CALLS]",
+                "special_function",
+                "[ARGS]",
+                "{\"arg1\": 1}",
+            ],
+        );
+        assert_eq!(
+            out,
+            [call("call_1", "special_function", json!({ "arg1": 1 }))]
+        );
+    }
+
+    #[test]
+    fn mistral_names_and_arguments_may_span_several_tokens() {
+        let (out, _) = mistral(
+            MISTRAL_TEMPLATE,
+            &[
+                "[TOOL_CALLS]",
+                "spec",
+                "ial_function",
+                "[ARGS]",
+                "{\"arg1\"",
+                ": 1}",
+            ],
+        );
+        assert_eq!(
+            out,
+            [call("call_1", "special_function", json!({ "arg1": 1 }))]
+        );
+    }
+
+    #[test]
+    fn mistral_malformed_calls_are_errors_and_do_not_stop_the_next_call() {
+        let mut rig = Rig::new(MISTRAL_VOCAB, MISTRAL_TEMPLATE, false, false);
+        rig.push(&[
+            "[TOOL_CALLS]",
+            "special_function",
+            "[ARGS]",
+            "{not json}",
+            "[TOOL_CALLS]",
+            "special_function",
+            "[ARGS]",
+            "{\"arg1\"",
+        ]);
+        let (out, _) = rig.finish();
+        assert_eq!(out.len(), 2);
+        for r in out {
+            let err = r.expect_err("both bodies are malformed").to_string();
+            assert!(err.contains("malformed tool call"), "{err}");
+        }
+        // A call with no `[ARGS]` at all.
+        let mut rig = Rig::new(MISTRAL_VOCAB, MISTRAL_TEMPLATE, false, false);
+        rig.push(&["[TOOL_CALLS]", "special_function"]);
+        let (out, _) = rig.finish();
+        assert!(out[0].is_err());
+    }
+
+    #[test]
+    fn mistral_syntax_is_not_claimed_without_the_args_token() {
+        // The template mentions the markers but the vocabulary has no
+        // `[ARGS]`: no tool calls, and the control token renders as nothing.
+        let vocab: &[(&str, i32)] = &[("</s>", 3), ("[TOOL_CALLS]", 3), ("a", 1)];
+        let mut rig = Rig::new(vocab, MISTRAL_TEMPLATE, false, false);
+        rig.push(&["a", "[TOOL_CALLS]"]);
+        let (out, _) = rig.finish();
+        assert_eq!(merged(ok(out)), [text("a")]);
     }
 
     #[test]

@@ -9,13 +9,14 @@
 //!   (`<|im_end|>`, `<|eot_id|>`, `<end_of_turn>`, `<|end|>`, `<turn|>`, ...),
 //!   the same set llama.cpp's loader treats as EOG;
 //! - the **reasoning** markers: a channel (`<|channel>thought\n` ...
-//!   `<channel|>`) or `<think>` ... `</think>` tags, whichever the template
-//!   writes, with [`ChatFormat::starts_in_thinking`] deciding from a rendered
-//!   prompt whether generation begins inside an open block;
+//!   `<channel|>`), `<think>` ... `</think>` tags or Mistral's `[THINK]` ...
+//!   `[/THINK]` control tokens, whichever the template writes, with
+//!   [`ChatFormat::starts_in_thinking`] deciding from a rendered prompt
+//!   whether generation begins inside an open block;
 //! - the **tool-call syntax** the template teaches the model: a custom
 //!   `call:name{key:<|"|>value<|"|>}` body between control tokens, tagged JSON
-//!   (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`), or the XML
-//!   style of Qwen 3.5; a
+//!   (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`), the XML
+//!   style of Qwen 3.5, or Mistral's `[TOOL_CALLS]name[ARGS]{json}`; a
 //!   template without tool syntax leaves the output plain text.
 
 use std::collections::HashMap;
@@ -109,6 +110,19 @@ pub(crate) enum ToolSyntax {
         alt_open: Option<String>,
         /// Text that closes it (`</tool_call>`), if the format has one.
         close: Option<String>,
+    },
+    /// `[TOOL_CALLS]name[ARGS]{json}` (Mistral Small 4, Devstral, Ministral 3;
+    /// `[TOOL_CALLS]name[CALL_ID]id[ARGS]{json}` for Mistral Small 3.2): one
+    /// block per call, no closing marker. A call ends at the next opener or at
+    /// the end of generation, and the arguments are one JSON object.
+    MistralArgs {
+        /// Text that opens each call (`[TOOL_CALLS]`).
+        open: String,
+        /// Text between the name (and call id) and the arguments (`[ARGS]`).
+        args: String,
+        /// Text between the name and the call id (`[CALL_ID]`), for templates
+        /// that carry one; the id the model writes becomes the call's id.
+        call_id: Option<String>,
     },
     /// `open <function=name><parameter=key>value</parameter>... </function> close`
     /// (the Qwen3-Coder XML style Qwen 3.5 is taught): one call per block,
@@ -204,6 +218,17 @@ impl ChatFormat {
             ToolSyntax::Gemma4 { open, close } | ToolSyntax::TaggedXml { open, close } => {
                 note(open);
                 note(close);
+            }
+            ToolSyntax::MistralArgs {
+                open,
+                args,
+                call_id,
+            } => {
+                note(open);
+                note(args);
+                if let Some(call_id) = call_id {
+                    note(call_id);
+                }
             }
             ToolSyntax::TaggedJson {
                 open,
@@ -301,6 +326,13 @@ fn detect_reasoning(tokenizer: &Tokenizer, template: &str) -> Option<Reasoning> 
             header: Some("thought".into()),
         });
     }
+    if template.contains("[THINK]") && both("[THINK]", "[/THINK]") {
+        return Some(Reasoning {
+            open: "[THINK]".into(),
+            close: "[/THINK]".into(),
+            header: None,
+        });
+    }
     if template.contains("<think>") || template.contains("</think>") {
         return Some(Reasoning {
             open: "<think>".into(),
@@ -325,6 +357,19 @@ fn detect_tools(tokenizer: &Tokenizer, template: &str) -> ToolSyntax {
             end_message: "<|eom|>".into(),
             end_turn: "<|eot|>".into(),
         });
+    }
+    if template.contains("[TOOL_CALLS]")
+        && template.contains("[ARGS]")
+        && ["[TOOL_CALLS]", "[ARGS]"]
+            .iter()
+            .all(|t| tokenizer.token_id(t).is_some())
+    {
+        return ToolSyntax::MistralArgs {
+            open: "[TOOL_CALLS]".into(),
+            args: "[ARGS]".into(),
+            call_id: (template.contains("[CALL_ID]") && tokenizer.token_id("[CALL_ID]").is_some())
+                .then(|| "[CALL_ID]".to_string()),
+        };
     }
     if template.contains("<|tool_call>")
         && tokenizer.token_id("<|tool_call>").is_some()
@@ -385,6 +430,67 @@ pub(super) mod tests {
             "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(eos),
         )])
+    }
+
+    #[test]
+    fn mistral_templates_are_detected_from_their_markers() {
+        let t = tokenizer(&[
+            "</s>",
+            "[THINK]",
+            "[/THINK]",
+            "[TOOL_CALLS]",
+            "[ARGS]",
+            "[CALL_ID]",
+            "x",
+        ]);
+        let small_4 = include_str!("../testdata/templates/mistral-small-4.jinja");
+        let f = ChatFormat::detect(&metadata(0), &t, small_4).expect("detects");
+        assert_eq!(
+            f.reasoning(),
+            Some(&Reasoning {
+                open: "[THINK]".into(),
+                close: "[/THINK]".into(),
+                header: None
+            })
+        );
+        // Small 4's template has no call ids.
+        assert_eq!(
+            f.tool_syntax(),
+            &ToolSyntax::MistralArgs {
+                open: "[TOOL_CALLS]".into(),
+                args: "[ARGS]".into(),
+                call_id: None
+            }
+        );
+        assert!(f.writes_reasoning());
+        for id in 1..=4 {
+            assert!(f.is_marker(id), "{id}");
+        }
+        assert!(!f.is_marker(5) && f.is_eog(0));
+        // The prompt ends after `[/INST]` (or the tool results): generation
+        // starts in the answer, the model opens `[THINK]` itself.
+        assert!(!f.starts_in_thinking("[INST]hi[/INST]"));
+        assert!(f.starts_in_thinking("[INST]hi[/INST][THINK]"));
+
+        // Mistral Small 3.2 names the call id, and has no reasoning.
+        let small_3_2 = include_str!("../testdata/templates/mistral-small-3.2.jinja");
+        let f = ChatFormat::detect(&metadata(0), &t, small_3_2).expect("detects");
+        assert!(f.reasoning().is_none() && !f.writes_reasoning());
+        assert_eq!(
+            f.tool_syntax(),
+            &ToolSyntax::MistralArgs {
+                open: "[TOOL_CALLS]".into(),
+                args: "[ARGS]".into(),
+                call_id: Some("[CALL_ID]".into())
+            }
+        );
+        assert!(f.is_marker(5));
+
+        // A vocabulary without the control tokens leaves the output plain.
+        let bare = tokenizer(&["</s>", "x"]);
+        let f = ChatFormat::detect(&metadata(0), &bare, small_4).expect("detects");
+        assert!(f.reasoning().is_none());
+        assert_eq!(f.tool_syntax(), &ToolSyntax::Plain);
     }
 
     #[test]

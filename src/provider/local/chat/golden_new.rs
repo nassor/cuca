@@ -1,5 +1,5 @@
 //! Golden chat-template renders for the architectures added after the first
-//! catalog (`golden.rs`): Muse Glimmer.
+//! catalog (`golden.rs`): Muse Glimmer, Mistral Small 4 and Mistral Small 3.2.
 //!
 //! `testdata/chat_golden_new.json` maps an entry name to its `template`
 //! (`testdata/templates/<name>.jinja`, the model repository's own
@@ -23,6 +23,8 @@ const PINNED_NOW: i64 = 1_792_281_600;
 fn template_source(name: &str) -> &'static str {
     match name {
         "muse-glimmer" => include_str!("../testdata/templates/muse-glimmer.jinja"),
+        "mistral-small-4" => include_str!("../testdata/templates/mistral-small-4.jinja"),
+        "mistral-small-3.2" => include_str!("../testdata/templates/mistral-small-3.2.jinja"),
         other => panic!("no template fixture for {other}"),
     }
 }
