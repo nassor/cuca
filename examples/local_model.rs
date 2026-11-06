@@ -33,12 +33,17 @@
 //! # Configuration
 //!
 //! - `CUCA_LOCAL_MODEL_PATH`: path of an already downloaded GGUF file (any
-//!   supported architecture); skips the download and wins over
-//!   `CUCA_LOCAL_MODEL`.
+//!   supported architecture), or of a Hugging Face checkpoint directory
+//!   (`config.json`, `*.safetensors`, tokenizer files), which is converted to
+//!   a cached GGUF once; skips the download and wins over `CUCA_LOCAL_MODEL`.
 //! - `CUCA_LOCAL_MODEL`: what to download: a preset name from
 //!   `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`,
-//!   `llama3.2-1b-q4_0`; ASCII case-insensitive) or an unverified
-//!   `repo:revision:file` on Hugging Face. Default: `gemma4-e2b-q4_0`.
+//!   `llama3.2-1b-q4_0`; ASCII case-insensitive), an unverified
+//!   `repo:revision:file` GGUF on Hugging Face, or `repo:revision`, a
+//!   safetensors checkpoint that is downloaded and converted to a GGUF
+//!   once. Default: `gemma4-e2b-q4_0`.
+//! - `CUCA_LOCAL_CONVERT_QUANT`: the weight precision of a converted
+//!   checkpoint, `f16`, `q8_0` (default) or `q4_0`.
 //! - `CUCA_LOCAL_DRAFTER`: a preset name, `in-trunk`, or `CUCA_LOCAL_DRAFTER_PATH`,
 //!   a path, enabling self-speculative decoding on the CPU; the acceptance
 //!   counters print at the end. A preset or path is the separate
@@ -76,7 +81,7 @@ use std::path::PathBuf;
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{
     CucaClient, DownloadProgressCallback, DrafterSource, LocalModel, LocalModelConfig, ModelSource,
-    UnifiedRequest,
+    UnifiedRequest, WeightQuant,
 };
 use tokio_stream::StreamExt;
 
@@ -96,7 +101,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..Default::default()
     };
     if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        config.source = ModelSource::File(PathBuf::from(path));
+        let path = PathBuf::from(path);
+        config.source = if path.is_dir() {
+            ModelSource::Dir(path)
+        } else {
+            ModelSource::File(path)
+        };
     } else if let Ok(name) = std::env::var("CUCA_LOCAL_MODEL")
         && !name.is_empty()
     {
@@ -112,6 +122,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             name.parse::<ModelSource>()?.into()
         });
+    }
+    if let Ok(quant) = std::env::var("CUCA_LOCAL_CONVERT_QUANT")
+        && !quant.is_empty()
+    {
+        config.convert.quant = quant.parse::<WeightQuant>()?;
     }
     if let Ok(device) = std::env::var("CUCA_LOCAL_DEVICE")
         && !device.is_empty()

@@ -31,6 +31,7 @@ weight = 1
 | `drafter` | `None` | optional multi-token-prediction drafter, an `Option<DrafterSource>` |
 | `draft_tokens` | `5` | most tokens the drafter proposes per round, `1..=16`; ignored without a drafter |
 | `experts` | `ExpertPlacement::Resident` | where a mixture-of-experts model's experts live: in memory (`Resident`) or streamed from the file through bounded caches (`Tiered`) |
+| `convert` | `ConvertConfig::default()` | weight precision of a converted checkpoint (`WeightQuant::F16`, `Q8_0` or `Q4_0`; default `Q8_0`); ignored for GGUF sources |
 | `on_download_progress` | `None` | download progress observer |
 
 - `source` defaults to the preset `gemma4-e2b-q4_0`.
@@ -68,8 +69,9 @@ The example `examples/local_model.rs` reads these; the library never does:
 
 | Variable | Meaning |
 |---|---|
-| `CUCA_LOCAL_MODEL_PATH` | path of a GGUF file; wins over `CUCA_LOCAL_MODEL` |
-| `CUCA_LOCAL_MODEL` | preset name or `repo:revision:file`; default `gemma4-e2b-q4_0` |
+| `CUCA_LOCAL_MODEL_PATH` | path of a GGUF file, or of a checkpoint directory (converted); wins over `CUCA_LOCAL_MODEL` |
+| `CUCA_LOCAL_MODEL` | preset name, `repo:revision:file` (a GGUF) or `repo:revision` (a checkpoint, converted); default `gemma4-e2b-q4_0` |
+| `CUCA_LOCAL_CONVERT_QUANT` | `f16`, `q8_0` or `q4_0`: the precision of a converted checkpoint; default `q8_0` |
 | `CUCA_LOCAL_DEVICE` | `LocalDevice` text form; default `cpu` |
 | `CUCA_LOCAL_DRAFTER` | drafter preset name, or `in-trunk` |
 | `CUCA_LOCAL_DRAFTER_PATH` | path of a drafter GGUF file |

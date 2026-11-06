@@ -32,8 +32,8 @@ use std::time::Instant;
 
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{
-    CucaClient, ExpertPlacement, ExpertTierStats, LocalDevice, LocalModel, LocalModelConfig,
-    ModelSource, UnifiedRequest,
+    ConvertConfig, CucaClient, ExpertPlacement, ExpertTierStats, LocalDevice, LocalModel,
+    LocalModelConfig, ModelSource, UnifiedRequest, WeightQuant,
 };
 use tokio_stream::StreamExt;
 
@@ -106,6 +106,14 @@ async fn phase(
         context_length: Some(2048),
         device,
         experts,
+        convert: ConvertConfig {
+            quant: env("CUCA_LOCAL_CONVERT_QUANT")
+                .map(|s| {
+                    s.parse::<WeightQuant>()
+                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_CONVERT_QUANT={s:?}: {e}"))
+                })
+                .unwrap_or_default(),
+        },
         ..Default::default()
     })
     .await
@@ -143,7 +151,12 @@ fn release(model: LocalModel) {
 #[tokio::test]
 async fn tiered_experts_reproduce_the_reference_replies() {
     let source = if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        ModelSource::File(path.into())
+        let path = std::path::PathBuf::from(path);
+        if path.is_dir() {
+            ModelSource::Dir(path)
+        } else {
+            ModelSource::File(path)
+        }
     } else if let Some(name) = env("CUCA_LOCAL_MODEL") {
         name.parse()
             .unwrap_or_else(|e| panic!("CUCA_LOCAL_MODEL={name:?}: {e}"))

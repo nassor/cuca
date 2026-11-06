@@ -36,8 +36,8 @@ use std::time::Instant;
 
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{
-    CucaClient, DrafterSource, LocalDevice, LocalModel, LocalModelConfig, ModelSource,
-    UnifiedRequest,
+    ConvertConfig, CucaClient, DrafterSource, LocalDevice, LocalModel, LocalModelConfig,
+    ModelSource, UnifiedRequest, WeightQuant,
 };
 use tokio_stream::StreamExt;
 
@@ -47,9 +47,34 @@ const PROMPTS: [&str; 3] = [
     "Write a short story about a lighthouse keeper who finds a message in a bottle.",
 ];
 
+/// A path in the environment: a GGUF file, or a checkpoint directory that is
+/// converted (`CUCA_LOCAL_CONVERT_QUANT`).
+fn path_source(path: std::ffi::OsString) -> ModelSource {
+    let path = std::path::PathBuf::from(path);
+    if path.is_dir() {
+        ModelSource::Dir(path)
+    } else {
+        ModelSource::File(path)
+    }
+}
+
+/// `LocalModelConfig::convert` from `CUCA_LOCAL_CONVERT_QUANT` (default q8_0).
+fn convert() -> ConvertConfig {
+    ConvertConfig {
+        quant: std::env::var("CUCA_LOCAL_CONVERT_QUANT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| {
+                s.parse::<WeightQuant>()
+                    .unwrap_or_else(|e| panic!("CUCA_LOCAL_CONVERT_QUANT={s:?}: {e}"))
+            })
+            .unwrap_or_default(),
+    }
+}
+
 fn source(path_var: &str, name_var: &str, download_default: bool) -> Option<ModelSource> {
     if let Some(path) = std::env::var_os(path_var) {
-        return Some(ModelSource::File(path.into()));
+        return Some(path_source(path));
     }
     match std::env::var(name_var) {
         Ok(name) if !name.is_empty() => Some(
@@ -67,7 +92,7 @@ fn source(path_var: &str, name_var: &str, download_default: bool) -> Option<Mode
 /// head inside the target's file (`CUCA_LOCAL_DRAFTER=in-trunk`).
 fn drafter_source() -> Option<DrafterSource> {
     if let Some(path) = std::env::var_os("CUCA_LOCAL_DRAFTER_PATH") {
-        return Some(ModelSource::File(path.into()).into());
+        return Some(path_source(path).into());
     }
     match std::env::var("CUCA_LOCAL_DRAFTER") {
         Ok(name) if name.eq_ignore_ascii_case("in-trunk") => Some(DrafterSource::InTrunk),
@@ -152,6 +177,7 @@ async fn drafter_output_equals_plain_greedy_decoding() {
         source: target.clone(),
         context_length: Some(2048),
         device,
+        convert: convert(),
         ..Default::default()
     })
     .await
@@ -164,6 +190,7 @@ async fn drafter_output_equals_plain_greedy_decoding() {
             draft_tokens,
             context_length: Some(2048),
             device,
+            convert: convert(),
             ..Default::default()
         })
         .await

@@ -1,14 +1,23 @@
 //! Live, multi-model tests for the in-process `provider-local` engine.
 //!
-//! They run a real GGUF model in-process, chosen by the environment:
+//! They run a real model in-process, chosen by the environment:
 //!
-//! - `CUCA_LOCAL_MODEL_PATH=<file.gguf>` loads an existing file (any
-//!   supported architecture), or
-//! - `CUCA_LOCAL_MODEL=<preset or repo:revision:file>` downloads that model
-//!   into the cache directory (`CUCA_CACHE_DIR` overrides it): a name from
-//!   `ModelSource::PRESETS` (`gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`,
-//!   `llama3.2-1b-q4_0`, ...) or an unverified `repo:revision:file`; or
+//! - `CUCA_LOCAL_MODEL_PATH=<file.gguf or checkpoint directory>` loads an
+//!   existing GGUF file (any supported architecture) or converts a Hugging
+//!   Face checkpoint directory (`ModelSource::Dir`), or
+//! - `CUCA_LOCAL_MODEL=<preset, repo:revision:file or repo:revision>`
+//!   downloads that model into the cache directory (`CUCA_CACHE_DIR`
+//!   overrides it): a name from `ModelSource::PRESETS` (`gemma4-e2b-q4_0`,
+//!   `qwen3-0.6b-q8_0`, `llama3.2-1b-q4_0`, ...), an unverified
+//!   `repo:revision:file` GGUF, or a safetensors checkpoint
+//!   `repo:revision` that is converted to a cached GGUF once; or
 //! - `CUCA_LOCAL_DOWNLOAD=1` downloads the default preset (Gemma 4 E2B Q4_0).
+//!
+//! `CUCA_LOCAL_CONVERT_QUANT` (`f16`, `q8_0` or `q4_0`, default `q8_0`) sets
+//! the weight precision of a converted checkpoint. A checkpoint that
+//! corresponds to a preset (same repository and revision as the preset's
+//! source weights, see `CHECKPOINT_PRESETS`) is reported under the preset's
+//! name, so the preset's known limits apply to it.
 //!
 //! `CUCA_LOCAL_MODEL_PATH` wins when several are set. With none set, every
 //! test prints `SKIP: local model not available: ...` and passes, unless
@@ -68,8 +77,8 @@ use cuca::types::{
     MessageContentBlock, MessageRole, ProviderEndpoint, ToolDefinition, UnifiedMessage,
 };
 use cuca::{
-    CucaClient, DownloadProgressCallback, LocalModel, LocalModelConfig, ModelSource,
-    UnifiedRequest, UnifiedResponse,
+    ConvertConfig, CucaClient, DownloadProgressCallback, LocalModel, LocalModelConfig, ModelSource,
+    UnifiedRequest, UnifiedResponse, WeightQuant,
 };
 use serde_json::json;
 use tokio::sync::{Mutex, OnceCell};
@@ -177,7 +186,12 @@ fn known_limit(model: &str, scenario: &str) -> Option<&'static str> {
 /// The model to load, from the environment; `None` when none is configured.
 fn model_source() -> Option<ModelSource> {
     if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        return Some(ModelSource::File(path.into()));
+        let path = std::path::PathBuf::from(path);
+        return Some(if path.is_dir() {
+            ModelSource::Dir(path)
+        } else {
+            ModelSource::File(path)
+        });
     }
     match std::env::var("CUCA_LOCAL_MODEL") {
         Ok(name) if !name.is_empty() => Some(
@@ -194,7 +208,7 @@ fn model_source() -> Option<ModelSource> {
 /// A label for the report: the preset's name, or the file or `repo:file`.
 fn source_label(source: &ModelSource) -> String {
     match source {
-        ModelSource::File(path) => path.file_name().map_or_else(
+        ModelSource::File(path) | ModelSource::Dir(path) => path.file_name().map_or_else(
             || path.display().to_string(),
             |n| n.to_string_lossy().into_owned(),
         ),
@@ -207,8 +221,60 @@ fn source_label(source: &ModelSource) -> String {
             .iter()
             .find(|p| p.repo == repo && p.revision == revision && p.file == file)
             .map_or_else(|| format!("{repo}:{file}"), |p| p.name.to_string()),
+        // A checkpoint is labelled with the preset it corresponds to, so the
+        // per-preset table of known limits (`known_limit`) applies to the
+        // converted model too: the same model at the same revision, converted
+        // instead of downloaded as a GGUF.
+        ModelSource::Checkpoint { repo, revision } => CHECKPOINT_PRESETS
+            .iter()
+            .find(|(r, rev, _)| r == repo && rev == revision)
+            .map_or_else(
+                || format!("{repo}:{revision}"),
+                |(_, _, p)| (*p).to_string(),
+            ),
     }
 }
+
+/// Checkpoints (`repo`, `revision`) and the GGUF preset made from the same
+/// weights: the harness reports a converted checkpoint under the preset's name
+/// so the known limits recorded for the preset apply to it.
+const CHECKPOINT_PRESETS: &[(&str, &str, &str)] = &[
+    (
+        "Qwen/Qwen3-0.6B",
+        "c1899de289a04d12100db370d81485cdf75e47ca",
+        "qwen3-0.6b-q8_0",
+    ),
+    (
+        "unsloth/Llama-3.2-1B-Instruct",
+        "5a8abab4a5d6f164389b1079fb721cfab8d7126c",
+        "llama3.2-1b-q4_0",
+    ),
+    (
+        "microsoft/Phi-3.5-mini-instruct",
+        "2fe192450127e6a83f7441aef6e3ca586c338b77",
+        "phi3.5-mini-q4_0",
+    ),
+    (
+        "microsoft/Phi-4-mini-instruct",
+        "cfbefacb99257ffa30c83adab238a50856ac3083",
+        "phi4-mini-q4_0",
+    ),
+    (
+        "unsloth/gemma-3-1b-it",
+        "5b11413a10db4e486ef16a20101fd028f8f2499c",
+        "gemma3-1b-q4_0",
+    ),
+    (
+        "Qwen/Qwen2.5-0.5B-Instruct",
+        "7ae557604adf67be50417f59c2c2f167def9a775",
+        "qwen2.5-0.5b-q8_0",
+    ),
+    (
+        "google/gemma-4-E2B-it-qat-q4_0-unquantized",
+        "6befbaca7398925921802abd1f277b495b78b738",
+        "gemma4-e2b-q4_0",
+    ),
+];
 
 /// What the oracle dump (`CUCA_LOCAL_REF_DIR`) of the GGUF file says about the
 /// chat turn [`ORACLE_USER`]: its prompt token count, and whether the rendered
@@ -220,11 +286,34 @@ struct OraclePrompt {
     has_date: bool,
 }
 
-/// The oracle dump for the GGUF file `source` names, if any.
+/// Whether the oracle `dump` was made from the model `source` names: a GGUF
+/// file by its `gguf.file` and `gguf.rev`, a checkpoint by the dump's
+/// `source.repo` and `source.revision` (a safetensors oracle) or by its
+/// `source.config_source` (`...repo@revision`, a dequantized-GGUF oracle whose
+/// configuration came from the checkpoint).
+fn dump_matches(dump: &serde_json::Value, source: &ModelSource) -> bool {
+    match source {
+        ModelSource::HuggingFace { file, revision, .. } => {
+            dump["gguf"]["file"] == *file && dump["gguf"]["rev"] == *revision
+        }
+        ModelSource::Checkpoint { repo, revision } => {
+            (dump["source"]["repo"] == *repo && dump["source"]["revision"] == *revision)
+                || dump["source"]["config_source"]
+                    .as_str()
+                    .is_some_and(|c| c.ends_with(&format!("{repo}@{revision}")))
+        }
+        _ => false,
+    }
+}
+
+/// The oracle dump for the model `source` names, if any.
 fn oracle_prompt(source: &ModelSource) -> Option<OraclePrompt> {
-    let ModelSource::HuggingFace { file, revision, .. } = source else {
+    if !matches!(
+        source,
+        ModelSource::HuggingFace { .. } | ModelSource::Checkpoint { .. }
+    ) {
         return None;
-    };
+    }
     let dir = std::env::var_os("CUCA_LOCAL_REF_DIR")?;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         if entry.path().extension().is_none_or(|e| e != "json") {
@@ -236,7 +325,7 @@ fn oracle_prompt(source: &ModelSource) -> Option<OraclePrompt> {
         let Ok(dump) = serde_json::from_str::<serde_json::Value>(&text) else {
             continue;
         };
-        if dump["gguf"]["file"] == *file && dump["gguf"]["rev"] == *revision {
+        if dump_matches(&dump, source) {
             let chat_a = dump["prompts"]
                 .as_array()?
                 .iter()
@@ -275,6 +364,16 @@ async fn loaded() -> Option<Loaded> {
                             .unwrap_or_else(|e| panic!("CUCA_LOCAL_EXPERTS={s:?}: {e}"))
                     })
                     .unwrap_or_default(),
+                convert: ConvertConfig {
+                    quant: std::env::var("CUCA_LOCAL_CONVERT_QUANT")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                        .map(|s| {
+                            s.parse::<WeightQuant>()
+                                .unwrap_or_else(|e| panic!("CUCA_LOCAL_CONVERT_QUANT={s:?}: {e}"))
+                        })
+                        .unwrap_or_default(),
+                },
                 on_download_progress: Some(DownloadProgressCallback::new(|p| {
                     eprint!(
                         "\rdownloading: {} / {:?} bytes",

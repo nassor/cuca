@@ -140,6 +140,8 @@ let client = CucaClient::builder()
 
 `generate_stream` then works as in the Quick start. The [Local page](https://nassor.github.io/cuca/providers/local/) has the full example, the presets, GPU features and the build command. [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) lists the supported architectures.
 
+A Hugging Face safetensors checkpoint needs no GGUF either: `"Qwen/Qwen3-0.6B:<commit>".parse::<ModelSource>()?` (or `ModelSource::Dir` for a local directory) is downloaded, converted once to a cached GGUF in pure Rust (`LocalModelConfig::convert` picks `f16`, `q8_0` or `q4_0`), and loaded like any other file; the conversion is a port of llama.cpp's converter whose output was checked against the original script. See [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/#checkpoints).
+
 ### Run the live tests
 
 With a chat model on `http://127.0.0.1:1234` (a llama.cpp server works), run this on Linux, macOS and Windows (PowerShell):

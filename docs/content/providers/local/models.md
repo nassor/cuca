@@ -24,7 +24,7 @@ Nothing here is specific to one model family. The loader reads every dimension f
 |---|---|
 | Feature flag | `provider-local` (CPU); GPU features are on [Local (in-process)](@/providers/local/gpu.md#devices-and-gpu-features) |
 | Entry types | `ModelSource`, `ModelPreset`, `LocalModelConfig::source` |
-| File format | GGUF |
+| File format | GGUF, or a Hugging Face safetensors checkpoint converted to GGUF once ([Checkpoints](#checkpoints)) |
 | Selects the forward pass | `general.architecture` |
 | Selects the tokenizer | `tokenizer.ggml.model` and `tokenizer.ggml.pre` |
 | Supplies the prompt format | `tokenizer.chat_template`, required |
@@ -89,6 +89,28 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 - Rolling back a speculative verification keeps a copy of the state from before the call plus the per-row inputs of the recurrence. A verification call covers at most 17 rows (the pending token and 16 drafts). For the 0.8B model the total is about 61 MB (live state, checkpoint and pre-call copy) plus 445 KB per verified row, none of it growing with the context.
 - On a GPU a hybrid model keeps the same state, checkpoint and cache fallback (see [Hybrid models on a GPU](@/providers/local/gpu.md#verified-and-compile-checked)); it keeps no verify record, since the in-trunk head and every drafter are CPU only or pair with `gemma4`. The delta-net recurrence runs token by token on the device, so a hybrid model decodes more slowly on the GPU than on the CPU today (Qwen3.6-35B-A3B with tiered experts: about 3 to 4 tokens per second on Vulkan against 7 to 17 on the CPU).
 - The trailing prediction block of a `qwen35moe` file is not loaded (the trunk ignores it). `DrafterSource::InTrunk` on such a file fails with a `CucaError::Config` that names the mixture-of-experts FFN: the in-trunk head supports a dense block only.
+
+## Checkpoints
+
+A safetensors checkpoint of any architecture in the table above loads through `ModelSource::Checkpoint` or `ModelSource::Dir` (see [Model sources and presets](@/providers/local/model-sources.md#checkpoints)): it is converted once, in process, to a cached GGUF at `f16`, `q8_0` (default) or `q4_0`, and the engine then reads that file exactly as it reads any other. The `architectures[0]` of `config.json` selects the converter:
+
+| `architectures[0]` | Engine architecture |
+|---|---|
+| `LlamaForCausalLM` | `llama` |
+| `SmolLM3ForCausalLM` | `smollm3` |
+| `GraniteForCausalLM`, `GraniteMoeForCausalLM` | `granite`, `granitemoe` |
+| `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | `qwen2`, `qwen3`, `qwen3moe` |
+| `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration` | `qwen35` |
+| `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration` | `qwen35moe` |
+| `Phi3ForCausalLM` | `phi3` |
+| `Gemma2ForCausalLM`, `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` | `gemma2`, `gemma3` |
+| `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`, `Gemma4AssistantForCausalLM` | `gemma4`, `gemma4-assistant` |
+| `Olmo2ForCausalLM`, `Olmo3ForCausalLM` (without sliding layers), `OlmoeForCausalLM` | `olmo2`, `olmoe` |
+| `Ernie4_5ForCausalLM` | `ernie4_5` |
+
+Any other architecture fails with `` architecture `X` has no checkpoint converter; convert it to GGUF with llama.cpp ``. The weights, the metadata, the tokenizer (including `tokenizer.ggml.pre`, found from `tokenizer.json` and fingerprinted with llama.cpp's probe-text hash table) and the chat template are those llama.cpp's `convert_hf_to_gguf.py` writes: that script (commit `67107ac34f62882d8b53ea41ad68010ea635b9be`) was run on the same checkpoints and its GGUF files compared key by key and tensor by tensor with the converter's, with no difference but the float-rounding ones listed under [Checkpoints](@/providers/local/model-sources.md#checkpoints). Converted `f16` checkpoints also match the transformers oracle (top-1 equal, top-10 overlap at least 9 of 10, logits within 2 % relative L2) in `src/provider/local/convert/oracle.rs`, and answer the oracle's chat turn in `tests/provider_local_convert.rs`. All ten pinned repositories (SmolLM 2, TinyLlama, Gemma 2, OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 3, Granite 3.1 MoE, OLMoE-1B-7B, Qwen 3.5) passed: top-1 equal, top-10 overlap 10 of 10, greedy ids equal for all 24 (8 or 4 on the long prompts) steps, and every checkpoint answers the oracle's chat turn.
+
+The live matrix (`tests/provider_local.rs`, CPU, release) on converted checkpoints gives the same PASS/SKIP/KNOWN-LIMIT categories as the preset GGUF of the same model for Qwen 3 0.6B, Llama 3.2 1B, Phi 3.5 mini, Phi 4 mini, Qwen 2.5 0.5B (converted at Q8_0) and Gemma 4 E2B (converted at Q4_0: `token_embd` at Q8_0 and `per_layer_model_proj` at F16, as the published file has them). The one scenario that differs is a model effect, not a conversion one: Gemma 3 1B converted at Q8_0 writes the count in words (`One, Two, ...`) where the Q4_0 preset writes digits, so `stop_string_cuts_the_reply` fails; converted at `q4_0` it passes like the preset. The multi-token-prediction drafter check (`tests/provider_local_mtp.rs`) passes with a converted Gemma 4 E2B target and a converted `google/gemma-4-E2B-it-assistant` (output identical to plain decoding, 1.17x at 3 drafts), and the Qwen 3 0.6B matrix passes on Vulkan.
 
 ## Weight formats
 

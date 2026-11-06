@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `provider-local`: Hugging Face checkpoints load without a GGUF. `ModelSource::Checkpoint { repo, revision }` (parses from `repo:revision`) and `ModelSource::Dir(path)` are converted once, in process and in pure Rust, to a cached GGUF (`<cache>/converted/<repo>/<revision>/model-<quant>.gguf`), which the existing loader, tokenizer and chat template read unchanged. `LocalModelConfig::convert` (`ConvertConfig { quant: WeightQuant }`, `F16`, `Q8_0` default or `Q4_0`) picks the precision. The converter ports llama.cpp's `convert_hf_to_gguf.py` for all sixteen engine architectures and the Gemma 4 assistant, and streams tensor by tensor (a block of at most 32 MiB of `f32` in flight). Its output was compared with the real script's, key by key and tensor by tensor: identical F16 files for thirteen real checkpoints and four synthetic ones, identical Q8_0 for SmolLM 2. `ModelSource::from_str` gains the `repo:revision` form; `LocalModelConfig::on_download_progress` also reports conversion progress (tensors written out of the tensor count).
+
 ## 0.6.2
 
 ### Changed

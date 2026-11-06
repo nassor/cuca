@@ -40,3 +40,5 @@ The scenarios:
 `tests/provider_local_mtp.rs` is the drafter check described under [Verified](@/providers/local/drafting.md#verified). Which models and devices these suites covered is on [Local models and formats](@/providers/local/models.md#verification).
 
 `tests/provider_local_tiers.rs` runs a mixture-of-experts model on a tiered placement and compares its greedy replies with a reference placement; it is described under [Run it](@/providers/local/expert-tiers.md#run-it).
+
+`tests/provider_local_convert.rs` and the unit test `convert::oracle` check converted checkpoints against the transformers oracle (`CUCA_LOCAL_REF_DIR`, each prints `SKIP:` without it). The converter itself was verified against llama.cpp's `convert_hf_to_gguf.py`, run on the same checkpoints with its GGUF files diffed key by key and tensor by tensor with the converter's; see [Checkpoints](@/providers/local/model-sources.md#checkpoints).
