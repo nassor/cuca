@@ -35,8 +35,10 @@
 //! header or a tool-call body are bounded by the
 //! generation length the engine already caps.
 
+mod atem;
 mod calls;
 
+use self::atem::AtemParser;
 use self::calls::{parse_json_calls, parse_tool_call, parse_xml_call};
 use super::chat::{ChatFormat, ToolSyntax};
 use super::tokenizer::Tokenizer;
@@ -114,6 +116,9 @@ pub(crate) struct OutputParser {
     trim_leading_ws: bool,
     /// Drop one leading space of the next text (SentencePiece prefix).
     strip_one_space: bool,
+    /// The channel-protocol parser that replaces the marker state machine for
+    /// a format that writes messages addressed to `self`, `user` and tools.
+    atem: Option<AtemParser>,
 }
 
 impl OutputParser {
@@ -138,7 +143,7 @@ impl OutputParser {
             header_word = r.header.clone().unwrap_or_default();
         }
         match format.tool_syntax() {
-            ToolSyntax::Plain => {}
+            ToolSyntax::Plain | ToolSyntax::Atem(_) => {}
             ToolSyntax::Gemma4 { open, close } | ToolSyntax::TaggedXml { open, close } => {
                 markers.content.push(open_tool(open));
                 markers.thinking.push(open_tool(open));
@@ -173,6 +178,10 @@ impl OutputParser {
             reasoning_tokens: 0,
             trim_leading_ws: thinking,
             strip_one_space: format.strips_leading_space(),
+            atem: match format.tool_syntax() {
+                ToolSyntax::Atem(markers) => Some(AtemParser::new(markers)),
+                _ => None,
+            },
             format: format.clone(),
         }
     }
@@ -181,7 +190,10 @@ impl OutputParser {
     /// closing marker ids (and every id before the first close when started in
     /// thinking).
     pub(crate) fn reasoning_tokens(&self) -> u32 {
-        self.reasoning_tokens
+        match &self.atem {
+            Some(atem) => atem.reasoning_tokens(),
+            None => self.reasoning_tokens,
+        }
     }
 
     /// Feed one generated id, appending any completed blocks to `out`.
@@ -192,6 +204,10 @@ impl OutputParser {
         next_call_id: &mut dyn FnMut() -> String,
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
+        if let Some(atem) = &mut self.atem {
+            atem.push(id, &self.format, tok, next_call_id, out);
+            return;
+        }
         let was_reasoning = self.in_reasoning();
         if self.format.is_marker(id) {
             self.flush_pending(next_call_id, out);
@@ -223,6 +239,10 @@ impl OutputParser {
         next_call_id: &mut dyn FnMut() -> String,
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
+        if let Some(atem) = &mut self.atem {
+            atem.finish(next_call_id, out);
+            return;
+        }
         self.flush_pending(next_call_id, out);
         let held = std::mem::take(&mut self.hold);
         match std::mem::replace(&mut self.state, State::Content) {

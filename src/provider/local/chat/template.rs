@@ -66,6 +66,12 @@ pub(crate) struct ChatTemplate {
     /// variable some templates use instead, Granite's), i.e. whether a request
     /// can switch its reasoning on or off.
     reads_enable_thinking: bool,
+    /// Whether the template reads `reasoning_strength` (Muse Glimmer:
+    /// low, medium, high, xhigh).
+    reads_strength: bool,
+    /// Whether the template reads `reasoning_effort` (Mistral Small 4: none
+    /// or high).
+    reads_effort: bool,
 }
 
 impl ChatTemplate {
@@ -87,8 +93,13 @@ impl ChatTemplate {
         });
         env.add_filter("tojson", tojson);
         env.add_filter("string", py_string);
-        let reads_enable_thinking =
-            source.contains("enable_thinking") || reads_variable(&source, "thinking");
+        let reads_effort = reads_variable(&source, "reasoning_effort");
+        // A two-mode `reasoning_effort` switches reasoning on and off like
+        // `enable_thinking`.
+        let reads_enable_thinking = source.contains("enable_thinking")
+            || reads_variable(&source, "thinking")
+            || reads_effort;
+        let reads_strength = reads_variable(&source, "reasoning_strength");
         env.add_template_owned(TEMPLATE_NAME, strip_generation_tags(&source))
             .map_err(template_err)?;
         Ok(Self {
@@ -96,6 +107,8 @@ impl ChatTemplate {
             bos_token,
             eos_token,
             reads_enable_thinking,
+            reads_strength,
+            reads_effort,
         })
     }
 
@@ -132,6 +145,19 @@ impl ChatTemplate {
         vars.insert("enable_thinking", Value::from(prompt.enable_thinking));
         vars.insert("thinking", Value::from(prompt.enable_thinking));
         vars.insert("preserve_thinking", Value::from(false));
+        // Reasoning knobs of their own are defined only for templates that
+        // read them: another template may use the same name with other values.
+        if self.reads_strength
+            && let Some(strength) = prompt.thinking.strength()
+        {
+            vars.insert("reasoning_strength", Value::from(strength));
+        }
+        if self.reads_effort {
+            vars.insert(
+                "reasoning_effort",
+                Value::from(prompt.thinking.two_mode_effort()),
+            );
+        }
         vars.insert("bos_token", Value::from(self.bos_token.as_str()));
         vars.insert("eos_token", Value::from(self.eos_token.as_str()));
         vars.insert(
@@ -643,12 +669,38 @@ mod tests {
             messages,
             tools: json!([]),
             enable_thinking: false,
+            thinking: crate::provider::local::chat::ThinkingRequest::from_flag(false),
         }
     }
 
     fn render(source: &str, prompt: &ChatPrompt) -> Result<String, CucaError> {
         ChatTemplate::new(source.to_string(), "<s>".into(), "</s>".into())?
             .render_at(prompt, 1_792_281_600)
+    }
+
+    /// The reasoning knobs of a request reach only templates that read them.
+    #[test]
+    fn reasoning_knobs_are_defined_for_the_templates_that_read_them() {
+        use crate::provider::local::chat::ThinkingRequest;
+        use crate::request::ThinkingEffort;
+        let mut p = prompt(json!([]));
+        p.thinking = ThinkingRequest::On(Some(ThinkingEffort::XHigh));
+        let strength = "{{ reasoning_strength if reasoning_strength is defined else 'default' }}";
+        let effort = "{{ reasoning_effort }}";
+        assert_eq!(render(strength, &p).unwrap(), "xhigh");
+        p.thinking = ThinkingRequest::On(None);
+        assert_eq!(render(strength, &p).unwrap(), "default");
+        assert_eq!(render(effort, &p).unwrap(), "high");
+        p.thinking = ThinkingRequest::Off;
+        assert_eq!(render(effort, &p).unwrap(), "none");
+        // A two-mode `reasoning_effort` is also the reasoning switch.
+        let t = ChatTemplate::new(
+            "{% if reasoning_effort == 'high' %}x{% endif %}".into(),
+            String::new(),
+            String::new(),
+        )
+        .unwrap();
+        assert!(t.reads_enable_thinking());
     }
 
     #[test]
@@ -743,6 +795,7 @@ mod tests {
             ]),
             tools: json!([{ "type": "function", "function": { "name": "get_weather" } }]),
             enable_thinking: false,
+            thinking: crate::provider::local::chat::ThinkingRequest::from_flag(false),
         };
         let rendered = render(source, &prompt).expect("renders");
         assert!(rendered.contains("<tool_call>\n<function=example_function_name>"));
@@ -778,6 +831,7 @@ mod tests {
                 "type": "function",
             }]),
             enable_thinking: false,
+            thinking: crate::provider::local::chat::ThinkingRequest::from_flag(false),
         };
         let source = "{{ tools[0] | tojson }}|{{ tools[0] is mapping }}|{{ tools[0].function.name }}|\
                       {% for k, v in tools[0].function.items() %}{{ k }},{% endfor %}|\

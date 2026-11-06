@@ -31,6 +31,7 @@ use crate::provider::local::tokenizer::Tokenizer;
 const EOG_TEXTS: &[&str] = &[
     "<|eot_id|>",
     "<|eom_id|>",
+    "<|eot|>",
     "<|im_end|>",
     "<|end|>",
     "<end_of_turn>",
@@ -57,11 +58,39 @@ pub(crate) struct Reasoning {
     pub(crate) header: Option<String>,
 }
 
+/// The marker texts of the channel protocol Muse Glimmer's chat template
+/// teaches ("ATEM"). A turn is a sequence of messages, each
+/// `<|start|>assistant to=RECIPIENT<|message|>BODY END`:
+///
+/// - `to=self`: the model's reasoning;
+/// - `to=user`: answer text (a header without a recipient is the same);
+/// - any other recipient: a tool call whose body is
+///   `<atem:function_calls>` ... `</atem:function_calls>`.
+///
+/// `END` is `<|eom|>` when more messages follow and `<|eot|>` (an
+/// end-of-generation token) at the end of the turn. The prompt already ends
+/// with `<|start|>assistant`, so the generated text begins with the
+/// ` to=...` of the first header.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Atem {
+    /// Starts a message header (`<|start|>`).
+    pub(crate) start: String,
+    /// Ends the header and starts the body (`<|message|>`).
+    pub(crate) message: String,
+    /// Ends a message that other messages follow (`<|eom|>`).
+    pub(crate) end_message: String,
+    /// Ends the turn (`<|eot|>`).
+    pub(crate) end_turn: String,
+}
+
 /// How the model writes tool calls.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ToolSyntax {
     /// No tool-call syntax: every token is answer text.
     Plain,
+    /// The channel protocol of [`Atem`]: reasoning, answers and tool calls are
+    /// messages addressed to `self`, `user` and a tool.
+    Atem(Atem),
     /// `open call:name{key:<|"|>value<|"|>} close` with a custom value grammar.
     Gemma4 {
         /// Text that opens a call (`<|tool_call>`).
@@ -167,6 +196,11 @@ impl ChatFormat {
         }
         match &tools {
             ToolSyntax::Plain => {}
+            ToolSyntax::Atem(a) => {
+                for text in [&a.start, &a.message, &a.end_message, &a.end_turn] {
+                    note(text);
+                }
+            }
             ToolSyntax::Gemma4 { open, close } | ToolSyntax::TaggedXml { open, close } => {
                 note(open);
                 note(close);
@@ -213,6 +247,12 @@ impl ChatFormat {
     /// The reasoning block markers, if the model has any.
     pub(crate) fn reasoning(&self) -> Option<&Reasoning> {
         self.reasoning.as_ref()
+    }
+
+    /// Whether the model writes reasoning the parser reports as `Thinking`
+    /// blocks: a marked block, or messages addressed to `self`.
+    pub(crate) fn writes_reasoning(&self) -> bool {
+        self.reasoning.is_some() || matches!(self.tools, ToolSyntax::Atem(_))
     }
 
     /// The tool-call syntax.
@@ -273,6 +313,19 @@ fn detect_reasoning(tokenizer: &Tokenizer, template: &str) -> Option<Reasoning> 
 
 /// Find the tool-call syntax the template teaches.
 fn detect_tools(tokenizer: &Tokenizer, template: &str) -> ToolSyntax {
+    if template.contains("<atem:function_calls>")
+        && template.contains("<|eom|>")
+        && ["<|start|>", "<|message|>", "<|eom|>", "<|eot|>"]
+            .iter()
+            .all(|t| tokenizer.token_id(t).is_some())
+    {
+        return ToolSyntax::Atem(Atem {
+            start: "<|start|>".into(),
+            message: "<|message|>".into(),
+            end_message: "<|eom|>".into(),
+            end_turn: "<|eot|>".into(),
+        });
+    }
     if template.contains("<|tool_call>")
         && tokenizer.token_id("<|tool_call>").is_some()
         && tokenizer.token_id("<tool_call|>").is_some()
@@ -332,6 +385,42 @@ pub(super) mod tests {
             "tokenizer.ggml.eos_token_id".to_string(),
             gguf_file::Value::U32(eos),
         )])
+    }
+
+    #[test]
+    fn atem_channel_protocol_is_detected_and_eom_does_not_end_generation() {
+        let t = tokenizer(&[
+            "<|end_of_text|>",
+            "<|start|>",
+            "<|message|>",
+            "<|eom|>",
+            "<|eot|>",
+            "x",
+        ]);
+        let template = "<atem:function_calls>...<|eom|>...<|eot|>";
+        // The GGUF names `<|end_of_text|>` as EOS only; `<|eot|>` is an
+        // end-of-generation id by its spelling.
+        let f = ChatFormat::detect(&metadata(0), &t, template).expect("detects");
+        assert!(f.is_eog(0) && f.is_eog(4));
+        assert!(!f.is_eog(3), "<|eom|> ends a message, not the turn");
+        assert_eq!(
+            f.tool_syntax(),
+            &ToolSyntax::Atem(Atem {
+                start: "<|start|>".into(),
+                message: "<|message|>".into(),
+                end_message: "<|eom|>".into(),
+                end_turn: "<|eot|>".into(),
+            })
+        );
+        for id in 1..=4 {
+            assert!(f.is_marker(id), "{id}");
+        }
+        assert!(f.writes_reasoning() && f.reasoning().is_none());
+        assert!(!f.starts_in_thinking("<|start|>assistant"));
+        // Without the markers in the vocabulary the syntax is not claimed.
+        let bare = tokenizer(&["<|end_of_text|>", "x"]);
+        let f = ChatFormat::detect(&metadata(0), &bare, template).expect("detects");
+        assert!(!f.writes_reasoning());
     }
 
     #[test]

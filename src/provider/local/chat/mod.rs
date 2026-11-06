@@ -14,20 +14,79 @@
 mod format;
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod golden_new;
 mod template;
 
-pub(crate) use self::format::{ChatFormat, ToolSyntax};
+pub(crate) use self::format::{Atem, ChatFormat, ToolSyntax};
 pub(crate) use self::template::ChatTemplate;
 
 use serde_json::json;
 
 use crate::error::CucaError;
-use crate::request::UnifiedRequest;
+use crate::request::{ThinkingEffort, UnifiedRequest};
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
 
 /// Build a local-provider error.
 fn local_err(message: impl Into<String>) -> CucaError {
     CucaError::provider(ProviderEndpoint::Local, message)
+}
+
+/// What a request asked of the model's reasoning, as templates with a
+/// reasoning knob of their own read it (`reasoning_strength`,
+/// `reasoning_effort`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum ThinkingRequest {
+    /// The request carries no thinking configuration: the template's default.
+    #[default]
+    Unset,
+    /// Thinking explicitly disabled.
+    Off,
+    /// Thinking enabled, with the unified effort when the request named one.
+    On(Option<ThinkingEffort>),
+}
+
+impl ThinkingRequest {
+    /// The request's `thinking` field.
+    fn of(thinking: Option<&crate::request::ThinkingConfig>) -> Self {
+        match thinking {
+            None => Self::Unset,
+            Some(t) if !t.enabled => Self::Off,
+            Some(t) => Self::On(t.effort),
+        }
+    }
+
+    /// A request that only says whether thinking is on (tests).
+    #[cfg(test)]
+    pub(crate) fn from_flag(enabled: bool) -> Self {
+        if enabled { Self::On(None) } else { Self::Unset }
+    }
+
+    /// The value of `reasoning_strength` (low, medium, high, xhigh), or
+    /// `None` to leave it undefined so the template applies its default.
+    ///
+    /// A model whose strength cannot be switched off gets `low` for a
+    /// disabled request, its least reasoning.
+    pub(crate) fn strength(self) -> Option<&'static str> {
+        match self {
+            Self::Unset | Self::On(None) => None,
+            Self::Off | Self::On(Some(ThinkingEffort::Minimal | ThinkingEffort::Low)) => {
+                Some("low")
+            }
+            Self::On(Some(ThinkingEffort::Medium)) => Some("medium"),
+            Self::On(Some(ThinkingEffort::High)) => Some("high"),
+            Self::On(Some(ThinkingEffort::XHigh)) => Some("xhigh"),
+        }
+    }
+
+    /// The value of `reasoning_effort` for a model that has two modes:
+    /// `high` when thinking is enabled, `none` otherwise.
+    pub(crate) fn two_mode_effort(self) -> &'static str {
+        match self {
+            Self::On(_) => "high",
+            Self::Unset | Self::Off => "none",
+        }
+    }
 }
 
 /// The template inputs derived from one request.
@@ -39,6 +98,8 @@ pub(crate) struct ChatPrompt {
     pub(crate) tools: serde_json::Value,
     /// Whether the template should open a thinking channel.
     pub(crate) enable_thinking: bool,
+    /// The request's reasoning mode and effort.
+    pub(crate) thinking: ThinkingRequest,
 }
 
 /// Join the text blocks of `msg` with newlines.
@@ -187,6 +248,7 @@ pub(crate) fn chat_prompt(req: &UnifiedRequest) -> Result<ChatPrompt, CucaError>
         messages: messages.into(),
         tools: tools.into(),
         enable_thinking: req.thinking.as_ref().is_some_and(|t| t.enabled),
+        thinking: ThinkingRequest::of(req.thinking.as_ref()),
     })
 }
 
@@ -259,6 +321,40 @@ mod tests {
         assert!(!plain.enable_thinking);
         let disabled = UnifiedRequest::new("m").with_thinking(ThinkingConfig::disabled());
         assert!(!chat_prompt(&disabled).expect("maps").enable_thinking);
+    }
+
+    #[test]
+    fn thinking_requests_map_to_the_two_reasoning_knobs() {
+        use ThinkingEffort::{High, Low, Medium, Minimal, XHigh};
+        let of = |t: Option<ThinkingConfig>| ThinkingRequest::of(t.as_ref());
+        let on = |effort| {
+            of(Some(ThinkingConfig {
+                effort,
+                ..ThinkingConfig::default()
+            }))
+        };
+        assert_eq!(of(None), ThinkingRequest::Unset);
+        assert_eq!(of(Some(ThinkingConfig::disabled())), ThinkingRequest::Off);
+        assert_eq!(on(Some(High)), ThinkingRequest::On(Some(High)));
+        // reasoning_strength: undefined unless the request names a level; a
+        // disabled request gets the least reasoning the model has.
+        assert_eq!(ThinkingRequest::Unset.strength(), None);
+        assert_eq!(ThinkingRequest::On(None).strength(), None);
+        assert_eq!(ThinkingRequest::Off.strength(), Some("low"));
+        for (effort, want) in [
+            (Minimal, "low"),
+            (Low, "low"),
+            (Medium, "medium"),
+            (High, "high"),
+            (XHigh, "xhigh"),
+        ] {
+            assert_eq!(ThinkingRequest::On(Some(effort)).strength(), Some(want));
+        }
+        // reasoning_effort of a two-mode model.
+        assert_eq!(ThinkingRequest::Unset.two_mode_effort(), "none");
+        assert_eq!(ThinkingRequest::Off.two_mode_effort(), "none");
+        assert_eq!(ThinkingRequest::On(None).two_mode_effort(), "high");
+        assert_eq!(ThinkingRequest::On(Some(Low)).two_mode_effort(), "high");
     }
 
     #[test]

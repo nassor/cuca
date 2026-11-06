@@ -61,6 +61,9 @@ fn renders_match_the_reference_jinja_environment() {
                     .cloned()
                     .unwrap_or(Value::Array(Vec::new())),
                 enable_thinking: input["enable_thinking"].as_bool().expect("flag"),
+                thinking: crate::provider::local::chat::ThinkingRequest::from_flag(
+                    input["enable_thinking"].as_bool().expect("flag"),
+                ),
             };
             let rendered = template.render_at(&prompt, PINNED_NOW);
             match (expected, rendered) {
@@ -207,6 +210,9 @@ mod real_models {
                 .cloned()
                 .unwrap_or(Value::Array(Vec::new())),
             enable_thinking: input["enable_thinking"].as_bool().expect("flag"),
+            thinking: crate::provider::local::chat::ThinkingRequest::from_flag(
+                input["enable_thinking"].as_bool().expect("flag"),
+            ),
         }
     }
 
@@ -231,6 +237,7 @@ mod real_models {
             );
             let kind = match format.tool_syntax() {
                 ToolSyntax::Plain => "plain",
+                ToolSyntax::Atem(_) => "atem",
                 ToolSyntax::Gemma4 { .. } => "gemma4",
                 ToolSyntax::TaggedJson { .. } => "tagged",
                 ToolSyntax::TaggedXml { .. } => "xml",
@@ -436,6 +443,7 @@ mod real_models {
             messages: serde_json::json!([{ "role": "user", "content": user }]),
             tools: Value::Array(Vec::new()),
             enable_thinking: false,
+            thinking: crate::provider::local::chat::ThinkingRequest::from_flag(false),
         };
         for expect in EXPECTED.iter().filter(|e| e.id != "gemma4") {
             let path = PathBuf::from(&dir).join(format!("{}.json", expect.id));
@@ -550,6 +558,7 @@ mod later_models {
                 messages: serde_json::json!([{ "role": "user", "content": user }]),
                 tools: Value::Array(Vec::new()),
                 enable_thinking: false,
+                thinking: crate::provider::local::chat::ThinkingRequest::from_flag(false),
             };
             let rendered = template
                 .render_at(&prompt, PINNED_NOW_2025)

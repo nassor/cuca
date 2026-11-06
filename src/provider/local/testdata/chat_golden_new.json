@@ -1,0 +1,745 @@
+{
+ "muse-glimmer": {
+  "bos": "<|begin_of_text|>",
+  "cases": {
+   "answer_after_tool": {
+    "messages": [
+     {
+      "content": "Weather?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Oslo"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "cold",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "call_1"
+     },
+     {
+      "content": "It is cold.",
+      "role": "assistant"
+     },
+     {
+      "content": "Thanks",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "complex_args": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "a_list": [
+           1,
+           2,
+           "x"
+          ],
+          "b_flag": true,
+          "c_none": null,
+          "d_obj": {
+           "k": "v",
+           "n": 1.5
+          },
+          "e_text": "line1\nline2",
+          "f_num": 42,
+          "g_str_num": "42"
+         },
+         "name": "calc"
+        },
+        "id": "call_1",
+        "type": "function"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "empty_args": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {},
+         "name": "calc"
+        },
+        "id": "call_1",
+        "type": "function"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "multi_turn": {
+    "messages": [
+     {
+      "content": "What is 2+2?",
+      "role": "user"
+     },
+     {
+      "content": "4",
+      "role": "assistant"
+     },
+     {
+      "content": "And 3+3?",
+      "role": "user"
+     }
+    ]
+   },
+   "parallel_calls": {
+    "messages": [
+     {
+      "content": "Both.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Paris"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+       },
+       {
+        "function": {
+         "arguments": {
+          "q": "rain"
+         },
+         "name": "web.search"
+        },
+        "id": "call_2",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "18C",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "call_1"
+     },
+     {
+      "content": "none",
+      "name": "web.search",
+      "role": "tool",
+      "tool_call_id": "call_2"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     },
+     {
+      "function": {
+       "description": "Search the web.",
+       "name": "web.search",
+       "parameters": {
+        "properties": {
+         "q": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "plain": {
+    "messages": [
+     {
+      "content": "Hello",
+      "role": "user"
+     }
+    ]
+   },
+   "reasoning_history": {
+    "messages": [
+     {
+      "content": "Think.",
+      "role": "user"
+     },
+     {
+      "content": "Done.",
+      "reasoning_content": "Let me think about it.",
+      "role": "assistant"
+     },
+     {
+      "content": "Again.",
+      "role": "user"
+     }
+    ]
+   },
+   "reasoning_then_call": {
+    "messages": [
+     {
+      "content": "Weather?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "reasoning_content": "I should call the tool.",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Oslo"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "same_role_twice": {
+    "messages": [
+     {
+      "content": "a",
+      "role": "user"
+     },
+     {
+      "content": "b",
+      "role": "assistant"
+     },
+     {
+      "content": "c",
+      "role": "assistant"
+     },
+     {
+      "content": "d",
+      "role": "user"
+     }
+    ]
+   },
+   "strength_high": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on:high"
+   },
+   "strength_low": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on:low"
+   },
+   "strength_medium": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on:medium"
+   },
+   "strength_minimal": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on:minimal"
+   },
+   "strength_xhigh": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on:xhigh",
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "system_mentions_effort": {
+    "messages": [
+     {
+      "content": "Be brief. Reasoning effort: low",
+      "role": "system"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ]
+   },
+   "system_mentions_strength_upper": {
+    "messages": [
+     {
+      "content": "Reasoning Effort: HIGH",
+      "role": "system"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ]
+   },
+   "system_user": {
+    "messages": [
+     {
+      "content": "You are concise.",
+      "role": "system"
+     },
+     {
+      "content": "Hi there",
+      "role": "user"
+     }
+    ]
+   },
+   "thinking_off": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "off"
+   },
+   "thinking_off_with_system": {
+    "messages": [
+     {
+      "content": "Be nice.",
+      "role": "system"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "off"
+   },
+   "thinking_on_default": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on"
+   },
+   "tool_round_trip": {
+    "messages": [
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Paris",
+          "unit": "c"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "{\"temp\": 18}",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "call_1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tool_round_trip_no_name": {
+    "messages": [
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Paris"
+         },
+         "name": "get_weather"
+        },
+        "id": "call_1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "sunny",
+      "role": "tool",
+      "tool_call_id": "call_1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tools_declared": {
+    "messages": [
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tools_with_system": {
+    "messages": [
+     {
+      "content": "Be brief.",
+      "role": "system"
+     },
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     },
+     {
+      "function": {
+       "description": "Search the web.",
+       "name": "web.search",
+       "parameters": {
+        "properties": {
+         "q": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "unicode": {
+    "messages": [
+     {
+      "content": "日本語 éè 😀 \"quotes\" <tag> & more",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "eos": "<|end_of_text|>",
+  "renders": {
+   "answer_after_tool": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"user\".<|eot|><|start|>user<|message|>Weather?<|eot|><|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"city\">Oslo</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|><|start|>tool get_weather<|message|><tool_output name=\"get_weather\">\ncold\n</tool_output><|eot|><|start|>assistant to=user<|message|>It is cold.<|eot|><|start|>user<|message|>Thanks<|eot|><|start|>assistant",
+   "complex_args": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"calc\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"calc.*\", \"user\".<|eot|><|start|>user<|message|>Go.<|eot|><|start|>assistant to=calc<|message|><atem:function_calls>\n<atem:invoke name=\"calc\">\n<atem:parameter name=\"a_list\">[1, 2, \"x\"]</atem:parameter>\n<atem:parameter name=\"b_flag\">true</atem:parameter>\n<atem:parameter name=\"c_none\">null</atem:parameter>\n<atem:parameter name=\"d_obj\">{\"k\": \"v\", \"n\": 1.5}</atem:parameter>\n<atem:parameter name=\"e_text\">line1\nline2</atem:parameter>\n<atem:parameter name=\"f_num\">42</atem:parameter>\n<atem:parameter name=\"g_str_num\">42</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|><|start|>assistant",
+   "empty_args": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"calc\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"calc.*\", \"user\".<|eot|><|start|>user<|message|>Go.<|eot|><|start|>assistant to=calc<|message|><atem:function_calls>\n<atem:invoke name=\"calc\">\n</atem:invoke>\n</atem:function_calls><|eot|><|start|>assistant",
+   "multi_turn": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>What is 2+2?<|eot|><|start|>assistant to=user<|message|>4<|eot|><|start|>user<|message|>And 3+3?<|eot|><|start|>assistant",
+   "parallel_calls": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n{\"name\": \"web\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n{\"name\": \"web.search\", \"description\": \"Search the web.\", \"parameters\": {\"properties\": {\"q\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"web.*\", \"user\".<|eot|><|start|>user<|message|>Both.<|eot|><|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eom|><|start|>assistant to=web.search<|message|><atem:function_calls>\n<atem:invoke name=\"web.search\">\n<atem:parameter name=\"q\">rain</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|><|start|>tool get_weather<|message|><tool_output name=\"get_weather\">\n18C\n</tool_output><|eot|><|start|>tool web.search<|message|><tool_output name=\"web.search\">\nnone\n</tool_output><|eot|><|start|>assistant",
+   "plain": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hello<|eot|><|start|>assistant",
+   "reasoning_history": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Think.<|eot|><|start|>assistant to=self<|message|>Let me think about it.<|eom|><|start|>assistant to=user<|message|>Done.<|eot|><|start|>user<|message|>Again.<|eot|><|start|>assistant",
+   "reasoning_then_call": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"user\".<|eot|><|start|>user<|message|>Weather?<|eot|><|start|>assistant to=self<|message|>I should call the tool.<|eom|><|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"city\">Oslo</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|><|start|>assistant",
+   "same_role_twice": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>a<|eot|><|start|>assistant to=user<|message|>b<|eot|><|start|>assistant to=user<|message|>c<|eot|><|start|>user<|message|>d<|eot|><|start|>assistant",
+   "strength_high": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "strength_low": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: low.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "strength_medium": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: medium.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "strength_minimal": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: low.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "strength_xhigh": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: xhigh.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "system_mentions_effort": "<|begin_of_text|><|start|>system<|message|>Be brief. Reasoning strength: low\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "system_mentions_strength_upper": "<|begin_of_text|><|start|>system<|message|>Reasoning Strength: HIGH\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "system_user": "<|begin_of_text|><|start|>system<|message|>You are concise.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi there<|eot|><|start|>assistant",
+   "thinking_off": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: low.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "thinking_off_with_system": "<|begin_of_text|><|start|>system<|message|>Be nice.\n\nReasoning strength: low.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "thinking_on_default": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>Hi<|eot|><|start|>assistant",
+   "tool_round_trip": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"user\".<|eot|><|start|>user<|message|>Weather in Paris?<|eot|><|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n<atem:parameter name=\"unit\">c</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|><|start|>tool get_weather<|message|><tool_output name=\"get_weather\">\n{\"temp\": 18}\n</tool_output><|eot|><|start|>assistant",
+   "tool_round_trip_no_name": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"user\".<|eot|><|start|>user<|message|>Weather in Paris?<|eot|><|start|>assistant to=get_weather<|message|><atem:function_calls>\n<atem:invoke name=\"get_weather\">\n<atem:parameter name=\"city\">Paris</atem:parameter>\n</atem:invoke>\n</atem:function_calls><|eot|><|start|>tool get_weather<|message|><tool_output name=\"get_weather\">\nsunny\n</tool_output><|eot|><|start|>assistant",
+   "tools_declared": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"user\".<|eot|><|start|>user<|message|>Weather in Paris?<|eot|><|start|>assistant",
+   "tools_with_system": "<|begin_of_text|><|start|>system<|message|>Be brief.\n\nReasoning strength: high.\n\nIn this environment you have access to a set of tools you can use to answer the user's question.\n\nYou can invoke a function by writing a \"<atem:function_calls>\" block like the following:\n<atem:function_calls>\n<atem:invoke name=\"$FUNCTION_NAME\">\n<atem:parameter name=\"$PARAMETER_NAME\">$PARAMETER_VALUE</atem:parameter>\n...\n</atem:invoke>\n</atem:function_calls>\n\nString and scalar parameters should be specified as is, while lists and objects should use JSON format. Note that spaces for string values are not stripped. The output is not expected to be valid XML and is parsed with regular expressions.\nHere are the functions available in JSONSchema format:\n// Tool metadata\n{\"name\": \"get_weather\", \"description\": \"\"}\n{\"name\": \"web\", \"description\": \"\"}\n// Function schemas\n{\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}\n{\"name\": \"web.search\", \"description\": \"Search the web.\", \"parameters\": {\"properties\": {\"q\": {\"type\": \"string\"}}, \"type\": \"object\"}}\n\nHere's an example of how to call a function in the tool set:\n(If the tool namespace is not specified, invoke the function directly as `example_function_name` rather than `example_tool_name.example_function_name`)\n\nto=example_tool_name.example_function_name\n\n<atem:function_calls>\n<atem:invoke name=\"example_tool_name.example_function_name\">\n<atem:parameter name=\"example_parameter_1\">value_1</atem:parameter>\n<atem:parameter name=\"example_parameter_2\">This is the value for the second parameter\nthat can span\n\"multiple\" lines\n</atem:parameter>\n</atem:invoke>\n</atem:function_calls>\n\n# Valid recipients: \"self\", \"get_weather.*\", \"web.*\", \"user\".<|eot|><|start|>user<|message|>Weather in Paris?<|eot|><|start|>assistant",
+   "unicode": "<|begin_of_text|><|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\nCurrent date: 2026-10-18.\n\nReasoning strength: high.\n\n# Valid recipients: \"self\", \"user\".<|eot|><|start|>user<|message|>日本語 éè 😀 \"quotes\" <tag> & more<|eot|><|start|>assistant"
+  },
+  "template": "muse-glimmer"
+ }
+}
