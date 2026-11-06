@@ -678,6 +678,7 @@ dependencies = [
  "burn-std",
  "burn-store",
  "burn-vision",
+ "cubecl",
 ]
 
 [[package]]
@@ -2544,10 +2545,12 @@ version = "0.6.1"
 dependencies = [
  "base64 0.23.1",
  "burn",
+ "burn-cubecl",
  "bytes",
  "candle-core",
  "candle-nn",
  "ctor",
+ "cubecl",
  "divan",
  "futures-core",
  "getrandom 0.4.3",

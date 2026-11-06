@@ -96,7 +96,7 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 |---|---|---|
 | Q4_0, Q8_0 | stays quantized; cuca's batch-invariant quantized matmul kernel | repacked at load into burn's block layout; stays quantized |
 | F32, F16, BF16 | held as f32 | uploaded as f32 (4 bytes per element) |
-| Q4_1, Q5_0, Q5_1, K-quants | stays quantized; candle's quantized matmul | dequantized row by row at load, requantized to Q8_0 |
+| Q4_1, Q5_0, Q5_1, K-quants | stays quantized; candle's quantized matmul | dequantized row by row at load, requantized to Q8_0 (stacked expert tensors: Q4_1 is read as Q4_1 by the MoE kernels) |
 | Q8_1 | not covered by a test | dequantized row by row at load, requantized to Q8_0 |
 | IQ family | rejected | rejected |
 

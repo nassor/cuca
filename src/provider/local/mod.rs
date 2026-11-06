@@ -811,7 +811,7 @@ pub enum ExpertPlacement {
 /// Placement only decides speed: an expert is built from the same file
 /// bytes and computed in the same order as in the resident mode, so the
 /// output is the resident mode's on the same device (bit for bit on the
-/// CPU). [`LocalModel::expert_tier_stats`] reports hits, reads and resident
+/// CPU, to float rounding on a GPU). [`LocalModel::expert_tier_stats`] reports hits, reads and resident
 /// bytes; [`LocalModel::expert_heat`] exports the learned heat, which
 /// `warm_from` feeds back in a later session.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -153,6 +153,8 @@ pub(crate) mod delta;
 pub(crate) mod gpu;
 pub(crate) mod layout;
 pub(crate) mod moe;
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) mod moe_kernel;
 pub(crate) mod mtp;
 pub(crate) mod params;
 pub(crate) mod qmm;

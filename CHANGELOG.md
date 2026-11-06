@@ -4,6 +4,25 @@
 
 ### Changed
 
+- `provider-local` (GPU): mixture-of-experts layers (qwen3moe, olmoe,
+  granitemoe, qwen35moe) run in fused CubeCL kernels instead of one burn
+  matmul triple per selected expert (`moe_kernel.rs`, safe Rust, attached
+  through burn's `backend_extension`; new direct dependencies `cubecl` and
+  `burn-cubecl`, burn features `extension` and `cubecl`). Routing (softmax
+  and top-k) runs on the device and a resident layer never reads it back,
+  so a resident MoE token has no per-layer host wait; a tiered layer reads
+  back only the router output and loads missing experts into a device slot
+  pool, computing in groups that do not change a bit of the result. Q4_1
+  experts are read as Q4_1 (the 5 Q4_1 down layers of Qwen3.6-35B-A3B were
+  held as f32, 4.2 MB per expert); `plan_dense` no longer sees expert
+  tensors. On a RX 9070 XT, against the previous commit: OLMoE resident
+  ~15 -> ~44 tok/s, Qwen3.6-35B-A3B at `tiered:device=4g,ram=12g` 3.7/4.5 ->
+  6.5/8.3 tok/s cold/warm (a long reply 5.9 -> 10.1), at `device=6g,ram=12g`
+  5.3 -> 9.6, Qwen3-30B-A3B at `device=6g,ram=12g` 2.7/2.9 -> 4.9/6.1. A
+  tiered load now agrees with the resident one to float rounding instead of
+  bit for bit on a GPU (tiered placements still agree among themselves bit
+  for bit).
+
 - `provider-local` (GPU): faster decode of mixture-of-experts and hybrid
   models. The gated delta-net step queues about half the operations (one
   product-and-sum convolution for a single token, one normalisation of the

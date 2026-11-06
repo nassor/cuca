@@ -106,7 +106,7 @@ provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja
 # cuda/rocm link a prebuilt LLVM that tracel-llvm-bundler downloads on first build
 # (network required; excluded from docs.rs and from the CI all-features jobs; rocm
 # runs on Linux only).
-provider-local-gpu = ["provider-local", "dep:burn"]
+provider-local-gpu = ["provider-local", "dep:burn", "dep:burn-cubecl", "dep:cubecl"]
 provider-local-vulkan = ["provider-local-gpu", "burn/vulkan"]
 provider-local-metal = ["provider-local-gpu", "burn/metal"]
 provider-local-cuda = ["provider-local-gpu", "burn/cuda"]
@@ -221,7 +221,9 @@ unicode-general-category = { version = "1", optional = true }
 # provider-local-gpu: burn (CubeCL) runs the forward pass on a GPU. burn's `default`
 # features enable `optim`/`autodiff`, which inference never uses; the backend itself is
 # chosen by the provider-local-{vulkan,metal,cuda,rocm} features.
-burn = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune"] }
+burn = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune", "extension", "cubecl"] }
+cubecl = { version = "0.11", optional = true, default-features = false, features = ["stdlib"] }
+burn-cubecl = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune"] }
 
 # Test-only deps for the integration suite: `ctor` runs the `--mcp-echo-server`
 # interceptor in tests/plugin_mcp.rs before libtest's main (that test binary
