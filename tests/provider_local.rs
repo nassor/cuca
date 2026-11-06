@@ -840,7 +840,13 @@ async fn prefix_reuse_hits_and_matches_cold() {
     let (model, caps) = (&live.model, &live.caps);
     // The instruction rides in the first user turn: some chat templates (Gemma
     // 2's) reject a system role.
-    let first_question = "You are a terse assistant. Name three primary colors.";
+    // The first turn is long enough that its prompt spans several full blocks
+    // of 16 positions under any template, so a reusable prefix always exists.
+    let first_question = format!(
+        "You are a terse assistant. {}Name three primary colors.",
+        "Colors appear in many places around us every day. ".repeat(8)
+    );
+    let first_question = first_question.as_str();
     let second_question = "Which of those is warmest?";
 
     let turn_a = ask(

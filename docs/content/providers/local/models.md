@@ -303,7 +303,7 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `qwen3-0.6b-q8_0`, `qwen3-1.7b-q8_0` | on and off | yes | all scenarios pass |
 | `smollm3-3b-q4_0` | on and off | yes | all seven run; thinking and the tool answer leg are known limits |
 | `phi4-mini-q4_0`, `phi4-mini-q4_k_m` | no | no syntax | all applicable scenarios pass |
-| `r1-distill-qwen-1.5b-q4_0` | always | no syntax | thinking passes; long-context retrieval is a known limit; the prefix-reuse scenario does not apply, because the 14-token first prompt is shorter than one block of 16 positions (the same on the previous release) |
+| `r1-distill-qwen-1.5b-q4_0` | always | no syntax | thinking and prefix reuse pass; long-context retrieval is a known limit |
 | `qwen3-30b-a3b-q4_0` | on and off | yes | all seven pass |
 | `olmoe-1b-7b-q4_0` | no | no syntax | greedy text and usage, long-context retrieval and prefix reuse pass; the thinking and tool scenarios skip |
 | `qwen3.5-0.8b-q8_0` | on and off | yes, XML | all seven pass on the CPU; not run on Vulkan |
