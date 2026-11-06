@@ -275,6 +275,13 @@ const GEMMA4: &[(&str, &[u32])] = &[
 /// Mistral Small 3.2's `tekken.json` through `mistral_common` (1,536 texts)
 /// give the same ids as the GGUF's tokenizer here, with `tekken` and `pixtral`
 /// pre-tokenizers.
+///
+/// Muse Glimmer's `tokenizer.json` sets `ignore_merges` (a whole word found in
+/// the vocabulary becomes its token without running the merges) while the
+/// engine's `llama4` rule does not. Settled by corpus: every non-special
+/// vocabulary entry, alone and after a space (400,000 texts), encodes to the
+/// same ids with `ignore_merges` on and off in HuggingFace, and the engine
+/// matches all of them through the real preset file's tokenizer.
 #[test]
 fn tokenizer_corpus_matches_reference_ids() {
     #[derive(Deserialize)]

@@ -1,5 +1,5 @@
 //! Golden chat-template renders for the architectures added after the first
-//! catalog (`golden.rs`): Muse Glimmer and Mistral Small 4.
+//! catalog (`golden.rs`): Muse Glimmer.
 //!
 //! `testdata/chat_golden_new.json` maps an entry name to its `template`
 //! (`testdata/templates/<name>.jinja`, the model repository's own
