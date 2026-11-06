@@ -142,7 +142,8 @@ Any other `tokenizer.ggml.model` fails the load with ``unsupported tokenizer mod
 | Gemma 3, ERNIE 4.5 | `llama` | `default` |
 | Qwen 3 | `gpt2` | `qwen2` |
 | Qwen 3.5 | `gpt2` | `qwen35` |
-| DeepSeek-R1 distill | `gpt2` | `deepseek-r1-qwen` |
+| DeepSeek-R1 distill (Qwen) | `gpt2` | `deepseek-r1-qwen` |
+| DeepSeek-R1 distill (Llama) | `gpt2` | `llama-bpe` |
 | SmolLM 3 | `gpt2` | `smaug-bpe` |
 | Phi 4 mini | `gpt2` | `gpt-4o` |
 | Granite 3.3 | `gpt2` | `refact` |
@@ -239,7 +240,7 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 ## Presets
 
-`ModelSource::PRESETS` has 19 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units: the block pools, which hold twice `context_length` positions. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
+`ModelSource::PRESETS` has 20 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units: the block pools, which hold twice `context_length` positions. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
 
 | Preset | Architecture | Repository | Size | K/V |
 |---|---|---|---|---|
@@ -252,6 +253,7 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 | `qwen3-0.6b-q8_0` | `qwen3` | `Qwen/Qwen3-0.6B-GGUF` | 0.64 GB | 3.76 GB |
 | `qwen3-1.7b-q8_0` | `qwen3` | `Qwen/Qwen3-1.7B-GGUF` | 1.83 GB | 3.76 GB |
 | `r1-distill-qwen-1.5b-q4_0` | `qwen2` | `bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` | 1.07 GB | 940 MB |
+| `r1-distill-llama-8b-q4_0` | `llama` | `unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF` | 4.68 GB | 4.29 GB |
 | `smollm3-3b-q4_0` | `smollm3` | `bartowski/HuggingFaceTB_SmolLM3-3B-GGUF` | 1.81 GB | 2.42 GB |
 | `phi4-mini-q4_0` | `phi3` | `bartowski/microsoft_Phi-4-mini-instruct-GGUF` | 2.33 GB | 4.29 GB |
 | `phi4-mini-q4_k_m` | `phi3` | `unsloth/Phi-4-mini-instruct-GGUF` | 2.49 GB | 4.29 GB |
@@ -282,7 +284,7 @@ Three kinds of evidence back this page, from strongest to weakest:
 
 Per architecture:
 
-- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `qwen2` (R1 distill), `qwen3`, `qwen35`, `qwen35moe`, `phi3` (Phi 4 mini), `smollm3`, `granite`, `qwen3moe`, `olmoe`, `olmo2`. `llama` has no preset: it is covered by tiny-model tests and by the converter oracle on a 2025 `LlamaForCausalLM` checkpoint (see [Checkpoints](@/providers/local/model-sources.md#checkpoints)).
+- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `qwen2` (R1 distill), `qwen3`, `qwen35`, `qwen35moe`, `phi3` (Phi 4 mini), `smollm3`, `granite`, `qwen3moe`, `olmoe`, `olmo2`. `llama` runs live through `r1-distill-llama-8b-q4_0` and is also covered by tiny-model tests and by the converter oracle on the same model's checkpoint (see [Checkpoints](@/providers/local/model-sources.md#checkpoints)).
 - Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` (Qwen3-30B-A3B with tiered experts).
 - `ernie4_5`: tiny-model tests and a recorded oracle run only. It has no preset and has not run in the live suite.
 - `qwen35moe` against HuggingFace `transformers` in f32 (`Qwen3_5MoeForCausalLM`, GGUF dequantized by `gguf`, routed experts dequantized per use): a 4-layer cut of the real Qwen3.6-35B-A3B file matches with the engine's dequantized weights to 1e-5 on the top-10 logits, top-1 equal and greedy output equal for 24 of 24 tokens on two prompts and 8 of 8 on a 321-token prompt. The full 40-layer file under the production Q4_0 path keeps the top-1 token on all three prompts, with a maximum absolute difference of 0.13 to 0.62 on the top-k logits. The oracle answers `The capital of France is **Paris**.`. Reading the value heads in grouped (HuggingFace) order instead of tiled order breaks the 4-layer match (top-10 overlap 0 to 2 of 10), which is how the tiled order was confirmed.
@@ -304,6 +306,7 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `smollm3-3b-q4_0` | on and off | yes | all seven run; thinking and the tool answer leg are known limits |
 | `phi4-mini-q4_0`, `phi4-mini-q4_k_m` | no | no syntax | all applicable scenarios pass |
 | `r1-distill-qwen-1.5b-q4_0` | always | no syntax | thinking and prefix reuse pass; long-context retrieval is a known limit |
+| `r1-distill-llama-8b-q4_0` | always | no syntax | all applicable scenarios pass (the oracle prompt count has no dump) |
 | `qwen3-30b-a3b-q4_0` | on and off | yes | all seven pass |
 | `olmoe-1b-7b-q4_0` | no | no syntax | greedy text and usage, long-context retrieval and prefix reuse pass; the thinking and tool scenarios skip |
 | `qwen3.5-0.8b-q8_0` | on and off | yes, XML | all seven pass on the CPU; not run on Vulkan |

@@ -279,7 +279,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 19] = [
+const PRESET_TABLE: [ModelPreset; 20] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -360,6 +360,15 @@ const PRESET_TABLE: [ModelPreset; 19] = [
         "b3af887d0a015b39fab2395e4faf682c1a81a6a3fd09a43f0d4292f7d94bf4d0",
         1_068_807_776,
         "qwen2",
+    ),
+    preset(
+        "r1-distill-llama-8b-q4_0",
+        "unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF",
+        "615f8936e16dfde29dcc00be71145d4d5ce8ed53",
+        "DeepSeek-R1-Distill-Llama-8B-Q4_0.gguf",
+        "4b041b222221e8e37d6faffe7b8184392a239c18c2d9a22e89e485b9a5a321e0",
+        4_675_894_720,
+        "llama",
     ),
     preset(
         "smollm3-3b-q4_0",
