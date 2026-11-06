@@ -913,37 +913,51 @@ async fn prefix_reuse_hits_and_matches_cold() {
         .expect("prefix reuse is reported")
         .read_tokens;
     // Turn B's prompt starts with all of turn A's prompt, up to templates
-    // that rewrite the final turn (an empty reasoning block), a few tokens.
+    // that rewrite the final turn (an empty reasoning block), a few tokens;
+    // only whole blocks of 16 positions are reused.
     assert!(
-        warm_read * 2 >= prompt_a && warm_read > 0,
+        warm_read * 2 + 32 >= prompt_a && warm_read > 0,
         "[{}] turn B should reuse turn A's prompt ({prompt_a} tokens), read {warm_read}",
         caps.name
     );
 
-    // An unrelated conversation evicts the shared prefix from the cache.
-    ask(
+    // An unrelated conversation does not evict the shared prefix: the prefix
+    // store keeps the blocks of both, named by their token ids.
+    let unrelated = ask(
         model,
         request()
             .add_user_message("You are a pirate. Reply in one short sentence. Say hello.")
             .set_max_tokens(8),
     )
     .await;
-
-    let cold = ask(model, turn_b(budget)).await;
-    let cold_read = cold
+    let unrelated_read = unrelated
         .response
         .prompt_cache_usage
         .expect("prefix reuse is reported")
         .read_tokens;
     assert!(
-        cold_read < warm_read,
-        "[{}] an unrelated request should shrink the reuse: {cold_read} vs {warm_read}",
+        unrelated_read < warm_read,
+        "[{}] an unrelated request should reuse less: {unrelated_read} vs {warm_read}",
+        caps.name
+    );
+
+    // Turn B again: everything the first run cached below the prompt's last
+    // token is read, whole blocks of 16, and the output is the same.
+    let again = ask(model, turn_b(budget)).await;
+    let again_read = again
+        .response
+        .prompt_cache_usage
+        .expect("prefix reuse is reported")
+        .read_tokens;
+    assert!(
+        again_read >= warm_read && again_read % 16 == 0 && warm_read % 16 == 0,
+        "[{}] the prefix store should keep turn B's blocks: {again_read} vs {warm_read}",
         caps.name
     );
     assert_eq!(
         warm.everything(),
-        cold.everything(),
-        "[{}] a warm and a cold prefix must produce the same greedy output",
+        again.everything(),
+        "[{}] a warm and a repeated prefix must produce the same greedy output",
         caps.name
     );
     passed("prefix_reuse_hits_and_matches_cold");
@@ -984,4 +998,53 @@ async fn long_context_needle() {
         usage.prompt_tokens
     );
     passed("long_context_needle");
+}
+
+/// Decode speed after a prompt of about 1,300 tokens (`CUCA_LOCAL_PERF=1`;
+/// prints `PERF|...` lines, asserts nothing).
+#[tokio::test]
+async fn perf_long_prompt() {
+    if std::env::var_os("CUCA_LOCAL_PERF").is_none() {
+        return;
+    }
+    live_model!(live, _turn);
+    let model = &live.model;
+    let mut prompt = String::from("The secret code word is PELICAN. ");
+    prompt.push_str(&"This sentence is filler text. ".repeat(180));
+    prompt.push_str("Now write a numbered list of one hundred different animals.");
+    for round in 0..3 {
+        let client = CucaClient::builder()
+            .with_provider(ProviderEndpoint::Local)
+            .with_local_model(model.clone())
+            .build()
+            .expect("client builds");
+        let started = std::time::Instant::now();
+        let (mut stream, handle) = client
+            .generate_stream_with_response(
+                request()
+                    .add_user_message(prompt.clone())
+                    .set_temperature(0.0)
+                    .set_max_tokens(96),
+            )
+            .await
+            .expect("request dispatches");
+        let mut first = None;
+        while let Some(item) = stream.next().await {
+            item.expect("stream item");
+            first.get_or_insert_with(|| started.elapsed().as_secs_f64());
+        }
+        let total = started.elapsed().as_secs_f64();
+        let response = handle.take().expect("terminal response");
+        let usage = response.usage.expect("usage");
+        let first = first.unwrap_or(total);
+        let tokens = f64::from(usage.completion_tokens);
+        println!(
+            "PERF|{}|round {round}|prompt {}|cached {}|completion {}|first {first:.2}s|decode {:.1} tok/s",
+            live.caps.name,
+            usage.prompt_tokens,
+            response.prompt_cache_usage.map_or(0, |c| c.read_tokens),
+            usage.completion_tokens,
+            (tokens - 1.0) / (total - first).max(1e-9),
+        );
+    }
 }

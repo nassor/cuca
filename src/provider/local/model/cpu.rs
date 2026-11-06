@@ -10,11 +10,9 @@
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use candle_core::quantized::{GgmlDType, QMatMul as CandleMatMul, QTensor, gguf_file};
-use candle_core::utils::barrier_pool;
 use candle_core::{D, DType, Device, Module, Tensor};
 use candle_nn::ops::{rms_norm, sigmoid, softmax_last_dim};
 use candle_nn::rotary_emb::{rope, rope_i};
@@ -23,20 +21,24 @@ use super::arch::Act;
 use super::delta::{DeltaCell, DeltaKernel, Rows};
 use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
 use super::moe::route;
+#[cfg(test)]
+use super::paged::Solo;
+use super::paged::{BLOCK_SIZE, BlockTable, KvLayout};
 use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
 use super::qmm::QmmWeight;
 use super::quant::{RowTable, TokenEmbedding};
 use super::rope::RopeKind;
 use super::tier::{BuildFn, ExpertSlice, ExpertStore, LayerExperts, TierShared, add};
 use super::{
-    RING_ROLLBACK, RING_ROWS, Want, attention_mask, build_rope_tables, candle_err, check_context,
-    err, kv_slots, read_hparams,
+    Want, attention_mask, build_rope_tables, candle_err, check_context, err, read_hparams,
 };
 use crate::error::CucaError;
 use crate::provider::local::{ExpertPlacement, ExpertTiers};
 
 mod head;
+pub(super) mod paged_attn;
 pub(crate) use head::NextnHead;
+use paged_attn::{PoolShape, attend_paged_rows, gather, store_rows};
 
 thread_local! {
     /// Whether the current forward pass must reproduce, row by row, exactly
@@ -329,37 +331,46 @@ struct RopeTable {
     sin: Tensor,
 }
 
-/// The key and value tensors of one K/V cache.
+/// The key and value tensors of one contiguous K/V cache: the in-trunk
+/// prediction head's own (see [`head`]); the trunk's is paged.
 type KvPair = (Tensor, Tensor);
 
-/// The K/V cache of one K/V-owning layer: `slots` slots holding the
-/// contiguous positions `base..base + slots` (position `p` at slot `p -
-/// base`). `base` stays 0 unless the layer is a bounded sliding-window layer
-/// ([`kv_slots`] below `context_length`) that was compacted
-/// ([`Transformer::make_room`]).
-struct KvSlab {
-    kv: KvPair,
-    base: usize,
-    slots: usize,
+/// The K and V data of one K/V-owning layer: `[n_blocks][n_kv_head]
+/// [BLOCK_SIZE][head_dim]` floats each, indexed by the block ids of the
+/// layer's group.
+struct KvData {
+    k: Vec<f32>,
+    v: Vec<f32>,
 }
 
-impl KvSlab {
-    /// An empty slab of `slots` slots for the K/V-owning layer `spec`.
-    fn zeros(spec: &LayerSpec, slots: usize) -> Result<Self, CucaError> {
-        let shape = (1, spec.n_kv_head, slots, spec.head_dim);
-        let zeros = || Tensor::zeros(shape, DType::F32, &Device::Cpu).map_err(candle_err);
-        Ok(Self {
-            kv: (zeros()?, zeros()?),
-            base: 0,
-            slots,
+/// The paged K/V cache of one K/V-owning layer. A layer runs on a shared
+/// `&Transformer`, so the data sits behind a lock that only the engine thread
+/// ever takes; a drafter holds a handle (`Arc`) to read the target's data.
+pub(crate) struct KvLayer {
+    data: Mutex<KvData>,
+    shape: PoolShape,
+}
+
+impl KvLayer {
+    /// An empty pool of `blocks` blocks for the K/V-owning layer `spec`.
+    fn zeros(spec: &LayerSpec, blocks: usize) -> Arc<Self> {
+        let floats = blocks * spec.n_kv_head * BLOCK_SIZE * spec.head_dim;
+        Arc::new(Self {
+            data: Mutex::new(KvData {
+                k: vec![0.0; floats],
+                v: vec![0.0; floats],
+            }),
+            shape: PoolShape {
+                n_head: spec.n_head,
+                n_kv_head: spec.n_kv_head,
+                head_dim: spec.head_dim,
+            },
         })
     }
-}
 
-/// K/V cache of the layers that own K/V, plus the shared filled length.
-struct KvCache {
-    layers: Vec<Option<KvSlab>>,
-    len: usize,
+    fn lock(&self) -> std::sync::MutexGuard<'_, KvData> {
+        self.data.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 /// Reads tensors from the GGUF file, checking each against its expected shape.
@@ -629,7 +640,7 @@ pub(crate) const MAX_VERIFY_ROWS: usize = 17;
 
 /// The cache positions a hybrid model can return to besides its end: the
 /// recurrent state is not positional, so a position needs a snapshot. See
-/// [`Transformer::truncate_cache`].
+/// [`Transformer::rewind`].
 #[derive(Debug, Default)]
 struct Rollback {
     /// The position of the checkpoint stored in every delta-net cell.
@@ -656,7 +667,15 @@ pub(crate) struct Transformer {
     /// Drafter projections between the target's hidden width and its own.
     nextn: Option<Nextn>,
     ropes: Vec<RopeTable>,
-    kv: KvCache,
+    /// The paged K/V of every K/V-owning layer (`None` for the others).
+    kv: Vec<Option<Arc<KvLayer>>>,
+    layout: KvLayout,
+    /// The position the model state sits at: where the next forward call must
+    /// start. Only a hybrid model's recurrent state makes it matter; an
+    /// attention-only model reads every position from the block tables.
+    len: usize,
+    #[cfg(test)]
+    solo: Solo,
     /// Whether any layer is a delta-net layer (has a recurrent state).
     hybrid: bool,
     rollback: Rollback,
@@ -685,53 +704,50 @@ pub(crate) struct Forward {
     pub(crate) hidden: Option<Vec<f32>>,
 }
 
-/// The target's K/V tensors a drafter attends to, sharing storage with the
-/// target's cache (candle tensors are handles), so the target's later writes
-/// are visible without copying. Valid until the target's next forward call,
-/// which may compact the sliding slab and move `sliding_base`: take a fresh
-/// one per draft.
+/// The target's paged K/V a drafter attends to: the pools of the last
+/// sliding-window layer's source and of the last full-attention layer's
+/// source (the layers Gemma 4's shared-K/V layers read) with the block table
+/// of the sequence being drafted for. The pools are shared handles, so the
+/// target's later writes are visible without copying; the tables are copies:
+/// take a fresh one per draft.
 pub(crate) struct ExtKv {
-    sliding: KvPair,
-    /// Position held by slot 0 of `sliding` (see [`KvSlab`]).
-    sliding_base: usize,
-    full: KvPair,
+    sliding: (Arc<KvLayer>, BlockTable),
+    full: (Arc<KvLayer>, BlockTable),
+}
+
+/// Where one attention call finds its keys and values.
+#[derive(Clone, Copy)]
+enum KvAccess<'a> {
+    /// One contiguous cache (the in-trunk prediction head's): the call's
+    /// rows fill the slots `start..`, which are not RoPE positions.
+    Slab(&'a KvPair),
+    /// A paged layer cache: position `p` is row `p % BLOCK_SIZE` of block
+    /// `table[p / BLOCK_SIZE]`.
+    Paged {
+        layer: &'a KvLayer,
+        /// The layer owns the cache: the call stores its own keys and
+        /// values first (a shared-K/V layer or a drafter layer only reads).
+        write: bool,
+        table: &'a [u32],
+        /// A drafter layer's single query reads exactly this many positions
+        /// of the target's cache; the trunk's row `i` reads up to itself.
+        read_len: Option<usize>,
+    },
 }
 
 /// One attention call: the rows it processes and the K/V storage it uses.
-/// The trunk runs a layer at `rope_start == start` over the model's cache;
+/// The trunk runs a layer at `rope_start == start` over the paged cache;
 /// the multi-token-prediction head (see [`head`]) runs its block over its own
 /// cache, whose slots are not RoPE positions.
 #[derive(Clone, Copy)]
 struct AttnCall<'a> {
     spec: &'a LayerSpec,
-    /// Cache index of the first row: the call's `t` rows fill `start..`,
-    /// stored at slots `start - base..`.
+    /// Cache index of the first row: the call's `t` rows fill `start..`.
     start: usize,
     /// RoPE position of the first row (the rows are consecutive positions).
     rope_start: usize,
     t: usize,
-    /// The cache this layer stores its keys and values in (K/V-owning
-    /// layers).
-    own: Option<&'a KvPair>,
-    /// The cache the layer attends to: its own, or the layer's shared source;
-    /// `None` for a drafter layer, which reads `ext`.
-    read: Option<&'a KvPair>,
-    /// Index held by slot 0 of `own` and `read` (one cache: an owning layer
-    /// reads its own); a drafter layer takes it from `ext` instead.
-    base: usize,
-    /// A drafter layer's source: the target's cache and the number of its
-    /// positions the layer may read.
-    ext: Option<(&'a ExtKv, usize)>,
-}
-
-/// The slot of cache index `index` in a slab whose slot 0 holds `base`: an
-/// error, not a wrap, when the index was evicted.
-fn slot(index: usize, base: usize) -> candle_core::Result<usize> {
-    index.checked_sub(base).ok_or_else(|| {
-        candle_core::Error::msg(format!(
-            "position {index} was evicted from a sliding-window cache that starts at {base}"
-        ))
-    })
+    kv: KvAccess<'a>,
 }
 
 /// A drafter's input and output projections: `pre` maps the concatenation of
@@ -917,17 +933,14 @@ impl Transformer {
             })
             .collect::<Result<Vec<_>, CucaError>>()?;
 
+        let kv_layout = KvLayout::single(&hp, context_length);
         let mut layers = Vec::with_capacity(hp.n_layer);
         let mut kv_layers = Vec::with_capacity(hp.n_layer);
         for (il, spec) in hp.layers.iter().enumerate() {
             let layout = LayerLayout::read(&hp, il, spec, content)?;
-            if spec.owns_kv(il) {
-                kv_layers.push(Some(KvSlab::zeros(
-                    spec,
-                    kv_slots(spec.window, context_length),
-                )?));
-            } else {
-                kv_layers.push(None);
+            match kv_layout.layer_group[il].filter(|_| spec.owns_kv(il)) {
+                Some(g) => kv_layers.push(Some(KvLayer::zeros(spec, kv_layout.blocks[g]))),
+                None => kv_layers.push(None),
             }
             layers.push(load_layer(
                 &mut loader,
@@ -949,6 +962,8 @@ impl Transformer {
         };
 
         let hybrid = hp.is_hybrid();
+        #[cfg(test)]
+        let solo = Solo::new(&kv_layout);
         Ok(Self {
             hp,
             context_length,
@@ -960,47 +975,40 @@ impl Transformer {
             lm_head,
             nextn,
             ropes,
-            kv: KvCache {
-                layers: kv_layers,
-                len: 0,
-            },
+            kv: kv_layers,
+            layout: kv_layout,
+            len: 0,
+            #[cfg(test)]
+            solo,
             hybrid,
             rollback: Rollback::default(),
             tiers: store.map(|s| Arc::clone(s.shared())),
         })
     }
 
-    /// Run `tokens` through the model at positions `start_pos..`, appending
-    /// their K/V to the cache; returns the logits `want` selects.
+    /// Run `tokens` through the model at positions `start_pos..`, storing
+    /// their K/V in the blocks of `tables` (one block table per group of the
+    /// model's [`KvLayout`], already holding every block the call writes);
+    /// returns the logits `want` selects and the final-norm hidden rows
+    /// `hidden` selects (one per row of logits). With `exact`, every batch row
+    /// equals, bit for bit, what a single-token step at its position computes
+    /// (see [`RowExact`]).
     ///
-    /// `start_pos` must equal the cache length; the cache grows to
-    /// `start_pos + tokens.len()`, which must not exceed the context length.
-    #[cfg(test)]
-    pub(crate) fn forward(
-        &mut self,
-        tokens: &[u32],
-        start_pos: usize,
-        want: Want,
-    ) -> Result<Option<Vec<f32>>, CucaError> {
-        Ok(self
-            .forward_ext(tokens, start_pos, want, Hidden::None, false)?
-            .logits)
-    }
-
-    /// [`Transformer::forward`] that also returns hidden-state rows (one per
-    /// row of logits). With `exact`, every batch row equals, bit for bit,
-    /// what a single-token step at its position computes (see [`RowExact`]).
+    /// A hybrid model's recurrent state sits at one position (the end of its
+    /// last call): `start_pos` must equal it.
     ///
     /// # Errors
     ///
-    /// [`CucaError::Provider`] for an empty `tokens`, a `start_pos` other
-    /// than the cache length, more positions than the context length, a
-    /// drafter model (it has no token embedding) or a failed pass; a hybrid
-    /// model then drops its cache and recurrent state.
-    pub(crate) fn forward_ext(
+    /// [`CucaError::Provider`] for an empty `tokens`, a hybrid model's
+    /// `start_pos` other than its state's position, more positions than the
+    /// context length or than `tables` holds, a drafter model (it has no
+    /// token embedding) or a failed pass; a hybrid model then drops its
+    /// recurrent state.
+    pub(crate) fn forward_seq(
         &mut self,
         tokens: &[u32],
         start_pos: usize,
+        tables: &[BlockTable],
         want: Want,
         hidden: Hidden,
         exact: bool,
@@ -1009,10 +1017,10 @@ impl Transformer {
         if tokens.is_empty() {
             return Err(err("forward requires at least one token"));
         }
-        if start_pos != self.kv.len {
+        if self.hybrid && start_pos != self.len {
             return Err(err(format!(
-                "forward start {start_pos} does not match the cache length {}",
-                self.kv.len
+                "forward start {start_pos} does not match the recurrent state's position {}",
+                self.len
             )));
         }
         let hi = start_pos + tokens.len();
@@ -1022,8 +1030,6 @@ impl Transformer {
                 self.context_length
             )));
         }
-        // A drafter (no token embedding) is rejected below; it owns no K/V.
-        self.make_room(start_pos, tokens.len())?;
         let embed = self
             .embed
             .as_ref()
@@ -1044,6 +1050,7 @@ impl Transformer {
             per_layer,
             tokens.len(),
             start_pos,
+            tables,
             want,
             hidden,
             record,
@@ -1054,67 +1061,35 @@ impl Transformer {
                 return Err(candle_err(e));
             }
         };
-        self.kv.len = hi;
+        self.len = hi;
         if record {
             self.rollback.verify = Some((start_pos, tokens.len()));
         }
         Ok(out)
     }
 
-    /// Compact every bounded sliding-window slab that cannot take the rows
-    /// `start..start + t` in place: its last `window - 1 + RING_ROLLBACK`
-    /// positions before `start` move to its front (a copy, so the move never
-    /// overlaps itself) and its `base` advances. Runs before any layer, so a
-    /// call reads and writes only contiguous slots.
-    ///
-    /// # Errors
-    ///
-    /// [`CucaError::Provider`] when a call writes more rows than a compacted
-    /// slab holds ([`RING_ROWS`]), or a tensor operation fails.
-    fn make_room(&mut self, start: usize, t: usize) -> Result<(), CucaError> {
-        for (il, slab) in self.kv.layers.iter_mut().enumerate() {
-            let (Some(slab), Some(w)) = (slab, self.hp.layers[il].window) else {
-                continue;
-            };
-            if start + t <= slab.base + slab.slots {
-                continue;
-            }
-            let keep = (w - 1 + RING_ROLLBACK).min(start - slab.base);
-            let from = start - keep - slab.base;
-            if from > 0 {
-                if keep > 0 {
-                    for cache in [&slab.kv.0, &slab.kv.1] {
-                        // A narrow over one KV head is already contiguous and
-                        // would share the slab's storage: force the copy.
-                        let moved = cache
-                            .narrow(2, from, keep)
-                            .and_then(|m| m.force_contiguous())
-                            .map_err(candle_err)?;
-                        cache.slice_set(&moved, 2, 0).map_err(candle_err)?;
-                    }
-                }
-                slab.base = start - keep;
-            }
-            if start + t > slab.base + slab.slots {
-                return Err(err(format!(
-                    "a bounded sliding-window cache takes at most {RING_ROWS} rows per call, got {t}"
-                )));
-            }
-        }
-        Ok(())
+    /// The block pools' layout: groups and blocks per group.
+    pub(crate) fn kv_layout(&self) -> &KvLayout {
+        &self.layout
     }
 
-    /// The target's K/V tensors a drafter reads: the cache of the last
-    /// sliding-window layer's source and of the last full-attention layer's
-    /// source (the layers Gemma 4's shared-K/V layers read), sharing storage
-    /// with this model's cache.
+    /// Bytes of K/V data the pools hold.
+    pub(crate) fn kv_pool_bytes(&self) -> u64 {
+        self.layout.pool_bytes(&self.hp)
+    }
+
+    /// The target's paged K/V a drafter reads, for the sequence whose block
+    /// tables are `tables`: the pool of the last sliding-window layer's
+    /// source and of the last full-attention layer's source (the layers
+    /// Gemma 4's shared-K/V layers read), sharing storage with this model's
+    /// cache.
     ///
     /// # Errors
     ///
     /// [`CucaError::Provider`] when the model has no sliding or no
     /// full-attention K/V-owning layer to share.
-    pub(crate) fn ext_kv(&self) -> Result<ExtKv, CucaError> {
-        let source = |sliding: bool| -> Result<&KvSlab, CucaError> {
+    pub(crate) fn ext_kv(&self, tables: &[BlockTable]) -> Result<ExtKv, CucaError> {
+        let source = |sliding: bool| -> Result<(Arc<KvLayer>, BlockTable), CucaError> {
             let layer = self
                 .hp
                 .layers
@@ -1127,13 +1102,15 @@ impl Transformer {
                         if sliding { "sliding-window" } else { "full" }
                     ))
                 })?;
-            self.cache(layer.kv_source).map_err(candle_err)
+            let pool = self.cache(layer.kv_source).map_err(candle_err)?;
+            let table = self.layout.layer_group[layer.kv_source]
+                .and_then(|g| tables.get(g))
+                .ok_or_else(|| err("the sequence has no block table for the drafter's layer"))?;
+            Ok((Arc::clone(pool), table.clone()))
         };
-        let sliding = source(true)?;
         Ok(ExtKv {
-            sliding: sliding.kv.clone(),
-            sliding_base: sliding.base,
-            full: source(false)?.kv.clone(),
+            sliding: source(true)?,
+            full: source(false)?,
         })
     }
 
@@ -1202,7 +1179,7 @@ impl Transformer {
             let input = Tensor::from_vec(input.to_vec(), (1, 1, input.len()), dev)?;
             let mut x = nextn.pre.forward(&input)?;
             for il in 0..hp.n_layer {
-                x = self.layer(il, &x, None, pos, 1, Some((ext, len)), false)?;
+                x = self.layer(il, &x, None, pos, 1, &[], Some((ext, len)), false)?;
             }
             let normed = rms(&x, &self.output_norm, eps)?;
             let logits = self.head(&normed)?;
@@ -1215,23 +1192,17 @@ impl Transformer {
         run().map_err(candle_err)
     }
 
-    /// Drop every cached position from `len` on and return how many
-    /// positions the cache retains: at most `len` and at most the current
-    /// length. The next `forward` must start at the returned length.
+    /// Take the model state back to at most `len` positions and return the
+    /// position it now sits at: the next forward call of a hybrid model must
+    /// start there. K/V rows are positional and live in the sequence's
+    /// blocks, so an attention-only model has no state to move and returns
+    /// `len`; the caller truncates its block tables to what it gets back.
     ///
-    /// An attention-only model retains exactly `min(len, current length)`:
-    /// K/V rows are positional, rows at or past the new length are
-    /// overwritten, not cleared. The exception is a `len` below the floor of
-    /// a compacted sliding-window slab (`base + window - 1`, at least
-    /// [`RING_ROLLBACK`] positions behind the call that compacted it): the
-    /// window such a prefix needs was evicted, so the cache is emptied and 0
-    /// returned.
+    /// A hybrid model keeps a recurrent state that is not positional (it
+    /// summarises everything before the current end and cannot be undone), so
+    /// it retains only positions it holds a state for:
     ///
-    /// A hybrid model keeps, besides K/V rows, a recurrent state that is not
-    /// positional (it summarises everything before the current end and
-    /// cannot be undone), so it retains only positions it holds a state for:
-    ///
-    /// - the current end (`len >=` the current length retains everything);
+    /// - the current end (`len >=` the state's position retains everything);
     /// - the checkpoint position ([`Transformer::checkpoint`]);
     /// - every position `first..first + rows` of the last forward call that
     ///   recorded its rows (`Want::All` over `2..=`[`MAX_VERIFY_ROWS`] rows),
@@ -1240,52 +1211,22 @@ impl Transformer {
     ///   computed it.
     ///
     /// For any other `len` it falls back to the largest of those positions
-    /// not above `len`, or to `0` (an empty cache and the zero state): the
-    /// caller recomputes from the returned position. A checkpoint above the
-    /// retained length is dropped, because the positions it covers are about
-    /// to be overwritten.
-    pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
-        let len = if len < self.ring_floor() { 0 } else { len };
-        let kept = self.truncate_positions(len);
-        if kept == 0 {
-            for slab in self.kv.layers.iter_mut().flatten() {
-                slab.base = 0;
-            }
+    /// not above `len`, or to `0` (the zero state): the caller recomputes from
+    /// the returned position. A checkpoint above the retained length is
+    /// dropped, because the positions it covers are about to be overwritten.
+    pub(crate) fn rewind(&mut self, len: usize) -> usize {
+        if !self.hybrid {
+            return len;
         }
-        kept
-    }
-
-    /// The smallest length every compacted sliding-window slab can still
-    /// serve: `base + window - 1` over the slabs whose `base` moved, 0 when
-    /// none did.
-    fn ring_floor(&self) -> usize {
-        self.kv
-            .layers
-            .iter()
-            .zip(&self.hp.layers)
-            .filter_map(|(slab, spec)| match (slab, spec.window) {
-                (Some(slab), Some(w)) if slab.base > 0 => Some(slab.base + w - 1),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
-    }
-
-    /// [`Transformer::truncate_cache`] without the sliding-window floor.
-    fn truncate_positions(&mut self, len: usize) -> usize {
         // An empty cache always means the zero state, even when a pass that
-        // died half-way left some layers' state advanced past `kv.len`.
-        if self.hybrid && len == 0 {
+        // died half-way left some layers' state advanced past `len`.
+        if len == 0 {
             self.discard_state();
             return 0;
         }
-        let current = self.kv.len;
+        let current = self.len;
         if len >= current {
             return current;
-        }
-        if !self.hybrid {
-            self.kv.len = len;
-            return len;
         }
         let kept = match (self.rollback.verify, self.rollback.checkpoint) {
             (Some((first, rows)), _) if len >= first && len < first + rows => len,
@@ -1314,27 +1255,26 @@ impl Transformer {
         if self.rollback.checkpoint.is_some_and(|at| at > kept) {
             self.rollback.checkpoint = None;
         }
-        self.kv.len = kept;
+        self.len = kept;
         kept
     }
 
     /// Keep the recurrent state at the current end as the checkpoint
-    /// [`Transformer::truncate_cache`] can return to, replacing the previous
-    /// one (one slot). A no-op for an attention-only model, which can
-    /// truncate anywhere, and for an empty cache (the zero state needs no
-    /// copy).
+    /// [`Transformer::rewind`] can return to, replacing the previous one (one
+    /// slot). A no-op for an attention-only model, which can truncate
+    /// anywhere, and for an empty cache (the zero state needs no copy).
     pub(crate) fn checkpoint(&mut self) {
-        if !self.hybrid || self.kv.len == 0 {
+        if !self.hybrid || self.len == 0 {
             return;
         }
         for dw in self.delta_layers() {
             dw.with_cell(DeltaCell::save_checkpoint);
         }
-        self.rollback.checkpoint = Some(self.kv.len);
+        self.rollback.checkpoint = Some(self.len);
     }
 
     /// Whether the model keeps a recurrent state (see
-    /// [`Transformer::truncate_cache`]).
+    /// [`Transformer::rewind`]).
     pub(crate) fn is_hybrid(&self) -> bool {
         self.hybrid
     }
@@ -1366,14 +1306,8 @@ impl Transformer {
         for dw in self.delta_layers() {
             dw.with_cell(DeltaCell::reset);
         }
-        self.kv.len = 0;
+        self.len = 0;
         self.rollback = Rollback::default();
-    }
-
-    /// Number of cached positions (test-only: the engine tracks the ids).
-    #[cfg(test)]
-    pub(crate) fn cache_len(&self) -> usize {
-        self.kv.len
     }
 
     #[expect(
@@ -1386,6 +1320,7 @@ impl Transformer {
         per_layer: Option<Vec<f32>>,
         t: usize,
         start: usize,
+        tables: &[BlockTable],
         want: Want,
         hidden: Hidden,
         record: bool,
@@ -1412,7 +1347,7 @@ impl Transformer {
         };
 
         for il in 0..hp.n_layer {
-            x = self.layer(il, &x, ple.as_ref(), start, t, None, record)?;
+            x = self.layer(il, &x, ple.as_ref(), start, t, tables, None, record)?;
         }
 
         let all_hidden = hidden == Hidden::PostNormAll;
@@ -1474,9 +1409,10 @@ impl Transformer {
         Ok(logits)
     }
 
-    /// One transformer block over `t` positions starting at `start`. With
-    /// `record`, a delta-net layer keeps what cache rollback needs from this
-    /// call (see [`Transformer::truncate_cache`]).
+    /// One transformer block over `t` positions starting at `start`, with the
+    /// sequence's block tables `tables`. With `record`, a delta-net layer
+    /// keeps what cache rollback needs from this call (see
+    /// [`Transformer::rewind`]).
     #[expect(
         clippy::too_many_arguments,
         reason = "one layer call's inputs; a struct would only rename them"
@@ -1488,12 +1424,13 @@ impl Transformer {
         ple: Option<&Tensor>,
         start: usize,
         t: usize,
+        tables: &[BlockTable],
         ext: Option<(&ExtKv, usize)>,
         record: bool,
     ) -> candle_core::Result<Tensor> {
         let lw = &self.layers[il];
         self.block(lw, x, ple.map(|p| (p, il)), t, |h| match &lw.mixer {
-            Mixer::Attention(aw) => self.attention(il, aw, h, start, t, ext),
+            Mixer::Attention(aw) => self.attention(il, aw, h, start, t, tables, ext),
             Mixer::Delta(dw) => dw.forward(h, t, record),
         })
     }
@@ -1556,7 +1493,11 @@ impl Transformer {
     /// The attention of layer `il` over the normed input `h` `(1, t, n_embd)`
     /// at positions `start..start + t`: projections, QK-norm, RoPE, K/V cache
     /// write, attention, the output gate (when the architecture has one) and
-    /// the output projection.
+    /// the output projection. `tables` are the sequence's block tables.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one attention call's inputs; a struct would only rename them"
+    )]
     fn attention(
         &self,
         il: usize,
@@ -1564,29 +1505,42 @@ impl Transformer {
         h: &Tensor,
         start: usize,
         t: usize,
+        tables: &[BlockTable],
         ext: Option<(&ExtKv, usize)>,
     ) -> candle_core::Result<Tensor> {
         let spec = &self.hp.layers[il];
-        let own = if spec.owns_kv(il) {
-            Some(&self.cache(il)?.kv)
+        let kv = if spec.kv_source != usize::MAX {
+            let source = spec.kv_source;
+            let table = self.layout.layer_group[source]
+                .and_then(|g| tables.get(g))
+                .ok_or_else(|| candle_core::Error::msg("the sequence has no block table"))?;
+            KvAccess::Paged {
+                layer: self.cache(source)?,
+                write: spec.owns_kv(il),
+                table,
+                read_len: None,
+            }
         } else {
-            None
-        };
-        let (read, base) = if spec.kv_source == usize::MAX {
-            (None, 0)
-        } else {
-            let slab = self.cache(spec.kv_source)?;
-            (Some(&slab.kv), slab.base)
+            let (e, len) = ext
+                .ok_or_else(|| candle_core::Error::msg("a drafter layer needs the target's K/V"))?;
+            let (layer, table) = if spec.window.is_some() {
+                &e.sliding
+            } else {
+                &e.full
+            };
+            KvAccess::Paged {
+                layer,
+                write: false,
+                table,
+                read_len: Some(len),
+            }
         };
         let call = AttnCall {
             spec,
             start,
             rope_start: start,
             t,
-            own,
-            read,
-            base,
-            ext,
+            kv,
         };
         self.attention_in(&call, aw, h)
     }
@@ -1605,16 +1559,12 @@ impl Transformer {
             start,
             rope_start,
             t,
-            read,
-            base,
-            ext,
-            ..
+            kv,
         } = *call;
         let eps = hp.eps as f32;
         let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
-        let hi = start + t;
 
-        let (q, kv) = aw.project(h, nh, nkv, d)?;
+        let (q, projected) = aw.project(h, nh, nkv, d)?;
         // A full-width Q/K norm (OLMo 2) normalises the whole projection
         // before the heads are split.
         let full_qk = hp.behavior.qk_norm_full;
@@ -1645,51 +1595,87 @@ impl Transformer {
         let q = q.transpose(1, 2)?.contiguous()?;
         let q = self.rotate_rows(spec, &q, rope_start, t)?;
 
-        if let Some((k, v)) = &kv {
+        if let Some((k, v)) = &projected {
             self.store_kv(call, aw, k, v)?;
         }
 
-        let (cache_k, cache_v, hi, base) = match read {
-            Some((k, v)) => (k, v, hi, base),
-            None => {
-                let (e, len) = ext.ok_or_else(|| {
-                    candle_core::Error::msg("a drafter layer needs the target's K/V")
-                })?;
-                let (pair, ext_base) = if spec.window.is_some() {
-                    (&e.sliding, e.sliding_base)
+        let attn = match kv {
+            KvAccess::Slab((cache_k, cache_v)) => {
+                let hi = start + t;
+                let lo = window_lo(spec, start, hi);
+                let l = hi - lo;
+                let k = cache_k.narrow(2, lo, l)?;
+                let v = cache_v.narrow(2, lo, l)?;
+                let mask = if t > 1 {
+                    let mask = attention_mask(start, t, lo, hi, spec.window);
+                    Some(Tensor::from_vec(mask, (t, l), &Device::Cpu)?)
                 } else {
-                    (&e.full, 0)
+                    None
                 };
-                (&pair.0, &pair.1, len, ext_base)
+                attend(&q, &k, &v, mask.as_ref(), spec.scale, hp.attn_softcap)?
+                    .transpose(1, 2)?
+                    .contiguous()?
+                    .reshape((1, t, nh * d))?
+            }
+            KvAccess::Paged {
+                layer,
+                table,
+                read_len,
+                ..
+            } => {
+                let shape = PoolShape {
+                    n_head: nh,
+                    ..layer.shape
+                };
+                let data = layer.lock();
+                if t == 1 || ROW_EXACT.get() {
+                    // Every query row over exactly the keys a decode step at
+                    // its position reads, straight out of the blocks.
+                    let rows = q
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .flatten_all()?
+                        .to_vec1::<f32>()?;
+                    let range = |i: usize| match read_len {
+                        Some(len) => (window_lo(spec, start, len), len),
+                        None => (window_lo(spec, start + i, start + i + 1), start + i + 1),
+                    };
+                    let out = attend_paged_rows(
+                        &rows,
+                        t,
+                        range,
+                        table,
+                        &data.k,
+                        &data.v,
+                        shape,
+                        spec.scale,
+                        hp.attn_softcap,
+                    )?;
+                    Tensor::from_vec(out, (1, t, nh * d), &Device::Cpu)?
+                } else {
+                    // One batched matmul over the gathered keys.
+                    let hi = start + t;
+                    let lo = window_lo(spec, start, hi);
+                    let l = hi - lo;
+                    let k = Tensor::from_vec(
+                        gather(table, lo, hi, &data.k, shape)?,
+                        (1, nkv, l, d),
+                        &Device::Cpu,
+                    )?;
+                    let v = Tensor::from_vec(
+                        gather(table, lo, hi, &data.v, shape)?,
+                        (1, nkv, l, d),
+                        &Device::Cpu,
+                    )?;
+                    let mask = attention_mask(start, t, lo, hi, spec.window);
+                    let mask = Tensor::from_vec(mask, (t, l), &Device::Cpu)?;
+                    attend(&q, &k, &v, Some(&mask), spec.scale, hp.attn_softcap)?
+                        .transpose(1, 2)?
+                        .contiguous()?
+                        .reshape((1, t, nh * d))?
+                }
             }
         };
-        let attn = if ROW_EXACT.get() && t > 1 && ext.is_none() {
-            attend_rows_exact(
-                spec,
-                hp.attn_softcap,
-                &q,
-                (cache_k, cache_v),
-                start,
-                t,
-                base,
-            )?
-        } else {
-            let lo = window_lo(spec, start, hi);
-            let l = hi - lo;
-            let k = cache_k.narrow(2, slot(lo, base)?, l)?;
-            let v = cache_v.narrow(2, slot(lo, base)?, l)?;
-            let mask = if t > 1 {
-                let mask = attention_mask(start, t, lo, hi, spec.window);
-                Some(Tensor::from_vec(mask, (t, l), &Device::Cpu)?)
-            } else {
-                None
-            };
-            attend(&q, &k, &v, mask.as_ref(), spec.scale, hp.attn_softcap)?
-        };
-        let attn = attn
-            .transpose(1, 2)?
-            .contiguous()?
-            .reshape((1, t, nh * d))?;
         let attn = match gate {
             Some(gate) => (attn * sigmoid(&gate)?)?,
             None => attn,
@@ -1722,8 +1708,8 @@ impl Transformer {
     }
 
     /// Normalise, rotate and store the key and value projections `k` and `v`
-    /// `(1, t, n_kv * d)` of a K/V-owning layer into cache indices
-    /// `call.start..` (slots `call.start - call.base..`) of its cache.
+    /// `(1, t, n_kv * d)` of a K/V-owning layer into the cache indices
+    /// `call.start..` of its cache.
     fn store_kv(
         &self,
         call: &AttnCall<'_>,
@@ -1734,9 +1720,6 @@ impl Transformer {
         let (spec, t) = (call.spec, call.t);
         let eps = self.hp.eps as f32;
         let (nkv, d) = (spec.n_kv_head, spec.head_dim);
-        let (cache_k, cache_v) = call
-            .own
-            .ok_or_else(|| candle_core::Error::msg("a K/V projection needs a cache to store in"))?;
         let full_qk = self.hp.behavior.qk_norm_full;
         let k = match &aw.k_norm {
             Some(w) if full_qk => rms(k, w, eps)?,
@@ -1754,16 +1737,39 @@ impl Transformer {
             None => v,
         };
         let v = v.transpose(1, 2)?.contiguous()?;
-        let at = slot(call.start, call.base)?;
-        cache_k.slice_set(&k.contiguous()?, 2, at)?;
-        cache_v.slice_set(&v, 2, at)?;
+        match call.kv {
+            KvAccess::Slab((cache_k, cache_v)) => {
+                cache_k.slice_set(&k.contiguous()?, 2, call.start)?;
+                cache_v.slice_set(&v, 2, call.start)?;
+            }
+            KvAccess::Paged {
+                layer,
+                write: true,
+                table,
+                ..
+            } => {
+                let ks = k.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                let vs = v.flatten_all()?.to_vec1::<f32>()?;
+                let mut data = layer.lock();
+                let KvData {
+                    k: pool_k,
+                    v: pool_v,
+                } = &mut *data;
+                store_rows(table, call.start, t, &ks, pool_k, layer.shape)?;
+                store_rows(table, call.start, t, &vs, pool_v, layer.shape)?;
+            }
+            KvAccess::Paged { write: false, .. } => {
+                return Err(candle_core::Error::msg(
+                    "a K/V projection needs a cache to store in",
+                ));
+            }
+        }
         Ok(())
     }
 
-    /// The K/V slab of the K/V-owning layer `il`.
-    fn cache(&self, il: usize) -> candle_core::Result<&KvSlab> {
+    /// The paged K/V of the K/V-owning layer `il`.
+    fn cache(&self, il: usize) -> candle_core::Result<&Arc<KvLayer>> {
         self.kv
-            .layers
             .get(il)
             .and_then(Option::as_ref)
             .ok_or_else(|| candle_core::Error::msg(format!("layer {il} owns no K/V cache")))
@@ -2224,58 +2230,63 @@ fn window_lo(spec: &LayerSpec, query: usize, hi: usize) -> usize {
     }
 }
 
-/// [`attend`] for the shape-stable mode ([`RowExact`]): every query row `i`
-/// of `q` `(1, n_head, t, d)` attends over exactly the keys a decode step at
-/// cache index `start + i` would, in its own call; slot 0 of the cache holds
-/// index `base`. The rows are independent, so they run on candle's barrier
-/// pool, so a verification round spawns no threads (each row's arithmetic is
-/// the same whichever worker computes it).
-fn attend_rows_exact(
-    spec: &LayerSpec,
-    softcap: Option<f64>,
-    q: &Tensor,
-    (cache_k, cache_v): (&Tensor, &Tensor),
-    start: usize,
-    t: usize,
-    base: usize,
-) -> candle_core::Result<Tensor> {
-    let one_row = |i: usize| -> candle_core::Result<Tensor> {
-        let hi = start + i + 1;
-        let lo = window_lo(spec, start + i, hi);
-        let from = slot(lo, base)?;
-        attend(
-            &q.narrow(2, i, 1)?.contiguous()?,
-            &cache_k.narrow(2, from, hi - lo)?,
-            &cache_v.narrow(2, from, hi - lo)?,
-            None,
-            spec.scale,
-            softcap,
-        )
-    };
-    // `attend` runs float matmuls and a softmax only, never a pooled job, so
-    // the pool is not re-entered from its own workers.
-    let next = AtomicUsize::new(0);
-    let rows: Vec<Mutex<Option<candle_core::Result<Tensor>>>> =
-        (0..t).map(|_| Mutex::new(None)).collect();
-    barrier_pool().execute(|_| {
-        loop {
-            let i = next.fetch_add(1, Ordering::Relaxed);
-            if i >= t {
-                break;
-            }
-            let row = one_row(i);
-            *rows[i].lock().unwrap_or_else(PoisonError::into_inner) = Some(row);
+/// The single-sequence calls the unit tests use: one implicit sequence over
+/// the model's own pools ([`Solo`]), so a test reads like the old contiguous
+/// cache. The engine passes its sequences' block tables explicitly.
+#[cfg(test)]
+impl Transformer {
+    /// [`Transformer::forward_ext`] logits only, not exact.
+    pub(crate) fn forward(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want: Want,
+    ) -> Result<Option<Vec<f32>>, CucaError> {
+        Ok(self
+            .forward_ext(tokens, start_pos, want, Hidden::None, false)?
+            .logits)
+    }
+
+    /// [`Transformer::forward_seq`] over the implicit sequence: its blocks
+    /// are allocated here; `start_pos` must equal its length.
+    pub(crate) fn forward_ext(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want: Want,
+        hidden: Hidden,
+        exact: bool,
+    ) -> Result<Forward, CucaError> {
+        let seq = self.solo.begin(start_pos, tokens.len())?;
+        let out = self.forward_seq(tokens, start_pos, &seq.tables, want, hidden, exact);
+        self.solo
+            .finish(seq, out.is_ok().then_some(start_pos + tokens.len()));
+        out
+    }
+
+    /// Drop the positions from `len` on of the implicit sequence and return
+    /// how many it retains (see [`Transformer::rewind`] and
+    /// [`KvPools::truncate`](super::paged::KvPools::truncate)).
+    pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
+        let state = self.rewind(len).min(self.solo.len());
+        let kept = self.solo.truncate(state);
+        if kept != state {
+            self.rewind(kept);
         }
-    });
-    let rows = rows
-        .into_iter()
-        .map(|row| {
-            row.into_inner()
-                .unwrap_or_else(PoisonError::into_inner)
-                .unwrap_or_else(|| Err(candle_core::Error::msg("attention row not computed")))
-        })
-        .collect::<candle_core::Result<Vec<_>>>()?;
-    Tensor::cat(&rows, 2)
+        kept
+    }
+
+    /// Positions of the implicit sequence.
+    pub(crate) fn cache_len(&self) -> usize {
+        self.solo.len()
+    }
+
+    /// The implicit sequence's block tables, for a drafter that reads this
+    /// target.
+    #[cfg(feature = "provider-local-gpu")]
+    pub(crate) fn solo_tables(&self) -> &[BlockTable] {
+        self.solo.tables()
+    }
 }
 
 #[cfg(test)]
@@ -2781,67 +2792,69 @@ mod tests {
     }
 
     #[test]
-    fn kv_cache_bytes_follow_the_general_formula() {
-        // Gemma 4 tiny: 3 owners (sliding 32, sliding 32, full 64), one KV
-        // head; no layer is bounded at 32 positions.
-        let model = write_tiny_model();
-        let m = load(&model, 32);
-        assert_eq!(m.hp.kv_cache_bytes(32), 32 * 2 * 4 * (32 + 32 + 64));
+    fn kv_pool_bytes_follow_the_layout() {
+        // At 32 positions every group holds 4 blocks (twice the context in
+        // blocks of 16, a sliding group at most as many): the bytes are 64
+        // positions of every K/V-owning layer.
+        let per_position = |m: &Transformer| -> usize {
+            m.hp.kv_owners()
+                .map(|(_, l)| 2 * 4 * l.n_kv_head * l.head_dim)
+                .sum()
+        };
+        // Gemma 4 tiny: 3 owners (two sliding, one full), one KV head.
+        let m = load(&write_tiny_model(), 32);
+        assert_eq!(m.kv_layout().blocks, [4, 4]);
+        assert_eq!(m.kv_pool_bytes(), (64 * per_position(&m)) as u64);
         // Llama tiny: 4 layers x 2 KV heads x 16 dims.
         let m = load(&write_spec(&TinySpec::llama()), 32);
-        assert_eq!(m.hp.kv_cache_bytes(32), 32 * 4 * 2 * 4 * 2 * 16);
+        assert_eq!(m.kv_layout().blocks, [4]);
+        assert_eq!(m.kv_pool_bytes(), 64 * 4 * 2 * 4 * 2 * 16);
         // Qwen 3: head dim 32 differs from the embedding split.
         let m = load(&write_spec(&TinySpec::qwen3()), 32);
-        assert_eq!(m.hp.kv_cache_bytes(32), 32 * 4 * 2 * 4 * 2 * 32);
-        // Gemma 3 tiny at 4096 positions: its four sliding owners (window 4)
-        // hold 3 + 1024 + 256 = 1283 slots, its two full owners 4096; one KV
-        // head of 32 dims.
+        assert_eq!(m.kv_pool_bytes(), 64 * 4 * 2 * 4 * 2 * 32);
+        // Gemma 3 tiny: four sliding owners (window 4) and two full ones, one
+        // KV head of 32 dims.
         let m = load(&write_spec(&TinySpec::gemma3()), 32);
-        assert_eq!(
-            m.hp.kv_cache_bytes(4096),
-            2 * 4 * 32 * (4 * 1283 + 2 * 4096)
-        );
+        assert_eq!(m.kv_pool_bytes(), (64 * per_position(&m)) as u64);
+        assert_eq!(m.kv_pool_bytes(), 2 * 4 * 32 * 64 * 6);
     }
 
-    impl Transformer {
-        /// Give every K/V-owning layer `context_length` slots: the cache
-        /// keeps every position, the reference a bounded slab must match.
-        fn unbound_cache(&mut self) {
-            for (il, slab) in self.kv.layers.iter_mut().enumerate() {
-                if slab.is_some() {
-                    *slab = Some(KvSlab::zeros(&self.hp.layers[il], self.context_length).unwrap());
-                }
-            }
-        }
-    }
-
-    /// The Gemma 3 tiny model loaded for 1400 positions twice: with its
-    /// bounded sliding slabs (1283 slots) and with every slab unbounded.
-    fn bounded_and_unbounded() -> (Transformer, Transformer) {
+    /// The Gemma 3 tiny model loaded for 1400 positions twice: the second
+    /// keeps every block of its sliding layers (the reference a releasing
+    /// sequence must match).
+    fn releasing_and_unbounded() -> (Transformer, Transformer) {
         let model = write_spec(&TinySpec {
             context: 1400,
             ..TinySpec::gemma3()
         });
-        let bounded = load(&model, 1400);
+        let releasing = load(&model, 1400);
         let mut unbounded = load(&model, 1400);
-        unbounded.unbound_cache();
-        assert!(
-            bounded
-                .kv
-                .layers
-                .iter()
-                .flatten()
-                .any(|slab| slab.slots == 1283)
-        );
-        (bounded, unbounded)
+        unbounded.solo.release = false;
+        (releasing, unbounded)
     }
 
-    /// A bounded sliding-window cache computes what keeping every position
-    /// computes, bit for bit, across compactions; it truncates back within
-    /// its rollback headroom and empties itself below its floor.
+    /// Blocks of the sliding group that still hold a block, and the group
+    /// of a model's sliding layers.
+    fn live_sliding_blocks(m: &Transformer) -> usize {
+        let g = m
+            .kv_layout()
+            .groups
+            .iter()
+            .position(|g| g.window.is_some())
+            .unwrap();
+        m.solo.tables()[g]
+            .iter()
+            .filter(|&&b| b != super::super::paged::NO_BLOCK)
+            .count()
+    }
+
+    /// A sequence that releases the sliding blocks left behind its window
+    /// computes what keeping every position computes, bit for bit; it holds
+    /// a bounded number of blocks, rolls back within its verification rows
+    /// and, asked for a length whose window was released, empties itself.
     #[test]
-    fn bounded_sliding_cache_matches_unbounded() {
-        let (mut bounded, mut unbounded) = bounded_and_unbounded();
+    fn sliding_blocks_released_behind_the_window_change_nothing() {
+        let (mut releasing, mut unbounded) = releasing_and_unbounded();
         let tokens: Vec<u32> = (0..1350u32)
             .map(|i| (i * 7 + i / 5) % VOCAB as u32)
             .collect();
@@ -2854,58 +2867,47 @@ mod tests {
         for (i, chunk) in tokens.chunks(256).enumerate() {
             let at = i * 256;
             assert_eq!(
-                step(&mut bounded, chunk, at),
+                step(&mut releasing, chunk, at),
                 step(&mut unbounded, chunk, at),
                 "chunk at {at}"
             );
         }
-        // The slab starting at 0 overflowed at the chunk starting at 1280.
-        assert!(bounded.ring_floor() > 0, "the prefill compacted the slabs");
+        // Window 4 needs three positions behind the end, rows of the
+        // verification lag and the block they start in: a handful of blocks
+        // of the 85 the whole sequence spans.
+        assert!(live_sliding_blocks(&releasing) <= 4);
+        assert_eq!(live_sliding_blocks(&unbounded), 1350usize.div_ceil(16));
         for (j, &token) in [3u32, 9, 1, 14, 6, 2, 11, 8, 5, 12].iter().enumerate() {
             let at = 1350 + j;
             assert_eq!(
-                step(&mut bounded, &[token], at),
+                step(&mut releasing, &[token], at),
                 step(&mut unbounded, &[token], at),
                 "step at {at}"
             );
         }
-        assert_eq!(bounded.truncate_cache(1300), 1300);
-        assert_eq!(unbounded.truncate_cache(1300), 1300);
+        // A verification round's rollback stays inside what is held.
+        assert_eq!(releasing.truncate_cache(1355), 1355);
+        assert_eq!(unbounded.truncate_cache(1355), 1355);
         assert_eq!(
-            step(&mut bounded, &[4], 1300),
-            step(&mut unbounded, &[4], 1300)
+            step(&mut releasing, &[4], 1355),
+            step(&mut unbounded, &[4], 1355)
         );
-        assert_eq!(bounded.truncate_cache(100), 0, "below the floor: emptied");
+        assert_eq!(
+            releasing.truncate_cache(100),
+            0,
+            "the window before 100 was released: emptied"
+        );
         assert_eq!(unbounded.truncate_cache(100), 100);
-        assert_eq!(bounded.ring_floor(), 0);
-        // Refilled from scratch, the bounded model agrees again.
+        assert_eq!(live_sliding_blocks(&releasing), 0);
+        // Refilled from scratch, the releasing model agrees again.
         for (i, chunk) in tokens[..101].chunks(64).enumerate() {
-            step(&mut bounded, chunk, i * 64);
+            step(&mut releasing, chunk, i * 64);
         }
         step(&mut unbounded, &tokens[100..101], 100);
         assert_eq!(
-            step(&mut bounded, &[7], 101),
+            step(&mut releasing, &[7], 101),
             step(&mut unbounded, &[7], 101)
         );
-    }
-
-    /// A call that needs a compaction may write at most `RING_ROWS` rows into
-    /// a bounded slab: more is an error naming the limit, not a panic.
-    #[test]
-    fn bounded_cache_rejects_oversized_calls() {
-        let (mut bounded, _) = bounded_and_unbounded();
-        let tokens: Vec<u32> = (0..1100u32).map(|i| i % VOCAB as u32).collect();
-        for (i, chunk) in tokens.chunks(256).enumerate() {
-            bounded
-                .forward_ext(chunk, i * 256, Want::None, Hidden::None, false)
-                .unwrap();
-        }
-        let more: Vec<u32> = (0..300u32).map(|i| i % VOCAB as u32).collect();
-        let e = bounded
-            .forward_ext(&more, 1100, Want::Last, Hidden::None, false)
-            .err()
-            .unwrap();
-        assert!(e.to_string().contains("at most 256 rows"), "{e}");
     }
 
     #[test]
@@ -3077,6 +3079,7 @@ mod hybrid_tests {
     use candle_core::quantized::gguf_file::Value;
 
     use super::super::delta::tests::{Inputs, reference};
+    use super::super::paged::KvPools;
     use super::super::tiny::{
         CONTEXT, Lcg, N_EMBD, PROMPT, Q35_DK, Q35_DV, Q35_HEAD, Q35_N_HEAD, Q35_N_KV,
         Q35_ROPE_DIMS, TinyModel, TinyQwen35, TinySpec, VOCAB, load, write_qwen35, write_spec,
@@ -3379,8 +3382,11 @@ mod hybrid_tests {
         }
 
         let input = Tensor::from_vec(h, (1, t, N_EMBD), &Device::Cpu).unwrap();
+        let mut pools = KvPools::new(m.kv_layout());
+        let mut seq = pools.seq();
+        pools.reserve(&mut seq, t).unwrap();
         let got = m
-            .attention(3, aw, &input, 0, t, None)
+            .attention(3, aw, &input, 0, t, &seq.tables, None)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -3638,7 +3644,11 @@ mod hybrid_tests {
         assert_eq!(spec.state_floats(), 3 * 96 + 4 * Q35_DK * Q35_DV);
         assert_eq!(m.hp.recurrent_state_bytes(), 4 * 4 * spec.state_floats());
         // One attention layer (layer 3) owns K/V.
-        assert_eq!(m.hp.kv_cache_bytes(1), (2 * 4 * Q35_N_KV * Q35_HEAD) as u64);
+        // 4 blocks (twice the 32 positions, 16 each) of one layer's rows.
+        assert_eq!(
+            m.kv_pool_bytes(),
+            (4 * 16 * 2 * 4 * Q35_N_KV * Q35_HEAD) as u64
+        );
         assert_eq!(m.hp.kv_owners().count(), 1);
 
         let state = 4 * spec.state_floats();

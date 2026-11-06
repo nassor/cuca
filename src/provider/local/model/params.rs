@@ -259,7 +259,7 @@ pub(crate) struct Hparams {
     /// Geometry of the first prediction block, block `n_layer` (an
     /// attention block that owns its K/V; `None` without prediction
     /// blocks). It is not part of [`Hparams::layers`], so the trunk's K/V
-    /// accounting ([`Hparams::kv_cache_bytes`]) leaves it out.
+    /// accounting ([`KvLayout`](super::paged::KvLayout)) leaves it out.
     pub(crate) nextn: Option<LayerSpec>,
 }
 
@@ -274,18 +274,6 @@ impl Hparams {
             .iter()
             .enumerate()
             .filter(|(il, l)| l.owns_kv(*il))
-    }
-
-    /// K/V cache bytes for `context_length` positions (f32 keys and values):
-    /// each K/V-owning layer's [`super::kv_slots`] slots, so a sliding-window
-    /// layer counts its bounded slab.
-    pub(crate) fn kv_cache_bytes(&self, context_length: usize) -> u64 {
-        self.kv_owners()
-            .map(|(_, l)| {
-                (2 * 4 * l.n_kv_head * l.head_dim) as u64
-                    * super::kv_slots(l.window, context_length) as u64
-            })
-            .sum()
     }
 
     /// Whether any layer keeps a recurrent state (gated delta-net layers).
@@ -788,11 +776,17 @@ pub(crate) fn md(entries: &[(&str, Value)]) -> Metadata {
 mod tests {
     use candle_core::quantized::gguf_file::Value::{Array, Bool, F32, String as Str, U32};
 
+    use super::super::paged::KvLayout;
     use super::super::rope::RopeKind;
     use super::*;
 
     fn none(_: &str) -> bool {
         false
+    }
+
+    /// Pool bytes of a layout holding `kv_tokens` positions at `context`.
+    fn pool_bytes(p: &Hparams, context: usize, kv_tokens: usize) -> u64 {
+        KvLayout::new(p, context, 1, kv_tokens, 16).pool_bytes(p)
     }
 
     /// Gemma 4 E2B sliding pattern: every fifth layer (4, 9, ...) is full.
@@ -875,12 +869,19 @@ mod tests {
         assert_eq!(swa.factors, Factors::None);
         assert_eq!(swa.base, 1e4);
         assert_eq!(p.layers[20].kv_source, 13);
-        // E2B: 12 sliding (256) and 3 full (512) owners, one KV head.
-        assert_eq!(p.kv_cache_bytes(1), 36_864);
-        // At 8192 positions the 12 sliding owners (window 512) hold
-        // 511 + 1024 + 256 = 1791 slots each, the 3 full owners every position.
-        assert_eq!(p.kv_cache_bytes(8192), 3 * 4096 * 8192 + 12 * 2048 * 1791);
-        assert_eq!(p.kv_cache_bytes(8192), 144_678_912);
+        // E2B: 12 sliding (256) and 3 full (512) owners, one KV head: a block
+        // of one position per group costs 16 rows of each owner.
+        assert_eq!(pool_bytes(&p, 16, 16), 16 * (3 * 4096 + 12 * 2048));
+        // At 8192 positions and twice that cached: the full group holds
+        // 1024 blocks; the sliding group (window 512) one sequence's
+        // (511 + 256) / 16 + 2 = 50 blocks plus 512 of cached prefixes.
+        let layout = KvLayout::single(&p, 8192);
+        assert_eq!(layout.blocks, [562, 1024]);
+        assert_eq!(
+            layout.pool_bytes(&p),
+            16 * (562 * 12 * 2048 + 1024 * 3 * 4096)
+        );
+        assert_eq!(layout.pool_bytes(&p), 422_313_984);
     }
 
     #[test]
@@ -982,7 +983,7 @@ mod tests {
                 .iter()
                 .all(|l| l.window.is_none() && l.rope == Some(0))
         );
-        assert_eq!(p.kv_cache_bytes(1), 4 * 2 * 4 * 2 * 8);
+        assert_eq!(pool_bytes(&p, 16, 16), 4 * 2048);
     }
 
     #[test]
@@ -1291,8 +1292,9 @@ mod tests {
         assert_eq!(p.ropes.len(), 1);
         assert_eq!(p.ropes[0].kind, RopeKind::Neox);
         assert_eq!((p.ropes[0].n_dims, p.ropes[0].base), (64, 1e7));
-        // Only the six attention layers store K/V: 6 x (2 x 4 x 2 x 256).
-        assert_eq!(p.kv_cache_bytes(1), 6 * 4096);
+        // Only the six attention layers store K/V: 6 x (2 x 4 x 16 x 2 x 256)
+        // per block.
+        assert_eq!(pool_bytes(&p, 16, 16), 6 * 65_536);
         // The prediction block (block 24) is a full-attention block of the
         // same geometry that owns its K/V and shares the trunk's rope; it is
         // not a trunk layer, so the count above leaves it out.

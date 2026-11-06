@@ -64,15 +64,21 @@
 //!   device memory is the file's bytes for Q4_0, Q4_1 and Q8_0 experts.
 //!   `ExpertPlacement::Tiered` reads no expert at load: see "Tiered experts"
 //!   below.
-//! - The K/V cache lives on the device, preallocated as on the CPU: a
-//!   full-attention layer holds `context_length` positions, a sliding-window
-//!   layer the bounded slab of [`kv_slots`], compacted before a call that
-//!   would write past its end (see the model module docs;
-//!   [`Hparams::kv_cache_bytes`] counts it). Writes are in place: a layer
-//!   takes its cache tensors out of the cache, assigns the new positions, and
-//!   puts them back, and attention views are dropped before the next write,
-//!   so no write copies the cache (a compaction, once per `RING_ROLLBACK`
-//!   positions, does).
+//! - The K/V cache lives on the device as a paged cache (see the
+//!   [`paged`](super::paged) module docs): per K/V-owning layer one pool of
+//!   `k` and `v` tensors `[n_blocks, n_kv_head, 16, head_dim]` (f32, zeroed
+//!   once at load, `n_blocks` from [`KvLayout::single`]), and the sequence's
+//!   block tables, one per group of layers with one window, map a position
+//!   to its block and row. A pass writes its rows block by block with
+//!   `slice_assign` into the pool, after taking the layer's tensors out of
+//!   the cache so the write is in place, and attention views are dropped
+//!   before the next write, so no write copies a pool. One query row (a
+//!   decode step, every drafter layer) reads the blocks in place with the
+//!   CubeCL kernel of [`paged_kernel`] (an online softmax over the visible
+//!   keys); several rows (prefill, verification) gather the visible blocks
+//!   of the table into one contiguous view and run burn's matmul attention
+//!   with the mask. The engine owns the allocation of blocks and the tables;
+//!   this module only checks that every block a pass touches is present.
 //! - RoPE cos/sin tables for `context_length` positions, one pair per distinct
 //!   rotary embedding, live on the device.
 //! - During load the host holds the read buffer of the whole tensor (its file
@@ -219,16 +225,17 @@ use super::cpu::{Forward, Hidden};
 use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
 use super::moe::Routing;
 use super::moe_kernel::{self as mk, MoeCall, SlotLayout};
+#[cfg(test)]
+use super::paged::Solo;
+use super::paged::{BLOCK_SIZE, BlockTable, KvLayout, NO_BLOCK};
+use super::paged_kernel::{self, PagedCall};
 use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
 use super::quant::{RowTable, dequant_row};
 use super::rope::{RopeKind, RopeSpec};
 use super::tier::{
     BuildFn, ExpertSlice, ExpertStore, LayerExperts, SlotTable, TierShared, add, sub, tier_slots,
 };
-use super::{
-    RING_ROLLBACK, RING_ROWS, Want, attention_mask, build_rope_tables, check_context, err,
-    kv_slots, read_hparams,
-};
+use super::{Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
 use crate::error::CucaError;
 use crate::provider::local::{
     ExpertHeat, ExpertPlacement, ExpertTiers, LocalDevice, device_unavailable,
@@ -1470,30 +1477,17 @@ struct RopeTable {
     sin: Tensor<2>,
 }
 
-/// One K/V-owning layer's cache on the device, `[1, n_kv_head, slots,
-/// head_dim]` K and V holding the positions `base..base + slots` (position
-/// `p` at slot `p - base`; `base` moves only for a bounded sliding-window
-/// layer, see the CPU engine's `KvSlab`).
-struct GpuKvSlab {
+/// One K/V-owning layer's pool on the device: `[n_blocks, n_kv_head,
+/// BLOCK_SIZE, head_dim]` keys and values, block `b` holding the positions of
+/// the sequences' tables that name it (see [`paged`](super::paged)).
+struct KvPool {
     k: Tensor<4>,
     v: Tensor<4>,
-    base: usize,
-    slots: usize,
 }
 
-/// The K/V slab of every layer (`None` for layers that share another
-/// layer's cache).
-type KvLayers = Vec<Option<GpuKvSlab>>;
-
-/// The slot of position `pos` in a slab whose slot 0 holds `base`: an error,
-/// not a wrap, when the position was evicted.
-fn slot(pos: usize, base: usize) -> Result<usize, CucaError> {
-    pos.checked_sub(base).ok_or_else(|| {
-        err(format!(
-            "position {pos} was evicted from a sliding-window cache that starts at {base}"
-        ))
-    })
-}
+/// The pool of every layer (`None` for layers that share another layer's
+/// pool and layers without attention).
+type KvLayers = Vec<Option<KvPool>>;
 
 /// The RoPE rows of the new positions: `[1, 1, t, n_dims / 2]`.
 struct RopeRows {
@@ -1501,18 +1495,150 @@ struct RopeRows {
     sin: Tensor<4>,
 }
 
-/// The visible range and mask of the layers with one window.
+/// Rows `r0..r1` of one block a pass writes, the new rows `off..off + (r1 -
+/// r0)` of the call.
+struct BlockWrite {
+    block: usize,
+    r0: usize,
+    r1: usize,
+    off: usize,
+}
+
+/// How a pass reads the visible positions of one window group.
+enum BlockRead {
+    /// A single query row: the decode kernel reads the blocks in place.
+    /// `table` is `[1, n]` ids of the blocks from the one holding the first
+    /// visible position, `range` the visible `lo`, `hi` relative to it.
+    Decode {
+        table: Box<Tensor<2, Int>>,
+        range: Box<Tensor<1, Int>>,
+    },
+    /// Several rows: `idx` the same ids gathered into one contiguous view,
+    /// of which rows `skip..skip + len` are visible.
+    Gather {
+        idx: Box<Tensor<1, Int>>,
+        skip: usize,
+        len: usize,
+    },
+}
+
+/// What a pass does with the blocks of one window group, shared by its
+/// layers.
+struct GroupBlocks {
+    writes: Vec<BlockWrite>,
+    read: BlockRead,
+}
+
+/// The positions and blocks one pass touches in one window group.
+struct BlockRows<'a> {
+    /// The sequence's block table of the group.
+    table: &'a [u32],
+    /// Blocks of the group's pools.
+    n_blocks: usize,
+    /// First new position and number of new rows.
+    start: usize,
+    t: usize,
+    /// Visible positions `lo..hi`.
+    lo: usize,
+    hi: usize,
+    /// Whether the pass writes its rows (a drafter's does not).
+    write: bool,
+}
+
+impl BlockRows<'_> {
+    /// The block writes and the read of the pass.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when the table does not reach the visible
+    /// positions or holds no block (a released or out-of-pool id) for one of
+    /// them.
+    fn view(&self, device: &Device) -> Result<GroupBlocks, CucaError> {
+        let Self {
+            table,
+            n_blocks,
+            start,
+            t,
+            lo,
+            hi,
+            write,
+        } = *self;
+        let first = lo / BLOCK_SIZE;
+        let last = (hi - 1) / BLOCK_SIZE;
+        let ids = table.get(first..=last).ok_or_else(|| {
+            err(format!(
+                "the block table holds {} blocks but positions {lo}..{hi} need block {last}",
+                table.len()
+            ))
+        })?;
+        if let Some(at) = ids
+            .iter()
+            .position(|&b| b == NO_BLOCK || b as usize >= n_blocks)
+        {
+            return Err(err(format!(
+                "position {} of the block table has no block (entry {}, pool of {n_blocks})",
+                (first + at) * BLOCK_SIZE,
+                ids[at]
+            )));
+        }
+        let mut writes = Vec::new();
+        if write {
+            for bi in start / BLOCK_SIZE..=(start + t - 1) / BLOCK_SIZE {
+                let from = start.max(bi * BLOCK_SIZE);
+                let to = (start + t).min((bi + 1) * BLOCK_SIZE);
+                writes.push(BlockWrite {
+                    block: ids[bi - first] as usize,
+                    r0: from - bi * BLOCK_SIZE,
+                    r1: to - bi * BLOCK_SIZE,
+                    off: from - start,
+                });
+            }
+        }
+        // Block ids are below the pool size, which fits an i32.
+        let ids: Vec<i32> = ids.iter().map(|&b| b as i32).collect();
+        let n = ids.len();
+        let skip = lo - first * BLOCK_SIZE;
+        let read = if t == 1 {
+            let range = vec![skip as i32, (hi - first * BLOCK_SIZE) as i32];
+            BlockRead::Decode {
+                table: Box::new(Tensor::from_data(TensorData::new(ids, [1, n]), device)),
+                range: Box::new(Tensor::from_data(TensorData::new(range, [2]), device)),
+            }
+        } else {
+            BlockRead::Gather {
+                idx: Box::new(Tensor::from_data(TensorData::new(ids, [n]), device)),
+                skip,
+                len: hi - lo,
+            }
+        };
+        Ok(GroupBlocks { writes, read })
+    }
+}
+
+/// The visible range, mask and blocks of the layers with one window.
 struct MaskInput {
     window: Option<usize>,
-    /// First visible cached position.
-    lo: usize,
     /// `[1, 1, t, hi - lo]`; `None` for a single query, which sees every key.
     mask: Option<Tensor<4>>,
+    /// `None` when no K/V group has this window (a layer without
+    /// attention).
+    blocks: Option<GroupBlocks>,
+}
+
+/// Where a pass finds its blocks.
+enum PassKv<'a> {
+    /// The target's own pass: the sequence's tables, one per group of the
+    /// layout.
+    Trunk {
+        layout: &'a KvLayout,
+        tables: &'a [BlockTable],
+    },
+    /// A drafter's: the target's pools, read-only.
+    Drafter(&'a GpuExtKv),
 }
 
 /// What one forward pass shares between its layers.
 struct Pass {
-    start: usize,
     /// New tokens.
     t: usize,
     /// Per-layer inputs of the Gemma 4 per-layer embeddings,
@@ -1544,10 +1670,18 @@ pub(crate) struct GpuTransformer {
     /// reference to the target while the table seeks in its file.
     embed: Mutex<RowTable>,
     ple_table: Option<RowTable>,
+    /// The K/V pool of every K/V-owning layer.
     kv: KvLayers,
-    kv_len: usize,
+    /// The groups of the pools and their sizes.
+    layout: KvLayout,
+    /// The implicit sequence of the unit tests.
+    #[cfg(test)]
+    solo: Solo,
+    /// Where the recurrent state of a hybrid model sits: the end of the last
+    /// forward call (unused by an attention-only model).
+    len: usize,
     /// The recurrent state of every delta-net layer (`None` for attention
-    /// layers), live at `kv_len`.
+    /// layers), live at `len`.
     delta: Vec<Option<DeltaState>>,
     /// The one checkpoint a hybrid model can return to: its position and
     /// the states there.
@@ -1591,10 +1725,11 @@ impl Weights {
     }
 
     /// Read every weight of the model `hp` describes through `reader` (onto
-    /// the reader's device) and allocate its K/V cache: the layers, the final
-    /// norm, the LM head (`output.weight`, else the token embedding), the
-    /// per-layer-embedding projection and the RoPE tables. A drafter's cache
-    /// is empty: it reads the target's.
+    /// the reader's device): the layers, the final norm, the LM head
+    /// (`output.weight`, else the token embedding), the per-layer-embedding
+    /// projection and the RoPE tables, plus the zero recurrent state of every
+    /// delta-net layer. The K/V pools are the caller's ([`alloc_pools`]): a
+    /// drafter has none, it reads the target's.
     /// With `tiers`, the experts of the MoE layers stay in the file (their
     /// banks hold the tiers) instead of being read.
     fn load(
@@ -1603,7 +1738,7 @@ impl Weights {
         hp: Hparams,
         context_length: usize,
         tiers: Option<&TierPlan>,
-    ) -> Result<(Self, KvLayers, Vec<Option<DeltaState>>), CucaError> {
+    ) -> Result<(Self, Vec<Option<DeltaState>>), CucaError> {
         let content = reader.content;
         let device = reader.device.clone();
         let n_embd = hp.n_embd;
@@ -1642,24 +1777,11 @@ impl Weights {
             .collect();
 
         let mut layers = Vec::with_capacity(hp.n_layer);
-        let mut kv: KvLayers = Vec::with_capacity(hp.n_layer);
         let mut delta: Vec<Option<DeltaState>> = Vec::with_capacity(hp.n_layer);
         for il in 0..hp.n_layer {
             let spec = &hp.layers[il];
             let layout = LayerLayout::read(&hp, il, spec, content)?;
             delta.push(spec.delta().map(|d| DeltaState::zeros(d, &device)));
-            if spec.owns_kv(il) {
-                let slots = kv_slots(spec.window, context_length);
-                let shape = [1, spec.n_kv_head, slots, spec.head_dim];
-                kv.push(Some(GpuKvSlab {
-                    k: Tensor::zeros(shape, &device),
-                    v: Tensor::zeros(shape, &device),
-                    base: 0,
-                    slots,
-                }));
-            } else {
-                kv.push(None);
-            }
             layers.push(load_layer(reader, &hp, il, spec, &layout, tiers)?);
         }
         Ok((
@@ -1672,10 +1794,37 @@ impl Weights {
                 lm_head,
                 ropes,
             },
-            kv,
             delta,
         ))
     }
+}
+
+/// The K/V pool of every K/V-owning layer of `hp`, zeroed on `device`, `[n_blocks,
+/// n_kv_head, BLOCK_SIZE, head_dim]` with the block count of the layer's group
+/// in `layout`; `None` for the layers that share another layer's pool or have
+/// no attention.
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] when an owning layer belongs to no group of
+/// `layout`.
+fn alloc_pools(hp: &Hparams, layout: &KvLayout, device: &Device) -> Result<KvLayers, CucaError> {
+    let mut kv: KvLayers = Vec::with_capacity(hp.n_layer);
+    for (il, spec) in hp.layers.iter().enumerate() {
+        if !spec.owns_kv(il) {
+            kv.push(None);
+            continue;
+        }
+        let blocks = layout.layer_group[il]
+            .map(|g| layout.blocks[g])
+            .ok_or_else(|| err(format!("layer {il} owns K/V but belongs to no block group")))?;
+        let shape = [blocks, spec.n_kv_head, BLOCK_SIZE, spec.head_dim];
+        kv.push(Some(KvPool {
+            k: Tensor::zeros(shape, device),
+            v: Tensor::zeros(shape, device),
+        }));
+    }
+    Ok(kv)
 }
 
 /// Where every MoE layer's experts live in the file and what one occupies in
@@ -1891,7 +2040,7 @@ impl GpuTransformer {
             dense,
         };
         let plan = tiers.as_ref().map(|(_, plan)| plan);
-        let (weights, kv, delta) = Weights::load(&mut reader, path, hp, context_length, plan)?;
+        let (weights, delta) = Weights::load(&mut reader, path, hp, context_length, plan)?;
         drop(reader);
         if let Some((tiers, plan)) = &tiers
             && let Some(heat) = &tiers.warm_from
@@ -1899,6 +2048,10 @@ impl GpuTransformer {
             plan.warm(&weights, heat)?;
         }
 
+        let layout = KvLayout::single(&weights.hp, context_length);
+        let kv = alloc_pools(&weights.hp, &layout, &weights.device)?;
+        #[cfg(test)]
+        let solo = Solo::new(&layout);
         Ok(Self {
             weights,
             context_length,
@@ -1906,7 +2059,10 @@ impl GpuTransformer {
             embed: Mutex::new(embed),
             ple_table,
             kv,
-            kv_len: 0,
+            layout,
+            #[cfg(test)]
+            solo,
+            len: 0,
             delta,
             checkpoint: None,
             hybrid,
@@ -1921,23 +2077,14 @@ impl GpuTransformer {
         self.tiers.clone()
     }
 
-    /// Run `tokens` through the model at positions `start_pos..`, appending
-    /// their K/V to the cache; returns the logits `want` selects. Same
-    /// contract and errors as the CPU engine's `forward`.
-    #[cfg(test)]
-    pub(crate) fn forward(
-        &mut self,
-        tokens: &[u32],
-        start_pos: usize,
-        want: Want,
-    ) -> Result<Option<Vec<f32>>, CucaError> {
-        Ok(self
-            .forward_ext(tokens, start_pos, want, Hidden::None, false)?
-            .logits)
-    }
-
-    /// [`GpuTransformer::forward`] that also returns the hidden-state rows
-    /// `hidden` selects (one per row of logits, `n_embd` floats each).
+    /// Run `tokens` through the model at positions `start_pos..`, writing
+    /// their K/V into the blocks `tables` names (one table per group of
+    /// [`GpuTransformer::kv_layout`], every block the call writes already
+    /// allocated) and reading the positions before them from there; returns
+    /// the logits `want` selects and the hidden-state rows `hidden` selects
+    /// (one per row of logits, `n_embd` floats each). A hybrid model's
+    /// recurrent state sits at the position the last call ended at:
+    /// `start_pos` must equal it.
     ///
     /// `exact` is ignored: a batched pass on the GPU equals single-token
     /// steps only up to float rounding (the matmul kernels differ by shape),
@@ -1947,13 +2094,16 @@ impl GpuTransformer {
     /// # Errors
     ///
     /// [`CucaError::Provider`] when `hidden` is neither `None` nor
-    /// `PostNorm`, `tokens` is empty, `start_pos` is not the cache length,
-    /// the pass exceeds the context length or a device operation fails;
-    /// [`CucaError::Io`] when an embedding row cannot be read.
-    pub(crate) fn forward_ext(
+    /// `PostNorm`, `tokens` is empty, a hybrid model's `start_pos` is not
+    /// its state's position, the pass exceeds the context length, a table
+    /// lacks a block the pass reads or writes, or a device operation fails (a
+    /// hybrid model then drops its recurrent state); [`CucaError::Io`] when
+    /// an embedding row cannot be read.
+    pub(crate) fn forward_seq(
         &mut self,
         tokens: &[u32],
         start_pos: usize,
+        tables: &[BlockTable],
         want: Want,
         hidden: Hidden,
         _exact: bool,
@@ -1966,10 +2116,10 @@ impl GpuTransformer {
         if tokens.is_empty() {
             return Err(err("forward requires at least one token"));
         }
-        if start_pos != self.kv_len {
+        if self.hybrid && start_pos != self.len {
             return Err(err(format!(
-                "forward start {start_pos} does not match the cache length {}",
-                self.kv_len
+                "forward start {start_pos} does not match the recurrent state's position {}",
+                self.len
             )));
         }
         let hi = start_pos + tokens.len();
@@ -1979,7 +2129,6 @@ impl GpuTransformer {
                 self.context_length
             )));
         }
-        self.make_room(start_pos, tokens.len())?;
         let hp = &self.weights.hp;
         let embeddings = self
             .embed
@@ -1992,6 +2141,8 @@ impl GpuTransformer {
         };
         let out = match self.weights.forward_layers(
             &mut self.kv,
+            &self.layout,
+            tables,
             &mut self.delta,
             embeddings,
             per_layer,
@@ -2003,72 +2154,15 @@ impl GpuTransformer {
             Ok(out) => out,
             Err(e) => {
                 // A half-advanced recurrent state cannot be repaired: as on
-                // the CPU, the cache is emptied.
+                // the CPU, the state is emptied.
                 if self.hybrid {
                     self.discard_state();
                 }
                 return Err(e);
             }
         };
-        self.kv_len = hi;
+        self.len = hi;
         Ok(out)
-    }
-
-    /// Compact every bounded sliding-window slab that cannot take the rows
-    /// `start..start + t` in place, as the CPU engine does: its last `window
-    /// - 1 + RING_ROLLBACK` positions before `start` move to its front and its
-    /// `base` advances.
-    ///
-    /// # Errors
-    ///
-    /// [`CucaError::Provider`] when a call writes more rows than a compacted
-    /// slab holds ([`RING_ROWS`]).
-    fn make_room(&mut self, start: usize, t: usize) -> Result<(), CucaError> {
-        for (il, entry) in self.kv.iter_mut().enumerate() {
-            let spec = &self.weights.hp.layers[il];
-            let (Some(w), Some(slab)) = (spec.window, entry.as_mut()) else {
-                continue;
-            };
-            if start + t <= slab.base + slab.slots {
-                continue;
-            }
-            let keep = (w - 1 + RING_ROLLBACK).min(start - slab.base);
-            let from = start - keep - slab.base;
-            if from > 0 {
-                if keep > 0 {
-                    let (nkv, d) = (spec.n_kv_head, spec.head_dim);
-                    let src = cache_ranges(nkv, from..from + keep, d);
-                    let dst = cache_ranges(nkv, 0..keep, d);
-                    // The slice holds a second handle, so the assignment
-                    // copies the slab instead of overlapping itself.
-                    let moved = slab.k.clone().slice(src.clone());
-                    slab.k = slab.k.clone().slice_assign(dst.clone(), moved);
-                    let moved = slab.v.clone().slice(src);
-                    slab.v = slab.v.clone().slice_assign(dst, moved);
-                }
-                slab.base = start - keep;
-            }
-            if start + t > slab.base + slab.slots {
-                return Err(err(format!(
-                    "a bounded sliding-window cache takes at most {RING_ROWS} rows per call, got {t}"
-                )));
-            }
-        }
-        Ok(())
-    }
-
-    /// The smallest length every compacted sliding-window slab can still
-    /// serve (`base + window - 1`), 0 when none was compacted.
-    fn ring_floor(&self) -> usize {
-        self.kv
-            .iter()
-            .zip(&self.weights.hp.layers)
-            .filter_map(|(slab, spec)| match (slab, spec.window) {
-                (Some(slab), Some(w)) if slab.base > 0 => Some(slab.base + w - 1),
-                _ => None,
-            })
-            .max()
-            .unwrap_or(0)
     }
 
     /// Vocabulary size.
@@ -2099,14 +2193,21 @@ impl GpuTransformer {
             .rows(&[token], self.weights.hp.embd_scale)
     }
 
-    /// The K/V cache tensors a drafter reads, `len` positions of them: the
-    /// cache of the last sliding-window layer's source and of the last
-    /// full-attention layer's source (the layers Gemma 4's shared-K/V layers
-    /// read). The handles are clones: hold them only for the length of one
-    /// drafting call, since a K/V write while another handle to the cache
-    /// exists copies the whole cache instead of writing in place.
-    fn ext_kv(&self, len: usize) -> Result<GpuExtKv, CucaError> {
-        let source = |sliding: bool| -> Result<&GpuKvSlab, CucaError> {
+    /// The target's paged K/V a drafter reads, for the sequence whose block
+    /// tables are `tables`: the pools of the last sliding-window layer's
+    /// source and of the last full-attention layer's source (the layers
+    /// Gemma 4's shared-K/V layers read), `len` positions of them. The
+    /// handles are clones: hold them only for the length of one drafting
+    /// call, since a K/V write while another handle to a pool exists copies
+    /// the whole pool instead of writing in place.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when the model has no sliding or no
+    /// full-attention K/V-owning layer to share, or `tables` has no table
+    /// for its group.
+    fn ext_kv(&self, tables: &[BlockTable], len: usize) -> Result<GpuExtKv, CucaError> {
+        let source = |sliding: bool| -> Result<ExtGroup, CucaError> {
             let layer = self
                 .weights
                 .hp
@@ -2120,52 +2221,57 @@ impl GpuTransformer {
                         if sliding { "sliding-window" } else { "full" }
                     ))
                 })?;
-            self.kv
+            let pool = self
+                .kv
                 .get(layer.kv_source)
                 .and_then(Option::as_ref)
-                .ok_or_else(|| err(format!("layer {} owns no K/V cache", layer.kv_source)))
+                .ok_or_else(|| err(format!("layer {} owns no K/V cache", layer.kv_source)))?;
+            let table = self.layout.layer_group[layer.kv_source]
+                .and_then(|g| tables.get(g))
+                .ok_or_else(|| err("the sequence has no block table for the drafter's layer"))?;
+            Ok(ExtGroup {
+                k: pool.k.clone(),
+                v: pool.v.clone(),
+                table: table.clone(),
+            })
         };
-        let (sliding, full) = (source(true)?, source(false)?);
         Ok(GpuExtKv {
-            sliding: (sliding.k.clone(), sliding.v.clone()),
-            sliding_base: sliding.base,
-            full: (full.k.clone(), full.v.clone()),
+            sliding: source(true)?,
+            full: source(false)?,
             len,
         })
     }
 
-    /// Drop every cached position from `len` on and return how many remain;
-    /// the next `forward` must start there. K/V rows are positional
-    /// (`min(len, current length)` for an attention-only model); a hybrid
-    /// model retains only positions it holds a recurrent state for: the
-    /// current end and the [`GpuTransformer::checkpoint`], else the largest
-    /// of those not above `len`, else `0` (the zero state). Unlike the CPU
-    /// engine it keeps no verify record (no drafter can pair with a hybrid
-    /// model on a GPU). A `len` below the floor of a compacted sliding-window
-    /// slab empties the cache and returns 0, as on the CPU.
-    pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
-        let len = if len < self.ring_floor() { 0 } else { len };
-        let kept = self.truncate_positions(len);
-        if kept == 0 {
-            for slab in self.kv.iter_mut().flatten() {
-                slab.base = 0;
-            }
-        }
-        kept
+    /// The block pools' layout: groups and blocks per group.
+    pub(crate) fn kv_layout(&self) -> &KvLayout {
+        &self.layout
     }
 
-    /// [`GpuTransformer::truncate_cache`] without the sliding-window floor.
-    fn truncate_positions(&mut self, len: usize) -> usize {
+    /// Bytes of K/V data the pools hold.
+    pub(crate) fn kv_pool_bytes(&self) -> u64 {
+        self.layout.pool_bytes(&self.weights.hp)
+    }
+
+    /// Take the model state back to at most `len` positions and return the
+    /// position it now sits at: the next forward call of a hybrid model must
+    /// start there. K/V rows are positional and live in the sequence's
+    /// blocks, so an attention-only model has no state to move and returns
+    /// `len`; the caller truncates its block tables to what it gets back. A
+    /// hybrid model retains only positions it holds a recurrent state for:
+    /// the current end and the [`GpuTransformer::checkpoint`], else the
+    /// largest of those not above `len`, else `0` (the zero state). Unlike
+    /// the CPU engine it keeps no verify record (no drafter can pair with a
+    /// hybrid model on a GPU).
+    pub(crate) fn rewind(&mut self, len: usize) -> usize {
         if !self.hybrid {
-            self.kv_len = len.min(self.kv_len);
-            return self.kv_len;
+            return len;
         }
         if len == 0 {
             self.discard_state();
             return 0;
         }
-        if len >= self.kv_len {
-            return self.kv_len;
+        if len >= self.len {
+            return self.len;
         }
         let kept = match &self.checkpoint {
             Some((at, _)) if *at <= len => *at,
@@ -2178,7 +2284,7 @@ impl GpuTransformer {
         if self.checkpoint.as_ref().is_some_and(|(at, _)| *at > kept) {
             self.checkpoint = None;
         }
-        self.kv_len = kept;
+        self.len = kept;
         kept
     }
 
@@ -2192,23 +2298,20 @@ impl GpuTransformer {
         }
     }
 
-    /// An empty cache: the zero state, no checkpoint, no positions.
+    /// An empty state: the zero state, no checkpoint, no positions.
     fn discard_state(&mut self) {
         self.zero_state();
         self.checkpoint = None;
-        self.kv_len = 0;
-        for slab in self.kv.iter_mut().flatten() {
-            slab.base = 0;
-        }
+        self.len = 0;
     }
 
     /// Keep the recurrent state at the current end as the one checkpoint
-    /// [`GpuTransformer::truncate_cache`] can return to, replacing the
-    /// previous one. A no-op for an attention-only model and an empty cache.
-    /// Free: the states are immutable device tensors, so this keeps handles.
+    /// [`GpuTransformer::rewind`] can return to, replacing the previous one.
+    /// A no-op for an attention-only model and an empty state. Free: the
+    /// states are immutable device tensors, so this keeps handles.
     pub(crate) fn checkpoint(&mut self) {
-        if self.hybrid && self.kv_len > 0 {
-            self.checkpoint = Some((self.kv_len, self.delta.clone()));
+        if self.hybrid && self.len > 0 {
+            self.checkpoint = Some((self.len, self.delta.clone()));
         }
     }
 
@@ -2223,22 +2326,79 @@ impl GpuTransformer {
     pub(crate) fn rollback_rows(&self) -> usize {
         if self.hybrid { 1 } else { usize::MAX }
     }
+}
 
-    /// Number of cached positions (test-only).
-    #[cfg(test)]
+/// The single-sequence calls the unit tests use: one implicit sequence over
+/// the model's own pools ([`Solo`]), so a test reads like the old contiguous
+/// cache. The engine passes its sequences' block tables explicitly.
+#[cfg(test)]
+impl GpuTransformer {
+    /// [`GpuTransformer::forward_ext`] logits only, not exact.
+    pub(crate) fn forward(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want: Want,
+    ) -> Result<Option<Vec<f32>>, CucaError> {
+        Ok(self
+            .forward_ext(tokens, start_pos, want, Hidden::None, false)?
+            .logits)
+    }
+
+    /// [`GpuTransformer::forward_seq`] over the implicit sequence: its blocks
+    /// are allocated here; `start_pos` must equal its length.
+    pub(crate) fn forward_ext(
+        &mut self,
+        tokens: &[u32],
+        start_pos: usize,
+        want: Want,
+        hidden: Hidden,
+        exact: bool,
+    ) -> Result<Forward, CucaError> {
+        let seq = self.solo.begin(start_pos, tokens.len())?;
+        let out = self.forward_seq(tokens, start_pos, &seq.tables, want, hidden, exact);
+        self.solo
+            .finish(seq, out.is_ok().then_some(start_pos + tokens.len()));
+        out
+    }
+
+    /// Drop the positions from `len` on of the implicit sequence and return
+    /// how many it retains (see [`GpuTransformer::rewind`] and
+    /// [`KvPools::truncate`](super::paged::KvPools::truncate)).
+    pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
+        let state = self.rewind(len).min(self.solo.len());
+        let kept = self.solo.truncate(state);
+        if kept != state {
+            self.rewind(kept);
+        }
+        kept
+    }
+
+    /// Positions of the implicit sequence.
     pub(crate) fn cache_len(&self) -> usize {
-        self.kv_len
+        self.solo.len()
+    }
+
+    /// The implicit sequence's block tables, for a drafter's `draft`.
+    pub(crate) fn solo_tables(&self) -> &[BlockTable] {
+        self.solo.tables()
     }
 }
 
-/// The target's K/V tensors a drafter attends to; see
+/// The pools and block table of one window group of the target a drafter
+/// reads.
+struct ExtGroup {
+    k: Tensor<4>,
+    v: Tensor<4>,
+    table: BlockTable,
+}
+
+/// The target's paged K/V a drafter attends to; see
 /// [`GpuTransformer::ext_kv`].
 struct GpuExtKv {
-    sliding: (Tensor<4>, Tensor<4>),
-    /// Position held by slot 0 of `sliding`.
-    sliding_base: usize,
-    full: (Tensor<4>, Tensor<4>),
-    /// Positions of the target cache the drafter may read.
+    sliding: ExtGroup,
+    full: ExtGroup,
+    /// Positions of the target's cache the drafter reads.
     len: usize,
 }
 
@@ -2341,7 +2501,7 @@ impl GpuDrafter {
         };
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
-        let (net, _, _) = Weights::load(&mut reader, path, hp, context_length, None)?;
+        let (net, _) = Weights::load(&mut reader, path, hp, context_length, None)?;
         if net.lm_head.rows() != target.vocab() {
             return Err(err(format!(
                 "drafter vocabulary {} differs from the target's {}",
@@ -2357,8 +2517,9 @@ impl GpuDrafter {
         })
     }
 
-    /// Draft at most `k` tokens after the pending token `first`, as the CPU
-    /// drafter.
+    /// Draft at most `k` tokens after the pending token `first` of the
+    /// sequence whose block tables (one per K/V group of the target) are
+    /// `tables`, as the CPU drafter.
     ///
     /// `hidden` is the target's final-norm hidden state at its last cached
     /// position (`Hidden::PostNorm` of its last forward pass), `len` the
@@ -2370,11 +2531,16 @@ impl GpuDrafter {
     /// # Errors
     ///
     /// [`CucaError::Provider`] when `hidden` has the wrong width, `len` is
-    /// zero, beyond the target's cache or the context length, or a device
-    /// operation fails.
+    /// zero, beyond the context length or the blocks `tables` holds, a
+    /// block it reads is released, or a device operation fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one drafting call's inputs; a struct would only rename them"
+    )]
     pub(crate) fn draft(
         &self,
         target: &GpuTransformer,
+        tables: &[BlockTable],
         hidden: &[f32],
         first: u32,
         len: usize,
@@ -2389,15 +2555,15 @@ impl GpuDrafter {
                 hp.n_embd_out
             )));
         }
-        if len == 0 || len > target.kv_len || len >= self.context_length {
+        if len == 0 || len >= self.context_length {
             return Err(err(format!(
-                "cannot draft at position {len}: the target caches {} positions and the drafter's context is {}",
-                target.kv_len, self.context_length
+                "cannot draft at position {len}: the drafter's context is {}",
+                self.context_length
             )));
         }
-        // Handles to the target's cache live for this call only.
-        let ext = target.ext_kv(len)?;
-        let pass = self.net.pass(None, len, 1);
+        // Handles to the target's pools live for this call only.
+        let ext = target.ext_kv(tables, len)?;
+        let pass = self.net.pass(None, len, 1, PassKv::Drafter(&ext))?;
         let mut no_cache: KvLayers = Vec::new();
         let mut drafts = Vec::with_capacity(k);
         let mut hidden = hidden.to_vec();
@@ -2646,6 +2812,8 @@ impl Weights {
     fn forward_layers(
         &self,
         kv: &mut KvLayers,
+        layout: &KvLayout,
+        tables: &[BlockTable],
         delta: &mut [Option<DeltaState>],
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
@@ -2674,7 +2842,7 @@ impl Weights {
             _ => None,
         };
 
-        let pass = self.pass(ple, start, t);
+        let pass = self.pass(ple, start, t, PassKv::Trunk { layout, tables })?;
         for il in 0..hp.n_layer {
             x = self.layer(il, x, &pass, kv, delta, None)?;
         }
@@ -2718,9 +2886,21 @@ impl Weights {
         logits
     }
 
-    /// The RoPE rows, visible ranges and masks shared by the layers of one
-    /// forward pass of `t` queries at `start..`.
-    fn pass(&self, ple: Option<Tensor<3>>, start: usize, t: usize) -> Pass {
+    /// The RoPE rows, visible ranges, masks and block views shared by the
+    /// layers of one forward pass of `t` queries at `start..`, reading the
+    /// blocks `kv` names.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when a block table lacks a block the pass
+    /// reads or writes.
+    fn pass(
+        &self,
+        ple: Option<Tensor<3>>,
+        start: usize,
+        t: usize,
+        kv: PassKv<'_>,
+    ) -> Result<Pass, CucaError> {
         let hp = &self.hp;
         let ropes = self
             .ropes
@@ -2735,33 +2915,80 @@ impl Weights {
             })
             .collect();
 
-        let hi = start + t;
         let mut masks: Vec<MaskInput> = Vec::new();
         for spec in &hp.layers {
             if masks.iter().any(|m| m.window == spec.window) {
                 continue;
             }
-            let lo = match spec.window {
-                Some(w) => start.saturating_sub(w - 1),
-                None => 0,
+            // A drafter's query is not cached: it sees the `len` cached
+            // positions, the sliding layers the window before it.
+            let (lo, hi) = match &kv {
+                PassKv::Trunk { .. } => (
+                    spec.window.map_or(0, |w| start.saturating_sub(w - 1)),
+                    start + t,
+                ),
+                PassKv::Drafter(ext) => (
+                    spec.window.map_or(0, |w| {
+                        start.saturating_sub(w - 1).min(ext.len.saturating_sub(1))
+                    }),
+                    ext.len,
+                ),
             };
             let mask = (t > 1).then(|| {
                 let values = attention_mask(start, t, lo, hi, spec.window);
                 Tensor::from_data(TensorData::new(values, [1, 1, t, hi - lo]), &self.device)
             });
+            let blocks = match &kv {
+                PassKv::Trunk { layout, tables } => {
+                    match layout.groups.iter().position(|g| g.window == spec.window) {
+                        Some(g) => {
+                            let table = tables.get(g).ok_or_else(|| {
+                                err(format!("the sequence has no block table for group {g}"))
+                            })?;
+                            let rows = BlockRows {
+                                table,
+                                n_blocks: layout.blocks[g],
+                                start,
+                                t,
+                                lo,
+                                hi,
+                                write: true,
+                            };
+                            Some(rows.view(&self.device)?)
+                        }
+                        None => None,
+                    }
+                }
+                PassKv::Drafter(ext) => {
+                    let group = if spec.window.is_some() {
+                        &ext.sliding
+                    } else {
+                        &ext.full
+                    };
+                    let rows = BlockRows {
+                        table: &group.table,
+                        n_blocks: group.k.dims()[0],
+                        start,
+                        t,
+                        lo,
+                        hi,
+                        write: false,
+                    };
+                    Some(rows.view(&self.device)?)
+                }
+            };
             masks.push(MaskInput {
                 window: spec.window,
-                lo,
                 mask,
+                blocks,
             });
         }
-        Pass {
-            start,
+        Ok(Pass {
             t,
             ple,
             ropes,
             masks,
-        }
+        })
     }
 
     /// One transformer block over `pass.t` positions starting at `pass.start`.
@@ -2779,8 +3006,7 @@ impl Weights {
         let lw = &self.layers[il];
         let eps = hp.eps;
         let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
-        let (start, t) = (pass.start, pass.t);
-        let hi = start + t;
+        let t = pass.t;
         let scaled = |branch: Tensor<2>| {
             if hp.residual_scale == 1.0 {
                 branch
@@ -2830,6 +3056,16 @@ impl Weights {
                     _ => q,
                 };
                 let q = rotate(q.swap_dims(1, 2));
+                let visible = pass
+                    .masks
+                    .iter()
+                    .find(|m| m.window == spec.window)
+                    .ok_or_else(|| err(format!("layer {il}: no attention mask for its window")))?;
+                let blocks = visible.blocks.as_ref().ok_or_else(|| {
+                    err(format!(
+                        "layer {il}: the sequence has no block table for its window"
+                    ))
+                })?;
 
                 if let Some((k, v)) = kv_proj {
                     let k = match &aw.k_norm {
@@ -2845,62 +3081,72 @@ impl Weights {
                     let v = v.reshape([1, t, nkv, d]);
                     let v = if aw.v_norm { rms(v, None, eps) } else { v };
                     let v = v.swap_dims(1, 2);
-                    // Take the cache out so the assignment owns the only handle and
-                    // writes in place.
-                    let mut slab = kv
+                    // Take the pools out so the assignments own the only handle
+                    // and write in place.
+                    let mut pool = kv
                         .get_mut(il)
                         .and_then(Option::take)
                         .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
-                    let at = cache_ranges(nkv, slot(start, slab.base)?..slot(hi, slab.base)?, d);
-                    slab.k = slab.k.slice_assign(at.clone(), k);
-                    slab.v = slab.v.slice_assign(at, v);
-                    kv[il] = Some(slab);
+                    for w in &blocks.writes {
+                        let at = [w.block..w.block + 1, 0..nkv, w.r0..w.r1, 0..d];
+                        let rows = w.r1 - w.r0;
+                        pool.k = pool
+                            .k
+                            .slice_assign(at.clone(), k.clone().narrow(2, w.off, rows));
+                        pool.v = pool.v.slice_assign(at, v.clone().narrow(2, w.off, rows));
+                    }
+                    kv[il] = Some(pool);
                 }
 
                 let src = spec.kv_source;
-                let attn = if src == usize::MAX {
-                    // A drafter layer: attend to the first `ext.len` positions of the
-                    // target's cache (the sliding layers to the window before the
-                    // query), with no mask since the drafter has a single query.
+                let (pool_k, pool_v) = if src == usize::MAX {
+                    // A drafter layer reads the target's pools.
                     let ext = ext.ok_or_else(|| {
                         err(format!(
                             "layer {il}: a drafter layer needs the target's K/V"
                         ))
                     })?;
-                    let ((cache_k, cache_v), base) = if spec.window.is_some() {
-                        (&ext.sliding, ext.sliding_base)
+                    let group = if spec.window.is_some() {
+                        &ext.sliding
                     } else {
-                        (&ext.full, 0)
+                        &ext.full
                     };
-                    let lo = match spec.window {
-                        Some(w) => start.saturating_sub(w - 1).min(ext.len.saturating_sub(1)),
-                        None => 0,
-                    };
-                    let at = cache_ranges(nkv, slot(lo, base)?..slot(ext.len, base)?, d);
-                    let k = cache_k.clone().slice(at.clone());
-                    let v = cache_v.clone().slice(at);
-                    attend(q, k, v, None, spec.scale, hp.attn_softcap)
+                    (&group.k, &group.v)
                 } else {
-                    let visible = pass
-                        .masks
-                        .iter()
-                        .find(|m| m.window == spec.window)
-                        .ok_or_else(|| {
-                            err(format!("layer {il}: no attention mask for its window"))
-                        })?;
-                    let slab = kv
+                    let pool = kv
                         .get(src)
                         .and_then(Option::as_ref)
                         .ok_or_else(|| err(format!("layer {src} owns no K/V cache")))?;
-                    let (cache_k, cache_v) = (&slab.k, &slab.v);
-                    let src_spec = hp.layers.get(src).ok_or_else(|| {
-                        err(format!("layer {il}: K/V source layer {src} out of range"))
-                    })?;
-                    let rows = slot(visible.lo, slab.base)?..slot(hi, slab.base)?;
-                    let at = cache_ranges(src_spec.n_kv_head, rows, src_spec.head_dim);
-                    let k = cache_k.clone().slice(at.clone());
-                    let v = cache_v.clone().slice(at);
-                    attend(q, k, v, visible.mask.clone(), spec.scale, hp.attn_softcap)
+                    (&pool.k, &pool.v)
+                };
+
+                let attn = match &blocks.read {
+                    // One query row reads the blocks in place.
+                    BlockRead::Decode { table, range } => {
+                        let call = PagedCall {
+                            scale: spec.scale,
+                            softcap: hp.attn_softcap.map(|cap| cap as f32),
+                        };
+                        paged_kernel::decode(
+                            q.reshape([1, nh, d]),
+                            pool_k.clone(),
+                            pool_v.clone(),
+                            Tensor::clone(table),
+                            Tensor::clone(range),
+                            &call,
+                        )
+                        .reshape([1, nh, 1, d])
+                    }
+                    // Several rows: the blocks of the visible range as one
+                    // contiguous `[1, n_kv, len, d]` view.
+                    BlockRead::Gather { idx, skip, len } => attend(
+                        q,
+                        gather_view(pool_k, idx, *skip, *len),
+                        gather_view(pool_v, idx, *skip, *len),
+                        visible.mask.clone(),
+                        spec.scale,
+                        hp.attn_softcap,
+                    ),
                 }
                 .swap_dims(1, 2)
                 .reshape([t, nh * d]);
@@ -3137,11 +3383,6 @@ impl DeltaWeights {
     }
 }
 
-/// The cache region of positions `positions` of every KV head.
-fn cache_ranges(n_kv_head: usize, positions: Range<usize>, d: usize) -> [Range<usize>; 4] {
-    [0..1, 0..n_kv_head, positions, 0..d]
-}
-
 /// Read a device tensor back to the host as f32 values, row-major.
 fn read_f32<const D: usize>(tensor: Tensor<D>, what: &str) -> Result<Vec<f32>, CucaError> {
     let data = tensor
@@ -3304,6 +3545,18 @@ fn rope(x: Tensor<4>, rows: &RopeRows, spec: &RopeSpec) -> Tensor<4> {
         Some(rest) => Tensor::cat(vec![rotated, rest], 3),
         None => rotated,
     }
+}
+
+/// Rows `skip..skip + len` of the blocks `idx` of `pool` `[n_blocks, n_kv,
+/// BLOCK_SIZE, d]`, laid end to end as one `[1, n_kv, len, d]` tensor.
+fn gather_view(pool: &Tensor<4>, idx: &Tensor<1, Int>, skip: usize, len: usize) -> Tensor<4> {
+    let [n_blocks] = idx.dims();
+    let [_, n_kv, _, d] = pool.dims();
+    pool.clone()
+        .select(0, idx.clone())
+        .swap_dims(0, 1)
+        .reshape([1, n_kv, n_blocks * BLOCK_SIZE, d])
+        .narrow(2, skip, len)
 }
 
 /// Grouped-query attention, as the CPU `attend`: `q` is `[1, n_head, t, d]`,
@@ -3617,7 +3870,7 @@ mod tests {
     /// A hybrid model (delta-net + gated attention, with a shared-expert MoE
     /// FFN for `qwen35moe`): the GPU engine reproduces the CPU engine
     /// through prefill, decode, chunked prefill, the checkpoint and the
-    /// fallback of `truncate_cache`, which retains the same positions.
+    /// fallback of `rewind`, which retains the same positions.
     fn check_hybrid_model(model: &TinyModel, device: LocalDevice, label: &str) {
         let n = PROMPT.len();
         let (mut cpu, mut gpu) = load_both(model, device);
@@ -3843,9 +4096,10 @@ mod tests {
         );
     }
 
-    /// Past a sliding slab's bound (the tiny Gemma 3 at 1400 positions: 1283
-    /// slots per sliding layer) the GPU compaction, the reads after it and
-    /// the truncation floor agree with the CPU engine's.
+    /// Past a sliding window (the tiny Gemma 3 at 1400 positions, window 4,
+    /// whose blocks behind the window are released) the blocks it holds, the
+    /// gathered reads and the decode kernel agree with the CPU engine's, also
+    /// after a rollback inside the live window.
     #[test]
     fn gpu_matches_cpu_on_a_bounded_sliding_cache() {
         let Some(device) = test_device() else {
@@ -3872,7 +4126,20 @@ mod tests {
                 &format!("chunk at {at}"),
             );
         }
-        assert!(gpu.ring_floor() > 0, "the prefill compacted the slabs");
+        let sliding = gpu
+            .kv_layout()
+            .groups
+            .iter()
+            .position(|g| g.window.is_some())
+            .unwrap();
+        let live = gpu.solo_tables()[sliding]
+            .iter()
+            .filter(|&&b| b != NO_BLOCK)
+            .count();
+        assert!(
+            live <= 4,
+            "the sliding group released its old blocks: {live}"
+        );
         for (j, token) in [3u32, 9, 1, 14, 6].into_iter().enumerate() {
             let at = 1350 + j;
             compare(
@@ -3884,19 +4151,221 @@ mod tests {
                 &format!("step at {at}"),
             );
         }
-        assert_eq!(gpu.truncate_cache(1300), 1300);
-        assert_eq!(cpu.truncate_cache(1300), 1300);
+        // A rollback inside the rows a verification round keeps.
+        assert_eq!(gpu.truncate_cache(1350), 1350);
+        assert_eq!(cpu.truncate_cache(1350), 1350);
         compare(
             &mut cpu,
             &mut gpu,
             &[4, 8],
-            1300,
+            1350,
             Want::All,
             "after rollback",
         );
-        assert_eq!(gpu.truncate_cache(100), 0, "below the floor: emptied");
+        assert_eq!(
+            gpu.truncate_cache(100),
+            0,
+            "the window before 100 was released: emptied"
+        );
         assert_eq!(cpu.truncate_cache(100), 0);
         compare(&mut cpu, &mut gpu, &tokens[..40], 0, Want::Last, "refilled");
+    }
+
+    /// A reproducible stream of values in `[-1, 1)`.
+    fn lcg(seed: u64) -> impl FnMut() -> f32 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+        }
+    }
+
+    /// One decode-kernel call: the query row `q` (`n_head * d` values) over
+    /// the positions `lo..hi` of the sequence whose block table is `table`,
+    /// launched the way a pass launches it (the table from the first block
+    /// the range touches, the range relative to it).
+    fn decode_row(
+        device: &Device,
+        pools: (&Tensor<4>, &Tensor<4>),
+        table: &[u32],
+        (lo, hi): (usize, usize),
+        q: &[f32],
+        (nh, d): (usize, usize),
+        call: &PagedCall,
+    ) -> Vec<f32> {
+        let first = lo / BLOCK_SIZE;
+        let last = (hi - 1) / BLOCK_SIZE;
+        let ids: Vec<i32> = table[first..=last].iter().map(|&b| b as i32).collect();
+        let n = ids.len();
+        let table = Tensor::<2, Int>::from_data(TensorData::new(ids, [1, n]), device);
+        let base = first * BLOCK_SIZE;
+        let range = vec![(lo - base) as i32, (hi - base) as i32];
+        let range = Tensor::<1, Int>::from_data(TensorData::new(range, [2]), device);
+        let q = Tensor::<3>::from_data(TensorData::new(q.to_vec(), [1, nh, d]), device);
+        let out = paged_kernel::decode(q, pools.0.clone(), pools.1.clone(), table, range, call);
+        read_f32(out, "decode").unwrap()
+    }
+
+    /// The decode kernel reads scrambled blocks like the CPU's paged
+    /// attention does: lengths around block boundaries, with and without a
+    /// soft-cap and a window floor, grouped query heads.
+    #[test]
+    fn gpu_paged_decode_kernel_matches_cpu() {
+        use super::super::cpu::paged_attn::{PoolShape, attend_paged_row};
+
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let device = open_device(device).unwrap();
+        let mut rand = lcg(7);
+        let n_blocks = 12;
+        // Blocks of the sequence, in no particular order.
+        let scrambled: [u32; 6] = [7, 2, 11, 0, 9, 4];
+        for (nh, nkv, d) in [(4usize, 2usize, 16usize), (6, 2, 8), (2, 2, 32)] {
+            let pool_len = n_blocks * nkv * BLOCK_SIZE * d;
+            let host_k: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+            let host_v: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+            let shape = [n_blocks, nkv, BLOCK_SIZE, d];
+            let pool_k = Tensor::<4>::from_data(TensorData::new(host_k.clone(), shape), &device);
+            let pool_v = Tensor::<4>::from_data(TensorData::new(host_v.clone(), shape), &device);
+            let scale = 1.0 / (d as f32).sqrt();
+            for softcap in [None, Some(2.0f32)] {
+                for hi in [1usize, 2, 15, 16, 17, 31, 32, 33, 70] {
+                    // The whole prefix, a short window and (past one block)
+                    // a floor at a block boundary.
+                    let mut los = vec![0, hi.saturating_sub(5)];
+                    if hi > BLOCK_SIZE + 1 {
+                        los.push(BLOCK_SIZE);
+                    }
+                    los.dedup();
+                    for lo in los {
+                        // Blocks before the range may be released.
+                        let mut table = scrambled.to_vec();
+                        table[..lo / BLOCK_SIZE].fill(NO_BLOCK);
+                        let q: Vec<f32> = (0..nh * d).map(|_| 4.0 * rand()).collect();
+                        let want = attend_paged_row(
+                            &q,
+                            &table,
+                            lo,
+                            hi,
+                            &host_k,
+                            &host_v,
+                            PoolShape {
+                                n_head: nh,
+                                n_kv_head: nkv,
+                                head_dim: d,
+                            },
+                            scale,
+                            softcap.map(f64::from),
+                        )
+                        .unwrap();
+                        let call = PagedCall { scale, softcap };
+                        let got = decode_row(
+                            &device,
+                            (&pool_k, &pool_v),
+                            &table,
+                            (lo, hi),
+                            &q,
+                            (nh, d),
+                            &call,
+                        );
+                        assert_eq!(got.len(), want.len());
+                        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                            assert!(
+                                (g - w).abs() <= 1e-4,
+                                "heads {nh}/{nkv} d {d} cap {softcap:?} {lo}..{hi}: value {i}: gpu {g} vs cpu {w}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The gather path of a prefill call (the visible blocks as one tensor,
+    /// burn's matmul attention with the mask) equals the decode kernel row by
+    /// row, each row over its own visible range.
+    #[test]
+    fn gpu_prefill_gather_matches_decode_rows() {
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let device = open_device(device).unwrap();
+        let mut rand = lcg(11);
+        let (nh, nkv, d, n_blocks) = (4usize, 2usize, 16usize, 12usize);
+        let pool_len = n_blocks * nkv * BLOCK_SIZE * d;
+        let shape = [n_blocks, nkv, BLOCK_SIZE, d];
+        let host_k: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+        let host_v: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+        let pool_k = Tensor::<4>::from_data(TensorData::new(host_k, shape), &device);
+        let pool_v = Tensor::<4>::from_data(TensorData::new(host_v, shape), &device);
+        let table: Vec<u32> = vec![7, 2, 11, 0, 9, 4];
+        let scale = 1.0 / (d as f32).sqrt();
+        // Twenty rows from the middle of the second block into the third.
+        let (start, t) = (21usize, 20usize);
+        let hi = start + t;
+        let q: Vec<f32> = (0..nh * t * d).map(|_| 4.0 * rand()).collect();
+        for window in [None, Some(8usize)] {
+            for softcap in [None, Some(2.0f32)] {
+                let lo = window.map_or(0, |w| start.saturating_sub(w - 1));
+                let rows = BlockRows {
+                    table: &table,
+                    n_blocks,
+                    start,
+                    t,
+                    lo,
+                    hi,
+                    write: false,
+                };
+                let BlockRead::Gather { idx, skip, len } = rows.view(&device).unwrap().read else {
+                    panic!("several rows gather");
+                };
+                let mask = Tensor::<4>::from_data(
+                    TensorData::new(attention_mask(start, t, lo, hi, window), [1, 1, t, hi - lo]),
+                    &device,
+                );
+                let qt = Tensor::<4>::from_data(TensorData::new(q.clone(), [1, nh, t, d]), &device);
+                let out = attend(
+                    qt,
+                    gather_view(&pool_k, &idx, skip, len),
+                    gather_view(&pool_v, &idx, skip, len),
+                    Some(mask),
+                    scale,
+                    softcap.map(f64::from),
+                );
+                let gathered = read_f32(out, "gathered attention").unwrap();
+                let call = PagedCall { scale, softcap };
+                for r in 0..t {
+                    let pos = start + r;
+                    let row_lo = window.map_or(0, |w| lo.max((pos + 1).saturating_sub(w)));
+                    let q_row: Vec<f32> = (0..nh)
+                        .flat_map(|h| q[(h * t + r) * d..][..d].iter().copied())
+                        .collect();
+                    let row = decode_row(
+                        &device,
+                        (&pool_k, &pool_v),
+                        &table,
+                        (row_lo, pos + 1),
+                        &q_row,
+                        (nh, d),
+                        &call,
+                    );
+                    for h in 0..nh {
+                        for i in 0..d {
+                            let (g, k) = (gathered[(h * t + r) * d + i], row[h * d + i]);
+                            assert!(
+                                (g - k).abs() <= 1e-4,
+                                "window {window:?} cap {softcap:?} row {r} head {h}[{i}]: gather {g} vs kernel {k}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// A model whose matmul weights are float or Q8_0 matches the dequantized
@@ -4792,6 +5261,7 @@ mod tests {
                 .forward_ext(&PROMPT[..len], 0, Want::Last, Hidden::PostNorm, false)
                 .unwrap();
             let (c_hidden, g_hidden) = (c.hidden.unwrap(), g.hidden.unwrap());
+            let c_tables = cpu.solo_tables().to_vec();
             let cpu = super::super::Model::Cpu(cpu);
             let cpu_drafter = Drafter::open(&content, &drafter.path, &cpu, 32).unwrap();
             let gpu_drafter = GpuDrafter::open(&content, &drafter.path, &gpu, 32).unwrap();
@@ -4800,6 +5270,7 @@ mod tests {
             let c_tokens = cpu_drafter
                 .draft(
                     &cpu,
+                    &c_tables,
                     &c_hidden,
                     6,
                     len,
@@ -4811,6 +5282,7 @@ mod tests {
             let g_tokens = gpu_drafter
                 .draft(
                     &gpu,
+                    gpu.solo_tables(),
                     &g_hidden,
                     6,
                     len,
@@ -4830,6 +5302,7 @@ mod tests {
             gpu_drafter
                 .draft(
                     &gpu,
+                    gpu.solo_tables(),
                     &g_hidden,
                     6,
                     len - 1,
@@ -4876,20 +5349,31 @@ mod tests {
         let mut pick = |_: &mut [f32]| Some(0u32);
         let hidden = vec![0.1f32; gpu.n_embd()];
         gpu.forward(&PROMPT[..5], 0, Want::None).unwrap();
+        let tables = gpu.solo_tables();
+        // The table holds one block: position 17 needs a second.
         assert!(
-            net.draft(&gpu, &hidden, 1, 6, 2, &mut pick).is_err(),
-            "beyond the cache"
+            net.draft(&gpu, tables, &hidden, 1, 17, 2, &mut pick)
+                .is_err(),
+            "beyond the table"
         );
         assert!(
-            net.draft(&gpu, &hidden, 1, 0, 2, &mut pick).is_err(),
+            net.draft(&gpu, tables, &hidden, 1, 0, 2, &mut pick)
+                .is_err(),
             "empty cache"
         );
         assert!(
-            net.draft(&gpu, &hidden[1..], 1, 5, 2, &mut pick).is_err(),
+            net.draft(&gpu, &[], &hidden, 1, 5, 2, &mut pick).is_err(),
+            "no block tables"
+        );
+        assert!(
+            net.draft(&gpu, tables, &hidden[1..], 1, 5, 2, &mut pick)
+                .is_err(),
             "hidden width"
         );
         assert_eq!(
-            net.draft(&gpu, &hidden, 1, 5, 2, &mut pick).unwrap().len(),
+            net.draft(&gpu, tables, &hidden, 1, 5, 2, &mut pick)
+                .unwrap()
+                .len(),
             2
         );
     }

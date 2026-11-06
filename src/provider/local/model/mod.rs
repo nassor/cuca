@@ -49,7 +49,7 @@
 //! K/V rows are positional: dropping a position just lowers the cache
 //! length. A delta-net layer's state summarises every token before the
 //! current end, cannot be truncated and cannot be undone, so
-//! [`Model::truncate_cache`] returns the number of positions a model really
+//! [`Model::rewind`] returns the number of positions a model really
 //! retained, and a hybrid model retains only positions it holds a state for:
 //!
 //! - the current end (the live state);
@@ -80,9 +80,12 @@
 //! batched rows equal single steps only up to float rounding, and no drafter
 //! can pair with a hybrid model there.
 //!
-//! The engine consumes the returned length: it keeps `cached` to the retained
-//! prefix, prefills from there and reports that as the reused prompt tokens.
-//! While prefilling a prompt it checkpoints the state after the last
+//! The engine consumes the returned length: it truncates its sequence's block
+//! tables to the retained prefix, prefills from there and reports that as the
+//! reused prompt tokens. An attention-only model keeps no state besides K/V,
+//! so its requests look their prompt up in the prefix store instead
+//! ([`paged::KvPools::lookup`]); a hybrid model keeps its last sequence. While
+//! prefilling a prompt a hybrid model checkpoints the state after the last
 //! end-of-turn token (the end of the last complete message: the generation
 //! prompt that follows is what chat templates rewrite on the next turn; a
 //! prompt without one is checkpointed at its end), so the next turn of a
@@ -107,20 +110,20 @@
 //!   LM head. `per_layer_token_embd` (Gemma 4, 1.32 GB in E2B Q4_0) is never
 //!   loaded: each token's row is read from the GGUF file with a seek and
 //!   dequantized by [`quant::dequant_row`].
-//! - The KV cache is preallocated: only the layers that own K/V store them,
-//!   `2 * 4 * n_kv_head * head_dim` bytes per slot in f32 per K/V-owning
-//!   layer, with that layer's own head count and head dimension. A
-//!   full-attention layer holds `context_length` slots; a sliding-window
-//!   layer holds [`kv_slots`] `= min(context_length, window - 1 +
-//!   RING_ROLLBACK + RING_ROWS)`, the window plus [`RING_ROLLBACK`] positions
-//!   of rollback headroom plus one call's [`RING_ROWS`]
-//!   ([`params::Hparams::kv_cache_bytes`] sums it all). Such a bounded slab
-//!   holds the contiguous positions `base..base + slots`: when a forward call
-//!   would write past its end, the slab is compacted first, keeping the last
-//!   `window - 1 + RING_ROLLBACK` positions before the call at its front, so
-//!   every read stays one contiguous slice and masks keep absolute
-//!   positions. A truncation below a compacted slab's floor (`base + window -
-//!   1`) empties the cache instead (the caller re-prefills).
+//! - The K/V cache is paged and preallocated ([`paged`]): only the layers
+//!   that own K/V store them, in pools of blocks of 16 positions, `2 * 4 * 16
+//!   * n_kv_head * head_dim` bytes per block in f32 per K/V-owning layer, with
+//!   that layer's own head count and head dimension. Layers with the same
+//!   window share block ids (a group). A full-attention group holds twice
+//!   `context_length` positions, so a finished request's blocks stay cached
+//!   while the next runs; a sliding-window group `ceil((window - 1 + rows) /
+//!   16) + 2` blocks per running sequence plus up to `context_length`
+//!   positions of cached prefixes ([`paged::KvLayout::new`],
+//!   [`paged::KvLayout::pool_bytes`] sums it all). A sliding-window block is
+//!   released once every position in it is before the window of the next
+//!   query; the rollback of a draft round (at most 16 rows past the accepted
+//!   length) never needs a released block. Prefix hits shorten by whole
+//!   blocks until every group still holds the blocks its window needs.
 //! - A hybrid model's recurrent state is independent of the context length:
 //!   [`params::Hparams::recurrent_state_bytes`] is 4 bytes times the sum, over
 //!   the delta-net layers, of `(conv_kernel - 1) * conv_dim + n_v_heads *
@@ -156,6 +159,9 @@ pub(crate) mod moe;
 #[cfg(feature = "provider-local-gpu")]
 pub(crate) mod moe_kernel;
 pub(crate) mod mtp;
+pub(crate) mod paged;
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) mod paged_kernel;
 pub(crate) mod params;
 pub(crate) mod qmm;
 pub(crate) mod quant;
@@ -238,22 +244,11 @@ pub(crate) fn prefill_chunk(context_length: usize) -> usize {
     (2_097_152 / context_length.max(1)).clamp(16, 256)
 }
 
-/// Positions behind the current end a bounded sliding-window cache can always
-/// roll back to (prefix reuse of a regenerated reply, a drafter's rollback).
-pub(crate) const RING_ROLLBACK: usize = 1024;
-/// Most rows one forward call writes into a bounded sliding-window cache (the
-/// largest [`prefill_chunk`]; a verification call has at most
-/// [`cpu::MAX_VERIFY_ROWS`]).
-pub(crate) const RING_ROWS: usize = 256;
-
-/// Slots a K/V-owning layer with `window` allocates for `context_length`
-/// positions: every position for a full-attention layer, the window plus the
-/// rollback headroom and one call's rows for a sliding-window layer.
-pub(crate) fn kv_slots(window: Option<usize>, context_length: usize) -> usize {
-    match window {
-        Some(w) => context_length.min(w.saturating_sub(1) + RING_ROLLBACK + RING_ROWS),
-        None => context_length,
-    }
+/// Most rows one forward call writes: the largest [`prefill_chunk`], and the
+/// widest verification call ([`cpu::MAX_VERIFY_ROWS`]). The sliding-window
+/// block pools are sized for it ([`paged::KvLayout::new`]).
+pub(crate) fn max_call_rows(context_length: usize) -> usize {
+    prefill_chunk(context_length).max(cpu::MAX_VERIFY_ROWS)
 }
 
 /// The per-pair factors of `spec`, read from the tensor its [`Factors`]
@@ -388,15 +383,16 @@ impl Model {
         }
     }
 
-    /// Run `tokens` through the model at positions `start_pos..`, appending
-    /// their K/V to the cache; returns the logits `want` selects and the
-    /// final-norm hidden rows `hidden` selects (one per logits row).
+    /// Run `tokens` through the model at positions `start_pos..`, storing
+    /// their K/V in the blocks of `tables` (one block table per K/V group of
+    /// [`Model::kv_layout`], holding every block the call writes); returns
+    /// the logits `want` selects and the final-norm hidden rows `hidden`
+    /// selects (one per logits row).
     ///
-    /// `start_pos` must equal the cache length; the cache grows to
-    /// `start_pos + tokens.len()`, which must not exceed the context length.
-    /// With `exact`, every row equals what a single-token step computes bit
-    /// for bit, which speculative verification needs: guaranteed on the CPU;
-    /// on a GPU the rows agree only up to float rounding.
+    /// `start_pos + tokens.len()` must not exceed the context length. With
+    /// `exact`, every row equals what a single-token step computes bit for
+    /// bit, which speculative verification needs: guaranteed on the CPU; on
+    /// a GPU the rows agree only up to float rounding.
     ///
     /// # Errors
     ///
@@ -405,14 +401,15 @@ impl Model {
         &mut self,
         tokens: &[u32],
         start_pos: usize,
+        tables: &[paged::BlockTable],
         want: Want,
         hidden: cpu::Hidden,
         exact: bool,
     ) -> Result<cpu::Forward, CucaError> {
         match self {
-            Model::Cpu(m) => m.forward_ext(tokens, start_pos, want, hidden, exact),
+            Model::Cpu(m) => m.forward_seq(tokens, start_pos, tables, want, hidden, exact),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.forward_ext(tokens, start_pos, want, hidden, exact),
+            Model::Gpu(m) => m.forward_seq(tokens, start_pos, tables, want, hidden, exact),
         }
     }
 
@@ -425,33 +422,28 @@ impl Model {
         }
     }
 
-    /// Drop every cached position from `len` on and return how many positions
-    /// the cache retains: at most `len` and at most the current length. The
-    /// next `forward` must start at the returned length.
-    ///
-    /// An attention-only model retains exactly `min(len, current length)`,
-    /// unless `len` is below the floor of a bounded sliding-window cache
-    /// ([`RING_ROLLBACK`] positions behind its last compaction), which
-    /// empties the cache (returns `0`). A
-    /// hybrid model (recurrent layers) retains only positions it holds a
-    /// state for: the current end, the [`Model::checkpoint`] and the rows of
-    /// the last multi-row `Want::All` call; otherwise it falls back to the
-    /// largest of those not above `len` (`0`: recompute from scratch). See
-    /// [`cpu::Transformer::truncate_cache`] and `Cache rollback` in the
-    /// module docs.
-    pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
+    /// Take the model state back to at most `len` positions and return the
+    /// position it now sits at; the caller truncates its sequence's block
+    /// tables to it. An attention-only model keeps no state besides the K/V
+    /// blocks and returns `len`. A hybrid model (recurrent layers) retains
+    /// only positions it holds a state for: the current end, the
+    /// [`Model::checkpoint`] and the rows of the last multi-row `Want::All`
+    /// call; otherwise it falls back to the largest of those not above `len`
+    /// (`0`: recompute from scratch). See [`cpu::Transformer::rewind`] and
+    /// `Cache rollback` in the module docs.
+    pub(crate) fn rewind(&mut self, len: usize) -> usize {
         match self {
-            Model::Cpu(m) => m.truncate_cache(len),
+            Model::Cpu(m) => m.rewind(len),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.truncate_cache(len),
+            Model::Gpu(m) => m.rewind(len),
         }
     }
 
     /// Keep the recurrent state at the current end of the cache as the one
-    /// checkpoint [`Model::truncate_cache`] can return to, replacing the
-    /// previous one. A no-op for models that can truncate anywhere
-    /// (attention-only). On a GPU the checkpoint is a set of handles to the
-    /// current immutable state tensors, so it costs nothing.
+    /// checkpoint [`Model::rewind`] can return to, replacing the previous
+    /// one. A no-op for models that can truncate anywhere (attention-only).
+    /// On a GPU the checkpoint is a set of handles to the current immutable
+    /// state tensors, so it costs nothing.
     pub(crate) fn checkpoint(&mut self) {
         match self {
             Model::Cpu(m) => m.checkpoint(),
@@ -461,8 +453,8 @@ impl Model {
     }
 
     /// Whether the model keeps a recurrent state next to its K/V cache (gated
-    /// delta-net layers): its cache can then return only to the positions
-    /// [`Model::truncate_cache`] lists.
+    /// delta-net layers): its state can then return only to the positions
+    /// [`Model::rewind`] lists.
     pub(crate) fn is_hybrid(&self) -> bool {
         match self {
             Model::Cpu(m) => m.is_hybrid(),
@@ -473,8 +465,8 @@ impl Model {
 
     /// Most rows of one `Want::All` forward call after which every
     /// intermediate length can still be returned to with
-    /// [`Model::truncate_cache`]: unbounded unless the model is hybrid. A
-    /// hybrid GPU model keeps no verify record (1: only the end of a call).
+    /// [`Model::rewind`]: unbounded unless the model is hybrid. A hybrid GPU
+    /// model keeps no verify record (1: only the end of a call).
     pub(crate) fn rollback_rows(&self) -> usize {
         match self {
             Model::Cpu(m) => m.rollback_rows(),
@@ -483,13 +475,21 @@ impl Model {
         }
     }
 
-    /// Number of cached positions (test-only: the engine tracks the ids).
-    #[cfg(test)]
-    pub(crate) fn cache_len(&self) -> usize {
+    /// The K/V block pools' layout: the groups, and the blocks each holds.
+    pub(crate) fn kv_layout(&self) -> &paged::KvLayout {
         match self {
-            Model::Cpu(m) => m.cache_len(),
+            Model::Cpu(m) => m.kv_layout(),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.cache_len(),
+            Model::Gpu(m) => m.kv_layout(),
+        }
+    }
+
+    /// Bytes of K/V data the block pools hold.
+    pub(crate) fn kv_pool_bytes(&self) -> u64 {
+        match self {
+            Model::Cpu(m) => m.kv_pool_bytes(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.kv_pool_bytes(),
         }
     }
 }

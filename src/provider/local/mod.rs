@@ -62,13 +62,16 @@
 //!
 //! - Single-slot FIFO engine: one request runs at a time, at most 16 queue
 //!   behind it (further callers wait), 64 output blocks buffered per request.
-//! - K/V cache memory is `2 * 4 * n_kv_head * head_dim` bytes per slot over
-//!   the layers that own K/V ([`LocalModel::kv_cache_bytes`]), in RAM or
-//!   device memory, with `context_length` slots for a full-attention layer
-//!   and `min(context_length, window - 1 + 1280)` for a sliding-window layer.
-//!   At 8192 positions: 145 MB for Gemma 4 E2B, 415 MB for E4B, 1.88 GB for
-//!   Qwen3-0.6B and 6.44 GB for Phi-3.5-mini (a full-attention model with 32
-//!   KV heads needs a smaller `context_length`).
+//! - K/V cache memory: blocks of 16 positions, `2 * 4 * 16 * n_kv_head *
+//!   head_dim` bytes per block and layer that owns K/V ([`LocalModel::kv_cache_bytes`]),
+//!   in RAM or device memory. A full-attention group holds twice
+//!   `context_length` positions, a sliding-window group `ceil((window - 1 +
+//!   rows) / 16) + 2` blocks per running sequence plus cached prefixes. At 8192
+//!   positions: 422 MB for Gemma 4 E2B, 1.27 GB for E4B, 3.76 GB for
+//!   Qwen3-0.6B and 12.88 GB for Phi-3.5-mini (a full-attention model with 32
+//!   KV heads needs a smaller `context_length`). A prefix store keeps the
+//!   blocks of finished requests, named by their token ids, and a prompt
+//!   reuses whole blocks of its cached prefix.
 //! - Gemma 4's per-layer embedding rows are read from disk per input token
 //!   instead of being held in RAM (5,040 bytes each and 1.32 GB saved in E2B
 //!   Q4_0). A mixture-of-experts model keeps every expert resident by default
@@ -82,13 +85,16 @@
 //!
 //! On the CPU a token's logits do not depend on how the prompt was split:
 //! prefill and speculative verification run in a row-exact mode (float
-//! matmuls per row, attention per query row) that equals single-token decoding
-//! bit for bit (per-row attention on candle's worker pool, float matmuls per row,
+//! matmuls per row, paged attention per query row on candle's worker pool,
 //! and a safe Q4_0/Q8_0 matmul kernel whose rows are independent of their
-//! batch), at no cost in prefill throughput. A request that
-//! reuses a cached prefix therefore generates what a cold request generates.
-//! (Quantized matmuls round activations to Q8_0, which otherwise amplifies the
-//! batch-shape rounding of a float matmul into visible logit jumps.)
+//! batch) that equals single-token decoding bit for bit, at no cost in
+//! prefill throughput. A request that reuses a cached prefix therefore
+//! generates what a cold request generates. (Quantized matmuls round
+//! activations to Q8_0, which otherwise amplifies the batch-shape rounding of
+//! a float matmul into visible logit jumps.) The attention itself is an
+//! online-softmax kernel over the K/V blocks, whose float rounding differs
+//! from candle's matmul attention in 0.6.x: where two logits are within about
+//! 0.1 of each other a greedy reply can differ from 0.6.x's.
 //!
 //! # Speculative decoding (opt-in)
 //!
@@ -1029,13 +1035,13 @@ pub struct LocalModelConfig {
     /// Hugging Face access token; `None` falls back to the `HF_TOKEN`
     /// environment variable, then to anonymous access.
     pub hf_token: Option<String>,
-    /// Maximum tokens of prompt plus completion per request, also the K/V
-    /// cache capacity: a full-attention K/V-owning layer costs
-    /// `context_length * 2 * 4 * n_kv_head * head_dim` bytes of RAM, a
-    /// sliding-window layer at most `window - 1 + 1280` positions of that
-    /// (Gemma 4 E2B 145 MB at 8192, Qwen3-0.6B 229,376 bytes per position,
-    /// Phi-3.5-mini 786,432, i.e. 6.44 GB at 8192: size it for the model;
-    /// [`LocalModel::kv_cache_bytes`] reports the result; see [`LocalModel`]).
+    /// Maximum tokens of prompt plus completion per request. The K/V block
+    /// pools hold twice this many positions per full-attention layer group, so
+    /// a layer costs `2 * context_length * 2 * 4 * n_kv_head * head_dim` bytes
+    /// of RAM (Gemma 4 E2B 422 MB at 8192, Qwen3-0.6B 458,752 bytes per
+    /// context position, Phi-3.5-mini 1,572,864, i.e. 12.88 GB at 8192: size it
+    /// for the model; [`LocalModel::kv_cache_bytes`] reports the result; see
+    /// [`LocalModel`]).
     /// `None` (the default)
     /// resolves to the smaller of 8192 and the model's own maximum, so a
     /// model trained for 2048 or 4096 positions loads without configuration.
@@ -1153,16 +1159,20 @@ pub(crate) struct LocalModelInner {
 ///   `generate_stream` waits for a free queue slot (backpressure, not an
 ///   error). A running request streams through a bounded 64-block channel, so
 ///   a slow consumer paces generation, and dropping the stream stops it.
-/// - The K/V cache is preallocated and costs `2 * 4 * n_kv_head * head_dim`
-///   bytes per slot over the layers that own K/V (each layer's head count and
-///   head dimension come from the file; [`LocalModel::kv_cache_bytes`]
-///   reports the total): a full-attention layer holds `context_length`
-///   slots, a sliding-window layer `min(context_length, window - 1 + 1280)`.
-///   At the default 8192 that is 145 MB for Gemma 4 E2B, 415 MB for E4B and
-///   1.88 GB for Qwen3-0.6B (28 full-attention layers, 8 KV heads of 128). It is
-///   reused across requests: a prompt that shares a prefix with the previous
-///   one only prefills the new tokens, reported as the response's
-///   `prompt_cache_usage`.
+/// - The K/V cache is paged and preallocated: blocks of 16 positions in
+///   pools, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and layer that
+///   owns K/V (each layer's head count and head dimension come from the file;
+///   [`LocalModel::kv_cache_bytes`] reports the total). A full-attention
+///   group holds twice `context_length` positions, a sliding-window group its
+///   window plus about 270 positions per running sequence plus cached
+///   prefixes. At the default 8192 that is 422 MB for Gemma 4 E2B, 1.27 GB for
+///   E4B and 3.76 GB for Qwen3-0.6B (28 full-attention layers, 8 KV heads of
+///   128). Blocks are named by the token ids they hold, so a finished
+///   request's blocks stay cached (least recently used evicted first) and a
+///   prompt that starts with the same ids only prefills what follows its
+///   last whole cached block, reported as the response's `prompt_cache_usage`
+///   (`read_tokens` is a multiple of 16: the trailing partial block, at most
+///   15 tokens, and the last prompt token are always recomputed).
 /// - Weights stay quantized (a mixture-of-experts model keeps every expert,
 ///   split per expert, so memory is the file size; a pass computes only the
 ///   routed experts; [`ExpertPlacement::Tiered`] bounds the expert memory to
@@ -1258,12 +1268,13 @@ impl DraftStats {
 }
 
 impl LocalModel {
-    /// Bytes the K/V cache occupies, in RAM or device memory: `2 * 4 *
-    /// n_kv_head * head_dim` bytes per slot over the layers that own K/V,
-    /// with `context_length` slots for a full-attention layer and
-    /// `min(context_length, window - 1 + 1280)` for a sliding-window layer
-    /// (the window plus rollback headroom and one call's rows; see the
-    /// local-provider module docs).
+    /// Bytes the K/V block pools occupy, in RAM or device memory: blocks of 16
+    /// positions, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and layer
+    /// that owns K/V. A full-attention group of layers holds twice
+    /// `context_length` positions; a sliding-window group `ceil((window - 1 +
+    /// rows) / 16) + 2` blocks per running sequence (rows: one call's, at
+    /// most 256) plus up to `context_length` positions of cached prefixes (see
+    /// the local-provider module docs).
     ///
     /// A hybrid model (Qwen 3.5) owns K/V only in its attention layers, and
     /// besides keeps a recurrent state of fixed size (about 20 MB for the
@@ -1705,7 +1716,7 @@ mod tests {
 
     use super::*;
     use crate::provider::local::engine::testing::{engine, tiny_format, tiny_tokenizer};
-    use crate::provider::local::model::tiny::{TinyModel, write_tiny_model};
+    use crate::provider::local::model::tiny::{TinyModel, TinySpec, write_spec, write_tiny_model};
 
     /// A template that renders the first message's content after `<bos>`.
     const TEMPLATE: &str = "{{ bos_token }}{{ messages[0]['content'] }}";
@@ -2146,11 +2157,16 @@ mod tests {
 
     #[tokio::test]
     async fn local_requests_stream_blocks_and_report_usage() {
-        let file = write_tiny_model();
-        let client = local_client(tiny_model(&file, 32).await);
+        // A model of 96 positions: the prompt spans two full K/V blocks.
+        let file = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let client = local_client(tiny_model(&file, 96).await);
+        let message = "abcdefg".repeat(6);
 
         let request = UnifiedRequest::new("ignored")
-            .add_user_message("abcdefg")
+            .add_user_message(message.clone())
             .set_temperature(0.0)
             .set_max_tokens(5);
         let (mut stream, response) = client.generate_stream_with_response(request).await.unwrap();
@@ -2161,23 +2177,24 @@ mod tests {
         }
         let response = response.take().expect("terminal response");
         let usage = response.usage.expect("local engine reports usage");
-        // `<bos>` + 7 letters.
-        assert_eq!(usage.prompt_tokens, 8);
+        // `<bos>` + 42 letters.
+        assert_eq!(usage.prompt_tokens, 43);
         assert!(usage.completion_tokens <= 5);
         assert_eq!(usage.reasoning_tokens, None);
         assert_eq!(response.provider, ProviderEndpoint::Local);
         let cache = response.prompt_cache_usage.expect("prefix reuse reported");
-        assert_eq!((cache.read_tokens, cache.write_tokens), (0, 8));
+        assert_eq!((cache.read_tokens, cache.write_tokens), (0, 43));
 
-        // The same prompt again reuses all but the last token.
+        // The same prompt again reuses its full blocks below the last token:
+        // 32 of 43 positions (the trailing 11 are recomputed).
         let request = UnifiedRequest::new("ignored")
-            .add_user_message("abcdefg")
+            .add_user_message(message)
             .set_temperature(0.0)
             .set_max_tokens(2);
         let (mut stream, response) = client.generate_stream_with_response(request).await.unwrap();
         while stream.next().await.is_some() {}
         let cache = response.take().unwrap().prompt_cache_usage.unwrap();
-        assert_eq!((cache.read_tokens, cache.write_tokens), (7, 1));
+        assert_eq!((cache.read_tokens, cache.write_tokens), (32, 11));
     }
 
     #[tokio::test]

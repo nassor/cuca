@@ -5,14 +5,19 @@
 //! thread (jobs queue FIFO in the channel owned by `LocalModel`). A job is a
 //! pre-tokenized prompt plus the channel its output blocks go to:
 //!
-//! 1. **Prefix reuse.** The engine remembers the ids whose K/V fill the model
-//!    cache. A new prompt keeps the longest common prefix (always leaving the
-//!    last prompt token to prefill, since its logits start generation) and the
-//!    cache is truncated to it, so a conversation that appends a turn pays only
-//!    for the new tokens. The reuse is reported as the response's
-//!    [`PromptCacheUsage`] (`read_tokens` reused, `write_tokens` prefilled).
-//!    An in-trunk drafter keeps the pairs the shared tokens still determine
-//!    (`Drafter::truncate`) and re-observes the replayed rows.
+//! 1. **Prefix reuse.** K/V lives in blocks of 16 positions named by the
+//!    token ids they hold ([`KvPools`]). A finished job's full blocks stay in
+//!    the pool (least recently used evicted first); a new prompt looks up the
+//!    longest cached prefix of whole blocks (always leaving the last prompt
+//!    token to prefill, since its logits start generation, so the trailing
+//!    partial block, at most 15 tokens, is recomputed), so a conversation
+//!    that appends a turn pays only for the new tokens. The reuse is reported
+//!    as the response's [`PromptCacheUsage`] (`read_tokens` reused,
+//!    `write_tokens` prefilled). A hybrid model's recurrent state belongs to
+//!    its last sequence, so it keeps that sequence and rewinds to the longest
+//!    shared prefix it holds a state for. An in-trunk drafter keeps the pairs
+//!    the shared tokens still determine (`Drafter::truncate`) and re-observes
+//!    the replayed rows.
 //! 2. **Prefill** in chunks of [`prefill_chunk`] tokens; only the last chunk
 //!    computes logits. The loop notices a dropped stream between chunks. An
 //!    in-trunk head takes the final-norm hidden row of every position
@@ -51,6 +56,7 @@ use self::stop::StopMatcher;
 use super::chat::{ChatFormat, ChatTemplate};
 use super::model::cpu::Hidden;
 use super::model::mtp::Drafter;
+use super::model::paged::{KvPools, SeqBlocks};
 use super::model::{Model, Want, prefill_chunk};
 use super::output::OutputParser;
 use super::sampler::{Dist, Scratch, SplitMix64, greedy, greedy_with_prob, random_seed, sample};
@@ -94,15 +100,27 @@ pub(crate) struct Job {
     pub(crate) metadata: ResponseMetadataHandle,
 }
 
+/// The ids a sequence holds and the K/V blocks that hold them.
+struct Sequence {
+    /// The token ids at positions `0..`: its length equals `blocks.len` while
+    /// the sequence runs.
+    ids: Vec<u32>,
+    blocks: SeqBlocks,
+}
+
 /// The model plus the state that survives between jobs.
 pub(crate) struct Engine {
     model: Model,
     tokenizer: Arc<Tokenizer>,
     format: ChatFormat,
     sampling: SamplingConfig,
-    /// Ids whose K/V fill the model cache, in order; its length always equals
-    /// the model's cache length.
-    cached: Vec<u32>,
+    /// The sequence the engine runs: the ids whose K/V fill its blocks, in
+    /// order. An attention-only model's sequence ends with its job (its
+    /// blocks go back to the pools, the ids stay for inspection until the
+    /// next job); a hybrid model's persists, with its recurrent state.
+    seq: Sequence,
+    /// The K/V block pools and the prefix store over them.
+    pools: KvPools,
     context_length: usize,
     /// Sampling generator when no fixed seed is configured.
     rng: SplitMix64,
@@ -463,7 +481,6 @@ impl Engine {
 
         let hp = super::model::read_hparams(&content)?;
         let context_length = super::resolve_context_length(config.context_length, hp.n_ctx_train);
-        let kv_cache_bytes = hp.kv_cache_bytes(context_length);
         let model = Model::load(
             &content,
             path,
@@ -508,12 +525,18 @@ impl Engine {
             tokenizer.eos_token().to_string(),
         )?;
 
+        let pools = KvPools::new(model.kv_layout());
+        let kv_cache_bytes = model.kv_pool_bytes();
         let engine = Self {
             model,
             tokenizer: Arc::clone(&tokenizer),
             format: format.clone(),
             sampling: config.sampling,
-            cached: Vec::new(),
+            seq: Sequence {
+                ids: Vec::new(),
+                blocks: pools.seq(),
+            },
+            pools,
             context_length,
             rng: SplitMix64(random_seed()),
             id_rng: SplitMix64(random_seed()),
@@ -547,21 +570,36 @@ impl Engine {
     /// Run one job to completion on the calling (engine) thread.
     ///
     /// A panic inside the job is caught: the consumer gets a provider error as
-    /// the last stream item and the cache is reset, so later jobs still work.
+    /// the last stream item and the cache is reset (the prefix store too, its
+    /// K/V is not trusted), so later jobs still work.
     pub(crate) fn run(&mut self, job: Job) {
         let events = job.events.clone();
         if catch_unwind(AssertUnwindSafe(|| self.generate(job))).is_err() {
             self.reset();
+            self.pools.reset();
             let _ = events.blocking_send(Err(local_err("local engine panicked; KV cache reset")));
         }
     }
 
-    /// Forget every cached position.
+    /// Forget the sequence: release its blocks (the prefix store keeps what
+    /// it holds) and the model's recurrent state.
     fn reset(&mut self) {
-        self.model.truncate_cache(0);
-        self.cached.clear();
+        self.model.rewind(0);
+        self.pools.release(&mut self.seq.blocks);
+        self.seq.ids.clear();
         if let Some(drafter) = &mut self.drafter {
             drafter.reset();
+        }
+    }
+
+    /// End the sequence a job ran. An attention-only model files the full
+    /// blocks of the sequence in the prefix store and releases them: the next
+    /// request whose prompt starts with the same ids finds them
+    /// ([`KvPools::lookup`]). A hybrid model keeps its sequence instead: its
+    /// recurrent state belongs to it (see [`Engine::generate`]).
+    fn end_sequence(&mut self) {
+        if !self.model.is_hybrid() {
+            self.pools.finish(&mut self.seq.blocks, &self.seq.ids);
         }
     }
 
@@ -583,7 +621,23 @@ impl Engine {
             .map_or(prompt_ids.len(), |i| i + 1)
     }
 
+    /// Run `job` and end its sequence.
     fn generate(&mut self, job: Job) {
+        self.generate_job(job);
+        self.end_sequence();
+    }
+
+    /// Release the blocks of `seq` that left the window of the next query;
+    /// with `share` (an attention-only model) its sequence files them in the
+    /// prefix store on the way. An associated function over the two fields:
+    /// the generation loop holds borrows of others.
+    fn release_out_of_window(pools: &mut KvPools, seq: &mut Sequence, share: bool) {
+        let len = seq.blocks.len;
+        let ids = share.then_some(seq.ids.as_slice());
+        pools.release_window(&mut seq.blocks, len, ids);
+    }
+
+    fn generate_job(&mut self, job: Job) {
         let Job {
             prompt_ids,
             start_in_thinking,
@@ -607,22 +661,43 @@ impl Engine {
         }
 
         // 1. Prefix reuse: the last prompt token is always prefilled, because
-        // its logits start generation. A hybrid model (recurrent state) can
-        // return only to positions it holds a state for, so it may keep less
-        // than the shared prefix; what it keeps is what was really reused.
-        let shared = self
-            .cached
-            .iter()
-            .zip(&prompt_ids)
-            .take_while(|(a, b)| a == b)
-            .count();
-        let reuse = if shared == prompt_len {
-            shared - 1
+        // its logits start generation.
+        //
+        // An attention-only model asks the prefix store (the blocks earlier
+        // sequences left, named by their ids): it reuses whole blocks, so the
+        // trailing partial block of the shared prefix is computed again. A
+        // hybrid model (recurrent state) keeps its last sequence instead and
+        // can return only to positions it holds a state for, so it may keep
+        // less than the shared prefix; what it keeps is what was really
+        // reused.
+        let (reuse, shared) = if self.model.is_hybrid() {
+            let shared = self
+                .seq
+                .ids
+                .iter()
+                .zip(&prompt_ids)
+                .take_while(|(a, b)| a == b)
+                .count();
+            let reuse = if shared == prompt_len {
+                shared - 1
+            } else {
+                shared
+            };
+            let state = self.model.rewind(reuse);
+            let reuse = self.pools.truncate(&mut self.seq.blocks, state);
+            if reuse != state {
+                self.model.rewind(reuse);
+            }
+            self.seq.ids.truncate(reuse);
+            (reuse, shared)
         } else {
-            shared
+            let hit = self.pools.lookup(&prompt_ids);
+            let reuse = hit.len;
+            self.seq.blocks = hit.into_seq();
+            self.seq.ids.clear();
+            self.seq.ids.extend_from_slice(&prompt_ids[..reuse]);
+            (reuse, reuse)
         };
-        let reuse = self.model.truncate_cache(reuse);
-        self.cached.truncate(reuse);
         // An in-trunk head keeps what still holds for the shared tokens; the
         // rows replayed below replace the rest.
         if let Some(drafter) = &mut self.drafter {
@@ -663,10 +738,19 @@ impl Engine {
             } else {
                 Hidden::None
             };
-            let forward = match self
-                .model
-                .forward_ext(&prompt_ids[pos..end], pos, want, tap, true)
-            {
+            if let Err(e) = self.pools.reserve(&mut self.seq.blocks, end) {
+                let _ = events.blocking_send(Err(e));
+                self.reset();
+                return;
+            }
+            let forward = match self.model.forward_ext(
+                &prompt_ids[pos..end],
+                pos,
+                &self.seq.blocks.tables,
+                want,
+                tap,
+                true,
+            ) {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = events.blocking_send(Err(e));
@@ -687,7 +771,9 @@ impl Engine {
             hidden = forward
                 .hidden
                 .map(|h| if observes { last_row(h, end - pos) } else { h });
-            self.cached.extend_from_slice(&prompt_ids[pos..end]);
+            self.seq.ids.extend_from_slice(&prompt_ids[pos..end]);
+            self.seq.blocks.len = end;
+            Self::release_out_of_window(&mut self.pools, &mut self.seq, !self.model.is_hybrid());
             pos = end;
             if checkpoint_at == Some(pos) {
                 self.model.checkpoint();
@@ -755,12 +841,12 @@ impl Engine {
                 Flow::Stopped => break,
                 Flow::Closed => return,
             }
-            if completion == budget || self.cached.len() == self.context_length {
+            if completion == budget || self.seq.ids.len() == self.context_length {
                 break;
             }
 
             // Draft: `id` sits at position `cached.len()` and is not cached.
-            let room = self.context_length - self.cached.len() - 1;
+            let room = self.context_length - self.seq.ids.len() - 1;
             // Draft only while the governor measures speculation as faster
             // than plain decoding.
             let round_start = std::time::Instant::now();
@@ -827,7 +913,15 @@ impl Engine {
                     Some(d)
                 };
                 let draft_start = std::time::Instant::now();
-                match drafter.draft(&self.model, h, id, self.cached.len(), k, &mut pick) {
+                match drafter.draft(
+                    &self.model,
+                    &self.seq.blocks.tables,
+                    h,
+                    id,
+                    self.seq.ids.len(),
+                    k,
+                    &mut pick,
+                ) {
                     Ok(d) => drafts = d,
                     Err(e) => {
                         let _ = events.blocking_send(Err(e));
@@ -847,9 +941,24 @@ impl Engine {
             } else {
                 Want::All
             };
-            let start = self.cached.len();
+            let start = self.seq.ids.len();
+            if let Err(e) = self
+                .pools
+                .reserve(&mut self.seq.blocks, start + batch.len())
+            {
+                let _ = events.blocking_send(Err(e));
+                self.reset();
+                return;
+            }
             let verify_start = std::time::Instant::now();
-            let forward = match self.model.forward_ext(&batch, start, want, tap, true) {
+            let forward = match self.model.forward_ext(
+                &batch,
+                start,
+                &self.seq.blocks.tables,
+                want,
+                tap,
+                true,
+            ) {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = events.blocking_send(Err(e));
@@ -905,17 +1014,22 @@ impl Engine {
             }
 
             // Cache `id` and the accepted drafts; the state for the next round
-            // is the verified row after the last of them.
+            // is the verified row after the last of them. The rows of the
+            // rejected drafts leave with their tail blocks.
             let keep = start + 1 + accepted;
-            if self.model.truncate_cache(keep) != keep {
+            self.seq.blocks.len = start + batch.len();
+            if self.model.rewind(keep) != keep
+                || self.pools.truncate(&mut self.seq.blocks, keep) != keep
+            {
                 let _ = events.blocking_send(Err(local_err(format!(
                     "the model cannot roll its cache back to {keep} positions"
                 ))));
                 self.reset();
                 return;
             }
-            self.cached.push(id);
-            self.cached.extend_from_slice(&drafts[..accepted]);
+            self.seq.ids.push(id);
+            self.seq.ids.extend_from_slice(&drafts[..accepted]);
+            Self::release_out_of_window(&mut self.pools, &mut self.seq, !self.model.is_hybrid());
             // The in-trunk head takes the hidden rows of the tokens kept
             // (`id` and the accepted drafts; rejected drafts' rows are
             // dropped with them), in plain rounds too, so it never falls
@@ -1159,8 +1273,10 @@ pub(crate) mod testing {
         seed: Option<u64>,
     ) -> Engine {
         let tokenizer = Arc::new(tiny_tokenizer());
+        let model = Model::Cpu(load(model, context_length));
+        let pools = KvPools::new(model.kv_layout());
         Engine {
-            model: Model::Cpu(load(model, context_length)),
+            model,
             format: tiny_format(&tokenizer),
             tokenizer,
             sampling: SamplingConfig {
@@ -1169,7 +1285,11 @@ pub(crate) mod testing {
                 top_p: 0.95,
                 seed,
             },
-            cached: Vec::new(),
+            seq: Sequence {
+                ids: Vec::new(),
+                blocks: pools.seq(),
+            },
+            pools,
             context_length,
             rng: SplitMix64(1),
             id_rng: SplitMix64(2),
@@ -1320,33 +1440,45 @@ mod tests {
 
     #[test]
     fn prefix_reuse_reads_the_shared_prefix() {
-        let model = write_tiny_model();
-        let mut e = engine(&model, 32, 0.0, None);
-        run(&mut e, &PROMPT, Some(3));
+        let model = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let mut e = engine(&model, 96, 0.0, None);
+        let prompt = long_prompt(40);
+        run(&mut e, &prompt, Some(3));
 
-        // Same prompt again: everything but the last token is reused.
-        let again = run(&mut e, &PROMPT, Some(3));
+        // Same prompt again: whole blocks below the last token are reused,
+        // 32 of 40 (the trailing partial block is computed again).
+        let again = run(&mut e, &prompt, Some(3));
         assert_eq!(
             again.metadata.prompt_cache_usage,
             Some(PromptCacheUsage {
-                read_tokens: 5,
-                write_tokens: 1
+                read_tokens: 32,
+                write_tokens: 8
             })
         );
 
-        // Longer prompt: at least the old prompt is reused.
-        let mut longer = PROMPT.to_vec();
+        // Longer prompt: the old prompt's two full blocks are reused.
+        let mut longer = prompt.clone();
         longer.extend([14, 15]);
         let out = run(&mut e, &longer, Some(3));
         let cache = out.metadata.prompt_cache_usage.unwrap();
-        assert!(cache.read_tokens >= 6, "{cache:?}");
-        assert_eq!(cache.read_tokens + cache.write_tokens, 8);
+        assert_eq!(cache.read_tokens, 32);
+        assert_eq!(cache.write_tokens, 10);
 
-        // Diverging prompt: only the common head is reused.
-        let out = run(&mut e, &[2, 9, 10, 15, 14], Some(3));
+        // Diverging prompt: only the whole blocks of the common head (20
+        // tokens: one block) are reused.
+        let mut diverging = prompt[..20].to_vec();
+        diverging.extend([15, 14, 15, 14, 15, 14]);
+        let out = run(&mut e, &diverging, Some(3));
         let cache = out.metadata.prompt_cache_usage.unwrap();
-        assert_eq!(cache.read_tokens, 3);
-        assert_eq!(cache.write_tokens, 2);
+        assert_eq!(cache.read_tokens, 16);
+        assert_eq!(cache.write_tokens, 10);
+
+        // Shorter than a block: nothing to reuse.
+        let out = run(&mut e, &prompt[..10], Some(3));
+        assert_eq!(out.metadata.prompt_cache_usage.unwrap().read_tokens, 0);
     }
 
     #[test]
@@ -1438,21 +1570,36 @@ mod tests {
         let out = run(&mut e, &[2, 9, 99], Some(2));
         assert_eq!(out.items.len(), 1);
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
-        assert!(e.cached.is_empty());
+        assert!(e.seq.ids.is_empty());
         // The engine still serves the next job from a cold cache.
         let ok = run(&mut e, &PROMPT, Some(2));
         assert!(ok.metadata.token_usage.is_some());
         assert_eq!(ok.metadata.prompt_cache_usage.unwrap().read_tokens, 0);
     }
 
+    /// `n` token ids of the tiny vocabulary, none of them the end-of-turn id.
+    fn long_prompt(n: usize) -> Vec<u32> {
+        (0..n).map(|i| 9 + (i * 3 % 7) as u32).collect()
+    }
+
+    /// Blocks some sequence still references, over every pool.
+    fn used_blocks(e: &Engine) -> usize {
+        e.pools.stats().iter().map(|s| s.used).sum()
+    }
+
     #[test]
     fn dropped_consumer_stops_generation_without_corrupting_state() {
-        let model = write_tiny_model();
-        let mut e = engine(&model, 32, 0.0, None);
+        // 40 tokens (no end-of-turn id among them): two full blocks.
+        let long = long_prompt(40);
+        let model = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let mut e = engine(&model, 96, 0.0, None);
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         e.run(Job {
-            prompt_ids: PROMPT.to_vec(),
+            prompt_ids: long.clone(),
             start_in_thinking: false,
             enable_thinking: false,
             temperature: None,
@@ -1464,11 +1611,13 @@ mod tests {
             events: tx,
             metadata: ResponseMetadataHandle::empty(),
         });
-        // `cached` mirrors the model cache, so the next job reuses it.
-        assert_eq!(e.cached.len(), e.model.cache_len());
-        let out = run(&mut e, &PROMPT, Some(2));
+        // The sequence ended with its job: its full blocks are in the prefix
+        // store and nothing is referenced; the next job reads them back.
+        assert_eq!(used_blocks(&e), 0);
+        let out = run(&mut e, &long, Some(2));
         assert!(out.metadata.token_usage.is_some());
-        assert_eq!(out.metadata.prompt_cache_usage.unwrap().read_tokens, 5);
+        // Whole blocks only: 39 shared positions read 32.
+        assert_eq!(out.metadata.prompt_cache_usage.unwrap().read_tokens, 32);
     }
 
     #[test]
@@ -1663,10 +1812,11 @@ mod tests {
                     expected.metadata.token_usage.map(|u| u.completion_tokens),
                     "k {k}, prompt {prompt:?}"
                 );
-                assert_eq!(spec.cached.len(), spec.model.cache_len());
-                // The cached ids equal plain decoding's: the K/V of rejected
-                // drafts never leaks into the bookkeeping.
-                assert_eq!(spec.cached, plain.cached, "k {k}, prompt {prompt:?}");
+                // The finished sequence left no block referenced, and its ids
+                // equal plain decoding's: the K/V of rejected drafts never
+                // leaks into the bookkeeping.
+                assert_eq!(used_blocks(&spec), 0);
+                assert_eq!(spec.seq.ids, plain.seq.ids, "k {k}, prompt {prompt:?}");
                 drafted += spec.stats.snapshot().drafted;
             }
         }
@@ -1771,8 +1921,8 @@ mod tests {
             b.metadata.token_usage.unwrap().completion_tokens,
             cold.metadata.token_usage.unwrap().completion_tokens
         );
-        // `cached` mirrors the model cache whatever was restored.
-        assert_eq!(warm.cached.len(), warm.model.cache_len());
+        // The sequence mirrors the model state whatever was restored.
+        assert_eq!(warm.seq.blocks.len, warm.seq.ids.len());
 
         // The same prompt again: the last token is always prefilled, and the
         // model can only go back to its checkpoint, not to position 8.
@@ -1829,7 +1979,7 @@ mod tests {
 
         // The cached ids plus more tokens (an agent loop that appends): the
         // live state is the end, all of it is reused.
-        let mut extended = e.cached.clone();
+        let mut extended = e.seq.ids.clone();
         let kept = extended.len();
         extended.extend([15, 14]);
         let out = run(&mut e, &extended, Some(2));
@@ -1850,8 +2000,8 @@ mod tests {
         // cache, state included, is reset.
         let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
-        assert!(e.cached.is_empty());
-        assert_eq!(e.model.cache_len(), 0);
+        assert!(e.seq.ids.is_empty());
+        assert_eq!(e.seq.blocks.len, 0);
         let after = run(&mut e, &prompt, Some(4));
         assert_eq!(usage(&after), (0, 7));
         assert_eq!(text(&after), text(&before));
@@ -1910,11 +2060,11 @@ mod tests {
                     expected.metadata.token_usage.map(|u| u.completion_tokens),
                     "k {k}, prompt {prompt:?}"
                 );
-                assert_eq!(spec.cached.len(), spec.model.cache_len());
-                assert_eq!(spec.cached, plain.cached, "k {k}, prompt {prompt:?}");
+                assert_eq!(spec.seq.blocks.len, spec.seq.ids.len());
+                assert_eq!(spec.seq.ids, plain.seq.ids, "k {k}, prompt {prompt:?}");
                 assert_eq!(
                     head_len(&spec),
-                    spec.cached.len() - 1,
+                    spec.seq.ids.len() - 1,
                     "k {k}, prompt {prompt:?}"
                 );
                 let stats = spec.stats.snapshot();
@@ -1940,7 +2090,7 @@ mod tests {
                 b.metadata.token_usage.map(|u| u.completion_tokens),
                 "max {max}"
             );
-            assert_eq!(head_len(&spec), spec.cached.len() - 1, "max {max}");
+            assert_eq!(head_len(&spec), spec.seq.ids.len() - 1, "max {max}");
         }
         // A context that fills up mid-round, for several sizes and prompts:
         // the completion stops at the room the context leaves.
@@ -1961,10 +2111,10 @@ mod tests {
                 // A budget that ends inside a round leaves the last accepted
                 // draft cached, which plain decoding never forwards.
                 assert!(
-                    spec.cached.starts_with(&plain.cached),
+                    spec.seq.ids.starts_with(&plain.seq.ids),
                     "ctx {ctx}, prompt {prompt:?}"
                 );
-                assert_eq!(head_len(&spec), spec.cached.len() - 1, "ctx {ctx}");
+                assert_eq!(head_len(&spec), spec.seq.ids.len() - 1, "ctx {ctx}");
                 let tokens = b.metadata.token_usage.map(|u| u.completion_tokens);
                 filled += usize::from(tokens == u32::try_from(ctx - prompt.len()).ok());
             }
@@ -1983,7 +2133,7 @@ mod tests {
         let mut warm = engine_in_trunk(&model, 32, 0.0, None, 3);
         let a = run(&mut warm, &first, Some(6));
         assert_eq!(usage(&a), (0, 7));
-        assert_eq!(head_len(&warm), warm.cached.len() - 1);
+        assert_eq!(head_len(&warm), warm.seq.ids.len() - 1);
 
         // Restarts from the checkpoint at 4: nothing is missing in the head.
         let b = run(&mut warm, &second, Some(6));
@@ -1996,23 +2146,23 @@ mod tests {
         let plain = run(&mut engine(&model, 32, 0.0, None), &second, Some(6));
         assert_eq!(text(&b), text(&cold));
         assert_eq!(text(&b), text(&plain));
-        assert_eq!(head_len(&warm), warm.cached.len() - 1);
+        assert_eq!(head_len(&warm), warm.seq.ids.len() - 1);
 
         // The same prompt again goes back to the checkpoint too.
         let c = run(&mut warm, &second, Some(6));
         assert_eq!(usage(&c), (4, 5));
         assert_eq!(text(&c), text(&plain));
-        assert_eq!(head_len(&warm), warm.cached.len() - 1);
+        assert_eq!(head_len(&warm), warm.seq.ids.len() - 1);
 
         // The cached ids plus more tokens: the live state is the end, and
         // the head's tail bridges the request boundary.
-        let mut extended = warm.cached.clone();
+        let mut extended = warm.seq.ids.clone();
         extended.extend([15, 14]);
         let d = run(&mut warm, &extended, Some(4));
         assert_eq!(usage(&d).0 as usize, extended.len() - 2);
         let expected = run(&mut engine(&model, 32, 0.0, None), &extended, Some(4));
         assert_eq!(text(&d), text(&expected));
-        assert_eq!(head_len(&warm), warm.cached.len() - 1);
+        assert_eq!(head_len(&warm), warm.seq.ids.len() - 1);
 
         // A prompt that diverges right at the checkpoint leaves the pair
         // whose hidden row the trunk no longer has out: one position fewer,
@@ -2022,7 +2172,7 @@ mod tests {
         assert_eq!(usage(&e), (4, 3));
         let expected = run(&mut engine(&model, 32, 0.0, None), &diverging, Some(5));
         assert_eq!(text(&e), text(&expected));
-        assert!(head_len(&warm) < warm.cached.len() - 1);
+        assert!(head_len(&warm) < warm.seq.ids.len() - 1);
     }
 
     /// A failed request resets the head with the trunk, and the engine keeps
@@ -2035,12 +2185,12 @@ mod tests {
         let before = run(&mut e, &prompt, Some(4));
         let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
-        assert!(e.cached.is_empty());
+        assert!(e.seq.ids.is_empty());
         assert_eq!(head_len(&e), 0);
         let after = run(&mut e, &prompt, Some(4));
         assert_eq!(usage(&after), (0, 7));
         assert_eq!(text(&after), text(&before));
-        assert_eq!(head_len(&e), e.cached.len() - 1);
+        assert_eq!(head_len(&e), e.seq.ids.len() - 1);
     }
 
     #[test]

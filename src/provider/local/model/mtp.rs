@@ -70,6 +70,7 @@ use super::arch::Arch;
 use super::cpu::{NextnHead, Transformer};
 #[cfg(feature = "provider-local-gpu")]
 use super::gpu::GpuDrafter;
+use super::paged::BlockTable;
 use super::{Model, err};
 use crate::error::CucaError;
 
@@ -78,8 +79,8 @@ use crate::error::CucaError;
 // nothing worth a box.
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum Drafter {
-    /// A separate `gemma4-assistant` drafter on the CPU, sharing the target's
-    /// K/V cache (read per draft: the cache's slot base moves over time).
+    /// A separate `gemma4-assistant` drafter on the CPU, reading the target's
+    /// paged K/V cache through the sequence's block tables.
     Cpu { net: Transformer },
     #[cfg(feature = "provider-local-gpu")]
     Gpu(GpuDrafter),
@@ -123,9 +124,8 @@ impl Drafter {
                         target.vocab()
                     )));
                 }
-                // The target must have the caches a draft reads; each draft
-                // takes fresh handles.
-                target.ext_kv()?;
+                // The target must have the caches a draft reads.
+                target.ext_kv(&vec![Vec::new(); target.kv_layout().groups.len()])?;
                 Ok(Self::Cpu { net })
             }
             #[cfg(feature = "provider-local-gpu")]
@@ -211,7 +211,9 @@ impl Drafter {
         }
     }
 
-    /// Draft at most `k` tokens after the pending token `first`.
+    /// Draft at most `k` tokens after the pending token `first` of the
+    /// sequence whose block tables (one per K/V group of the target) are
+    /// `tables`.
     ///
     /// `hidden` is the target's final-norm hidden state at its last cached
     /// position, `len` the number of cached positions (`first` sits at
@@ -223,9 +225,14 @@ impl Drafter {
     ///
     /// [`CucaError::Provider`] for a forward-pass failure or a `target` on
     /// another device than the drafter.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "one drafting call's inputs; a struct would only rename them"
+    )]
     pub(crate) fn draft(
         &self,
         target: &Model,
+        tables: &[BlockTable],
         hidden: &[f32],
         first: u32,
         len: usize,
@@ -234,7 +241,7 @@ impl Drafter {
     ) -> Result<Vec<u32>, CucaError> {
         match (self, target) {
             (Self::Cpu { net }, Model::Cpu(target)) => {
-                let ext = target.ext_kv()?;
+                let ext = target.ext_kv(tables)?;
                 let mut drafts = Vec::with_capacity(k);
                 let mut hidden = hidden.to_vec();
                 let mut token = first;
@@ -254,7 +261,7 @@ impl Drafter {
             }
             #[cfg(feature = "provider-local-gpu")]
             (Self::Gpu(drafter), Model::Gpu(target)) => {
-                drafter.draft(target, hidden, first, len, k, pick)
+                drafter.draft(target, tables, hidden, first, len, k, pick)
             }
             #[cfg(feature = "provider-local-gpu")]
             _ => Err(err("the drafter and its target run on different devices")),

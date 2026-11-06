@@ -98,7 +98,9 @@ use candle_core::{DType, Device, Tensor};
 use super::super::layout::{LayerLayout, name};
 use super::super::params::LayerSpec;
 use super::super::{candle_err, err};
-use super::{AttnCall, LayerWeights, Loader, Mixer, QMatMul, Transformer, load_layer, rms};
+use super::{
+    AttnCall, KvAccess, LayerWeights, Loader, Mixer, QMatMul, Transformer, load_layer, rms,
+};
 use crate::error::CucaError;
 
 /// Token ids a draft step ranks (the first ones of the vocabulary): see
@@ -353,10 +355,7 @@ impl Transformer {
             start: slot,
             rope_start: first + 1,
             t: m,
-            own: Some(&head.kv),
-            read: Some(&head.kv),
-            base: 0,
-            ext: None,
+            kv: KvAccess::Slab(&head.kv),
         };
         self.store_kv(&call, aw, &k, &v)
     }
@@ -429,10 +428,7 @@ impl Transformer {
             start: slot,
             rope_start: j + 1,
             t: 1,
-            own: Some(&head.kv),
-            read: Some(&head.kv),
-            base: 0,
-            ext: None,
+            kv: KvAccess::Slab(&head.kv),
         };
         let y = self.block(&head.block, &x, None, 1, |h| {
             self.attention_in(&call, aw, h)
