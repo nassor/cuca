@@ -27,7 +27,10 @@
 //! The sum over experts is a separate kernel with a fixed order so that the
 //! result of a layer does not depend on how its experts were grouped into
 //! passes (a tiered model computes the experts of a long prompt in several
-//! passes): tiered and resident output are bit for bit the same.
+//! passes): tiered placements agree bit for bit with each other. Against a
+//! resident load they agree to float rounding only: the resident layer never
+//! reads the router output back, a tiered one does, which splits burn's fused
+//! elementwise kernels around the layer at different places.
 
 // The `#[cube]` kernels are Rust the CubeCL macro translates: it needs runtime
 // values built from runtime values (`tid - tid` is a runtime zero where a
