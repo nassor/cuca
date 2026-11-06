@@ -69,7 +69,7 @@ fn check_range(
 }
 
 /// Dot product in eight independent lanes: fixed order, vectorisable.
-fn dot(a: &[f32], b: &[f32]) -> f32 {
+pub(super) fn dot(a: &[f32], b: &[f32]) -> f32 {
     let mut lanes = [0f32; 8];
     let ((a8, ar), (b8, br)) = (a.as_chunks::<8>(), b.as_chunks::<8>());
     for (x, y) in a8.iter().zip(b8) {
@@ -85,9 +85,30 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
     sum
 }
 
+/// Where the values of a layer's keys live.
+#[derive(Clone, Copy)]
+enum Values<'a> {
+    /// A pool of their own with the keys' geometry.
+    Pool(&'a [f32]),
+    /// The first `v_width` columns of the key row itself (latent attention:
+    /// the cached latent is both the key and the value, the rotary key sits
+    /// after it).
+    KeyPrefix(usize),
+}
+
+impl Values<'_> {
+    /// Columns of a value row.
+    fn width(&self, head_dim: usize) -> usize {
+        match self {
+            Values::Pool(_) => head_dim,
+            Values::KeyPrefix(w) => *w,
+        }
+    }
+}
+
 /// One query head over the keys `lo..hi`: `q` is its `head_dim` query values,
-/// `kvh` the KV head it reads, `out` receives `head_dim` values. The ranges
-/// were checked by [`check_range`].
+/// `kvh` the KV head it reads, `out` receives the value width. The ranges were
+/// checked by [`check_range`].
 #[expect(
     clippy::too_many_arguments,
     reason = "one attention head's inputs; a struct would only rename them"
@@ -99,15 +120,16 @@ fn attend_head(
     lo: usize,
     hi: usize,
     pool_k: &[f32],
-    pool_v: &[f32],
+    values: Values<'_>,
     shape: PoolShape,
     scale: f32,
     out: &mut [f32],
 ) {
     let d = shape.head_dim;
+    let vw = values.width(d);
     let mut max = f32::NEG_INFINITY;
     let mut sum = 0f32;
-    let mut acc = vec![0f32; d];
+    let mut acc = vec![0f32; vw];
     let mut scores = [0f32; BLOCK_SIZE];
     let mut pos = lo;
     while pos < hi {
@@ -138,7 +160,11 @@ fn attend_head(
             let p = (s - max).exp();
             sum += p;
             let at = first + j * d;
-            for (a, &v) in acc.iter_mut().zip(&pool_v[at..at + d]) {
+            let row = match values {
+                Values::Pool(pool_v) => &pool_v[at..at + d],
+                Values::KeyPrefix(w) => &pool_k[at..at + w],
+            };
+            for (a, &v) in acc.iter_mut().zip(row) {
                 *a += p * v;
             }
         }
@@ -175,6 +201,70 @@ pub(crate) fn attend_paged_rows(
     shape: PoolShape,
     scale: f32,
 ) -> candle_core::Result<Vec<f32>> {
+    attend_rows(
+        q,
+        t,
+        range,
+        table,
+        pool_k,
+        Values::Pool(pool_v),
+        shape,
+        scale,
+    )
+}
+
+/// [`attend_paged_rows`] over a latent cache (multi-head latent attention):
+/// the pool holds one `head_dim` row per position (`n_kv_head` 1) whose first
+/// `v_width` columns are also the value. `q` holds `[t][n_head][head_dim]`
+/// and the result `[t][n_head][v_width]`. A row's result depends only on its
+/// query, its table and its range, as for [`attend_paged_rows`].
+///
+/// # Errors
+///
+/// As [`attend_paged_rows`], and a value width above the row.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one attention call's inputs; a struct would only rename them"
+)]
+pub(crate) fn attend_latent_rows(
+    q: &[f32],
+    t: usize,
+    range: impl Fn(usize) -> (usize, usize) + Sync,
+    table: &[u32],
+    pool: &[f32],
+    shape: PoolShape,
+    v_width: usize,
+    scale: f32,
+) -> candle_core::Result<Vec<f32>> {
+    if v_width == 0 || v_width > shape.head_dim {
+        return Err(candle_core::Error::msg("attention: bad latent value width"));
+    }
+    attend_rows(
+        q,
+        t,
+        range,
+        table,
+        pool,
+        Values::KeyPrefix(v_width),
+        shape,
+        scale,
+    )
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one attention call's inputs; a struct would only rename them"
+)]
+fn attend_rows(
+    q: &[f32],
+    t: usize,
+    range: impl Fn(usize) -> (usize, usize) + Sync,
+    table: &[u32],
+    pool_k: &[f32],
+    values: Values<'_>,
+    shape: PoolShape,
+    scale: f32,
+) -> candle_core::Result<Vec<f32>> {
     let PoolShape {
         n_head,
         n_kv_head,
@@ -183,15 +273,20 @@ pub(crate) fn attend_paged_rows(
     if q.len() != t * n_head * d || n_kv_head == 0 || n_head % n_kv_head != 0 {
         return Err(candle_core::Error::msg("attention: query shape mismatch"));
     }
+    let pool_len = match values {
+        Values::Pool(pool_v) => pool_k.len().min(pool_v.len()),
+        Values::KeyPrefix(_) => pool_k.len(),
+    };
     for i in 0..t {
         let (lo, hi) = range(i);
-        check_range(table, lo, hi, pool_k.len().min(pool_v.len()), shape)?;
+        check_range(table, lo, hi, pool_len, shape)?;
     }
+    let vw = values.width(d);
     let group = n_head / n_kv_head;
-    let mut out = vec![0f32; t * n_head * d];
+    let mut out = vec![0f32; t * n_head * vw];
     let jobs = t * n_head;
     {
-        let slots: Vec<Mutex<&mut [f32]>> = out.chunks_mut(d).map(Mutex::new).collect();
+        let slots: Vec<Mutex<&mut [f32]>> = out.chunks_mut(vw).map(Mutex::new).collect();
         let next = AtomicUsize::new(0);
         let run = |_: usize| {
             loop {
@@ -209,7 +304,7 @@ pub(crate) fn attend_paged_rows(
                     lo,
                     hi,
                     pool_k,
-                    pool_v,
+                    values,
                     shape,
                     scale,
                     &mut slot,

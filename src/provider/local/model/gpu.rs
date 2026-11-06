@@ -2455,6 +2455,17 @@ impl GpuTransformer {
                 hp.arch.name()
             )));
         }
+        if hp.behavior.mla {
+            return Err(CucaError::Config(format!(
+                "`{}` uses multi-head latent attention (a low-rank query and one shared latent K/V row per position, absorbed into the query), which the GPU engine does not implement: run it on the CPU (`LocalDevice::Cpu`)",
+                hp.arch.name()
+            )));
+        }
+        if hp.moe.is_some_and(|m| m.scale != 1.0) {
+            return Err(CucaError::Config(
+                "`expert_weights_scale` other than 1 is not implemented by the GPU engine's expert kernels: run the model on the CPU (`LocalDevice::Cpu`)".into(),
+            ));
+        }
         let hybrid = hp.behavior.hybrid_delta_net;
         check_context(&hp, context_length)?;
         let world = 1 + shards.len();
@@ -3431,7 +3442,13 @@ fn load_layer(
             },
             down: matrix(reader, name::FFN_DOWN, n_embd, ff)?,
         },
-        (Ffn::Moe { ff, shared_ff }, Some(spec)) => FfnWeights::Moe {
+        (Ffn::Moe { fused: true, .. }, _) => {
+            return Err(CucaError::Config(
+                "a fused `ffn_gate_up_exps` expert tensor is not implemented by the GPU engine"
+                    .into(),
+            ));
+        }
+        (Ffn::Moe { ff, shared_ff, .. }, Some(spec)) => FfnWeights::Moe {
             spec,
             router: reader.matrix(&blk(name::FFN_GATE_INP), spec.n_expert, n_embd)?,
             experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, tiers, tp)?,
@@ -6445,6 +6462,7 @@ mod tests {
                         n_expert,
                         n_used,
                         norm_weights: norm,
+                        scale: 1.0,
                     };
                     let routing: Routing = host_route(&logits, t, &spec);
                     // Host reference.
@@ -6847,6 +6865,7 @@ mod tests {
             n_expert,
             n_used: 8,
             norm_weights: true,
+            scale: 1.0,
         };
         let router = upload(GgmlDType::F32, n_expert, n_embd, 3);
         let router_parts = router.parts.clone();

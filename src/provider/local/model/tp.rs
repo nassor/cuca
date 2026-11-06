@@ -200,7 +200,7 @@ pub(super) fn validate(
         }
         match LayerLayout::read(hp, il, spec, content)?.ffn {
             Ffn::Dense { ff, .. } => check_width("dense FFN", il, ff, world)?,
-            Ffn::Moe { ff, shared_ff } => {
+            Ffn::Moe { ff, shared_ff, .. } => {
                 check_width("expert FFN", il, ff, world)?;
                 if let Some(shared) = shared_ff {
                     check_width("shared expert FFN", il, shared, world)?;

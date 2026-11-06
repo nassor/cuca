@@ -191,7 +191,7 @@ impl KvLayout {
                     .iter()
                     .map(|&il| {
                         let l = &hp.layers[il];
-                        (2 * 4 * BLOCK_SIZE * l.n_kv_head * l.head_dim) as u64
+                        (4 * BLOCK_SIZE * l.kv_floats_per_position()) as u64
                     })
                     .sum();
                 per_block * n as u64

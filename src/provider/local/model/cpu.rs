@@ -24,7 +24,7 @@ use super::moe::route;
 #[cfg(test)]
 use super::paged::Solo;
 use super::paged::{BLOCK_SIZE, BlockTable, KvLayout, Sizing};
-use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
+use super::params::{DeltaSpec, Hparams, LayerSpec, MlaSpec, MoeSpec};
 use super::qmm::QmmWeight;
 use super::quant::{RowTable, TokenEmbedding};
 use super::rope::RopeKind;
@@ -36,6 +36,7 @@ use crate::error::CucaError;
 use crate::provider::local::{ExpertPlacement, ExpertTiers};
 
 mod head;
+mod mla;
 pub(super) mod paged_attn;
 pub(crate) use head::NextnHead;
 use paged_attn::{PoolShape, attend_paged_rows, gather, store_rows};
@@ -197,6 +198,25 @@ struct AttnWeights {
     wo: Linear,
 }
 
+/// Multi-head latent attention weights of one layer (Mistral Small 4).
+///
+/// The query goes through a low-rank pair (`q_a`, a norm, `q_b`); `kv_a`
+/// yields the latent and the shared rotary key. `k_b` and `v_b` are the
+/// per-head up-projections of the latent, held as f32 because they are used
+/// by the absorbed attention one row at a time ([`mla`]).
+struct MlaWeights {
+    q_a: Linear,
+    q_a_norm: Tensor,
+    q_b: Linear,
+    kv_a: Linear,
+    kv_a_norm: Tensor,
+    /// `attn_k_b`, `[n_head][kv_lora][nope]`.
+    k_b: Vec<f32>,
+    /// `attn_v_b`, `[n_head][v_head][kv_lora]`.
+    v_b: Vec<f32>,
+    wo: Linear,
+}
+
 /// Gate and up projections of a dense FFN.
 enum GateUp {
     Split {
@@ -229,14 +249,16 @@ enum ExpertBank {
     },
 }
 
-/// The shared expert of a Qwen 3.5 MoE layer: a dense gated FFN every token
-/// runs, scaled per token by `sigmoid(gate_inp . x)`.
+/// The shared expert of a MoE layer: a dense gated FFN every token runs,
+/// scaled per token by `sigmoid(gate_inp . x)` (Qwen 3.5 MoE) or, without a
+/// gate, added as it is (Mistral Small 4).
 struct SharedExpert {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
-    /// `ffn_gate_inp_shexp`, `n_embd` floats.
-    gate_inp: Vec<f32>,
+    /// `ffn_gate_inp_shexp`, `n_embd` floats; `None` for an ungated shared
+    /// expert.
+    gate_inp: Option<Vec<f32>>,
 }
 
 impl SharedExpert {
@@ -248,11 +270,14 @@ impl SharedExpert {
         let (t, n_embd) = flat.dims2()?;
         let hidden = (activate(&self.gate.forward(flat)?, act)? * self.up.forward(flat)?)?;
         let y = self.down.forward(&hidden)?;
+        let Some(gate_inp) = &self.gate_inp else {
+            return Ok(y);
+        };
         let rows = flat.flatten_all()?.to_vec1::<f32>()?;
         let gates: Vec<f32> = rows
             .chunks_exact(n_embd)
             .map(|x| {
-                let dot: f32 = x.iter().zip(&self.gate_inp).map(|(a, b)| a * b).sum();
+                let dot: f32 = x.iter().zip(gate_inp).map(|(a, b)| a * b).sum();
                 1.0 / (1.0 + (-dot).exp())
             })
             .collect();
@@ -305,6 +330,7 @@ struct DeltaWeights {
 /// are much larger than an attention layer's handles.
 enum Mixer {
     Attention(AttnWeights),
+    Mla(Box<MlaWeights>),
     Delta(Box<DeltaWeights>),
 }
 
@@ -363,7 +389,12 @@ impl KvLayer {
         Arc::new(Self {
             data: Mutex::new(KvData {
                 k: vec![0.0; floats],
-                v: vec![0.0; floats],
+                // A latent cache holds the value inside the key row.
+                v: if spec.mla.is_some() {
+                    Vec::new()
+                } else {
+                    vec![0.0; floats]
+                },
             }),
             shape: PoolShape {
                 n_head: spec.n_head,
@@ -514,14 +545,48 @@ impl Loader<'_> {
             .collect()
     }
 
+    /// The fused `[n_expert, 2 * ff, cols]` gate/up expert tensor
+    /// `tensor_name`, split into one quantized `[ff, cols]` gate and one up
+    /// matmul weight per expert.
+    fn fused_experts(
+        &mut self,
+        tensor_name: &str,
+        n_expert: usize,
+        ff: usize,
+        cols: usize,
+    ) -> Result<(Vec<QMatMul>, Vec<QMatMul>), CucaError> {
+        let (gate, up) = ExpertSlice::read_fused(self.content, tensor_name, n_expert, ff, cols)?;
+        let mut raw = vec![0u8; n_expert * gate.stride];
+        let io = |e: std::io::Error| err(format!("tensor `{tensor_name}`: {e}"));
+        self.reader
+            .seek(SeekFrom::Start(gate.offset(0)))
+            .map_err(io)?;
+        self.reader.read_exact(&mut raw).map_err(io)?;
+        let mut gates = Vec::with_capacity(n_expert);
+        let mut ups = Vec::with_capacity(n_expert);
+        for chunk in raw.chunks_exact(gate.stride.max(1)) {
+            for (slice, bytes, out) in [
+                (&gate, &chunk[..gate.file_bytes], &mut gates),
+                (&up, &chunk[gate.file_bytes..], &mut ups),
+            ] {
+                let qt = expert_qtensor(slice, bytes)
+                    .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
+                out.push(self.to_matmul(Arc::new(qt), tensor_name)?);
+            }
+        }
+        Ok((gates, ups))
+    }
+
     /// The experts of MoE layer `il` (FFN width `ff`): every expert read and
     /// split now, or, with `tiers`, left in the file for the store to load.
+    /// `fused` when gate and up share one tensor.
     fn expert_bank(
         &mut self,
         il: usize,
         n_expert: usize,
         ff: usize,
         n_embd: usize,
+        fused: bool,
         tiers: Option<&Arc<ExpertStore<CpuExpert>>>,
     ) -> Result<ExpertBank, CucaError> {
         if let Some(store) = tiers {
@@ -531,8 +596,14 @@ impl Loader<'_> {
             });
         }
         let blk = |part: &str| name::blk(il, part);
-        let gate = self.experts(&blk(name::FFN_GATE_EXPS), n_expert, ff, n_embd)?;
-        let up = self.experts(&blk(name::FFN_UP_EXPS), n_expert, ff, n_embd)?;
+        let (gate, up) = if fused {
+            self.fused_experts(&blk(name::FFN_GATE_UP_EXPS), n_expert, ff, n_embd)?
+        } else {
+            (
+                self.experts(&blk(name::FFN_GATE_EXPS), n_expert, ff, n_embd)?,
+                self.experts(&blk(name::FFN_UP_EXPS), n_expert, ff, n_embd)?,
+            )
+        };
         let down = self.experts(&blk(name::FFN_DOWN_EXPS), n_expert, n_embd, ff)?;
         Ok(ExpertBank::Resident(
             gate.into_iter()
@@ -597,12 +668,24 @@ fn open_expert_store(
     })?;
     let mut layers = Vec::new();
     for (il, ls) in hp.layers.iter().enumerate() {
-        if let Ffn::Moe { ff, .. } = LayerLayout::read(hp, il, ls, content)?.ffn {
+        if let Ffn::Moe { ff, fused, .. } = LayerLayout::read(hp, il, ls, content)?.ffn {
             let slice = |part: &str, rows, cols| {
                 ExpertSlice::read(content, &name::blk(il, part), spec.n_expert, rows, cols)
             };
-            let gate = slice(name::FFN_GATE_EXPS, ff, hp.n_embd)?;
-            let up = slice(name::FFN_UP_EXPS, ff, hp.n_embd)?;
+            let (gate, up) = if fused {
+                ExpertSlice::read_fused(
+                    content,
+                    &name::blk(il, name::FFN_GATE_UP_EXPS),
+                    spec.n_expert,
+                    ff,
+                    hp.n_embd,
+                )?
+            } else {
+                (
+                    slice(name::FFN_GATE_EXPS, ff, hp.n_embd)?,
+                    slice(name::FFN_UP_EXPS, ff, hp.n_embd)?,
+                )
+            };
             let down = slice(name::FFN_DOWN_EXPS, hp.n_embd, ff)?;
             layers.push(LayerExperts {
                 il,
@@ -1394,7 +1477,7 @@ impl Transformer {
     fn delta_layers(&self) -> impl Iterator<Item = &DeltaWeights> {
         self.layers.iter().filter_map(|l| match &l.mixer {
             Mixer::Delta(dw) => Some(dw.as_ref()),
-            Mixer::Attention(_) => None,
+            Mixer::Attention(_) | Mixer::Mla(_) => None,
         })
     }
 
@@ -1561,6 +1644,7 @@ impl Transformer {
         let t = x.dim(1)?;
         self.block(lw, x, ple.map(|p| (p, il)), t, |h| match &lw.mixer {
             Mixer::Attention(aw) => self.attention(il, aw, h, segs, ext),
+            Mixer::Mla(mw) => self.mla_in(&self.attn_calls(il, segs, ext)?, mw, h),
             Mixer::Delta(dw) => dw.forward_segs(h, segs),
         })
     }
@@ -1633,9 +1717,20 @@ impl Transformer {
         segs: &[Seg<'_>],
         ext: Option<(&ExtKv, usize)>,
     ) -> candle_core::Result<Tensor> {
+        let calls = self.attn_calls(il, segs, ext)?;
+        self.attention_in(&calls, aw, h)
+    }
+
+    /// The attention calls of layer `il`: what each sequence of `segs`
+    /// contributes and the K/V storage it reads and writes.
+    fn attn_calls<'a>(
+        &'a self,
+        il: usize,
+        segs: &'a [Seg<'a>],
+        ext: Option<(&'a ExtKv, usize)>,
+    ) -> candle_core::Result<Vec<AttnCall<'a>>> {
         let spec = &self.hp.layers[il];
-        let calls = segs
-            .iter()
+        segs.iter()
             .map(|seg| {
                 let kv = if spec.kv_source != usize::MAX {
                     let source = spec.kv_source;
@@ -1675,8 +1770,7 @@ impl Transformer {
                     kv,
                 })
             })
-            .collect::<candle_core::Result<Vec<_>>>()?;
-        self.attention_in(&calls, aw, h)
+            .collect()
     }
 
     /// [`Transformer::attention`] for the calls `calls` describe (all of one
@@ -1982,9 +2076,10 @@ fn load_layer(
 ) -> Result<LayerWeights, CucaError> {
     let n_embd = hp.n_embd;
     let blk = |part: &str| name::blk(il, part);
-    let mixer = match spec.delta() {
-        Some(delta) => Mixer::Delta(Box::new(load_delta(loader, hp, il, delta)?)),
-        None => Mixer::Attention(load_attention(loader, hp, il, spec, layout)?),
+    let mixer = match (spec.delta(), spec.mla) {
+        (Some(delta), _) => Mixer::Delta(Box::new(load_delta(loader, hp, il, delta)?)),
+        (None, Some(mla)) => Mixer::Mla(Box::new(load_mla(loader, hp, il, spec, &mla)?)),
+        (None, None) => Mixer::Attention(load_attention(loader, hp, il, spec, layout)?),
     };
 
     let ffn = match (layout.ffn, hp.moe) {
@@ -2002,16 +2097,27 @@ fn load_layer(
             },
             down: loader.matmul(&blk(name::FFN_DOWN), &[n_embd, ff])?,
         },
-        (Ffn::Moe { ff, shared_ff }, Some(spec)) => FfnWeights::Moe {
+        (
+            Ffn::Moe {
+                ff,
+                shared_ff,
+                fused,
+            },
+            Some(spec),
+        ) => FfnWeights::Moe {
             spec,
             router: loader.matmul(&blk(name::FFN_GATE_INP), &[spec.n_expert, n_embd])?,
-            experts: loader.expert_bank(il, spec.n_expert, ff, n_embd, tiers)?,
+            experts: loader.expert_bank(il, spec.n_expert, ff, n_embd, fused, tiers)?,
             shared: match shared_ff {
                 Some(sff) => Some(SharedExpert {
                     gate: loader.matmul(&blk(name::FFN_GATE_SHEXP), &[sff, n_embd])?,
                     up: loader.matmul(&blk(name::FFN_UP_SHEXP), &[sff, n_embd])?,
                     down: loader.matmul(&blk(name::FFN_DOWN_SHEXP), &[n_embd, sff])?,
-                    gate_inp: loader.floats(&blk(name::FFN_GATE_INP_SHEXP), &[n_embd])?,
+                    gate_inp: if hp.behavior.shared_expert_ungated {
+                        None
+                    } else {
+                        Some(loader.floats(&blk(name::FFN_GATE_INP_SHEXP), &[n_embd])?)
+                    },
                 }),
                 None => None,
             },
@@ -2134,6 +2240,30 @@ fn load_attention(
             None
         },
         wo: loader.linear(il, name::ATTN_OUTPUT, [n_embd, q_width], layout.biases.o)?,
+    })
+}
+
+/// Read the latent attention weights of layer `il`: the low-rank query, the
+/// latent projection, and the per-head up-projections as f32.
+fn load_mla(
+    loader: &mut Loader<'_>,
+    hp: &Hparams,
+    il: usize,
+    spec: &LayerSpec,
+    mla: &MlaSpec,
+) -> Result<MlaWeights, CucaError> {
+    let n_embd = hp.n_embd;
+    let nh = spec.n_head;
+    let blk = |part: &str| name::blk(il, part);
+    Ok(MlaWeights {
+        q_a: loader.linear(il, name::ATTN_Q_A, [mla.q_lora, n_embd], false)?,
+        q_a_norm: loader.vector(&blk(name::ATTN_Q_A_NORM), mla.q_lora)?,
+        q_b: loader.linear(il, name::ATTN_Q_B, [nh * mla.q_head(), mla.q_lora], false)?,
+        kv_a: loader.linear(il, name::ATTN_KV_A_MQA, [mla.latent_width(), n_embd], false)?,
+        kv_a_norm: loader.vector(&blk(name::ATTN_KV_A_NORM), mla.kv_lora)?,
+        k_b: loader.floats(&blk(name::ATTN_K_B), &[nh, mla.kv_lora, mla.nope])?,
+        v_b: loader.floats(&blk(name::ATTN_V_B), &[nh, mla.v_head, mla.kv_lora])?,
+        wo: loader.linear(il, name::ATTN_OUTPUT, [n_embd, nh * mla.v_head], false)?,
     })
 }
 
@@ -2527,7 +2657,7 @@ mod tests {
     /// Cache and batching invariants every architecture must satisfy: a
     /// chunked prefill, a token-by-token decode and a replay after
     /// truncation all reproduce the single-shot logits.
-    fn check_invariants(model: &super::super::tiny::TinyModel, what: &str) {
+    pub(super) fn check_invariants(model: &super::super::tiny::TinyModel, what: &str) {
         let mut whole = load(model, 32);
         let expected = logits(&mut whole, &PROMPT, 0);
         assert_eq!(expected.len(), VOCAB, "{what}");
@@ -2594,7 +2724,7 @@ mod tests {
     /// rows, attention and the recurrent state stay per sequence. The steps
     /// mix a joint prefill, decode rows, a sequence sitting one step out, a
     /// prefill chunk next to decode rows and a verification-shaped call.
-    fn check_batched(model: &super::super::tiny::TinyModel, what: &str) {
+    pub(super) fn check_batched(model: &super::super::tiny::TinyModel, what: &str) {
         use super::super::StateSlot;
         use super::super::paged::KvPools;
         use super::super::tiny::load_sized;
@@ -3020,7 +3150,8 @@ mod tests {
             layout.ffn,
             Ffn::Moe {
                 ff: 64,
-                shared_ff: Some(32)
+                shared_ff: Some(32),
+                fused: false
             }
         );
         let lw = load_layer(&mut loader, &hp, 0, &hp.layers[0], &layout, None).unwrap();
@@ -3074,7 +3205,7 @@ mod tests {
             let y = vec_of(shared.down.forward(&h).unwrap());
             let dot: f64 = values[token * 64..][..64]
                 .iter()
-                .zip(&shared.gate_inp)
+                .zip(shared.gate_inp.as_ref().unwrap())
                 .map(|(a, b)| f64::from(*a) * f64::from(*b))
                 .sum();
             let gate = 1.0 / (1.0 + (-dot).exp());
@@ -3290,7 +3421,7 @@ mod tests {
             .sum()
     }
 
-    fn load_tiered(
+    pub(super) fn load_tiered(
         model: &super::super::tiny::TinyModel,
         ram_bytes: u64,
         warm_from: Option<crate::provider::local::ExpertHeat>,
@@ -3315,7 +3446,7 @@ mod tests {
 
     /// A 24-token prompt in chunks of 16 then 8 greedy steps: the logits of
     /// every call.
-    fn greedy_run(m: &mut Transformer) -> Vec<Vec<f32>> {
+    pub(super) fn greedy_run(m: &mut Transformer) -> Vec<Vec<f32>> {
         let prompt: Vec<u32> = (0..24u32).map(|i| (i * 5 + 3) % VOCAB as u32).collect();
         let mut out: Vec<Vec<f32>> = Vec::new();
         let mut at = 0;
@@ -3450,7 +3581,7 @@ mod hybrid_tests {
     }
 
     /// Run `tokens` at `start` and return the logits `want` selects.
-    fn step(m: &mut Transformer, tokens: &[u32], start: usize, want: Want) -> Vec<f32> {
+    pub(super) fn step(m: &mut Transformer, tokens: &[u32], start: usize, want: Want) -> Vec<f32> {
         m.forward_ext(tokens, start, want, Hidden::None, true)
             .unwrap()
             .logits
@@ -3458,7 +3589,7 @@ mod hybrid_tests {
     }
 
     /// One sequence's rows `0..t` at slot 0, as a forward step builds it.
-    fn solo_seg(t: usize, tables: &[BlockTable]) -> Seg<'_> {
+    pub(super) fn solo_seg(t: usize, tables: &[BlockTable]) -> Seg<'_> {
         Seg {
             start: 0,
             offset: 0,

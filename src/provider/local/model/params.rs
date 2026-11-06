@@ -84,6 +84,14 @@ impl<'a> Keys<'a> {
             .ok_or_else(|| meta_err(&self.full(key), "missing"))
     }
 
+    pub(crate) fn bool_opt(&self, key: &str) -> Result<Option<bool>, CucaError> {
+        match self.value(key) {
+            None => Ok(None),
+            Some(Value::Bool(b)) => Ok(Some(*b)),
+            Some(_) => Err(meta_err(&self.full(key), "not a boolean")),
+        }
+    }
+
     pub(crate) fn str_opt(&self, key: &str) -> Option<&'a str> {
         match self.value(key) {
             Some(Value::String(s)) => Some(s.as_str()),
@@ -192,6 +200,68 @@ pub(crate) struct LayerSpec {
     pub(crate) kv_source: usize,
     /// Multiplier on the attention scores.
     pub(crate) scale: f32,
+    /// Multi-head latent attention geometry; the layer then caches one shared
+    /// latent row per position (`n_kv_head` is 1 and `head_dim` the width of
+    /// that row, [`MlaSpec::latent_width`]) and the value is its first
+    /// [`MlaSpec::kv_lora`] columns.
+    pub(crate) mla: Option<MlaSpec>,
+}
+
+/// Dimensions of a multi-head latent attention layer (DeepSeek-style, as
+/// llama.cpp's `mistral4` / `deepseek2` graphs read them).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MlaSpec {
+    /// Rank of the low-rank query projection (`attn_q_a` outputs this many).
+    pub(crate) q_lora: usize,
+    /// Width of the compressed K/V latent (`kv_lora_rank`).
+    pub(crate) kv_lora: usize,
+    /// Per-head query/key dimensions that carry no position (`qk_nope_head_dim`).
+    pub(crate) nope: usize,
+    /// Per-head dimensions that rotate; the key's rotary part is shared by
+    /// every head (`qk_rope_head_dim`, `rope.dimension_count`).
+    pub(crate) rot: usize,
+    /// Per-head value width (`value_length_mla`).
+    pub(crate) v_head: usize,
+}
+
+impl MlaSpec {
+    /// Width of one query head before absorption: `nope + rot`.
+    pub(crate) fn q_head(&self) -> usize {
+        self.nope + self.rot
+    }
+
+    /// Width of the cached row: the latent plus the shared rotary key.
+    pub(crate) fn latent_width(&self) -> usize {
+        self.kv_lora + self.rot
+    }
+}
+
+/// Llama 4 style per-position query scaling: row `pos` of a query is
+/// multiplied by `1 + beta * ln(1 + floor(pos / length))`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct AttnTemp {
+    pub(crate) beta: f32,
+    pub(crate) length: usize,
+}
+
+impl AttnTemp {
+    /// The multiplier of the query at absolute position `pos`.
+    pub(crate) fn at(&self, pos: usize) -> f32 {
+        1.0 + self.beta * ((pos / self.length) as f32 + 1.0).ln()
+    }
+}
+
+impl LayerSpec {
+    /// `f32` values one position occupies in this layer's K/V blocks: keys and
+    /// values, or the latent row alone (the value is a slice of it).
+    pub(crate) fn kv_floats_per_position(&self) -> usize {
+        let per_row = self.n_kv_head * self.head_dim;
+        if self.mla.is_some() {
+            per_row
+        } else {
+            2 * per_row
+        }
+    }
 }
 
 impl LayerSpec {
@@ -210,12 +280,15 @@ impl LayerSpec {
 }
 
 /// Top-k mixture-of-experts FFN.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct MoeSpec {
     pub(crate) n_expert: usize,
     pub(crate) n_used: usize,
     /// Renormalise the selected experts' softmax weights to sum to one.
     pub(crate) norm_weights: bool,
+    /// Multiplier on the final expert weights (`expert_weights_scale`; `1.0`
+    /// when the file has none or `0`, as in llama.cpp).
+    pub(crate) scale: f32,
 }
 
 /// Hyperparameters of a checkpoint.
@@ -255,6 +328,9 @@ pub(crate) struct Hparams {
     /// Width of one layer's per-layer-embedding slice (Gemma 4).
     pub(crate) ple_dim: Option<usize>,
     pub(crate) moe: Option<MoeSpec>,
+    /// Per-position query scaling of the attention layers, when the model has
+    /// it ([`Behavior::attn_temp_default`](super::arch::Behavior)).
+    pub(crate) attn_temp: Option<AttnTemp>,
     /// Trailing blocks of the file (`{arch}.nextn_predict_layers`, only read
     /// for architectures that embed them) that hold a multi-token-prediction
     /// head instead of trunk layers: blocks `n_layer..n_layer +
@@ -374,6 +450,7 @@ impl Hparams {
         ] {
             if let (Some(v), Some(e)) = (k.usize_opt(key)?, expected)
                 && v != e
+                && !behavior.mla
             {
                 return Err(err(format!(
                     "GGUF metadata `{}.{key}`: {v} differs from the key length {e}; only equal key and value lengths are supported",
@@ -464,6 +541,75 @@ impl Hparams {
             None
         };
 
+        // Latent attention (Mistral Small 4): the low-rank query, the latent
+        // and the per-head dimensions. The cache holds one shared row per
+        // position, so `attention.key_length` / `value_length` are the
+        // absorbed widths (`kv_lora + rot` and `kv_lora`).
+        let mla = if behavior.mla {
+            let q_lora = nonzero("attention.q_lora_rank")?;
+            let kv_lora = nonzero("attention.kv_lora_rank")?;
+            let rot = nonzero("rope.dimension_count")?;
+            let k_head = nonzero("attention.key_length_mla")?;
+            let v_head = nonzero("attention.value_length_mla")?;
+            if !rot.is_multiple_of(2) || k_head <= rot {
+                return Err(err(format!(
+                    "GGUF metadata `{0}.rope.dimension_count`: {rot} rotary dimensions must be even and below the head key length {k_head} (`{0}.attention.key_length_mla`)",
+                    arch.name()
+                )));
+            }
+            for (key, want) in [
+                ("attention.key_length", kv_lora + rot),
+                ("attention.value_length", kv_lora),
+            ] {
+                if let Some(v) = k.usize_opt(key)?
+                    && v != want
+                {
+                    return Err(meta_err(
+                        &format!("{}.{key}", arch.name()),
+                        format!(
+                            "{v} differs from the latent width {want} (kv_lora_rank and rope.dimension_count)"
+                        ),
+                    ));
+                }
+            }
+            if n_kv_head.iter().any(|&n| n != 1) {
+                return Err(meta_err(
+                    &format!("{}.attention.head_count_kv", arch.name()),
+                    "latent attention keeps one shared K/V head",
+                ));
+            }
+            if k.usize_opt("leading_dense_block_count")?
+                .is_some_and(|n| n > 0)
+            {
+                return Err(meta_err(
+                    &format!("{}.leading_dense_block_count", arch.name()),
+                    "leading dense blocks are not supported",
+                ));
+            }
+            if k.usize_opt("expert_group_count")?.is_some_and(|n| n > 1) {
+                return Err(meta_err(
+                    &format!("{}.expert_group_count", arch.name()),
+                    "grouped expert routing is not supported",
+                ));
+            }
+            // llama.cpp: 1 softmax, 2 sigmoid.
+            if k.usize_opt("expert_gating_func")?.is_some_and(|n| n != 1) {
+                return Err(meta_err(
+                    &format!("{}.expert_gating_func", arch.name()),
+                    "only softmax expert gating is supported",
+                ));
+            }
+            Some(MlaSpec {
+                q_lora,
+                kv_lora,
+                nope: k_head - rot,
+                rot,
+                v_head,
+            })
+        } else {
+            None
+        };
+
         // Rotary embeddings.
         let n_ctx_orig = k
             .usize_opt("rope.scaling.original_context_length")?
@@ -506,7 +652,18 @@ impl Hparams {
                     1.0
                 },
                 yarn,
-                attn_factor: k.f64_opt("rope.scaling.attn_factor")?.unwrap_or(1.0),
+                attn_factor: {
+                    let attn_factor = k.f64_opt("rope.scaling.attn_factor")?.unwrap_or(1.0);
+                    if mla.is_some() && yarn.is_some() && factor > 0.0 {
+                        // The magnitude scale of a latent-attention model is
+                        // not applied to cos and sin: it enters the softmax
+                        // scale instead (`mscale` below), twice. Cancel the
+                        // table's own `1 + 0.1 ln(factor)`.
+                        attn_factor / (1.0 + 0.1 * factor.ln())
+                    } else {
+                        attn_factor
+                    }
+                },
                 factors,
             })
         };
@@ -543,6 +700,7 @@ impl Hparams {
                                    kv_source: usize|
          -> Result<LayerSpec, CucaError> {
             let head_dim = match (is_sliding, key_length_swa, key_length) {
+                _ if mla.is_some() => mla.map_or(0, |m| m.latent_width()),
                 (true, Some(d), _) => d,
                 (_, _, Some(d)) => d,
                 _ => {
@@ -595,6 +753,24 @@ impl Hparams {
                 })
             };
             let scale = match behavior.attn_scale {
+                _ if mla.is_some() => {
+                    // llama.cpp deepseek2: `mscale^2 / sqrt(key_length_mla)`
+                    // with `mscale = attn_factor * (1 + yarn_log_multiplier *
+                    // ln(factor))` under YaRN; the file's multiplier is
+                    // `0.1 * mscale_all_dim`.
+                    let factor = k.f64_opt("rope.scaling.factor")?.unwrap_or(0.0);
+                    let attn_factor = k.f64_opt("rope.scaling.attn_factor")?.unwrap_or(1.0);
+                    let mscale = if k.str_opt("rope.scaling.type") == Some("yarn") && factor > 0.0 {
+                        attn_factor
+                            * (1.0
+                                + k.f64_opt("rope.scaling.yarn_log_multiplier")?
+                                    .unwrap_or(0.0)
+                                    * factor.ln())
+                    } else {
+                        attn_factor
+                    };
+                    mscale * mscale / (k.usize("attention.key_length_mla")? as f64).sqrt()
+                }
                 AttnScale::HeadDim => 1.0 / (head_dim as f64).sqrt(),
                 AttnScale::One => 1.0,
                 AttnScale::Gemma3 if n_layer == 62 => {
@@ -612,6 +788,7 @@ impl Hparams {
                 rope,
                 kv_source,
                 scale: scale as f32,
+                mla,
             })
         };
         let mut layers = Vec::with_capacity(n_layer);
@@ -628,6 +805,7 @@ impl Hparams {
                     rope: None,
                     kv_source: usize::MAX,
                     scale: 1.0,
+                    mla: None,
                 });
                 continue;
             }
@@ -684,13 +862,46 @@ impl Hparams {
             Some(MoeSpec {
                 n_expert,
                 n_used,
-                norm_weights: behavior.moe_norm_weights,
+                norm_weights: if behavior.mla {
+                    k.bool_opt("expert_weights_norm")?
+                        .unwrap_or(behavior.moe_norm_weights)
+                } else {
+                    behavior.moe_norm_weights
+                },
+                scale: match k.f64_opt("expert_weights_scale")? {
+                    Some(s) if s.is_finite() && s != 0.0 => s as f32,
+                    _ => 1.0,
+                },
             })
         } else if k.usize_opt("expert_count")?.is_some_and(|n| n > 0) {
             return Err(err(format!(
                 "`{}` checkpoints with experts are not supported",
                 arch.name()
             )));
+        } else {
+            None
+        };
+
+        let attn_temp = if behavior.mla {
+            match (
+                k.f64_opt("attention.temperature_scale")?,
+                k.usize_opt("attention.temperature_length")?,
+            ) {
+                (Some(beta), Some(length)) if length > 0 => (beta != 0.0).then_some(AttnTemp {
+                    beta: beta as f32,
+                    length,
+                }),
+                (None, None) => behavior.attn_temp_default.map(|(beta, length)| AttnTemp {
+                    beta: beta as f32,
+                    length,
+                }),
+                _ => {
+                    return Err(meta_err(
+                        &format!("{}.attention.temperature_length", arch.name()),
+                        "`temperature_scale` and a non-zero `temperature_length` come together",
+                    ));
+                }
+            }
         } else {
             None
         };
@@ -718,6 +929,7 @@ impl Hparams {
             logit_softcap: positive("final_logit_softcapping")?,
             ple_dim,
             moe,
+            attn_temp,
             nextn_predict_layers,
             nextn,
         })
@@ -1100,6 +1312,170 @@ mod tests {
     }
 
     /// Muse Glimmer metadata: `[sliding x3, full]` twice.
+    /// The published Mistral Small 4 119B metadata (bartowski's GGUF header),
+    /// with 2 blocks.
+    fn mistral4_metadata() -> Metadata {
+        md(&[
+            ("general.architecture", Str("mistral4".into())),
+            ("mistral4.block_count", U32(2)),
+            ("mistral4.context_length", U32(1_048_576)),
+            ("mistral4.embedding_length", U32(4096)),
+            ("mistral4.feed_forward_length", U32(12288)),
+            ("mistral4.attention.head_count", U32(32)),
+            ("mistral4.attention.head_count_kv", U32(1)),
+            ("mistral4.attention.layer_norm_rms_epsilon", F32(1e-6)),
+            ("mistral4.attention.key_length", U32(320)),
+            ("mistral4.attention.value_length", U32(256)),
+            ("mistral4.attention.q_lora_rank", U32(1024)),
+            ("mistral4.attention.kv_lora_rank", U32(256)),
+            ("mistral4.attention.key_length_mla", U32(128)),
+            ("mistral4.attention.value_length_mla", U32(128)),
+            ("mistral4.rope.dimension_count", U32(64)),
+            ("mistral4.rope.freq_base", F32(10_000.0)),
+            ("mistral4.rope.scaling.type", Str("yarn".into())),
+            ("mistral4.rope.scaling.factor", F32(128.0)),
+            ("mistral4.rope.scaling.original_context_length", U32(8192)),
+            ("mistral4.rope.scaling.yarn_beta_fast", F32(32.0)),
+            ("mistral4.rope.scaling.yarn_beta_slow", F32(1.0)),
+            ("mistral4.rope.scaling.yarn_log_multiplier", F32(0.1)),
+            ("mistral4.expert_count", U32(128)),
+            ("mistral4.expert_used_count", U32(4)),
+            ("mistral4.expert_shared_count", U32(1)),
+            ("mistral4.expert_feed_forward_length", U32(2048)),
+            ("mistral4.expert_weights_scale", F32(1.0)),
+            ("mistral4.expert_weights_norm", Bool(true)),
+            ("mistral4.expert_group_count", U32(1)),
+            ("mistral4.leading_dense_block_count", U32(0)),
+        ])
+    }
+
+    #[test]
+    fn mistral4_reads_latent_attention_yarn_and_routing() {
+        let p = Hparams::from_metadata(&mistral4_metadata(), &none).unwrap();
+        assert_eq!(p.arch, Arch::Mistral4);
+        assert_eq!(p.n_layer, 2);
+        let mla = MlaSpec {
+            q_lora: 1024,
+            kv_lora: 256,
+            nope: 64,
+            rot: 64,
+            v_head: 128,
+        };
+        for l in &p.layers {
+            assert_eq!(l.mla, Some(mla));
+            // One shared latent row of kv_lora + rot per position.
+            assert_eq!((l.n_head, l.n_kv_head, l.head_dim), (32, 1, 320));
+            assert_eq!(l.window, None);
+            assert_eq!(l.kv_floats_per_position(), 320);
+            // mscale = 1 + 0.1 ln 128; scale = mscale^2 / sqrt(128).
+            let mscale = 1.0 + 0.1 * 128f64.ln();
+            assert!((f64::from(l.scale) - mscale * mscale / 128f64.sqrt()).abs() < 1e-6);
+            assert!((f64::from(l.scale) - 0.194_977).abs() < 1e-5);
+        }
+        assert_eq!(p.layers[1].kv_source, 1);
+        // The rotary table is not magnitude-scaled: HF's attention factor is 1.
+        assert_eq!(p.ropes.len(), 1);
+        let rope = p.ropes[0];
+        assert_eq!((rope.n_dims, rope.kind), (64, RopeKind::Norm));
+        assert!((rope.attn_factor * (1.0 + 0.1 * 128f64.ln()) - 1.0).abs() < 1e-12);
+        assert_eq!(rope.yarn.map(|y| y.n_ctx_orig), Some(8192));
+        // Routing: softmax, renormalised, ungated shared expert.
+        assert_eq!(
+            p.moe,
+            Some(MoeSpec {
+                n_expert: 128,
+                n_used: 4,
+                norm_weights: true,
+                scale: 1.0
+            })
+        );
+        // The file has no temperature keys: the checkpoint's own (0.1, 8192).
+        let t = p.attn_temp.unwrap();
+        assert_eq!((t.beta, t.length), (0.1, 8192));
+        assert_eq!(t.at(0), 1.0);
+        assert_eq!(t.at(8191), 1.0);
+        assert!((t.at(8192) - (1.0 + 0.1 * 2f32.ln())).abs() < 1e-7);
+        assert!((t.at(24_576) - (1.0 + 0.1 * 4f32.ln())).abs() < 1e-7);
+    }
+
+    #[test]
+    fn mistral4_metadata_overrides_and_rejections_name_the_key() {
+        let mut m = mistral4_metadata();
+        m.insert("mistral4.attention.temperature_scale".into(), F32(0.2));
+        m.insert("mistral4.attention.temperature_length".into(), U32(4096));
+        let t = Hparams::from_metadata(&m, &none)
+            .unwrap()
+            .attn_temp
+            .unwrap();
+        assert_eq!((t.beta, t.length), (0.2, 4096));
+        m.insert("mistral4.attention.temperature_scale".into(), F32(0.0));
+        assert!(
+            Hparams::from_metadata(&m, &none)
+                .unwrap()
+                .attn_temp
+                .is_none()
+        );
+        m.remove("mistral4.attention.temperature_length");
+        assert!(
+            Hparams::from_metadata(&m, &none)
+                .unwrap_err()
+                .to_string()
+                .contains("temperature_length")
+        );
+        // A smaller routing scale and an explicit renormalisation switch.
+        let mut m = mistral4_metadata();
+        m.insert("mistral4.expert_weights_scale".into(), F32(2.5));
+        m.insert("mistral4.expert_weights_norm".into(), Bool(false));
+        let moe = Hparams::from_metadata(&m, &none).unwrap().moe.unwrap();
+        assert!(!moe.norm_weights && moe.scale == 2.5);
+        for (key, value, needle) in [
+            (
+                "mistral4.attention.key_length",
+                U32(128),
+                "latent width 320",
+            ),
+            (
+                "mistral4.attention.value_length",
+                U32(128),
+                "latent width 256",
+            ),
+            (
+                "mistral4.attention.head_count_kv",
+                U32(32),
+                "one shared K/V head",
+            ),
+            (
+                "mistral4.leading_dense_block_count",
+                U32(1),
+                "leading dense",
+            ),
+            (
+                "mistral4.expert_group_count",
+                U32(8),
+                "grouped expert routing",
+            ),
+            (
+                "mistral4.expert_gating_func",
+                U32(2),
+                "softmax expert gating",
+            ),
+            ("mistral4.rope.dimension_count", U32(63), "even"),
+        ] {
+            let mut bad = mistral4_metadata();
+            bad.insert(key.into(), value);
+            let msg = Hparams::from_metadata(&bad, &none).unwrap_err().to_string();
+            assert!(msg.contains(needle), "{key}: {msg}");
+        }
+        let mut bad = mistral4_metadata();
+        bad.remove("mistral4.attention.q_lora_rank");
+        assert!(
+            Hparams::from_metadata(&bad, &none)
+                .unwrap_err()
+                .to_string()
+                .contains("q_lora_rank")
+        );
+    }
+
     fn muse_metadata() -> Metadata {
         let pattern = (0..8).map(|il| Bool(il % 4 != 3)).collect();
         md(&[
@@ -1208,7 +1584,8 @@ mod tests {
             Some(MoeSpec {
                 n_expert: 8,
                 n_used: 2,
-                norm_weights: true
+                norm_weights: true,
+                scale: 1.0
             })
         );
         let mut bad = meta.clone();
@@ -1242,7 +1619,8 @@ mod tests {
             Some(MoeSpec {
                 n_expert: 8,
                 n_used: 2,
-                norm_weights: true
+                norm_weights: true,
+                scale: 1.0
             })
         );
     }
@@ -1255,7 +1633,8 @@ mod tests {
             Some(MoeSpec {
                 n_expert: 8,
                 n_used: 2,
-                norm_weights: false
+                norm_weights: false,
+                scale: 1.0
             })
         );
     }

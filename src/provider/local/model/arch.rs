@@ -59,6 +59,14 @@ pub(crate) enum Arch {
     /// sandwich norms (the post norms with their own epsilon), a scale-less
     /// norm on the embeddings and a logit multiplier ahead of the soft-cap.
     MuseGlimmer,
+    /// Mistral Small 4 (`mistral4`): DeepSeek-style multi-head latent
+    /// attention (low-rank Q, a compressed K/V latent shared by every head
+    /// plus one shared rotary key, absorbed into the query so that only the
+    /// latent is cached), YaRN with a softmax-scale `mscale`, Llama 4 style
+    /// per-position query scaling, and a softmax-routed mixture of experts
+    /// (fused gate/up expert tensor, renormalised weights) plus an ungated
+    /// shared expert in every layer.
+    Mistral4,
     /// OLMo 2: no pre-norms, post-attention and post-FFN norms, full-width
     /// Q/K RMSNorm.
     Olmo2,
@@ -194,6 +202,21 @@ pub(crate) struct Behavior {
     /// `{arch}.logit_scale` multiplies the final logits (Granite's divides),
     /// before the soft-cap.
     pub(crate) logit_multiplier: bool,
+    /// Multi-head latent attention: `attn_q_a`/`attn_q_b` (low-rank Q),
+    /// `attn_kv_a_mqa` (latent plus shared rotary key), `attn_k_b` and
+    /// `attn_v_b` (the per-head up-projections, absorbed at run time) and
+    /// `attn_output`; the K/V cache holds the latent and the rotary key only.
+    pub(crate) mla: bool,
+    /// The shared expert has no `ffn_gate_inp_shexp` gate: its output is added
+    /// as it is (llama.cpp's deepseek2 family). Only read with
+    /// [`Behavior::shared_expert`].
+    pub(crate) shared_expert_ungated: bool,
+    /// Llama 4 per-position query scaling `1 + beta * ln(1 + floor(pos /
+    /// length))` (`beta`, `length`) when the file carries no
+    /// `attention.temperature_scale` / `attention.temperature_length`: the
+    /// checkpoint's own configuration, which llama.cpp's converter did not
+    /// write for Mistral Small 4.
+    pub(crate) attn_temp_default: Option<(f64, usize)>,
 }
 
 const DEFAULT: Behavior = Behavior {
@@ -221,11 +244,14 @@ const DEFAULT: Behavior = Behavior {
     embd_norm: false,
     post_norm_eps: None,
     logit_multiplier: false,
+    mla: false,
+    shared_expert_ungated: false,
+    attn_temp_default: None,
 };
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 16] = [
+    pub(crate) const ALL: [Arch; 17] = [
         Arch::Gemma4,
         Arch::Gemma3,
         Arch::Llama,
@@ -241,6 +267,7 @@ impl Arch {
         Arch::Olmo2,
         Arch::Ernie4_5,
         Arch::MuseGlimmer,
+        Arch::Mistral4,
         Arch::Gemma4Assistant,
     ];
 
@@ -264,6 +291,7 @@ impl Arch {
             Arch::Ernie4_5 => "ernie4_5",
             Arch::Gemma4Assistant => "gemma4-assistant",
             Arch::MuseGlimmer => "muse-glimmer",
+            Arch::Mistral4 => "mistral4",
         }
     }
 
@@ -318,6 +346,15 @@ impl Arch {
                 embd_norm: true,
                 post_norm_eps: Some(1e-8),
                 logit_multiplier: true,
+                ..DEFAULT
+            },
+            Arch::Mistral4 => Behavior {
+                rope: RopeKind::Norm,
+                moe: true,
+                shared_expert: true,
+                shared_expert_ungated: true,
+                mla: true,
+                attn_temp_default: Some((0.1, 8192)),
                 ..DEFAULT
             },
             Arch::Olmo2 => Behavior {
@@ -448,13 +485,29 @@ mod tests {
     }
 
     #[test]
-    fn only_qwen35moe_has_a_shared_expert_and_it_renormalises() {
+    fn only_the_qwen35moe_and_mistral4_have_a_shared_expert_and_only_mistral4_ungated() {
         for arch in Arch::ALL {
             let b = arch.behavior();
-            assert_eq!(b.shared_expert, arch == Arch::Qwen35Moe, "{arch:?}");
+            let shared = matches!(arch, Arch::Qwen35Moe | Arch::Mistral4);
+            assert_eq!(b.shared_expert, shared, "{arch:?}");
+            assert_eq!(b.shared_expert_ungated, arch == Arch::Mistral4, "{arch:?}");
         }
         let b = Arch::Qwen35Moe.behavior();
         assert!(b.moe && b.moe_norm_weights);
         assert!(!Arch::Qwen35.behavior().moe);
+    }
+
+    #[test]
+    fn mistral4_alone_is_latent_attention_with_llama4_query_scaling() {
+        for arch in Arch::ALL {
+            let b = arch.behavior();
+            let m = arch == Arch::Mistral4;
+            assert_eq!(b.mla, m, "{arch:?}");
+            assert_eq!(b.attn_temp_default.is_some(), m, "{arch:?}");
+        }
+        let b = Arch::Mistral4.behavior();
+        assert_eq!(b.rope, RopeKind::Norm);
+        assert!(b.moe && b.moe_norm_weights && !b.post_norms);
+        assert_eq!(b.attn_temp_default, Some((0.1, 8192)));
     }
 }

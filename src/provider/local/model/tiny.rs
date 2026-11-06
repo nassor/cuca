@@ -1026,3 +1026,220 @@ pub(crate) fn write_tiny_drafter() -> TinyModel {
     write(&path, &meta, &tensors);
     TinyModel { path }
 }
+
+// ---------------------------------------------------------------------------
+// Mistral Small 4
+// ---------------------------------------------------------------------------
+
+pub(crate) const M4_N_HEAD: usize = 4;
+pub(crate) const M4_Q_LORA: usize = 32;
+pub(crate) const M4_KV_LORA: usize = 16;
+pub(crate) const M4_NOPE: usize = 8;
+pub(crate) const M4_ROT: usize = 8;
+pub(crate) const M4_V_HEAD: usize = 16;
+pub(crate) const M4_N_EXPERT: usize = 8;
+pub(crate) const M4_N_USED: usize = 2;
+pub(crate) const M4_FF: usize = 32;
+pub(crate) const M4_SHARED_FF: usize = 32;
+/// Original context length of the tiny model's YaRN scaling, and the length
+/// of its per-position query scaling: both inside the tiny context, so the
+/// positions of a prompt cross them.
+pub(crate) const M4_ORIG_CTX: usize = 16;
+pub(crate) const M4_TEMP_LEN: usize = 8;
+
+/// A tiny `mistral4` model: multi-head latent attention (4 heads of
+/// `nope 8 + rot 8`, `v_head` 16, a latent of 16 and a query rank of 32),
+/// YaRN with factor 2 over an original context of 16, Llama 4 query scaling
+/// from position 8, and in every layer 8 softmax-routed experts (top 2, the
+/// gate and up matrices fused in one tensor unless [`TinyMistral4::fused`] is
+/// off), an ungated shared expert and `expert_weights_scale` 1.5.
+#[derive(Clone)]
+pub(crate) struct TinyMistral4 {
+    pub(crate) layers: usize,
+    /// `ffn_gate_up_exps` (the layout llama.cpp writes) instead of separate
+    /// `ffn_gate_exps` and `ffn_up_exps` holding the same values.
+    pub(crate) fused: bool,
+    /// Dtype of the dense matrices.
+    pub(crate) dtype: GgmlDType,
+    /// Metadata keys (relative to `mistral4.`) written over the defaults.
+    pub(crate) meta: Vec<(String, Value)>,
+}
+
+impl Default for TinyMistral4 {
+    fn default() -> Self {
+        Self {
+            layers: 3,
+            fused: true,
+            dtype: GgmlDType::Q8_0,
+            meta: Vec::new(),
+        }
+    }
+}
+
+/// Write the model `s` describes.
+pub(crate) fn write_mistral4(s: &TinyMistral4) -> TinyModel {
+    let p = "mistral4";
+    let path = temp_path(p);
+    let mut rng = Lcg(4);
+    let dt = s.dtype;
+    let q_head = M4_NOPE + M4_ROT;
+    let mut tensors: Vec<(String, QTensor)> = Vec::new();
+    let mut add = |n: String, t: QTensor| tensors.push((n, t));
+
+    add(
+        "token_embd.weight".into(),
+        quantized(&mut rng, &[VOCAB, N_EMBD], GgmlDType::Q8_0, 0.5),
+    );
+    add("output_norm.weight".into(), norm(&mut rng, N_EMBD));
+    add(
+        "output.weight".into(),
+        quantized(&mut rng, &[VOCAB, N_EMBD], GgmlDType::Q8_0, 0.5),
+    );
+    for il in 0..s.layers {
+        let b = |part: &str| format!("blk.{il}.{part}.weight");
+        add(b("attn_norm"), norm(&mut rng, N_EMBD));
+        add(
+            b("attn_q_a"),
+            quantized(&mut rng, &[M4_Q_LORA, N_EMBD], dt, 0.3),
+        );
+        add(b("attn_q_a_norm"), norm(&mut rng, M4_Q_LORA));
+        add(
+            b("attn_q_b"),
+            quantized(&mut rng, &[M4_N_HEAD * q_head, M4_Q_LORA], dt, 0.3),
+        );
+        add(
+            b("attn_kv_a_mqa"),
+            quantized(&mut rng, &[M4_KV_LORA + M4_ROT, N_EMBD], dt, 0.3),
+        );
+        add(b("attn_kv_a_norm"), norm(&mut rng, M4_KV_LORA));
+        // The per-head up-projections stay f32 in the tiny file (their rows
+        // are narrower than a quantization block).
+        add(
+            b("attn_k_b"),
+            quantized(
+                &mut rng,
+                &[M4_N_HEAD, M4_KV_LORA, M4_NOPE],
+                GgmlDType::F32,
+                0.5,
+            ),
+        );
+        add(
+            b("attn_v_b"),
+            quantized(
+                &mut rng,
+                &[M4_N_HEAD, M4_V_HEAD, M4_KV_LORA],
+                GgmlDType::F32,
+                0.5,
+            ),
+        );
+        add(
+            b("attn_output"),
+            quantized(&mut rng, &[N_EMBD, M4_N_HEAD * M4_V_HEAD], dt, 0.3),
+        );
+        add(b("ffn_norm"), norm(&mut rng, N_EMBD));
+        add(
+            b("ffn_gate_inp"),
+            quantized(&mut rng, &[M4_N_EXPERT, N_EMBD], GgmlDType::F32, 0.8),
+        );
+        // The same values either way: per expert, the gate rows then the up
+        // rows.
+        let gate = rng.values(M4_N_EXPERT * M4_FF * N_EMBD, 0.3);
+        let up = rng.values(M4_N_EXPERT * M4_FF * N_EMBD, 0.3);
+        if s.fused {
+            let fused: Vec<f32> = (0..M4_N_EXPERT)
+                .flat_map(|e| {
+                    let span = e * M4_FF * N_EMBD..(e + 1) * M4_FF * N_EMBD;
+                    gate[span.clone()].iter().chain(&up[span]).copied()
+                })
+                .collect();
+            add(
+                b("ffn_gate_up_exps"),
+                quantize(fused, &[M4_N_EXPERT, 2 * M4_FF, N_EMBD], GgmlDType::Q4_0),
+            );
+        } else {
+            for (part, values) in [("ffn_gate_exps", gate), ("ffn_up_exps", up)] {
+                add(
+                    b(part),
+                    quantize(values, &[M4_N_EXPERT, M4_FF, N_EMBD], GgmlDType::Q4_0),
+                );
+            }
+        }
+        add(
+            b("ffn_down_exps"),
+            quantized(
+                &mut rng,
+                &[M4_N_EXPERT, N_EMBD, M4_FF],
+                GgmlDType::Q4_0,
+                0.3,
+            ),
+        );
+        for part in ["ffn_gate_shexp", "ffn_up_shexp"] {
+            add(
+                b(part),
+                quantized(&mut rng, &[M4_SHARED_FF, N_EMBD], dt, 0.3),
+            );
+        }
+        add(
+            b("ffn_down_shexp"),
+            quantized(&mut rng, &[N_EMBD, M4_SHARED_FF], dt, 0.3),
+        );
+    }
+
+    let mut meta = vec![
+        kv("general.architecture", Value::String(p.into())),
+        kv(&format!("{p}.block_count"), u(s.layers)),
+        kv(&format!("{p}.context_length"), u(CONTEXT)),
+        kv(&format!("{p}.embedding_length"), u(N_EMBD)),
+        kv(&format!("{p}.feed_forward_length"), u(96)),
+        kv(&format!("{p}.attention.head_count"), u(M4_N_HEAD)),
+        kv(&format!("{p}.attention.head_count_kv"), u(1)),
+        kv(&format!("{p}.attention.key_length"), u(M4_KV_LORA + M4_ROT)),
+        kv(&format!("{p}.attention.value_length"), u(M4_KV_LORA)),
+        kv(&format!("{p}.attention.q_lora_rank"), u(M4_Q_LORA)),
+        kv(&format!("{p}.attention.kv_lora_rank"), u(M4_KV_LORA)),
+        kv(&format!("{p}.attention.key_length_mla"), u(q_head)),
+        kv(&format!("{p}.attention.value_length_mla"), u(M4_V_HEAD)),
+        kv(
+            &format!("{p}.attention.layer_norm_rms_epsilon"),
+            Value::F32(1e-6),
+        ),
+        kv(&format!("{p}.rope.dimension_count"), u(M4_ROT)),
+        kv(&format!("{p}.rope.freq_base"), Value::F32(10_000.0)),
+        kv(
+            &format!("{p}.rope.scaling.type"),
+            Value::String("yarn".into()),
+        ),
+        kv(&format!("{p}.rope.scaling.factor"), Value::F32(2.0)),
+        kv(
+            &format!("{p}.rope.scaling.original_context_length"),
+            u(M4_ORIG_CTX),
+        ),
+        kv(
+            &format!("{p}.rope.scaling.yarn_beta_fast"),
+            Value::F32(32.0),
+        ),
+        kv(&format!("{p}.rope.scaling.yarn_beta_slow"), Value::F32(1.0)),
+        kv(
+            &format!("{p}.rope.scaling.yarn_log_multiplier"),
+            Value::F32(0.1),
+        ),
+        kv(&format!("{p}.attention.temperature_scale"), Value::F32(0.3)),
+        kv(&format!("{p}.attention.temperature_length"), u(M4_TEMP_LEN)),
+        kv(&format!("{p}.expert_count"), u(M4_N_EXPERT)),
+        kv(&format!("{p}.expert_used_count"), u(M4_N_USED)),
+        kv(&format!("{p}.expert_shared_count"), u(1)),
+        kv(&format!("{p}.expert_feed_forward_length"), u(M4_FF)),
+        kv(&format!("{p}.expert_weights_scale"), Value::F32(1.5)),
+        kv(&format!("{p}.expert_weights_norm"), Value::Bool(true)),
+        kv(&format!("{p}.leading_dense_block_count"), u(0)),
+    ];
+    for (key, value) in &s.meta {
+        let full = format!("{p}.{key}");
+        match meta.iter_mut().find(|(k, _)| *k == full) {
+            Some(entry) => entry.1 = value.clone(),
+            None => meta.push((full, value.clone())),
+        }
+    }
+    write(&path, &meta, &tensors);
+    TinyModel { path }
+}

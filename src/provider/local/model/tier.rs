@@ -116,6 +116,9 @@ pub(crate) struct ExpertSlice {
     start: u64,
     /// Bytes of one expert's matrix in the file.
     pub(crate) file_bytes: usize,
+    /// Bytes from expert `e`'s matrix to expert `e + 1`'s: `file_bytes`, or
+    /// twice that for the gate or the up half of a fused gate/up tensor.
+    pub(crate) stride: usize,
 }
 
 impl ExpertSlice {
@@ -149,12 +152,38 @@ impl ExpertSlice {
             cols,
             start: content.tensor_data_offset + info.offset,
             file_bytes: rows * (cols / dtype.block_size() * dtype.type_size()),
+            stride: rows * (cols / dtype.block_size() * dtype.type_size()),
         })
+    }
+
+    /// The gate and up halves of the fused expert tensor `tensor_name`, of
+    /// shape `[n_expert, 2 * ff, cols]`: for every expert the first `ff` rows
+    /// are the gate matrix and the next `ff` rows the up matrix.
+    pub(crate) fn read_fused(
+        content: &gguf_file::Content,
+        tensor_name: &str,
+        n_expert: usize,
+        ff: usize,
+        cols: usize,
+    ) -> Result<(Self, Self), CucaError> {
+        let both = Self::read(content, tensor_name, n_expert, 2 * ff, cols)?;
+        let half = both.file_bytes / 2;
+        let gate = Self {
+            rows: ff,
+            file_bytes: half,
+            stride: both.file_bytes,
+            ..both
+        };
+        let up = Self {
+            start: both.start + half as u64,
+            ..gate
+        };
+        Ok((gate, up))
     }
 
     /// File offset of expert `e`'s matrix.
     pub(crate) fn offset(&self, e: usize) -> u64 {
-        self.start + (e * self.file_bytes) as u64
+        self.start + (e * self.stride) as u64
     }
 }
 
@@ -1024,6 +1053,7 @@ mod tests {
                     cols: 4,
                     start,
                     file_bytes,
+                    stride: file_bytes,
                 }
             };
             let (gate, up, down) = (slice(&mut bytes), slice(&mut bytes), slice(&mut bytes));

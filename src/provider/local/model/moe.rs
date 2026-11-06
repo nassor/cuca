@@ -3,7 +3,8 @@
 //! The router logits of every token reach the host (`tokens * n_expert`
 //! floats), where [`route`] applies llama.cpp's `LLM_GATING_SOFTMAX` top-k:
 //! softmax over all experts, keep the `n_used` largest, and renormalise the
-//! kept weights to sum to one when the architecture asks for it. The result
+//! kept weights to sum to one when the architecture asks for it, and scale
+//! them by `expert_weights_scale`. The result
 //! is grouped by expert so each expert runs once on exactly its own tokens.
 
 use super::params::MoeSpec;
@@ -39,7 +40,7 @@ pub(crate) fn route(logits: &[f32], t: usize, spec: &MoeSpec) -> Routing {
             total
         };
         for &e in kept {
-            per_expert[e].push((token as u32, probs[e] / denominator));
+            per_expert[e].push((token as u32, probs[e] / denominator * spec.scale));
         }
     }
     Routing { per_expert }
@@ -54,6 +55,7 @@ mod tests {
             n_expert,
             n_used,
             norm_weights: norm,
+            scale: 1.0,
         }
     }
 
@@ -90,6 +92,37 @@ mod tests {
         assert_eq!(r.per_expert[0], vec![(0, 0.25)]);
         assert_eq!(r.per_expert[1], vec![(0, 0.25)]);
         assert!(r.per_expert[2].is_empty() && r.per_expert[3].is_empty());
+    }
+
+    #[test]
+    fn the_expert_weights_scale_multiplies_the_final_weights() {
+        let logits = [1.0f32, 0.0, 3.0, -1.0];
+        let plain = route(&logits, 1, &spec(4, 2, true));
+        let scaled = route(
+            &logits,
+            1,
+            &MoeSpec {
+                scale: 2.5,
+                ..spec(4, 2, true)
+            },
+        );
+        for e in 0..4 {
+            for (a, b) in plain.per_expert[e].iter().zip(&scaled.per_expert[e]) {
+                assert_eq!(a.0, b.0);
+                assert!((a.1 * 2.5 - b.1).abs() < 1e-6);
+            }
+        }
+        // Not renormalised: the scale multiplies the plain softmax weights.
+        let raw = route(&logits, 1, &spec(4, 2, false));
+        let raw_scaled = route(
+            &logits,
+            1,
+            &MoeSpec {
+                scale: 0.5,
+                ..spec(4, 2, false)
+            },
+        );
+        assert!((raw.per_expert[2][0].1 * 0.5 - raw_scaled.per_expert[2][0].1).abs() < 1e-7);
     }
 
     #[test]

@@ -143,8 +143,14 @@ pub(crate) enum Ffn {
     /// rows followed by the up rows.
     Dense { ff: usize, fused: bool },
     /// Mixture of experts, each of width `ff`, plus a shared expert of width
-    /// `shared_ff` when the layer has one.
-    Moe { ff: usize, shared_ff: Option<usize> },
+    /// `shared_ff` when the layer has one. `fused` when `ffn_gate_up_exps`
+    /// holds every expert's gate and up rows in one tensor instead of
+    /// `ffn_gate_exps` and `ffn_up_exps`.
+    Moe {
+        ff: usize,
+        shared_ff: Option<usize>,
+        fused: bool,
+    },
 }
 
 /// Optional tensors of the attention block that this layer has.
@@ -169,6 +175,9 @@ pub(crate) struct LayerLayout {
     /// A separate `attn_gate` projection multiplies the attention output
     /// ([`Behavior::attn_gate_tensor`](super::arch::Behavior)).
     pub(crate) attn_gate: bool,
+    /// Latent attention: the `attn_q_a` ... `attn_v_b` tensors replace the
+    /// query/key/value projections.
+    pub(crate) mla: bool,
     pub(crate) ffn: Ffn,
 }
 
@@ -208,13 +217,27 @@ impl LayerLayout {
         };
 
         let ffn = if hp.moe.is_some() {
-            let gate = name::blk(il, name::FFN_GATE_EXPS);
+            let fused = has_part(name::FFN_GATE_UP_EXPS);
+            let gate = name::blk(
+                il,
+                if fused {
+                    name::FFN_GATE_UP_EXPS
+                } else {
+                    name::FFN_GATE_EXPS
+                },
+            );
             let d = dims(content, &gate)?;
-            let [_, ff, _] = d else {
+            let [_, rows, _] = d else {
                 return Err(err(format!(
                     "tensor `{gate}`: expected a rank-3 expert tensor, found {d:?}"
                 )));
             };
+            if fused && !rows.is_multiple_of(2) {
+                return Err(err(format!(
+                    "tensor `{gate}`: {rows} rows cannot hold a gate and an up matrix"
+                )));
+            }
+            let ff = if fused { rows / 2 } else { *rows };
             let shared_ff = if hp.behavior.shared_expert {
                 let shared = name::blk(il, name::FFN_DOWN_SHEXP);
                 let d = dims(content, &shared)?;
@@ -227,7 +250,11 @@ impl LayerLayout {
             } else {
                 None
             };
-            Ffn::Moe { ff: *ff, shared_ff }
+            Ffn::Moe {
+                ff,
+                shared_ff,
+                fused,
+            }
         } else {
             let down = name::blk(il, name::FFN_DOWN);
             let d = dims(content, &down)?;
@@ -249,6 +276,22 @@ impl LayerLayout {
                 tensor_info(content, &name::blk(il, part))?;
             }
         }
+        let mla = spec.mla.is_some();
+        if mla {
+            for part in [
+                name::ATTN_Q_A,
+                name::ATTN_Q_B,
+                name::ATTN_KV_A_MQA,
+                name::ATTN_K_B,
+                name::ATTN_V_B,
+                name::ATTN_OUTPUT,
+            ] {
+                tensor_info(content, &name::blk(il, part))?;
+            }
+            for part in [name::ATTN_Q_A_NORM, name::ATTN_KV_A_NORM] {
+                tensor_info(content, &name::blk(il, part))?;
+            }
+        }
         let attn_gate = hp.behavior.attn_gate_tensor && spec.delta().is_none();
         if attn_gate {
             tensor_info(content, &name::blk(il, name::ATTN_GATE))?;
@@ -261,6 +304,7 @@ impl LayerLayout {
             post_attn_norm,
             post_ffw_norm,
             attn_gate,
+            mla,
             ffn,
         })
     }
