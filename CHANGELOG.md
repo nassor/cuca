@@ -10,9 +10,11 @@
   architecture keeps a live test; its embedded chat template equals the
   Hugging Face one (the bartowski file's lacks the trailing `<think>`).
 - `provider-local`: split GGUF files (`llama-gguf-split`, `<base>-00001-of-0000N.gguf`) load. `ModelSource::File` naming any part merges the set into one cached GGUF under `<cache>/merged/`; a Hugging Face source whose file is a split name downloads and verifies every part, merges them into `<base>.gguf` in the repository's cache directory and deletes the parts. `ModelSource::HuggingFace` gains `parts: Vec<ModelPart>`, `ModelPreset` gains `parts: &[PresetPart]` (empty for every current preset), and `on_download_progress` reports the merge. A merge needs about twice the model's size free and a deleted merged file means a re-download; see the model sources page.
+- `provider-local`: the `tekken` pre-tokenizer (Mistral Nemo, Pixtral, Mistral Small 3 and 4), built from the GPT-4o word rule with optional contraction suffixes and a digit-group size as parameters, and the checkpoint converter's structural name for the Tekken regex. Equal ids to Hugging Face `tokenizers` (Mistral Small 4) and `mistral_common` (Mistral Small 3.2) on 4,537 and 1,536 texts.
 
 ### Changed
 
+- `provider-local`: the pre-tokenizer name `pixtral` now selects the Tekken expression (llama.cpp's mapping, with `ignore_merges` and a default BOS) instead of the Llama 3 expression. No preset used it.
 - `provider-local`: the K/V cache is paged. K/V lives in blocks of 16
   positions in per-layer-group pools (`model/paged.rs`), a sequence holds one
   block table per group, and a prefix store names full blocks by a hash chain

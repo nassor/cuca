@@ -154,13 +154,14 @@ Any other `tokenizer.ggml.model` fails the load with ``unsupported tokenizer mod
 
 A `gpt2` model with no `pre`, or `default`, uses the default expression. SentencePiece models use no pre-tokenizer. The implemented values, by expression:
 
-- `llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano`: the Llama 3 expression. Whole words found in the vocabulary skip the merges, and a BOS token is added by default.
+- `llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`, `midm-2.0`, `lfm2`, `jina-v5-nano`: the Llama 3 expression. Whole words found in the vocabulary skip the merges, and a BOS token is added by default.
 - `smaug-bpe`, `dbrx`: the Llama 3 expression without that shortcut.
 - `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `hunyuan`, `solar-open`: the Qwen 2 expression.
 - `qwen35`: the Qwen 2 expression with combining marks.
 - `gpt-2`, `olmo`, `trillion`, `granite-docling`, `exaone4`, `mellum`, `modern-bert`, `gigachat`, `a.x-4.0`: the GPT-2 expression.
 - `starcoder`, `refact`, `command-r`, `exaone`, `mellum2`: digits are split first, then the GPT-2 expression runs on the fragments between them.
 - `gpt-4o`, `llama4`, `kanana2`, `talkie`, `minimax-m2`: the GPT-4o expression, with case classes from real Unicode categories.
+- `tekken`, `pixtral`: the Tekken expression of Mistral Nemo, Pixtral, Mistral Small 3 and Mistral Small 4, as llama.cpp maps both names (`LLAMA_VOCAB_PRE_TYPE_TEKKEN`). It is the GPT-4o expression without the contraction suffix on words and with single digits (`\p{N}`, not groups of three). Whole words found in the vocabulary skip the merges, and a BOS token is added by default. Before this release `pixtral` read as the Llama 3 expression, which is what the Hugging Face `tokenizer.json` of Pixtral and of Mistral Small 3.x declares; the Tekken expression is what the models were trained with (their `tekken.json`), and on a 1,536-text corpus the two differ on 13 texts (non-ASCII letters, mostly). A checkpoint whose `tokenizer.json` carries the Tekken regex and `ignore_merges` converts to `tekken`; the probe-text fingerprints of llama.cpp's `tekken` and `pixtral` tokenizers are in the converter's table.
 - `gemma4`: the space-escaped scheme above.
 
 Any other `pre` fails the load with ``unsupported pre-tokenizer `NAME` ``. The names of families first released before 2025 (`smollm`, `megrez`, `stablelm2`, `phi-2`, `mpt`, `jais`, `jina-es`, `jina-de`, `jina-v2-es`, `jina-v2-de`, `codeshell`, `minerva-7b`) are not implemented.
@@ -170,6 +171,8 @@ Any other `pre` fails the load with ``unsupported pre-tokenizer `NAME` ``. The n
 - Special tokens (control, user-defined and unknown types) are cut out of the text longest-first before the scheme runs, so `<|im_start|>` in a rendered prompt is one token.
 - The prompt gets a BOS token when `tokenizer.ggml.add_bos_token` (or the scheme's default) says so, and never a second one when the rendered template already starts with it.
 - For a SentencePiece model with `add_space_prefix`, text after a special token such as `</s>` gets a leading space token, as in llama.cpp. HuggingFace's tokenizer does not add it, so such a model's prompt has one more token than the reference tokenizer's (ERNIE 4.5's GGUF files that omit the key; the default stays because llama.cpp applies it).
+
+The Tekken rule is verified by `tekken_words_match_the_reference_regex` (`src/provider/local/tokenizer/pretok.rs`): the pieces of 336 texts (ASCII, digits, CJK, emoji, accented mixed case, code, whitespace runs, 300 seeded random ones) equal those of Hugging Face `tokenizers`' regex splitter with Mistral Small 4's `tokenizer.json` regex. With real vocabularies, the env-gated `tokenizer_corpus_matches_reference_ids` (`CUCA_TOK_GGUF`, `CUCA_TOK_CASES`) gave identical ids for 4,537 texts (those plus every one of the model's 1,000 special tokens alone and in context) against Mistral Small 4's `tokenizer.json`, and for 1,536 texts against Mistral Small 3.2's `tekken.json` read by `mistral_common`, through the headers of the published GGUFs (pre-tokenizer `pixtral` and `tekken`).
 
 Verified by the tokenizer golden test in `src/provider/local/tokenizer/golden.rs`: for 7 models (Qwen 3, Gemma 3 270M and 1B, SmolLM 3, Phi 4 mini, R1 distill, Qwen 3.5) the ids of 16 texts and 3 chat prompts equal the HuggingFace `tokenizer.json` ids. The test reads cached model files and prints `SKIP:` for a missing one. Where llama.cpp and HuggingFace differ, the expected ids follow llama.cpp, with one exception that follows HuggingFace: the GPT-4o case classes.
 

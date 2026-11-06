@@ -719,6 +719,7 @@ const LLAMA3: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{
 const QWEN2: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+|\p{N}| ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
+const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
 /// The `tokenizer.ggml.pre` this checkpoint's pre-tokenizer corresponds to,
 /// by `tokenizer.json` structure (the generic name of its chain).
@@ -788,6 +789,8 @@ fn structural_pre(tok: &Json) -> Result<&'static str, CucaError> {
         (Some(r), false, false) if r == QWEN2 => Ok("qwen2"),
         (Some(r), false, false) if r == QWEN35 => Ok("qwen35"),
         (Some(r), false, false) if r == GPT4O => Ok("gpt-4o"),
+        // llama.cpp's `tekken` always sets `ignore_merges`.
+        (Some(r), false, false) if r == TEKKEN && ignore_merges => Ok("tekken"),
         (None, true, true) => Ok("starcoder"),
         (None, false, true) => Ok("gpt-2"),
         _ => Err(unsupported(pre)),
@@ -1200,6 +1203,12 @@ mod tests {
             structural_pre(&tok(seq(vec![split(GPT4O), byte(false)]), false)).unwrap(),
             "gpt-4o"
         );
+        assert_eq!(
+            structural_pre(&tok(seq(vec![split(TEKKEN), byte(false)]), true)).unwrap(),
+            "tekken"
+        );
+        // Tekken always merges whole vocabulary words first.
+        assert!(structural_pre(&tok(seq(vec![split(TEKKEN), byte(false)]), false)).is_err());
         assert_eq!(structural_pre(&tok(byte(true), false)).unwrap(), "gpt-2");
         let digits = serde_json::json!({"type": "Digits", "individual_digits": true});
         assert_eq!(
@@ -1215,6 +1224,24 @@ mod tests {
     #[test]
     fn probe_text_hash_table_is_loaded() {
         assert_eq!(PRE_BY_HASH.len(), 105);
+        // llama.cpp's `tekken` and `pixtral` fingerprints resolve to names the
+        // engine implements.
+        for (hash, name) in [
+            (
+                "63b97e4253352e6f357cc59ea5b583e3a680eaeaf2632188c2b952de2588485e",
+                "tekken",
+            ),
+            (
+                "0e9433cbbb161f89e264eb32e8e64bfe69e834973ffca5d41d3948a604a3e2a3",
+                "pixtral",
+            ),
+        ] {
+            assert!(PRE_BY_HASH.contains(&(hash, name)), "{name}");
+            assert!(
+                crate::provider::local::tokenizer::supports_pre(name),
+                "{name}"
+            );
+        }
         assert!(PRE_BY_HASH.iter().all(|(h, _)| h.len() == 64));
         assert_eq!(chkhsh(&[1, 2, 3]).len(), 64);
         assert!(CHKTXT.contains("កាន់តែពិសេសអាច"));

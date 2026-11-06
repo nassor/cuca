@@ -39,7 +39,8 @@ use unicode_general_category::{GeneralCategory, get_general_category};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct WordRule {
     /// A standalone case-insensitive contraction alternative opens the pattern
-    /// (llama3, qwen2); GPT-4o instead appends contractions to a word.
+    /// (llama3, qwen2); GPT-4o instead appends contractions to a word and
+    /// Tekken has none.
     standalone_contractions: bool,
     /// Longest digit group: 3 for llama3 and GPT-4o, 1 for qwen2.
     max_digits: usize,
@@ -47,8 +48,11 @@ pub(super) struct WordRule {
     /// class (qwen35).
     marks_are_letters: bool,
     /// Words split on the `[\p{Lu}...]*[\p{Ll}...]+` / `[\p{Lu}...]+[\p{Ll}...]*`
-    /// case pair and the punctuation tail also takes `/` (GPT-4o).
+    /// case pair and the punctuation tail also takes `/` (GPT-4o, Tekken).
     case_split: bool,
+    /// A case-split word may end in a case-insensitive contraction suffix
+    /// (`(?i:'s|'t|'re|'ve|'m|'ll|'d)?`): GPT-4o has it, Tekken does not.
+    suffix_contractions: bool,
 }
 
 /// The llama3 pattern (also smaug-bpe and dbrx).
@@ -57,6 +61,7 @@ const LLAMA3: WordRule = WordRule {
     max_digits: 3,
     marks_are_letters: false,
     case_split: false,
+    suffix_contractions: false,
 };
 /// The qwen2 pattern: single digits.
 const QWEN2: WordRule = WordRule {
@@ -74,6 +79,14 @@ const GPT4O: WordRule = WordRule {
     max_digits: 3,
     marks_are_letters: false,
     case_split: true,
+    suffix_contractions: true,
+};
+/// The Tekken pattern (Mistral Nemo, Pixtral, Mistral Small 3 and 4): the
+/// GPT-4o case-split words without contraction suffixes and single digits.
+const TEKKEN: WordRule = WordRule {
+    suffix_contractions: false,
+    max_digits: 1,
+    ..GPT4O
 };
 
 /// One stage of a pre-tokenizer chain.
@@ -113,6 +126,8 @@ const QWEN2_STAGES: &[Stage] = &[Stage::Word(QWEN2)];
 const QWEN35_STAGES: &[Stage] = &[Stage::Word(QWEN35)];
 /// The GPT-4o pattern.
 const GPT4O_STAGES: &[Stage] = &[Stage::Word(GPT4O)];
+/// The Tekken pattern.
+const TEKKEN_STAGES: &[Stage] = &[Stage::Word(TEKKEN)];
 
 /// What a `tokenizer.ggml.pre` value selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -147,8 +162,8 @@ impl Pre {
         };
         match name.unwrap_or("default") {
             "default" => words(DEFAULT_STAGES, false, false),
-            "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
-            | "midm-2.0" | "lfm2" | "jina-v5-nano" => words(LLAMA3_STAGES, true, true),
+            "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "midm-2.0" | "lfm2"
+            | "jina-v5-nano" => words(LLAMA3_STAGES, true, true),
             "smaug-bpe" | "dbrx" => words(LLAMA3_STAGES, false, false),
             "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "hunyuan" | "solar-open" => {
                 words(QWEN2_STAGES, false, false)
@@ -159,6 +174,9 @@ impl Pre {
             "starcoder" | "refact" | "command-r" | "exaone" | "mellum2" => {
                 words(STARCODER_STAGES, false, false)
             }
+            // llama.cpp maps both to LLAMA_VOCAB_PRE_TYPE_TEKKEN: whole-word hits
+            // skip the merges and a BOS is added by default.
+            "tekken" | "pixtral" => words(TEKKEN_STAGES, true, true),
             "gpt-4o" | "llama4" | "kanana2" | "talkie" | "minimax-m2" => {
                 words(GPT4O_STAGES, false, false)
             }
@@ -468,7 +486,7 @@ fn word_at(rule: WordRule, s: &str, pos: usize, c: char) -> Option<usize> {
         return Some(end);
     }
     if rule.case_split {
-        if let Some(end) = case_split_word(s, pos, c) {
+        if let Some(end) = case_split_word(rule, s, pos, c) {
             return Some(end);
         }
     } else if let Some(end) = letter_word(rule, s, pos, c) {
@@ -529,24 +547,24 @@ fn letter_word(rule: WordRule, s: &str, pos: usize, c: char) -> Option<usize> {
 /// The two GPT-4o word alternatives, each with and without the optional prefix:
 /// `[^\r\n\p{L}\p{N}]?[\p{Lu}..]*[\p{Ll}..]+(?i:contraction)?` first, then
 /// `[^\r\n\p{L}\p{N}]?[\p{Lu}..]+[\p{Ll}..]*(?i:contraction)?`.
-fn case_split_word(s: &str, pos: usize, c: char) -> Option<usize> {
+fn case_split_word(rule: WordRule, s: &str, pos: usize, c: char) -> Option<usize> {
     for lower_tail in [true, false] {
         if is_word_prefix(c)
-            && let Some(end) = case_body(s, pos + c.len_utf8(), lower_tail)
+            && let Some(end) = case_body(rule, s, pos + c.len_utf8(), lower_tail)
         {
             return Some(end);
         }
-        if let Some(end) = case_body(s, pos, lower_tail) {
+        if let Some(end) = case_body(rule, s, pos, lower_tail) {
             return Some(end);
         }
     }
     None
 }
 
-/// Match `U*L+` (`lower_tail`) or `U+L*` at `start`, then an optional
-/// contraction suffix, where `U` and `L` are the overlapping upper and lower
+/// Match `U*L+` (`lower_tail`) or `U+L*` at `start`, then, when the rule has
+/// them, an optional contraction suffix, where `U` and `L` are the overlapping upper and lower
 /// classes.
-fn case_body(s: &str, start: usize, lower_tail: bool) -> Option<usize> {
+fn case_body(rule: WordRule, s: &str, start: usize, lower_tail: bool) -> Option<usize> {
     // Maximal upper-class prefix, remembering the last character that is also
     // lower-class (the point regex backtracking would settle on).
     let mut upper_end = start;
@@ -572,7 +590,10 @@ fn case_body(s: &str, start: usize, lower_tail: bool) -> Option<usize> {
         }
         run_end(s, upper_end, is_lower_class)
     };
-    Some(contraction(s, end, true).unwrap_or(end))
+    if rule.suffix_contractions {
+        return Some(contraction(s, end, true).unwrap_or(end));
+    }
+    Some(end)
 }
 
 #[cfg(test)]
@@ -752,6 +773,77 @@ mod tests {
     }
 
     #[test]
+    fn tekken_words_are_gpt4o_words_without_contractions_and_with_single_digits() {
+        check(
+            "tekken",
+            &[
+                ("Hello world", &["Hello", " world"]),
+                ("HelloWorld", &["Hello", "World"]),
+                // No contraction suffix: the apostrophe starts the next word.
+                (
+                    "don't DON'T Don'T",
+                    &["don", "'t", " DON", "'T", " Don", "'T"],
+                ),
+                (
+                    "12345 6789",
+                    &["1", "2", "3", "4", "5", " ", "6", "7", "8", "9"],
+                ),
+                ("x1234y", &["x", "1", "2", "3", "4", "y"]),
+                ("a, b!\n/x", &["a", ",", " b", "!\n/", "x"]),
+            ],
+        );
+        // The same where the two families agree.
+        for text in ["Hello world", "camelCaseWord", "ABc Def", "  two", "a \n b"] {
+            assert_eq!(words("tekken", text), words("gpt-4o", text), "{text:?}");
+        }
+    }
+
+    /// The Tekken rule against HuggingFace `tokenizers`' `Split` pre-tokenizer
+    /// (Oniguruma) with Mistral Small 4's `tokenizer.json` regex, over fixed
+    /// texts (ASCII, digits, CJK, emoji, accented mixed case, code, whitespace
+    /// runs) and 300 seeded random ones. `testdata/tekken_pretok.json` holds the
+    /// regex and the reference pieces.
+    #[test]
+    fn tekken_words_match_the_reference_regex() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            regex: String,
+            cases: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            text: String,
+            pieces: Vec<String>,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../testdata/tekken_pretok.json")).unwrap();
+        assert!(
+            fixture
+                .regex
+                .contains(r"|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|")
+        );
+        assert!(fixture.cases.len() > 300);
+        let mut failures = Vec::new();
+        for case in &fixture.cases {
+            for pre in ["tekken", "pixtral"] {
+                let got = words(pre, &case.text);
+                if got != case.pieces {
+                    failures.push(format!(
+                        "{pre} {:?}: got {got:?}, want {:?}",
+                        case.text, case.pieces
+                    ));
+                }
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} differ:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
     fn gpt4o_case_split_words() {
         check(
             "gpt-4o",
@@ -795,6 +887,7 @@ mod tests {
             "llama-bpe",
             "falcon3",
             "falcon-h1",
+            "tekken",
             "pixtral",
             "midm-2.0",
             "lfm2",
@@ -843,6 +936,15 @@ mod tests {
         ] {
             assert!(Pre::from_name(Some(name)).is_none(), "{name}");
         }
+        let Some(Pre::Words(tekken)) = Pre::from_name(Some("tekken")) else {
+            panic!("tekken resolves");
+        };
+        assert!(tekken.ignore_merges() && tekken.add_bos());
+        assert_eq!(
+            Pre::from_name(Some("pixtral")),
+            Pre::from_name(Some("tekken")),
+            "llama.cpp maps both names to one pre-tokenizer"
+        );
         let Some(Pre::Words(llama3)) = Pre::from_name(Some("llama-bpe")) else {
             panic!("llama-bpe resolves");
         };

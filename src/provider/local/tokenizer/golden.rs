@@ -258,3 +258,62 @@ const GEMMA4: &[(&str, &[u32])] = &[
         &[1257, 886, 107, 1257, 1156, 108, 23362, 138, 1257],
     ),
 ];
+
+/// A tokenizer corpus against reference ids: `CUCA_TOK_GGUF` names a GGUF
+/// (its header is read, so a file cut after the metadata works) and
+/// `CUCA_TOK_CASES` a JSON array of `{"text": .., "ids": [..]}` produced by the
+/// model's reference tokenizer (`encode(text, add_special_tokens=False)` of
+/// HuggingFace `tokenizers`, or `Tekkenizer.encode(text, bos=False,
+/// eos=False)` of `mistral_common`). Without both the test prints `SKIP:` and
+/// passes (`CUCA_REQUIRE_LIVE=1` makes it fail). `CUCA_TOK_MAX_DIFF` (default
+/// 0) bounds the accepted mismatches, for a documented llama.cpp-vs-reference
+/// difference.
+///
+/// The Tekken pre-tokenizer was settled with it: Mistral Small 4's
+/// `tokenizer.json` (4,537 texts: ASCII, digits, CJK, emoji, accented mixed
+/// case, code, whitespace runs, 1,000 special tokens alone and in context) and
+/// Mistral Small 3.2's `tekken.json` through `mistral_common` (1,536 texts)
+/// give the same ids as the GGUF's tokenizer here, with `tekken` and `pixtral`
+/// pre-tokenizers.
+#[test]
+fn tokenizer_corpus_matches_reference_ids() {
+    #[derive(Deserialize)]
+    struct Case {
+        text: String,
+        ids: Vec<u32>,
+    }
+    let (Some(gguf), Some(cases)) = (
+        std::env::var_os("CUCA_TOK_GGUF"),
+        std::env::var_os("CUCA_TOK_CASES"),
+    ) else {
+        skip("set CUCA_TOK_GGUF and CUCA_TOK_CASES");
+        return;
+    };
+    let cases: Vec<Case> =
+        serde_json::from_str(&std::fs::read_to_string(cases).unwrap()).expect("cases parse");
+    let tokenizer =
+        Tokenizer::from_gguf(&read_metadata(Path::new(&gguf))).expect("tokenizer builds");
+    let mut failures = Vec::new();
+    for case in &cases {
+        compare(
+            &mut failures,
+            "corpus",
+            "encode",
+            &case.text,
+            &case.ids,
+            &tokenizer.encode(&case.text),
+        );
+    }
+    let allowed: usize = std::env::var("CUCA_TOK_MAX_DIFF")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    eprintln!("corpus: {} cases, {} differ", cases.len(), failures.len());
+    assert!(
+        failures.len() <= allowed,
+        "{} of {} differ:\n{}",
+        failures.len(),
+        cases.len(),
+        failures.join("\n")
+    );
+}
