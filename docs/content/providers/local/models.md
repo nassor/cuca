@@ -316,7 +316,7 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `gemma3-270m-q8_0` | no | no syntax | long-context retrieval is a known limit; the rest pass |
 | `gemma3-1b-q4_0` | no | no syntax | all applicable scenarios pass |
 | `qwen3-0.6b-q8_0`, `qwen3-1.7b-q8_0` | on and off | yes | all scenarios pass |
-| `qwen2.5-0.5b-q8_0` | no | yes | the two tool scenarios are a known limit of the published GGUF: its embedded template writes the tool-call example with doubled braces (`{{"name": ...}}`), the greedy model copies them and the call is malformed; the same weights converted from the checkpoint (HF template) pass everything applicable |
+| `qwen2.5-0.5b-q8_0` | no | yes | the two tool scenarios are a known limit of the published GGUF: its embedded template writes the tool-call example with doubled braces (`{% raw %}{{"name": ...}}{% endraw %}`), the greedy model copies them and the call is malformed; the same weights converted from the checkpoint (HF template) pass everything applicable |
 | `llama3.2-1b-q4_0` | no | yes | the tool round trip is a known limit |
 | `smollm3-3b-q4_0` | on and off | yes | all seven run; thinking and the tool answer leg are known limits |
 | `phi3.5-mini-q4_0`, `phi4-mini-q4_0`, `phi4-mini-q4_k_m` | no | no syntax | all applicable scenarios pass |
