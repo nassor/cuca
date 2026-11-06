@@ -329,6 +329,10 @@ pub(super) fn part_cut(
     let heads = tp.heads(spec.n_head, spec.n_kv_head);
     match part {
         name::ATTN_Q => Cut::rows_only(heads.query_rows(rows / spec.n_head.max(1)), cols),
+        // A gate projection of its own has the query's rows.
+        name::ATTN_GATE if hp.behavior.attn_gate_tensor => {
+            Cut::rows_only(heads.query_rows(rows / spec.n_head.max(1)), cols)
+        }
         name::ATTN_K | name::ATTN_V => Cut::rows_only(heads.kv_rows(d), cols),
         name::ATTN_QKV if layout.qkv == Qkv::Fused => Cut::of_rows(
             heads.fused_rows(d, spec.n_head * d, spec.n_kv_head * d),
@@ -847,6 +851,7 @@ mod tests {
                     let replicated = !matches!(
                         part,
                         name::ATTN_Q
+                            | name::ATTN_GATE
                             | name::ATTN_K
                             | name::ATTN_V
                             | name::ATTN_QKV

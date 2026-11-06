@@ -1342,6 +1342,10 @@ struct AttnWeights {
     k_norm: Option<Tensor<1>>,
     /// Whether the layer applies the weightless value norm.
     v_norm: bool,
+    /// `attn_gate`: the sigmoid gate of the attention output, computed from
+    /// the normed layer input ([`Behavior::attn_gate_tensor`](super::arch::Behavior)).
+    /// Its rows follow the shard's heads like the query's.
+    gate: Option<Proj>,
     wo: Proj,
 }
 
@@ -2662,11 +2666,12 @@ impl GpuTransformer {
             tokens.extend_from_slice(r.tokens);
         }
         let hp = &self.weights[0].hp;
-        let embeddings = self
+        let mut embeddings = self
             .embed
             .get_mut()
             .map_err(|_| err("the embedding table lock is poisoned"))?
             .rows(&tokens, hp.embd_scale)?;
+        hp.norm_embeddings(&mut embeddings);
         let per_layer = match (&mut self.ple_table, hp.ple_dim) {
             (Some(table), Some(dim)) => Some(table.rows(&tokens, (dim as f32).sqrt())?),
             _ => None,
@@ -3322,6 +3327,11 @@ fn load_attention(
             },
         )?,
         v_norm: hp.behavior.gemma4_extras && owns,
+        gate: if layout.attn_gate {
+            Some(proj(reader, name::ATTN_GATE, [q_width, n_embd], false)?)
+        } else {
+            None
+        },
         // Its columns follow the shard's heads; its bias (whole) is added
         // once after the shards' outputs are summed.
         wo: proj(
@@ -3702,6 +3712,9 @@ impl Weights {
         if hp.logit_scale != 1.0 {
             logits = logits.div_scalar(f64::from(hp.logit_scale));
         }
+        if hp.logit_mult != 1.0 {
+            logits = logits.mul_scalar(f64::from(hp.logit_mult));
+        }
         if let Some(cap) = hp.logit_softcap {
             logits = logits.div_scalar(cap).tanh().mul_scalar(cap);
         }
@@ -3976,6 +3989,8 @@ impl Weights {
                 y
             }
             Mixer::Attention(aw) => {
+                // A gate projection of its own reads the same normed input.
+                let own_gate = aw.gate.as_ref().map(|g| g.forward(h.clone()));
                 let (q, kv_proj) = aw.project(h, nh, nkv, d);
                 let full_qk = hp.behavior.qk_norm_full;
                 let q = match &aw.q_norm {
@@ -3993,6 +4008,7 @@ impl Weights {
                 } else {
                     (q.reshape([1, t, nh, d]), None)
                 };
+                let gate = own_gate.or(gate);
                 let q = match &aw.q_norm {
                     Some(w) if !full_qk => rms(q, Some(w), eps),
                     _ => q,
@@ -4149,7 +4165,7 @@ impl Weights {
             attn = attn + b.clone().unsqueeze::<2>();
         }
         if let Some(w) = &lw.post_attn_norm {
-            attn = rms(attn, Some(w), self.hp.eps);
+            attn = rms(attn, Some(w), self.hp.post_eps);
         }
         x + self.scaled(attn)
     }
@@ -4179,7 +4195,7 @@ impl Weights {
         let lw = &self.layers[il];
         let eps = hp.eps;
         if let Some(w) = &lw.post_ffw_norm {
-            f = rms(f, Some(w), eps);
+            f = rms(f, Some(w), hp.post_eps);
         }
         let mut x = x + self.scaled(f);
 
