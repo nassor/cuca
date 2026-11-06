@@ -1,0 +1,243 @@
+//! A Hugging Face checkpoint on disk: the files the converter reads, and the
+//! download of those files for [`super::super::ModelSource::Checkpoint`].
+
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+
+use serde_json::Value;
+
+use super::arch::ConvArch;
+use crate::error::CucaError;
+use crate::provider::local::DownloadProgressCallback;
+use crate::provider::local::download;
+
+/// Optional files of a checkpoint, fetched when the repository has them.
+const OPTIONAL_FILES: [&str; 6] = [
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "tokenizer.model",
+    "added_tokens.json",
+    "chat_template.jinja",
+];
+/// The shard index of a sharded checkpoint.
+const INDEX_FILE: &str = "model.safetensors.index.json";
+/// The weights of an unsharded checkpoint.
+const SINGLE_FILE: &str = "model.safetensors";
+
+/// The files of one checkpoint directory.
+#[derive(Debug)]
+pub(crate) struct CheckpointDir {
+    pub(crate) dir: PathBuf,
+    /// `config.json`.
+    pub(crate) config: Value,
+    pub(crate) generation_config: Option<Value>,
+    pub(crate) tokenizer_json: Option<Value>,
+    pub(crate) tokenizer_config: Option<Value>,
+    /// `tokenizer.model` (SentencePiece), when present.
+    pub(crate) tokenizer_model: Option<PathBuf>,
+    /// `added_tokens.json`: SentencePiece tokens added after training.
+    pub(crate) added_tokens: Option<Value>,
+    /// The text of `chat_template.jinja`, when present.
+    pub(crate) chat_template_file: Option<String>,
+    /// The safetensors shards, sorted by name.
+    pub(crate) shards: Vec<PathBuf>,
+}
+
+fn read_json(path: &Path) -> Result<Value, CucaError> {
+    let text = std::fs::read_to_string(path).map_err(|e| CucaError::Io {
+        message: format!("cannot read `{}`: {e}", path.display()),
+    })?;
+    serde_json::from_str(&text).map_err(|e| CucaError::Config(format!("`{}`: {e}", path.display())))
+}
+
+fn read_json_opt(path: &Path) -> Result<Option<Value>, CucaError> {
+    path.is_file().then(|| read_json(path)).transpose()
+}
+
+/// The shard files named by a `model.safetensors.index.json`, sorted.
+fn index_shards(dir: &Path, index: &Value) -> Result<Vec<PathBuf>, CucaError> {
+    let map = index
+        .get("weight_map")
+        .and_then(Value::as_object)
+        .ok_or_else(|| CucaError::Config(format!("`{INDEX_FILE}` has no `weight_map`")))?;
+    let names: BTreeSet<&str> = map.values().filter_map(Value::as_str).collect();
+    if names.is_empty() {
+        return Err(CucaError::Config(format!("`{INDEX_FILE}` lists no shard")));
+    }
+    names
+        .into_iter()
+        .map(|n| {
+            if n.contains(['/', '\\']) || n.starts_with('.') {
+                Err(CucaError::Config(format!(
+                    "`{INDEX_FILE}` names the shard `{n}`; expected a plain file name"
+                )))
+            } else {
+                Ok(dir.join(n))
+            }
+        })
+        .collect()
+}
+
+impl CheckpointDir {
+    /// Read the checkpoint in `dir`: `config.json` is required; the shards
+    /// are the `weight_map` values of `model.safetensors.index.json` when
+    /// present, else `model.safetensors`, else every `*.safetensors` file.
+    pub(crate) fn open(dir: &Path) -> Result<Self, CucaError> {
+        let config = read_json(&dir.join("config.json"))?;
+        let shards = if let Some(index) = read_json_opt(&dir.join(INDEX_FILE))? {
+            index_shards(dir, &index)?
+        } else if dir.join(SINGLE_FILE).is_file() {
+            vec![dir.join(SINGLE_FILE)]
+        } else {
+            let mut found: Vec<PathBuf> = std::fs::read_dir(dir)?
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
+                .collect();
+            found.sort();
+            found
+        };
+        if shards.is_empty() {
+            return Err(CucaError::Config(format!(
+                "checkpoint `{}` has no {SINGLE_FILE} or {INDEX_FILE}",
+                dir.display()
+            )));
+        }
+        for shard in &shards {
+            if !shard.is_file() {
+                return Err(CucaError::Io {
+                    message: format!("checkpoint shard `{}` does not exist", shard.display()),
+                });
+            }
+        }
+        let template = dir.join("chat_template.jinja");
+        let model = dir.join("tokenizer.model");
+        Ok(Self {
+            dir: dir.to_path_buf(),
+            config,
+            generation_config: read_json_opt(&dir.join("generation_config.json"))?,
+            tokenizer_json: read_json_opt(&dir.join("tokenizer.json"))?,
+            tokenizer_config: read_json_opt(&dir.join("tokenizer_config.json"))?,
+            tokenizer_model: model.is_file().then_some(model),
+            added_tokens: read_json_opt(&dir.join("added_tokens.json"))?,
+            chat_template_file: template
+                .is_file()
+                .then(|| std::fs::read_to_string(&template))
+                .transpose()?,
+            shards,
+        })
+    }
+}
+
+/// Download the files of `repo` at `revision` into `dir` (the cache location
+/// of the checkpoint) and open them.
+///
+/// `config.json` comes first: an architecture without a converter fails
+/// before any weight is downloaded. Missing optional files are skipped.
+pub(crate) async fn fetch(
+    client: &reqwest::Client,
+    endpoint: &str,
+    repo: &str,
+    revision: &str,
+    cache_dir: &Path,
+    token: Option<&str>,
+    progress: Option<&DownloadProgressCallback>,
+) -> Result<CheckpointDir, CucaError> {
+    let path = |file: &str| download::cached_path(cache_dir, repo, revision, file);
+    let dir = path("config.json")?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| CucaError::Config("checkpoint path has no parent".into()))?;
+    download::ensure_downloaded(
+        client,
+        endpoint,
+        repo,
+        revision,
+        "config.json",
+        None,
+        &path("config.json")?,
+        token,
+        progress,
+    )
+    .await?;
+    ConvArch::from_config(&read_json(&dir.join("config.json"))?)?;
+
+    for file in OPTIONAL_FILES.iter().chain(&[INDEX_FILE]) {
+        download::ensure_downloaded_optional(
+            client,
+            endpoint,
+            repo,
+            revision,
+            file,
+            None,
+            &path(file)?,
+            token,
+            progress,
+        )
+        .await?;
+    }
+    let shards: Vec<String> = match read_json_opt(&dir.join(INDEX_FILE))? {
+        Some(index) => index_shards(&dir, &index)?
+            .iter()
+            .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
+            .collect(),
+        None => vec![SINGLE_FILE.to_string()],
+    };
+    for shard in &shards {
+        download::ensure_downloaded(
+            client,
+            endpoint,
+            repo,
+            revision,
+            shard,
+            None,
+            &path(shard)?,
+            token,
+            progress,
+        )
+        .await?;
+    }
+    CheckpointDir::open(&dir)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::local::convert::safetensors::tests::temp_dir;
+
+    #[test]
+    fn opens_single_and_sharded_checkpoints() {
+        let dir = temp_dir("hf");
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        assert!(CheckpointDir::open(&dir).is_err(), "no weights");
+        std::fs::write(dir.join("model.safetensors"), b"x").unwrap();
+        let c = CheckpointDir::open(&dir).unwrap();
+        assert_eq!(c.shards, [dir.join("model.safetensors")]);
+        assert!(c.tokenizer_json.is_none() && c.tokenizer_model.is_none());
+
+        std::fs::write(
+            dir.join(INDEX_FILE),
+            r#"{"weight_map":{"a":"s-2.safetensors","b":"s-1.safetensors","c":"s-2.safetensors"}}"#,
+        )
+        .unwrap();
+        assert!(
+            CheckpointDir::open(&dir).is_err(),
+            "listed shards are missing"
+        );
+        std::fs::write(dir.join("s-1.safetensors"), b"x").unwrap();
+        std::fs::write(dir.join("s-2.safetensors"), b"x").unwrap();
+        std::fs::write(dir.join("chat_template.jinja"), "{{ x }}").unwrap();
+        let c = CheckpointDir::open(&dir).unwrap();
+        assert_eq!(
+            c.shards,
+            [dir.join("s-1.safetensors"), dir.join("s-2.safetensors")]
+        );
+        assert_eq!(c.chat_template_file.as_deref(), Some("{{ x }}"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}

@@ -34,7 +34,31 @@
 //! syntax and reasoning markers come from the file ([`LocalModel::capabilities`]
 //! reports what a model supports).
 //!
-//! Bounds:
+//! # Checkpoints
+//!
+//! A Hugging Face safetensors checkpoint loads without a GGUF:
+//! [`ModelSource::Checkpoint`] (`"repo:revision".parse()`, downloaded pinned to
+//! `revision`) or [`ModelSource::Dir`] (a directory with `config.json`, the
+//! `*.safetensors` shards and the tokenizer files) is converted once, in
+//! process and in pure Rust, to a GGUF under `<cache>/converted/`, and that
+//! file then loads exactly like any other. The conversion is a port of
+//! llama.cpp's `convert_hf_to_gguf.py` for the architectures above
+//! (`LlamaForCausalLM`, `SmolLM3ForCausalLM`, `GraniteForCausalLM`,
+//! `GraniteMoeForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
+//! `Qwen3MoeForCausalLM`, `Qwen3_5*`, `Qwen3_5Moe*`, `Phi3ForCausalLM`,
+//! `Gemma2ForCausalLM`, `Gemma3*`, `Gemma4*`, `Gemma4AssistantForCausalLM`,
+//! `Olmo2ForCausalLM`, `Olmo3ForCausalLM` without sliding layers,
+//! `OlmoeForCausalLM`, `Ernie4_5ForCausalLM`; any other architecture fails
+//! before a weight is downloaded) and writes the file llama.cpp would write
+//! (compared with its output tensor by tensor, see the local-provider docs). [`WeightQuant`]
+//! (`LocalModelConfig::convert`, `f16`, `q8_0` by default, or `q4_0`) sets
+//! the matrix precision; each precision is converted once and cached.
+//! Conversion streams tensor by tensor (peak memory is one block of one
+//! tensor), and reports its progress through
+//! `LocalModelConfig::on_download_progress` as tensors converted out of the
+//! tensor count.
+//!
+//! # Bounds
 //!
 //! - Single-slot FIFO engine: one request runs at a time, at most 16 queue
 //!   behind it (further callers wait), 64 output blocks buffered per request.
@@ -115,6 +139,7 @@
 //! tokens per round.
 
 mod chat;
+mod convert;
 mod download;
 mod engine;
 mod model;
@@ -469,14 +494,18 @@ const PRESET_TABLE: [ModelPreset; 26] = [
     },
 ];
 
-/// Where [`LocalModel::load`] gets the GGUF file from.
+/// Where [`LocalModel::load`] gets the model from.
 ///
 /// Any GGUF whose architecture the engine supports works (see the module
 /// docs): the loader derives every dimension from the file. The verified
 /// presets are in [`ModelSource::PRESETS`]; other files are described with
-/// [`ModelSource::hugging_face`] or [`ModelSource::File`]. A source also
-/// parses from a string (`str::parse`): a preset name (ASCII
-/// case-insensitive), or `repo:revision:file`.
+/// [`ModelSource::hugging_face`] or [`ModelSource::File`]. A Hugging Face
+/// safetensors checkpoint ([`ModelSource::Checkpoint`], or a local checkpoint
+/// directory, [`ModelSource::Dir`]) is converted once to a cached GGUF at the
+/// weight precision of [`LocalModelConfig::convert`], then loaded like any
+/// other file. A source also parses from a string (`str::parse`): a preset
+/// name (ASCII case-insensitive), `repo:revision:file` (a GGUF) or
+/// `repo:revision` (a checkpoint).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelSource {
     /// A file hosted on Hugging Face, downloaded once into the cache and
@@ -493,6 +522,20 @@ pub enum ModelSource {
     },
     /// A GGUF file already on disk; nothing is downloaded.
     File(PathBuf),
+    /// A Hugging Face safetensors checkpoint (`config.json`, the weight
+    /// shards, the tokenizer files), downloaded into the cache pinned to
+    /// `revision` and converted once to a GGUF there.
+    Checkpoint {
+        /// Repository id, e.g. `Qwen/Qwen3-0.6B`.
+        repo: String,
+        /// Commit hash the download is pinned to.
+        revision: String,
+    },
+    /// A checkpoint directory already on disk (the same files as
+    /// [`ModelSource::Checkpoint`]); converted once to a GGUF in the cache.
+    /// The conversion is keyed by the directory's path and the size and
+    /// modification time of its `config.json` and weight shards.
+    Dir(PathBuf),
 }
 
 impl ModelSource {
@@ -557,8 +600,19 @@ impl std::str::FromStr for ModelSource {
             {
                 Ok(Self::hugging_face(*repo, *revision, *file))
             }
+            [repo, revision]
+                if !revision.is_empty()
+                    && repo.split_once('/').is_some_and(|(owner, name)| {
+                        !owner.is_empty() && !name.is_empty() && !name.contains('/')
+                    }) =>
+            {
+                Ok(Self::Checkpoint {
+                    repo: (*repo).to_string(),
+                    revision: (*revision).to_string(),
+                })
+            }
             _ => Err(CucaError::Config(format!(
-                "unknown model `{s}`: expected a preset ({}) or `repo:revision:file`",
+                "unknown model `{s}`: expected a preset ({}), `repo:revision:file` (a GGUF), or `repo:revision` (a checkpoint)",
                 Self::PRESETS
                     .iter()
                     .map(|p| p.name)
@@ -765,6 +819,66 @@ impl From<ModelSource> for DrafterSource {
     }
 }
 
+/// Weight precision of a checkpoint converted to GGUF
+/// ([`ConvertConfig::quant`]).
+///
+/// Every 2-D matrix whose row length is a multiple of 32 (attention and FFN
+/// projections, expert stacks, the embeddings and the output head) is stored at
+/// this precision (at `Q4_0` the token embedding and the output head stay at
+/// Q8_0 and Gemma 4's `per_layer_model_proj` at F16, as in llama.cpp's Q4_0
+/// files); norms, biases, scales, RoPE factors, the router and the
+/// recurrent-layer parameters stay `f32`. Parses from a string (`str::parse`,
+/// ASCII case-insensitive): `f16`, `q8_0` or `q4_0`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum WeightQuant {
+    /// IEEE half precision: 2 bytes per weight, the closest to the checkpoint.
+    F16,
+    /// 8-bit blocks of 32 (8.5 bits per weight): the default, indistinguishable
+    /// from `f16` in practice at half its size.
+    #[default]
+    Q8_0,
+    /// 4-bit blocks of 32 (4.5 bits per weight): smallest and fastest, with
+    /// visible quantization noise on small models.
+    Q4_0,
+}
+
+impl WeightQuant {
+    /// The lowercase name: `f16`, `q8_0` or `q4_0`; also the stem suffix of the
+    /// converted file (`model-q8_0.gguf`).
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::F16 => "f16",
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+        }
+    }
+}
+
+impl std::str::FromStr for WeightQuant {
+    type Err = CucaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        [Self::F16, Self::Q8_0, Self::Q4_0]
+            .into_iter()
+            .find(|q| q.name().eq_ignore_ascii_case(s))
+            .ok_or_else(|| {
+                CucaError::Config(format!(
+                    "unknown weight quantization `{s}`; expected f16, q8_0 or q4_0"
+                ))
+            })
+    }
+}
+
+/// How a safetensors checkpoint ([`ModelSource::Checkpoint`],
+/// [`ModelSource::Dir`]) is converted to GGUF; ignored for GGUF sources.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ConvertConfig {
+    /// Precision of the weight matrices; [`WeightQuant::Q8_0`] by default.
+    /// Each precision is converted once and cached next to the others.
+    pub quant: WeightQuant,
+}
+
 /// Where a mixture-of-experts model's routed experts live
 /// ([`LocalModelConfig::experts`]); see [`ExpertTiers`].
 ///
@@ -955,6 +1069,8 @@ pub struct LocalModelConfig {
     /// through bounded caches ([`ExpertTiers`]). Tiered placement on a model
     /// without experts fails [`LocalModel::load`] with [`CucaError::Config`].
     pub experts: ExpertPlacement,
+    /// How a checkpoint source is converted to GGUF; unused for GGUF sources.
+    pub convert: ConvertConfig,
 }
 
 impl Default for LocalModelConfig {
@@ -970,6 +1086,7 @@ impl Default for LocalModelConfig {
             draft_tokens: DEFAULT_DRAFT_TOKENS,
             on_download_progress: None,
             experts: ExpertPlacement::Resident,
+            convert: ConvertConfig::default(),
         }
     }
 }
@@ -987,6 +1104,7 @@ impl fmt::Debug for LocalModelConfig {
             .field("draft_tokens", &self.draft_tokens)
             .field("on_download_progress", &self.on_download_progress)
             .field("experts", &self.experts)
+            .field("convert", &self.convert)
             .finish()
     }
 }
@@ -1376,16 +1494,22 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
     Ok(())
 }
 
-/// The GGUF path for `config.source`, downloading it first when needed.
+/// The GGUF path for `config.source`, downloading (and, for a checkpoint,
+/// converting) it first when needed.
 ///
 /// Runs on the engine thread. The download uses a private current-thread
 /// runtime and HTTP client (never the `CucaClient` one), both dropped before
 /// returning: the engine loop later blocks on a channel, which must not happen
-/// inside a runtime.
+/// inside a runtime. A checkpoint ([`ModelSource::Checkpoint`],
+/// [`ModelSource::Dir`]) is converted to
+/// `<cache>/converted/.../model-<quant>.gguf` once; an existing result is
+/// reused without touching the network or the shards.
 fn resolve_model_path(
     config: &LocalModelConfig,
     source: &ModelSource,
 ) -> Result<PathBuf, CucaError> {
+    let cache_dir =
+        || download::resolve_cache_dir(config.cache_dir.as_deref(), &|key| std::env::var_os(key));
     match source {
         ModelSource::File(path) => {
             if !path.is_file() {
@@ -1401,16 +1525,9 @@ fn resolve_model_path(
             file,
             sha256,
         } => {
-            let cache_dir = download::resolve_cache_dir(config.cache_dir.as_deref(), &|key| {
-                std::env::var_os(key)
-            })?;
+            let cache_dir = cache_dir()?;
             let final_path = download::cached_path(&cache_dir, repo, revision, file)?;
             if !final_path.exists() {
-                let token = config.hf_token.clone().or_else(|| {
-                    std::env::var("HF_TOKEN")
-                        .ok()
-                        .filter(|token| !token.is_empty())
-                });
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()?;
@@ -1425,13 +1542,71 @@ fn resolve_model_path(
                     file,
                     sha256.as_deref(),
                     &final_path,
-                    token.as_deref(),
+                    hf_token(config).as_deref(),
                     config.on_download_progress.as_ref(),
                 ))?;
             }
             Ok(final_path)
         }
+        ModelSource::Checkpoint { repo, revision } => {
+            let cache_dir = cache_dir()?;
+            let quant = config.convert.quant;
+            let out = convert::output_path(&cache_dir, source, quant)?;
+            if !out.exists() {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                let client = reqwest::Client::builder()
+                    .connect_timeout(CONNECT_TIMEOUT)
+                    .build()?;
+                let checkpoint = runtime.block_on(convert::hf::fetch(
+                    &client,
+                    download::HF_ENDPOINT,
+                    repo,
+                    revision,
+                    &cache_dir,
+                    hf_token(config).as_deref(),
+                    config.on_download_progress.as_ref(),
+                ))?;
+                drop(runtime);
+                convert::convert(
+                    &checkpoint,
+                    &out,
+                    quant,
+                    config.on_download_progress.as_ref(),
+                )?;
+            }
+            Ok(out)
+        }
+        ModelSource::Dir(dir) => {
+            if !dir.is_dir() {
+                return Err(CucaError::Io {
+                    message: format!("checkpoint directory `{}` does not exist", dir.display()),
+                });
+            }
+            let quant = config.convert.quant;
+            let out = convert::output_path(&cache_dir()?, source, quant)?;
+            if !out.exists() {
+                let checkpoint = convert::hf::CheckpointDir::open(dir)?;
+                convert::convert(
+                    &checkpoint,
+                    &out,
+                    quant,
+                    config.on_download_progress.as_ref(),
+                )?;
+            }
+            Ok(out)
+        }
     }
+}
+
+/// The Hugging Face token: the configured one, else `HF_TOKEN`.
+fn hf_token(config: &LocalModelConfig) -> Option<String> {
+    config.hf_token.clone().or_else(|| {
+        std::env::var("HF_TOKEN")
+            .ok()
+            .filter(|token| !token.is_empty())
+    })
 }
 
 /// The block stream of one local request: the receiving end of the channel the

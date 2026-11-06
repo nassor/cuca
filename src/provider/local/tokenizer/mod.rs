@@ -68,6 +68,11 @@ use crate::types::ProviderEndpoint;
 /// The word-boundary marker substituted for ASCII space.
 const SPACE_MARK: char = '\u{2581}';
 
+/// Whether `name` is a `tokenizer.ggml.pre` value this module implements.
+pub(crate) fn supports_pre(name: &str) -> bool {
+    Pre::from_name(Some(name)).is_some()
+}
+
 /// Build a local-provider error.
 fn local_err(message: impl Into<String>) -> CucaError {
     CucaError::provider(ProviderEndpoint::Local, message)
