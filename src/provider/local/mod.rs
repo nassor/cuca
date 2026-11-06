@@ -363,11 +363,11 @@ const PRESET_TABLE: [ModelPreset; 26] = [
     ),
     preset(
         "qwen2.5-0.5b-q8_0",
-        "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        "9217f5db79a29953eb74d5343926648285ec7e67",
-        "qwen2.5-0.5b-instruct-q8_0.gguf",
-        "ca59ca7f13d0e15a8cfa77bd17e65d24f6844b554a7b6c12e07a5f89ff76844e",
-        675_710_816,
+        "bartowski/Qwen2.5-0.5B-Instruct-GGUF",
+        "41ba88dbac95fed2528c92514c131d73eb5a174b",
+        "Qwen2.5-0.5B-Instruct-Q8_0.gguf",
+        "25130a98aa782284a7dabea0c23245b2fd371ed47244e79d78b8ec23245fdf96",
+        531_068_480,
         "qwen2",
     ),
     preset(

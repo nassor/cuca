@@ -77,6 +77,10 @@
   speed (the host-staged reduction: two readbacks per layer), and continuous
   batching works on it (8 of 8 concurrent replies equal to the serial ones).
 
+### Fixed
+
+- `provider-local`: the `qwen2.5-0.5b-q8_0` preset now uses `bartowski/Qwen2.5-0.5B-Instruct-GGUF` (same weights, tied output head). The official `Qwen/Qwen2.5-0.5B-Instruct-GGUF` embeds a chat template that teaches a doubled-brace tool-call syntax (`{{"name": ...}}`), which the greedy model copied and the parser rejected; the new file's template equals the Hugging Face one, and both tool scenarios pass.
+
 ## 0.6.2
 
 ### Changed

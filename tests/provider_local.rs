@@ -115,8 +115,6 @@ struct Capabilities {
     can_disable_thinking: bool,
     /// The model has a tool-call syntax.
     tools: bool,
-    /// The model was converted from a checkpoint, not loaded from a GGUF.
-    converted: bool,
 }
 
 impl Capabilities {
@@ -137,15 +135,8 @@ impl Capabilities {
 /// where the engine's exact arithmetic matches the dequantized reference and
 /// only the production Q8_0 activation rounding differs. In both cases the scenario is reported as
 /// `KNOWN-LIMIT` instead of failing. Everything else that fails is a failure.
-fn known_limit(model: &str, converted: bool, scenario: &str) -> Option<&'static str> {
+fn known_limit(model: &str, scenario: &str) -> Option<&'static str> {
     match (model, scenario) {
-        // The published GGUF only: the same weights converted from the HF
-        // checkpoint (HF template) pass.
-        ("qwen2.5-0.5b-q8_0", "tool_call_leg") if !converted => Some(
-            "the GGUF's embedded chat template escapes the tool-call example as \
-                 `{{\"name\": ...}}`; the greedy model copies the doubled braces and the \
-                 call is malformed (the HF template of the same weights does not)",
-        ),
         ("gemma3-270m-q8_0", "long_context_needle") => Some(
             "the HuggingFace f32 model also answers with <end_of_turn> at once for 750+ \
              token prompts (570 tokens still retrieve PELICAN)",
@@ -403,7 +394,6 @@ async fn loaded() -> Option<Loaded> {
                 reasoning: reported.reasoning,
                 can_disable_thinking: reported.can_disable_thinking,
                 tools: reported.tools,
-                converted: matches!(source, ModelSource::Checkpoint { .. } | ModelSource::Dir(_)),
             };
             println!("MATRIX|model|{caps:?}");
             Some(Loaded {
@@ -568,10 +558,10 @@ async fn greedy_text_and_usage() {
         caps.name
     );
     match &live.oracle {
-        Some(_) if known_limit(&caps.name, caps.converted, "oracle_prompt_tokens").is_some() => {
+        Some(_) if known_limit(&caps.name, "oracle_prompt_tokens").is_some() => {
             println!(
                 "MATRIX|oracle_prompt_tokens|KNOWN-LIMIT|{}",
-                known_limit(&caps.name, caps.converted, "oracle_prompt_tokens").unwrap_or_default()
+                known_limit(&caps.name, "oracle_prompt_tokens").unwrap_or_default()
             )
         }
         Some(OraclePrompt {
@@ -612,7 +602,7 @@ async fn thinking_precedes_answer() {
     if !caps.reasoning {
         not_applicable!("thinking_precedes_answer", "no reasoning in the template");
     }
-    if let Some(evidence) = known_limit(&caps.name, caps.converted, "thinking_precedes_answer") {
+    if let Some(evidence) = known_limit(&caps.name, "thinking_precedes_answer") {
         not_applicable!(
             "thinking_precedes_answer",
             format!("KNOWN-LIMIT: {evidence}")
@@ -764,11 +754,6 @@ async fn tool_round_trip(live: &Loaded, scenario: &str, tools_on_follow_up: bool
     let (model, caps) = (&live.model, &live.caps);
     let question = "What's the weather in Paris right now? Use the tool.";
 
-    // A limit of the file's own template breaks the call leg itself.
-    if let Some(evidence) = known_limit(&caps.name, caps.converted, "tool_call_leg") {
-        println!("MATRIX|{scenario}|KNOWN-LIMIT|{evidence}");
-        return;
-    }
     let first = ask(
         model,
         request()
@@ -805,8 +790,7 @@ async fn tool_round_trip(live: &Loaded, scenario: &str, tools_on_follow_up: bool
         caps.name
     );
 
-    if tools_on_follow_up && let Some(evidence) = known_limit(&caps.name, caps.converted, scenario)
-    {
+    if tools_on_follow_up && let Some(evidence) = known_limit(&caps.name, scenario) {
         println!("MATRIX|{scenario}|KNOWN-LIMIT|call leg passed; answer leg: {evidence}");
         return;
     }
@@ -970,7 +954,7 @@ async fn prefix_reuse_hits_and_matches_cold() {
 async fn long_context_needle() {
     live_model!(live, _turn);
     let (model, caps) = (&live.model, &live.caps);
-    if let Some(evidence) = known_limit(&caps.name, caps.converted, "long_context_needle") {
+    if let Some(evidence) = known_limit(&caps.name, "long_context_needle") {
         not_applicable!("long_context_needle", format!("KNOWN-LIMIT: {evidence}"));
     }
     // Well over 1,000 tokens: past every sliding window, so the code word is

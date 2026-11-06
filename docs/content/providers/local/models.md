@@ -260,7 +260,7 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 | `gemma2-2b-q4_0` | `gemma2` | `second-state/gemma-2-2b-it-GGUF` | 1.63 GB | 3.08 GB |
 | `qwen3-0.6b-q8_0` | `qwen3` | `Qwen/Qwen3-0.6B-GGUF` | 0.64 GB | 3.76 GB |
 | `qwen3-1.7b-q8_0` | `qwen3` | `Qwen/Qwen3-1.7B-GGUF` | 1.83 GB | 3.76 GB |
-| `qwen2.5-0.5b-q8_0` | `qwen2` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | 0.68 GB | 403 MB |
+| `qwen2.5-0.5b-q8_0` | `qwen2` | `bartowski/Qwen2.5-0.5B-Instruct-GGUF` | 0.53 GB | 403 MB |
 | `r1-distill-qwen-1.5b-q4_0` | `qwen2` | `bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` | 1.07 GB | 940 MB |
 | `llama3.2-1b-q4_0` | `llama` | `bartowski/Llama-3.2-1B-Instruct-GGUF` | 0.77 GB | 1.07 GB |
 | `smollm3-3b-q4_0` | `smollm3` | `bartowski/HuggingFaceTB_SmolLM3-3B-GGUF` | 1.81 GB | 2.42 GB |
@@ -316,7 +316,7 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `gemma3-270m-q8_0` | no | no syntax | long-context retrieval is a known limit; the rest pass |
 | `gemma3-1b-q4_0` | no | no syntax | all applicable scenarios pass |
 | `qwen3-0.6b-q8_0`, `qwen3-1.7b-q8_0` | on and off | yes | all scenarios pass |
-| `qwen2.5-0.5b-q8_0` | no | yes | the two tool scenarios are a known limit of the published GGUF: its embedded template writes the tool-call example with doubled braces (`{% raw %}{{"name": ...}}{% endraw %}`), the greedy model copies them and the call is malformed; the same weights converted from the checkpoint (HF template) pass everything applicable |
+| `qwen2.5-0.5b-q8_0` | no | yes | all applicable scenarios pass |
 | `llama3.2-1b-q4_0` | no | yes | the tool round trip is a known limit |
 | `smollm3-3b-q4_0` | on and off | yes | all seven run; thinking and the tool answer leg are known limits |
 | `phi3.5-mini-q4_0`, `phi4-mini-q4_0`, `phi4-mini-q4_k_m` | no | no syntax | all applicable scenarios pass |
