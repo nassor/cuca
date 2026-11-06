@@ -2,7 +2,7 @@
 //!
 //! Ports the pinned llama.cpp converter's vocabulary paths: the byte-level
 //! BPE one (`_set_vocab_gpt2`, `tokenizer.ggml.model = gpt2`), the
-//! SentencePiece ones (`_set_vocab_sentencepiece`, Phi 3's own variant),
+//! SentencePiece ones (`_set_vocab_sentencepiece`),
 //! Gemma 4's (`tokenizer.ggml.model = gemma4`) and gguf-py's `SpecialVocab`
 //! (special token ids, BOS/EOS flags, merges, chat template). The BPE
 //! pre-tokenizer is identified from `tokenizer.json`'s structure and then
@@ -981,63 +981,6 @@ fn spm_generic(ck: &CheckpointDir, hp: &Hp) -> Result<SpmVocab, CucaError> {
     Ok(v)
 }
 
-/// Phi 3's own SentencePiece reader.
-fn spm_phi3(ck: &CheckpointDir, hp: &Hp) -> Result<SpmVocab, CucaError> {
-    let path = ck
-        .tokenizer_model
-        .as_ref()
-        .ok_or_else(|| cfg_err("checkpoint has no tokenizer.model"))?;
-    let pieces = spm::parse_pieces(&std::fs::read(path)?)?;
-    let vocab_size = hp.uint(&["vocab_size"]).unwrap_or(pieces.len());
-    let mut v = SpmVocab {
-        tokens: (0..vocab_size).map(|i| format!("[PAD{i}]")).collect(),
-        scores: vec![-10000.0; vocab_size],
-        types: vec![UNUSED; vocab_size],
-    };
-    for (i, p) in pieces.iter().enumerate().take(vocab_size) {
-        v.tokens[i] = p.text.clone();
-        v.scores[i] = p.score;
-        v.types[i] = piece_type_value(p.kind);
-    }
-    let put = |id: usize, content: &str, special: bool, v: &mut SpmVocab| {
-        if id < vocab_size {
-            v.tokens[id] = content.to_string();
-            v.scores[id] = -1000.0;
-            v.types[id] = if special { CONTROL } else { USER_DEFINED };
-        }
-    };
-    if let Some(Json::Object(added)) = &ck.added_tokens {
-        for (key, id) in added {
-            if let Some(id) = id.as_u64() {
-                put(id as usize, key, false, &mut v);
-            }
-        }
-    }
-    if let Some(Json::Object(decoder)) = ck
-        .tokenizer_config
-        .as_ref()
-        .and_then(|c| c.get("added_tokens_decoder"))
-    {
-        for (id, data) in decoder {
-            if let (Ok(id), Some(content)) = (
-                id.parse::<usize>(),
-                data.get("content").and_then(Json::as_str),
-            ) {
-                put(
-                    id,
-                    content,
-                    data.get("special").and_then(Json::as_bool).unwrap_or(false),
-                    &mut v,
-                );
-            }
-        }
-    }
-    for (id, content, special) in json_added_tokens(ck) {
-        put(id, &content, special, &mut v);
-    }
-    Ok(v)
-}
-
 fn spm_meta(
     ck: &CheckpointDir,
     v: SpmVocab,
@@ -1192,11 +1135,12 @@ pub(crate) fn build(
         ConvArch::Phi3 => {
             let gpt2_class =
                 config_str(ck, "tokenizer_class").and_then(Json::as_str) == Some("GPT2Tokenizer");
-            if gpt2_class {
-                gpt2(ck, hp)?
-            } else {
-                spm_meta(ck, spm_phi3(ck, hp)?, None)?
+            if !gpt2_class {
+                return Err(cfg_err(
+                    "Phi 3 SentencePiece checkpoints are not supported (only Phi 4 style GPT2Tokenizer ones)",
+                ));
             }
+            gpt2(ck, hp)?
         }
         ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite => {
             let prefix = config_str(ck, "add_prefix_space").and_then(Json::as_bool);
