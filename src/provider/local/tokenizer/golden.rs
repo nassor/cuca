@@ -141,7 +141,7 @@ fn compare(
 #[test]
 fn golden_ids_match_reference_tokenizers() {
     let fixture: Fixture = serde_json::from_str(FIXTURE).expect("fixture parses");
-    assert_eq!(fixture.models.len(), 11, "every catalog model has a vector");
+    assert_eq!(fixture.models.len(), 7, "every catalog model has a vector");
     let Some(dir) = catalog_dir() else {
         skip("no model cache directory");
         return;

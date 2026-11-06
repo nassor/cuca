@@ -150,14 +150,15 @@ impl Pre {
             "llama3" | "llama-v3" | "llama-bpe" | "falcon3" | "falcon-h1" | "pixtral"
             | "midm-2.0" | "lfm2" | "jina-v5-nano" => words(LLAMA3_STAGES, true, true),
             "smaug-bpe" | "dbrx" => words(LLAMA3_STAGES, false, false),
-            "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "megrez" | "stablelm2"
-            | "hunyuan" | "solar-open" => words(QWEN2_STAGES, false, false),
+            "qwen2" | "deepseek-r1-qwen" | "kormo" | "f2llmv2" | "hunyuan" | "solar-open" => {
+                words(QWEN2_STAGES, false, false)
+            }
             "qwen35" => words(QWEN35_STAGES, false, false),
-            "gpt-2" | "phi-2" | "jina-es" | "jina-de" | "gigachat" | "jina-v2-es"
-            | "jina-v2-de" | "a.x-4.0" | "mellum" | "modern-bert" | "mpt" | "olmo" | "jais"
-            | "trillion" | "granite-docling" | "exaone4" => words(GPT2_STAGES, false, false),
-            "starcoder" | "refact" | "command-r" | "smollm" | "codeshell" | "exaone"
-            | "minerva-7b" | "mellum2" => words(STARCODER_STAGES, false, false),
+            "gpt-2" | "gigachat" | "a.x-4.0" | "mellum" | "modern-bert" | "olmo" | "trillion"
+            | "granite-docling" | "exaone4" => words(GPT2_STAGES, false, false),
+            "starcoder" | "refact" | "command-r" | "exaone" | "mellum2" => {
+                words(STARCODER_STAGES, false, false)
+            }
             "gpt-4o" | "llama4" | "kanana2" | "talkie" | "minimax-m2" => {
                 words(GPT4O_STAGES, false, false)
             }
@@ -804,27 +805,18 @@ mod tests {
             "deepseek-r1-qwen",
             "kormo",
             "f2llmv2",
-            "megrez",
-            "stablelm2",
             "hunyuan",
             "solar-open",
             "qwen35",
             "gpt-2",
-            "phi-2",
-            "mpt",
             "olmo",
-            "jais",
             "trillion",
             "granite-docling",
             "exaone4",
-            "jina-es",
             "starcoder",
             "refact",
             "command-r",
-            "smollm",
-            "codeshell",
             "exaone",
-            "minerva-7b",
             "mellum2",
             "gpt-4o",
             "llama4",
@@ -833,6 +825,23 @@ mod tests {
             "minimax-m2",
         ] {
             assert!(Pre::from_name(Some(name)).is_some(), "{name}");
+        }
+        // Aliases of families first released before 2025 are gone.
+        for name in [
+            "megrez",
+            "stablelm2",
+            "phi-2",
+            "mpt",
+            "jais",
+            "jina-es",
+            "jina-de",
+            "jina-v2-es",
+            "jina-v2-de",
+            "smollm",
+            "codeshell",
+            "minerva-7b",
+        ] {
+            assert!(Pre::from_name(Some(name)).is_none(), "{name}");
         }
         let Some(Pre::Words(llama3)) = Pre::from_name(Some("llama-bpe")) else {
             panic!("llama-bpe resolves");

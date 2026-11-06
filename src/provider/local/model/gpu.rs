@@ -4061,10 +4061,7 @@ impl Weights {
                     (&pool.k, &pool.v)
                 };
 
-                let call = PagedCall {
-                    scale: spec.scale,
-                    softcap: hp.attn_softcap.map(|cap| cap as f32),
-                };
+                let call = PagedCall { scale: spec.scale };
                 let attn = if let Some(st) = pass.stacked.iter().find(|s| s.window == spec.window) {
                     // A decode step: every sequence's one row in one launch.
                     paged_kernel::decode(
@@ -4104,7 +4101,6 @@ impl Weights {
                                 gather_view(pool_v, idx, *skip, *len),
                                 visible.mask.clone(),
                                 spec.scale,
-                                hp.attn_softcap,
                             ),
                             BlockRead::Rows { .. } => {
                                 return Err(err(format!(
@@ -4633,17 +4629,15 @@ fn gather_view(pool: &Tensor<4>, idx: &Tensor<1, Int>, skip: usize, len: usize) 
 
 /// Grouped-query attention, as the CPU `attend`: `q` is `[1, n_head, t, d]`,
 /// `k` and `v` are `[1, n_kv, l, d]`, `mask` the additive `[1, 1, t, l]`
-/// mask. The scores are scaled by `scale` and, with `softcap`, squashed as
-/// `cap * tanh(score / cap)` before the mask. The `n_head / n_kv` query heads
-/// of one KV head are stacked into the rows of one matmul. Returns `[1,
-/// n_head, t, d]`.
+/// mask. The scores are scaled by `scale` before the mask. The `n_head / n_kv`
+/// query heads of one KV head are stacked into the rows of one matmul.
+/// Returns `[1, n_head, t, d]`.
 fn attend(
     q: Tensor<4>,
     k: Tensor<4>,
     v: Tensor<4>,
     mask: Option<Tensor<4>>,
     scale: f32,
-    softcap: Option<f64>,
 ) -> Tensor<4> {
     let [_, n_head, t, d] = q.dims();
     let [_, n_kv, l, _] = k.dims();
@@ -4651,9 +4645,6 @@ fn attend(
     let mut scores = q.reshape([1, n_kv, rows, d]).matmul(k.transpose());
     if scale != 1.0 {
         scores = scores.mul_scalar(f64::from(scale));
-    }
-    if let Some(cap) = softcap {
-        scores = scores.div_scalar(cap).tanh().mul_scalar(cap);
     }
     let scores = match mask {
         Some(mask) => (scores.reshape([1, n_head, t, l]) + mask).reshape([1, n_kv, rows, l]),
@@ -5422,23 +5413,19 @@ mod tests {
             return;
         };
         let qwen35moe = write_qwen35(&tiny_qwen35moe());
-        let models: Vec<(&str, TinyModel)> = [
-            TinySpec::granitemoe(),
-            TinySpec::qwen3moe(),
-            TinySpec::olmoe(),
-        ]
-        .into_iter()
-        .map(|spec| {
-            let arch = spec.arch;
-            let model = write_spec(&TinySpec {
-                moe: Some((8, 2)),
-                n_layer: 4,
-                ..spec
-            });
-            (arch, model)
-        })
-        .chain([("qwen35moe", qwen35moe)])
-        .collect();
+        let models: Vec<(&str, TinyModel)> = [TinySpec::qwen3moe(), TinySpec::olmoe()]
+            .into_iter()
+            .map(|spec| {
+                let arch = spec.arch;
+                let model = write_spec(&TinySpec {
+                    moe: Some((8, 2)),
+                    n_layer: 4,
+                    ..spec
+                });
+                (arch, model)
+            })
+            .chain([("qwen35moe", qwen35moe)])
+            .collect();
         for (arch, model) in &models {
             let min = 2 * expert_device_bytes(model) as u64;
             let want = greedy_run(
@@ -5641,53 +5628,50 @@ mod tests {
             let pool_k = Tensor::<4>::from_data(TensorData::new(host_k.clone(), shape), &device);
             let pool_v = Tensor::<4>::from_data(TensorData::new(host_v.clone(), shape), &device);
             let scale = 1.0 / (d as f32).sqrt();
-            for softcap in [None, Some(2.0f32)] {
-                for hi in [1usize, 2, 15, 16, 17, 31, 32, 33, 70] {
-                    // The whole prefix, a short window and (past one block)
-                    // a floor at a block boundary.
-                    let mut los = vec![0, hi.saturating_sub(5)];
-                    if hi > BLOCK_SIZE + 1 {
-                        los.push(BLOCK_SIZE);
-                    }
-                    los.dedup();
-                    for lo in los {
-                        // Blocks before the range may be released.
-                        let mut table = scrambled.to_vec();
-                        table[..lo / BLOCK_SIZE].fill(NO_BLOCK);
-                        let q: Vec<f32> = (0..nh * d).map(|_| 4.0 * rand()).collect();
-                        let want = attend_paged_row(
-                            &q,
-                            &table,
-                            lo,
-                            hi,
-                            &host_k,
-                            &host_v,
-                            PoolShape {
-                                n_head: nh,
-                                n_kv_head: nkv,
-                                head_dim: d,
-                            },
-                            scale,
-                            softcap.map(f64::from),
-                        )
-                        .unwrap();
-                        let call = PagedCall { scale, softcap };
-                        let got = decode_row(
-                            &device,
-                            (&pool_k, &pool_v),
-                            &table,
-                            (lo, hi),
-                            &q,
-                            (nh, d),
-                            &call,
+            for hi in [1usize, 2, 15, 16, 17, 31, 32, 33, 70] {
+                // The whole prefix, a short window and (past one block)
+                // a floor at a block boundary.
+                let mut los = vec![0, hi.saturating_sub(5)];
+                if hi > BLOCK_SIZE + 1 {
+                    los.push(BLOCK_SIZE);
+                }
+                los.dedup();
+                for lo in los {
+                    // Blocks before the range may be released.
+                    let mut table = scrambled.to_vec();
+                    table[..lo / BLOCK_SIZE].fill(NO_BLOCK);
+                    let q: Vec<f32> = (0..nh * d).map(|_| 4.0 * rand()).collect();
+                    let want = attend_paged_row(
+                        &q,
+                        &table,
+                        lo,
+                        hi,
+                        &host_k,
+                        &host_v,
+                        PoolShape {
+                            n_head: nh,
+                            n_kv_head: nkv,
+                            head_dim: d,
+                        },
+                        scale,
+                    )
+                    .unwrap();
+                    let call = PagedCall { scale };
+                    let got = decode_row(
+                        &device,
+                        (&pool_k, &pool_v),
+                        &table,
+                        (lo, hi),
+                        &q,
+                        (nh, d),
+                        &call,
+                    );
+                    assert_eq!(got.len(), want.len());
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (g - w).abs() <= 1e-4,
+                            "heads {nh}/{nkv} d {d} {lo}..{hi}: value {i}: gpu {g} vs cpu {w}"
                         );
-                        assert_eq!(got.len(), want.len());
-                        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-                            assert!(
-                                (g - w).abs() <= 1e-4,
-                                "heads {nh}/{nkv} d {d} cap {softcap:?} {lo}..{hi}: value {i}: gpu {g} vs cpu {w}"
-                            );
-                        }
                     }
                 }
             }
@@ -5719,59 +5703,56 @@ mod tests {
         let hi = start + t;
         let q: Vec<f32> = (0..nh * t * d).map(|_| 4.0 * rand()).collect();
         for window in [None, Some(8usize)] {
-            for softcap in [None, Some(2.0f32)] {
-                let lo = window.map_or(0, |w| start.saturating_sub(w - 1));
-                let rows = BlockRows {
-                    table: &table,
-                    n_blocks,
-                    start,
-                    t,
-                    lo,
-                    hi,
-                    write: false,
-                    stack: false,
-                };
-                let BlockRead::Gather { idx, skip, len } = rows.view(&device).unwrap().read else {
-                    panic!("several rows gather");
-                };
-                let mask = Tensor::<4>::from_data(
-                    TensorData::new(attention_mask(start, t, lo, hi, window), [1, 1, t, hi - lo]),
+            let lo = window.map_or(0, |w| start.saturating_sub(w - 1));
+            let rows = BlockRows {
+                table: &table,
+                n_blocks,
+                start,
+                t,
+                lo,
+                hi,
+                write: false,
+                stack: false,
+            };
+            let BlockRead::Gather { idx, skip, len } = rows.view(&device).unwrap().read else {
+                panic!("several rows gather");
+            };
+            let mask = Tensor::<4>::from_data(
+                TensorData::new(attention_mask(start, t, lo, hi, window), [1, 1, t, hi - lo]),
+                &device,
+            );
+            let qt = Tensor::<4>::from_data(TensorData::new(q.clone(), [1, nh, t, d]), &device);
+            let out = attend(
+                qt,
+                gather_view(&pool_k, &idx, skip, len),
+                gather_view(&pool_v, &idx, skip, len),
+                Some(mask),
+                scale,
+            );
+            let gathered = read_f32(out, "gathered attention").unwrap();
+            let call = PagedCall { scale };
+            for r in 0..t {
+                let pos = start + r;
+                let row_lo = window.map_or(0, |w| lo.max((pos + 1).saturating_sub(w)));
+                let q_row: Vec<f32> = (0..nh)
+                    .flat_map(|h| q[(h * t + r) * d..][..d].iter().copied())
+                    .collect();
+                let row = decode_row(
                     &device,
+                    (&pool_k, &pool_v),
+                    &table,
+                    (row_lo, pos + 1),
+                    &q_row,
+                    (nh, d),
+                    &call,
                 );
-                let qt = Tensor::<4>::from_data(TensorData::new(q.clone(), [1, nh, t, d]), &device);
-                let out = attend(
-                    qt,
-                    gather_view(&pool_k, &idx, skip, len),
-                    gather_view(&pool_v, &idx, skip, len),
-                    Some(mask),
-                    scale,
-                    softcap.map(f64::from),
-                );
-                let gathered = read_f32(out, "gathered attention").unwrap();
-                let call = PagedCall { scale, softcap };
-                for r in 0..t {
-                    let pos = start + r;
-                    let row_lo = window.map_or(0, |w| lo.max((pos + 1).saturating_sub(w)));
-                    let q_row: Vec<f32> = (0..nh)
-                        .flat_map(|h| q[(h * t + r) * d..][..d].iter().copied())
-                        .collect();
-                    let row = decode_row(
-                        &device,
-                        (&pool_k, &pool_v),
-                        &table,
-                        (row_lo, pos + 1),
-                        &q_row,
-                        (nh, d),
-                        &call,
-                    );
-                    for h in 0..nh {
-                        for i in 0..d {
-                            let (g, k) = (gathered[(h * t + r) * d + i], row[h * d + i]);
-                            assert!(
-                                (g - k).abs() <= 1e-4,
-                                "window {window:?} cap {softcap:?} row {r} head {h}[{i}]: gather {g} vs kernel {k}"
-                            );
-                        }
+                for h in 0..nh {
+                    for i in 0..d {
+                        let (g, k) = (gathered[(h * t + r) * d + i], row[h * d + i]);
+                        assert!(
+                            (g - k).abs() <= 1e-4,
+                            "window {window:?} row {r} head {h}[{i}]: gather {g} vs kernel {k}"
+                        );
                     }
                 }
             }
@@ -7332,15 +7313,7 @@ mod tests {
             check_sharded(&model, &devices, if moe { 1e-3 } else { 1e-4 }, arch);
             ran.push(arch);
         }
-        for must in [
-            "llama",
-            "qwen2",
-            "qwen3",
-            "phi3",
-            "gemma3",
-            "granitemoe",
-            "qwen3moe",
-        ] {
+        for must in ["llama", "qwen2", "qwen3", "phi3", "gemma3", "qwen3moe"] {
             assert!(ran.contains(&must), "{must} did not run: {ran:?}");
         }
     }
@@ -7439,7 +7412,7 @@ mod tests {
             warm_from: None,
         });
         assert_split_rejected(
-            &write_spec(&TinySpec::granitemoe()),
+            &write_spec(&TinySpec::qwen3moe()),
             1,
             &tiered,
             "tiered experts",

@@ -38,7 +38,7 @@
 //!   a cached GGUF once; skips the download and wins over `CUCA_LOCAL_MODEL`.
 //! - `CUCA_LOCAL_MODEL`: what to download: a preset name from
 //!   `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`,
-//!   `llama3.2-1b-q4_0`; ASCII case-insensitive), an unverified
+//!   `phi4-mini-q4_0`; ASCII case-insensitive), an unverified
 //!   `repo:revision:file` GGUF on Hugging Face, or `repo:revision`, a
 //!   safetensors checkpoint that is downloaded and converted to a GGUF
 //!   once. Default: `gemma4-e2b-q4_0`.

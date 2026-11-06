@@ -15,9 +15,7 @@
 //!   "arguments": …}</tool_call>`, also a JSON list, with or without a closing
 //!   tag), the XML style of Qwen 3.5 (`<tool_call><function=name>
 //!   <parameter=key>value</parameter></function></tool_call>`,
-//!   [`calls::parse_xml_call`]), or a bare `{"name": …, "parameters": …}` object as the whole reply
-//!   and a `<|python_tag|>` body that runs to the end of generation (code that
-//!   is not JSON becomes a `python` call with a `code` argument);
+//!   [`calls::parse_xml_call`]);
 //! - everything else is [`MessageContentBlock::Text`].
 //!
 //! Markers are matched on **text**, not ids, so a marker that the vocabulary
@@ -34,7 +32,7 @@
 //! for SentencePiece models. End-of-generation ids are never pushed (the engine
 //! stops first); [`OutputParser::finish`] flushes whatever is pending. Per token
 //! the parser allocates only the emitted block; the buffers for a reasoning
-//! header, a tool-call body or a bare-JSON candidate are bounded by the
+//! header or a tool-call body are bounded by the
 //! generation length the engine already caps.
 
 mod calls;
@@ -44,9 +42,6 @@ use super::chat::{ChatFormat, ToolSyntax};
 use super::tokenizer::Tokenizer;
 use crate::error::CucaError;
 use crate::types::{MessageContentBlock, ProviderEndpoint};
-
-/// Tool name given to `<|python_tag|>` bodies that are code, not JSON.
-const PYTHON_TOOL: &str = "python";
 
 /// What recognising a marker does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,8 +56,6 @@ enum Action {
     OpenTool,
     /// End the current tool-call body.
     CloseTool,
-    /// Start a `<|python_tag|>` body.
-    OpenPython,
 }
 
 /// A marker text and its action.
@@ -85,53 +78,6 @@ struct MarkerTable {
     tool: Vec<Marker>,
 }
 
-/// Running brace tracker for a bare-JSON tool-call candidate.
-#[derive(Debug, Default)]
-struct JsonCapture {
-    /// The candidate text so far.
-    text: String,
-    /// Open-brace depth.
-    depth: usize,
-    /// Inside a string literal.
-    in_string: bool,
-    /// The previous character was a backslash inside a string.
-    escaped: bool,
-}
-
-impl JsonCapture {
-    /// Append characters of `text` up to and including the brace that closes
-    /// the object; returns the bytes consumed and whether the object closed.
-    fn advance(&mut self, text: &str) -> (usize, bool) {
-        let mut consumed = 0;
-        for c in text.chars() {
-            consumed += c.len_utf8();
-            self.text.push(c);
-            if self.in_string {
-                if self.escaped {
-                    self.escaped = false;
-                } else if c == '\\' {
-                    self.escaped = true;
-                } else if c == '"' {
-                    self.in_string = false;
-                }
-                continue;
-            }
-            match c {
-                '"' => self.in_string = true,
-                '{' => self.depth += 1,
-                '}' => {
-                    self.depth = self.depth.saturating_sub(1);
-                    if self.depth == 0 {
-                        return (consumed, true);
-                    }
-                }
-                _ => {}
-            }
-        }
-        (consumed, false)
-    }
-}
-
 /// Where the parser currently is in the model's output grammar.
 #[derive(Debug)]
 enum State {
@@ -144,10 +90,6 @@ enum State {
     Thinking,
     /// Inside a marked tool call: the raw body collected so far.
     ToolCall(String),
-    /// After `<|python_tag|>`: the raw body collected so far.
-    PythonTag(String),
-    /// Inside a bare-JSON tool-call candidate.
-    JsonCall(JsonCapture),
 }
 
 /// Incremental parser turning generated ids into content blocks.
@@ -172,9 +114,6 @@ pub(crate) struct OutputParser {
     trim_leading_ws: bool,
     /// Drop one leading space of the next text (SentencePiece prefix).
     strip_one_space: bool,
-    /// Nothing but whitespace has been answered since the start or since the
-    /// reasoning block closed: a `{` now may start a bare-JSON tool call.
-    json_call_window: bool,
 }
 
 impl OutputParser {
@@ -218,14 +157,6 @@ impl OutputParser {
                     markers.tool.push(close_tool(close));
                 }
             }
-            ToolSyntax::LlamaJson { python_tag } => {
-                if let Some(tag) = python_tag {
-                    markers.content.push(Marker {
-                        text: tag.clone(),
-                        action: Action::OpenPython,
-                    });
-                }
-            }
         }
         let thinking = start_in_thinking && format.reasoning().is_some();
         let state = if thinking {
@@ -242,8 +173,6 @@ impl OutputParser {
             reasoning_tokens: 0,
             trim_leading_ws: thinking,
             strip_one_space: format.strips_leading_space(),
-            json_call_window: matches!(format.tool_syntax(), ToolSyntax::LlamaJson { .. })
-                && !thinking,
             format: format.clone(),
         }
     }
@@ -297,7 +226,7 @@ impl OutputParser {
         self.flush_pending(next_call_id, out);
         let held = std::mem::take(&mut self.hold);
         match std::mem::replace(&mut self.state, State::Content) {
-            State::Content => self.emit_content(held, next_call_id, out),
+            State::Content => self.emit_content(held, out),
             State::Thinking => {
                 self.state = State::Thinking;
                 self.emit_thinking(held, out);
@@ -310,14 +239,6 @@ impl OutputParser {
             State::ToolCall(mut body) => {
                 body.push_str(&held);
                 self.finish_tool_call(body, next_call_id, out);
-            }
-            State::PythonTag(mut body) => {
-                body.push_str(&held);
-                self.finish_python(&body, next_call_id, out);
-            }
-            State::JsonCall(mut capture) => {
-                capture.text.push_str(&held);
-                self.emit_text_block(capture.text, out);
             }
         }
     }
@@ -381,7 +302,6 @@ impl OutputParser {
             State::Content => &self.markers.content,
             State::Header(_) | State::Thinking => &self.markers.thinking,
             State::ToolCall(_) => &self.markers.tool,
-            State::PythonTag(_) | State::JsonCall(_) => &[],
         }
     }
 
@@ -404,12 +324,6 @@ impl OutputParser {
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
         loop {
-            if matches!(self.state, State::JsonCall(_)) {
-                if !self.scan_json(next_call_id, out) {
-                    return;
-                }
-                continue;
-            }
             let (found, keep) = {
                 let markers = self.active_markers();
                 match earliest_marker(&self.hold, markers) {
@@ -421,13 +335,13 @@ impl OutputParser {
                 Some((pos, len, action)) => {
                     let before = self.hold[..pos].to_owned();
                     self.hold.drain(..pos + len);
-                    self.route(before, next_call_id, out);
+                    self.route(before, out);
                     self.apply(action, next_call_id, out);
                 }
                 None => {
                     let ready_len = self.hold.len() - keep;
                     if ready_len > 0 {
-                        self.route_hold(ready_len, next_call_id, out);
+                        self.route_hold(ready_len, out);
                     }
                     return;
                 }
@@ -438,48 +352,33 @@ impl OutputParser {
     /// Hand the first `len` bytes of the hold buffer to the current state.
     /// States that only accumulate text take it by reference; states that emit
     /// a block take it as that block's string.
-    fn route_hold(
-        &mut self,
-        len: usize,
-        next_call_id: &mut dyn FnMut() -> String,
-        out: &mut Vec<Result<MessageContentBlock, CucaError>>,
-    ) {
+    fn route_hold(&mut self, len: usize, out: &mut Vec<Result<MessageContentBlock, CucaError>>) {
         match &mut self.state {
-            State::ToolCall(body) | State::PythonTag(body) => {
+            State::ToolCall(body) => {
                 body.push_str(&self.hold[..len]);
-                self.hold.drain(..len);
-            }
-            State::JsonCall(capture) => {
-                capture.text.push_str(&self.hold[..len]);
                 self.hold.drain(..len);
             }
             _ => {
                 let text = self.hold[..len].to_owned();
                 self.hold.drain(..len);
-                self.route(text, next_call_id, out);
+                self.route(text, out);
             }
         }
     }
 
     /// Hand marker-free text to the current state.
-    fn route(
-        &mut self,
-        text: String,
-        next_call_id: &mut dyn FnMut() -> String,
-        out: &mut Vec<Result<MessageContentBlock, CucaError>>,
-    ) {
+    fn route(&mut self, text: String, out: &mut Vec<Result<MessageContentBlock, CucaError>>) {
         if text.is_empty() {
             return;
         }
         match &mut self.state {
-            State::Content => self.emit_content(text, next_call_id, out),
+            State::Content => self.emit_content(text, out),
             State::Thinking => self.emit_thinking(text, out),
             State::Header(header) => {
                 header.push_str(&text);
                 self.resolve_header(false, out);
             }
-            State::ToolCall(body) | State::PythonTag(body) => body.push_str(&text),
-            State::JsonCall(capture) => capture.text.push_str(&text),
+            State::ToolCall(body) => body.push_str(&text),
         }
     }
 
@@ -490,11 +389,6 @@ impl OutputParser {
         next_call_id: &mut dyn FnMut() -> String,
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
-        if matches!(self.state, State::JsonCall(_))
-            && let State::JsonCall(capture) = std::mem::replace(&mut self.state, State::Content)
-        {
-            self.emit_text_block(capture.text, out);
-        }
         match action {
             Action::OpenReasoning => {
                 self.trim_leading_ws = true;
@@ -508,8 +402,6 @@ impl OutputParser {
                 self.resolve_header(true, out);
                 self.state = State::Content;
                 self.trim_leading_ws = true;
-                self.json_call_window =
-                    matches!(self.format.tool_syntax(), ToolSyntax::LlamaJson { .. });
             }
             Action::StrayClose => {}
             Action::OpenTool => {
@@ -523,42 +415,18 @@ impl OutputParser {
                 };
                 self.finish_tool_call(body, next_call_id, out);
             }
-            Action::OpenPython => self.state = State::PythonTag(String::new()),
         }
     }
 
-    /// Emit answer text, dropping prefix whitespace as configured and starting
-    /// a bare-JSON tool-call candidate when allowed.
+    /// Emit answer text, dropping prefix whitespace as configured.
     fn emit_content(
         &mut self,
         text: String,
-        next_call_id: &mut dyn FnMut() -> String,
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
         let Some(text) = self.trim_prefix(text) else {
             return;
         };
-        if self.json_call_window {
-            let trimmed = text.trim_start();
-            if trimmed.is_empty() {
-                // Whitespace before a possible call is dropped, like the
-                // whitespace after a reasoning block.
-                return;
-            }
-            self.json_call_window = false;
-            if trimmed.starts_with('{') {
-                let mut capture = JsonCapture::default();
-                let (consumed, complete) = capture.advance(trimmed);
-                if complete {
-                    let rest = trimmed[consumed..].to_string();
-                    self.complete_json(capture.text, next_call_id, out);
-                    self.emit_content(rest, next_call_id, out);
-                } else {
-                    self.state = State::JsonCall(capture);
-                }
-                return;
-            }
-        }
         self.emit_text_block(text, out);
     }
 
@@ -608,51 +476,6 @@ impl OutputParser {
         (!text.is_empty()).then_some(text)
     }
 
-    /// Consume the hold buffer into the bare-JSON candidate; returns whether the
-    /// feed loop should continue (the candidate completed and text remains).
-    fn scan_json(
-        &mut self,
-        next_call_id: &mut dyn FnMut() -> String,
-        out: &mut Vec<Result<MessageContentBlock, CucaError>>,
-    ) -> bool {
-        let State::JsonCall(capture) = &mut self.state else {
-            return false;
-        };
-        let (consumed, complete) = capture.advance(&self.hold);
-        self.hold.drain(..consumed);
-        if !complete {
-            return false;
-        }
-        let State::JsonCall(capture) = std::mem::replace(&mut self.state, State::Content) else {
-            return false;
-        };
-        self.complete_json(capture.text, next_call_id, out);
-        !self.hold.is_empty()
-    }
-
-    /// Resolve a closed bare-JSON candidate: a tool call when it has the call
-    /// shape, answer text otherwise.
-    fn complete_json(
-        &mut self,
-        text: String,
-        next_call_id: &mut dyn FnMut() -> String,
-        out: &mut Vec<Result<MessageContentBlock, CucaError>>,
-    ) {
-        match parse_json_calls(&text, true) {
-            Ok(calls) => {
-                for (name, arguments) in calls {
-                    out.push(Ok(MessageContentBlock::ToolCall {
-                        id: next_call_id(),
-                        name,
-                        arguments,
-                    }));
-                }
-                self.trim_leading_ws = true;
-            }
-            Err(_) => self.emit_text_block(text, out),
-        }
-    }
-
     /// Decide whether the reasoning header is complete and, if so, move to
     /// `Thinking`, emitting the body text already seen.
     ///
@@ -697,7 +520,7 @@ impl OutputParser {
         let parsed = match self.format.tool_syntax() {
             ToolSyntax::Gemma4 { .. } => parse_tool_call(&body).map(|call| vec![call]),
             ToolSyntax::TaggedXml { .. } => parse_xml_call(&body).map(|call| vec![call]),
-            _ => parse_json_calls(&body, false),
+            _ => parse_json_calls(&body),
         };
         match parsed {
             Ok(calls) => {
@@ -713,32 +536,6 @@ impl OutputParser {
                 ProviderEndpoint::Local,
                 format!("malformed tool call: {body}"),
             ))),
-        }
-    }
-
-    /// Emit a `<|python_tag|>` body: JSON calls as such, anything else as a
-    /// `python` call carrying the code.
-    fn finish_python(
-        &mut self,
-        body: &str,
-        next_call_id: &mut dyn FnMut() -> String,
-        out: &mut Vec<Result<MessageContentBlock, CucaError>>,
-    ) {
-        if body.trim().is_empty() {
-            return;
-        }
-        let calls = parse_json_calls(body, true).unwrap_or_else(|_| {
-            vec![(
-                PYTHON_TOOL.to_string(),
-                serde_json::json!({ "code": body.trim() }),
-            )]
-        });
-        for (name, arguments) in calls {
-            out.push(Ok(MessageContentBlock::ToolCall {
-                id: next_call_id(),
-                name,
-                arguments,
-            }));
         }
     }
 }
@@ -854,27 +651,6 @@ mod tests {
     ];
     /// Template text for the Hermes-style format.
     const HERMES_TEMPLATE: &str = "<think> </think> <tool_call> </tool_call>";
-
-    /// Llama-3-style vocabulary: bare JSON calls and a python tag.
-    const LLAMA_VOCAB: &[(&str, i32)] = &[
-        ("<|eot_id|>", 3),
-        ("<|eom_id|>", 3),
-        ("<|python_tag|>", 3),
-        ("hello", 1),
-        ("{\"name\": \"f\", ", 1),
-        ("\"parameters\": {\"x\": \"}\"}", 1),
-        ("}", 1),
-        (" tail", 1),
-        ("{\"name\": \"only\"}", 1),
-        ("{\"a\": 1}", 1),
-        ("{", 1),
-        ("{\"name\": \"f\", \"parameters\": {\"x\": 1}}", 1),
-        ("print(1)", 1),
-        ("\n", 1),
-        ("  ", 1),
-    ];
-    /// Template text for the Llama-3-style format.
-    const LLAMA_TEMPLATE: &str = "{% if message.tool_calls %}{\"name\": x, \"parameters\": y}";
 
     /// A parser over a synthetic vocabulary, fed token texts.
     struct Rig {
@@ -1317,77 +1093,6 @@ mod tests {
             ok(out),
             [text("hello"), call("call_1", "a", json!({ "k": 1 }))]
         );
-    }
-
-    #[test]
-    fn bare_json_reply_is_a_tool_call() {
-        let mut rig = Rig::new(LLAMA_VOCAB, LLAMA_TEMPLATE, false, false);
-        rig.push(&[
-            "  ",
-            "{\"name\": \"f\", ",
-            "\"parameters\": {\"x\": \"}\"}",
-            "}",
-            " tail",
-        ]);
-        let (out, _) = rig.finish();
-        assert_eq!(
-            ok(out),
-            [call("call_1", "f", json!({ "x": "}" })), text("tail")]
-        );
-    }
-
-    #[test]
-    fn bare_json_that_is_not_a_call_stays_text() {
-        let mut rig = Rig::new(LLAMA_VOCAB, LLAMA_TEMPLATE, false, false);
-        rig.push(&["{\"a\": 1}", " tail"]);
-        let (out, _) = rig.finish();
-        assert_eq!(ok(out), [text("{\"a\": 1}"), text(" tail")]);
-
-        let mut rig = Rig::new(LLAMA_VOCAB, LLAMA_TEMPLATE, false, false);
-        rig.push(&["{\"name\": \"only\"}"]);
-        let (out, _) = rig.finish();
-        assert_eq!(ok(out), [text("{\"name\": \"only\"}")]);
-
-        // Truncated candidates come out as text at the end of generation.
-        let mut rig = Rig::new(LLAMA_VOCAB, LLAMA_TEMPLATE, false, false);
-        rig.push(&["{", "hello"]);
-        let (out, _) = rig.finish();
-        assert_eq!(ok(out), [text("{hello")]);
-    }
-
-    #[test]
-    fn brace_after_answer_text_is_not_a_call() {
-        let mut rig = Rig::new(LLAMA_VOCAB, LLAMA_TEMPLATE, false, false);
-        rig.push(&["hello", "{\"name\": \"f\", \"parameters\": {\"x\": 1}}"]);
-        let (out, _) = rig.finish();
-        assert_eq!(
-            ok(out),
-            [
-                text("hello"),
-                text("{\"name\": \"f\", \"parameters\": {\"x\": 1}}")
-            ]
-        );
-    }
-
-    #[test]
-    fn python_tag_bodies_become_calls() {
-        let mut rig = Rig::new(LLAMA_VOCAB, LLAMA_TEMPLATE, false, false);
-        rig.push(&["hello", "<|python_tag|>", "print(1)"]);
-        let (out, _) = rig.finish();
-        assert_eq!(
-            ok(out),
-            [
-                text("hello"),
-                call("call_1", "python", json!({ "code": "print(1)" }))
-            ]
-        );
-        let mut rig = Rig::new(LLAMA_VOCAB, LLAMA_TEMPLATE, false, false);
-        rig.push(&[
-            "<|python_tag|>",
-            "{\"name\": \"f\", \"parameters\": {\"x\": 1}}",
-        ]);
-        let (out, _) = rig.finish();
-        assert_eq!(ok(out), [call("call_1", "f", json!({ "x": 1 }))]);
     }
 
     #[test]

@@ -17,14 +17,14 @@
 //! # Choosing a model
 //!
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
-//! `gemma2`, `llama` (Llama 1-3.x and compatible), `qwen2`, `qwen3`, `phi3`
-//! (Phi 3, 3.5, 4-mini), `smollm3`, `granite`, `granitemoe`, `qwen3moe`,
+//! `llama` (Llama 1-3.x and compatible), `qwen2`, `qwen3`, `phi3`
+//! (Phi 3, 3.5, 4-mini), `smollm3`, `granite`, `qwen3moe`,
 //! `olmoe`, `olmo2`, `ernie4_5`, `qwen35` or `qwen35moe` runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
 //! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
 //! gate/up tensors, tied or separate output heads, sliding windows, NoPE
-//! layers, soft-caps and mixtures of experts, and rejects anything else (an
+//! layers, mixtures of experts, and rejects anything else (an
 //! unknown architecture, a tensor dtype candle cannot read) with an error
 //! naming the cause. [`ModelSource::PRESETS`] lists the verified models,
 //! each pinned to a repository commit and SHA-256 (by name through
@@ -44,9 +44,9 @@
 //! file then loads exactly like any other. The conversion is a port of
 //! llama.cpp's `convert_hf_to_gguf.py` for the architectures above
 //! (`LlamaForCausalLM`, `SmolLM3ForCausalLM`, `GraniteForCausalLM`,
-//! `GraniteMoeForCausalLM`, `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
+//! `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 //! `Qwen3MoeForCausalLM`, `Qwen3_5*`, `Qwen3_5Moe*`, `Phi3ForCausalLM`,
-//! `Gemma2ForCausalLM`, `Gemma3*`, `Gemma4*`, `Gemma4AssistantForCausalLM`,
+//! `Gemma3*`, `Gemma4*`, `Gemma4AssistantForCausalLM`,
 //! `Olmo2ForCausalLM`, `Olmo3ForCausalLM` without sliding layers,
 //! `OlmoeForCausalLM`, `Ernie4_5ForCausalLM`; any other architecture fails
 //! before a weight is downloaded) and writes the file llama.cpp would write
@@ -279,7 +279,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 26] = [
+const PRESET_TABLE: [ModelPreset; 19] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -335,15 +335,6 @@ const PRESET_TABLE: [ModelPreset; 26] = [
         "gemma3",
     ),
     preset(
-        "gemma2-2b-q4_0",
-        "second-state/gemma-2-2b-it-GGUF",
-        "b7d6a1a55228d89cc129757c687384b96781f97e",
-        "gemma-2-2b-it-Q4_0.gguf",
-        "2c1a93b3dfaaff7345ef184956f3adc78e37e6a3a4fd7bddb25bff01607ef12c",
-        1_629_509_216,
-        "gemma2",
-    ),
-    preset(
         "qwen3-0.6b-q8_0",
         "Qwen/Qwen3-0.6B-GGUF",
         "23749fefcc72300e3a2ad315e1317431b06b590a",
@@ -362,15 +353,6 @@ const PRESET_TABLE: [ModelPreset; 26] = [
         "qwen3",
     ),
     preset(
-        "qwen2.5-0.5b-q8_0",
-        "bartowski/Qwen2.5-0.5B-Instruct-GGUF",
-        "41ba88dbac95fed2528c92514c131d73eb5a174b",
-        "Qwen2.5-0.5B-Instruct-Q8_0.gguf",
-        "25130a98aa782284a7dabea0c23245b2fd371ed47244e79d78b8ec23245fdf96",
-        531_068_480,
-        "qwen2",
-    ),
-    preset(
         "r1-distill-qwen-1.5b-q4_0",
         "bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF",
         "9cc28b17e86fa2415fcb070f8ee5ec27c965aa61",
@@ -380,15 +362,6 @@ const PRESET_TABLE: [ModelPreset; 26] = [
         "qwen2",
     ),
     preset(
-        "llama3.2-1b-q4_0",
-        "bartowski/Llama-3.2-1B-Instruct-GGUF",
-        "067b946cf014b7c697f3654f621d577a3e3afd1c",
-        "Llama-3.2-1B-Instruct-Q4_0.gguf",
-        "fa0390e7c043f89ae1847bd6682d748041a99d4ef3de0e0b27d33b6af97a8be8",
-        773_025_920,
-        "llama",
-    ),
-    preset(
         "smollm3-3b-q4_0",
         "bartowski/HuggingFaceTB_SmolLM3-3B-GGUF",
         "86b3536ed1ca0dcb4716745642db4e6804bf3d32",
@@ -396,15 +369,6 @@ const PRESET_TABLE: [ModelPreset; 26] = [
         "1e0e56d458e6b6d5ea18d0e5fe598cca252450308f1648afab49984fceae47da",
         1_811_455_808,
         "smollm3",
-    ),
-    preset(
-        "phi3.5-mini-q4_0",
-        "bartowski/Phi-3.5-mini-instruct-GGUF",
-        "6d70da17e749a471ccb62ade694486011a75cda3",
-        "Phi-3.5-mini-instruct-Q4_0.gguf",
-        "6e0a4c93fe5db9408348cd2cbd15eee6f448efe6f91255a208c2d28701259b1d",
-        2_182_468_896,
-        "phi3",
     ),
     preset(
         "phi4-mini-q4_0",
@@ -443,33 +407,6 @@ const PRESET_TABLE: [ModelPreset; 26] = [
         "olmo2",
     ),
     preset(
-        "smollm2-360m-q8_0",
-        "bartowski/SmolLM2-360M-Instruct-GGUF",
-        "7be6f65f1db715fe5dc5a4634c0d459b4eed42ec",
-        "SmolLM2-360M-Instruct-Q8_0.gguf",
-        "c004ac34cce45e03e4452bca472535bc371fcb0d07ae560bba2c57ce4a284b7b",
-        386_405_280,
-        "llama",
-    ),
-    preset(
-        "tinyllama-1.1b-q4_0",
-        "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-        "52e7645ba7c309695bec7ac98f4f005b139cf465",
-        "tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
-        "da3087fb14aede55fde6eb81a0e55e886810e43509ec82ecdc7aa5d62a03b556",
-        637_699_456,
-        "llama",
-    ),
-    preset(
-        "granite3.1-moe-1b-q4_0",
-        "bartowski/granite-3.1-1b-a400m-instruct-GGUF",
-        "940d2e1f9f65330615c7c8e980e6c5ac73d3360c",
-        "granite-3.1-1b-a400m-instruct-Q4_0.gguf",
-        "642a83a3e38607015d14ccc0cb8069d02b94a32d4bf8fd18b958ead08d4b6e0e",
-        771_466_560,
-        "granitemoe",
-    ),
-    preset(
         "qwen3-30b-a3b-q4_0",
         "unsloth/Qwen3-30B-A3B-GGUF",
         "d5b1d57bd0b504ac62ae6c725904e96ef228dc74",
@@ -480,11 +417,11 @@ const PRESET_TABLE: [ModelPreset; 26] = [
     ),
     preset(
         "olmoe-1b-7b-q4_0",
-        "bartowski/OLMoE-1B-7B-0924-Instruct-GGUF",
-        "7448e4317d367a3d6838fe367fe996758da6fc6e",
-        "OLMoE-1B-7B-0924-Instruct-Q4_0.gguf",
-        "e6fe22c3beb101a0679e49647f57c159f87b4a5547f0b444ae7f6b90f09d23d8",
-        3_944_815_424,
+        "allenai/OLMoE-1B-7B-0125-Instruct-GGUF",
+        "2ac1d27317927518c9ef7bd99f91f3f1e4ee288d",
+        "OLMoE-1B-7B-0125-Instruct-Q4_0.gguf",
+        "df43bd738dfdcbe889c5f854120c271e9e53e2c624f212ac2523f8bc11ae9bf3",
+        3_928_038_048,
         "olmoe",
     ),
     preset(
@@ -2069,12 +2006,7 @@ mod tests {
         let drafters: Vec<_> = ModelSource::PRESETS.iter().filter(|p| p.drafter).collect();
         assert_eq!(drafters.len(), 1);
         assert_eq!(drafters[0].architecture, "gemma4-assistant");
-        for name in [
-            "qwen3-0.6b-q8_0",
-            "llama3.2-1b-q4_0",
-            "phi3.5-mini-q4_0",
-            "granite3.1-moe-1b-q4_0",
-        ] {
+        for name in ["qwen3-0.6b-q8_0", "phi4-mini-q4_0", "olmoe-1b-7b-q4_0"] {
             assert!(ModelSource::preset(name).is_some(), "{name}");
         }
     }

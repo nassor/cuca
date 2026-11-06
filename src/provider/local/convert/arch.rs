@@ -17,8 +17,6 @@ pub(crate) enum ConvArch {
     Smollm3,
     /// `GraniteForCausalLM`.
     Granite,
-    /// `GraniteMoeForCausalLM`.
-    GraniteMoe,
     /// `Qwen2ForCausalLM`.
     Qwen2,
     /// `Qwen3ForCausalLM`.
@@ -31,8 +29,6 @@ pub(crate) enum ConvArch {
     Qwen35Moe,
     /// `Phi3ForCausalLM` (`Phi3MiniModel`).
     Phi3,
-    /// `Gemma2ForCausalLM`.
-    Gemma2,
     /// `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration`.
     Gemma3,
     /// `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`.
@@ -54,14 +50,12 @@ impl ConvArch {
             "LlamaForCausalLM" => Self::Llama,
             "SmolLM3ForCausalLM" => Self::Smollm3,
             "GraniteForCausalLM" => Self::Granite,
-            "GraniteMoeForCausalLM" => Self::GraniteMoe,
             "Qwen2ForCausalLM" => Self::Qwen2,
             "Qwen3ForCausalLM" => Self::Qwen3,
             "Qwen3MoeForCausalLM" => Self::Qwen3Moe,
             "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration" => Self::Qwen35,
             "Qwen3_5MoeForCausalLM" | "Qwen3_5MoeForConditionalGeneration" => Self::Qwen35Moe,
             "Phi3ForCausalLM" => Self::Phi3,
-            "Gemma2ForCausalLM" => Self::Gemma2,
             "Gemma3ForCausalLM" | "Gemma3ForConditionalGeneration" => Self::Gemma3,
             "Gemma4ForCausalLM" | "Gemma4ForConditionalGeneration" => Self::Gemma4,
             "Gemma4AssistantForCausalLM" => Self::Gemma4Assistant,
@@ -93,14 +87,12 @@ impl ConvArch {
             Self::Llama => "llama",
             Self::Smollm3 => "smollm3",
             Self::Granite => "granite",
-            Self::GraniteMoe => "granitemoe",
             Self::Qwen2 => "qwen2",
             Self::Qwen3 => "qwen3",
             Self::Qwen3Moe => "qwen3moe",
             Self::Qwen35 => "qwen35",
             Self::Qwen35Moe => "qwen35moe",
             Self::Phi3 => "phi3",
-            Self::Gemma2 => "gemma2",
             Self::Gemma3 => "gemma3",
             Self::Gemma4 => "gemma4",
             Self::Gemma4Assistant => "gemma4-assistant",
@@ -113,38 +105,29 @@ impl ConvArch {
     /// Llama-family models whose Q/K rows the converter permutes into
     /// adjacent pairs (`LlamaModel.undo_permute`).
     pub(crate) fn permutes_qk(self) -> bool {
-        matches!(
-            self,
-            Self::Llama | Self::Smollm3 | Self::Granite | Self::GraniteMoe
-        )
+        matches!(self, Self::Llama | Self::Smollm3 | Self::Granite)
     }
 
     /// The Gemma family, whose HF checkpoints keep `norm.weight` as an offset
-    /// from 1 for Gemma 2 and 3 (see [`ConvArch::norm_shift`]).
+    /// from 1 for Gemma 3 (see [`ConvArch::norm_shift`]).
     pub(crate) fn is_gemma(self) -> bool {
-        matches!(
-            self,
-            Self::Gemma2 | Self::Gemma3 | Self::Gemma4 | Self::Gemma4Assistant
-        )
+        matches!(self, Self::Gemma3 | Self::Gemma4 | Self::Gemma4Assistant)
     }
 
-    /// Added to every tensor whose name ends in `norm.weight`: Gemma 2 and 3
+    /// Added to every tensor whose name ends in `norm.weight`: Gemma 3
     /// store `w` and compute `x * (1 + w)`, so the GGUF holds `1 + w`.
     /// Gemma 4 and every other family store the multiplier itself.
     /// (Qwen 3.5's shift applies to all norms but one and is its own rule.)
     pub(crate) fn norm_shift(self) -> f32 {
         match self {
-            Self::Gemma2 | Self::Gemma3 => 1.0,
+            Self::Gemma3 => 1.0,
             _ => 0.0,
         }
     }
 
     /// Whether the checkpoint's FFN is a mixture of experts.
     pub(crate) fn is_moe(self) -> bool {
-        matches!(
-            self,
-            Self::GraniteMoe | Self::Qwen3Moe | Self::Qwen35Moe | Self::Olmoe
-        )
+        matches!(self, Self::Qwen3Moe | Self::Qwen35Moe | Self::Olmoe)
     }
 
     /// The hybrid gated delta-net family.
@@ -164,14 +147,12 @@ mod tests {
             ConvArch::Llama,
             ConvArch::Smollm3,
             ConvArch::Granite,
-            ConvArch::GraniteMoe,
             ConvArch::Qwen2,
             ConvArch::Qwen3,
             ConvArch::Qwen3Moe,
             ConvArch::Qwen35,
             ConvArch::Qwen35Moe,
             ConvArch::Phi3,
-            ConvArch::Gemma2,
             ConvArch::Gemma3,
             ConvArch::Gemma4,
             ConvArch::Gemma4Assistant,
@@ -189,12 +170,18 @@ mod tests {
 
     #[test]
     fn unknown_architectures_are_named() {
-        let cfg = serde_json::json!({"architectures": ["MixtralForCausalLM"]});
-        let err = ConvArch::from_config(&cfg).unwrap_err().to_string();
-        assert!(
-            err.contains("`MixtralForCausalLM`") && err.contains("llama.cpp"),
-            "{err}"
-        );
+        for class in [
+            "MixtralForCausalLM",
+            "Gemma2ForCausalLM",
+            "GraniteMoeForCausalLM",
+        ] {
+            let cfg = serde_json::json!({"architectures": [class]});
+            let err = ConvArch::from_config(&cfg).unwrap_err().to_string();
+            assert!(
+                err.contains(&format!("`{class}`")) && err.contains("llama.cpp"),
+                "{err}"
+            );
+        }
         assert!(ConvArch::from_config(&serde_json::json!({})).is_err());
     }
 }

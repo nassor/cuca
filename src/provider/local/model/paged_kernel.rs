@@ -14,8 +14,7 @@
 //!   KV head (the grouped heads share every key and value read from the
 //!   pool): an online softmax over its chunk, a running maximum and sum, a
 //!   `head_dim`-wide accumulator rescaled whenever the maximum grows, f32
-//!   throughout, the score `q . k * scale` squashed as `cap * tanh(score /
-//!   cap)` when the layer has a soft-cap;
+//!   throughout, the score being `q . k * scale`;
 //! - a second pass merges the chunks' partial results of each (row, head) in
 //!   chunk order (the global maximum, every partial rescaled to it), so the
 //!   result does not depend on how the work was scheduled. One serial chunk
@@ -56,8 +55,6 @@ const MAX_SPLITS: usize = 128;
 pub(crate) struct PagedCall {
     /// Factor of every `q . k` score.
     pub(crate) scale: f32,
-    /// The score soft-cap, if the model has one.
-    pub(crate) softcap: Option<f32>,
 }
 
 /// First pass of the split decode attention: cube `(kvh * splits + s, row)`
@@ -76,8 +73,6 @@ fn paged_decode_kernel(
     ranges: &Tensor<u32>,
     part: &mut Tensor<f32>,
     scale: f32,
-    cap: f32,
-    use_cap: u32,
     n_head: u32,
     n_kv: u32,
     max_blocks: u32,
@@ -113,13 +108,6 @@ fn paged_decode_kernel(
             score += q[q_at + i] * pool_k[at + i];
         }
         score = score * scale;
-        if use_cap != 0u32 {
-            let z = score / cap;
-            let e = (-2.0f32 * f32::abs(z)).exp();
-            let t = (1.0f32 - e) / (1.0f32 + e);
-            let th = if z < 0.0f32 { -t } else { t };
-            score = th * cap;
-        }
         if score > top {
             let c = (top - score).exp();
             total = total * c;
@@ -245,8 +233,6 @@ impl PagedKernels for CubeBackend {
             ranges.into_tensor_arg(),
             part.clone().into_tensor_arg(),
             call.scale,
-            call.softcap.unwrap_or(1.0),
-            u32::from(call.softcap.is_some()),
             n_head as u32,
             n_kv as u32,
             max_blocks as u32,

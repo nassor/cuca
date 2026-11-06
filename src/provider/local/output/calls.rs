@@ -295,20 +295,13 @@ fn is_json_number(word: &str) -> bool {
 /// `{"type": "function", "function": {...}}`).
 ///
 /// `arguments` may be an object, `null`, or a string holding a JSON object; an
-/// absent one means no arguments unless `require_arguments` is set, which a
-/// bare-JSON reply needs to tell a call from an ordinary JSON answer.
-pub(crate) fn parse_json_calls(
-    body: &str,
-    require_arguments: bool,
-) -> Result<Vec<(String, Value)>, String> {
+/// absent one means no arguments.
+pub(crate) fn parse_json_calls(body: &str) -> Result<Vec<(String, Value)>, String> {
     let value: Value = serde_json::from_str(body.trim()).map_err(|e| e.to_string())?;
     match value {
         Value::Array(items) if items.is_empty() => Err("empty tool-call list".to_string()),
-        Value::Array(items) => items
-            .iter()
-            .map(|item| json_call(item, require_arguments))
-            .collect(),
-        other => json_call(&other, require_arguments).map(|call| vec![call]),
+        Value::Array(items) => items.iter().map(json_call).collect(),
+        other => json_call(&other).map(|call| vec![call]),
     }
 }
 
@@ -320,7 +313,7 @@ pub(crate) fn parse_json_calls(
 /// "arguments": {...}}}`. The arguments come from `arguments` or `parameters`,
 /// in the nested object first and then beside it; they may be an object, `null`,
 /// or a string holding a JSON object.
-fn json_call(value: &Value, require_arguments: bool) -> Result<(String, Value), String> {
+fn json_call(value: &Value) -> Result<(String, Value), String> {
     let outer = value.as_object().ok_or("tool call is not a JSON object")?;
     let nested = outer.get("function").and_then(Value::as_object);
     let inner = nested.unwrap_or(outer);
@@ -335,7 +328,6 @@ fn json_call(value: &Value, require_arguments: bool) -> Result<(String, Value), 
         .iter()
         .find_map(|o| o.get("arguments").or_else(|| o.get("parameters")));
     let arguments = match arguments {
-        None if require_arguments => return Err("missing arguments".to_string()),
         None | Some(Value::Null) => Value::Object(Map::new()),
         Some(object @ Value::Object(_)) => object.clone(),
         Some(Value::String(text)) => match serde_json::from_str(text) {
@@ -479,19 +471,17 @@ mod tests {
     fn json_calls_accept_the_common_shapes() {
         let one = parse_json_calls(
             "\n{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}\n",
-            false,
         )
         .expect("parses");
         assert_eq!(
             one,
             [("get_weather".to_string(), json!({ "city": "Paris" }))]
         );
-        let llama = parse_json_calls("{\"name\": \"f\", \"parameters\": {\"x\": 1}}", true)
-            .expect("parses");
+        let llama =
+            parse_json_calls("{\"name\": \"f\", \"parameters\": {\"x\": 1}}").expect("parses");
         assert_eq!(llama, [("f".to_string(), json!({ "x": 1 }))]);
         let list = parse_json_calls(
             "[{\"name\": \"a\", \"arguments\": {}}, {\"type\": \"function\", \"function\": {\"name\": \"b\", \"arguments\": \"{\\\"k\\\": 2}\"}}]",
-            false,
         )
         .expect("parses");
         assert_eq!(
@@ -501,7 +491,7 @@ mod tests {
                 ("b".to_string(), json!({ "k": 2 }))
             ]
         );
-        let bare = parse_json_calls("{\"name\": \"f\"}", false).expect("parses");
+        let bare = parse_json_calls("{\"name\": \"f\"}").expect("parses");
         assert_eq!(bare, [("f".to_string(), json!({}))]);
     }
 
@@ -525,25 +515,19 @@ mod tests {
             r#"{"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}"#,
         ];
         for shape in shapes {
-            for require in [false, true] {
-                let got = parse_json_calls(shape, require)
-                    .unwrap_or_else(|e| panic!("{shape} (require {require}): {e}"));
-                assert_eq!(got, std::slice::from_ref(&expect), "{shape}");
-            }
+            let got = parse_json_calls(shape).unwrap_or_else(|e| panic!("{shape}: {e}"));
+            assert_eq!(got, std::slice::from_ref(&expect), "{shape}");
         }
         // The same shapes in a list, as Granite and Qwen write them.
         let list = format!("[{}, {}]", shapes[2], shapes[4]);
         assert_eq!(
-            parse_json_calls(&list, true).expect("list parses"),
+            parse_json_calls(&list).expect("list parses"),
             [expect.clone(), expect]
         );
         // `name` wins over a `function` string; null arguments mean none.
         assert_eq!(
-            parse_json_calls(
-                r#"{"name": "a", "function": "b", "arguments": null}"#,
-                false
-            )
-            .expect("parses"),
+            parse_json_calls(r#"{"name": "a", "function": "b", "arguments": null}"#)
+                .expect("parses"),
             [("a".to_string(), json!({}))]
         );
     }
@@ -564,11 +548,7 @@ mod tests {
             "{\"function\": {\"arguments\": {}}}",
             "{\"function\": \"\", \"arguments\": {}}",
         ] {
-            assert!(
-                parse_json_calls(bad, false).is_err(),
-                "should reject {bad:?}"
-            );
+            assert!(parse_json_calls(bad).is_err(), "should reject {bad:?}");
         }
-        assert!(parse_json_calls("{\"name\": \"f\"}", true).is_err());
     }
 }

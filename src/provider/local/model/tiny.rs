@@ -8,7 +8,8 @@
 //! a [`TinySpec`]: Llama (NORM RoPE, Llama 3 factors), Qwen 2 (biases), Qwen 3
 //! (QK-norm, query width different from the embedding width), Phi 3 (fused
 //! QKV and gate-up, LongRoPE, partial rotary), SmolLM 3 (NoPE layers),
-//! Granite MoE (experts, scales) and Gemma 3 (post-norms, sliding pattern).
+//! Granite (scales), OLMoE and Qwen 3 MoE (experts) and Gemma 3 (post-norms,
+//! sliding pattern).
 //! [`write_qwen35`] builds the hybrid Qwen 3.5 model from a [`TinyQwen35`]:
 //! delta-net, delta-net, delta-net, gated attention, delta-net, then a
 //! trailing multi-token-prediction block with its `nextn.*` tensors, four
@@ -372,19 +373,6 @@ impl TinySpec {
         s
     }
 
-    /// Granite MoE: four experts, two used, Granite scales.
-    pub(crate) fn granitemoe() -> Self {
-        let mut s = Self::base("granitemoe");
-        s.moe = Some((4, 2));
-        s.ff = 64;
-        s.meta.push(kv("attention.scale", Value::F32(0.1)));
-        s.meta.push(kv("embedding_scale", Value::F32(2.0)));
-        s.meta.push(kv("residual_scale", Value::F32(0.5)));
-        s.meta.push(kv("logit_scale", Value::F32(2.0)));
-        s.meta.push(kv("rope.freq_base", Value::F32(1_500_000.0)));
-        s
-    }
-
     /// Qwen 3 MoE: the Qwen 3 attention with four experts, two used.
     pub(crate) fn qwen3moe() -> Self {
         let mut s = Self::qwen3();
@@ -439,22 +427,6 @@ impl TinySpec {
         s
     }
 
-    /// Gemma 2: post-norms, attention and final logit soft-caps, alternating
-    /// sliding and full layers with a window shorter than the prompt.
-    pub(crate) fn gemma2() -> Self {
-        let mut s = Self::base("gemma2");
-        s.n_layer = 6;
-        s.n_kv_head = 2;
-        s.head_dim = 32;
-        s.post_norms = true;
-        s.tied = true;
-        s.meta.push(kv("attention.sliding_window", u(4)));
-        s.meta.push(kv("attn_logit_softcapping", Value::F32(50.0)));
-        s.meta.push(kv("final_logit_softcapping", Value::F32(30.0)));
-        s.meta.push(kv("rope.freq_base", Value::F32(10_000.0)));
-        s
-    }
-
     /// Gemma 3: QK-norm, post-norms, three-layer sliding pattern (two
     /// sliding, one full) with a window shorter than the prompt.
     pub(crate) fn gemma3() -> Self {
@@ -479,11 +451,9 @@ impl TinySpec {
             Self::qwen3(),
             Self::phi3(),
             Self::smollm3(),
-            Self::granitemoe(),
             Self::qwen3moe(),
             Self::olmoe(),
             Self::gemma3(),
-            Self::gemma2(),
             Self::granite(),
             Self::olmo2(),
             Self::ernie4_5(),

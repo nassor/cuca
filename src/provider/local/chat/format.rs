@@ -14,8 +14,8 @@
 //!   prompt whether generation begins inside an open block;
 //! - the **tool-call syntax** the template teaches the model: a custom
 //!   `call:name{key:<|"|>value<|"|>}` body between control tokens, tagged JSON
-//!   (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`), or bare JSON
-//!   `{"name": ..., "parameters": ...}` optionally behind `<|python_tag|>`; a
+//!   (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`), or the XML
+//!   style of Qwen 3.5; a
 //!   template without tool syntax leaves the output plain text.
 
 use std::collections::HashMap;
@@ -90,13 +90,6 @@ pub(crate) enum ToolSyntax {
         open: String,
         /// Text that closes it (`</tool_call>`).
         close: String,
-    },
-    /// Bare JSON `{"name": ..., "parameters": ...}` as the whole reply, plus an
-    /// optional `<|python_tag|>` prefix for code or JSON calls running to the
-    /// end of generation.
-    LlamaJson {
-        /// Text of the python tag token, when the vocabulary has one.
-        python_tag: Option<String>,
     },
 }
 
@@ -189,11 +182,6 @@ impl ChatFormat {
                 }
                 if let Some(close) = close {
                     note(close);
-                }
-            }
-            ToolSyntax::LlamaJson { python_tag } => {
-                if let Some(tag) = python_tag {
-                    note(tag);
                 }
             }
         }
@@ -322,13 +310,6 @@ fn detect_tools(tokenizer: &Tokenizer, template: &str) -> ToolSyntax {
                 .then(|| "<|/tool_call|>".to_string()),
         };
     }
-    if template.contains("tool_calls") && template.contains("\"parameters\"") {
-        return ToolSyntax::LlamaJson {
-            python_tag: tokenizer
-                .token_id("<|python_tag|>")
-                .map(|_| "<|python_tag|>".to_string()),
-        };
-    }
     ToolSyntax::Plain
 }
 
@@ -420,7 +401,7 @@ pub(super) mod tests {
 
     #[test]
     fn tool_syntax_follows_the_template() {
-        let t = tokenizer(&["<eos>", "<|python_tag|>", "<|tool_call|>"]);
+        let t = tokenizer(&["<eos>", "<|tool_call|>"]);
         let detect = |source: &str| {
             ChatFormat::detect(&metadata(0), &t, source)
                 .expect("detects")
@@ -448,12 +429,6 @@ pub(super) mod tests {
                 open: "<|tool_call|>".into(),
                 alt_open: Some("<tool_call>".into()),
                 close: None,
-            }
-        );
-        assert_eq!(
-            detect("{% if 'tool_calls' in message %}{\"name\": x, \"parameters\": y}"),
-            ToolSyntax::LlamaJson {
-                python_tag: Some("<|python_tag|>".into()),
             }
         );
         assert_eq!(detect("{{ messages }}"), ToolSyntax::Plain);

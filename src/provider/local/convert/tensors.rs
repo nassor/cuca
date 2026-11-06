@@ -571,7 +571,7 @@ impl Planner<'_> {
             .unwrap_or(self.n_head()?))
     }
 
-    /// The norm shift of a tensor: `norm_shift` of Gemma 2 and 3, and
+    /// The norm shift of a tensor: `norm_shift` of Gemma 3, and
     /// Qwen 3.5's `+1` on every norm but the delta-net's own.
     fn norm_ops(&self, hf: &str) -> Vec<Op> {
         let shift = if self.arch.is_qwen35() {
@@ -747,8 +747,7 @@ impl Planner<'_> {
             "mlp.up_proj.weight" => Some((gguf::FFN_UP, false)),
             "mlp.down_proj.weight" => Some((gguf::FFN_DOWN, false)),
             "post_attention_layernorm.weight" => Some(match arch {
-                ConvArch::Gemma2
-                | ConvArch::Gemma3
+                ConvArch::Gemma3
                 | ConvArch::Gemma4
                 | ConvArch::Gemma4Assistant
                 | ConvArch::Olmo2
@@ -859,11 +858,7 @@ impl Planner<'_> {
         let n_expert =
             self.hp
                 .req_uint(&["num_local_experts", "num_experts", "n_routed_experts"])?;
-        let router = matches!(
-            rest,
-            "mlp.gate.weight" | "block_sparse_moe.router.layer.weight"
-        );
-        if router {
+        if rest == "mlp.gate.weight" {
             self.direct(hf, gguf::blk(il, gguf::FFN_GATE_INP), Vec::new())?;
             return Ok(Some(()));
         }
@@ -881,16 +876,9 @@ impl Planner<'_> {
             }
         }
         // Fused expert tensors: [E, 2 * ff, hidden] and [E, hidden, ff].
-        let fused = |s: &str| {
-            s == "mlp.experts.gate_up_proj"
-                || s == "mlp.experts.gate_up_proj.weight"
-                || s == "block_sparse_moe.input_linear.weight"
-        };
-        let down = |s: &str| {
-            s == "mlp.experts.down_proj"
-                || s == "mlp.experts.down_proj.weight"
-                || s == "block_sparse_moe.output_linear.weight"
-        };
+        let fused =
+            |s: &str| s == "mlp.experts.gate_up_proj" || s == "mlp.experts.gate_up_proj.weight";
+        let down = |s: &str| s == "mlp.experts.down_proj" || s == "mlp.experts.down_proj.weight";
         if fused(rest) {
             let shape = self.shape(hf)?;
             if shape.len() != 3 || shape[0] != n_expert || !shape[1].is_multiple_of(2) {
@@ -1176,9 +1164,9 @@ mod tests {
     }
 
     #[test]
-    fn gemma2_shifts_every_norm_and_renames_the_feed_forward_norms() {
+    fn gemma3_shifts_every_norm_and_renames_the_feed_forward_norms() {
         let (s, dir) = checkpoint(
-            "t-gemma2",
+            "t-gemma3",
             &[
                 ("model.embed_tokens.weight", &[4, 2]),
                 ("lm_head.weight", &[4, 2]),
@@ -1190,7 +1178,7 @@ mod tests {
             ],
         );
         let h = hp(serde_json::json!({"num_hidden_layers": 1}));
-        let plans = plan(ConvArch::Gemma2, &h, &s, Vec::new(), None).unwrap();
+        let plans = plan(ConvArch::Gemma3, &h, &s, Vec::new(), None).unwrap();
         assert_eq!(plans.len(), 6, "lm_head is not exported");
         assert_eq!(
             values(&s, by_name(&plans, "blk.0.ffn_norm.weight")),
@@ -1298,44 +1286,6 @@ mod tests {
         by_name(&plans, "blk.0.attn_qkv.weight");
         by_name(&plans, "blk.0.ffn_up.weight");
         by_name(&plans, "blk.0.ffn_norm.weight");
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn granite_moe_splits_input_linear_and_stacks_nothing_else() {
-        let (s, dir) = checkpoint(
-            "t-gmoe",
-            &[
-                (
-                    "model.layers.0.block_sparse_moe.router.layer.weight",
-                    &[3, 4],
-                ),
-                (
-                    "model.layers.0.block_sparse_moe.input_linear.weight",
-                    &[3, 10, 4],
-                ),
-                (
-                    "model.layers.0.block_sparse_moe.output_linear.weight",
-                    &[3, 4, 5],
-                ),
-            ],
-        );
-        let h = hp(serde_json::json!({"num_hidden_layers": 1, "num_local_experts": 3}));
-        let plans = plan(ConvArch::GraniteMoe, &h, &s, Vec::new(), None).unwrap();
-        let gate = by_name(&plans, "blk.0.ffn_gate_exps.weight");
-        let up = by_name(&plans, "blk.0.ffn_up_exps.weight");
-        assert_eq!(gate.dims, [3, 5, 4]);
-        assert_eq!(up.dims, [3, 5, 4]);
-        let g = values(&s, gate);
-        let u = values(&s, up);
-        // Expert 1: rows 10..20 of the flat [30, 4] tensor; gate = first 5 rows.
-        assert_eq!(g[20], 40.0);
-        assert_eq!(u[20], 60.0);
-        assert_eq!(
-            by_name(&plans, "blk.0.ffn_down_exps.weight").dims,
-            [3, 4, 5]
-        );
-        assert_eq!(by_name(&plans, "blk.0.ffn_gate_inp.weight").dims, [3, 4]);
         let _ = std::fs::remove_dir_all(dir);
     }
 

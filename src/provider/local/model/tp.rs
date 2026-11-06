@@ -797,7 +797,7 @@ mod tests {
                 ff: 128,
                 ..TinySpec::qwen2()
             },
-            TinySpec::granitemoe(),
+            TinySpec::qwen3moe(),
         ];
         for spec in specs {
             let model = write_spec(&spec);
@@ -914,7 +914,7 @@ mod tests {
         // One shard and a model that splits pass.
         for (spec, world) in [
             (llama, 2),
-            (TinySpec::granitemoe(), 2),
+            (TinySpec::qwen3moe(), 2),
             (TinySpec::llama(), 1),
         ] {
             let model = write_spec(&spec);

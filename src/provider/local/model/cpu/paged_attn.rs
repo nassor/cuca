@@ -102,11 +102,9 @@ fn attend_head(
     pool_v: &[f32],
     shape: PoolShape,
     scale: f32,
-    softcap: Option<f64>,
     out: &mut [f32],
 ) {
     let d = shape.head_dim;
-    let cap = softcap.map(|c| c as f32);
     let mut max = f32::NEG_INFINITY;
     let mut sum = 0f32;
     let mut acc = vec![0f32; d];
@@ -121,10 +119,7 @@ fn attend_head(
         let mut block_max = f32::NEG_INFINITY;
         for (j, score) in scores.iter_mut().take(n).enumerate() {
             let at = first + j * d;
-            let mut s = dot(q, &pool_k[at..at + d]) * scale;
-            if let Some(cap) = cap {
-                s = (s / cap).tanh() * cap;
-            }
+            let s = dot(q, &pool_k[at..at + d]) * scale;
             *score = s;
             if s > block_max {
                 block_max = s;
@@ -158,8 +153,7 @@ fn attend_head(
 /// `[t][n_head][head_dim]`; row `i` attends to the positions `range(i)`
 /// (`lo..hi`) of `table`. Returns `[t][n_head][head_dim]`. Query head `h`
 /// reads KV head `h / (n_head / n_kv_head)`; the scores are scaled by
-/// `scale` and, with `softcap`, squashed as `cap * tanh(score / cap)` before
-/// the softmax.
+/// `scale` before the softmax.
 ///
 /// Runs on candle's barrier pool, so it must not be called from inside one of
 /// its jobs.
@@ -180,7 +174,6 @@ pub(crate) fn attend_paged_rows(
     pool_v: &[f32],
     shape: PoolShape,
     scale: f32,
-    softcap: Option<f64>,
 ) -> candle_core::Result<Vec<f32>> {
     let PoolShape {
         n_head,
@@ -219,7 +212,6 @@ pub(crate) fn attend_paged_rows(
                     pool_v,
                     shape,
                     scale,
-                    softcap,
                     &mut slot,
                 );
             }
@@ -253,19 +245,8 @@ pub(crate) fn attend_paged_row(
     pool_v: &[f32],
     shape: PoolShape,
     scale: f32,
-    softcap: Option<f64>,
 ) -> candle_core::Result<Vec<f32>> {
-    attend_paged_rows(
-        q_row,
-        1,
-        |_| (lo, hi),
-        table,
-        pool_k,
-        pool_v,
-        shape,
-        scale,
-        softcap,
-    )
+    attend_paged_rows(q_row, 1, |_| (lo, hi), table, pool_k, pool_v, shape, scale)
 }
 
 /// The keys (or values) of positions `lo..hi` as `[n_kv_head][hi - lo][head_dim]`.
@@ -345,7 +326,7 @@ mod tests {
 
     /// Paged attention over scattered blocks equals candle's contiguous
     /// attention (within float rounding), for every key count around a block
-    /// boundary, a window, a soft-cap and grouped heads.
+    /// boundary, a window and grouped heads.
     #[test]
     fn paged_attention_matches_contiguous_attention() {
         let mut rng = Lcg(42);
@@ -356,12 +337,7 @@ mod tests {
                 head_dim: d,
             };
             for l in [1usize, 2, 15, 16, 17, 33, 50] {
-                for (lo, softcap) in [
-                    (0, None),
-                    (l / 3, None),
-                    (0, Some(30.0)),
-                    (l / 2, Some(5.0)),
-                ] {
+                for lo in [0, l / 3, l / 2] {
                     // Blocks in a scrambled order inside a larger pool.
                     let blocks = l.div_ceil(BLOCK_SIZE);
                     let table: Vec<u32> = (0..blocks as u32).map(|b| (b * 5 + 3) % 11).collect();
@@ -373,10 +349,8 @@ mod tests {
                     store_rows(&table, 0, l, &values, &mut pool_v, shape).unwrap();
                     let q = rng.values(n_head * d, 2.0);
                     let scale = 1.0 / (d as f32).sqrt();
-                    let got = attend_paged_row(
-                        &q, &table, lo, l, &pool_k, &pool_v, shape, scale, softcap,
-                    )
-                    .unwrap();
+                    let got = attend_paged_row(&q, &table, lo, l, &pool_k, &pool_v, shape, scale)
+                        .unwrap();
 
                     // Reference: the same keys as one contiguous tensor.
                     let dev = &Device::Cpu;
@@ -394,7 +368,6 @@ mod tests {
                         &slice(&values),
                         None,
                         scale,
-                        softcap,
                     )
                     .unwrap()
                     .flatten_all()
@@ -405,7 +378,7 @@ mod tests {
                     for (i, (g, w)) in got.iter().zip(&want).enumerate() {
                         assert!(
                             (g - w).abs() <= 1e-5,
-                            "heads {n_head}/{n_kv_head}, d {d}, l {l}, lo {lo}, cap {softcap:?}, \
+                            "heads {n_head}/{n_kv_head}, d {d}, l {l}, lo {lo}, \
                              output {i}: {g} vs {w}"
                         );
                     }
@@ -466,7 +439,6 @@ mod tests {
                 &pool_v,
                 shape,
                 0.35,
-                Some(8.0),
             )
             .unwrap();
             for i in 0..t {
@@ -479,7 +451,6 @@ mod tests {
                     &pool_v,
                     shape,
                     0.35,
-                    Some(8.0),
                 )
                 .unwrap();
                 assert_eq!(
@@ -502,11 +473,11 @@ mod tests {
         let pool = vec![0f32; 2 * BLOCK_SIZE * 4];
         let q = [0.0; 4];
         let table = [NO_BLOCK, 1];
-        assert!(attend_paged_row(&q, &table, 0, 20, &pool, &pool, shape, 1.0, None).is_err());
+        assert!(attend_paged_row(&q, &table, 0, 20, &pool, &pool, shape, 1.0).is_err());
         // Only the second block is read: fine.
-        assert!(attend_paged_row(&q, &table, 16, 20, &pool, &pool, shape, 1.0, None).is_ok());
+        assert!(attend_paged_row(&q, &table, 16, 20, &pool, &pool, shape, 1.0).is_ok());
         // A block id past the pool.
         let table = [5];
-        assert!(attend_paged_row(&q, &table, 0, 4, &pool, &pool, shape, 1.0, None).is_err());
+        assert!(attend_paged_row(&q, &table, 0, 4, &pool, &pool, shape, 1.0).is_err());
     }
 }

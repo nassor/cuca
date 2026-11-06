@@ -16,9 +16,6 @@ pub(crate) enum Arch {
     /// Gemma 4 dense: sliding/full layers with per-type head sizes and RoPE,
     /// shared K/V layers, per-layer embeddings, weightless value norm.
     Gemma4,
-    /// Gemma 2: sliding/full layers alternating (every other full), attention
-    /// and final logit soft-caps, post-norms, no QK-norm.
-    Gemma2,
     /// Gemma 3: sliding/full layers (every sixth full), QK-norm, post-norms.
     Gemma3,
     /// Llama 1/2/3 and every model that publishes as `llama` (Mistral, ...).
@@ -34,9 +31,6 @@ pub(crate) enum Arch {
     /// Granite 3 dense: Llama-style layers with Granite's embedding, attention,
     /// residual and logit scales.
     Granite,
-    /// Granite 3 MoE: Llama-style attention with Granite scales and a top-k
-    /// mixture of experts.
-    GraniteMoe,
     /// Qwen 3 MoE: Qwen 3 attention (QK-norm) with a top-k mixture of
     /// experts in every layer.
     Qwen3Moe,
@@ -101,9 +95,6 @@ pub(crate) enum AttnScale {
     /// Gemma 3: `1 / sqrt(head_dim)`, except the 62-layer 27B model, which
     /// uses `1 / sqrt(n_embd / n_head)`.
     Gemma3,
-    /// Gemma 2: `1 / sqrt(head_dim)`, except the 46-layer 27B model, which
-    /// uses `1 / sqrt(n_embd / n_head)`.
-    Gemma2,
     /// `{arch}.attention.scale` (Granite).
     Key,
 }
@@ -200,17 +191,15 @@ const DEFAULT: Behavior = Behavior {
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 17] = [
+    pub(crate) const ALL: [Arch; 15] = [
         Arch::Gemma4,
         Arch::Gemma3,
-        Arch::Gemma2,
         Arch::Llama,
         Arch::Qwen2,
         Arch::Qwen3,
         Arch::Phi3,
         Arch::Smollm3,
         Arch::Granite,
-        Arch::GraniteMoe,
         Arch::Qwen3Moe,
         Arch::Olmoe,
         Arch::Qwen35,
@@ -226,14 +215,12 @@ impl Arch {
         match self {
             Arch::Gemma4 => "gemma4",
             Arch::Gemma3 => "gemma3",
-            Arch::Gemma2 => "gemma2",
             Arch::Llama => "llama",
             Arch::Qwen2 => "qwen2",
             Arch::Qwen3 => "qwen3",
             Arch::Phi3 => "phi3",
             Arch::Smollm3 => "smollm3",
             Arch::Granite => "granite",
-            Arch::GraniteMoe => "granitemoe",
             Arch::Qwen3Moe => "qwen3moe",
             Arch::Olmoe => "olmoe",
             Arch::Qwen35 => "qwen35",
@@ -285,15 +272,6 @@ impl Arch {
                 attn_scale: AttnScale::Gemma3,
                 ..DEFAULT
             },
-            Arch::Gemma2 => Behavior {
-                rope: RopeKind::Neox,
-                act: Act::Gelu,
-                post_norms: true,
-                embd_scale: EmbdScale::SqrtEmbd,
-                swa: Swa::Every(2),
-                attn_scale: AttnScale::Gemma2,
-                ..DEFAULT
-            },
             Arch::Olmo2 => Behavior {
                 rope: RopeKind::Neox,
                 post_norms: true,
@@ -314,13 +292,6 @@ impl Arch {
                 embd_scale: EmbdScale::Key,
                 attn_scale: AttnScale::Key,
                 granite_scales: true,
-                ..DEFAULT
-            },
-            Arch::GraniteMoe => Behavior {
-                embd_scale: EmbdScale::Key,
-                attn_scale: AttnScale::Key,
-                granite_scales: true,
-                moe: true,
                 ..DEFAULT
             },
             Arch::Qwen3Moe => Behavior {
@@ -369,19 +340,21 @@ mod tests {
         let msg = Arch::from_name("mamba").unwrap_err().to_string();
         assert!(msg.contains("`mamba`"), "{msg}");
         assert!(msg.contains("qwen3"), "{msg}");
+        for removed in ["gemma2", "granitemoe"] {
+            let msg = Arch::from_name(removed).unwrap_err().to_string();
+            assert!(msg.contains(&format!("`{removed}`")), "{msg}");
+        }
     }
 
     #[test]
     fn rope_kinds_follow_llama_cpp() {
         assert_eq!(Arch::Llama.behavior().rope, RopeKind::Norm);
         assert_eq!(Arch::Smollm3.behavior().rope, RopeKind::Norm);
-        assert_eq!(Arch::GraniteMoe.behavior().rope, RopeKind::Norm);
         assert_eq!(Arch::Granite.behavior().rope, RopeKind::Norm);
         assert_eq!(Arch::Ernie4_5.behavior().rope, RopeKind::Norm);
         for arch in [
             Arch::Gemma4,
             Arch::Gemma3,
-            Arch::Gemma2,
             Arch::Olmo2,
             Arch::Qwen2,
             Arch::Qwen3,

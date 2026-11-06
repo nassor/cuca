@@ -1745,7 +1745,6 @@ impl Transformer {
     /// The attention output `(1, t, n_head * d)` of one sequence's queries
     /// `q` `(1, n_head, t, d)` (RoPE applied, K/V already stored).
     fn attend_call(&self, call: &AttnCall<'_>, q: &Tensor) -> candle_core::Result<Tensor> {
-        let hp = &self.hp;
         let AttnCall {
             spec, start, t, kv, ..
         } = *call;
@@ -1763,7 +1762,7 @@ impl Transformer {
                 } else {
                     None
                 };
-                attend(q, &k, &v, mask.as_ref(), spec.scale, hp.attn_softcap)?
+                attend(q, &k, &v, mask.as_ref(), spec.scale)?
                     .transpose(1, 2)?
                     .contiguous()?
                     .reshape((1, t, nh * d))?
@@ -1792,15 +1791,7 @@ impl Transformer {
                         None => (window_lo(spec, start + i, start + i + 1), start + i + 1),
                     };
                     let out = attend_paged_rows(
-                        &rows,
-                        t,
-                        range,
-                        table,
-                        &data.k,
-                        &data.v,
-                        shape,
-                        spec.scale,
-                        hp.attn_softcap,
+                        &rows, t, range, table, &data.k, &data.v, shape, spec.scale,
                     )?;
                     Tensor::from_vec(out, (1, t, nh * d), &Device::Cpu)?
                 } else {
@@ -1820,7 +1811,7 @@ impl Transformer {
                     )?;
                     let mask = attention_mask(start, t, lo, hi, spec.window);
                     let mask = Tensor::from_vec(mask, (t, l), &Device::Cpu)?;
-                    attend(q, &k, &v, Some(&mask), spec.scale, hp.attn_softcap)?
+                    attend(q, &k, &v, Some(&mask), spec.scale)?
                         .transpose(1, 2)?
                         .contiguous()?
                         .reshape((1, t, nh * d))?
@@ -2394,9 +2385,8 @@ pub(crate) fn apply_rope(
 /// Grouped-query attention: `q` is `(1, n_head, t, d)`, `k` and `v` are
 /// `(1, n_kv, l, d)` and `mask` the additive `t x l` mask (`None` for a single
 /// query, which sees every key). Query head `h` reads KV head
-/// `h / (n_head / n_kv)`. The scores are scaled by `scale` and, with
-/// `softcap`, squashed as `cap * tanh(score / cap)` before the mask. The
-/// result is `(1, n_head, t, d)`.
+/// `h / (n_head / n_kv)`. The scores are scaled by `scale` before the mask.
+/// The result is `(1, n_head, t, d)`.
 ///
 /// The `n_head / n_kv` query heads of one KV head are stacked into the rows of
 /// one matmul against that head's keys, so K and V are never repeated.
@@ -2406,7 +2396,6 @@ pub(crate) fn attend(
     v: &Tensor,
     mask: Option<&Tensor>,
     scale: f32,
-    softcap: Option<f64>,
 ) -> candle_core::Result<Tensor> {
     let (_, n_head, t, d) = q.dims4()?;
     let (_, n_kv, l, _) = k.dims4()?;
@@ -2414,9 +2403,6 @@ pub(crate) fn attend(
     let mut scores = q.reshape((1, n_kv, rows, d))?.matmul(&k.transpose(2, 3)?)?;
     if scale != 1.0 {
         scores = scores.affine(f64::from(scale), 0.0)?;
-    }
-    if let Some(cap) = softcap {
-        scores = scores.affine(1.0 / cap, 0.0)?.tanh()?.affine(cap, 0.0)?;
     }
     let scores = match mask {
         Some(mask) => scores
@@ -2910,7 +2896,7 @@ mod tests {
     /// expert densely and sums with the routing weights.
     #[test]
     fn moe_ffn_matches_a_per_token_reference() {
-        let model = write_spec(&TinySpec::granitemoe());
+        let model = write_spec(&TinySpec::qwen3moe());
         let mut reader = BufReader::new(File::open(&model.path).unwrap());
         let content = gguf_file::Content::read(&mut reader).unwrap();
         let hp = read_hparams(&content).unwrap();
@@ -2935,7 +2921,7 @@ mod tests {
             shared: None,
         } = &lw.ffn
         else {
-            panic!("granitemoe FFN is a mixture of resident experts");
+            panic!("qwen3moe FFN is a mixture of resident experts");
         };
         let flat = f.reshape((t, 64)).unwrap();
         let logits = router
@@ -3334,11 +3320,7 @@ mod tests {
     /// equal the resident load's bit for bit, for every MoE architecture.
     #[test]
     fn tiered_experts_match_resident_bit_for_bit() {
-        for spec in [
-            TinySpec::granitemoe(),
-            TinySpec::qwen3moe(),
-            TinySpec::olmoe(),
-        ] {
+        for spec in [TinySpec::qwen3moe(), TinySpec::olmoe()] {
             let arch = spec.arch;
             let model = write_spec(&moe_spec(spec));
             let min = 2 * expert_bytes(&model);
@@ -3358,7 +3340,7 @@ mod tests {
 
     #[test]
     fn tiered_load_rejects_a_budget_below_n_used() {
-        let model = write_spec(&moe_spec(TinySpec::granitemoe()));
+        let model = write_spec(&moe_spec(TinySpec::qwen3moe()));
         let min = 2 * expert_bytes(&model);
         let e = load_tiered(&model, min - 1, None).err().unwrap();
         assert!(
@@ -3377,7 +3359,7 @@ mod tests {
     /// experts: the first forward pass reads fewer from the file.
     #[test]
     fn warm_from_loads_the_hottest_experts_first() {
-        let model = write_spec(&moe_spec(TinySpec::granitemoe()));
+        let model = write_spec(&moe_spec(TinySpec::qwen3moe()));
         let budget = 4 * expert_bytes(&model);
         let first_pass_reads = |m: &mut Transformer| {
             let before = m.expert_tiers().unwrap().stats().disk_reads;

@@ -133,7 +133,7 @@ impl Hp {
                 set(&mut self.map, "head_dim", Json::from(128));
                 set(&mut self.map, "rms_norm_eps", Json::from(1e-6));
             }
-            ConvArch::Qwen2 | ConvArch::Granite | ConvArch::GraniteMoe => {
+            ConvArch::Qwen2 | ConvArch::Granite => {
                 set(&mut self.map, "rms_norm_eps", Json::from(1e-6));
             }
             ConvArch::Phi3 | ConvArch::Olmo2 | ConvArch::Olmoe | ConvArch::Ernie4_5 => {
@@ -806,15 +806,6 @@ fn guard(arch: ConvArch, hp: &Hp) -> Result<(), CucaError> {
                 "OLMoE with norm_topk_prob = true is not supported: the engine keeps the raw softmax weights",
             ));
         }
-        ConvArch::GraniteMoe
-            if hp
-                .uint(&["shared_intermediate_size"])
-                .is_some_and(|n| n > 0) =>
-        {
-            return Err(cfg_err(
-                "Granite MoE shared experts are not supported by the engine",
-            ));
-        }
         ConvArch::Smollm3 => {
             // The engine fixes the NoPE pattern: every fourth layer.
             if let Some(Json::Array(layers)) = hp.get("no_rope_layers") {
@@ -838,18 +829,6 @@ fn guard(arch: ConvArch, hp: &Hp) -> Result<(), CucaError> {
                 if !ok {
                     return Err(cfg_err(
                         "Gemma 3 layer_types differ from every sixth layer being full attention",
-                    ));
-                }
-            }
-        }
-        ConvArch::Gemma2 => {
-            if let Some(Json::Array(types)) = hp.get("layer_types") {
-                let ok = types.iter().enumerate().all(|(i, t)| {
-                    (t.as_str() == Some("full_attention")) == (i + 1).is_multiple_of(2)
-                });
-                if !ok {
-                    return Err(cfg_err(
-                        "Gemma 2 layer_types differ from alternating sliding and full attention",
                     ));
                 }
             }
@@ -888,8 +867,8 @@ pub(crate) fn build(
     let mut extra = Vec::new();
 
     match arch {
-        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite | ConvArch::GraniteMoe => {
-            if matches!(arch, ConvArch::Granite | ConvArch::GraniteMoe) {
+        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite => {
+            if arch == ConvArch::Granite {
                 // Granite ignores head_dim: the engine derives the head size
                 // from the embedding width.
                 let mut granite = Hp {
@@ -972,40 +951,6 @@ pub(crate) fn build(
             }
         }
         ConvArch::Phi3 => extra = phi3(hp, &mut kv, n_block)?,
-        ConvArch::Gemma2 => {
-            kv.u32("context_length", hp.req_uint(&["max_position_embeddings"])?)?;
-            kv.u32("embedding_length", hp.req_uint(&["hidden_size"])?)?;
-            kv.u32("block_count", n_block)?;
-            kv.u32("feed_forward_length", hp.req_uint(&["intermediate_size"])?)?;
-            let heads = hp.req_uint(&["num_attention_heads"])?;
-            kv.u32("attention.head_count", heads)?;
-            kv.u32(
-                "attention.head_count_kv",
-                hp.uint(&["num_key_value_heads"]).unwrap_or(heads),
-            )?;
-            kv.f32(
-                "attention.layer_norm_rms_epsilon",
-                hp.float(&["rms_norm_eps"])
-                    .ok_or_else(|| cfg_err("config.json has no rms_norm_eps"))?,
-            );
-            let head_dim = hp.req_uint(&["head_dim"])?;
-            kv.u32("attention.key_length", head_dim)?;
-            kv.u32("attention.value_length", head_dim)?;
-            kv.f32(
-                "attn_logit_softcapping",
-                hp.float(&["attn_logit_softcapping"])
-                    .ok_or_else(|| cfg_err("config.json has no attn_logit_softcapping"))?,
-            );
-            kv.f32(
-                "final_logit_softcapping",
-                hp.float(&["final_logit_softcapping"])
-                    .ok_or_else(|| cfg_err("config.json has no final_logit_softcapping"))?,
-            );
-            kv.u32(
-                "attention.sliding_window",
-                hp.req_uint(&["sliding_window"])?,
-            )?;
-        }
         ConvArch::Gemma3 => {
             base(arch, hp, &mut kv, n_block)?;
             gemma3_overrides(hp, &mut kv)?;
@@ -1029,11 +974,6 @@ pub(crate) fn build(
             base(arch, hp, &mut kv, n_block)?;
             kv.f32("attention.layer_norm_rms_epsilon", 1e-5);
         }
-    }
-    if matches!(arch, ConvArch::GraniteMoe)
-        && let Some(n) = hp.uint(&["shared_intermediate_size"])
-    {
-        kv.u32("expert_shared_feed_forward_length", n)?;
     }
     kv.raw("general.quantization_version", Value::U32(2));
     kv.raw("general.file_type", Value::U32(file_type(quant)));

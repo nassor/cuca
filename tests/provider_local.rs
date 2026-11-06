@@ -8,7 +8,7 @@
 //! - `CUCA_LOCAL_MODEL=<preset, repo:revision:file or repo:revision>`
 //!   downloads that model into the cache directory (`CUCA_CACHE_DIR`
 //!   overrides it): a name from `ModelSource::PRESETS` (`gemma4-e2b-q4_0`,
-//!   `qwen3-0.6b-q8_0`, `llama3.2-1b-q4_0`, ...), an unverified
+//!   `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`, ...), an unverified
 //!   `repo:revision:file` GGUF, or a safetensors checkpoint
 //!   `repo:revision` that is converted to a cached GGUF once; or
 //! - `CUCA_LOCAL_DOWNLOAD=1` downloads the default preset (Gemma 4 E2B Q4_0).
@@ -152,10 +152,6 @@ fn known_limit(model: &str, scenario: &str) -> Option<&'static str> {
              exact arithmetic, both answer `PEICAN` (quantization flips a near-tie at the \
              second token); the HuggingFace f32 model answers `PELICAN`",
         ),
-        ("tinyllama-1.1b-q4_0", "oracle_prompt_tokens") => Some(
-            "llama.cpp's SentencePiece rule puts a space token after the `</s>` of the \
-             chat template (one more token than the HuggingFace tokenizer)",
-        ),
         ("gemma4-e4b-q8_0", "thinking_precedes_answer") => Some(
             "this file derives from the base google/gemma-4-E4B-it checkpoint (its Q4_0 \
              sibling from the QAT one), which itself answers `72` at once without opening \
@@ -177,10 +173,6 @@ fn known_limit(model: &str, scenario: &str) -> Option<&'static str> {
              (margin 0.173), identical to the dequantized reference run in HuggingFace \
              (HuggingFace f32 margin 2.06) and answers; the production path's Q8_0 activation \
              rounding flips it (18.663 against 19.237) and the model calls the tool again",
-        ),
-        ("llama3.2-1b-q4_0", "tool_call_round_trip") => Some(
-            "after the tool result the model calls the tool again instead of answering; \
-             HuggingFace f32 Llama-3.2-1B-Instruct does the same on the same prompt",
         ),
         _ => None,
     }
@@ -248,16 +240,6 @@ const CHECKPOINT_PRESETS: &[(&str, &str, &str)] = &[
         "qwen3-0.6b-q8_0",
     ),
     (
-        "unsloth/Llama-3.2-1B-Instruct",
-        "5a8abab4a5d6f164389b1079fb721cfab8d7126c",
-        "llama3.2-1b-q4_0",
-    ),
-    (
-        "microsoft/Phi-3.5-mini-instruct",
-        "2fe192450127e6a83f7441aef6e3ca586c338b77",
-        "phi3.5-mini-q4_0",
-    ),
-    (
         "microsoft/Phi-4-mini-instruct",
         "cfbefacb99257ffa30c83adab238a50856ac3083",
         "phi4-mini-q4_0",
@@ -266,11 +248,6 @@ const CHECKPOINT_PRESETS: &[(&str, &str, &str)] = &[
         "unsloth/gemma-3-1b-it",
         "5b11413a10db4e486ef16a20101fd028f8f2499c",
         "gemma3-1b-q4_0",
-    ),
-    (
-        "Qwen/Qwen2.5-0.5B-Instruct",
-        "7ae557604adf67be50417f59c2c2f167def9a775",
-        "qwen2.5-0.5b-q8_0",
     ),
     (
         "google/gemma-4-E2B-it-qat-q4_0-unquantized",

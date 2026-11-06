@@ -23,17 +23,10 @@ fn template_source(name: &str) -> &'static str {
     match name {
         "gemma3-1b" => include_str!("../testdata/templates/gemma3-1b.jinja"),
         "gemma4" => include_str!("../testdata/gemma4_chat_template.jinja"),
-        "granitemoe" => include_str!("../testdata/templates/granitemoe.jinja"),
-        "gemma2" => include_str!("../testdata/templates/gemma2.jinja"),
         "olmo2" => include_str!("../testdata/templates/olmo2.jinja"),
         "granite33" => include_str!("../testdata/templates/granite33.jinja"),
         "ernie45" => include_str!("../testdata/templates/ernie45.jinja"),
-        "smollm2" => include_str!("../testdata/templates/smollm2.jinja"),
-        "tinyllama" => include_str!("../testdata/templates/tinyllama.jinja"),
-        "llama32" => include_str!("../testdata/templates/llama32.jinja"),
-        "phi35" => include_str!("../testdata/templates/phi35.jinja"),
         "phi4mini" => include_str!("../testdata/templates/phi4mini.jinja"),
-        "qwen25" => include_str!("../testdata/templates/qwen25.jinja"),
         "qwen3" => include_str!("../testdata/templates/qwen3.jinja"),
         "qwen35" => include_str!("../testdata/templates/qwen35.jinja"),
         "r1qwen" => include_str!("../testdata/templates/r1qwen.jinja"),
@@ -85,7 +78,7 @@ fn renders_match_the_reference_jinja_environment() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert_eq!(checked, 13 * 7);
+    assert_eq!(checked, 9 * 7);
 }
 
 /// Catalog models: format detection and an end-to-end render + tokenize check
@@ -109,7 +102,7 @@ mod real_models {
         template: &'static str,
         /// Reasoning open marker, if any.
         reasoning_open: Option<&'static str>,
-        /// Tool syntax variant name: plain, gemma4, tagged, llama.
+        /// Tool syntax variant name: plain, gemma4, tagged, xml.
         tools: &'static str,
         /// Vocabulary texts that must end generation.
         eog: &'static [&'static str],
@@ -122,20 +115,6 @@ mod real_models {
             reasoning_open: Some("<think>"),
             tools: "tagged",
             eog: &["<|im_end|>", "<|endoftext|>"],
-        },
-        Expect {
-            id: "qwen25",
-            template: "qwen25",
-            reasoning_open: None,
-            tools: "tagged",
-            eog: &["<|im_end|>", "<|endoftext|>"],
-        },
-        Expect {
-            id: "llama32",
-            template: "llama32",
-            reasoning_open: None,
-            tools: "llama",
-            eog: &["<|eot_id|>", "<|eom_id|>", "<|end_of_text|>"],
         },
         Expect {
             id: "gemma3-270m",
@@ -159,13 +138,6 @@ mod real_models {
             eog: &["<|im_end|>", "<|eot_id|>"],
         },
         Expect {
-            id: "phi35",
-            template: "phi35",
-            reasoning_open: None,
-            tools: "plain",
-            eog: &["<|end|>", "<|endoftext|>"],
-        },
-        Expect {
             id: "phi4mini",
             template: "phi4mini",
             reasoning_open: None,
@@ -178,13 +150,6 @@ mod real_models {
             reasoning_open: Some("<think>"),
             tools: "plain",
             eog: &["<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>"],
-        },
-        Expect {
-            id: "granitemoe",
-            template: "granitemoe",
-            reasoning_open: None,
-            tools: "tagged",
-            eog: &["<|end_of_text|>"],
         },
         Expect {
             id: "qwen35-08b-mtp",
@@ -269,7 +234,6 @@ mod real_models {
                 ToolSyntax::Gemma4 { .. } => "gemma4",
                 ToolSyntax::TaggedJson { .. } => "tagged",
                 ToolSyntax::TaggedXml { .. } => "xml",
-                ToolSyntax::LlamaJson { .. } => "llama",
             };
             assert_eq!(kind, expect.tools, "{id}: tool syntax");
             for text in expect.eog {
@@ -418,31 +382,6 @@ mod real_models {
                 ],
             ),
             (
-                "llama32",
-                "llama32",
-                r#"{"name": "get_weather", "parameters": {"city": "Paris"}}"#.to_string(),
-                vec![call("get_weather", json!({ "city": "Paris" }))],
-            ),
-            (
-                "llama32",
-                "llama32",
-                "Hello there, {not a call}.".to_string(),
-                vec![text("Hello there, {not a call}.")],
-            ),
-            (
-                "granitemoe",
-                "granitemoe",
-                r#"<|tool_call|>[{"name": "get_weather", "arguments": {"city": "Paris"}}]"#
-                    .to_string(),
-                vec![call("get_weather", json!({ "city": "Paris" }))],
-            ),
-            (
-                "phi35",
-                "phi35",
-                "Hello there".to_string(),
-                vec![text("Hello"), text(" there")],
-            ),
-            (
                 "r1qwen",
                 "r1qwen",
                 "<think>\nhmm\n</think>\n\nThe answer.".to_string(),
@@ -557,11 +496,6 @@ mod later_models {
     /// `(oracle id, template fixture, GGUF path under the catalog dir)`.
     const MODELS: &[(&str, &str, &str)] = &[
         (
-            "gemma2",
-            "gemma2",
-            "second-state--gemma-2-2b-it-GGUF/b7d6a1a55228d89cc129757c687384b96781f97e/gemma-2-2b-it-Q4_0.gguf",
-        ),
-        (
             "olmo2",
             "olmo2",
             "allenai--OLMo-2-0425-1B-Instruct-GGUF/62f8c199538474c3e33ed5d7e0580abd66686a27/OLMo-2-0425-1B-Instruct-Q4_0.gguf",
@@ -576,22 +510,12 @@ mod later_models {
             "ernie45",
             "unsloth--ERNIE-4.5-0.3B-PT-GGUF/32b9743ef4cb56af53d71a6ab4b822d191ccb4fc/ERNIE-4.5-0.3B-PT-Q8_0.gguf",
         ),
-        (
-            "smollm2",
-            "smollm2",
-            "bartowski--SmolLM2-360M-Instruct-GGUF/7be6f65f1db715fe5dc5a4634c0d459b4eed42ec/SmolLM2-360M-Instruct-Q8_0.gguf",
-        ),
-        (
-            "tinyllama",
-            "tinyllama",
-            "TheBloke--TinyLlama-1.1B-Chat-v1.0-GGUF/52e7645ba7c309695bec7ac98f4f005b139cf465/tinyllama-1.1b-chat-v1.0.Q4_0.gguf",
-        ),
     ];
 
     /// SentencePiece models whose ids differ from HF's by llama.cpp's space
-    /// prefix rule (ERNIE 4.5 omits `tokenizer.ggml.add_space_prefix`;
-    /// TinyLlama's text after `</s>` gets a space), see the comparison below.
-    const SPACE_PREFIX: &[&str] = &["ernie45", "tinyllama"];
+    /// prefix rule (ERNIE 4.5 omits `tokenizer.ggml.add_space_prefix`), see
+    /// the comparison below.
+    const SPACE_PREFIX: &[&str] = &["ernie45"];
 
     #[test]
     fn prompts_and_ids_match_the_transformers_oracle() {

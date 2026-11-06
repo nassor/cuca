@@ -10,7 +10,7 @@
 //! `TIERS|<phase>|<tok/s>|<stats>`.
 //!
 //! - `CUCA_LOCAL_MODEL_PATH` / `CUCA_LOCAL_MODEL`: the model (a preset such as
-//!   `olmoe-1b-7b-q4_0`, `qwen3-30b-a3b-q4_0`, `granite3.1-moe-1b-q4_0`).
+//!   `olmoe-1b-7b-q4_0`, `qwen3-30b-a3b-q4_0`, `qwen3.6-35b-a3b-q4_0`).
 //! - `CUCA_LOCAL_EXPERTS`: the tiered placement under test (`ExpertPlacement`
 //!   syntax, e.g. `tiered:ram=4g`, or `tiered:device=6g,ram=12g` on a GPU).
 //! - `CUCA_LOCAL_EXPERTS_REF`: the reference placement (default

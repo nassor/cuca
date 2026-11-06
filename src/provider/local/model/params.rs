@@ -247,7 +247,6 @@ pub(crate) struct Hparams {
     /// Divisor of the final logits.
     pub(crate) logit_scale: f32,
     pub(crate) logit_softcap: Option<f64>,
-    pub(crate) attn_softcap: Option<f64>,
     /// Width of one layer's per-layer-embedding slice (Gemma 4).
     pub(crate) ple_dim: Option<usize>,
     pub(crate) moe: Option<MoeSpec>,
@@ -576,10 +575,6 @@ impl Hparams {
                     1.0 / ((n_embd / n_head[il].max(1)) as f64).sqrt()
                 }
                 AttnScale::Gemma3 => 1.0 / (head_dim as f64).sqrt(),
-                AttnScale::Gemma2 if n_layer == 46 => {
-                    1.0 / ((n_embd / n_head[il].max(1)) as f64).sqrt()
-                }
-                AttnScale::Gemma2 => 1.0 / (head_dim as f64).sqrt(),
                 AttnScale::Key => k.f64("attention.scale")?,
             };
             Ok(LayerSpec {
@@ -688,7 +683,6 @@ impl Hparams {
             residual_scale,
             logit_scale,
             logit_softcap: positive("final_logit_softcapping")?,
-            attn_softcap: positive("attn_logit_softcapping")?,
             ple_dim,
             moe,
             nextn_predict_layers,
@@ -1019,44 +1013,11 @@ mod tests {
     }
 
     #[test]
-    fn gemma2_alternates_windows_and_reads_the_soft_caps() {
-        let mut meta = md(&[
-            ("general.architecture", Str("gemma2".into())),
-            ("gemma2.block_count", U32(26)),
-            ("gemma2.context_length", U32(8192)),
-            ("gemma2.embedding_length", U32(2304)),
-            ("gemma2.attention.head_count", U32(8)),
-            ("gemma2.attention.head_count_kv", U32(4)),
-            ("gemma2.attention.key_length", U32(256)),
-            ("gemma2.attention.sliding_window", U32(4096)),
-            ("gemma2.attention.layer_norm_rms_epsilon", F32(1e-6)),
-            ("gemma2.attn_logit_softcapping", F32(50.0)),
-            ("gemma2.final_logit_softcapping", F32(30.0)),
-            ("gemma2.rope.freq_base", F32(10_000.0)),
-        ]);
-        let p = Hparams::from_metadata(&meta, &none).unwrap();
-        for il in 0..26 {
-            assert_eq!(p.layers[il].window.is_some(), il % 2 == 0, "layer {il}");
-        }
-        assert_eq!(p.attn_softcap, Some(50.0));
-        assert_eq!(p.logit_softcap, Some(30.0));
-        assert!((p.layers[0].scale - 1.0 / 16.0).abs() < 1e-7);
-        assert_eq!(p.ropes.len(), 1, "both layer types share one rotary base");
-        // The 46-layer 27B model scales by the embedding per head instead.
-        meta.insert("gemma2.block_count".into(), U32(46));
-        meta.insert("gemma2.embedding_length".into(), U32(4608));
-        meta.insert("gemma2.attention.head_count".into(), U32(32));
-        meta.insert("gemma2.attention.head_count_kv".into(), U32(16));
-        let p = Hparams::from_metadata(&meta, &none).unwrap();
-        assert!((p.layers[0].scale - 1.0 / 144f32.sqrt()).abs() < 1e-7);
-    }
-
-    #[test]
     fn olmo2_has_only_post_norms_and_full_width_qk_norm() {
         let b = Arch::Olmo2.behavior();
         assert!(!b.pre_norms && b.post_norms && b.qk_norm_full);
         assert_eq!(b.rope, RopeKind::Neox);
-        for arch in [Arch::Llama, Arch::Gemma2, Arch::Granite, Arch::Ernie4_5] {
+        for arch in [Arch::Llama, Arch::Granite, Arch::Ernie4_5] {
             let b = arch.behavior();
             assert!(b.pre_norms && !b.qk_norm_full, "{arch:?}");
         }
@@ -1148,28 +1109,9 @@ mod tests {
     }
 
     #[test]
-    fn granitemoe_reads_scales_and_experts() {
-        let meta = md(&[
-            ("general.architecture", Str("granitemoe".into())),
-            ("granitemoe.block_count", U32(2)),
-            ("granitemoe.context_length", U32(4096)),
-            ("granitemoe.embedding_length", U32(64)),
-            ("granitemoe.attention.head_count", U32(4)),
-            ("granitemoe.attention.head_count_kv", U32(2)),
-            ("granitemoe.attention.layer_norm_rms_epsilon", F32(1e-6)),
-            ("granitemoe.attention.scale", F32(0.015625)),
-            ("granitemoe.embedding_scale", F32(12.0)),
-            ("granitemoe.residual_scale", F32(0.22)),
-            ("granitemoe.logit_scale", F32(6.0)),
-            ("granitemoe.expert_count", U32(8)),
-            ("granitemoe.expert_used_count", U32(2)),
-        ]);
+    fn moe_reads_experts_and_rejects_more_used_than_exist() {
+        let meta = moe_metadata("qwen3moe");
         let p = Hparams::from_metadata(&meta, &none).unwrap();
-        assert_eq!(p.layers[0].scale, 0.015625);
-        assert_eq!(
-            (p.embd_scale, p.residual_scale, p.logit_scale),
-            (12.0, 0.22, 6.0)
-        );
         assert_eq!(
             p.moe,
             Some(MoeSpec {
@@ -1179,7 +1121,7 @@ mod tests {
             })
         );
         let mut bad = meta.clone();
-        bad.insert("granitemoe.expert_used_count".into(), U32(9));
+        bad.insert("qwen3moe.expert_used_count".into(), U32(9));
         assert!(Hparams::from_metadata(&bad, &none).is_err());
     }
 

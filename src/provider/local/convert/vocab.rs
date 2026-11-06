@@ -1178,7 +1178,6 @@ pub(crate) fn build(
     let meta = match arch {
         ConvArch::Gemma4Assistant => return Ok(None),
         ConvArch::Gemma4 => gemma4(ck)?,
-        ConvArch::Gemma2 => spm_meta(ck, spm_generic(ck, hp)?, Some(false))?,
         ConvArch::Gemma3 => {
             if ck.tokenizer_model.is_some() {
                 spm_meta(ck, spm_generic(ck, hp)?, Some(false))?
@@ -1199,7 +1198,7 @@ pub(crate) fn build(
                 spm_meta(ck, spm_phi3(ck, hp)?, None)?
             }
         }
-        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite | ConvArch::GraniteMoe => {
+        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite => {
             let prefix = config_str(ck, "add_prefix_space").and_then(Json::as_bool);
             let mut m = if ck.tokenizer_model.is_some() {
                 spm_meta(ck, spm_generic(ck, hp)?, prefix)?
