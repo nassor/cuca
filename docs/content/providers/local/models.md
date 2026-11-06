@@ -247,38 +247,38 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 ## Presets
 
-`ModelSource::PRESETS` has 25 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
+`ModelSource::PRESETS` has 25 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units: the block pools, which hold twice `context_length` positions. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
 
 | Preset | Architecture | Repository | Size | K/V |
 |---|---|---|---|---|
-| `gemma4-e2b-q4_0` (default) | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 2.84 GB | 145 MB |
-| `gemma4-e2b-q8_0` | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 4.97 GB | 145 MB |
-| `gemma4-e4b-q4_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 4.59 GB | 415 MB |
-| `gemma4-e4b-q8_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 8.03 GB | 415 MB |
-| `gemma3-270m-q8_0` | `gemma3` | `ggml-org/gemma-3-270m-it-GGUF` | 0.29 GB | 105 MB |
-| `gemma3-1b-q4_0` | `gemma3` | `unsloth/gemma-3-1b-it-GGUF` | 0.72 GB | 148 MB |
-| `gemma2-2b-q4_0` | `gemma2` | `second-state/gemma-2-2b-it-GGUF` | 1.63 GB | 1.44 GB |
-| `qwen3-0.6b-q8_0` | `qwen3` | `Qwen/Qwen3-0.6B-GGUF` | 0.64 GB | 1.88 GB |
-| `qwen3-1.7b-q8_0` | `qwen3` | `Qwen/Qwen3-1.7B-GGUF` | 1.83 GB | 1.88 GB |
-| `qwen2.5-0.5b-q8_0` | `qwen2` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | 0.68 GB | 201 MB |
-| `r1-distill-qwen-1.5b-q4_0` | `qwen2` | `bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` | 1.07 GB | 470 MB |
-| `llama3.2-1b-q4_0` | `llama` | `bartowski/Llama-3.2-1B-Instruct-GGUF` | 0.77 GB | 537 MB |
-| `smollm3-3b-q4_0` | `smollm3` | `bartowski/HuggingFaceTB_SmolLM3-3B-GGUF` | 1.81 GB | 1.21 GB |
-| `phi3.5-mini-q4_0` | `phi3` | `bartowski/Phi-3.5-mini-instruct-GGUF` | 2.18 GB | 6.44 GB |
-| `phi4-mini-q4_0` | `phi3` | `bartowski/microsoft_Phi-4-mini-instruct-GGUF` | 2.33 GB | 2.15 GB |
-| `phi4-mini-q4_k_m` | `phi3` | `unsloth/Phi-4-mini-instruct-GGUF` | 2.49 GB | 2.15 GB |
-| `granite3.3-2b-q4_0` | `granite` | `ibm-granite/granite-3.3-2b-instruct-GGUF` | 1.45 GB | 1.34 GB |
-| `olmo2-1b-q4_0` | `olmo2` | `allenai/OLMo-2-0425-1B-Instruct-GGUF` | 0.89 GB | 1.07 GB (4,096 maximum) |
-| `smollm2-360m-q8_0` | `llama` | `bartowski/SmolLM2-360M-Instruct-GGUF` | 0.39 GB | 671 MB |
-| `tinyllama-1.1b-q4_0` | `llama` | `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` | 0.64 GB | 92 MB (2,048 maximum) |
-| `granite3.1-moe-1b-q4_0` | `granitemoe` | `bartowski/granite-3.1-1b-a400m-instruct-GGUF` | 0.77 GB | 805 MB |
-| `qwen3-30b-a3b-q4_0` | `qwen3moe` | `unsloth/Qwen3-30B-A3B-GGUF` | 17.38 GB | 1.61 GB |
-| `olmoe-1b-7b-q4_0` | `olmoe` | `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF` | 3.94 GB | 1.07 GB (4,096 maximum) |
-| `qwen3.5-0.8b-q8_0` | `qwen35` | `unsloth/Qwen3.5-0.8B-MTP-GGUF` | 0.83 GB | 201 MB, plus a 20.2 MB recurrent state |
-| `qwen3.6-35b-a3b-q4_0` | `qwen35moe` | `bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` | 20.84 GB | 336 MB, plus a 65.9 MB recurrent state |
+| `gemma4-e2b-q4_0` (default) | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 2.84 GB | 422 MB |
+| `gemma4-e2b-q8_0` | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 4.97 GB | 422 MB |
+| `gemma4-e4b-q4_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 4.59 GB | 1.27 GB |
+| `gemma4-e4b-q8_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 8.03 GB | 1.27 GB |
+| `gemma3-270m-q8_0` | `gemma3` | `ggml-org/gemma-3-270m-it-GGUF` | 0.29 GB | 377 MB |
+| `gemma3-1b-q4_0` | `gemma3` | `unsloth/gemma-3-1b-it-GGUF` | 0.72 GB | 539 MB |
+| `gemma2-2b-q4_0` | `gemma2` | `second-state/gemma-2-2b-it-GGUF` | 1.63 GB | 3.08 GB |
+| `qwen3-0.6b-q8_0` | `qwen3` | `Qwen/Qwen3-0.6B-GGUF` | 0.64 GB | 3.76 GB |
+| `qwen3-1.7b-q8_0` | `qwen3` | `Qwen/Qwen3-1.7B-GGUF` | 1.83 GB | 3.76 GB |
+| `qwen2.5-0.5b-q8_0` | `qwen2` | `Qwen/Qwen2.5-0.5B-Instruct-GGUF` | 0.68 GB | 403 MB |
+| `r1-distill-qwen-1.5b-q4_0` | `qwen2` | `bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` | 1.07 GB | 940 MB |
+| `llama3.2-1b-q4_0` | `llama` | `bartowski/Llama-3.2-1B-Instruct-GGUF` | 0.77 GB | 1.07 GB |
+| `smollm3-3b-q4_0` | `smollm3` | `bartowski/HuggingFaceTB_SmolLM3-3B-GGUF` | 1.81 GB | 2.42 GB |
+| `phi3.5-mini-q4_0` | `phi3` | `bartowski/Phi-3.5-mini-instruct-GGUF` | 2.18 GB | 12.88 GB |
+| `phi4-mini-q4_0` | `phi3` | `bartowski/microsoft_Phi-4-mini-instruct-GGUF` | 2.33 GB | 4.29 GB |
+| `phi4-mini-q4_k_m` | `phi3` | `unsloth/Phi-4-mini-instruct-GGUF` | 2.49 GB | 4.29 GB |
+| `granite3.3-2b-q4_0` | `granite` | `ibm-granite/granite-3.3-2b-instruct-GGUF` | 1.45 GB | 2.68 GB |
+| `olmo2-1b-q4_0` | `olmo2` | `allenai/OLMo-2-0425-1B-Instruct-GGUF` | 0.89 GB | 2.15 GB (4,096 maximum) |
+| `smollm2-360m-q8_0` | `llama` | `bartowski/SmolLM2-360M-Instruct-GGUF` | 0.39 GB | 1.34 GB |
+| `tinyllama-1.1b-q4_0` | `llama` | `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` | 0.64 GB | 185 MB (2,048 maximum) |
+| `granite3.1-moe-1b-q4_0` | `granitemoe` | `bartowski/granite-3.1-1b-a400m-instruct-GGUF` | 0.77 GB | 1.61 GB |
+| `qwen3-30b-a3b-q4_0` | `qwen3moe` | `unsloth/Qwen3-30B-A3B-GGUF` | 17.38 GB | 3.22 GB |
+| `olmoe-1b-7b-q4_0` | `olmoe` | `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF` | 3.94 GB | 2.15 GB (4,096 maximum) |
+| `qwen3.5-0.8b-q8_0` | `qwen35` | `unsloth/Qwen3.5-0.8B-MTP-GGUF` | 0.83 GB | 403 MB, plus a 20.2 MB recurrent state |
+| `qwen3.6-35b-a3b-q4_0` | `qwen35moe` | `bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` | 20.84 GB | 671 MB, plus a 65.9 MB recurrent state |
 | `gemma4-e2b-mtp-f16` | `gemma4-assistant` | `unsloth/gemma-4-E2B-it-GGUF` | 0.17 GB | none: a drafter, reads the target's cache |
 
-- The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position, and a sliding-window layer holds only its window plus 1,280 positions (the Gemma presets). Phi 3.5 mini has 32 K/V heads and needs 6.44 GB of cache at 8,192 positions for a 2.18 GB file. Lower `context_length` to shrink it.
+- The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position. The pool holds twice `context_length` positions (see [Local limits and errors](@/providers/local/limits-and-errors.md#limits)), and a sliding-window group (the Gemma presets) holds its window plus about 270 positions per running sequence plus cached prefixes. Phi 3.5 mini has 32 K/V heads and needs 12.88 GB of cache at 8,192 positions for a 2.18 GB file. Lower `context_length` to shrink it.
 - A model trained on fewer positions loads at its maximum by default (OLMo 2: 4,096; TinyLlama: 2,048). An explicit larger value fails with `context_length N exceeds the model maximum M`.
 - `gemma4-e2b-mtp-f16` has `drafter: true`: it loads only through `LocalModelConfig::drafter` and cannot be the main model.
 - `qwen3.5-0.8b-q8_0` carries the in-trunk prediction head, so `DrafterSource::InTrunk` works with it.
@@ -365,6 +365,8 @@ Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on 
 | GPU (Vulkan) against the CPU dequantized reference | relative error 2e-6 to 2e-5, greedy token ids equal, on Qwen 3 0.6B and 1.7B, Qwen 2.5 0.5B, Llama 3.2 1B, Gemma 3 270M and 1B, SmolLM 3, Phi 3.5, Granite 3.1 MoE, Gemma 4 E2B and the R1 distill |
 
 On the CPU, every Q4_0 and Q8_0 matrix multiplication runs through cuca's own batch-invariant quantized kernel, written in safe Rust; other dtypes use candle. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output.
+
+Since the paged K/V cache, attention reads the K/V blocks in place with an online-softmax kernel (per query row and head, so a row is bit-identical alone or in a batch) instead of candle's matmul attention. Its float rounding differs slightly from 0.6.x: logits move by about 0.04 (median) and up to 0.7 on the models measured, because the quantized matmuls round activations to Q8_0, so a greedy reply can differ from 0.6.x's where two logits are within about 0.1 of each other. In the 4-model matrix every first difference sat at a margin of 0.13 or less; Phi 3.5 mini and OLMoE (tiered) replies were identical.
 
 Measured prefill speed with that kernel (1,300-token prompt in chunks of 256, release build with `-C target-cpu=native`, 32-core CPU): `gemma4-e2b-q4_0` 86.5 tokens/s, `phi3.5-mini-q4_0` 76.8, `qwen3-0.6b-q8_0` 249.6.
 

@@ -35,7 +35,7 @@ The scenarios:
 - `thinking_precedes_answer` and `thinking_off_has_no_reasoning`: `Thinking` blocks precede the answer when thinking is on, and are absent when it is off.
 - `tool_call_round_trip` and `tool_result_answer_without_tools`: a `get_weather` call, then an answer from the result, with the tool declared on both requests and with no tool declared on the follow-up.
 - `long_context_needle`: a prompt of 1,000 tokens or more with a code word to retrieve.
-- `prefix_reuse_hits_and_matches_cold`: the warm prefix is read from the cache, an unrelated request shrinks it, and the warm and cold greedy outputs are identical.
+- `prefix_reuse_hits_and_matches_cold`: the warm prefix is read from the cache in whole blocks of 16, an unrelated request reuses less, and a repeat of the second turn reads at least as much and gives the identical greedy output.
 
 `tests/provider_local_mtp.rs` is the drafter check described under [Verified](@/providers/local/drafting.md#verified). Which models and devices these suites covered is on [Local models and formats](@/providers/local/models.md#verification).
 

@@ -6,6 +6,28 @@
 
 - `provider-local`: Hugging Face checkpoints load without a GGUF. `ModelSource::Checkpoint { repo, revision }` (parses from `repo:revision`) and `ModelSource::Dir(path)` are converted once, in process and in pure Rust, to a cached GGUF (`<cache>/converted/<repo>/<revision>/model-<quant>.gguf`), which the existing loader, tokenizer and chat template read unchanged. `LocalModelConfig::convert` (`ConvertConfig { quant: WeightQuant }`, `F16`, `Q8_0` default or `Q4_0`) picks the precision. The converter ports llama.cpp's `convert_hf_to_gguf.py` for all sixteen engine architectures and the Gemma 4 assistant, and streams tensor by tensor (a block of at most 32 MiB of `f32` in flight). Its output was compared with the real script's, key by key and tensor by tensor: identical F16 files for thirteen real checkpoints and four synthetic ones, identical Q8_0 for SmolLM 2. `ModelSource::from_str` gains the `repo:revision` form; `LocalModelConfig::on_download_progress` also reports conversion progress (tensors written out of the tensor count).
 
+### Changed
+
+- `provider-local`: the K/V cache is paged. K/V lives in blocks of 16
+  positions in per-layer-group pools (`model/paged.rs`), a sequence holds one
+  block table per group, and a prefix store names full blocks by a hash chain
+  over their token ids, so a finished request's blocks stay cached (least
+  recently used evicted first) and an unrelated request no longer evicts a
+  prefix. `prompt_cache_usage.read_tokens` is now a multiple of 16 (the
+  trailing partial block, at most 15 tokens, is recomputed). The sliding-window
+  ring buffer and its compaction are gone: a sliding block is released once it
+  leaves the window. The pool holds twice `context_length` positions, so
+  `LocalModel::kv_cache_bytes` grows (Gemma 4 E2B at 8192: 145 MB to 422 MB;
+  full-attention models double). On the CPU attention reads the blocks in
+  place with an online-softmax kernel per (row, head): decode is faster
+  (Gemma 4 E2B 20.9 to 25 tok/s, Qwen3-0.6B 27 to 50 at 1,100 tokens), a row
+  is bit-identical alone or in a batch, and warm equals cold, chunked equals
+  token by token and speculative equals plain bit for bit as before; the
+  rounding differs from candle's matmul attention, so a greedy reply can
+  differ from 0.6.x where two logits are within about 0.1. On a GPU a decode
+  step reads the blocks with a split (flash-decoding) CubeCL kernel
+  (`paged_kernel.rs`) and a prefill gathers the blocks it needs.
+
 ## 0.6.2
 
 ### Changed

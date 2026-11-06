@@ -39,8 +39,8 @@ weight = 2
 ## Token usage
 
 - Usage is exact, not estimated: `prompt_tokens` equals the prefix-reuse read plus write counts, and a `max_tokens` cap is met to the token.
-- `prompt_cache_usage` reports `read_tokens` (reused from the previous prompt) and `write_tokens` (prefilled). The engine keeps the longest common prefix of the cached ids and the new prompt, always leaving the last prompt token to prefill.
-- On the CPU the output of a request that reuses a prefix equals the output of a cold request, bit for bit.
+- `prompt_cache_usage` reports `read_tokens` (reused from earlier prompts) and `write_tokens` (prefilled). The engine looks the prompt up in its prefix store: K/V is kept in blocks of 16 positions named by the token ids they hold, so `read_tokens` is a multiple of 16, at most the prompt length minus one rounded down to a block; the trailing partial block (at most 15 tokens) and the last prompt token are always prefilled. An unrelated request does not evict the prefix: blocks are evicted least recently used when the pool is full. A hybrid model (Qwen 3.5) reuses its last sequence from its one checkpoint instead.
+- On the CPU the output of a request that reuses a prefix equals the output of a cold request, bit for bit. Replies can differ from 0.6.x's at near-ties (two logits within about 0.1), because the attention kernel rounds differently; see [Numerical parity](@/providers/local/models.md#numerical-parity-with-huggingface).
 - `reasoning_tokens` is set only when the request enabled thinking. It counts the tokens inside reasoning blocks, markers included.
 
 Read the usage per call with `CucaClient::generate_stream_with_response`.

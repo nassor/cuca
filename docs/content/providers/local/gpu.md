@@ -80,7 +80,7 @@ Any other text is a `CucaError::Config`: ``unknown local device `...` ``.
 - Device memory is about the file size, minus any table the engine reads from the file instead of uploading (Gemma 4's per-layer embedding table), plus the K/V cache.
 - A mixture-of-experts model can keep its experts in the GGUF file with `ExpertPlacement::Tiered`: `device_bytes` bounds the device memory they use and an optional RAM tier (`ram_bytes`) holds packed copies. See [Tiered expert placement](@/providers/local/expert-tiers.md).
 - The token embedding is uploaded once, as the LM head, only when it is tied to it. Embedding lookups read rows from the file on the host.
-- The K/V cache lives in device memory with the same formula as on the CPU. The RoPE tables are on the device.
+- The K/V cache lives in device memory as the same block pools as on the CPU (twice `context_length` positions, in blocks of 16); the decode step reads it in place with a CubeCL kernel and a prefill gathers the blocks it needs. The RoPE tables are on the device.
 - A weight over 1 GiB is split into row chunks, because wgpu cannot allocate a single buffer that large.
 - Dtype handling is in [Weight formats](@/providers/local/models.md#weight-formats).
 - Dropping the last clone of a `LocalModel` on a GPU returns its device memory to the driver, so another model can load in the same process.
