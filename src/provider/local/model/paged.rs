@@ -171,6 +171,10 @@ impl KvLayout {
 
 /// FNV-1a over the previous hash and the ids of one block.
 pub(crate) fn chain_hash(prev: u64, ids: &[u32]) -> u64 {
+    #[cfg(test)]
+    if COLLIDE.get() {
+        return 0x5eed;
+    }
     const PRIME: u64 = 0x0100_0000_01b3;
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in prev.to_le_bytes() {
@@ -182,6 +186,48 @@ pub(crate) fn chain_hash(prev: u64, ids: &[u32]) -> u64 {
         }
     }
     h
+}
+
+/// What names a cached block: its chain hash, the hash of the block before it
+/// and its 16 token ids. A lookup hits only when all three match, so a 64-bit
+/// hash collision can never make two different prefixes share K/V.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BlockKey {
+    hash: u64,
+    parent: u64,
+    ids: [u32; BLOCK_SIZE],
+}
+
+impl BlockKey {
+    /// The key of the block holding `ids` after the block hashed `parent`
+    /// (0 for the first block).
+    fn new(parent: u64, ids: &[u32]) -> Self {
+        let mut block = [0; BLOCK_SIZE];
+        block.copy_from_slice(ids);
+        Self {
+            hash: chain_hash(parent, ids),
+            parent,
+            ids: block,
+        }
+    }
+
+    /// The key of block `i` of a sequence whose chain hashes are `chain` and
+    /// whose tokens are `ids`.
+    fn of(chain: &[u64], ids: &[u32], i: usize) -> Self {
+        let mut block = [0; BLOCK_SIZE];
+        block.copy_from_slice(&ids[i * BLOCK_SIZE..(i + 1) * BLOCK_SIZE]);
+        Self {
+            hash: chain[i],
+            parent: i.checked_sub(1).map_or(0, |p| chain[p]),
+            ids: block,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only: every chain hash is the same constant, to force collisions.
+    static COLLIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -204,7 +250,7 @@ pub(crate) struct BlockPool {
     /// Free block ids, popped from the back.
     free: Vec<u32>,
     refcount: Vec<u32>,
-    hash: Vec<Option<u64>>,
+    key: Vec<Option<BlockKey>>,
     /// Unreferenced hashed blocks, least recently used at the front, with
     /// the stamp that validates the entry (a block taken out of the LRU or
     /// put back leaves its old entry stale).
@@ -221,7 +267,7 @@ impl BlockPool {
         Self {
             free: (0..blocks as u32).rev().collect(),
             refcount: vec![0; blocks],
-            hash: vec![None; blocks],
+            key: vec![None; blocks],
             lru: VecDeque::new(),
             stamp: vec![0; blocks],
             next_stamp: 1,
@@ -245,10 +291,10 @@ impl BlockPool {
             }
             self.stamp[i] = 0;
             self.cached -= 1;
-            if let Some(h) = self.hash[i].take()
-                && self.by_hash.get(&h) == Some(&b)
+            if let Some(k) = self.key[i].take()
+                && self.by_hash.get(&k.hash) == Some(&b)
             {
-                self.by_hash.remove(&h);
+                self.by_hash.remove(&k.hash);
             }
             self.refcount[i] = 1;
             return Some(b);
@@ -267,7 +313,7 @@ impl BlockPool {
         if self.refcount[i] > 0 {
             return;
         }
-        if self.hash[i].is_some() {
+        if self.key[i].is_some() {
             self.stamp[i] = self.next_stamp;
             self.lru.push_back((block, self.next_stamp));
             self.next_stamp += 1;
@@ -277,29 +323,36 @@ impl BlockPool {
         }
     }
 
-    /// Name `block` (referenced by its owner) `hash`, so a later
+    /// Name `block` (referenced by its owner) by `key`, so a later
     /// [`BlockPool::lookup`] finds it. A block that is already named, or a
     /// hash another block already holds, is left alone; returns whether the
     /// block was registered.
-    pub(crate) fn register(&mut self, block: u32, hash: u64) -> bool {
+    pub(crate) fn register(&mut self, block: u32, key: BlockKey) -> bool {
         let i = block as usize;
-        if self.refcount[i] == 0 || self.hash[i].is_some() || self.by_hash.contains_key(&hash) {
+        if self.refcount[i] == 0 || self.key[i].is_some() || self.by_hash.contains_key(&key.hash) {
             return false;
         }
-        self.hash[i] = Some(hash);
-        self.by_hash.insert(hash, block);
+        self.key[i] = Some(key);
+        self.by_hash.insert(key.hash, block);
         true
     }
 
-    /// Whether a block named `hash` is held (referenced or cached).
-    pub(crate) fn contains(&self, hash: u64) -> bool {
-        self.by_hash.contains_key(&hash)
+    /// Whether a block named `key.hash` is held (referenced or cached) and
+    /// holds the same ids after the same parent: the hash alone is 64 bits,
+    /// so a collision must not make two different prefixes share K/V.
+    pub(crate) fn holds(&self, key: &BlockKey) -> bool {
+        self.by_hash
+            .get(&key.hash)
+            .is_some_and(|&b| self.key[b as usize].as_ref() == Some(key))
     }
 
-    /// Take a reference to the block named `hash`, pulling it out of the
-    /// cache when nobody else held it.
-    pub(crate) fn lookup(&mut self, hash: u64) -> Option<u32> {
-        let &block = self.by_hash.get(&hash)?;
+    /// Take a reference to the block `key` names, pulling it out of the cache
+    /// when nobody else held it; `None` unless [`BlockPool::holds`].
+    pub(crate) fn lookup(&mut self, key: &BlockKey) -> Option<u32> {
+        if !self.holds(key) {
+            return None;
+        }
+        let &block = self.by_hash.get(&key.hash)?;
         let i = block as usize;
         if self.refcount[i] == 0 {
             self.stamp[i] = 0;
@@ -311,7 +364,7 @@ impl BlockPool {
 
     /// Whether `block` carries a hash (its content is fixed).
     pub(crate) fn is_hashed(&self, block: u32) -> bool {
-        self.hash[block as usize].is_some()
+        self.key[block as usize].is_some()
     }
 
     #[cfg(test)]
@@ -431,10 +484,10 @@ impl KvPools {
                 if *slot == NO_BLOCK {
                     continue;
                 }
-                if ids.is_some()
-                    && let Some(&h) = seq.chain.get(i)
+                if let Some(ids) = ids
+                    && i < seq.chain.len()
                 {
-                    pool.register(*slot, h);
+                    pool.register(*slot, BlockKey::of(&seq.chain, ids, i));
                 }
                 pool.release(*slot);
                 *slot = NO_BLOCK;
@@ -494,12 +547,10 @@ impl KvPools {
     pub(crate) fn finish(&mut self, seq: &mut SeqBlocks, ids: &[u32]) {
         let len = seq.len;
         Self::extend_chain(seq, ids, len);
-        for ((table, pool), _) in seq.tables.iter().zip(&mut self.pools).zip(&self.groups) {
+        for (table, pool) in seq.tables.iter().zip(&mut self.pools) {
             for (i, &b) in table.iter().enumerate() {
-                if b != NO_BLOCK
-                    && let Some(&h) = seq.chain.get(i)
-                {
-                    pool.register(b, h);
+                if b != NO_BLOCK && i < seq.chain.len() {
+                    pool.register(b, BlockKey::of(&seq.chain, ids, i));
                 }
             }
         }
@@ -540,27 +591,25 @@ impl KvPools {
     /// group has them (0 when none does).
     pub(crate) fn lookup(&mut self, prompt: &[u32]) -> Hit {
         let max_blocks = prompt.len().saturating_sub(1) / BLOCK_SIZE;
-        let mut hashes = Vec::with_capacity(max_blocks);
+        let mut keys: Vec<BlockKey> = Vec::with_capacity(max_blocks);
         let mut prev = 0;
         for chunk in prompt.as_chunks::<BLOCK_SIZE>().0.iter().take(max_blocks) {
-            prev = chain_hash(prev, chunk);
-            hashes.push(prev);
+            let key = BlockKey::new(prev, chunk);
+            prev = key.hash;
+            keys.push(key);
         }
         // Longest chain the full-attention group holds (no such group: any).
         let full = self.groups.iter().position(|g| g.window.is_none());
         let mut n = match full {
-            Some(g) => hashes
-                .iter()
-                .take_while(|&&h| self.pools[g].contains(h))
-                .count(),
-            None => hashes.len(),
+            Some(g) => keys.iter().take_while(|k| self.pools[g].holds(k)).count(),
+            None => keys.len(),
         };
         // The first block each sliding group needs for a prefix of `n` blocks.
         let first = |w: usize, n: usize| (n * BLOCK_SIZE).saturating_sub(w - 1) / BLOCK_SIZE;
         while n > 0 {
             let ok = self.groups.iter().zip(&self.pools).all(|(g, pool)| {
                 g.window
-                    .is_none_or(|w| hashes[first(w, n)..n].iter().all(|&h| pool.contains(h)))
+                    .is_none_or(|w| keys[first(w, n)..n].iter().all(|k| pool.holds(k)))
             });
             if ok {
                 break;
@@ -571,11 +620,11 @@ impl KvPools {
         for (g, pool) in self.groups.iter().zip(&mut self.pools) {
             let from = g.window.map_or(0, |w| first(w, n));
             let mut table = vec![NO_BLOCK; from];
-            for &h in &hashes[from.min(n)..n] {
+            for key in &keys[from.min(n)..n] {
                 // Present by the checks above; a miss would leave a hole the
                 // attention never reads for a full group, so stop the prefix
                 // rather than hand out a table with one.
-                if let Some(b) = pool.lookup(h) {
+                if let Some(b) = pool.lookup(key) {
                     table.push(b);
                 }
             }
@@ -714,8 +763,10 @@ mod tests {
             pool.alloc().unwrap(),
         );
         assert!(pool.alloc().is_none());
-        pool.register(a, 1);
-        pool.register(b, 2);
+        let ka = BlockKey::new(0, &ids(0, 16));
+        let kb = BlockKey::new(0, &ids(100, 16));
+        pool.register(a, ka);
+        pool.register(b, kb);
         pool.release(a);
         pool.release(b);
         pool.release(c);
@@ -731,8 +782,55 @@ mod tests {
         assert_eq!(pool.alloc(), Some(c));
         // The free list is empty: the oldest cached block (`a`) goes first.
         assert_eq!(pool.alloc(), Some(a));
-        assert!(!pool.contains(1));
-        assert!(pool.contains(2));
+        assert!(!pool.holds(&ka));
+        assert!(pool.holds(&kb));
+    }
+
+    /// Two different blocks whose hashes collide never share: the key also
+    /// holds the parent hash and the ids, and a lookup checks all of them.
+    #[test]
+    fn a_hash_collision_does_not_share_blocks() {
+        // At the pool: one hash, two id sets.
+        let mut pool = BlockPool::new(4);
+        let (a, b) = (pool.alloc().unwrap(), pool.alloc().unwrap());
+        let one = BlockKey {
+            hash: 9,
+            parent: 0,
+            ids: [1; BLOCK_SIZE],
+        };
+        let other_ids = BlockKey {
+            ids: [2; BLOCK_SIZE],
+            ..one
+        };
+        let other_parent = BlockKey { parent: 5, ..one };
+        assert!(pool.register(a, one));
+        // The hash is taken: the second block is left unregistered.
+        assert!(!pool.register(b, other_ids));
+        assert!(pool.holds(&one));
+        assert!(!pool.holds(&other_ids));
+        assert!(!pool.holds(&other_parent));
+        assert_eq!(pool.lookup(&other_ids), None);
+        assert_eq!(pool.lookup(&other_parent), None);
+        assert_eq!(pool.lookup(&one), Some(a));
+
+        // Through the store, with every chain hash forced equal.
+        COLLIDE.set(true);
+        let mut p = pools(&[(None, 8)]);
+        let first = ids(0, 33);
+        let mut seq = fill(&mut p, &first);
+        p.finish(&mut seq, &first);
+        // Same first block, different second block: with equal hashes only
+        // the ids tell the second blocks apart, so only the first is shared.
+        let mut prompt = first[..16].to_vec();
+        prompt.extend(ids(500, 17));
+        let hit = p.lookup(&prompt);
+        assert_eq!(hit.len, 16);
+        // A completely different prompt shares nothing.
+        assert_eq!(p.lookup(&ids(900, 33)).len, 0);
+        // The same prompt still hits, as far as the registered blocks go: the
+        // second block lost its hash to the first (one hash, one block).
+        assert_eq!(p.lookup(&first).len, 16);
+        COLLIDE.set(false);
     }
 
     #[test]
