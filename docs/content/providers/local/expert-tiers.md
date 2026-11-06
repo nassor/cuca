@@ -202,12 +202,10 @@ For `qwen3.6-35b-a3b-q4_0` the cold runs read 18,861 experts (33.6 GB) at `ram=4
 
 The same test on Vulkan (AMD RX 9070 XT, Windows, release build) gave the rates below. They include the first-use kernel tuning of each new matrix shape, which a short run does not amortize.
 
-The `olmoe-1b-7b-q4_0` rows were measured with the September 2024 OLMoE-1B-7B-0924 file this preset pinned before; the 0125 file has the same architecture and sizes and was not re-measured on Vulkan.
-
 | Model | Placement | Tokens per second | Hit rate |
 |---|---|---|---|
-| `olmoe-1b-7b-q4_0` | resident | 7.2 | not applicable |
-| `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 6.1 cold, 6.0 warm | 0.565 cold, 0.590 warm |
+| `olmoe-1b-7b-q4_0` | resident | 5.9 | not applicable |
+| `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 5.3 cold, 5.3 warm | 0.575 cold, 0.599 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:device=2g,ram=0` | 1.9 | 0.501 |
 | `qwen3-30b-a3b-q4_0` | `tiered:device=6g,ram=12g` | 4.9 cold, 6.1 warm | 0.911 cold, 0.983 warm |
 | `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=0` (the reference) | 1.9 to 2.5 | 0.541 |
