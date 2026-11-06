@@ -204,8 +204,8 @@ The same test on Vulkan (AMD RX 9070 XT, Windows, release build) gave the rates 
 
 | Model | Placement | Tokens per second | Hit rate |
 |---|---|---|---|
-| `olmoe-1b-7b-q4_0` | resident | 5.9 | not applicable |
-| `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 5.3 cold, 5.3 warm | 0.575 cold, 0.599 warm |
+| `olmoe-1b-7b-q4_0` | resident | 8.3 | not applicable |
+| `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 5.7 cold, 6.1 warm | 0.575 cold, 0.599 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:device=2g,ram=0` | 1.9 | 0.501 |
 | `qwen3-30b-a3b-q4_0` | `tiered:device=6g,ram=12g` | 4.9 cold, 6.1 warm | 0.911 cold, 0.983 warm |
 | `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=0` (the reference) | 1.9 to 2.5 | 0.541 |
