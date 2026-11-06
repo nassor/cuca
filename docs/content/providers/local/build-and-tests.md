@@ -37,6 +37,8 @@ The scenarios:
 - `long_context_needle`: a prompt of 1,000 tokens or more with a code word to retrieve.
 - `prefix_reuse_hits_and_matches_cold`: the warm prefix is read from the cache in whole blocks of 16, an unrelated request reuses less, and a repeat of the second turn reads at least as much and gives the identical greedy output.
 
+`tests/provider_local_batch.rs` runs 8 concurrent clients on one model (`CUCA_LOCAL_BATCHING` sets the batching, default `seqs=4`): replies equal the serial ones on the CPU, steps carry several rows, a second round reads the prefix store, and `BATCH|...` lines report aggregate tokens per second for 1 and for 4 sequences.
+
 `tests/provider_local_mtp.rs` is the drafter check described under [Verified](@/providers/local/drafting.md#verified). Which models and devices these suites covered is on [Local models and formats](@/providers/local/models.md#verification).
 
 `tests/provider_local_tiers.rs` runs a mixture-of-experts model on a tiered placement and compares its greedy replies with a reference placement; it is described under [Run it](@/providers/local/expert-tiers.md#run-it).

@@ -32,12 +32,14 @@ weight = 1
 | `draft_tokens` | `5` | most tokens the drafter proposes per round, `1..=16`; ignored without a drafter |
 | `experts` | `ExpertPlacement::Resident` | where a mixture-of-experts model's experts live: in memory (`Resident`) or streamed from the file through bounded caches (`Tiered`) |
 | `convert` | `ConvertConfig::default()` | weight precision of a converted checkpoint (`WeightQuant::F16`, `Q8_0` or `Q4_0`; default `Q8_0`); ignored for GGUF sources |
+| `batching` | `BatchingConfig::default()` | how concurrent requests share the engine: `max_sequences` (4), `kv_tokens` (twice `context_length`), `max_step_tokens` (the prefill chunk), `prefix_cache` (on) |
 | `on_download_progress` | `None` | download progress observer |
 
 - `source` defaults to the preset `gemma4-e2b-q4_0`.
 - `context_length` of `None` resolves to the smaller of 8,192 and the model's own maximum, so a model trained for 4,096 positions loads without configuration. An explicit value must be at least 1 and at most the model's maximum.
 - `device` needs the matching cargo feature for a GPU; see [Devices and GPU features](@/providers/local/gpu.md#devices-and-gpu-features).
 - `experts` matters only for models with experts. `Tiered` needs a RAM budget on the CPU and a device budget on a GPU, and parses from text such as `tiered:ram=4g`; the fields, rules and errors are on [Tiered expert placement](@/providers/local/expert-tiers.md).
+- `batching` sets how many requests run at once and what they share. `max_sequences` is 1 to 64 (default 4; an in-trunk drafter forces 1). `kv_tokens` is the size of the one K/V block pool all running requests and the cached prefixes share, in positions per full-attention layer group; `None` is twice `context_length`, an explicit value is at least `context_length + 16` and rounds up to whole blocks of 16. It is the memory knob (`LocalModel::kv_cache_bytes` reports it): raising `max_sequences` does not raise it, and a pool too small for the running requests makes them wait or preempt each other. `max_step_tokens` caps the rows of one forward step (`max_sequences` to 2048). `prefix_cache` off registers nothing in the prefix store, so every prompt prefills in full. It parses from text such as `seqs=4,kv=16384,step=256,prefix=off` (any subset), which `CUCA_LOCAL_BATCHING` carries in the example and the live tests. `LocalModel::serving_stats` reports the running and waiting counts, free and cached blocks, snapshot bytes, prefix hits, preemptions and the rows per step.
 - `Debug` for `LocalModelConfig` prints `hf_token` as `<redacted>`.
 
 `SamplingConfig` fields:

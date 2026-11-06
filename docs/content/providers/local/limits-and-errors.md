@@ -20,26 +20,28 @@ weight = 3
 
 | Item | Cap | At the cap |
 |---|---|---|
-| Waiting requests | 16 behind the running one | `generate_stream` waits for a free slot; no error |
-| Output channel | 64 blocks | the engine waits for the consumer, so a slow consumer paces generation |
+| Running requests | `batching.max_sequences`, 1 to 64, default 4 (1 with an in-trunk drafter) | later requests wait in the queue |
+| Waiting requests | 16 behind the running ones | `generate_stream` waits for a free slot; no error |
+| Output channel | 64 blocks | that request is skipped until its consumer takes its output; the others keep running |
 | Prompt | fewer than `context_length` tokens | `CucaError::Provider`: `prompt has N tokens; context_length is M` |
 | Completion | `max_tokens`, the remaining context and any `stop` string | generation stops |
-| K/V cache | twice `context_length` positions in blocks of 16 per full-attention group; a window plus about 270 positions per running sequence plus cached prefixes per sliding-window group; preallocated | no growth; unreferenced blocks are evicted least recently used; the prefix cache is reused across requests |
+| K/V cache | `batching.kv_tokens` positions (twice `context_length` by default) in blocks of 16 per full-attention group, shared by all running sequences and the cached prefixes; a window plus about 270 positions per running sequence plus cached prefixes per sliding-window group; preallocated | no growth; unreferenced blocks are evicted least recently used; a running request that needs a block preempts the youngest one; the prefix cache is reused across requests |
+| Step rows | `batching.max_step_tokens`, at most 2048, default the prefill chunk | the decode rows come first, prompts prefill in the rest |
 | `draft_tokens` | `1..=16` with a drafter | `CucaError::Config` at load |
 | Prefill chunk | 256 tokens at most | a longer prompt prefills in chunks |
 | Download stall | 60 seconds without data | `CucaError::Transport`; the partial file stays for a later resume |
 | Download connect | 30 seconds | `CucaError::Transport` |
 
-- The engine is a single slot: it runs one request at a time, in arrival order.
+- The engine is a step scheduler: requests start in arrival order while fewer than `max_sequences` run and the pool can hold their prompts, and every step runs one decode row per running request plus chunks of the prompts being prefilled in one forward pass. `batching.kv_tokens` is the shared pool for all of them, so raising `max_sequences` does not raise `kv_cache_bytes`; a smaller pool makes requests wait or preempt each other. A preempted request goes back to the front of the queue and prefills again, mostly from the blocks it left in the prefix store. An in-trunk drafter observes every position of its one sequence, so with it the engine runs one request at a time; a file drafter speculates only while one request runs alone.
 - The prefill chunk is `2,097,152 / context_length`, clamped to between 16 and 256 tokens: 256 at 8,192 positions, 64 at 32,768 and 16 at 131,072. The chunk size bounds the transient attention score matrix.
-- The K/V cache is paged: blocks of 16 positions, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and K/V-owning layer (f32 keys and values), with each layer's own head count and head dimension. Layers that share an attention window share block ids (a group). A full-attention group holds twice `context_length` positions in blocks, so a finished request's prefix stays cached while the next one runs. A sliding-window group holds `ceil((window - 1 + rows) / 16) + 2` blocks per running sequence (its window, one call's rows of at most 256, and two blocks of slack), plus up to `context_length` positions of cached prefixes. `LocalModel::kv_cache_bytes` reports the total of all pools, so you can compare a `context_length` with your memory before the first request.
+- The K/V cache is paged: blocks of 16 positions, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and K/V-owning layer (f32 keys and values), with each layer's own head count and head dimension. Layers that share an attention window share block ids (a group). A full-attention group holds `batching.kv_tokens` positions (twice `context_length` by default) in blocks, shared by every running sequence, so a finished request's prefix stays cached while the next one runs. A sliding-window group holds `ceil((window - 1 + rows) / 16) + 2` blocks per running sequence (its window, one call's rows of at most 256, and two blocks of slack), plus up to `kv_tokens - context_length` positions of cached prefixes. `LocalModel::kv_cache_bytes` reports the total of all pools, so you can compare a `context_length` with your memory before the first request.
 - A sliding-window block is released once every position in it is before the window of the next query; it stays cached, named by its token ids, until the pool needs it. A prefix hit needs the blocks of the window before its end, so a hit shortens by whole blocks until every group has them.
-- Eviction is least recently used among blocks no sequence references; a block in use is never evicted, and a request that cannot get a block fails with a `CucaError::Provider` (`the K/V block pool is exhausted`).
+- Eviction is least recently used among blocks no sequence references; a block in use is never evicted, and a running request that cannot get a block preempts the youngest running request, and only the oldest one alone in a pool smaller than it needs fails with a `CucaError::Provider` (`the K/V block pool is exhausted by a single sequence`).
 - K/V cost varies by model. At 8,192 positions it is 422 MB for Gemma 4 E2B and 12.88 GB for Phi 3.5 mini, which has 32 K/V heads and no sliding-window layers (twice what a pool of exactly `context_length` positions would cost); the preset table on [Local models and formats](@/providers/local/models.md#presets) lists the value for each preset.
 - Weights stay quantized and are consumed by the engine's quantized matmul kernel (Q4_0 and Q8_0) or candle's (other dtypes). Norm vectors, biases and float weights are held as f32. Resident weights are about the file size.
 - Gemma 4's per-layer embedding table (`per_layer_token_embd`: 1.32 GB in E2B Q4_0, 1.59 GB in E4B Q4_0) is not loaded. The engine reads one row per input token from the GGUF file, usually from the OS page cache, so E2B Q4_0 holds 1.5 GB of its 2.84 GB file.
 - Mixture of experts: by default expert tensors are split once at load into one quantized 2-D weight per expert. Memory is the file size, and a pass computes only the experts its tokens route to. With `ExpertPlacement::Tiered` the experts stay in the GGUF file and memory is the dense weights plus the RAM and device budgets you set; see [Tiered expert placement](@/providers/local/expert-tiers.md).
-- Hybrid models (Qwen 3.5) keep a recurrent state of fixed size next to the K/V cache. For the 0.8B model it is 20.2 MB, about 61 MB with the one checkpoint slot and the rollback copy, plus 445 KB per verified row. See [Architectures](@/providers/local/models.md#architectures).
+- Hybrid models (Qwen 3.5) keep a recurrent state of fixed size next to the K/V cache. For the 0.8B model it is 20.2 MB per running sequence (`max_sequences` slots), about 40 MB with the rollback copy, plus 445 KB per verified row, and one more 20.2 MB per snapshot in the prefix store (at most `max_sequences + 4`). See [Architectures](@/providers/local/models.md#architectures).
 - On a GPU the weights and the K/V cache are in device memory instead of RAM, at the sizes in [Devices and GPU features](@/providers/local/gpu.md#devices-and-gpu-features).
 
 ## Errors
@@ -50,6 +52,7 @@ weight = 3
   - `context_length` of 0 (`context_length must be at least 1`), or above the model's maximum (`context_length N exceeds the model maximum M`).
   - `temperature` not finite or below 0, or `top_p` outside `(0, 1]`.
   - `draft_tokens` outside `1..=16` with a drafter.
+  - `batching.max_sequences` outside `1..=64`, `batching.max_step_tokens` outside `max_sequences..=2048`, or `batching.kv_tokens` below `context_length + 16`.
   - A `device` whose cargo feature is off, for example ``device Vulkan(Default) requires the `provider-local-vulkan` cargo feature``.
   - `DrafterSource::InTrunk` with a GPU device.
   - A repo, revision or file with an empty, `.`, `..` or `:` segment, a backslash or a leading `/`.

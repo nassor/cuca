@@ -43,7 +43,7 @@ There is no API key and no auth header. The one credential is the optional Huggi
 - `LocalModel::load(LocalModelConfig)` is async. It resolves or downloads the file, loads it and starts the thread named `cuca-local-engine`. The download, the hashing and the weight parsing run on that thread, so the call never blocks the async runtime.
 - `CucaClientBuilder::with_local_model(LocalModel)` attaches the model. `CucaClient::local_model()` returns `Option<&LocalModel>`.
 - `LocalModel` is cheap to clone. Every clone and every client built from a clone shares the one engine thread, which ends when the last clone is dropped.
-- `LocalModel::kv_cache_bytes()` returns the K/V cache size in bytes. `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`. `LocalModel::draft_stats()` returns the drafter counters.
+- `LocalModel::kv_cache_bytes()` returns the K/V cache size in bytes. `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`. `LocalModel::draft_stats()` returns the drafter counters. `LocalModel::serving_stats()` returns the scheduler counters (`ServingStats`: running and waiting requests, free and cached blocks, prefix hits, preemptions, rows per step).
 - `LocalModel::expert_tier_stats()` and `LocalModel::expert_heat()` return the expert cache counters and the learned heat, `None` unless `LocalModelConfig::experts` is `ExpertPlacement::Tiered`.
 - `ModelSource::PRESETS`, `ModelSource::preset(name)`, `ModelSource::default_model()` and `ModelSource::hugging_face(repo, revision, file)` describe model sources. `ModelSource` and `LocalDevice` also implement `FromStr`.
 
@@ -51,7 +51,7 @@ There is no API key and no auth header. The one credential is the optional Huggi
 <div class="dgm-scroll">
 <svg viewBox="0 0 660 124" role="img" aria-labelledby="loc-title loc-desc">
   <title id="loc-title">One request through the in-process engine</title>
-  <desc id="loc-desc">Five stages, left to right. CucaClient::generate_stream receives the UnifiedRequest. The chat template and the tokenizer turn it into prompt token ids. The job queue holds up to 16 waiting requests. The engine thread runs one request at a time: prefix reuse, prefill and decode. A channel of up to 64 blocks carries Text, Thinking and ToolCall blocks back to the stream. Dropping the stream stops generation, and a full queue makes generate_stream wait.</desc>
+  <desc id="loc-desc">Five stages, left to right. CucaClient::generate_stream receives the UnifiedRequest. The chat template and the tokenizer turn it into prompt token ids. The job queue holds up to 16 waiting requests. The engine thread runs up to four requests at once, each step one forward pass over all of them: prefix reuse, prefill chunks and decode rows. A channel of up to 64 blocks carries Text, Thinking and ToolCall blocks back to the stream. Dropping the stream stops generation, and a full queue makes generate_stream wait.</desc>
   <defs>
     <marker id="loc-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -70,7 +70,7 @@ There is no API key and no auth header. The one credential is the optional Huggi
   <text class="t-sm t-mid" x="330" y="81">16 waiting</text>
   <rect class="blk" x="414" y="44" width="104" height="50" rx="6"/>
   <text class="t-sm t-mid" x="466" y="67">engine thread</text>
-  <text class="t-sm t-mid" x="466" y="81">prefill, decode</text>
+  <text class="t-sm t-mid" x="466" y="81">batched steps</text>
   <rect class="blk blk-data" x="550" y="44" width="104" height="50" rx="6"/>
   <text class="t-sm t-mid t-data" x="602" y="67">block channel</text>
   <text class="t-sm t-mid" x="602" y="81">64 blocks</text>
@@ -81,7 +81,7 @@ There is no API key and no auth header. The one credential is the optional Huggi
   <text class="t-ax" x="6" y="114">dropping the stream stops generation; a full queue makes generate_stream wait</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>One thread runs one request at a time.</b> Requests run in arrival order, and a slow consumer paces generation through the bounded channel.</p>
+<p class="dgm-cap"><b>One thread runs several requests in one forward pass per step.</b> Requests start in arrival order, up to `max_sequences` at once; a slow consumer stalls only its own request, through the bounded channel.</p>
 </div>
 
 ## Example

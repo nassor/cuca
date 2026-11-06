@@ -49,6 +49,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 - At temperature `0.0` a draft is accepted when it equals the target's greedy token. On the CPU the output equals plain decoding bit for bit.
 - Above `0.0` a draft is accepted with probability `min(1, p/q)`, where `p` and `q` are the target's and the drafter's distributions after temperature, `top_k` and `top_p`. A rejected draft is replaced by a token drawn from the residual distribution `max(0, p - q)`, which preserves the target's sampling distribution.
 - `LocalModel::draft_stats()` returns `DraftStats { rounds, drafted, accepted }`, summed over every request. `DraftStats::acceptance_rate()` returns the accepted fraction, `None` before the first round.
+- A drafter speculates only while one request runs alone and none waits: with several running requests the engine batches their decode rows instead, which already shares the weight reads that speculation saves. The in-trunk head observes every position of its one sequence, so with it the engine runs one request at a time (`batching.max_sequences` is treated as 1).
 - `draft_tokens` is only the cap: the rule above sets the length per round from the drafter's confidence and the verification cost it measures on the running device.
 - The in-trunk head ranks only the first 65,536 token ids in a draft step, which is about five times cheaper than ranking the whole vocabulary for 4 percent fewer accepted tokens per round (Qwen 3.5 0.8B, whose vocabulary has 248,320 ids).
 
