@@ -15,12 +15,24 @@
 //!    full-attention pool can hold their prompts next to what the running
 //!    prompts still have to prefill. A prompt starts from the longest prefix
 //!    the store holds ([`Engine::prefix_for`]).
-//! 4. **Step**: one forward pass over a row budget of `max_step_tokens`:
-//!    every decoding sequence takes one row (a lone sequence may verify
-//!    drafted tokens, see [`Engine::draft`]), then the prefilling sequences,
-//!    in admission order, take chunks of their prompts with what is left. The
-//!    sampled tokens go through the sequence's output parser and stop
-//!    matcher.
+//! 4. **Step**, in three parts:
+//!    1. *Plan*: one forward pass over a row budget of `max_step_tokens`.
+//!       Each decoding sequence with no output pending, oldest first, samples
+//!       its next token from the logits the last pass left (or takes the one a
+//!       rejected draft resampled), runs it through the sequence's output
+//!       parser and stop matcher into its pending output, and takes one row
+//!       (a lone sequence may verify drafted tokens, see [`Engine::draft`]); a
+//!       reply that ends with the token leaves the plan. Then the prefilling
+//!       sequences, in admission order, take chunks of their prompts with the
+//!       rows left.
+//!    2. **Deliver** again, before the forward pass: the tokens sampled while
+//!       planning reach their streams while the pass runs, not after it.
+//!    3. *Forward and apply*: run the pass over every planned row, then
+//!       record its results per sequence (prefill progress, accepted draft
+//!       tokens, the logits the next plan samples from) and retire the
+//!       sequences that ended.
+//! 5. **Deliver** a last time, so what the step produced goes out now, not
+//!    after the next turn's cancel and deliver.
 //!
 //! A decoding sequence that needs a new block when none is left makes room by
 //! preempting the youngest running sequence: its blocks go back to the
