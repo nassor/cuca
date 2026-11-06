@@ -857,6 +857,10 @@ impl Engine {
             return progressed;
         }
 
+        // The tokens planned above go out before the forward pass that
+        // computes the next ones, as a sequence's first token would with a
+        // blocking send: a step costs tens of milliseconds.
+        self.deliver();
         let started = Instant::now();
         let outs = {
             let batch = Batch {
