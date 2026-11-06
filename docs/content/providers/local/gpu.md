@@ -84,7 +84,7 @@ Any other text is a `CucaError::Config`: ``unknown local device `...` ``.
 - A weight over 1 GiB is split into row chunks, because wgpu cannot allocate a single buffer that large.
 - Dtype handling is in [Weight formats](@/providers/local/models.md#weight-formats).
 - Dropping the last clone of a `LocalModel` on a GPU returns its device memory to the driver, so another model can load in the same process.
-- The first forward pass of each new input shape is slow while CubeCL autotunes and compiles kernels.
+- The first forward pass of each new input shape is slow while CubeCL autotunes and compiles kernels. Continuous batching adds shapes: every distinct number of rows in a step (one to `max_sequences` decode rows, and each prefill chunk size) pays this once per process. Measured on Gemma 4 E2B Q4_0 on Vulkan: the first 1,108-token prompt takes 37 to 42 s to its first token, the first warm request (a 4-row chunk) about 2 s, and every request after that 0.06 s, the same with and without batching.
 
 ### Numerics
 
