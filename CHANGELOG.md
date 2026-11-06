@@ -27,6 +27,37 @@
   differ from 0.6.x where two logits are within about 0.1. On a GPU a decode
   step reads the blocks with a split (flash-decoding) CubeCL kernel
   (`paged_kernel.rs`) and a prefill gathers the blocks it needs.
+- `provider-local`: continuous batching. The engine is a step scheduler
+  (`engine/scheduler.rs`): up to `LocalModelConfig::batching.max_sequences`
+  requests (default 4) run at once, and every step is one forward pass
+  (`Model::forward_batch`) over a decode row of each running sequence plus
+  chunks of the prompts being prefilled, within `max_step_tokens` rows: the
+  dense layers read each weight once per step, attention, the K/V block
+  writes and a hybrid model's recurrent scan stay per sequence (per-sequence
+  state slots). All sequences share the one K/V block pool
+  (`batching.kv_tokens`, default twice `context_length`, the memory knob:
+  more sequences do not grow it); a request that needs a block when the pool
+  is full preempts the youngest running one, which resumes from the blocks it
+  left in the prefix store, and blocks of a prompt are named as soon as they
+  are filled, so a request with the same prompt as a running one reuses them.
+  A slow consumer stalls only its own request (`try_send`, no blocking send
+  in the engine), and a dropped stream releases its blocks at once.
+  `LocalModel::serving_stats` reports the scheduler (running and waiting
+  requests, free and cached blocks, snapshot bytes, prefix hits, preemptions,
+  rows per step). `BatchingConfig` parses from `seqs=4,kv=16384,step=256,
+  prefix=off` (`CUCA_LOCAL_BATCHING` in the example and the live tests). On
+  the CPU a sequence's output equals what it produces alone, bit for bit;
+  with four sequences decoding 96 tokens each the aggregate rate rose from
+  24.3 to 50.1 tok/s on Gemma 4 E2B Q4_0 (2.07x), 65.5 to 110.8 on
+  Qwen3-0.6B Q8_0 (1.69x) and 53.3 to 95.1 on Qwen3.5-0.8B Q8_0 (1.78x); on
+  Vulkan 11.3 to 21.7 (1.93x) and 27.4 to 43.8 tok/s (1.60x). A lone
+  sequence decodes as fast as before (Qwen3-0.6B 51 tok/s on both). A hybrid
+  model (Qwen 3.5) no longer keeps its last sequence and one checkpoint: the
+  prefix store keeps a recurrent-state snapshot at the block boundary below
+  the last end-of-turn token of every prompt it prefills
+  (`Model::snapshot`/`restore`; `read_tokens` is that boundary at most), and
+  `Model::checkpoint` is gone. An in-trunk drafter serves one sequence at a
+  time and a file drafter speculates only while one request runs alone.
 
 ## 0.6.2
 
