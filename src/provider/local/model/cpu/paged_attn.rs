@@ -430,17 +430,8 @@ mod tests {
             let t = 9;
             let q = rng.values(t * 4 * 8, 1.0);
             let range = |i: usize| (i / 3, l - t + i + 1);
-            let all = attend_paged_rows(
-                &q,
-                t,
-                range,
-                &table,
-                &pool_k,
-                &pool_v,
-                shape,
-                0.35,
-            )
-            .unwrap();
+            let all =
+                attend_paged_rows(&q, t, range, &table, &pool_k, &pool_v, shape, 0.35).unwrap();
             for i in 0..t {
                 let one = attend_paged_rows(
                     &q[i * 32..(i + 1) * 32],
