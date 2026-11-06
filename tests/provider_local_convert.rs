@@ -31,11 +31,11 @@
 //! was compared, key by key and tensor by tensor, with what that script writes
 //! for the same checkpoint (pinned commit
 //! `67107ac34f62882d8b53ea41ad68010ea635b9be`, `--outtype f16`): the files were
-//! identical for SmolLM 2, TinyLlama, Gemma 2, Gemma 3, Gemma 4, the Gemma 4
-//! assistant (but for the tokenizer it does not carry), OLMo 2, Granite 3.3,
-//! Granite 3.1 MoE, ERNIE 4.5, SmolLM 3, Qwen 2.5, Phi 3.5 and Phi 4 mini, and
-//! for synthetic Qwen 3 MoE, OLMoE, Qwen 3.5 and Qwen 3.5 MoE checkpoints
-//! (value heads regrouped); SmolLM 2 at Q8_0 matched byte for byte too. Qwen 3
+//! identical for Gemma 3, Gemma 4, the Gemma 4 assistant (but for the
+//! tokenizer it does not carry), OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 3,
+//! Phi 4 mini and a `Qwen2ForCausalLM` checkpoint, and for synthetic Qwen 3
+//! MoE, OLMoE, Llama (with attention biases), Qwen 3.5 and Qwen 3.5 MoE
+//! checkpoints (value heads regrouped). Qwen 3
 //! 0.6B at Q8_0 equals the converter's own Q8_0, but not the published
 //! `Qwen/Qwen3-0.6B-GGUF` file: that file's layer weights were built from
 //! different weights (relative L2 distance 0.9 % from the checkpoint at
@@ -209,8 +209,7 @@ async fn converted_checkpoints_answer_like_the_oracle() {
             "CONVERT {repo}: prompt tokens {} (oracle {oracle_tokens}, date in oracle prompt: {has_date})",
             usage.prompt_tokens
         );
-        let checkpoint_template_differs = repo.starts_with("ibm-granite/granite-3.1");
-        if !has_date && !repo.starts_with("TinyLlama/") && !checkpoint_template_differs {
+        if !has_date {
             assert_eq!(
                 u64::from(usage.prompt_tokens),
                 oracle_tokens,

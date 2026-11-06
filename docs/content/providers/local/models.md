@@ -382,7 +382,7 @@ Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on 
 | Qwen 3.5 0.8B Q8_0, reference arithmetic | maximum absolute logit difference below 5e-5; the production path keeps the top-1 token |
 | Qwen 3.6 35B-A3B Q4_0 (`qwen35moe`), 4-layer cut, reference arithmetic | maximum absolute logit difference 1e-5, greedy output equal for 24 of 24 and 8 of 8 tokens |
 | The same file, 40 layers, production path | top-1 token kept on all three prompts; maximum absolute logit difference 0.13 to 0.62 |
-| GPU (Vulkan) against the CPU dequantized reference | relative error 2e-6 to 2e-5, greedy token ids equal, on Qwen 3 0.6B and 1.7B, Gemma 3 270M and 1B, SmolLM 3, Gemma 4 E2B and the R1 distill (and, before the pre-2025 presets were removed, Qwen 2.5, Llama 3.2, Phi 3.5 and Granite 3.1 MoE) |
+| GPU (Vulkan) against the CPU dequantized reference | relative error 2e-6 to 2e-5, greedy token ids equal, on Qwen 3 0.6B and 1.7B, Gemma 3 270M and 1B, SmolLM 3, Gemma 4 E2B and the R1 distill |
 
 On the CPU, every Q4_0 and Q8_0 matrix multiplication runs through cuca's own batch-invariant quantized kernel, written in safe Rust; other dtypes use candle. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output.
 

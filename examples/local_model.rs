@@ -3,8 +3,9 @@
 //!
 //! One `LocalModel` downloads (once) and loads the model; one client routes a
 //! request to it and streams the reply. The default is Gemma 4 E2B Q4_0; the
-//! environment selects any verified preset (Gemma 3/4, Qwen 2.5/3, Llama 3.2,
-//! SmolLM 3, Phi 3.5/4, DeepSeek-R1-Distill-Qwen, Granite 3 MoE) or any other
+//! environment selects any verified preset (Gemma 3/4, Qwen 3/3.5/3.6,
+//! SmolLM 3, Phi 4 mini, Granite 3.3, OLMo 2, OLMoE, DeepSeek-R1-Distill,
+//! Muse Glimmer, Mistral Small 4) or any other
 //! GGUF file of a supported architecture (see Configuration).
 //!
 //! # Prerequisites

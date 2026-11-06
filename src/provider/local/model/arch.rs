@@ -131,7 +131,7 @@ pub(crate) struct Behavior {
     pub(crate) rope: RopeKind,
     pub(crate) act: Act,
     /// `post_attention_norm` and `post_ffw_norm` wrap the two sub-blocks
-    /// (Gemma 2/3/4); the tensors must then exist.
+    /// (Gemma 3/4); the tensors must then exist.
     pub(crate) post_norms: bool,
     pub(crate) embd_scale: EmbdScale,
     pub(crate) swa: Swa,

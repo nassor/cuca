@@ -29,7 +29,7 @@
 //!   ASCII case only; this crate uses the real categories like HuggingFace, so
 //!   the fixture's mixed-case non-ASCII text (`\u{c9}COLE \u{c9}cole`) is the
 //!   HuggingFace result.
-//! - The `refact` pre-tokenizer (IBM Granite 3.1): llama.cpp splits single digits
+//! - The `refact` pre-tokenizer (IBM Granite 3.x): llama.cpp splits single digits
 //!   out first and runs the GPT-2 stage on the fragments in between, so a
 //!   whitespace run directly before a digit stays whole (`"  1"` is `"  "`, `1`),
 //!   whereas HuggingFace's single GPT-2 regex over the whole text splits off the
