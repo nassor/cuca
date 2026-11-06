@@ -58,6 +58,24 @@
   (`Model::snapshot`/`restore`; `read_tokens` is that boundary at most), and
   `Model::checkpoint` is gone. An in-trunk drafter serves one sequence at a
   time and a file drafter speculates only while one request runs alone.
+- `provider-local` (GPU): tensor parallelism. `LocalModelConfig::shards`
+  (and `LocalModelConfig::set_devices("cuda:0+cuda:1")`, the syntax of
+  `CUCA_LOCAL_DEVICE` in the example and the live tests; the example's
+  `loaded on` line lists the devices) splits a model over `1 + shards.len()`
+  GPUs of one backend: attention heads and FFN widths are split evenly (a mixture
+  of experts inside every expert, K/V heads replicated when a model has fewer
+  than there are devices, as Gemma 4 E2B's one), every device holds its slice
+  of the weights and of the K/V pools, and the partial outputs are summed twice
+  per layer, by burn's NCCL `all_reduce` on CUDA (Linux, distinct devices;
+  compile-checked, not run) and host-staged in a fixed order everywhere else,
+  so runs are deterministic. A device may repeat (`vulkan:0+vulkan:0`): the
+  same path on one GPU. Rejected at load with `tensor parallelism: ...`: a
+  drafter, tiered experts, delta-net layers (Qwen 3.5), full-width Q/K norms
+  (OLMo 2, OLMoE) and models whose heads or widths do not divide. On
+  `vulkan:0+vulkan:0` the live matrix of Gemma 4 E2B Q4_0 and Qwen3-0.6B Q8_0
+  gives the single-device replies (15 of 15 each), at about a third of the
+  speed (the host-staged reduction: two readbacks per layer), and continuous
+  batching works on it (8 of 8 concurrent replies equal to the serial ones).
 
 ## 0.6.2
 

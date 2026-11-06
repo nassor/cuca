@@ -52,6 +52,7 @@ weight = 3
   - `context_length` of 0 (`context_length must be at least 1`), or above the model's maximum (`context_length N exceeds the model maximum M`).
   - `temperature` not finite or below 0, or `top_p` outside `(0, 1]`.
   - `draft_tokens` outside `1..=16` with a drafter.
+  - `shards` with a CPU device, a different GPU backend than `device`, a `drafter` or `ExpertPlacement::Tiered` (`tensor parallelism: ...`), or a model that cannot be split over the shards (heads, K/V heads or widths that do not divide, a delta-net layer, a full-width Q/K norm), reported at load before any weight is read.
   - `batching.max_sequences` outside `1..=64`, `batching.max_step_tokens` outside `max_sequences..=2048`, or `batching.kv_tokens` below `context_length + 16`.
   - A `device` whose cargo feature is off, for example ``device Vulkan(Default) requires the `provider-local-vulkan` cargo feature``.
   - `DrafterSource::InTrunk` with a GPU device.

@@ -75,6 +75,17 @@ cargo run --release --example local_model --features provider-local-vulkan
 
 Any other text is a `CucaError::Config`: ``unknown local device `...` ``.
 
+### Tensor parallelism
+
+`LocalModelConfig::shards` splits one model over several GPUs, as vLLM's tensor parallelism does. The model runs on `1 + shards.len()` devices (`device` is the first); the tests and the example read a `+`-separated list from `CUCA_LOCAL_DEVICE` (`cuda:0+cuda:1`, `vulkan:0+vulkan:1`), and `LocalModelConfig::set_devices` parses the same text. A device may repeat: `vulkan:0+vulkan:0` splits the model in two on one GPU. That gives no speedup, and holds the replicated parts twice, but runs the whole path, which is how it is tested on one GPU.
+
+- Each layer's attention heads are split evenly, with the K/V heads they read. A model with fewer K/V heads than devices keeps a copy of each K/V head on every device that needs it (Gemma 4 E2B has one K/V head, so with two devices each holds it whole). The FFN width is split evenly, a mixture of experts inside every expert (each device holds all experts, each cut to its share of the width, with the router replicated) and the shared expert the same way.
+- Each device holds its slice of the weights and its own K/V pools. Norms, embeddings, Gemma 4's per-layer inputs and the RoPE tables are replicated; only the first device holds the LM head and runs the final norm. `LocalModel::kv_cache_bytes` sums the pools of all devices, which exceeds the single-device number when K/V heads are replicated.
+- The partial outputs are summed twice per layer, after the attention output projection and after the FFN down projection. On CUDA (Linux, every device a distinct GPU) the sum is burn's NCCL `all_reduce`; everywhere else it is host-staged: every partial is read back, added in f32 in device order and uploaded to every device. The order is fixed, so repeated runs give the same bits. The host round trip is two per layer and makes a split decode slower than one device when the model fits on one; the point is a model that does not.
+- A split model agrees with the single-device GPU model to float rounding, not bit for bit (the two half-width partial sums add in another order than one full-width matmul).
+- `LocalModel::load` rejects, with `CucaError::Config` (`tensor parallelism: <rule> (<numbers>)`): a CPU device or shards of another backend than `device`, a `drafter`, `ExpertPlacement::Tiered`, and a model that cannot be split: `n_head` not divisible by the device count, K/V heads that neither divide nor replicate, a query width per device that is not a multiple of 32, an FFN (or expert) width that does not divide into multiples of 32 per device, a gated delta-net layer (Qwen 3.5 and its MoE variant) or a full-width Q/K norm (OLMo 2, OLMoE).
+- Continuous batching and prefix reuse work as on one device.
+
 ### Device memory
 
 - Device memory is about the file size, minus any table the engine reads from the file instead of uploading (Gemma 4's per-layer embedding table), plus the K/V cache.
