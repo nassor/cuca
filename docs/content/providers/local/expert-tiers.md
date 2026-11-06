@@ -207,10 +207,10 @@ The same test on Vulkan (AMD RX 9070 XT, Windows, release build) gave the rates 
 | `olmoe-1b-7b-q4_0` | resident | 4.5 | not applicable |
 | `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 3.3 cold, 3.5 warm | 0.437 cold, 0.464 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:device=2g,ram=0` | 1.3 | 0.356 |
-| `qwen3-30b-a3b-q4_0` | `tiered:device=6g,ram=12g` | 2.5 cold, 2.6 warm | 0.880 cold, 0.992 warm |
+| `qwen3-30b-a3b-q4_0` | `tiered:device=6g,ram=12g` | 2.7 cold, 2.9 warm (2.3 and 2.5 before the decode changes) | 0.880 cold, 0.992 warm |
 | `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=0` (the reference) | 1.8 to 2.0 | 0.406 |
-| `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=4g` | 3.1 cold, 3.2 warm | 0.611 cold, 0.735 warm |
-| `qwen3.6-35b-a3b-q4_0` | `tiered:device=4g,ram=12g` | 2.9 cold, 3.2 warm | 0.846 cold, 0.978 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=4g` | 2.9 cold, 3.3 warm (disk-bound) | 0.611 cold, 0.735 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered:device=4g,ram=12g` | 3.7 cold, 4.5 warm (2.9 and 3.3 before the decode changes in the changelog) | 0.846 cold, 0.978 warm |
 
 With `device=6g` the card's dedicated memory stayed flat at about 9.5 GB for the whole run, the desktop's own 1.4 GB included.
 

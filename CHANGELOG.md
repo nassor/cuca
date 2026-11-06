@@ -2,6 +2,21 @@
 
 ## Unreleased
 
+### Changed
+
+- `provider-local` (GPU): faster decode of mixture-of-experts and hybrid
+  models. The gated delta-net step queues about half the operations (one
+  product-and-sum convolution for a single token, one normalisation of the
+  query and key heads, value heads broadcasting their key head instead of a
+  repeat, `ssm_beta` and `ssm_alpha` as one f32 matmul), a single token sums
+  its experts' outputs without a zero tensor, and an expert uploaded from the
+  RAM tier shares the tier's bytes instead of copying them. On a RX 9070 XT,
+  Qwen3.6-35B-A3B at `tiered:device=4g,ram=12g` went from 2.9 cold / 3.3 warm
+  to 3.7 / 4.5 tok/s (a long reply at `device=6g,ram=12g`: 4.6-4.8 to 5.3),
+  Qwen3-30B-A3B at `device=6g,ram=12g` from 2.3 / 2.5 to 2.7 / 2.9. Decode is
+  bound by the host: one readback of the router logits per layer costs about
+  1 ms however little it carries. Output is unchanged up to float rounding.
+
 ### Added
 
 - `provider-local`: architecture `qwen35moe` (Qwen3.6-35B-A3B): the `qwen35`

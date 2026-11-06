@@ -223,7 +223,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use burn::tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
-use burn::tensor::{DType, Device, IndexingUpdateOp, Int, Tensor, TensorData, activation};
+use burn::tensor::{
+    AllocationProperty, Bytes, DType, Device, IndexingUpdateOp, Int, Tensor, TensorData, activation,
+};
 use candle_core::quantized::{GgmlDType, gguf_file};
 
 use super::arch::{Act, Arch};
@@ -624,8 +626,10 @@ fn plan_dense(own: &[(String, QuantShape)], peers: &[QuantShape]) -> HashSet<Str
 /// One row chunk of a weight, converted on the host to what the device takes.
 #[derive(Clone)]
 enum PackedData {
-    /// burn's block-quantized layout under the scheme ([`pack_blocks`]).
-    Quant(Vec<u8>, QuantScheme),
+    /// burn's block-quantized layout under the scheme ([`pack_blocks`]),
+    /// reference counted: an upload of a chunk the RAM tier keeps shares its
+    /// bytes instead of copying them.
+    Quant(bytes::Bytes, QuantScheme),
     /// f32 values, row-major.
     Float(Vec<f32>),
 }
@@ -642,9 +646,11 @@ impl PackedPart {
     fn upload(self, cols: usize, device: &Device) -> Tensor<2> {
         let shape = [self.rows, cols];
         let data = match self.data {
-            PackedData::Quant(bytes, scheme) => {
-                TensorData::from_bytes_vec(bytes, shape, DType::QFloat(scheme))
-            }
+            PackedData::Quant(bytes, scheme) => TensorData::from_bytes(
+                Bytes::from_shared(bytes, AllocationProperty::Other),
+                shape,
+                DType::QFloat(scheme),
+            ),
             PackedData::Float(values) => TensorData::new(values, shape),
         };
         Tensor::from_data(data, device)
@@ -784,9 +790,10 @@ impl<'a> PackPlan<'a> {
         let n = rows.len();
         let src = &raw[rows.start * row_bytes..rows.end * row_bytes];
         let data = match (self.stored, quant_scheme(self.stored.unwrap_or(dtype))) {
-            (Some(layout), Some(scheme)) if layout == dtype => {
-                PackedData::Quant(pack_blocks(dtype, src, n, cols).map_err(context)?, scheme)
-            }
+            (Some(layout), Some(scheme)) if layout == dtype => PackedData::Quant(
+                pack_blocks(dtype, src, n, cols).map_err(context)?.into(),
+                scheme,
+            ),
             (Some(layout), Some(scheme)) => {
                 let mut values = vec![0f32; cols];
                 let mut q8 = Vec::with_capacity(n * (cols / 32) * 34);
@@ -794,7 +801,10 @@ impl<'a> PackPlan<'a> {
                     dequant_row(dtype, row, 1.0, &mut values).map_err(context)?;
                     quantize_q8_0(&values, &mut q8);
                 }
-                PackedData::Quant(pack_blocks(layout, &q8, n, cols).map_err(context)?, scheme)
+                PackedData::Quant(
+                    pack_blocks(layout, &q8, n, cols).map_err(context)?.into(),
+                    scheme,
+                )
             }
             _ => {
                 let mut floats = vec![0f32; n * cols];
@@ -1159,20 +1169,20 @@ struct DeltaWeights {
     qkv: Weight,
     /// `attn_gate`: the output gate `z`.
     gate: Weight,
-    /// `ssm_beta`.
-    beta: Weight,
-    /// `ssm_alpha`.
-    alpha: Weight,
+    /// `ssm_beta` rows then `ssm_alpha` rows, held as one f32 weight
+    /// `[2 * n_v_heads, n_embd]`: two tiny matmuls (a narrow `vecmat` shape
+    /// that burn runs by dequantizing the whole weight) become one.
+    beta_alpha: Weight,
     /// `ssm_out`.
     out: Weight,
     /// The convolution taps, `[conv_kernel, conv_dim]`.
     conv: Tensor<2>,
     /// `ssm_norm`, `[head_v_dim]`.
     norm: Tensor<1>,
-    /// `ssm_a`, `[n_v_heads]`.
-    a: Tensor<1>,
-    /// `ssm_dt.bias`, `[n_v_heads]`.
-    dt_bias: Tensor<1>,
+    /// `ssm_a`, `[1, n_v_heads]`.
+    a: Tensor<2>,
+    /// `ssm_dt.bias`, `[1, n_v_heads]`.
+    dt_bias: Tensor<2>,
 }
 
 /// The recurrent state of one delta-net layer on the device. Device tensors
@@ -1183,15 +1193,25 @@ struct DeltaState {
     /// The last `conv_kernel - 1` convolution inputs, `[conv_kernel - 1,
     /// conv_dim]`.
     conv: Tensor<2>,
-    /// One `[head_k_dim, head_v_dim]` matrix per value head.
-    s: Tensor<3>,
+    /// One `[head_k_dim, head_v_dim]` matrix per value head, as `[n_v_heads
+    /// / n_k_heads, n_k_heads, head_k_dim, head_v_dim]`: value head
+    /// `r * n_k_heads + j` is `[r, j]` and reads key head `j`.
+    s: Tensor<4>,
 }
 
 impl DeltaState {
     fn zeros(spec: &DeltaSpec, device: &Device) -> Self {
         Self {
             conv: Tensor::zeros([spec.conv_kernel - 1, spec.conv_dim()], device),
-            s: Tensor::zeros([spec.n_v_heads, spec.head_k_dim, spec.head_v_dim], device),
+            s: Tensor::zeros(
+                [
+                    spec.n_v_heads / spec.n_k_heads,
+                    spec.n_k_heads,
+                    spec.head_k_dim,
+                    spec.head_v_dim,
+                ],
+                device,
+            ),
         }
     }
 }
@@ -2561,17 +2581,33 @@ fn load_delta(
             conv[i * cd + c] = stored[c * taps + i];
         }
     }
+    let mut beta_alpha = reader.host_floats(&blk(name::SSM_BETA), &[nv, n_embd])?;
+    beta_alpha.extend(reader.host_floats(&blk(name::SSM_ALPHA), &[nv, n_embd])?);
+    let beta_alpha = Weight {
+        parts: vec![Tensor::from_data(
+            TensorData::new(beta_alpha, [2 * nv, n_embd]),
+            reader.device,
+        )],
+    };
+    let mut head_row = |tensor: String| -> Result<Tensor<2>, CucaError> {
+        let values = reader.host_vector(&tensor, nv)?;
+        Ok(Tensor::from_data(
+            TensorData::new(values, [1, nv]),
+            reader.device,
+        ))
+    };
+    let a = head_row(name::blk_bare(il, name::SSM_A))?;
+    let dt_bias = head_row(name::blk_bias(il, name::SSM_DT))?;
     Ok(DeltaWeights {
         spec: *spec,
         qkv: reader.matrix(&blk(name::ATTN_QKV), cd, n_embd)?,
         gate: reader.matrix(&blk(name::ATTN_GATE), spec.value_dim(), n_embd)?,
-        beta: reader.matrix(&blk(name::SSM_BETA), nv, n_embd)?,
-        alpha: reader.matrix(&blk(name::SSM_ALPHA), nv, n_embd)?,
+        beta_alpha,
         out: reader.matrix(&blk(name::SSM_OUT), n_embd, spec.value_dim())?,
         conv: Tensor::from_data(TensorData::new(conv, [taps, cd]), reader.device),
         norm: reader.vector(&blk(name::SSM_NORM), spec.head_v_dim)?,
-        a: reader.vector(&name::blk_bare(il, name::SSM_A), nv)?,
-        dt_bias: reader.vector(&name::blk_bias(il, name::SSM_DT), nv)?,
+        a,
+        dt_bias,
     })
 }
 
@@ -3056,7 +3092,9 @@ impl FfnWeights {
                     }
                 }
                 let mut ready = ready.into_iter();
-                let mut out = Tensor::<2>::zeros([t, n_embd], device);
+                // A single token sums its experts' outputs (no zero tensor to
+                // start from); longer passes scatter-add into zeros.
+                let mut out: Option<Tensor<2>> = None;
                 for (e, picks) in routing.per_expert.iter().enumerate() {
                     let Some(&(_, weight)) = picks.first() else {
                         continue;
@@ -3069,7 +3107,11 @@ impl FfnWeights {
                         // The one token reaches the expert whole: no gather
                         // and no scatter.
                         let y = expert(&picked, f.clone(), None);
-                        out = out + y.mul_scalar(f64::from(weight));
+                        let y = y.mul_scalar(f64::from(weight));
+                        out = Some(match out.take() {
+                            Some(sum) => sum + y,
+                            None => y,
+                        });
                         continue;
                     }
                     let ids: Vec<i32> = picks.iter().map(|p| p.0 as i32).collect();
@@ -3091,8 +3133,12 @@ impl FfnWeights {
                             Tensor::<2>::from_data(TensorData::new(weights, [m, 1]), device);
                         expert(&picked, f.clone().select(0, ids.clone()), Some(weights))
                     };
-                    out = out.select_assign(0, ids, y, IndexingUpdateOp::Add);
+                    let sum = out
+                        .take()
+                        .unwrap_or_else(|| Tensor::zeros([t, n_embd], device));
+                    out = Some(sum.select_assign(0, ids, y, IndexingUpdateOp::Add));
                 }
+                let mut out = out.unwrap_or_else(|| Tensor::zeros([t, n_embd], device));
                 if let Some(sh) = shared {
                     // The shared expert, scaled per token by
                     // `sigmoid(gate_inp . x)`: the dot product is an
@@ -3122,64 +3168,83 @@ fn l2_normalise(x: Tensor<3>) -> Tensor<3> {
     x * inv
 }
 
+/// Row `ti` of the `t` rows of `m` (the tensor itself for a single row: no
+/// operation to queue).
+fn token_row<const D: usize>(m: Tensor<D>, ti: usize, t: usize) -> Tensor<D> {
+    if t == 1 { m } else { m.narrow(0, ti, 1) }
+}
+
 impl DeltaWeights {
     /// The layer's output `[t, n_embd]` for the normed input `h [t, n_embd]`
     /// and the state before it, with the state after it (see
     /// [`super::delta`]: the same recurrence, run per token on the device).
+    ///
+    /// Decode is host-bound (every queued operation costs the host about
+    /// 10 us), so a single token runs few, wide operations: the convolution
+    /// is one product and sum over the window, the key and query heads are
+    /// normalised together, and the value heads that share a key head
+    /// broadcast it instead of repeating it.
     fn forward(&self, h: Tensor<2>, state: &DeltaState, eps: f64) -> (Tensor<2>, DeltaState) {
         let d = &self.spec;
         let [t, _] = h.dims();
         let device = h.device();
         let (nk, nv, dk, dv) = (d.n_k_heads, d.n_v_heads, d.head_k_dim, d.head_v_dim);
         let (kd, vd, taps) = (d.key_dim(), d.value_dim(), d.conv_kernel);
+        let rep = nv / nk;
 
         let mixed = linear(h.clone(), &self.qkv);
         let z = linear(h.clone(), &self.gate);
-        let beta = activation::sigmoid(linear(h.clone(), &self.beta));
+        let ba = linear(h, &self.beta_alpha);
+        let beta = activation::sigmoid(ba.clone().narrow(1, 0, nv));
         // exp(ssm_a * softplus(alpha + dt_bias)), softplus linear above 20.
-        let pre = linear(h, &self.alpha) + self.dt_bias.clone().unsqueeze::<2>();
+        let pre = ba.narrow(1, nv, nv) + self.dt_bias.clone();
         let soft = pre.clone().exp().log1p();
         let soft = soft.mask_where(pre.clone().greater_elem(20.0), pre);
-        let decay = (soft * self.a.clone().unsqueeze::<2>()).exp();
+        let decay = (soft * self.a.clone()).exp();
 
         // Causal depthwise convolution over `history ++ mixed`, then silu.
         let padded = Tensor::cat(vec![state.conv.clone(), mixed], 0);
-        let tap = |i: usize| padded.clone().narrow(0, i, t) * self.conv.clone().narrow(0, i, 1);
-        let mut conv = tap(0);
-        for i in 1..taps {
-            conv = conv + tap(i);
-        }
+        let conv = if t == 1 {
+            // The window is the whole padded history.
+            (padded.clone() * self.conv.clone()).sum_dim(0)
+        } else {
+            let tap = |i: usize| padded.clone().narrow(0, i, t) * self.conv.clone().narrow(0, i, 1);
+            let mut conv = tap(0);
+            for i in 1..taps {
+                conv = conv + tap(i);
+            }
+            conv
+        };
         let x = activation::silu(conv);
         let next_conv = padded.narrow(0, t, taps - 1);
 
-        let q = x.clone().narrow(1, 0, kd).reshape([t, nk, dk]);
-        let k = x.clone().narrow(1, kd, kd).reshape([t, nk, dk]);
+        // Queries and keys are adjacent in `x`: one normalisation of `2 * nk`
+        // heads.
+        let qk = l2_normalise(x.clone().narrow(1, 0, 2 * kd).reshape([t, 2 * nk, dk]));
+        let q = qk
+            .clone()
+            .narrow(1, 0, nk)
+            .mul_scalar(1.0 / (dk as f64).sqrt());
+        let k = qk.narrow(1, nk, nk);
         let v = x.narrow(1, 2 * kd, vd).reshape([t, nv, dv]);
-        let q = l2_normalise(q).mul_scalar(1.0 / (dk as f64).sqrt());
-        let k = l2_normalise(k);
-        // Tiled: value head `h` reads key head `h % n_k_heads`.
-        let rep = nv / nk;
-        let (q, k) = if rep > 1 {
-            (Tensor::cat(vec![q; rep], 1), Tensor::cat(vec![k; rep], 1))
-        } else {
-            (q, k)
-        };
 
         // The delta rule, one token at a time: decay the state, read what
-        // it predicts for `k`, write the correction, read the output.
+        // it predicts for `k`, write the correction, read the output. The
+        // state is `[rep, nk, dk, dv]`; value head `r * nk + j` reads key
+        // head `j`, which broadcasts over the leading axis.
         let mut s = state.s.clone();
         let mut rows = Vec::with_capacity(t);
         for ti in 0..t {
-            let kt = k.clone().narrow(0, ti, 1).reshape([nv, dk, 1]);
-            let qt = q.clone().narrow(0, ti, 1).reshape([nv, dk, 1]);
-            let vt = v.clone().narrow(0, ti, 1).reshape([nv, 1, dv]);
-            let bt = beta.clone().narrow(0, ti, 1).reshape([nv, 1, 1]);
-            let gt = decay.clone().narrow(0, ti, 1).reshape([nv, 1, 1]);
+            let kt = token_row(k.clone(), ti, t).reshape([1, nk, dk, 1]);
+            let qt = token_row(q.clone(), ti, t).reshape([1, nk, dk, 1]);
+            let vt = token_row(v.clone(), ti, t).reshape([rep, nk, 1, dv]);
+            let bt = token_row(beta.clone(), ti, t).reshape([rep, nk, 1, 1]);
+            let gt = token_row(decay.clone(), ti, t).reshape([rep, nk, 1, 1]);
             s = s * gt;
-            let kv_mem = (s.clone() * kt.clone()).sum_dim(1);
+            let kv_mem = (s.clone() * kt.clone()).sum_dim(2);
             let delta = (vt - kv_mem) * bt;
             s = s + kt * delta;
-            rows.push((s.clone() * qt).sum_dim(1).reshape([1, nv, dv]));
+            rows.push((s.clone() * qt).sum_dim(2).reshape([1, nv, dv]));
             // Each token queues a few state-sized temporaries (2 MB for
             // Qwen3.6-35B-A3B): without a drain a 256-token prefill chunk
             // holds hundreds of MB of them at once. Best effort: a failed
@@ -3188,7 +3253,11 @@ impl DeltaWeights {
                 let _ = device.sync();
             }
         }
-        let o = Tensor::cat(rows, 0);
+        let o = if t == 1 {
+            rows.swap_remove(0)
+        } else {
+            Tensor::cat(rows, 0)
+        };
 
         // Gated RMSNorm per head: rms(o) * weight * silu(z).
         let z = z.reshape([t, nv, dv]);
