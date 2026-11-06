@@ -41,6 +41,8 @@ pub(crate) enum ConvArch {
     Olmoe,
     /// `Ernie4_5ForCausalLM`.
     Ernie4_5,
+    /// `MuseGlimmerForConditionalGeneration` (`MuseGlimmerModel`).
+    MuseGlimmer,
 }
 
 impl ConvArch {
@@ -62,6 +64,7 @@ impl ConvArch {
             "Olmo2ForCausalLM" | "Olmo3ForCausalLM" => Self::Olmo2,
             "OlmoeForCausalLM" => Self::Olmoe,
             "Ernie4_5ForCausalLM" | "Ernie4_5_ForCausalLM" => Self::Ernie4_5,
+            "MuseGlimmerForConditionalGeneration" => Self::MuseGlimmer,
             _ => return None,
         })
     }
@@ -99,13 +102,24 @@ impl ConvArch {
             Self::Olmo2 => "olmo2",
             Self::Olmoe => "olmoe",
             Self::Ernie4_5 => "ernie4_5",
+            Self::MuseGlimmer => "muse-glimmer",
         }
     }
 
     /// Llama-family models whose Q/K rows the converter permutes into
     /// adjacent pairs (`LlamaModel.undo_permute`).
     pub(crate) fn permutes_qk(self) -> bool {
-        matches!(self, Self::Llama | Self::Smollm3 | Self::Granite)
+        matches!(
+            self,
+            Self::Llama | Self::Smollm3 | Self::Granite | Self::MuseGlimmer
+        )
+    }
+
+    /// Checkpoints whose `*layernorm.weight` tensors are offsets from 1
+    /// (`x * (1 + w)`): the GGUF holds `1 + w`. The final `norm.weight` of
+    /// these models is a plain multiplier.
+    pub(crate) fn shifts_layernorms(self) -> bool {
+        self == Self::MuseGlimmer
     }
 
     /// The Gemma family, whose HF checkpoints keep `norm.weight` as an offset
@@ -159,6 +173,7 @@ mod tests {
             ConvArch::Olmo2,
             ConvArch::Olmoe,
             ConvArch::Ernie4_5,
+            ConvArch::MuseGlimmer,
         ];
         for conv in all {
             assert!(Arch::from_name(conv.gguf_name()).is_ok(), "{conv:?}");

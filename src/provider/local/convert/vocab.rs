@@ -1110,6 +1110,26 @@ fn gemma4(ck: &CheckpointDir) -> Result<VocabMeta, CucaError> {
     })
 }
 
+/// The id of the vocabulary token `text` (the converter's
+/// `tok.convert_tokens_to_ids`).
+fn token_id(ck: &CheckpointDir, text: &str) -> Result<u32, CucaError> {
+    let added = added_tokens(ck)
+        .into_iter()
+        .find(|(_, content, _)| content == text)
+        .map(|(id, _, _)| id);
+    let base = || {
+        bpe_vocab(ck)
+            .ok()?
+            .into_iter()
+            .find(|(_, tok)| tok == text)
+            .map(|(id, _)| id)
+    };
+    added
+        .or_else(base)
+        .and_then(|id| u32::try_from(id).ok())
+        .ok_or_else(|| cfg_err(format!("the tokenizer has no token `{text}`")))
+}
+
 fn config_str<'a>(ck: &'a CheckpointDir, key: &str) -> Option<&'a Json> {
     ck.tokenizer_config.as_ref()?.get(key)
 }
@@ -1165,6 +1185,15 @@ pub(crate) fn build(
             }
         }
         ConvArch::Qwen35 | ConvArch::Qwen35Moe | ConvArch::Olmo2 | ConvArch::Olmoe => gpt2(ck, hp)?,
+        // `MuseGlimmerModel.set_vocab`: the GPT-2 vocabulary plus `<|eot|>`
+        // as the end-of-turn token (`<|eom|>` ends a message, not the turn).
+        ConvArch::MuseGlimmer => {
+            let mut m = gpt2(ck, hp)?;
+            let eot = token_id(ck, "<|eot|>")?;
+            m.kv.retain(|(k, _)| k != "tokenizer.ggml.eot_token_id");
+            m.kv.push(("tokenizer.ggml.eot_token_id".into(), Value::U32(eot)));
+            m
+        }
     };
     if !meta.kv.iter().any(|(k, _)| k == "tokenizer.chat_template") {
         return Err(cfg_err("checkpoint has no chat template"));

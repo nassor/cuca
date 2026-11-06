@@ -580,6 +580,12 @@ impl Planner<'_> {
             } else {
                 0.0
             }
+        } else if self.arch.shifts_layernorms() {
+            if hf.ends_with("layernorm.weight") {
+                1.0
+            } else {
+                0.0
+            }
         } else if hf.ends_with("norm.weight") {
             self.arch.norm_shift()
         } else {
@@ -659,6 +665,12 @@ impl Planner<'_> {
         let blk = |part: &str| gguf::blk(il, part);
         let bias = |part: &str| gguf::blk_bias(il, part);
         let norm = self.norm_ops(rest);
+
+        // Muse Glimmer's Q/K norms are scale-less in the checkpoint; the GGUF
+        // carries constant weights that fold in `qk_scale_factor` (Q) and 1 (K).
+        if arch == ConvArch::MuseGlimmer && rest == "self_attn.q_proj.weight" {
+            self.plan_muse_qk_norms(il)?;
+        }
 
         // Q/K projections: Llama-family rows are permuted.
         if arch.permutes_qk() {
@@ -750,14 +762,24 @@ impl Planner<'_> {
                 ConvArch::Gemma3
                 | ConvArch::Gemma4
                 | ConvArch::Gemma4Assistant
+                | ConvArch::MuseGlimmer
                 | ConvArch::Olmo2
                 | ConvArch::Qwen35
                 | ConvArch::Qwen35Moe => (gguf::POST_ATTENTION_NORM, false),
                 _ => (gguf::FFN_NORM, false),
             }),
-            "pre_feedforward_layernorm.weight" if arch.is_gemma() => Some((gguf::FFN_NORM, false)),
-            "post_feedforward_layernorm.weight" if arch.is_gemma() || arch == ConvArch::Olmo2 => {
+            "pre_feedforward_layernorm.weight"
+                if arch.is_gemma() || arch == ConvArch::MuseGlimmer =>
+            {
+                Some((gguf::FFN_NORM, false))
+            }
+            "post_feedforward_layernorm.weight"
+                if arch.is_gemma() || arch == ConvArch::Olmo2 || arch == ConvArch::MuseGlimmer =>
+            {
                 Some((gguf::POST_FFW_NORM, false))
+            }
+            "self_attn.gate_proj.weight" if arch == ConvArch::MuseGlimmer => {
+                Some((gguf::ATTN_GATE, false))
             }
             "per_layer_input_gate.weight" if arch == ConvArch::Gemma4 => {
                 Some((gguf::INP_GATE, false))
@@ -774,6 +796,28 @@ impl Planner<'_> {
             Some((p, false)) => self.direct(hf, blk(p), norm),
             None => Err(self.unmapped(hf)),
         }
+    }
+
+    /// `MuseGlimmerModel.modify_tensors`: the constant `attn_q_norm`
+    /// (`qk_scale_factor`) and `attn_k_norm` (ones) weights of layer `il`,
+    /// one `head_dim` vector each.
+    fn plan_muse_qk_norms(&mut self, il: usize) -> Result<(), CucaError> {
+        let head_dim = self.hp.head_dim()?;
+        let scale =
+            self.hp
+                .float(&["qk_scale_factor"])
+                .ok_or_else(|| cfg_err("config.json has no qk_scale_factor"))? as f32;
+        for (part, value) in [(gguf::ATTN_Q_NORM, scale), (gguf::ATTN_K_NORM, 1.0)] {
+            let name = gguf::blk(il, part);
+            self.check(&name)?;
+            self.plans.push(Plan {
+                name,
+                dims: vec![head_dim],
+                body: Body::Generated(vec![value; head_dim]),
+                ops: Vec::new(),
+            });
+        }
+        Ok(())
     }
 
     /// Gated delta-net parameters of a Qwen 3.5 layer (`modify_tensors` of
@@ -1198,6 +1242,104 @@ mod tests {
         );
         // The embedding is not a norm.
         assert_eq!(values(&s, by_name(&plans, "token_embd.weight"))[0], 0.0);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn muse_glimmer_shifts_layer_norms_synthesizes_qk_norms_and_skips_vision() {
+        let (s, dir) = checkpoint(
+            "t-muse",
+            &[
+                ("model.language_model.embed_tokens.weight", &[4, 2]),
+                ("lm_head.weight", &[4, 2]),
+                ("model.language_model.norm.weight", &[2]),
+                ("model.language_model.layers.0.input_layernorm.weight", &[2]),
+                (
+                    "model.language_model.layers.0.post_attention_layernorm.weight",
+                    &[2],
+                ),
+                (
+                    "model.language_model.layers.0.pre_feedforward_layernorm.weight",
+                    &[2],
+                ),
+                (
+                    "model.language_model.layers.0.post_feedforward_layernorm.weight",
+                    &[2],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.q_proj.weight",
+                    &[8, 2],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.k_proj.weight",
+                    &[4, 2],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.v_proj.weight",
+                    &[4, 2],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.gate_proj.weight",
+                    &[8, 2],
+                ),
+                (
+                    "model.language_model.layers.0.self_attn.o_proj.weight",
+                    &[2, 8],
+                ),
+                (
+                    "model.language_model.layers.0.mlp.gate_proj.weight",
+                    &[3, 2],
+                ),
+                ("model.language_model.layers.0.mlp.up_proj.weight", &[3, 2]),
+                (
+                    "model.language_model.layers.0.mlp.down_proj.weight",
+                    &[2, 3],
+                ),
+                ("model.vision_tower.ln_post.weight", &[2]),
+                ("model.vision_adapter.fc1.weight", &[2, 2]),
+                ("model.vision_projection.weight", &[2, 2]),
+            ],
+        );
+        let h = hp(serde_json::json!({
+            "text_config": {"num_hidden_layers": 1, "hidden_size": 2, "num_attention_heads": 2,
+                "num_key_value_heads": 1, "head_dim": 4, "qk_scale_factor": 3.87}
+        }));
+        let plans = plan(ConvArch::MuseGlimmer, &h, &s, Vec::new(), None).unwrap();
+        // Embedding, output norm and head, four layer norms, Q/K/V/gate/O,
+        // three FFN matrices and the two synthesized Q/K norms: no vision tensor.
+        assert_eq!(plans.len(), 17, "{plans:?}");
+        for norm in [
+            "attn_norm",
+            "post_attention_norm",
+            "ffn_norm",
+            "post_ffw_norm",
+        ] {
+            assert_eq!(
+                values(&s, by_name(&plans, &format!("blk.0.{norm}.weight"))),
+                [1.0, 2.0],
+                "{norm}"
+            );
+        }
+        // The final norm is a plain multiplier.
+        assert_eq!(
+            values(&s, by_name(&plans, "output_norm.weight")),
+            [0.0, 1.0]
+        );
+        assert_eq!(
+            values(&s, by_name(&plans, "blk.0.attn_q_norm.weight")),
+            [3.87; 4]
+        );
+        assert_eq!(
+            values(&s, by_name(&plans, "blk.0.attn_k_norm.weight")),
+            [1.0; 4]
+        );
+        // Q rows are permuted per head (2 heads of 4 rows), the gate is not.
+        let q = values(&s, by_name(&plans, "blk.0.attn_q.weight"));
+        let row = |i: usize| [2.0 * i as f32, 2.0 * i as f32 + 1.0];
+        let want: Vec<f32> = [0, 2, 1, 3, 4, 6, 5, 7].into_iter().flat_map(row).collect();
+        assert_eq!(q, want);
+        let gate = values(&s, by_name(&plans, "blk.0.attn_gate.weight"));
+        assert_eq!(gate, (0..16).map(|i| i as f32).collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(dir);
     }
 

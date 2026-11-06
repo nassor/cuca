@@ -31,6 +31,8 @@ pub(crate) mod gguf_writer;
 pub(crate) mod hf;
 #[cfg(test)]
 mod oracle;
+#[cfg(test)]
+mod oracle_local;
 pub(crate) mod safetensors;
 pub(crate) mod spm;
 pub(crate) mod tensors;

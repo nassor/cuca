@@ -763,6 +763,78 @@ fn phi3(hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<Vec<ExtraTensor>, CucaEr
     ])
 }
 
+/// The remaining `MuseGlimmerModel.set_gguf_parameters` keys, after refusing
+/// configurations whose behaviour the engine fixes per architecture.
+fn muse_glimmer(hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
+    let n_layer = hp.n_layer()?;
+    let window = hp.req_uint(&["sliding_window"])?;
+    let Some(Json::Array(types)) = hp.get("layer_types") else {
+        return Err(cfg_err("config.json has no layer_types"));
+    };
+    if types.len() != n_layer {
+        return Err(cfg_err(format!(
+            "layer_types has {} entries, expected num_hidden_layers ({n_layer})",
+            types.len()
+        )));
+    }
+    let sliding: Vec<bool> = types
+        .iter()
+        .map(|t| t.as_str() == Some("sliding_attention"))
+        .collect();
+    if types
+        .iter()
+        .any(|t| !matches!(t.as_str(), Some("sliding_attention" | "full_attention")))
+    {
+        return Err(cfg_err(
+            "Muse Glimmer layer_types other than sliding_attention and full_attention",
+        ));
+    }
+    // The engine rotates exactly the sliding layers, with the global base.
+    let theta = hp.rope_full().get("rope_theta").and_then(Json::as_f64);
+    if let Some(Json::Array(thetas)) = hp.get("layer_rope_theta") {
+        let ok = thetas.len() == n_layer
+            && thetas.iter().zip(&sliding).all(|(t, s)| {
+                let t = t.as_f64().unwrap_or(f64::NAN);
+                if *s { Some(t) == theta } else { t == 0.0 }
+            });
+        if !ok {
+            return Err(cfg_err(
+                "Muse Glimmer layer_rope_theta differs from rotary embeddings on the sliding layers only, with rope_theta",
+            ));
+        }
+    }
+    if hp.rope_full().get("rope_type").and_then(Json::as_str) != Some("default") {
+        return Err(cfg_err("Muse Glimmer rope scaling is not supported"));
+    }
+    if hp
+        .get("hidden_activation")
+        .or_else(|| hp.get("hidden_act"))
+        .and_then(Json::as_str)
+        .is_some_and(|a| a != "silu")
+    {
+        return Err(cfg_err("Muse Glimmer activations other than silu"));
+    }
+    if hp.get("attention_bias").and_then(Json::as_bool) == Some(true) {
+        return Err(cfg_err("Muse Glimmer attention biases are not supported"));
+    }
+    if hp.float(&["post_norm_eps"]).is_some_and(|e| e != 1e-8) {
+        return Err(cfg_err(
+            "Muse Glimmer post_norm_eps other than 1e-8 is not supported: the engine fixes it",
+        ));
+    }
+    if let Some(c) = hp.truthy_f("final_logit_softcapping") {
+        kv.f32("final_logit_softcapping", c);
+    }
+    kv.f32(
+        "logit_scale",
+        hp.float(&["output_multiplier"])
+            .ok_or_else(|| cfg_err("config.json has no output_multiplier"))?,
+    );
+    kv.u32("attention.sliding_window", window)?;
+    kv.bools("attention.sliding_window_pattern", &sliding);
+    Ok(())
+}
+
 /// Refuse features the engine's architecture does not implement, so a
 /// converted file never silently computes something else.
 fn guard(arch: ConvArch, hp: &Hp) -> Result<(), CucaError> {
@@ -974,6 +1046,10 @@ pub(crate) fn build(
             base(arch, hp, &mut kv, n_block)?;
             kv.f32("attention.layer_norm_rms_epsilon", 1e-5);
         }
+        ConvArch::MuseGlimmer => {
+            base(arch, hp, &mut kv, n_block)?;
+            muse_glimmer(hp, &mut kv)?;
+        }
     }
     kv.raw("general.quantization_version", Value::U32(2));
     kv.raw("general.file_type", Value::U32(file_type(quant)));
@@ -1068,6 +1144,98 @@ mod tests {
             Value::U32(512)
         ));
         assert!(matches!(get(&m, "general.file_type"), Value::U32(7)));
+    }
+
+    fn muse_config() -> Json {
+        serde_json::json!({
+            "architectures": ["MuseGlimmerForConditionalGeneration"],
+            "text_config": {
+                "hidden_size": 64, "intermediate_size": 96, "num_hidden_layers": 4,
+                "num_attention_heads": 4, "num_key_value_heads": 2, "head_dim": 32,
+                "sliding_window": 8, "max_position_embeddings": 512, "rms_norm_eps": 1e-5,
+                "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+                "layer_rope_theta": [500000.0, 500000.0, 500000.0, 0],
+                "rope_parameters": {"rope_theta": 500000.0, "rope_type": "default"},
+                "output_multiplier": 0.35, "final_logit_softcapping": 20.0,
+                "qk_scale_factor": 3.87, "post_norm_eps": 1e-8, "hidden_activation": "silu",
+                "vocab_size": 300
+            }
+        })
+    }
+
+    #[test]
+    fn muse_glimmer_writes_the_pattern_multiplier_and_softcap() {
+        let m = build(
+            ConvArch::MuseGlimmer,
+            &hp(muse_config()),
+            "t",
+            WeightQuant::F16,
+            0,
+        )
+        .unwrap();
+        assert!(matches!(
+            get(&m, "muse-glimmer.logit_scale"),
+            Value::F32(f) if *f == 0.35f32
+        ));
+        assert!(matches!(
+            get(&m, "muse-glimmer.final_logit_softcapping"),
+            Value::F32(f) if *f == 20.0
+        ));
+        assert!(matches!(
+            get(&m, "muse-glimmer.attention.sliding_window"),
+            Value::U32(8)
+        ));
+        let Value::Array(pattern) = get(&m, "muse-glimmer.attention.sliding_window_pattern") else {
+            panic!("pattern");
+        };
+        let bools: Vec<bool> = pattern
+            .iter()
+            .map(|v| matches!(v, Value::Bool(true)))
+            .collect();
+        assert_eq!(bools, [true, true, true, false]);
+        assert!(matches!(
+            get(&m, "muse-glimmer.rope.freq_base"),
+            Value::F32(f) if *f == 500000.0
+        ));
+        assert!(matches!(
+            get(&m, "muse-glimmer.attention.key_length"),
+            Value::U32(32)
+        ));
+    }
+
+    #[test]
+    fn muse_glimmer_refuses_what_the_engine_fixes() {
+        let refuse = |edit: &dyn Fn(&mut serde_json::Map<String, Json>)| {
+            let mut cfg = muse_config();
+            edit(cfg["text_config"].as_object_mut().unwrap());
+            let h = hp(cfg);
+            build(ConvArch::MuseGlimmer, &h, "t", WeightQuant::F16, 0).unwrap_err()
+        };
+        // A rotary embedding on a full layer (or none on a sliding one).
+        refuse(&|t| {
+            t.insert(
+                "layer_rope_theta".into(),
+                serde_json::json!([500000.0, 500000.0, 500000.0, 500000.0]),
+            );
+        });
+        refuse(&|t| {
+            t.insert(
+                "layer_rope_theta".into(),
+                serde_json::json!([500000.0, 0, 500000.0, 0]),
+            );
+        });
+        refuse(&|t| {
+            t.insert("post_norm_eps".into(), serde_json::json!(1e-5));
+        });
+        refuse(&|t| {
+            t.insert("hidden_activation".into(), serde_json::json!("gelu"));
+        });
+        refuse(&|t| {
+            t.insert("attention_bias".into(), serde_json::json!(true));
+        });
+        refuse(&|t| {
+            t.remove("output_multiplier");
+        });
     }
 
     #[test]
