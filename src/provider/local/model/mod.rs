@@ -111,15 +111,16 @@
 //!   loaded: each token's row is read from the GGUF file with a seek and
 //!   dequantized by [`quant::dequant_row`].
 //! - The K/V cache is paged and preallocated ([`paged`]): only the layers
-//!   that own K/V store them, in pools of blocks of 16 positions, `2 * 4 * 16
-//!   * n_kv_head * head_dim` bytes per block in f32 per K/V-owning layer, with
-//!   that layer's own head count and head dimension. Layers with the same
-//!   window share block ids (a group). A full-attention group holds twice
-//!   `context_length` positions, so a finished request's blocks stay cached
-//!   while the next runs; a sliding-window group `ceil((window - 1 + rows) /
-//!   16) + 2` blocks per running sequence plus up to `context_length`
-//!   positions of cached prefixes ([`paged::KvLayout::new`],
-//!   [`paged::KvLayout::pool_bytes`] sums it all). A sliding-window block is
+//!   that own K/V store them, in pools of blocks of 16 positions, 8 bytes
+//!   times 16 times `n_kv_head` times `head_dim` per block (f32 keys and
+//!   values) per K/V-owning layer, with that layer's own head count and head
+//!   dimension. Layers with the same window share block ids (a group). A
+//!   full-attention group holds twice `context_length` positions, so a
+//!   finished request's blocks stay cached while the next runs; a
+//!   sliding-window group holds `ceil((window - 1 + rows) / 16) + 2` blocks
+//!   per running sequence plus up to `context_length` positions of cached
+//!   prefixes ([`paged::KvLayout::new`]; [`paged::KvLayout::pool_bytes`]
+//!   sums it all). A sliding-window block is
 //!   released once every position in it is before the window of the next
 //!   query; the rollback of a draft round (at most 16 rows past the accepted
 //!   length) never needs a released block. Prefix hits shorten by whole
