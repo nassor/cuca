@@ -59,18 +59,6 @@ const ORACLE_USER: &str = "What is the capital of France? Answer in one word.";
 /// `(repo, revision)` of the checkpoints with a safetensors oracle.
 const PINNED: &[(&str, &str)] = &[
     (
-        "HuggingFaceTB/SmolLM2-360M-Instruct",
-        "a10cc1512eabd3dde888204e902eca88bddb4951",
-    ),
-    (
-        "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-        "fe8a4ea1ffedaf415f4da2f062534de366a451e6",
-    ),
-    (
-        "unsloth/gemma-2-2b-it",
-        "457f2e15bf550c227ce6ad86e2ec108d3e42c106",
-    ),
-    (
         "allenai/OLMo-2-0425-1B-Instruct",
         "48d788eca847d4d7548f375ad03d3c9312f6139e",
     ),
@@ -87,12 +75,16 @@ const PINNED: &[(&str, &str)] = &[
         "a07cc9a04f16550a088caea529712d1d335b0ac1",
     ),
     (
-        "ibm-granite/granite-3.1-1b-a400m-instruct",
-        "0da7a48b0276d500ce5922fd2b33944091fc6c09",
+        "unsloth/gemma-3-1b-it",
+        "5b11413a10db4e486ef16a20101fd028f8f2499c",
     ),
     (
-        "allenai/OLMoE-1B-7B-0924-Instruct",
-        "7f1c97f440f06ce36705e4f2b843edb5925f4498",
+        "allenai/OLMoE-1B-7B-0125-Instruct",
+        "b89a7c4bc24fb9e55ce2543c9458ce0ca5c4650e",
+    ),
+    (
+        "deepseek-ai/DeepSeek-R1-Distill-Llama-8B",
+        "6a6f4aa4197940add57724a7707d069478df56b1",
     ),
     (
         "Qwen/Qwen3.5-0.8B",
