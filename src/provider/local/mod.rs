@@ -89,6 +89,11 @@
 //!   [`ExpertPlacement::Tiered`] keeps the experts in the file instead and
 //!   streams them through RAM (and, on a GPU, device-memory) caches of a
 //!   configured byte size, with the same output.
+//! - [`LocalModelConfig::shards`] splits a model over several GPUs (tensor
+//!   parallelism): attention heads and FFN widths are split evenly, each
+//!   device holds its slice of the weights and of the K/V pools, and the
+//!   partial outputs are summed twice per layer, by NCCL on CUDA and in a
+//!   fixed host-staged order elsewhere. See the GPU page of the docs.
 //! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix,
 //!   and a step carries at most [`BatchingConfig::max_step_tokens`] rows in
 //!   all. An in-trunk drafter observes every position of its sequence, so
@@ -1094,6 +1099,24 @@ pub struct LocalModelConfig {
     pub convert: ConvertConfig,
     /// How concurrent requests share the engine: see [`BatchingConfig`].
     pub batching: BatchingConfig,
+    /// More devices to split the model over (tensor parallelism); empty (the
+    /// default) runs it on [`device`](Self::device) alone. The model runs on
+    /// `1 + shards.len()` devices, `device` being the first: every layer's
+    /// attention heads and FFN width are split evenly, each device holds its
+    /// slice of the weights and of the K/V pools, and the partial outputs are
+    /// summed twice per layer (device collectives on CUDA, a host-staged sum
+    /// in fixed order elsewhere, so a run is deterministic). One device may
+    /// appear several times (`vulkan:0` as `device` and as the only shard
+    /// splits the model in two on one GPU: no speedup, but the same code
+    /// path). [`LocalModel::load`] fails with [`CucaError::Config`] unless
+    /// `device` and every shard are GPU devices of the same backend and
+    /// there is no `drafter` and `experts` is [`ExpertPlacement::Resident`];
+    /// at load it also rejects a model that cannot be split: the head count
+    /// and the FFN widths must divide by the device count (a model with
+    /// fewer K/V heads than devices, such as Gemma 4 E2B with one, keeps a
+    /// copy of each K/V head on every device), a delta-net (hybrid) layer or
+    /// a full-width Q/K norm cannot be split. See [`LocalModelConfig::set_devices`].
+    pub shards: Vec<LocalDevice>,
 }
 
 impl Default for LocalModelConfig {
@@ -1111,7 +1134,31 @@ impl Default for LocalModelConfig {
             experts: ExpertPlacement::Resident,
             convert: ConvertConfig::default(),
             batching: BatchingConfig::default(),
+            shards: Vec::new(),
         }
+    }
+}
+
+impl LocalModelConfig {
+    /// Set [`device`](Self::device) and [`shards`](Self::shards) from a
+    /// `+`-separated list of devices (the syntax of `CUCA_LOCAL_DEVICE` in the
+    /// tests and the example): `vulkan:0` is one device, `vulkan:0+vulkan:1`
+    /// splits the model over two. The first device is `device`, the rest are
+    /// the shards; each parses as a [`LocalDevice`].
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] for an empty list or an entry that is not a
+    /// device; the configuration is left unchanged.
+    pub fn set_devices(&mut self, list: &str) -> Result<(), CucaError> {
+        let mut devices = list.split('+').map(|d| d.trim().parse::<LocalDevice>());
+        let first = devices
+            .next()
+            .ok_or_else(|| CucaError::Config("empty device list".into()))??;
+        let rest = devices.collect::<Result<Vec<_>, _>>()?;
+        self.device = first;
+        self.shards = rest;
+        Ok(())
     }
 }
 
@@ -1130,6 +1177,7 @@ impl fmt::Debug for LocalModelConfig {
             .field("experts", &self.experts)
             .field("convert", &self.convert)
             .field("batching", &self.batching)
+            .field("shards", &self.shards)
             .finish()
     }
 }
@@ -1608,6 +1656,35 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
         return Err(CucaError::Config(
             "context_length must be at least 1".into(),
         ));
+    }
+    if !config.shards.is_empty() {
+        let devices = std::iter::once(config.device).chain(config.shards.iter().copied());
+        if devices.clone().any(|d| d == LocalDevice::Cpu) {
+            return Err(CucaError::Config(
+                "tensor parallelism: `device` and every shard must be a GPU device, got cpu".into(),
+            ));
+        }
+        for device in devices {
+            if let Some(e) = device_unavailable(device) {
+                return Err(e);
+            }
+            if std::mem::discriminant(&device) != std::mem::discriminant(&config.device) {
+                return Err(CucaError::Config(format!(
+                    "tensor parallelism: every shard must use the same GPU backend as `device` ({:?}), got {device:?}",
+                    config.device
+                )));
+            }
+        }
+        if config.drafter.is_some() {
+            return Err(CucaError::Config(
+                "tensor parallelism: a drafter is not supported with `shards`".into(),
+            ));
+        }
+        if config.experts != ExpertPlacement::Resident {
+            return Err(CucaError::Config(
+                "tensor parallelism: tiered experts are not supported with `shards`".into(),
+            ));
+        }
     }
     let batching = &config.batching;
     if !(1..=64).contains(&batching.max_sequences) {
@@ -2319,6 +2396,88 @@ mod tests {
             ..Default::default()
         };
         assert!(validate(&cpu).is_ok());
+    }
+
+    #[test]
+    fn devices_parse_from_a_plus_separated_list() {
+        let mut config = LocalModelConfig::default();
+        config.set_devices("vulkan:0+vulkan:1").unwrap();
+        assert_eq!(config.device, LocalDevice::Vulkan(GpuAdapter::Discrete(0)));
+        assert_eq!(
+            config.shards,
+            [LocalDevice::Vulkan(GpuAdapter::Discrete(1))]
+        );
+        config.set_devices(" cuda + cuda:1 + CUDA:1 ").unwrap();
+        assert_eq!(
+            (config.device, config.shards.clone()),
+            (
+                LocalDevice::Cuda(0),
+                vec![LocalDevice::Cuda(1), LocalDevice::Cuda(1)]
+            )
+        );
+        config.set_devices("cpu").unwrap();
+        assert_eq!((config.device, config.shards.len()), (LocalDevice::Cpu, 0));
+        // A bad entry leaves the configuration alone.
+        config.set_devices("vulkan").unwrap();
+        for bad in ["", "+", "vulkan+", "vulkan+nope", "gpu:0"] {
+            let err = config.set_devices(bad).unwrap_err();
+            assert!(matches!(err, CucaError::Config(_)), "{bad}: {err}");
+            assert_eq!(
+                config.device,
+                LocalDevice::Vulkan(GpuAdapter::Default),
+                "{bad}"
+            );
+            assert!(config.shards.is_empty(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn validate_enforces_the_tensor_parallel_rules() {
+        let config = |device, shards: &[LocalDevice]| LocalModelConfig {
+            device,
+            shards: shards.to_vec(),
+            ..LocalModelConfig::default()
+        };
+        let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
+        let rejects = |config: LocalModelConfig, what: &str| {
+            let err = validate(&config).unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains(what)),
+                "{what}: {err}"
+            );
+        };
+        // No shards: the single-device rules only.
+        assert!(validate(&config(LocalDevice::Cpu, &[])).is_ok());
+        // The CPU cannot be a shard or a first device of a split model.
+        rejects(config(vulkan, &[LocalDevice::Cpu]), "tensor parallelism");
+        rejects(config(LocalDevice::Cpu, &[vulkan]), "tensor parallelism");
+        // A backend that is compiled out names its feature.
+        #[cfg(not(feature = "provider-local-vulkan"))]
+        rejects(config(vulkan, &[vulkan]), "`provider-local-vulkan`");
+        #[cfg(feature = "provider-local-vulkan")]
+        {
+            assert!(
+                validate(&config(vulkan, &[vulkan])).is_ok(),
+                "a device may repeat"
+            );
+            let two = config(
+                vulkan,
+                &[vulkan, LocalDevice::Vulkan(GpuAdapter::Discrete(1))],
+            );
+            assert!(validate(&two).is_ok());
+            let mut drafted = config(vulkan, &[vulkan]);
+            drafted.drafter = Some(DrafterSource::InTrunk);
+            rejects(drafted, "drafter");
+            let mut tiered = config(vulkan, &[vulkan]);
+            tiered.experts = "tiered:device=1g".parse().unwrap();
+            rejects(tiered, "tiered experts");
+        }
+        // Different backends do not mix (when both are compiled in).
+        #[cfg(all(feature = "provider-local-vulkan", feature = "provider-local-metal"))]
+        rejects(
+            config(vulkan, &[LocalDevice::Metal(GpuAdapter::Default)]),
+            "same GPU backend",
+        );
     }
 
     #[test]

@@ -26,7 +26,10 @@
 //! `CUCA_LOCAL_DEVICE` selects where the model runs (`LocalDevice` syntax):
 //! `cpu` (the default), `vulkan`, `vulkan:<n>`, `metal`, `cuda[:<n>]` or
 //! `rocm[:<n>]`; a GPU device needs its feature
-//! (`--features provider-local-vulkan`, ...). `CUCA_LOCAL_EXPERTS` sets
+//! (`--features provider-local-vulkan`, ...). A `+`-separated list
+//! (`vulkan:0+vulkan:1`, `vulkan:0+vulkan:0`) splits the model over those
+//! devices (`LocalModelConfig::shards`: tensor parallelism; a device may
+//! repeat, which exercises the path on one GPU). `CUCA_LOCAL_EXPERTS` sets
 //! `LocalModelConfig::experts` (`ExpertPlacement` syntax, e.g.
 //! `tiered:ram=4g`; unset = resident), so the whole matrix runs on tiered
 //! experts. Build for the host CPU, since
@@ -355,16 +358,8 @@ async fn loaded() -> Option<Loaded> {
     MODEL
         .get_or_init(|| async {
             let source = model_source()?;
-            let config = LocalModelConfig {
+            let mut config = LocalModelConfig {
                 source: source.clone(),
-                device: std::env::var("CUCA_LOCAL_DEVICE")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        s.parse()
-                            .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={s:?}: {e}"))
-                    })
-                    .unwrap_or_default(),
                 experts: std::env::var("CUCA_LOCAL_EXPERTS")
                     .ok()
                     .filter(|s| !s.is_empty())
@@ -391,6 +386,14 @@ async fn loaded() -> Option<Loaded> {
                 })),
                 ..Default::default()
             };
+            if let Ok(devices) = std::env::var("CUCA_LOCAL_DEVICE")
+                && !devices.is_empty()
+            {
+                config
+                    .set_devices(&devices)
+                    .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
+            }
+            println!("MATRIX|devices|{:?} + {:?}", config.device, config.shards);
             let model = LocalModel::load(config)
                 .await
                 .unwrap_or_else(|e| panic!("local model must load: {e}"));

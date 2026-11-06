@@ -53,7 +53,10 @@
 //!   `unsloth/Qwen3.5-0.8B-MTP-GGUF`; set `CUCA_LOCAL_MODEL_PATH` to it).
 //! - `CUCA_LOCAL_DEVICE`: where the model runs: `cpu` (default), `vulkan`,
 //!   `vulkan:<n>`, `metal`, `cuda[:<n>]` or `rocm[:<n>]` (see `LocalDevice`).
-//!   A GPU needs its feature, e.g. `--features provider-local-vulkan`.
+//!   A GPU needs its feature, e.g. `--features provider-local-vulkan`. A
+//!   `+`-separated list such as `cuda:0+cuda:1` splits the model over those
+//!   GPUs (tensor parallelism, `LocalModelConfig::shards`; a device may
+//!   repeat, e.g. `vulkan:0+vulkan:0`); the line `loaded on ...` lists them.
 //! - `CUCA_LOCAL_EXPERTS`: where a mixture-of-experts model's experts live
 //!   (see `ExpertPlacement`): `resident` (default) or tiered caches such as
 //!   `tiered:ram=600m` (CPU) or `tiered:device=4g,ram=8g` (GPU); the tier
@@ -68,7 +71,7 @@
 //!
 //! # Output
 //!
-//! The download progress goes to stderr, then `loaded on <device>`; the reply
+//! The download progress goes to stderr, then `loaded on <devices>`; the reply
 //! prints to stdout as its blocks arrive. Reasoning (`Thinking`) blocks print
 //! dimmed after a `[thinking]` prefix when the model reasons, then the answer
 //! follows as plain text. The reply depends on the model and the sampling
@@ -135,7 +138,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Ok(device) = std::env::var("CUCA_LOCAL_DEVICE")
         && !device.is_empty()
     {
-        config.device = device.parse()?;
+        config.set_devices(&device)?;
     }
     if let Ok(experts) = std::env::var("CUCA_LOCAL_EXPERTS")
         && !experts.is_empty()
@@ -147,11 +150,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         config.batching = batching.parse()?;
     }
-    let device = config.device;
+    let devices = std::iter::once(config.device)
+        .chain(config.shards.iter().copied())
+        .map(|d| format!("{d:?}"))
+        .collect::<Vec<_>>()
+        .join(" + ");
     let model = LocalModel::load(config).await?;
     let stats_handle = model.clone();
     eprintln!();
-    eprintln!("loaded on {device:?}");
+    eprintln!("loaded on {devices}");
 
     // Stage 2: build the client. `Local` needs the model attached; the request's
     // model name is not used for routing.

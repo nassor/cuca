@@ -3,7 +3,8 @@
 //!
 //! The model comes from the environment like `provider_local.rs`
 //! (`CUCA_LOCAL_MODEL_PATH`, `CUCA_LOCAL_MODEL` or `CUCA_LOCAL_DOWNLOAD=1`;
-//! `CUCA_LOCAL_DEVICE`; `CUCA_REQUIRE_LIVE=1` turns a skip into a failure),
+//! `CUCA_LOCAL_DEVICE`, also a `+`-separated list that splits the model over
+//! several devices; `CUCA_REQUIRE_LIVE=1` turns a skip into a failure),
 //! and `CUCA_LOCAL_BATCHING` sets `LocalModelConfig::batching` (`BatchingConfig`
 //! syntax, e.g. `seqs=4,kv=16384`; `seqs=4` when unset, so the 8 clients
 //! below queue behind 4 slots).
@@ -80,7 +81,6 @@ async fn loaded() -> Option<(LocalModel, String)> {
             };
             let mut config = LocalModelConfig {
                 source,
-                device: env_parsed("CUCA_LOCAL_DEVICE").unwrap_or_default(),
                 on_download_progress: Some(DownloadProgressCallback::new(|p| {
                     eprint!(
                         "\rdownloading: {} / {:?} bytes",
@@ -89,6 +89,11 @@ async fn loaded() -> Option<(LocalModel, String)> {
                 })),
                 ..Default::default()
             };
+            if let Some(devices) = env_parsed::<String>("CUCA_LOCAL_DEVICE") {
+                config
+                    .set_devices(&devices)
+                    .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
+            }
             if let Some(batching) = env_parsed("CUCA_LOCAL_BATCHING") {
                 config.batching = batching;
             }

@@ -542,6 +542,7 @@ impl Engine {
             path,
             context_length,
             config.device,
+            &config.shards,
             &config.experts,
             &sizing,
         )?;
@@ -1794,6 +1795,7 @@ mod tests {
                 &model.path,
                 resolved,
                 device,
+                &[],
                 &resident,
                 &Sizing::single(resolved)
             )
@@ -1804,6 +1806,7 @@ mod tests {
             &model.path,
             33,
             device,
+            &[],
             &resident,
             &Sizing::single(33),
         )

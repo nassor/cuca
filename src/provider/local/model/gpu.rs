@@ -186,6 +186,69 @@
 //! differ from plain greedy where two logits are within float rounding; in
 //! the measured runs the outputs were identical.
 //!
+//! # Tensor parallelism
+//!
+//! [`GpuTransformer::load_placed`] takes `shards`, the devices after its
+//! `device`: one model split across `world = 1 + shards.len()` devices, each
+//! layer's attention and FFN sliced across them with two all-reduces per
+//! layer. A device may repeat (`vulkan:0+vulkan:0`: two shards on one GPU are
+//! still split and reduced, which tests the path without a second GPU but
+//! saves nothing). The split itself (which heads, rows and columns a shard
+//! owns, the rules a model must meet, the all-reduce) is described in
+//! [`tp`]; the rules are checked before any weight is read and fail with
+//! `CucaError::Config("tensor parallelism: <rule> (<numbers>)")`. Hybrid
+//! (delta-net) models, a drafter and tiered experts are not supported with
+//! shards. What this module does for it:
+//!
+//! - **Weights per shard**: one [`Weights`] per device, built with the
+//!   shard's own hyperparameters (its head counts) from sliced reads
+//!   ([`WeightReader::matrix_cut`]: a shard reads only its rows from the
+//!   file and copies its columns' bytes out of whole rows; a column cut that
+//!   splits a block of the file's dtype, as a K-quant `ffn_down` can, is cut
+//!   from the dequantized rows and held as Q8_0 or f32). [`plan_dense`]
+//!   judges the shapes after the cut ([`shard_shapes`]). Only shard 0 holds
+//!   the LM head and the final norm; norms, per-head Q/K norms, the router,
+//!   the shared expert's gate, the per-layer-embedding weights, the layer
+//!   output scales and the RoPE tables are replicated, and so is the
+//!   `attn_output` bias, added once after the reduction. Q/K/V biases are
+//!   cut with their rows.
+//! - **Experts**: every shard holds every expert, each cut to `ff / world`
+//!   units (gate and up rows, down columns, before [`mk::pack_expert`]
+//!   converts them), and the shared expert is cut the same way. The router
+//!   is replicated, so the kernels keep indexing experts by id, and the
+//!   weighted sum over experts is linear in the down projection, so the
+//!   shards' partial outputs add up exactly.
+//! - **K/V pools**: one set per shard with the shard's own KV heads and the
+//!   same blocks and block tables ([`GpuTransformer::kv_pool_bytes`] sums
+//!   them: a KV head that is replicated, because the model has fewer KV
+//!   heads than shards, is stored on every shard that serves it).
+//! - **A layer**: every shard runs [`Weights::mixer`] (pre-norm, the
+//!   projections of its heads, RoPE, K/V writes, paged attention and the
+//!   output projection's matmul, no bias), the partial `[t, n_embd]`
+//!   outputs are summed ([`tp::Collective::all_reduce_sum`]), every shard
+//!   runs [`Weights::attn_tail`] (bias, post-norm, residual add) and
+//!   [`Weights::ffn_half`] (pre-norm, its slice of the FFN or MoE), a second
+//!   reduction, and [`Weights::ffn_tail`] (post-norm, residual add, the
+//!   per-layer-embedding block, the output scale). On one device
+//!   [`Weights::layer`] runs the same functions in the same order and
+//!   nothing is reduced, so a model that is not split computes what it did
+//!   before the split existed. The residual stream is replicated: the
+//!   embedding rows go to every shard, and the final norm and the LM head
+//!   run on shard 0's copy.
+//! - **The sum** is host-staged (every part read back, added in f32 in shard
+//!   order, uploaded to every device) except for distinct CUDA devices on
+//!   Linux, which use NCCL through burn's `all_reduce`. Two sharded loads
+//!   agree bit for bit on the host path; a sharded and a single-device run
+//!   agree to float rounding (the reduction order differs). The host path
+//!   costs two device-to-host round trips per layer: it is for correctness
+//!   and for GPUs without a collective, not for speed.
+//! - **Memory**: each device holds about `1 / world` of the attention,
+//!   FFN and expert weights plus the replicated tensors (and shard 0 the
+//!   LM head), its own K/V pools and, during a forward pass, the whole
+//!   `[t, n_embd]` residual stream. The host reads each shard's tensors in
+//!   turn with the buffer of one whole tensor (a row cut reads only its
+//!   rows), so the load's host footprint does not grow with `world`.
+//!
 //! # Known burn 0.22 Vulkan bugs
 //!
 //! The first three are worked around in [`linear`], whose docs give the details and the tests
@@ -254,6 +317,7 @@ use super::rope::{RopeKind, RopeSpec};
 use super::tier::{
     BuildFn, ExpertSlice, ExpertStore, LayerExperts, SlotTable, TierShared, add, sub, tier_slots,
 };
+use super::tp::{self, Collective, Cut, Tp};
 use super::{Batch, Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
 use crate::error::CucaError;
 use crate::provider::local::{
@@ -597,6 +661,91 @@ fn quant_shapes(content: &gguf_file::Content) -> Vec<(String, QuantShape)> {
     out
 }
 
+/// The bytes of the columns `cols` of every row of `raw` (rows `row_len`
+/// wide, GGUF dtype `dtype`) appended to `out` as `held` ([`tp::column_dtype`]
+/// says which): the sub-slice of every row when `held` is `dtype` and the
+/// cut lies on block bounds, else the rows dequantized to f32 and cut, as f32
+/// or quantized to Q8_0.
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] for rows that are not whole blocks of `dtype`, a
+/// cut past the row, a `held` other than `dtype`, Q8_0 or f32, or a Q8_0 cut
+/// that is not whole 32-element blocks.
+fn append_columns(
+    dtype: GgmlDType,
+    raw: &[u8],
+    row_len: usize,
+    cols: &Range<usize>,
+    held: GgmlDType,
+    out: &mut Vec<u8>,
+) -> Result<(), CucaError> {
+    if held == dtype
+        && let Some(bytes) = tp::copy_columns(dtype, raw, row_len, cols)
+    {
+        out.extend_from_slice(&bytes);
+        return Ok(());
+    }
+    let row_bytes = row_len / dtype.block_size() * dtype.type_size();
+    if row_bytes == 0
+        || !row_len.is_multiple_of(dtype.block_size())
+        || !raw.len().is_multiple_of(row_bytes)
+        || cols.end > row_len
+        || !matches!(held, GgmlDType::Q8_0 | GgmlDType::F32)
+        || (held == GgmlDType::Q8_0 && !cols.len().is_multiple_of(32))
+    {
+        return Err(err(format!(
+            "{} bytes of {dtype:?} do not hold whole rows of {row_len} cut at columns {cols:?} as {held:?}",
+            raw.len()
+        )));
+    }
+    let mut values = vec![0f32; row_len];
+    for row in raw.chunks_exact(row_bytes) {
+        dequant_row(dtype, row, 1.0, &mut values)?;
+        let kept = &values[cols.clone()];
+        if held == GgmlDType::Q8_0 {
+            quantize_q8_0(kept, out);
+        } else {
+            out.extend(kept.iter().flat_map(|v| v.to_le_bytes()));
+        }
+    }
+    Ok(())
+}
+
+/// [`quant_shapes`] as the shard `tp` holds the weights (the rows and columns
+/// its [`Cut`] keeps), so that [`plan_dense`] judges the shapes the autotune
+/// sees. The dense set it yields is the same for every shard: all shards
+/// cut equal shapes.
+///
+/// # Errors
+///
+/// The loader's errors for a layer whose tensors are missing.
+fn shard_shapes(
+    content: &gguf_file::Content,
+    hp: &Hparams,
+    tp: Tp,
+) -> Result<Vec<(String, QuantShape)>, CucaError> {
+    let mut shapes = quant_shapes(content);
+    if !tp.is_split() {
+        return Ok(shapes);
+    }
+    let mut layouts: Vec<LayerLayout> = Vec::with_capacity(hp.n_layer);
+    for (il, spec) in hp.layers.iter().enumerate() {
+        layouts.push(LayerLayout::read(hp, il, spec, content)?);
+    }
+    for (tensor, shape) in &mut shapes {
+        let Some((il, part)) = tp::block_part(tensor) else {
+            continue;
+        };
+        let Some(layout) = layouts.get(il) else {
+            continue;
+        };
+        let cut = tp::part_cut(hp, layout, il, part, (shape.rows, shape.cols), tp);
+        (shape.rows, shape.cols) = (cut.n_rows(), cut.cols.len());
+    }
+    Ok(shapes)
+}
+
 /// The weights of `own` to hold as f32 instead of quantized so that no Q4 and
 /// Q8 weight can share an autotune key (the scheme is not part of it).
 ///
@@ -882,38 +1031,157 @@ impl WeightReader<'_> {
         )
     }
 
-    /// A matrix weight plus, when `bias` is set, its `[rows]` bias.
+    /// The bytes the part `cut` keeps of the `[rows, cols]` weight
+    /// `tensor_name`, and the dtype they are in: the cut's row ranges are
+    /// read from the file at their byte offsets (a shard reads only its
+    /// rows), its columns are a per-row byte sub-slice of the file's dtype
+    /// when the bounds lie on block boundaries and otherwise cut from the
+    /// dequantized rows ([`tp::column_dtype`]). Touches no device.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a tensor that is missing, of another
+    /// shape, truncated or cut outside its matrix.
+    fn cut_bytes(
+        &mut self,
+        tensor_name: &str,
+        (rows, cols): (usize, usize),
+        cut: &Cut,
+    ) -> Result<(GgmlDType, Vec<u8>), CucaError> {
+        let info = tensor_info(self.content, tensor_name)?;
+        let dims = info.shape.dims();
+        if dims != [rows, cols] {
+            return Err(err(format!(
+                "tensor `{tensor_name}`: expected shape {:?}, found {dims:?}",
+                [rows, cols]
+            )));
+        }
+        let dtype = info.ggml_dtype;
+        let block = dtype.block_size();
+        if !cols.is_multiple_of(block) {
+            return Err(err(format!(
+                "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size {block}"
+            )));
+        }
+        if cut.cols.end > cols || cut.rows.iter().any(|r| r.end > rows) {
+            return Err(err(format!(
+                "tensor `{tensor_name}`: the cut {cut:?} lies outside the [{rows}, {cols}] matrix"
+            )));
+        }
+        let row_bytes = cols / block * dtype.type_size();
+        if cut.cols == (0..cols)
+            && let [r] = cut.rows.as_slice()
+        {
+            self.read_at(tensor_name, r.start * row_bytes, r.len() * row_bytes)?;
+            return Ok((dtype, std::mem::take(&mut self.buf)));
+        }
+        let held = tp::column_dtype(dtype, cols, &cut.cols, self.dense.contains(tensor_name));
+        let mut out = Vec::new();
+        for r in &cut.rows {
+            self.read_at(tensor_name, r.start * row_bytes, r.len() * row_bytes)?;
+            append_columns(dtype, &self.buf, cols, &cut.cols, held, &mut out)
+                .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
+        }
+        Ok((held, out))
+    }
+
+    /// The part `cut` keeps of the `[rows, cols]` matmul weight `tensor_name`
+    /// on the device (a tensor-parallel shard's slice, see [`tp`] and
+    /// [`WeightReader::cut_bytes`]), uploaded under the rules of
+    /// [`upload_matrix_with`]. The whole matrix is [`WeightReader::matrix`].
+    fn matrix_cut(
+        &mut self,
+        tensor_name: &str,
+        (rows, cols): (usize, usize),
+        cut: &Cut,
+    ) -> Result<Weight, CucaError> {
+        if cut.is_whole(rows, cols) {
+            return self.matrix(tensor_name, rows, cols);
+        }
+        let (held, bytes) = self.cut_bytes(tensor_name, (rows, cols), cut)?;
+        upload_matrix_with(
+            tensor_name,
+            held,
+            &bytes,
+            cut.n_rows(),
+            cut.cols.len(),
+            self.device,
+            MAX_PART_BYTES,
+            self.dense.contains(tensor_name),
+        )
+    }
+
+    /// The elements `rows` (ranges, one after the other) of the `[len]`
+    /// vector `tensor_name` as a device tensor: the bias rows that follow a
+    /// cut weight's rows.
+    fn vector_cut(
+        &mut self,
+        tensor_name: &str,
+        len: usize,
+        rows: &[Range<usize>],
+    ) -> Result<Tensor<1>, CucaError> {
+        if let [r] = rows
+            && *r == (0..len)
+        {
+            return self.vector(tensor_name, len);
+        }
+        let values = self.host_vector(tensor_name, len)?;
+        let mut kept: Vec<f32> = Vec::new();
+        for r in rows {
+            let part = values.get(r.clone()).ok_or_else(|| {
+                err(format!(
+                    "tensor `{tensor_name}`: rows {r:?} lie outside its {len} elements"
+                ))
+            })?;
+            kept.extend_from_slice(part);
+        }
+        let n = kept.len();
+        Ok(Tensor::from_data(TensorData::new(kept, [n]), self.device))
+    }
+
+    /// A matrix weight, cut to `cut`, plus, when `bias` is set, its `[rows]`
+    /// bias cut to the same rows.
     fn proj(
         &mut self,
         il: usize,
         part: &str,
         shape: [usize; 2],
         bias: bool,
+        cut: &Cut,
     ) -> Result<Proj, CucaError> {
         Ok(Proj {
-            w: self.matrix(&name::blk(il, part), shape[0], shape[1])?,
+            w: self.matrix_cut(&name::blk(il, part), (shape[0], shape[1]), cut)?,
             bias: if bias {
-                Some(self.vector(&name::blk_bias(il, part), shape[0])?)
+                Some(self.vector_cut(&name::blk_bias(il, part), shape[0], &cut.rows)?)
             } else {
                 None
             },
         })
     }
 
-    /// The bytes of expert `e` of the stacked expert tensor `tensor_name`.
-    fn expert_bytes(
+    /// The rows `rows` of the matrix of expert `e` of the stacked expert
+    /// tensor `tensor_name` (`slice` describes it).
+    fn expert_rows(
         &mut self,
         tensor_name: &str,
         slice: &ExpertSlice,
         e: usize,
+        rows: &Range<usize>,
     ) -> Result<Vec<u8>, CucaError> {
-        self.read_at(tensor_name, e * slice.file_bytes, slice.file_bytes)?;
+        let row_bytes = slice.cols / slice.dtype.block_size() * slice.dtype.type_size();
+        self.read_at(
+            tensor_name,
+            e * slice.file_bytes + rows.start * row_bytes,
+            rows.len() * row_bytes,
+        )?;
         Ok(std::mem::take(&mut self.buf))
     }
 
     /// The experts of MoE layer `il` (FFN width `ff`): every expert read,
     /// converted and uploaded now, or, with `tiers`, left in the file for
-    /// the tiers to load into an empty pool.
+    /// the tiers to load into an empty pool. Shard `tp` of a split model
+    /// holds every expert cut to its `ff / world` units (gate and up rows,
+    /// down columns).
     fn expert_bank(
         &mut self,
         il: usize,
@@ -921,6 +1189,7 @@ impl WeightReader<'_> {
         ff: usize,
         n_embd: usize,
         tiers: Option<&TierPlan>,
+        tp: Tp,
     ) -> Result<GpuExpertBank, CucaError> {
         let (layer, layout) = layer_experts(self.content, il, n_expert, ff, n_embd)?;
         let no_list = Tensor::<1, Int>::zeros([2], self.device);
@@ -944,6 +1213,13 @@ impl WeightReader<'_> {
                 }),
             }));
         }
+        // The units of the FFN width this shard computes, and the dtype of
+        // the down matrix once its columns are cut.
+        let part = tp.part(ff);
+        let whole = part == (0..ff);
+        let down_dtype = tp::column_dtype(layer.down.dtype, ff, &part, false);
+        let dtypes = [layer.gate.dtype, layer.up.dtype, down_dtype];
+        let layout = SlotLayout::new(n_embd, part.len(), dtypes)?;
         if n_expert * layout.bytes() > MAX_PART_BYTES {
             return Err(CucaError::Config(format!(
                 "layer {il}: {n_expert} experts of {} bytes do not fit one device buffer of {MAX_PART_BYTES} bytes; use tiered experts",
@@ -952,13 +1228,20 @@ impl WeightReader<'_> {
         }
         // The same conversion the tiers apply to an expert they load, so a
         // resident and a tiered expert are the same words.
-        let dtypes = [layer.gate.dtype, layer.up.dtype, layer.down.dtype];
-        let blk = |part: &str| name::blk(il, part);
+        let blk = |tensor: &str| name::blk(il, tensor);
         let mut words: Vec<i32> = Vec::with_capacity(n_expert * layout.words);
         for e in 0..n_expert {
-            let gate = self.expert_bytes(&blk(name::FFN_GATE_EXPS), &layer.gate, e)?;
-            let up = self.expert_bytes(&blk(name::FFN_UP_EXPS), &layer.up, e)?;
-            let down = self.expert_bytes(&blk(name::FFN_DOWN_EXPS), &layer.down, e)?;
+            let gate = self.expert_rows(&blk(name::FFN_GATE_EXPS), &layer.gate, e, &part)?;
+            let up = self.expert_rows(&blk(name::FFN_UP_EXPS), &layer.up, e, &part)?;
+            let down = self.expert_rows(&blk(name::FFN_DOWN_EXPS), &layer.down, e, &(0..n_embd))?;
+            let down = if whole {
+                down
+            } else {
+                let mut cut = Vec::new();
+                append_columns(layer.down.dtype, &down, ff, &part, down_dtype, &mut cut)
+                    .map_err(|e| err(format!("layer {il} experts: {e}")))?;
+                cut
+            };
             let packed = mk::pack_expert(&layout, dtypes, &gate, &up, &down)?;
             words.extend(packed.iter().map(|w| *w as i32));
         }
@@ -1742,14 +2025,23 @@ struct Pass {
     stacked: Vec<StackedDecode>,
 }
 
-/// Everything read-only during a forward pass.
+/// The final norm and the LM head, held by the first shard only.
+struct Head {
+    norm: Tensor<1>,
+    lm_head: Weight,
+}
+
+/// Everything read-only during a forward pass: the weights of one device (one
+/// shard of a tensor-parallel model, see [`tp`]; the whole model on one
+/// device), with the hyperparameters as that shard sees them (its own head
+/// counts).
 struct Weights {
     hp: Hparams,
     device: Device,
     ple: Option<PleWeights>,
     layers: Vec<LayerWeights>,
-    output_norm: Tensor<1>,
-    lm_head: Weight,
+    /// `None` on every shard but the first.
+    head: Option<Head>,
     ropes: Vec<RopeTable>,
 }
 
@@ -1784,15 +2076,19 @@ impl GpuSnapshot {
 
 /// A loaded model on a GPU with its K/V cache; see the module docs.
 pub(crate) struct GpuTransformer {
-    weights: Weights,
+    /// The weights of every shard, shard 0 (the `device` of the load, which
+    /// also holds the LM head) first; never empty.
+    weights: Vec<Weights>,
+    /// The sum of the shards' partial layer outputs.
+    collective: Collective,
     context_length: usize,
     vocab: usize,
     /// Behind a lock because a drafter reads embedding rows through a shared
     /// reference to the target while the table seeks in its file.
     embed: Mutex<RowTable>,
     ple_table: Option<RowTable>,
-    /// The K/V pool of every K/V-owning layer.
-    kv: KvLayers,
+    /// The K/V pool of every K/V-owning layer, per shard.
+    kv: Vec<KvLayers>,
     /// The groups of the pools and their sizes.
     layout: KvLayout,
     /// The implicit sequence of the unit tests.
@@ -1823,11 +2119,24 @@ fn return_device_memory(device: &Device) {
 
 impl Drop for GpuTransformer {
     fn drop(&mut self) {
-        self.kv.clear();
+        // The communication server first: it holds the devices' streams.
+        self.collective.close();
+        for kv in &mut self.kv {
+            kv.clear();
+        }
         self.slots.clear();
         self.zero.clear();
-        self.weights.release();
-        return_device_memory(&self.weights.device);
+        for weights in &mut self.weights {
+            weights.release();
+        }
+        // Every distinct device once: shards may share one.
+        let mut returned: Vec<&Device> = Vec::with_capacity(self.weights.len());
+        for weights in &self.weights {
+            if !returned.contains(&&weights.device) {
+                return_device_memory(&weights.device);
+                returned.push(&weights.device);
+            }
+        }
     }
 }
 
@@ -1837,40 +2146,62 @@ impl Weights {
     fn release(&mut self) {
         self.layers.clear();
         self.ple = None;
-        self.lm_head.parts.clear();
+        if let Some(head) = &mut self.head {
+            head.lm_head.parts.clear();
+        }
         self.ropes.clear();
     }
 
-    /// Read every weight of the model `hp` describes through `reader` (onto
-    /// the reader's device): the layers, the final norm, the LM head
-    /// (`output.weight`, else the token embedding), the per-layer-embedding
-    /// projection and the RoPE tables. The K/V pools and the recurrent states
-    /// are the caller's ([`alloc_pools`]): a drafter has none, it reads the
-    /// target's.
+    /// The final norm and the LM head.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] on a shard that holds none.
+    fn head_parts(&self) -> Result<&Head, CucaError> {
+        self.head
+            .as_ref()
+            .ok_or_else(|| err("this tensor-parallel shard holds no LM head"))
+    }
+
+    /// Read the weights of the model `hp` describes (as it is in the file)
+    /// that shard `tp` holds through `reader` (onto the reader's device):
+    /// the layers (each cut to the shard's slice, see [`tp`]), on the first
+    /// shard the final norm and the LM head (`output.weight`, else the token
+    /// embedding), the per-layer-embedding projection and the RoPE tables.
+    /// The result's `hp` is the shard's (its own head counts). The K/V pools
+    /// and the recurrent states are the caller's ([`alloc_pools`]): a
+    /// drafter has none, it reads the target's.
     /// With `tiers`, the experts of the MoE layers stay in the file (their
     /// banks hold the tiers) instead of being read.
     fn load(
         reader: &mut WeightReader<'_>,
         path: &Path,
-        hp: Hparams,
+        hp: &Hparams,
+        tp: Tp,
         context_length: usize,
         tiers: Option<&TierPlan>,
     ) -> Result<Self, CucaError> {
         let content = reader.content;
         let device = reader.device.clone();
         let n_embd = hp.n_embd;
-        let vocab = *tensor_info(content, name::TOKEN_EMBD)?
-            .shape
-            .dims()
-            .first()
-            .ok_or_else(|| err(format!("tensor `{}`: scalar", name::TOKEN_EMBD)))?;
-        let head = if content.tensor_infos.contains_key(name::OUTPUT) {
-            name::OUTPUT
+        let head = if tp.shard == 0 {
+            let vocab = *tensor_info(content, name::TOKEN_EMBD)?
+                .shape
+                .dims()
+                .first()
+                .ok_or_else(|| err(format!("tensor `{}`: scalar", name::TOKEN_EMBD)))?;
+            let head = if content.tensor_infos.contains_key(name::OUTPUT) {
+                name::OUTPUT
+            } else {
+                name::TOKEN_EMBD
+            };
+            Some(Head {
+                lm_head: reader.matrix(head, vocab, n_embd)?,
+                norm: reader.vector(name::OUTPUT_NORM, n_embd)?,
+            })
         } else {
-            name::TOKEN_EMBD
+            None
         };
-        let lm_head = reader.matrix(head, vocab, n_embd)?;
-        let output_norm = reader.vector(name::OUTPUT_NORM, n_embd)?;
         let ple = match hp.ple_dim {
             Some(dim) => {
                 let row_len = hp.n_layer * dim;
@@ -1882,7 +2213,7 @@ impl Weights {
             None => None,
         };
 
-        let ropes = build_rope_tables(content, path, &hp, context_length)?
+        let ropes = build_rope_tables(content, path, hp, context_length)?
             .into_iter()
             .map(|t| {
                 let shape = [context_length, t.half];
@@ -1896,16 +2227,15 @@ impl Weights {
         let mut layers = Vec::with_capacity(hp.n_layer);
         for il in 0..hp.n_layer {
             let spec = &hp.layers[il];
-            let layout = LayerLayout::read(&hp, il, spec, content)?;
-            layers.push(load_layer(reader, &hp, il, spec, &layout, tiers)?);
+            let layout = LayerLayout::read(hp, il, spec, content)?;
+            layers.push(load_layer(reader, hp, tp, il, spec, &layout, tiers)?);
         }
         Ok(Self {
-            hp,
+            hp: tp.local_hparams(hp),
             device,
             ple,
             layers,
-            output_norm,
-            lm_head,
+            head,
             ropes,
         })
     }
@@ -2064,8 +2394,8 @@ fn open_tiers(
 }
 
 impl GpuTransformer {
-    /// [`GpuTransformer::load_placed`] with every expert resident and room
-    /// for one sequence (tests).
+    /// [`GpuTransformer::load_placed`] with every expert resident, one
+    /// device and room for one sequence (tests).
     #[cfg(test)]
     pub(crate) fn load(
         content: &gguf_file::Content,
@@ -2078,31 +2408,39 @@ impl GpuTransformer {
             path,
             context_length,
             device,
+            &[],
             &ExpertPlacement::Resident,
             &Sizing::single(context_length),
         )
     }
 
     /// Load the model from the GGUF file at `path`, whose index `content`
-    /// was read already, onto `device` with K/V pools and recurrent-state
+    /// was read already, onto `device` and, for tensor parallelism (see
+    /// [`tp`]), the `shards` after it: with K/V pools and recurrent-state
     /// slots for `sizing` (`context_length` positions per sequence), its
     /// experts placed as `experts` says (`Tiered`: left in the file, see the
-    /// module docs).
+    /// module docs). With no `shards` the model runs on `device` alone. A
+    /// device may appear several times (`device` and a shard, or two
+    /// shards): the model is still split and reduced across them, which
+    /// saves no time but exercises the same code.
     ///
     /// # Errors
     ///
     /// [`CucaError::Config`] when `context_length` is zero or above the
-    /// checkpoint maximum, `device` is not a GPU compiled into this build, or
+    /// checkpoint maximum, a device is not a GPU compiled into this build,
     /// the `experts` budgets do not fit the model (no experts, a device or
-    /// RAM tier below `n_used` experts per layer, heat of another shape);
-    /// [`CucaError::Provider`] for unsupported or malformed checkpoints and a
-    /// device that fails to open; [`CucaError::Io`] when the file cannot be
-    /// read.
+    /// RAM tier below `n_used` experts per layer, heat of another shape) or
+    /// the model cannot be split across `1 + shards.len()` devices (checked
+    /// before any weight is read, see [`tp::validate`]);
+    /// [`CucaError::Provider`] for unsupported or malformed checkpoints and
+    /// a device that fails to open; [`CucaError::Io`] when the file cannot
+    /// be read.
     pub(crate) fn load_placed(
         content: &gguf_file::Content,
         path: &Path,
         context_length: usize,
         device: LocalDevice,
+        shards: &[LocalDevice],
         experts: &ExpertPlacement,
         sizing: &Sizing,
     ) -> Result<Self, CucaError> {
@@ -2115,9 +2453,18 @@ impl GpuTransformer {
         }
         let hybrid = hp.behavior.hybrid_delta_net;
         check_context(&hp, context_length)?;
-        let device = open_device(device)?;
+        let world = 1 + shards.len();
+        tp::validate(content, &hp, world, experts)?;
+        let locals: Vec<LocalDevice> = std::iter::once(device)
+            .chain(shards.iter().copied())
+            .collect();
+        let devices = locals
+            .iter()
+            .map(|d| open_device(*d))
+            .collect::<Result<Vec<_>, _>>()?;
 
-        let shapes = quant_shapes(content);
+        // Every shard cuts equal shapes, so one plan serves all.
+        let shapes = shard_shapes(content, &hp, Tp { world, shard: 0 })?;
         let dense = plan_dense(&shapes, &[]);
         let tiers = match experts {
             ExpertPlacement::Resident => None,
@@ -2148,33 +2495,50 @@ impl GpuTransformer {
             .filter(|(tensor, _)| !dense.contains(tensor))
             .map(|(_, shape)| *shape)
             .collect();
-        let mut reader = WeightReader {
-            content,
-            file: File::open(path)?,
-            buf: Vec::new(),
-            device: &device,
-            dense,
-        };
         let plan = tiers.as_ref().map(|(_, plan)| plan);
-        let weights = Weights::load(&mut reader, path, hp, context_length, plan)?;
-        drop(reader);
+        let mut weights: Vec<Weights> = Vec::with_capacity(world);
+        for (shard, device) in devices.iter().enumerate() {
+            let mut reader = WeightReader {
+                content,
+                file: File::open(path)?,
+                buf: Vec::new(),
+                device,
+                dense: dense.clone(),
+            };
+            weights.push(Weights::load(
+                &mut reader,
+                path,
+                &hp,
+                Tp { world, shard },
+                context_length,
+                plan,
+            )?);
+        }
         if let Some((tiers, plan)) = &tiers
             && let Some(heat) = &tiers.warm_from
         {
-            plan.warm(&weights, heat)?;
+            plan.warm(&weights[0], heat)?;
         }
 
-        let layout = KvLayout::sized(&weights.hp, context_length, sizing);
-        let kv = alloc_pools(&weights.hp, &layout, &weights.device)?;
+        // The pool layout depends on the layers' windows and K/V sources,
+        // which every shard shares; each shard's pools hold its own heads.
+        let layout = KvLayout::sized(&weights[0].hp, context_length, sizing);
+        let kv = weights
+            .iter()
+            .map(|w| alloc_pools(&w.hp, &layout, &w.device))
+            .collect::<Result<Vec<_>, _>>()?;
         #[cfg(test)]
         let solo = Solo::new(&layout);
         // One zero state per delta-net layer, shared by every empty slot
-        // (the states are immutable).
-        let zero: Vec<Option<DeltaState>> = weights
+        // (the states are immutable); a hybrid model is never split.
+        let zero: Vec<Option<DeltaState>> = weights[0]
             .hp
             .layers
             .iter()
-            .map(|spec| spec.delta().map(|d| DeltaState::zeros(d, &weights.device)))
+            .map(|spec| {
+                spec.delta()
+                    .map(|d| DeltaState::zeros(d, &weights[0].device))
+            })
             .collect();
         let slots = if hybrid {
             (0..sizing.max_sequences)
@@ -2188,6 +2552,7 @@ impl GpuTransformer {
         };
         Ok(Self {
             weights,
+            collective: Collective::new(&locals, &devices),
             context_length,
             vocab,
             embed: Mutex::new(embed),
@@ -2202,6 +2567,11 @@ impl GpuTransformer {
             peers,
             tiers: tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
         })
+    }
+
+    /// The devices the model is split across (1 when it is not).
+    pub(crate) fn world(&self) -> usize {
+        self.weights.len()
     }
 
     /// Counters and heat of the expert tiers; `None` unless loaded with
@@ -2291,7 +2661,7 @@ impl GpuTransformer {
             });
             tokens.extend_from_slice(r.tokens);
         }
-        let hp = &self.weights.hp;
+        let hp = &self.weights[0].hp;
         let embeddings = self
             .embed
             .get_mut()
@@ -2301,14 +2671,7 @@ impl GpuTransformer {
             (Some(table), Some(dim)) => Some(table.rows(&tokens, (dim as f32).sqrt())?),
             _ => None,
         };
-        let outs = match self.weights.forward_layers(
-            &mut self.kv,
-            &self.layout,
-            &mut self.slots,
-            embeddings,
-            per_layer,
-            &segs,
-        ) {
+        let outs = match self.forward_layers(embeddings, per_layer, &segs) {
             Ok(outs) => outs,
             Err(e) => {
                 // A half-advanced recurrent state cannot be repaired: as on
@@ -2330,6 +2693,98 @@ impl GpuTransformer {
         Ok(outs)
     }
 
+    /// The layers over the concatenated rows `embeddings` of the sequences
+    /// `segs` describe, then the final norm and the LM head over the rows
+    /// they want ([`Weights::forward_layers`] on one device).
+    ///
+    /// A split model runs every layer on every shard: each shard's attention
+    /// half, an all-reduce of the partial outputs, each shard's residual
+    /// tail, each shard's FFN half, a second all-reduce and each shard's
+    /// residual tail. Every shard holds the whole residual stream, so the
+    /// final norm and the LM head run on shard 0's copy.
+    ///
+    /// # Errors
+    ///
+    /// As [`Weights::forward_layers`]; [`CucaError::Provider`] for a failed
+    /// all-reduce.
+    fn forward_layers(
+        &mut self,
+        embeddings: Vec<f32>,
+        per_layer: Option<Vec<f32>>,
+        segs: &[Seg<'_>],
+    ) -> Result<Vec<Forward>, CucaError> {
+        if let ([weights], [kv]) = (self.weights.as_slice(), self.kv.as_mut_slice()) {
+            return weights.forward_layers(
+                kv,
+                &self.layout,
+                &mut self.slots,
+                embeddings,
+                per_layer,
+                segs,
+            );
+        }
+        let (mut embeddings, mut per_layer) = (embeddings, per_layer);
+        let n = self.weights.len();
+        let mut xs: Vec<Tensor<2>> = Vec::with_capacity(n);
+        let mut ples: Vec<Option<Tensor<3>>> = Vec::with_capacity(n);
+        for (s, weights) in self.weights.iter().enumerate() {
+            let (e, p) = if s + 1 == n {
+                (std::mem::take(&mut embeddings), per_layer.take())
+            } else {
+                (embeddings.clone(), per_layer.clone())
+            };
+            let (x, ple) = weights.embed_input(e, p);
+            xs.push(x);
+            ples.push(ple);
+        }
+        let seqs = trunk_seqs(&self.layout, segs);
+        let passes = self
+            .weights
+            .iter()
+            .zip(ples)
+            .map(|(weights, ple)| weights.pass(ple, &seqs))
+            .collect::<Result<Vec<_>, _>>()?;
+        for il in 0..self.weights[0].hp.n_layer {
+            // Attention: each shard's heads, then the sum of their outputs.
+            let mut parts = Vec::with_capacity(n);
+            for (((weights, x), pass), kv) in self
+                .weights
+                .iter()
+                .zip(&xs)
+                .zip(&passes)
+                .zip(self.kv.iter_mut())
+            {
+                parts.push(weights.mixer(il, x, pass, kv, &mut [], None)?);
+            }
+            let sums = self.collective.all_reduce_sum(parts)?;
+            xs = self
+                .weights
+                .iter()
+                .zip(xs)
+                .zip(sums)
+                .map(|((weights, x), sum)| weights.attn_tail(il, x, sum))
+                .collect();
+            // The FFN: each shard's slice of it, then the sum.
+            let mut parts = Vec::with_capacity(n);
+            for (weights, x) in self.weights.iter().zip(&xs) {
+                parts.push(weights.ffn_half(il, x)?);
+            }
+            let sums = self.collective.all_reduce_sum(parts)?;
+            xs = self
+                .weights
+                .iter()
+                .zip(xs)
+                .zip(sums)
+                .zip(&passes)
+                .map(|(((weights, x), sum), pass)| weights.ffn_tail(il, x, sum, pass))
+                .collect();
+        }
+        let Some(x) = xs.into_iter().next() else {
+            return Err(err("a model without devices"));
+        };
+        self.weights[0].finish(x, segs)
+    }
+
     /// Vocabulary size.
     pub(crate) fn vocab(&self) -> usize {
         self.vocab
@@ -2337,12 +2792,12 @@ impl GpuTransformer {
 
     /// Width of the hidden state (and of an embedding row).
     pub(crate) fn n_embd(&self) -> usize {
-        self.weights.hp.n_embd
+        self.weights[0].hp.n_embd
     }
 
     /// The architecture.
     pub(crate) fn arch(&self) -> Arch {
-        self.weights.hp.arch
+        self.weights[0].hp.arch
     }
 
     /// The `n_embd`-wide embedding row of `token`, scaled as the first layer
@@ -2355,7 +2810,7 @@ impl GpuTransformer {
         self.embed
             .lock()
             .map_err(|_| err("the embedding table lock is poisoned"))?
-            .rows(&[token], self.weights.hp.embd_scale)
+            .rows(&[token], self.weights[0].hp.embd_scale)
     }
 
     /// The target's paged K/V a drafter reads, for the sequence whose block
@@ -2373,8 +2828,7 @@ impl GpuTransformer {
     /// for its group.
     fn ext_kv(&self, tables: &[BlockTable], len: usize) -> Result<GpuExtKv, CucaError> {
         let source = |sliding: bool| -> Result<ExtGroup, CucaError> {
-            let layer = self
-                .weights
+            let layer = self.weights[0]
                 .hp
                 .layers
                 .iter()
@@ -2386,8 +2840,7 @@ impl GpuTransformer {
                         if sliding { "sliding-window" } else { "full" }
                     ))
                 })?;
-            let pool = self
-                .kv
+            let pool = self.kv[0]
                 .get(layer.kv_source)
                 .and_then(Option::as_ref)
                 .ok_or_else(|| err(format!("layer {} owns no K/V cache", layer.kv_source)))?;
@@ -2412,9 +2865,14 @@ impl GpuTransformer {
         &self.layout
     }
 
-    /// Bytes of K/V data the pools hold.
+    /// Bytes of K/V data the pools of every shard hold: with KV-head
+    /// replication a shard keeps whole heads that other shards keep too, so
+    /// a split model holds more than the same model on one device.
     pub(crate) fn kv_pool_bytes(&self) -> u64 {
-        self.layout.pool_bytes(&self.weights.hp)
+        self.weights
+            .iter()
+            .map(|w| self.layout.pool_bytes(&w.hp))
+            .sum()
     }
 
     /// Take the recurrent state of `slot` back to at most `len` positions
@@ -2635,6 +3093,12 @@ impl GpuDrafter {
         target: &GpuTransformer,
         context_length: usize,
     ) -> Result<Self, CucaError> {
+        if target.world() > 1 {
+            return Err(CucaError::Config(format!(
+                "tensor parallelism: a drafter cannot pair with a model split across {} devices",
+                target.world()
+            )));
+        }
         if target.arch() != Arch::Gemma4 {
             return Err(err(format!(
                 "the `gemma4-assistant` drafter pairs with a `gemma4` model, not `{}`",
@@ -2656,7 +3120,7 @@ impl GpuDrafter {
                 target.n_embd()
             )));
         }
-        let target_layers = &target.weights.hp.layers;
+        let target_layers = &target.weights[0].hp.layers;
         for (il, spec) in hp.layers.iter().enumerate() {
             let sliding = spec.window.is_some();
             let source = target_layers
@@ -2681,16 +3145,16 @@ impl GpuDrafter {
             content,
             file: File::open(path)?,
             buf: Vec::new(),
-            device: &target.weights.device,
+            device: &target.weights[0].device,
             dense,
         };
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
-        let net = Weights::load(&mut reader, path, hp, context_length, None)?;
-        if net.lm_head.rows() != target.vocab() {
+        let net = Weights::load(&mut reader, path, &hp, Tp::SOLO, context_length, None)?;
+        let vocab = net.head_parts()?.lm_head.rows();
+        if vocab != target.vocab() {
             return Err(err(format!(
-                "drafter vocabulary {} differs from the target's {}",
-                net.lm_head.rows(),
+                "drafter vocabulary {vocab} differs from the target's {}",
                 target.vocab()
             )));
         }
@@ -2758,6 +3222,7 @@ impl GpuDrafter {
             }],
         )?;
         let mut no_cache: KvLayers = Vec::new();
+        let head = self.net.head_parts()?;
         let mut drafts = Vec::with_capacity(k);
         let mut hidden = hidden.to_vec();
         let mut token = first;
@@ -2772,9 +3237,9 @@ impl GpuDrafter {
                     .net
                     .layer(il, x, &pass, &mut no_cache, &mut [], Some(&ext))?;
             }
-            let normed = rms(x, Some(&self.net.output_norm), hp.eps);
+            let normed = rms(x, Some(&head.norm), hp.eps);
             let next = linear(normed.clone(), &self.post);
-            let mut logits = read_f32(self.net.head(normed), "drafter logits")?;
+            let mut logits = read_f32(self.net.head(normed)?, "drafter logits")?;
             let Some(next_token) = pick(&mut logits) else {
                 break;
             };
@@ -2787,10 +3252,13 @@ impl GpuDrafter {
 }
 
 /// Read the attention weights of layer `il` (a gated attention packs
-/// `[query | gate]` per head into its query projection, twice the width).
+/// `[query | gate]` per head into its query projection, twice the width),
+/// cut to the heads shard `tp` computes. `hp` and `spec` describe the layer
+/// as it is in the file.
 fn load_attention(
     reader: &mut WeightReader<'_>,
     hp: &Hparams,
+    tp: Tp,
     il: usize,
     spec: &LayerSpec,
     layout: &LayerLayout,
@@ -2806,6 +3274,10 @@ fn load_attention(
     let kv_width = nkv * d;
     let blk = |part: &str| name::blk(il, part);
     let owns = spec.owns_kv(il);
+    let proj = |reader: &mut WeightReader<'_>, part: &str, shape: [usize; 2], bias: bool| {
+        let cut = tp::part_cut(hp, layout, il, part, (shape[0], shape[1]), tp);
+        reader.proj(il, part, shape, bias, &cut)
+    };
 
     let qkv = match layout.qkv {
         Qkv::Fused => {
@@ -2814,19 +3286,19 @@ fn load_attention(
                     "layer {il}: a fused attn_qkv layer cannot share another layer's K/V"
                 )));
             }
-            QkvWeights::Fused(reader.proj(
-                il,
+            QkvWeights::Fused(proj(
+                reader,
                 name::ATTN_QKV,
                 [q_width + 2 * kv_width, n_embd],
                 layout.biases.q,
             )?)
         }
         Qkv::Split => QkvWeights::Split {
-            q: reader.proj(il, name::ATTN_Q, [q_rows, n_embd], layout.biases.q)?,
+            q: proj(reader, name::ATTN_Q, [q_rows, n_embd], layout.biases.q)?,
             kv: if owns {
                 Some((
-                    reader.proj(il, name::ATTN_K, [kv_width, n_embd], layout.biases.k)?,
-                    reader.proj(il, name::ATTN_V, [kv_width, n_embd], layout.biases.v)?,
+                    proj(reader, name::ATTN_K, [kv_width, n_embd], layout.biases.k)?,
+                    proj(reader, name::ATTN_V, [kv_width, n_embd], layout.biases.v)?,
                 ))
             } else {
                 None
@@ -2850,7 +3322,14 @@ fn load_attention(
             },
         )?,
         v_norm: hp.behavior.gemma4_extras && owns,
-        wo: reader.proj(il, name::ATTN_OUTPUT, [n_embd, q_width], layout.biases.o)?,
+        // Its columns follow the shard's heads; its bias (whole) is added
+        // once after the shards' outputs are summed.
+        wo: proj(
+            reader,
+            name::ATTN_OUTPUT,
+            [n_embd, q_width],
+            layout.biases.o,
+        )?,
     })
 }
 
@@ -2903,11 +3382,13 @@ fn load_delta(
     })
 }
 
-/// Read every weight of layer `il`; with `tiers`, the layer's experts stay in
-/// the file.
+/// Read every weight of layer `il` that shard `tp` holds; with `tiers`, the
+/// layer's experts stay in the file. `hp` and `spec` describe the layer as
+/// it is in the file.
 fn load_layer(
     reader: &mut WeightReader<'_>,
     hp: &Hparams,
+    tp: Tp,
     il: usize,
     spec: &LayerSpec,
     layout: &LayerLayout,
@@ -2915,38 +3396,42 @@ fn load_layer(
 ) -> Result<LayerWeights, CucaError> {
     let n_embd = hp.n_embd;
     let blk = |part: &str| name::blk(il, part);
+    let matrix = |reader: &mut WeightReader<'_>, part: &str, rows: usize, cols: usize| {
+        let cut = tp::part_cut(hp, layout, il, part, (rows, cols), tp);
+        reader.matrix_cut(&blk(part), (rows, cols), &cut)
+    };
 
     let mixer = match spec.delta() {
         Some(delta) => Mixer::Delta(Box::new(load_delta(reader, hp, il, delta)?)),
-        None => Mixer::Attention(load_attention(reader, hp, il, spec, layout)?),
+        None => Mixer::Attention(load_attention(reader, hp, tp, il, spec, layout)?),
     };
 
     let ffn = match (layout.ffn, hp.moe) {
         (Ffn::Dense { ff, fused }, _) => FfnWeights::Dense {
             gate_up: if fused {
                 GateUp::Fused {
-                    up: reader.matrix(&blk(name::FFN_UP), 2 * ff, n_embd)?,
-                    ff,
+                    up: matrix(reader, name::FFN_UP, 2 * ff, n_embd)?,
+                    ff: ff / tp.world,
                 }
             } else {
                 GateUp::Split {
-                    gate: reader.matrix(&blk(name::FFN_GATE), ff, n_embd)?,
-                    up: reader.matrix(&blk(name::FFN_UP), ff, n_embd)?,
+                    gate: matrix(reader, name::FFN_GATE, ff, n_embd)?,
+                    up: matrix(reader, name::FFN_UP, ff, n_embd)?,
                 }
             },
-            down: reader.matrix(&blk(name::FFN_DOWN), n_embd, ff)?,
+            down: matrix(reader, name::FFN_DOWN, n_embd, ff)?,
         },
         (Ffn::Moe { ff, shared_ff }, Some(spec)) => FfnWeights::Moe {
             spec,
             router: reader.matrix(&blk(name::FFN_GATE_INP), spec.n_expert, n_embd)?,
-            experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, tiers)?,
+            experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, tiers, tp)?,
             shared: match shared_ff {
                 Some(sff) => {
                     let gate_inp = reader.host_vector(&blk(name::FFN_GATE_INP_SHEXP), n_embd)?;
                     Some(GpuShared {
-                        gate: reader.matrix(&blk(name::FFN_GATE_SHEXP), sff, n_embd)?,
-                        up: reader.matrix(&blk(name::FFN_UP_SHEXP), sff, n_embd)?,
-                        down: reader.matrix(&blk(name::FFN_DOWN_SHEXP), n_embd, sff)?,
+                        gate: matrix(reader, name::FFN_GATE_SHEXP, sff, n_embd)?,
+                        up: matrix(reader, name::FFN_UP_SHEXP, sff, n_embd)?,
+                        down: matrix(reader, name::FFN_DOWN_SHEXP, n_embd, sff)?,
                         gate_inp: Tensor::from_data(
                             TensorData::new(gate_inp, [1, n_embd]),
                             reader.device,
@@ -3035,10 +3520,54 @@ fn take_rows(x: Tensor<2>, ranges: &[Range<usize>]) -> Tensor<2> {
     }
 }
 
+/// The pass inputs of the sequences `segs`, over the target's own blocks.
+fn trunk_seqs<'a>(layout: &'a KvLayout, segs: &[Seg<'a>]) -> Vec<PassSeq<'a>> {
+    segs.iter()
+        .map(|s| PassSeq {
+            start: s.start,
+            t: s.t,
+            slot: s.slot,
+            kv: PassKv::Trunk {
+                layout,
+                tables: s.tables,
+            },
+        })
+        .collect()
+}
+
 impl Weights {
+    /// The residual stream `[t, n_embd]` the layers start from, for the
+    /// concatenated rows `embeddings`, and the Gemma 4 per-layer inputs
+    /// `(ctx + tok) / sqrt(2)`: the projected embeddings merged with the
+    /// token-identity rows `per_layer`.
+    fn embed_input(
+        &self,
+        embeddings: Vec<f32>,
+        per_layer: Option<Vec<f32>>,
+    ) -> (Tensor<2>, Option<Tensor<3>>) {
+        let hp = &self.hp;
+        let dev = &self.device;
+        let eps = hp.eps;
+        let t = embeddings.len() / hp.n_embd;
+        let x = Tensor::<2>::from_data(TensorData::new(embeddings, [t, hp.n_embd]), dev);
+        let ple = match (&self.ple, hp.ple_dim, per_layer) {
+            (Some(ple), Some(dim), Some(tokens)) => {
+                let tokens =
+                    Tensor::<3>::from_data(TensorData::new(tokens, [t, hp.n_layer, dim]), dev);
+                let ctx = linear(x.clone(), &ple.proj)
+                    .mul_scalar(1.0 / (hp.n_embd as f64).sqrt())
+                    .reshape([t, hp.n_layer, dim]);
+                let ctx = rms(ctx, Some(&ple.proj_norm), eps);
+                Some((ctx + tokens).mul_scalar(FRAC_1_SQRT_2))
+            }
+            _ => None,
+        };
+        (x, ple)
+    }
+
     /// The layers over the concatenated rows `embeddings` of the sequences
     /// `segs` describe, then the final norm and the LM head over the rows
-    /// the sequences want.
+    /// the sequences want (the whole model on this one device).
     ///
     /// # Errors
     ///
@@ -3053,41 +3582,10 @@ impl Weights {
         per_layer: Option<Vec<f32>>,
         segs: &[Seg<'_>],
     ) -> Result<Vec<Forward>, CucaError> {
-        let hp = &self.hp;
-        let dev = &self.device;
-        let eps = hp.eps;
-        let t = embeddings.len() / hp.n_embd;
-        let mut x = Tensor::<2>::from_data(TensorData::new(embeddings, [t, hp.n_embd]), dev);
-
-        // Gemma 4 per-layer inputs: projected embeddings merged with the
-        // token-identity rows, `(ctx + tok) / sqrt(2)`.
-        let ple = match (&self.ple, hp.ple_dim, per_layer) {
-            (Some(ple), Some(dim), Some(tokens)) => {
-                let tokens =
-                    Tensor::<3>::from_data(TensorData::new(tokens, [t, hp.n_layer, dim]), dev);
-                let ctx = linear(x.clone(), &ple.proj)
-                    .mul_scalar(1.0 / (hp.n_embd as f64).sqrt())
-                    .reshape([t, hp.n_layer, dim]);
-                let ctx = rms(ctx, Some(&ple.proj_norm), eps);
-                Some((ctx + tokens).mul_scalar(FRAC_1_SQRT_2))
-            }
-            _ => None,
-        };
-
-        let seqs: Vec<PassSeq<'_>> = segs
-            .iter()
-            .map(|s| PassSeq {
-                start: s.start,
-                t: s.t,
-                slot: s.slot,
-                kv: PassKv::Trunk {
-                    layout,
-                    tables: s.tables,
-                },
-            })
-            .collect();
+        let (mut x, ple) = self.embed_input(embeddings, per_layer);
+        let seqs = trunk_seqs(layout, segs);
         let pass = self.pass(ple, &seqs)?;
-        for il in 0..hp.n_layer {
+        for il in 0..self.hp.n_layer {
             x = self.layer(il, x, &pass, kv, slots, None)?;
         }
         self.finish(x, segs)
@@ -3127,7 +3625,8 @@ impl Weights {
         if ranges.is_empty() {
             return Ok(outs);
         }
-        let normed = rms(take_rows(x, &ranges), Some(&self.output_norm), self.hp.eps);
+        let head = self.head_parts()?;
+        let normed = rms(take_rows(x, &ranges), Some(&head.norm), self.hp.eps);
 
         // The logits rows among the normed rows, per sequence: first row
         // among the head's rows and row count.
@@ -3157,8 +3656,11 @@ impl Weights {
             .any(|(seg, p)| p.is_some() && seg.hidden != Hidden::None);
         // The head is queued before the hidden-state readback so the device
         // keeps working through it instead of idling at that sync point.
-        let logits =
-            (!logit_ranges.is_empty()).then(|| self.head(take_rows(normed.clone(), &logit_ranges)));
+        let logits = if logit_ranges.is_empty() {
+            None
+        } else {
+            Some(self.head(take_rows(normed.clone(), &logit_ranges))?)
+        };
         if wants_hidden {
             let flat = read_f32(normed, "hidden states")?;
             if let ([seg], [Some(_)]) = (segs, plan.as_slice()) {
@@ -3190,16 +3692,20 @@ impl Weights {
     }
 
     /// LM head over final-norm output rows: matmul, logit scale, soft-cap.
-    fn head(&self, normed: Tensor<2>) -> Tensor<2> {
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] on a shard that holds no LM head.
+    fn head(&self, normed: Tensor<2>) -> Result<Tensor<2>, CucaError> {
         let hp = &self.hp;
-        let mut logits = linear(normed, &self.lm_head);
+        let mut logits = linear(normed, &self.head_parts()?.lm_head);
         if hp.logit_scale != 1.0 {
             logits = logits.div_scalar(f64::from(hp.logit_scale));
         }
         if let Some(cap) = hp.logit_softcap {
             logits = logits.div_scalar(cap).tanh().mul_scalar(cap);
         }
-        logits
+        Ok(logits)
     }
 
     /// The RoPE rows, visible ranges, masks and block views shared by the
@@ -3398,13 +3904,33 @@ impl Weights {
     }
 
     /// One transformer block over the `pass.t` rows of the step's
-    /// sequences. The projections, norms and FFN run over all rows (each
-    /// weight is read once); the K/V writes, the attention and the
-    /// recurrent layers run per sequence.
+    /// sequences (the whole block on this device). The projections, norms
+    /// and FFN run over all rows (each weight is read once); the K/V writes,
+    /// the attention and the recurrent layers run per sequence.
     fn layer(
         &self,
         il: usize,
         x: Tensor<2>,
+        pass: &Pass,
+        kv: &mut KvLayers,
+        slots: &mut [DeltaSlot],
+        ext: Option<&GpuExtKv>,
+    ) -> Result<Tensor<2>, CucaError> {
+        let attn = self.mixer(il, &x, pass, kv, slots, ext)?;
+        let x = self.attn_tail(il, x, attn);
+        let f = self.ffn_half(il, &x)?;
+        Ok(self.ffn_tail(il, x, f, pass))
+    }
+
+    /// The first half of layer `il` over the residual stream `x`: the
+    /// pre-attention norm, then the attention (or recurrent) mixer, up to
+    /// and including the output projection's matmul and no further. On a
+    /// split model it is this shard's heads' share of the projection, a
+    /// partial sum of the layer's output.
+    fn mixer(
+        &self,
+        il: usize,
+        x: &Tensor<2>,
         pass: &Pass,
         kv: &mut KvLayers,
         slots: &mut [DeltaSlot],
@@ -3416,13 +3942,6 @@ impl Weights {
         let eps = hp.eps;
         let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
         let t = pass.t;
-        let scaled = |branch: Tensor<2>| {
-            if hp.residual_scale == 1.0 {
-                branch
-            } else {
-                branch.mul_scalar(f64::from(hp.residual_scale))
-            }
-        };
         let rotate = |m: Tensor<4>| match spec.rope {
             Some(r) => rope(m, &pass.ropes[r], &hp.ropes[r]),
             None => m,
@@ -3432,7 +3951,7 @@ impl Weights {
             Some(w) => rms(x.clone(), Some(w), eps),
             None => x.clone(),
         };
-        let mut attn = match &lw.mixer {
+        let attn = match &lw.mixer {
             Mixer::Delta(dw) => {
                 let mut states = Vec::with_capacity(pass.seqs.len());
                 for seq in &pass.seqs {
@@ -3605,33 +4124,78 @@ impl Weights {
                     Some(gate) => attn * activation::sigmoid(gate),
                     None => attn,
                 };
-                aw.wo.forward(attn)
+                // The output projection's product only: its bias is added
+                // after the shards' products are summed ([`Weights::attn_tail`]).
+                linear(attn, &aw.wo.w)
             }
         };
-        if let Some(w) = &lw.post_attn_norm {
-            attn = rms(attn, Some(w), eps);
-        }
-        let x = x + scaled(attn);
+        Ok(attn)
+    }
 
+    /// `branch` scaled by the residual scale (the branch itself when 1).
+    fn scaled(&self, branch: Tensor<2>) -> Tensor<2> {
+        if self.hp.residual_scale == 1.0 {
+            branch
+        } else {
+            branch.mul_scalar(f64::from(self.hp.residual_scale))
+        }
+    }
+
+    /// What follows the mixer in layer `il`: the output projection's bias,
+    /// the post-attention norm and the residual add. `attn` is
+    /// [`Weights::mixer`]'s output (on a split model, summed over the
+    /// shards: the bias belongs to the sum, so it is added once, here).
+    fn attn_tail(&self, il: usize, x: Tensor<2>, mut attn: Tensor<2>) -> Tensor<2> {
+        let lw = &self.layers[il];
+        if let Mixer::Attention(aw) = &lw.mixer
+            && let Some(b) = &aw.wo.bias
+        {
+            attn = attn + b.clone().unsqueeze::<2>();
+        }
+        if let Some(w) = &lw.post_attn_norm {
+            attn = rms(attn, Some(w), self.hp.eps);
+        }
+        x + self.scaled(attn)
+    }
+
+    /// The FFN of layer `il` over the residual stream `x`: the pre-FFN norm
+    /// and the dense FFN or MoE (on a split model, this shard's slice of it:
+    /// a partial sum of the layer's output).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when an expert tier fails to load an expert.
+    fn ffn_half(&self, il: usize, x: &Tensor<2>) -> Result<Tensor<2>, CucaError> {
+        let lw = &self.layers[il];
         let f = match &lw.ffn_norm {
-            Some(w) => rms(x.clone(), Some(w), eps),
+            Some(w) => rms(x.clone(), Some(w), self.hp.eps),
             None => x.clone(),
         };
-        let mut f = lw.ffn.forward(f, hp.act(), &self.device)?;
+        lw.ffn.forward(f, self.hp.act(), &self.device)
+    }
+
+    /// What follows the FFN in layer `il`: the post-FFN norm, the residual
+    /// add of `f` ([`Weights::ffn_half`]'s output, summed over the shards of
+    /// a split model), the Gemma 4 per-layer-embedding block and the layer's
+    /// output scale.
+    fn ffn_tail(&self, il: usize, x: Tensor<2>, mut f: Tensor<2>, pass: &Pass) -> Tensor<2> {
+        let hp = &self.hp;
+        let lw = &self.layers[il];
+        let eps = hp.eps;
         if let Some(w) = &lw.post_ffw_norm {
             f = rms(f, Some(w), eps);
         }
-        let mut x = x + scaled(f);
+        let mut x = x + self.scaled(f);
 
         if let (Some(layer), Some(ple), Some(dim)) = (&lw.ple, &pass.ple, hp.ple_dim) {
-            let slice = ple.clone().narrow(1, il, 1).reshape([t, dim]);
+            let slice = ple.clone().narrow(1, il, 1).reshape([pass.t, dim]);
             let g = gelu(linear(x.clone(), &layer.inp_gate)) * slice;
             x = x + rms(linear(g, &layer.proj), Some(&layer.post_norm), eps);
         }
-        Ok(match lw.out_scale {
+        match lw.out_scale {
             Some(s) => x.mul_scalar(s),
             None => x,
-        })
+        }
     }
 }
 
@@ -3889,7 +4453,10 @@ impl DeltaWeights {
 }
 
 /// Read a device tensor back to the host as f32 values, row-major.
-fn read_f32<const D: usize>(tensor: Tensor<D>, what: &str) -> Result<Vec<f32>, CucaError> {
+pub(super) fn read_f32<const D: usize>(
+    tensor: Tensor<D>,
+    what: &str,
+) -> Result<Vec<f32>, CucaError> {
     let data = tensor
         .try_into_data()
         .map_err(|e| err(format!("reading {what} from the device: {e}")))?;
@@ -4202,14 +4769,28 @@ mod tests {
         assert!(pack_blocks(GgmlDType::Q4_0, &q4_0_row()[..35], 1, 64).is_err());
     }
 
-    /// The GPU device under test, from `CUCA_LOCAL_DEVICE`; `None` (skip)
-    /// when unset or `cpu`.
+    /// The GPU devices under test, from `CUCA_LOCAL_DEVICE`: one device or a
+    /// `+`-separated list (`vulkan:0+vulkan:1`); empty (skip) when unset or
+    /// when the first is `cpu`.
+    fn test_devices() -> Vec<LocalDevice> {
+        let Ok(list) = std::env::var("CUCA_LOCAL_DEVICE") else {
+            return Vec::new();
+        };
+        let devices: Vec<LocalDevice> = list
+            .split('+')
+            .map(|d| d.trim().parse().expect("CUCA_LOCAL_DEVICE"))
+            .collect();
+        if devices.first().is_none_or(|d| *d == LocalDevice::Cpu) {
+            Vec::new()
+        } else {
+            devices
+        }
+    }
+
+    /// The GPU device under test, the first of [`test_devices`]; `None`
+    /// (skip) when unset or `cpu`.
     fn test_device() -> Option<LocalDevice> {
-        let device: LocalDevice = std::env::var("CUCA_LOCAL_DEVICE")
-            .ok()?
-            .parse()
-            .expect("CUCA_LOCAL_DEVICE");
-        (device != LocalDevice::Cpu).then_some(device)
+        test_devices().first().copied()
     }
 
     fn load_both(model: &TinyModel, device: LocalDevice) -> (Transformer, GpuTransformer) {
@@ -4464,17 +5045,10 @@ mod tests {
     }
 
     fn assert_rows_close(got: &[f32], want: &[f32], what: &str) {
-        assert_eq!(got.len(), want.len(), "{what}");
         // Batched and solo steps run different matmul shapes (and, in a
         // mixture of experts, group different rows per expert), so they
         // agree up to float rounding of the vector's scale.
-        let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-        for (i, (a, b)) in got.iter().zip(want).enumerate() {
-            assert!(
-                (a - b).abs() <= 1e-3 * scale,
-                "{what}: value {i}: {a} vs {b} (scale {scale})"
-            );
-        }
+        assert_rows_within(got, want, 1e-3, what);
     }
 
     /// The logits and hidden rows of two runs of one sequence's call agree
@@ -4514,6 +5088,7 @@ mod tests {
             &model.path,
             CTX,
             device,
+            &[],
             &ExpertPlacement::Resident,
             &sizing,
         )
@@ -4781,6 +5356,7 @@ mod tests {
             &model.path,
             32,
             device,
+            &[],
             experts,
             &Sizing::single(32),
         )
@@ -6365,5 +6941,633 @@ mod tests {
         ];
         let dense = plan_dense(&own, &[]);
         assert_eq!(dense, HashSet::from(["shared".to_string()]));
+    }
+
+    // ------------------------------------------------------------------
+    // Tensor parallelism (see `tp`)
+    // ------------------------------------------------------------------
+
+    /// A `rows x cols` matrix of test values encoded as `dtype` (Q8_0, F32 or
+    /// F16): its GGUF bytes and the values they decode to.
+    fn encoded_matrix(dtype: GgmlDType, rows: usize, cols: usize) -> (Vec<u8>, Vec<f32>) {
+        let values = test_values(rows, cols);
+        let mut raw = Vec::new();
+        match dtype {
+            GgmlDType::Q8_0 => quantize_q8_0(&values, &mut raw),
+            GgmlDType::F32 => raw.extend(values.iter().flat_map(|v| v.to_le_bytes())),
+            GgmlDType::F16 => raw.extend(values.iter().flat_map(|v| f16_bytes(*v))),
+            other => panic!("{other:?}"),
+        }
+        let decoded = decode_rows(dtype, &raw, cols);
+        (raw, decoded)
+    }
+
+    /// The values of `raw`, rows of `width` elements stored as `dtype`.
+    fn decode_rows(dtype: GgmlDType, raw: &[u8], width: usize) -> Vec<f32> {
+        let row_bytes = width / dtype.block_size() * dtype.type_size();
+        let mut out = vec![0f32; raw.len() / row_bytes * width];
+        for (src, dst) in raw.chunks_exact(row_bytes).zip(out.chunks_exact_mut(width)) {
+            dequant_row(dtype, src, 1.0, dst).unwrap();
+        }
+        out
+    }
+
+    /// The columns `cols` of every row of the row-major `values`.
+    fn host_columns(values: &[f32], width: usize, cols: &Range<usize>) -> Vec<f32> {
+        values
+            .chunks(width)
+            .flat_map(|row| row[cols.clone()].iter().copied())
+            .collect()
+    }
+
+    /// A column cut at block bounds is a byte copy of the rows' sub-slices and
+    /// decodes to the same columns of the whole matrix (Q8_0, F32, F16), a
+    /// float cut may start anywhere, and a cut inside a Q8_0 block is not a
+    /// byte copy. Host only.
+    #[test]
+    fn column_cuts_match_the_host_reference() {
+        let (rows, width) = (5usize, 128usize);
+        for dtype in [GgmlDType::Q8_0, GgmlDType::F32, GgmlDType::F16] {
+            let (raw, whole) = encoded_matrix(dtype, rows, width);
+            for cols in [0..128, 0..64, 64..128, 32..96, 96..128, 0..32] {
+                let held = tp::column_dtype(dtype, width, &cols, false);
+                assert_eq!(held, dtype, "{dtype:?} {cols:?} is a byte copy");
+                let mut out = Vec::new();
+                append_columns(dtype, &raw, width, &cols, held, &mut out).unwrap();
+                assert_eq!(
+                    decode_rows(held, &out, cols.len()),
+                    host_columns(&whole, width, &cols),
+                    "{dtype:?} {cols:?}"
+                );
+            }
+        }
+        for dtype in [GgmlDType::F32, GgmlDType::F16] {
+            let (raw, whole) = encoded_matrix(dtype, rows, width);
+            let cols = 5..77;
+            assert_eq!(tp::column_dtype(dtype, width, &cols, false), dtype);
+            let mut out = Vec::new();
+            append_columns(dtype, &raw, width, &cols, dtype, &mut out).unwrap();
+            assert_eq!(
+                decode_rows(dtype, &out, cols.len()),
+                host_columns(&whole, width, &cols)
+            );
+        }
+        // Inside a Q8_0 block the cut is requantized (never a byte copy).
+        let (raw, whole) = encoded_matrix(GgmlDType::Q8_0, rows, width);
+        let cols = 16..80;
+        assert!(tp::copy_columns(GgmlDType::Q8_0, &raw, width, &cols).is_none());
+        let mut out = Vec::new();
+        append_columns(
+            GgmlDType::Q8_0,
+            &raw,
+            width,
+            &cols,
+            GgmlDType::Q8_0,
+            &mut out,
+        )
+        .unwrap();
+        let kept = host_columns(&whole, width, &cols);
+        for (g, w) in decode_rows(GgmlDType::Q8_0, &out, cols.len())
+            .chunks(32)
+            .zip(kept.chunks(32))
+        {
+            let amax = w.iter().fold(0f32, |m, v| m.max(v.abs()));
+            let bound = amax * (0.5 / 127.0 + 1.0 / 1024.0) + 1e-6;
+            assert!(g.iter().zip(w).all(|(a, b)| (a - b).abs() <= bound));
+        }
+        // A cut that runs past the row, or bytes that are not whole rows.
+        assert!(
+            append_columns(
+                GgmlDType::Q8_0,
+                &raw,
+                width,
+                &(64..160),
+                GgmlDType::Q8_0,
+                &mut out
+            )
+            .is_err()
+        );
+        assert!(
+            append_columns(
+                GgmlDType::Q8_0,
+                &raw[..35],
+                width,
+                &(0..64),
+                GgmlDType::Q8_0,
+                &mut out
+            )
+            .is_err()
+        );
+    }
+
+    /// A column cut that splits a 256-element K-quant block dequantizes the
+    /// rows and cuts the values, as Q8_0 (or f32 for a dense weight); a cut
+    /// on block bounds stays a byte copy. Host only.
+    #[test]
+    fn column_cuts_inside_a_k_quant_block_requantize() {
+        use candle_core::quantized::QTensor;
+
+        let (rows, width) = (3usize, 512usize);
+        let source = candle_core::Tensor::from_vec(
+            test_values(rows, width),
+            (rows, width),
+            &candle_core::Device::Cpu,
+        )
+        .unwrap();
+        let qt = QTensor::quantize(&source, GgmlDType::Q6K).unwrap();
+        let raw = qt.data().unwrap();
+        let whole = decode_rows(GgmlDType::Q6K, &raw, width);
+
+        let aligned = 256..512;
+        assert_eq!(
+            tp::column_dtype(GgmlDType::Q6K, width, &aligned, false),
+            GgmlDType::Q6K
+        );
+        let mut copy = Vec::new();
+        append_columns(
+            GgmlDType::Q6K,
+            &raw,
+            width,
+            &aligned,
+            GgmlDType::Q6K,
+            &mut copy,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_rows(GgmlDType::Q6K, &copy, aligned.len()),
+            host_columns(&whole, width, &aligned)
+        );
+
+        let cols = 32..288;
+        assert_eq!(
+            tp::column_dtype(GgmlDType::Q6K, width, &cols, false),
+            GgmlDType::Q8_0
+        );
+        assert_eq!(
+            tp::column_dtype(GgmlDType::Q6K, width, &cols, true),
+            GgmlDType::F32
+        );
+        let kept = host_columns(&whole, width, &cols);
+        let mut q8 = Vec::new();
+        append_columns(GgmlDType::Q6K, &raw, width, &cols, GgmlDType::Q8_0, &mut q8).unwrap();
+        let mut want = Vec::new();
+        quantize_q8_0(&kept, &mut want);
+        assert_eq!(q8, want);
+        let mut f32s = Vec::new();
+        append_columns(
+            GgmlDType::Q6K,
+            &raw,
+            width,
+            &cols,
+            GgmlDType::F32,
+            &mut f32s,
+        )
+        .unwrap();
+        assert_eq!(
+            f32s,
+            kept.iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>()
+        );
+    }
+
+    /// The GPU devices under test, as `test_devices` plus a repeat of the
+    /// first when the list names one only (two shards on one device are
+    /// still split and reduced).
+    fn two_test_devices() -> Option<Vec<LocalDevice>> {
+        let mut devices = test_devices();
+        let first = *devices.first()?;
+        if devices.len() < 2 {
+            devices.push(first);
+        }
+        Some(devices)
+    }
+
+    /// `got` agrees with `want` to `tol` of the vector's scale
+    /// (`max(1, max |want|)`).
+    fn assert_rows_within(got: &[f32], want: &[f32], tol: f32, what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}");
+        let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+        for (i, (a, b)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (a - b).abs() <= tol * scale,
+                "{what}: value {i}: {a} vs {b} (scale {scale}, tolerance {tol})"
+            );
+        }
+    }
+
+    /// Run `steps` (the rows of each step, over `tokens` per sequence)
+    /// through the batched API of `m` over fresh block pools: the output of
+    /// every sequence's call, in order.
+    fn run_steps(m: &mut GpuTransformer, steps: &[Vec<Step>], tokens: &[Vec<u32>]) -> Vec<Forward> {
+        let mut pools = KvPools::new(m.kv_layout());
+        let mut seqs: Vec<SeqBlocks> = tokens.iter().map(|_| pools.seq()).collect();
+        let mut at = vec![0usize; tokens.len()];
+        let mut out = Vec::new();
+        for rows_of_step in steps {
+            for st in rows_of_step {
+                pools.reserve(&mut seqs[st.seq], at[st.seq] + st.n).unwrap();
+            }
+            let rows: Vec<SeqRows<'_>> = rows_of_step
+                .iter()
+                .map(|st| SeqRows {
+                    tokens: &tokens[st.seq][at[st.seq]..at[st.seq] + st.n],
+                    start_pos: at[st.seq],
+                    tables: &seqs[st.seq].tables,
+                    state: StateSlot(st.seq),
+                    want: st.want,
+                    hidden: st.hidden,
+                })
+                .collect();
+            let outs = m.forward_batch(&Batch { rows, exact: false }).unwrap();
+            assert_eq!(outs.len(), rows_of_step.len());
+            for (st, o) in rows_of_step.iter().zip(outs) {
+                out.push(o);
+                at[st.seq] += st.n;
+            }
+        }
+        out
+    }
+
+    /// The steps of a sharded run: one sequence alone (a prefill, a chunk
+    /// with every logits row and every hidden row, decode steps), a second
+    /// prefilling alone, both decoding together (the stacked decode launch),
+    /// a prefill chunk next to a decoding sequence, hidden rows only, one
+    /// logits row.
+    fn sharded_steps() -> Vec<Vec<Step>> {
+        let (last, all, none) = (Want::Last, Want::All, Want::None);
+        let (plain, post, post_all) = (Hidden::None, Hidden::PostNorm, Hidden::PostNormAll);
+        vec![
+            vec![step(0, 5, last, plain)],
+            vec![step(0, 3, all, post_all)],
+            vec![step(0, 1, last, post)],
+            vec![step(0, 1, last, plain)],
+            vec![step(1, 9, last, plain)],
+            vec![step(0, 1, last, post), step(1, 1, last, plain)],
+            vec![step(0, 1, last, plain), step(1, 1, last, plain)],
+            vec![step(0, 4, none, post_all), step(1, 1, last, plain)],
+            vec![step(0, 1, last, plain), step(1, 2, all, post)],
+        ]
+    }
+
+    /// `model` split across `devices[0]` and `devices[1]` equals the same
+    /// model on `devices[0]` alone (to `tol` of the logits' scale: the
+    /// shards sum two half-width partial products where the single device's
+    /// matmul sums the whole inner dimension, so the reduction order, not the
+    /// arithmetic, differs) and two sharded loads agree bit for bit (the host
+    /// reduction adds in a fixed shard order). Also: the shards' pools are at
+    /// least the single device's, and the split model reports its world.
+    fn check_sharded(model: &TinyModel, devices: &[LocalDevice], tol: f32, label: &str) {
+        const CTX: usize = 32;
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let sizing = Sizing {
+            max_sequences: 2,
+            kv_tokens: 2 * CTX,
+            max_rows: 16,
+        };
+        let load = |shards: &[LocalDevice]| {
+            GpuTransformer::load_placed(
+                &content,
+                &model.path,
+                CTX,
+                devices[0],
+                shards,
+                &ExpertPlacement::Resident,
+                &sizing,
+            )
+            .unwrap()
+        };
+        let steps = sharded_steps();
+        let tokens: Vec<Vec<u32>> = (0..2).map(|s| stream(s, 20)).collect();
+
+        let mut single = load(&[]);
+        assert_eq!(single.world(), 1, "{label}");
+        let want = run_steps(&mut single, &steps, &tokens);
+        let single_bytes = single.kv_pool_bytes();
+        let layout = single.kv_layout().clone();
+        drop(single);
+
+        let mut split = load(&devices[1..2]);
+        assert_eq!(split.world(), 2, "{label}");
+        assert_eq!(split.kv_layout(), &layout, "{label}: same block layout");
+        assert!(
+            split.kv_pool_bytes() >= single_bytes,
+            "{label}: the shards' pools hold at least the single device's"
+        );
+        let got = run_steps(&mut split, &steps, &tokens);
+        drop(split);
+        assert_eq!(got.len(), want.len(), "{label}");
+        for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+            for (name, g, w) in [
+                ("logits", &g.logits, &w.logits),
+                ("hidden", &g.hidden, &w.hidden),
+            ] {
+                let what = format!("{label} call {i} {name}");
+                match (g, w) {
+                    (Some(g), Some(w)) => assert_rows_within(g, w, tol, &what),
+                    (None, None) => {}
+                    _ => panic!("{what}: present in only one of the runs"),
+                }
+            }
+        }
+
+        // Determinism: the first sharded load tuned burn's kernels, so the
+        // next two run the same kernels on the same data.
+        let a = run_steps(&mut load(&devices[1..2]), &steps, &tokens);
+        let b = run_steps(&mut load(&devices[1..2]), &steps, &tokens);
+        for (i, (x, y)) in a.iter().zip(&b).enumerate() {
+            assert!(
+                x.logits == y.logits && x.hidden == y.hidden,
+                "{label}: call {i} differs between two sharded loads"
+            );
+        }
+    }
+
+    /// A model split across two devices equals the model on one: the tiny
+    /// Gemma 4 (per-layer embeddings, shared K/V, sliding windows; its
+    /// single KV head is replicated on both shards, the GQA variant divides
+    /// its two) and every `TinySpec` the split rules allow (OLMo 2 and OLMoE
+    /// have full-width Q/K norms, which a shard cannot compute alone). The
+    /// dense specs' FFN width 96 is widened to 128, since a shard's FFN
+    /// slice must be a multiple of 32 (a property of the tiny dimensions,
+    /// not of the rule); the MoE specs' experts (64 wide) split as they are.
+    /// With one device in `CUCA_LOCAL_DEVICE`, both shards live on it.
+    #[test]
+    fn gpu_sharded_matches_single_device() {
+        let Some(devices) = two_test_devices() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device (`a+b` for two)");
+            return;
+        };
+        for (label, options) in [
+            ("gemma4 mqa", TinyOptions::default()),
+            (
+                "gemma4 gqa",
+                TinyOptions {
+                    n_head: 4,
+                    n_kv_head: 2,
+                    ..TinyOptions::default()
+                },
+            ),
+        ] {
+            check_sharded(&write_tiny_model_with(options), &devices, 1e-4, label);
+        }
+        let mut ran = Vec::new();
+        for spec in TinySpec::all() {
+            let arch = spec.arch;
+            if spec.qk_norm_full {
+                println!("SKIP {arch}: tensor parallelism rejects a full-width Q/K norm");
+                continue;
+            }
+            let moe = spec.moe.is_some();
+            let ff = if moe {
+                spec.ff
+            } else {
+                spec.ff.div_ceil(64) * 64
+            };
+            let model = write_spec(&TinySpec { ff, ..spec });
+            // Routing near-ties and the weighted expert sums add rounding
+            // steps the dense models do not have.
+            check_sharded(&model, &devices, if moe { 1e-3 } else { 1e-4 }, arch);
+            ran.push(arch);
+        }
+        for must in [
+            "llama",
+            "qwen2",
+            "qwen3",
+            "phi3",
+            "gemma3",
+            "granitemoe",
+            "qwen3moe",
+        ] {
+            assert!(ran.contains(&must), "{must} did not run: {ran:?}");
+        }
+    }
+
+    /// Load a split of `model` that must fail with a tensor-parallelism
+    /// configuration error naming `rule`. The rules are checked before any
+    /// device is opened or weight read, so a missing GPU does not matter.
+    fn assert_split_rejected(
+        model: &TinyModel,
+        shards: usize,
+        experts: &ExpertPlacement,
+        rule: &str,
+    ) {
+        use crate::provider::local::GpuAdapter;
+
+        let device = test_device().unwrap_or(LocalDevice::Vulkan(GpuAdapter::Default));
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let e = GpuTransformer::load_placed(
+            &content,
+            &model.path,
+            32,
+            device,
+            &vec![device; shards],
+            experts,
+            &Sizing::single(32),
+        )
+        .err()
+        .unwrap_or_else(|| panic!("a split with {shards} shards must be rejected ({rule})"));
+        match &e {
+            CucaError::Config(message) => assert!(
+                message.starts_with("tensor parallelism: ") && message.contains(rule),
+                "{message}"
+            ),
+            other => panic!("{rule}: expected a Config error, got {other:?}"),
+        }
+    }
+
+    /// Each rule of the split fails the load with a `CucaError::Config` that
+    /// names it (and the numbers it failed on).
+    #[test]
+    fn gpu_sharded_rejects_unsplittable_heads() {
+        let resident = ExpertPlacement::Resident;
+        let llama = TinySpec {
+            ff: 128,
+            ..TinySpec::llama()
+        };
+        // Heads that do not divide.
+        // (F32 weights: three heads of 16 are 48 columns, not a Q4_0 block
+        // multiple, which the tiny writer cannot quantize.)
+        let heads = write_spec(&TinySpec {
+            n_head: 3,
+            n_kv_head: 1,
+            weight_dtype: GgmlDType::F32,
+            ..llama.clone()
+        });
+        assert_split_rejected(&heads, 1, &resident, "attention heads do not divide");
+        // Three shards of four heads.
+        assert_split_rejected(&write_spec(&llama), 2, &resident, "4 heads, 3 shards");
+        // KV heads that neither divide nor replicate.
+        let kv = write_spec(&TinySpec {
+            n_head: 6,
+            n_kv_head: 3,
+            ..llama.clone()
+        });
+        assert_split_rejected(&kv, 1, &resident, "key/value heads");
+        // A shard's query width off the 32-element blocks (1 head of 16).
+        let narrow = write_spec(&TinySpec {
+            n_head: 2,
+            n_kv_head: 2,
+            ..llama.clone()
+        });
+        assert_split_rejected(&narrow, 1, &resident, "query width");
+        // The tiny llama's FFN width 96 leaves 48 per shard.
+        assert_split_rejected(
+            &write_spec(&TinySpec::llama()),
+            1,
+            &resident,
+            "dense FFN width",
+        );
+        // Full-width Q/K norms.
+        assert_split_rejected(
+            &write_spec(&TinySpec::olmo2()),
+            1,
+            &resident,
+            "full-width Q/K norm",
+        );
+        // Recurrent layers.
+        assert_split_rejected(&write_qwen35(&tiny_qwen35()), 1, &resident, "delta-net");
+        // Tiered experts.
+        let tiered = ExpertPlacement::Tiered(ExpertTiers {
+            ram_bytes: 0,
+            device_bytes: 1 << 20,
+            loader_threads: 1,
+            warm_from: None,
+        });
+        assert_split_rejected(
+            &write_spec(&TinySpec::granitemoe()),
+            1,
+            &tiered,
+            "tiered experts",
+        );
+    }
+
+    /// The sum over shards is added in shard order on the host and comes
+    /// back on every shard's device (with NCCL, in any order).
+    #[test]
+    fn gpu_all_reduce_adds_in_shard_order() {
+        let Some(mut locals) = two_test_devices() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let first = locals[0];
+        locals.resize(3, first);
+        let devices: Vec<Device> = locals.iter().map(|d| open_device(*d).unwrap()).collect();
+        let collective = Collective::new(&locals, &devices);
+        // (2^24 + 1) + 1 = 2^24 in f32, 2^24 + (1 + 1) = 2^24 + 2.
+        let parts: Vec<Tensor<2>> = [16_777_216.0f32, 1.0, 1.0]
+            .iter()
+            .zip(&devices)
+            .map(|(v, device)| Tensor::from_data(TensorData::new(vec![*v; 6], [2, 3]), device))
+            .collect();
+        let sums = collective.all_reduce_sum(parts).unwrap();
+        assert_eq!(sums.len(), 3);
+        for (s, (sum, device)) in sums.into_iter().zip(&devices).enumerate() {
+            assert!(
+                sum.device() == *device,
+                "shard {s}: the sum is on its device"
+            );
+            let values = read_f32(sum, "the sum").unwrap();
+            assert_eq!(values.len(), 6);
+            for v in values {
+                if collective.uses_nccl() {
+                    assert!(v == 16_777_216.0 || v == 16_777_218.0, "{v}");
+                } else {
+                    assert_eq!(v, 16_777_216.0, "shard {s}");
+                }
+            }
+        }
+    }
+
+    /// What a shard reads of every per-layer matrix of a tiny Phi 3 (fused
+    /// QKV and gate-up, several row ranges per cut), Llama (separate
+    /// projections) and Gemma 3 (one KV head, replicated) equals the rows
+    /// and columns of the whole tensor read the plain way, at world 2 for
+    /// both shards. The cut reads touch the file and the host only: the
+    /// reader's device is never used.
+    #[test]
+    fn cut_reads_match_the_whole_tensor() {
+        for spec in [
+            TinySpec {
+                ff: 128,
+                ..TinySpec::phi3()
+            },
+            TinySpec {
+                ff: 128,
+                ..TinySpec::llama()
+            },
+            TinySpec {
+                ff: 128,
+                ..TinySpec::gemma3()
+            },
+        ] {
+            let model = write_spec(&spec);
+            let content =
+                gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                    .unwrap();
+            let hp = read_hparams(&content).unwrap();
+            let device = Device::default();
+            let mut reader = WeightReader {
+                content: &content,
+                file: File::open(&model.path).unwrap(),
+                buf: Vec::new(),
+                device: &device,
+                dense: HashSet::new(),
+            };
+            let matrices: Vec<(String, usize, usize)> = content
+                .tensor_infos
+                .iter()
+                .filter_map(|(name, info)| match info.shape.dims() {
+                    [rows, cols] => Some((name.clone(), *rows, *cols)),
+                    _ => None,
+                })
+                .collect();
+            let mut cut_weights = 0;
+            for shard in 0..2 {
+                let tp = Tp { world: 2, shard };
+                for (tensor, rows, cols) in &matrices {
+                    let (rows, cols) = (*rows, *cols);
+                    let Some((il, part)) = tp::block_part(tensor) else {
+                        continue;
+                    };
+                    let layout = LayerLayout::read(&hp, il, &hp.layers[il], &content).unwrap();
+                    let cut = tp::part_cut(&hp, &layout, il, part, (rows, cols), tp);
+                    let dtype = reader.read(tensor, &[rows, cols]).unwrap();
+                    let whole = decode_rows(dtype, &reader.buf, cols);
+                    let (held, bytes) = reader.cut_bytes(tensor, (rows, cols), &cut).unwrap();
+                    assert_eq!(held, dtype, "{} {tensor}", spec.arch);
+                    let want: Vec<f32> = cut
+                        .rows
+                        .iter()
+                        .flat_map(|r| r.clone())
+                        .flat_map(|row| {
+                            whole[row * cols..(row + 1) * cols][cut.cols.clone()].to_vec()
+                        })
+                        .collect();
+                    assert_eq!(want.len(), cut.n_rows() * cut.cols.len());
+                    assert_eq!(
+                        decode_rows(held, &bytes, cut.cols.len()),
+                        want,
+                        "{} shard {shard} {tensor} {cut:?}",
+                        spec.arch
+                    );
+                    if !cut.is_whole(rows, cols) {
+                        cut_weights += 1;
+                    }
+                }
+            }
+            assert!(cut_weights > 0, "{}: nothing was cut", spec.arch);
+            // A cut outside the matrix is an error, not a panic.
+            let outside = Cut::rows_only(0..1000, 64);
+            assert!(
+                reader
+                    .cut_bytes("blk.0.attn_output.weight", (64, 128), &outside)
+                    .is_err()
+            );
+        }
     }
 }

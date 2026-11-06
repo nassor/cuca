@@ -181,6 +181,8 @@ pub(crate) mod rope;
 pub(crate) mod tier;
 #[cfg(test)]
 pub(crate) mod tiny;
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) mod tp;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -425,8 +427,10 @@ pub(crate) enum Model {
 impl Model {
     /// Load the model from the GGUF file at `path`, whose index `content` was
     /// read already, onto `device`, with a K/V cache for `context_length`
-    /// positions; `sizing` says how many sequences the K/V pools and the
-    /// recurrent-state slots serve.
+    /// positions; `shards` are the devices after `device` that share the
+    /// model (tensor parallelism, GPU only: empty for one device); `sizing`
+    /// says how many sequences the K/V pools and the recurrent-state slots
+    /// serve.
     ///
     /// # Errors
     ///
@@ -440,6 +444,7 @@ impl Model {
         path: &Path,
         context_length: usize,
         device: LocalDevice,
+        shards: &[LocalDevice],
         experts: &ExpertPlacement,
         sizing: &paged::Sizing,
     ) -> Result<Self, CucaError> {
@@ -457,13 +462,18 @@ impl Model {
                 path,
                 context_length,
                 device,
+                shards,
                 experts,
                 sizing,
             )?)),
             #[cfg(not(feature = "provider-local-gpu"))]
-            device => Err(super::device_unavailable(device).unwrap_or_else(|| {
-                CucaError::Config(format!("device {device:?} is not available"))
-            })),
+            device => {
+                // Shards are GPU devices: `validate` rejects them without one.
+                let _ = shards;
+                Err(super::device_unavailable(device).unwrap_or_else(|| {
+                    CucaError::Config(format!("device {device:?} is not available"))
+                }))
+            }
         }
     }
 
