@@ -571,9 +571,10 @@ impl std::str::FromStr for ModelSource {
 
 /// Default sampling parameters of a [`LocalModel`].
 ///
-/// `temperature` may be overridden per request with
-/// `UnifiedRequest::set_temperature`; `top_k`, `top_p` and `seed` apply to
-/// every request.
+/// Each value is overridden per request by the matching [`UnifiedRequest`]
+/// field (`set_temperature`, `set_top_k`, `set_top_p`, `set_seed`) and holds
+/// for requests that set none. A request `seed` restarts the generator for
+/// that request only; the load-time `seed` restarts it for every request.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SamplingConfig {
     /// Softmax temperature; `0.0` selects the greedy argmax.
@@ -1067,9 +1068,12 @@ pub(crate) struct LocalModelInner {
 ///   reasoning channel, and its effort level is ignored.
 /// - The engine is text-only: image blocks are rejected.
 /// - `UnifiedRequest::model` is not used for routing, since one client holds
-///   one model. `temperature` and `max_tokens` apply per request; `top_k`,
-///   `top_p` and `seed` come from [`SamplingConfig`]. Generation also stops
-///   at the context limit.
+///   one model. `temperature`, `max_tokens`, `top_p`, `top_k`, `seed` and
+///   `stop` apply per request and override the load-time [`SamplingConfig`]
+///   (a request `seed` restarts the generator for that request only);
+///   without one the [`SamplingConfig`] value holds. Generation ends at the
+///   first occurrence of a stop string (the stop text is not emitted), at
+///   `max_tokens`, at the end-of-generation token, or at the context limit.
 /// - Token usage in the response is exact, not estimated.
 ///
 /// # Build
@@ -1455,9 +1459,9 @@ impl CucaClient {
     /// # Errors
     ///
     /// [`CucaError::Config`] when no model is attached or the request's
-    /// `temperature` is invalid; [`CucaError::Provider`] when the request
-    /// cannot be rendered (for example an image block), the prompt does not
-    /// fit the context, or the engine has shut down.
+    /// `temperature` or `top_p` is invalid; [`CucaError::Provider`] when the
+    /// request cannot be rendered (for example an image block), the prompt
+    /// does not fit the context, or the engine has shut down.
     pub(crate) async fn dispatch_local(
         &self,
         req: UnifiedRequest,
@@ -1471,6 +1475,13 @@ impl CucaClient {
         {
             return Err(CucaError::Config(format!(
                 "temperature must be a finite value >= 0, got {t}"
+            )));
+        }
+        if let Some(p) = req.top_p
+            && (!p.is_finite() || p <= 0.0 || p > 1.0)
+        {
+            return Err(CucaError::Config(format!(
+                "top_p must be a finite value in (0, 1], got {p}"
             )));
         }
 
@@ -1496,6 +1507,10 @@ impl CucaClient {
             enable_thinking: prompt.enable_thinking,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
+            top_p: req.top_p,
+            top_k: req.top_k,
+            seed: req.seed,
+            stop: req.stop,
             events,
             metadata: metadata.clone(),
         };
@@ -2024,6 +2039,22 @@ mod tests {
             .err()
             .expect("non-finite temperature");
         assert!(matches!(&err, CucaError::Config(m) if m.contains("temperature")));
+
+        for p in [0.0, -0.5, 1.5, f32::NAN] {
+            let err = client
+                .generate_stream(
+                    UnifiedRequest::new("m")
+                        .add_user_message("abc")
+                        .set_top_p(p),
+                )
+                .await
+                .err()
+                .expect("invalid top_p");
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains("top_p")),
+                "{err:?}"
+            );
+        }
 
         // `<bos>` + 7 letters fills the 8-position context.
         let err = client

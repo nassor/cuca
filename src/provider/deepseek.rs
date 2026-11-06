@@ -197,7 +197,7 @@ mod tests {
     #[test]
     fn native_body_is_openai_shaped_with_deepseek_model() {
         let req = UnifiedRequest::new("deepseek-v4-pro").add_user_message("hi");
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["model"], json!("deepseek-v4-pro"));
         assert_eq!(body["stream"], json!(true));
@@ -212,7 +212,7 @@ mod tests {
             .add_user_message("hi")
             .enable_thinking(Some(ThinkingEffort::High));
         req.provider = ProviderEndpoint::DeepSeek;
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         // DeepSeek has no effort knob.
@@ -225,7 +225,7 @@ mod tests {
             .add_user_message("hi")
             .disable_thinking();
         req.provider = ProviderEndpoint::DeepSeek;
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
         assert!(body.get("reasoning_effort").is_none());
@@ -309,7 +309,7 @@ mod tests {
     #[test]
     fn native_body_never_emits_prompt_cache_fields() {
         let req = ephemeral_request("deepseek-v4-pro");
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
         let text = serde_json::to_string(&body).unwrap();
 
         assert!(
@@ -319,7 +319,7 @@ mod tests {
         // Byte-identical to the same request without a directive.
         let mut plain = req.clone();
         plain.prompt_cache = PromptCacheDirective::Disabled;
-        assert_eq!(body, build_chat_completion_body(&plain));
+        assert_eq!(body, build_chat_completion_body(&plain).unwrap());
     }
 
     /// DeepSeek never asks for provider caching, so a bridge response reports

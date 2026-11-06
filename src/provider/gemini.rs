@@ -50,8 +50,9 @@ use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint};
 ///   `System` message, joined with `\n`; omitted entirely when there is none.
 ///   Non-text blocks in system messages are dropped (Gemini has no system
 ///   image/thinking parts).
-/// - `generationConfig`: `temperature` and `maxOutputTokens` only when set;
-///   the whole key is omitted when neither is set.
+/// - `generationConfig`: `temperature`, `maxOutputTokens`, `topP`, `topK`,
+///   `seed` and `stopSequences` (non-empty only), each only when set; the
+///   whole key is omitted when none is set.
 /// - `contents`: one entry per non-system message: role `"user"` for
 ///   `User`/`Tool` messages and `"model"` for `Assistant`, with the parts built
 ///   by [`block_to_part`].
@@ -91,6 +92,18 @@ pub fn build_generate_content_body(req: &UnifiedRequest) -> Result<serde_json::V
     }
     if let Some(max_tokens) = req.max_tokens {
         generation.insert("maxOutputTokens".to_string(), serde_json::json!(max_tokens));
+    }
+    if let Some(top_p) = req.top_p {
+        generation.insert("topP".to_string(), serde_json::json!(top_p));
+    }
+    if let Some(top_k) = req.top_k {
+        generation.insert("topK".to_string(), serde_json::json!(top_k));
+    }
+    if let Some(seed) = req.seed {
+        generation.insert("seed".to_string(), serde_json::json!(seed));
+    }
+    if !req.stop.is_empty() {
+        generation.insert("stopSequences".to_string(), serde_json::json!(req.stop));
     }
     if !generation.is_empty() {
         body.insert(
@@ -511,6 +524,22 @@ mod tests {
             body["contents"],
             json!([{ "role": "user", "parts": [{ "text": "hi" }] }])
         );
+    }
+
+    #[test]
+    fn build_body_maps_top_p_top_k_seed_and_stop_sequences() {
+        let req = UnifiedRequest::new("gemini-2.0-flash")
+            .add_user_message("hi")
+            .set_top_p(0.7)
+            .set_top_k(30)
+            .set_seed(11)
+            .add_stop("END");
+        let body = build_generate_content_body(&req).unwrap();
+
+        assert_eq!(body["generationConfig"]["topP"], json!(0.7_f32));
+        assert_eq!(body["generationConfig"]["topK"], json!(30));
+        assert_eq!(body["generationConfig"]["seed"], json!(11));
+        assert_eq!(body["generationConfig"]["stopSequences"], json!(["END"]));
     }
 
     #[test]

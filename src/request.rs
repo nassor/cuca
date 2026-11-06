@@ -211,6 +211,23 @@ pub struct UnifiedRequest {
     pub temperature: Option<f32>,
     /// Optional cap on completion tokens; `None` defers to the provider default.
     pub max_tokens: Option<u32>,
+    /// Optional nucleus-sampling mass in `(0, 1]`: sampling keeps the smallest
+    /// set of likeliest tokens whose probability reaches it; `None` defers to
+    /// the provider default.
+    #[serde(default)]
+    pub top_p: Option<f32>,
+    /// Optional top-k cut: sampling keeps only the `k` likeliest tokens, and
+    /// `0` turns the cut off; `None` defers to the provider default.
+    #[serde(default)]
+    pub top_k: Option<u32>,
+    /// Optional sampling seed for reproducible output; `None` defers to the
+    /// provider default.
+    #[serde(default)]
+    pub seed: Option<u64>,
+    /// Stop sequences: generation ends before the first occurrence of any
+    /// entry, and the stop text is not emitted. Empty means none.
+    #[serde(default)]
+    pub stop: Vec<String>,
     /// Whether the request streams its response.
     pub stream: bool,
     /// Optional thinking capability; `None` defers to the provider's default
@@ -233,6 +250,10 @@ impl UnifiedRequest {
             messages: Vec::new(),
             temperature: None,
             max_tokens: None,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: Vec::new(),
             stream: true,
             thinking: None,
             tools: Vec::new(),
@@ -279,6 +300,31 @@ impl UnifiedRequest {
     /// Set the cap on completion tokens.
     pub fn set_max_tokens(mut self, n: u32) -> Self {
         self.max_tokens = Some(n);
+        self
+    }
+
+    /// Set the nucleus-sampling mass, in `(0, 1]`.
+    pub fn set_top_p(mut self, p: f32) -> Self {
+        self.top_p = Some(p);
+        self
+    }
+
+    /// Set the top-k cut (`0` turns it off).
+    pub fn set_top_k(mut self, k: u32) -> Self {
+        self.top_k = Some(k);
+        self
+    }
+
+    /// Set the sampling seed.
+    pub fn set_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Append a stop sequence: generation ends before its first occurrence
+    /// and the stop text is not emitted.
+    pub fn add_stop(mut self, stop: impl Into<String>) -> Self {
+        self.stop.push(stop.into());
         self
     }
 

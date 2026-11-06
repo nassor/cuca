@@ -84,7 +84,7 @@ Anthropic request building:
 - `unknown model ...: expected a preset (...) or repo:revision:file` and `unknown local device ...`.
 - ``device {device:?} requires the `{feature}` cargo feature`` for a GPU device compiled out; `device ... is not available`.
 - `context_length must be at least 1`, and `context_length {n} exceeds the model maximum {max}`.
-- `sampling.temperature must be a finite value >= 0`, `sampling.top_p must be in (0, 1]`, and `temperature must be a finite value >= 0` for a request temperature.
+- `sampling.temperature must be a finite value >= 0`, `sampling.top_p must be in (0, 1]`, `temperature must be a finite value >= 0` for a request temperature, and `top_p must be a finite value in (0, 1], got P` for a request `top_p`.
 - `DrafterSource::InTrunk runs on the CPU only`, and `draft_tokens must be in 1..=16` when a drafter is set.
 
 ## `PluginError`

@@ -56,7 +56,7 @@ Each omission is a decision, not a gap.
 - `ToolDefinition::input_schema` holds the tool's contract in keywords such as `const`, `enum`, and `pattern`. [Guardrails](@/plugins/guardrails.md) validates against the same schemas.
 - `ImageBase64 { media_type, data }`: a hit inside base64 is a coincidence, and rewriting it corrupts the image.
 - JSON object keys inside `arguments` belong to the tool's input contract.
-- `req.model`, `req.provider`, `temperature`, `max_tokens`, `stream`, `thinking`, and `prompt_cache` are routing and sampling settings, not text.
+- `req.model`, `req.provider`, `temperature`, `max_tokens`, `top_p`, `top_k`, `seed`, `stop`, `stream`, `thinking`, and `prompt_cache` are routing and sampling settings, not text.
 
 ### Inbound text
 

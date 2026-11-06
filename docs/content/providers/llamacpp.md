@@ -67,7 +67,7 @@ Completion route: the body is a JSON object with these keys:
 - `prompt` is assembled from the conversation. `System` message text comes first as bare context. `User` and `Assistant` messages are marked with `### User:` and `### Assistant:` prefixes.
 - Only `Text` blocks contribute. Images, thinking and tool blocks are dropped, and `Tool`-role messages are skipped.
 - `stream` is always `true`.
-- `temperature` is included only when set.
+- `temperature`, `top_p`, `top_k` and `seed` are included only when set, and `stop` only when non-empty.
 - `n_predict` carries `max_tokens`, or 128 when the request leaves it unset.
 - `n_threads` and `n_gpu_layers` are included only when configured, and `flash_attn` only when `true`.
 - `model` is `LlamaCppConfig::model`, or the request's model when that is empty. `llama-server` ignores it.

@@ -40,7 +40,8 @@ The request body is built from a `UnifiedRequest`:
 
 - `model` is the request's model; `messages` is one entry per unified message.
 - `stream` is always `true`, and `stream_options` is always `{"include_usage": true}`.
-- `temperature` and `max_tokens` are included only when set on the request.
+- `temperature`, `max_tokens`, `top_p` and `seed` are included only when set on the request, and `stop` (an array of strings) only when non-empty.
+- OpenAI's chat API has no `top_k`: a request that sets it fails with `CucaError::Config` (message: `top_k is not supported by OpenAI`).
 - `tools` carries every `UnifiedRequest::tools` entry as `{"type": "function", "function": {name, description, parameters}}`, with `parameters` holding the definition's `input_schema`. The key is omitted when the request declares no tool.
 - No `tool_choice` is sent, so the server's own selection default applies.
 - A message's `Text` blocks are joined with a newline into plain string content.

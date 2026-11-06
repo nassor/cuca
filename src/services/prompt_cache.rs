@@ -788,6 +788,10 @@ struct RequestDigest<'a> {
     messages: DigestSeq<'a, UnifiedMessage, MessageDigest<'a>>,
     temperature: Option<f32>,
     max_tokens: Option<u32>,
+    top_p: Option<f32>,
+    top_k: Option<u32>,
+    seed: Option<u64>,
+    stop: &'a [String],
     stream: bool,
     thinking: Option<&'a crate::request::ThinkingConfig>,
     tools: DigestSeq<'a, ToolDefinition, ToolDigest<'a>>,
@@ -804,6 +808,10 @@ impl<'a> From<&'a UnifiedRequest> for RequestDigest<'a> {
             messages,
             temperature,
             max_tokens,
+            top_p,
+            top_k,
+            seed,
+            stop,
             stream,
             thinking,
             tools,
@@ -815,6 +823,10 @@ impl<'a> From<&'a UnifiedRequest> for RequestDigest<'a> {
             messages: DigestSeq::new(messages),
             temperature: *temperature,
             max_tokens: *max_tokens,
+            top_p: *top_p,
+            top_k: *top_k,
+            seed: *seed,
+            stop,
             stream: *stream,
             thinking: thinking.as_ref(),
             tools: DigestSeq::new(tools),
@@ -1030,6 +1042,15 @@ mod tests {
         let max_tokens_changed = base.clone().set_max_tokens(64);
         assert_ne!(digest_request(&max_tokens_changed).unwrap(), base_digest);
 
+        for changed in [
+            base.clone().set_top_p(0.5),
+            base.clone().set_top_k(10),
+            base.clone().set_seed(1),
+            base.clone().add_stop("END"),
+        ] {
+            assert_ne!(digest_request(&changed).unwrap(), base_digest);
+        }
+
         let stream_changed = base.clone().with_stream(false);
         assert_ne!(digest_request(&stream_changed).unwrap(), base_digest);
 
@@ -1226,7 +1247,7 @@ mod tests {
         assert!(is_lowercase_sha256_hex(&digest), "{digest}");
         assert_eq!(
             digest,
-            "3aeb50cda5633431ed74604ec827993c4c9bf05a78582c6e42bfc4d9da308121"
+            "0d6a1b6e45d6d706deec3bd69db396ec5884464fb7528cf709c0463ea839df3a"
         );
     }
 

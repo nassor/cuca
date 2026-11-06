@@ -77,7 +77,10 @@ pub struct OpenAiCompatConfig {
 /// `stream_options.include_usage` is always `true` too, so the server reports
 /// the call's token usage in a final frame (see the
 /// [module docs](crate::provider::openai_compat)).
-/// `temperature`/`max_tokens` are included only when set. `tools` carries
+/// `temperature`/`max_tokens`/`top_p`/`seed` are included only when set, and
+/// `stop` (a JSON array of strings) only when non-empty. `top_k` is not part
+/// of the OpenAI chat API: it is sent as `top_k` to llama.cpp, vLLM and LM
+/// Studio, which accept it. `tools` carries
 /// every [`UnifiedRequest::tools`] entry as an OpenAI function tool,
 /// `{"type": "function", "function": {name, description, parameters}}` with
 /// `parameters` holding the definition's `input_schema`; the key is omitted
@@ -91,7 +94,12 @@ pub struct OpenAiCompatConfig {
 /// `CucaClient::generate_stream` overwrites `request.provider` with the
 /// client's selected provider before dispatch, so at body-build time
 /// `req.provider` is the effective provider.
-pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
+///
+/// # Errors
+///
+/// [`CucaError::Config`] when `req.top_k` is set and the effective provider is
+/// OpenAI, DeepSeek or a custom gateway, none of which accept `top_k`.
+pub fn build_chat_completion_body(req: &UnifiedRequest) -> Result<serde_json::Value, CucaError> {
     let messages: Vec<serde_json::Value> = req.messages.iter().map(message_to_wire).collect();
     let mut body = serde_json::Map::new();
     body.insert("model".to_string(), serde_json::json!(req.model));
@@ -101,6 +109,31 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
     }
     if let Some(max_tokens) = req.max_tokens {
         body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
+    }
+    if let Some(top_p) = req.top_p {
+        body.insert("top_p".to_string(), serde_json::json!(top_p));
+    }
+    if let Some(top_k) = req.top_k {
+        let unsupported = match req.provider {
+            ProviderEndpoint::LlamaCpp | ProviderEndpoint::Vllm | ProviderEndpoint::LmStudio => {
+                None
+            }
+            ProviderEndpoint::OpenAi => Some("OpenAI"),
+            ProviderEndpoint::DeepSeek => Some("DeepSeek"),
+            _ => Some("this endpoint"),
+        };
+        if let Some(name) = unsupported {
+            return Err(CucaError::Config(format!(
+                "`top_k` is not supported by {name}"
+            )));
+        }
+        body.insert("top_k".to_string(), serde_json::json!(top_k));
+    }
+    if let Some(seed) = req.seed {
+        body.insert("seed".to_string(), serde_json::json!(seed));
+    }
+    if !req.stop.is_empty() {
+        body.insert("stop".to_string(), serde_json::json!(req.stop));
     }
     if !req.tools.is_empty() {
         let tools: Vec<serde_json::Value> = req
@@ -165,7 +198,7 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> serde_json::Value {
             }
         }
     }
-    serde_json::Value::Object(body)
+    Ok(serde_json::Value::Object(body))
 }
 
 /// Unified thinking effort -> OpenAI `reasoning_effort` string.
@@ -630,7 +663,7 @@ pub async fn openai_compat_stream(
     // source of truth.
     let mut req = req;
     req.model = config.model.clone();
-    let mut request = http.post(&url).json(&build_chat_completion_body(&req));
+    let mut request = http.post(&url).json(&build_chat_completion_body(&req)?);
     if let Some(api_key) = &config.api_key {
         request = request.bearer_auth(api_key);
     }
@@ -747,7 +780,7 @@ mod tests {
             .add_user_message("hello")
             .set_temperature(0.7)
             .set_max_tokens(128);
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["model"], json!("gpt-4o"));
         assert_eq!(body["stream"], json!(true));
@@ -765,11 +798,71 @@ mod tests {
     #[test]
     fn build_body_omits_unset_knobs_and_always_streams() {
         let req = UnifiedRequest::new("gpt-4o").add_user_message("hi");
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert!(body.get("temperature").is_none());
         assert!(body.get("max_tokens").is_none());
         assert_eq!(body["stream"], json!(true));
+    }
+
+    #[test]
+    fn build_body_maps_top_p_seed_stop_and_top_k_for_local_servers() {
+        for provider in [
+            ProviderEndpoint::LlamaCpp,
+            ProviderEndpoint::Vllm,
+            ProviderEndpoint::LmStudio,
+        ] {
+            let mut req = UnifiedRequest::new("m")
+                .add_user_message("hi")
+                .set_top_p(0.9)
+                .set_top_k(40)
+                .set_seed(7)
+                .add_stop("END")
+                .add_stop("\n\n");
+            req.provider = provider;
+            let body = build_chat_completion_body(&req).unwrap();
+
+            assert_eq!(body["top_p"], json!(0.9_f32));
+            assert_eq!(body["top_k"], json!(40));
+            assert_eq!(body["seed"], json!(7));
+            assert_eq!(body["stop"], json!(["END", "\n\n"]));
+        }
+    }
+
+    #[test]
+    fn build_body_omits_unset_sampling_keys() {
+        let body = build_chat_completion_body(&UnifiedRequest::new("m")).unwrap();
+        for key in ["top_p", "top_k", "seed", "stop"] {
+            assert!(body.get(key).is_none(), "{key} must be omitted");
+        }
+    }
+
+    #[test]
+    fn build_body_openai_keeps_top_p_seed_stop_and_rejects_top_k() {
+        let mut req = UnifiedRequest::new("gpt-4o")
+            .set_top_p(0.5)
+            .set_seed(1)
+            .add_stop("x");
+        req.provider = ProviderEndpoint::OpenAi;
+        let body = build_chat_completion_body(&req).unwrap();
+        assert_eq!(body["top_p"], json!(0.5_f32));
+        assert_eq!(body["seed"], json!(1));
+        assert_eq!(body["stop"], json!(["x"]));
+        assert!(body.get("top_k").is_none());
+
+        for (provider, name) in [
+            (ProviderEndpoint::OpenAi, "OpenAI"),
+            (ProviderEndpoint::DeepSeek, "DeepSeek"),
+            (ProviderEndpoint::Custom("gw".into()), "this endpoint"),
+        ] {
+            let mut req = UnifiedRequest::new("m").set_top_k(5);
+            req.provider = provider;
+            let err = build_chat_completion_body(&req).unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if *m == format!("`top_k` is not supported by {name}")),
+                "{err:?}"
+            );
+        }
     }
 
     #[test]
@@ -783,7 +876,7 @@ mod tests {
         ] {
             let mut req = UnifiedRequest::new("m").add_user_message("hi");
             req.provider = provider.clone();
-            let body = build_chat_completion_body(&req);
+            let body = build_chat_completion_body(&req).unwrap();
 
             assert_eq!(
                 body["stream_options"],
@@ -807,7 +900,7 @@ mod tests {
             name: None,
             tool_call_id: None,
         });
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(
             body["messages"][0]["content"],
@@ -830,7 +923,7 @@ mod tests {
             name: None,
             tool_call_id: None,
         });
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         // No text accompanies the call, so content is null.
         assert_eq!(body["messages"][0]["content"], json!(null));
@@ -858,7 +951,7 @@ mod tests {
             name: None,
             tool_call_id: Some("call_1".into()),
         });
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(
             body["messages"][0],
@@ -879,7 +972,7 @@ mod tests {
                     "required": ["city"],
                 }),
             });
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(
             body["tools"],
@@ -903,7 +996,7 @@ mod tests {
     #[test]
     fn build_body_omits_tools_when_none_declared() {
         let req = UnifiedRequest::new("gpt-4o").add_user_message("hi");
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert!(body.get("tools").is_none());
     }
@@ -919,7 +1012,7 @@ mod tests {
             name: None,
             tool_call_id: None,
         });
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(
             body["messages"][0]["reasoning_content"],
@@ -948,7 +1041,7 @@ mod tests {
             name: None,
             tool_call_id: None,
         });
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert!(body["messages"][0].get("reasoning_content").is_none());
     }
@@ -968,7 +1061,7 @@ mod tests {
             let req = UnifiedRequest::new("gpt-5")
                 .add_user_message("hi")
                 .enable_thinking(Some(effort));
-            let body = build_chat_completion_body(&req);
+            let body = build_chat_completion_body(&req).unwrap();
 
             assert_eq!(body["reasoning_effort"], json!(expected));
             assert!(body.get("thinking").is_none());
@@ -980,7 +1073,7 @@ mod tests {
         let req = UnifiedRequest::new("gpt-5")
             .add_user_message("hi")
             .enable_thinking(None);
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["reasoning_effort"], json!("medium"));
     }
@@ -996,7 +1089,7 @@ mod tests {
                     reasoning_effort: Some("high".into()),
                 },
             });
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["reasoning_effort"], json!("high"));
     }
@@ -1007,7 +1100,7 @@ mod tests {
             .add_user_message("hi")
             .enable_thinking(Some(ThinkingEffort::High))
             .disable_thinking();
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
@@ -1016,7 +1109,7 @@ mod tests {
     #[test]
     fn build_body_omits_thinking_keys_when_unset() {
         let req = UnifiedRequest::new("gpt-5").add_user_message("hi");
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert!(body.get("reasoning_effort").is_none());
         assert!(body.get("thinking").is_none());
@@ -1028,7 +1121,7 @@ mod tests {
             .add_user_message("hi")
             .enable_thinking(Some(ThinkingEffort::High));
         req.provider = ProviderEndpoint::DeepSeek;
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "enabled" }));
         assert!(body.get("reasoning_effort").is_none());
@@ -1040,7 +1133,7 @@ mod tests {
             .add_user_message("hi")
             .disable_thinking();
         req.provider = ProviderEndpoint::DeepSeek;
-        let body = build_chat_completion_body(&req);
+        let body = build_chat_completion_body(&req).unwrap();
 
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
         assert!(body.get("reasoning_effort").is_none());

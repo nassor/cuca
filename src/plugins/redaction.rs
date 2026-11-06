@@ -42,8 +42,10 @@
 //!   coincidence, and rewriting the payload corrupts the image.
 //! - JSON **object keys** inside `arguments` — part of the tool's input
 //!   contract, not user data.
-//! - `model`, `provider`, `temperature`, `max_tokens`, `stream`, `thinking`,
-//!   `prompt_cache` — routing and sampling knobs, not text. `provider` in
+//! - `model`, `provider`, `temperature`, `max_tokens`, `top_p`, `top_k`,
+//!   `seed`, `stop`, `stream`, `thinking`, `prompt_cache` — routing and
+//!   sampling knobs, not text (`stop` strings are delimiters the model's own
+//!   output is matched against, and are sent as written). `provider` in
 //!   particular is authoritative (see the
 //!   [field-usage contract](crate::request)).
 //!

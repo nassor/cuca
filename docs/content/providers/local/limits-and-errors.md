@@ -23,7 +23,7 @@ weight = 3
 | Waiting requests | 16 behind the running one | `generate_stream` waits for a free slot; no error |
 | Output channel | 64 blocks | the engine waits for the consumer, so a slow consumer paces generation |
 | Prompt | fewer than `context_length` tokens | `CucaError::Provider`: `prompt has N tokens; context_length is M` |
-| Completion | `max_tokens` and the remaining context | generation stops |
+| Completion | `max_tokens`, the remaining context and any `stop` string | generation stops |
 | K/V cache | `context_length` positions per full-attention layer, at most `window - 1 + 1280` per sliding-window layer, preallocated | no growth; a full sliding-window layer moves its recent positions to the front; the cache is reused across requests |
 | `draft_tokens` | `1..=16` with a drafter | `CucaError::Config` at load |
 | Prefill chunk | 256 tokens at most | a longer prompt prefills in chunks |
@@ -69,7 +69,7 @@ weight = 3
 
 `CucaClientBuilder::build` and `generate_stream` return:
 
-- `CucaError::Config` when `ProviderEndpoint::Local` has no model: `ProviderEndpoint::Local requires CucaClientBuilder::with_local_model`. The check runs at `build` and again at dispatch. A request `temperature` that is not finite or is below 0 is also `CucaError::Config`.
+- `CucaError::Config` when `ProviderEndpoint::Local` has no model: `ProviderEndpoint::Local requires CucaClientBuilder::with_local_model`. The check runs at `build` and again at dispatch. A request `temperature` that is not finite or is below 0, or a request `top_p` outside `(0, 1]` (`top_p must be a finite value in (0, 1], got P`), is also `CucaError::Config`.
 - `CucaError::Provider` for a request the engine cannot take:
   - An `ImageBase64` block: `the local engine is text-only; ImageBase64 blocks are not supported`.
   - Tool call `arguments` that are not a JSON object: ``tool call `NAME` arguments must be a JSON object``.

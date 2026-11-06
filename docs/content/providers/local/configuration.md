@@ -48,8 +48,8 @@ weight = 1
 | `top_p` | `0.95` | nucleus threshold in `(0, 1]`; `1.0` disables the filter |
 | `seed` | `None` | fixed generator seed |
 
-- A request's `temperature` overrides the config value for that request. `top_k`, `top_p` and `seed` apply to every request.
-- With `seed: Some(n)`, every request restarts the generator from `n`, so equal prompts sample equal tokens. With `None`, the generator is seeded from the system once at load.
+- A request's `temperature`, `top_k`, `top_p` and `seed` override the config value for that request (`set_temperature`, `set_top_k`, `set_top_p`, `set_seed`); a request that leaves one unset takes the config value.
+- With `seed: Some(n)`, every request restarts the generator from `n`, so equal prompts sample equal tokens; a request `seed` does the same for that request alone. With `None`, the generator is seeded from the system once at load.
 - The sampler applies temperature, top-k, softmax and top-p in that order, then draws once. Temperature `0.0` takes the first maximum.
 
 ### Environment variables

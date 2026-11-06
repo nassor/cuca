@@ -18,12 +18,15 @@
 //!    in-trunk head takes the final-norm hidden row of every position
 //!    (`Drafter::observe`).
 //! 3. **Decode**: sample, stop on an end-of-generation id, feed the id through
-//!    the [`OutputParser`] and forward every resulting block to the stream with
-//!    a blocking send (a slow consumer backpressures generation), then run the
-//!    model one token further (a round: draft, verify one batch, roll back the
-//!    rejected positions, let the in-trunk head observe the kept rows).
-//!    Generation stops at the end-of-generation id, at `max_tokens`, or when
-//!    the context is full.
+//!    the [`OutputParser`], cut its text at the first stop string of the job
+//!    ([`StopMatcher`]; thinking and tool calls pass through, and text a stop
+//!    string might still begin is held back) and forward every resulting
+//!    block to the stream with a blocking send (a slow consumer backpressures
+//!    generation), then run the model one token further (a round: draft,
+//!    verify one batch, roll back the rejected positions, let the in-trunk
+//!    head observe the kept rows). Generation stops at the end-of-generation
+//!    id, at a stop string, at `max_tokens`, or when the context is full;
+//!    held text is released at every end but a stop string.
 //! 4. **Usage**: exact prompt and completion token counts are recorded in the
 //!    response metadata before the stream ends.
 //!
@@ -31,6 +34,8 @@
 //! item; a panic inside a job is caught, reported the same way, and the engine
 //! keeps serving later jobs. A job whose consumer has gone away leaves the
 //! cache consistent with the ids it processed, so its work is reusable.
+
+mod stop;
 
 use std::fs::File;
 use std::io::BufReader;
@@ -42,6 +47,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use candle_core::quantized::gguf_file;
 use tokio::sync::mpsc;
 
+use self::stop::StopMatcher;
 use super::chat::{ChatFormat, ChatTemplate};
 use super::model::cpu::Hidden;
 use super::model::mtp::Drafter;
@@ -74,6 +80,14 @@ pub(crate) struct Job {
     pub(crate) temperature: Option<f32>,
     /// Per-request cap on completion tokens.
     pub(crate) max_tokens: Option<u32>,
+    /// Per-request nucleus mass in `(0, 1]`, overriding the load-time one.
+    pub(crate) top_p: Option<f32>,
+    /// Per-request top-k (`0` disables it), overriding the load-time one.
+    pub(crate) top_k: Option<u32>,
+    /// Per-request seed: restarts the generator for this request only.
+    pub(crate) seed: Option<u64>,
+    /// Stop strings: generation ends before the first occurrence of any.
+    pub(crate) stop: Vec<String>,
     /// Where output blocks (or the failure) go; dropping it ends the stream.
     pub(crate) events: mpsc::Sender<Result<MessageContentBlock, CucaError>>,
     /// Receives the prompt-cache and token usage of this job.
@@ -576,6 +590,10 @@ impl Engine {
             enable_thinking,
             temperature,
             max_tokens,
+            top_p,
+            top_k,
+            seed,
+            stop,
             events,
             metadata,
         } = job;
@@ -692,10 +710,15 @@ impl Engine {
 
         // 4. Generation setup.
         let temperature = temperature.unwrap_or(self.sampling.temperature);
-        let (top_k, top_p) = (self.sampling.top_k, self.sampling.top_p);
-        let seed_fixed = self.sampling.seed.is_some();
-        let mut seeded = self.sampling.seed.map(SplitMix64);
+        let top_k = top_k.map_or(self.sampling.top_k, |k| k as usize);
+        let top_p = top_p.unwrap_or(self.sampling.top_p);
+        // A request seed wins over the load-time one; either restarts the
+        // generator for this request alone.
+        let request_seed = seed.or(self.sampling.seed);
+        let seed_fixed = request_seed.is_some();
+        let mut seeded = request_seed.map(SplitMix64);
         let rng = seeded.as_mut().unwrap_or(&mut self.rng);
+        let mut sink = Sink::new(&events, &stop);
         let budget = max_tokens
             .map_or(usize::MAX, |n| n as usize)
             .min(self.context_length - prompt_len);
@@ -727,10 +750,10 @@ impl Engine {
             }
             completion += 1;
             parser.push(id, &tokenizer, &mut next_call_id, &mut items);
-            for item in items.drain(..) {
-                if events.blocking_send(item).is_err() {
-                    return;
-                }
+            match sink.send(&mut items) {
+                Flow::Go => {}
+                Flow::Stopped => break,
+                Flow::Closed => return,
             }
             if completion == budget || self.cached.len() == self.context_length {
                 break;
@@ -952,10 +975,10 @@ impl Engine {
                 }
                 completion += 1;
                 parser.push(d, &tokenizer, &mut next_call_id, &mut items);
-                for item in items.drain(..) {
-                    if events.blocking_send(item).is_err() {
-                        return;
-                    }
+                match sink.send(&mut items) {
+                    Flow::Go => {}
+                    Flow::Stopped => break 'decode,
+                    Flow::Closed => return,
                 }
                 if completion == budget {
                     break 'decode;
@@ -963,10 +986,15 @@ impl Engine {
             }
         }
 
-        // 6. Flush whatever the parser still holds.
-        parser.finish(&mut next_call_id, &mut items);
-        for item in items.drain(..) {
-            if events.blocking_send(item).is_err() {
+        // 6. Flush whatever the parser and the stop matcher still hold, unless
+        // a stop string ended the reply: nothing after it is emitted.
+        if !sink.stopped {
+            parser.finish(&mut next_call_id, &mut items);
+            let mut flow = sink.send(&mut items);
+            if flow == Flow::Go {
+                flow = sink.finish();
+            }
+            if flow == Flow::Closed {
                 return;
             }
         }
@@ -982,6 +1010,92 @@ impl Engine {
 
 fn saturating_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+/// What forwarding output to the stream tells the decode loop.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    /// Keep generating.
+    Go,
+    /// A stop string ended the reply: the cut text is sent, nothing follows.
+    Stopped,
+    /// The consumer dropped the stream.
+    Closed,
+}
+
+/// Forwards the parser's output to the stream, cutting text at the job's stop
+/// strings.
+struct Sink<'a> {
+    events: &'a mpsc::Sender<Result<MessageContentBlock, CucaError>>,
+    stop: StopMatcher,
+    /// A stop string has matched.
+    stopped: bool,
+}
+
+impl<'a> Sink<'a> {
+    fn new(
+        events: &'a mpsc::Sender<Result<MessageContentBlock, CucaError>>,
+        stop: &[String],
+    ) -> Self {
+        Self {
+            events,
+            stop: StopMatcher::new(stop),
+            stopped: false,
+        }
+    }
+
+    /// Send `text` as one block (nothing for an empty one); `false` when the
+    /// consumer is gone.
+    fn emit_text(&self, text: String) -> bool {
+        text.is_empty()
+            || self
+                .events
+                .blocking_send(Ok(MessageContentBlock::Text(text)))
+                .is_ok()
+    }
+
+    /// Send `items` in order, draining them. Text goes through the stop
+    /// matcher; any other block first releases the text held back (it came
+    /// earlier) and then passes through. Items after a stop match are dropped.
+    fn send(&mut self, items: &mut Vec<Result<MessageContentBlock, CucaError>>) -> Flow {
+        for item in items.drain(..) {
+            if self.stop.is_passthrough() {
+                if self.events.blocking_send(item).is_err() {
+                    return Flow::Closed;
+                }
+                continue;
+            }
+            match item {
+                Ok(MessageContentBlock::Text(text)) => {
+                    let out = self.stop.push(&text);
+                    if !self.emit_text(out.emit) {
+                        return Flow::Closed;
+                    }
+                    if out.done {
+                        self.stopped = true;
+                        return Flow::Stopped;
+                    }
+                }
+                other => {
+                    let held = self.stop.flush();
+                    if !self.emit_text(held) || self.events.blocking_send(other).is_err() {
+                        return Flow::Closed;
+                    }
+                }
+            }
+        }
+        Flow::Go
+    }
+
+    /// Release the text still held back at an end that is not a stop match.
+    fn finish(&mut self) -> Flow {
+        let held = self.stop.flush();
+        if self.emit_text(held) {
+            Flow::Go
+        } else {
+            Flow::Closed
+        }
+    }
 }
 
 /// The last of the `rows` equal-width rows held in `h`, kept in the same
@@ -1122,17 +1236,34 @@ mod tests {
     }
 
     fn run(e: &mut Engine, prompt: &[u32], max_tokens: Option<u32>) -> Outcome {
+        run_with(e, prompt, max_tokens, |_| {})
+    }
+
+    /// [`run`] with `edit` applied to the job first (sampling overrides, stop
+    /// strings).
+    fn run_with(
+        e: &mut Engine,
+        prompt: &[u32],
+        max_tokens: Option<u32>,
+        edit: impl FnOnce(&mut Job),
+    ) -> Outcome {
         let (tx, mut rx) = mpsc::channel(1024);
         let metadata = ResponseMetadataHandle::empty();
-        e.run(Job {
+        let mut job = Job {
             prompt_ids: prompt.to_vec(),
             start_in_thinking: false,
             enable_thinking: false,
             temperature: None,
             max_tokens,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: Vec::new(),
             events: tx,
             metadata: metadata.clone(),
-        });
+        };
+        edit(&mut job);
+        e.run(job);
         let mut items = Vec::new();
         while let Some(item) = rx.blocking_recv() {
             items.push(item);
@@ -1219,6 +1350,58 @@ mod tests {
     }
 
     #[test]
+    fn a_stop_string_cuts_the_reply_and_usage_is_still_reported() {
+        let model = write_tiny_model();
+        let mut e = engine(&model, 32, 0.0, None);
+        let plain = text(&run(&mut e, &PROMPT, Some(8)));
+        assert!(plain.len() >= 3, "tiny model reply too short: {plain:?}");
+
+        // Stop at the second character of the reply: what precedes its first
+        // occurrence is all that is emitted.
+        let stop = plain[1..2].to_string();
+        let cut = &plain[..plain.find(&stop).unwrap()];
+        let out = run_with(&mut e, &PROMPT, Some(8), |job| {
+            job.stop = vec![stop.clone()]
+        });
+        assert_eq!(text(&out), cut);
+        assert!(out.metadata.token_usage.is_some());
+
+        // Stop strings that never occur change nothing, and the held tail is
+        // flushed at the end.
+        let out = run_with(&mut e, &PROMPT, Some(8), |job| {
+            job.stop = vec!["zzz".to_string(), format!("{}!", &plain[plain.len() - 1..])];
+        });
+        assert_eq!(text(&out), plain);
+    }
+
+    #[test]
+    fn a_request_seed_restarts_the_generator_for_that_request() {
+        let model = write_tiny_model();
+        let mut e = engine(&model, 32, 1.0, None);
+        let first = text(&run_with(&mut e, &PROMPT, Some(6), |job| {
+            job.seed = Some(7)
+        }));
+        // Another request in between moves the engine's own generator.
+        run(&mut e, &PROMPT, Some(6));
+        let second = text(&run_with(&mut e, &PROMPT, Some(6), |job| {
+            job.seed = Some(7)
+        }));
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn request_top_k_one_is_greedy() {
+        let model = write_tiny_model();
+        let mut greedy = engine(&model, 32, 0.0, None);
+        let want = text(&run(&mut greedy, &PROMPT, Some(6)));
+        let mut e = engine(&model, 32, 1.0, None);
+        let got = text(&run_with(&mut e, &PROMPT, Some(6), |job| {
+            job.top_k = Some(1)
+        }));
+        assert_eq!(got, want);
+    }
+
+    #[test]
     fn warm_cache_generates_what_a_cold_engine_generates() {
         let model = write_tiny_model();
         let mut warm = engine(&model, 32, 0.0, None);
@@ -1274,6 +1457,10 @@ mod tests {
             enable_thinking: false,
             temperature: None,
             max_tokens: Some(10),
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: Vec::new(),
             events: tx,
             metadata: ResponseMetadataHandle::empty(),
         });

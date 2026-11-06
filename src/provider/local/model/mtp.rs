@@ -30,7 +30,7 @@
 //! [`Drafter::draft`] runs such a chain. Verification (one batched target
 //! forward over the pending token and the drafts, longest-prefix acceptance,
 //! cache truncation) lives in the engine, which keeps the output equal to the
-//! target's own (see `engine.rs`).
+//! target's own (see `engine`).
 //!
 //! # Memory
 //!

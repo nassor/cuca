@@ -54,6 +54,9 @@
 //! 4. `long_context_needle`: a 1,000+ token prompt, past any sliding window,
 //!    with a code word to retrieve ("PELICAN").
 //! 5. `prefix_reuse_hits_and_matches_cold`: `prompt_cache_usage`.
+//! 6. `stop_string_cuts_the_reply`: `stop = ["5"]` on a counting prompt ends
+//!    the reply before the first "5" (thinking is switched off where the
+//!    model allows it).
 //!
 //! One model is loaded for the whole binary and the tests take turns on its
 //! single engine, so they run sequentially whatever the test harness does.
@@ -572,6 +575,47 @@ async fn thinking_off_has_no_reasoning() {
     let usage = reply.response.usage.expect("usage");
     assert_eq!(usage.reasoning_tokens, None, "[{}]", caps.name);
     passed("thinking_off_has_no_reasoning");
+}
+
+#[tokio::test]
+async fn stop_string_cuts_the_reply() {
+    live_model!(live, _turn);
+    let (model, caps) = (&live.model, &live.caps);
+    let prompt = "Count from 1 to 10 separated by commas";
+    let make = || {
+        let mut req = request()
+            .add_user_message(prompt)
+            .set_max_tokens(caps.budget(64, 2048));
+        if caps.can_disable_thinking {
+            req = req.disable_thinking();
+        }
+        req
+    };
+
+    // Without a stop string the count runs past 5: the cut below is real.
+    let full = ask(model, make()).await;
+    assert!(
+        full.text().contains('5'),
+        "[{}] the unstopped count reaches 5: {:?}",
+        caps.name,
+        full.blocks
+    );
+
+    let cut = ask(model, make().add_stop("5")).await;
+    let text = cut.text();
+    assert!(
+        text.contains('4'),
+        "[{}] the reply keeps what precedes the stop: {text:?}",
+        caps.name
+    );
+    assert!(
+        !text.contains('5'),
+        "[{}] the stop string and what follows are cut: {text:?}",
+        caps.name
+    );
+    let usage = cut.response.usage.expect("usage reported after a stop");
+    assert!(usage.completion_tokens > 0);
+    passed("stop_string_cuts_the_reply");
 }
 
 /// The `get_weather` tool of the round-trip scenarios.

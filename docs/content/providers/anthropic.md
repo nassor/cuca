@@ -54,7 +54,8 @@ The request body is built from a `UnifiedRequest`:
 
 - `model` is the request's model; `stream` is always `true`.
 - `max_tokens` is required by the API and defaults to 1024 when the request leaves it unset.
-- `temperature` is included only when set.
+- `temperature`, `top_p`, `top_k` and `stop_sequences` (from `UnifiedRequest::stop`) are included only when set or non-empty.
+- The API has no seed: a request that sets `seed` fails with `CucaError::Config` (message: `seed is not supported by Anthropic`).
 - `system` is every `Text` block of every `System` message joined with a newline, as one string. With a prompt cache breakpoint on a system block it is an array of `{type: "text"}` blocks instead. Non-text system blocks are dropped, and the key is omitted with no system messages.
 - `messages` carries user and assistant turns only. Tool results ride inside a user message as `tool_result` blocks, and standalone `Tool`-role messages are skipped.
 - `tools` carries every `UnifiedRequest::tools` entry as `{name, description, input_schema}`. The key is omitted when the request declares no tool, and no `tool_choice` is sent.

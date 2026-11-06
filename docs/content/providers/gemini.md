@@ -45,7 +45,7 @@ The base URL has no `/v1` suffix. The adapter appends the `/v1beta` segment, the
 The request body is built from a `UnifiedRequest`. The model is not in the body.
 
 - `system_instruction` is `{parts: [{text}]}` built from every `Text` block of every `System` message, joined with a newline. Non-text system blocks are dropped, and the key is omitted with no system messages.
-- `generationConfig` carries `temperature` and `maxOutputTokens` only when set. The key is omitted when neither is set.
+- `generationConfig` carries `temperature`, `maxOutputTokens`, `topP`, `topK`, `seed` and `stopSequences` only when set or non-empty. The key is omitted when none is set.
 - `contents` has one entry per non-system message. The role is `"user"` for `User` and `Tool` messages and `"model"` for `Assistant` messages.
 - `tools` is one entry whose `functionDeclarations` array holds every `UnifiedRequest::tools` definition as `{name, description, parameters}`, with `parameters` holding the `input_schema`. The key is omitted when the request declares no tool, and no `toolConfig` is sent.
 - Content blocks map to `parts` as follows:

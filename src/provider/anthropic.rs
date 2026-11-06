@@ -301,6 +301,9 @@ pub fn authorization_url(cfg: &OAuthPkceConfig, challenge: &str, state: &str) ->
 ///   `{name, description, input_schema}`, the Anthropic tool shape; the key is
 ///   omitted when the request declares no tool, and `tool_choice` is never
 ///   emitted, so the API's own selection default applies.
+/// - `top_p`, `top_k` and `stop_sequences` (from [`UnifiedRequest::stop`]) are
+///   emitted only when set / non-empty. The API has no seed: a request that
+///   sets one is rejected rather than silently losing reproducibility.
 ///
 /// When `req.thinking` is set, a top-level `thinking` key is emitted: adaptive
 /// mode (`{"type": "adaptive"}` plus `effort` when a unified effort is set)
@@ -314,8 +317,13 @@ pub fn authorization_url(cfg: &OAuthPkceConfig, challenge: &str, state: &str) ->
 /// # Errors
 ///
 /// [`CucaError::Config`] when a prompt-cache breakpoint cannot be represented
-/// (see `cache_marks`).
+/// (see `cache_marks`), or when `req.seed` is set.
 pub fn build_anthropic_request(req: &UnifiedRequest) -> Result<serde_json::Value, CucaError> {
+    if req.seed.is_some() {
+        return Err(CucaError::Config(
+            "`seed` is not supported by Anthropic".to_string(),
+        ));
+    }
     let marks = cache_marks(req)?;
     // `(text, cache-marked)` per system text block, in unified order.
     let mut system: Vec<(&str, bool)> = Vec::new();
@@ -363,6 +371,15 @@ pub fn build_anthropic_request(req: &UnifiedRequest) -> Result<serde_json::Value
     );
     if let Some(temperature) = req.temperature {
         body.insert("temperature".to_string(), serde_json::json!(temperature));
+    }
+    if let Some(top_p) = req.top_p {
+        body.insert("top_p".to_string(), serde_json::json!(top_p));
+    }
+    if let Some(top_k) = req.top_k {
+        body.insert("top_k".to_string(), serde_json::json!(top_k));
+    }
+    if !req.stop.is_empty() {
+        body.insert("stop_sequences".to_string(), serde_json::json!(req.stop));
     }
     body.insert("stream".to_string(), serde_json::Value::Bool(true));
     if !system.is_empty() {
@@ -1228,6 +1245,39 @@ mod tests {
         assert!(body.get("system").is_none());
         assert_eq!(body["max_tokens"], json!(2048));
         assert_eq!(body["temperature"], json!(0.5_f32));
+    }
+
+    #[test]
+    fn build_body_maps_top_p_top_k_and_stop_sequences() {
+        let req = UnifiedRequest::new("claude-3-5-sonnet-20241022")
+            .add_user_message("hi")
+            .set_top_p(0.8)
+            .set_top_k(20)
+            .add_stop("END")
+            .add_stop("STOP");
+        let body = build_anthropic_request(&req).unwrap();
+
+        assert_eq!(body["top_p"], json!(0.8_f32));
+        assert_eq!(body["top_k"], json!(20));
+        assert_eq!(body["stop_sequences"], json!(["END", "STOP"]));
+        assert!(body.get("seed").is_none());
+
+        let plain = build_anthropic_request(&UnifiedRequest::new("m")).unwrap();
+        for key in ["top_p", "top_k", "stop_sequences"] {
+            assert!(plain.get(key).is_none(), "{key} must be omitted");
+        }
+    }
+
+    #[test]
+    fn build_body_rejects_seed() {
+        let req = UnifiedRequest::new("claude-3-5-sonnet-20241022")
+            .add_user_message("hi")
+            .set_seed(3);
+        let err = build_anthropic_request(&req).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m == "`seed` is not supported by Anthropic"),
+            "{err:?}"
+        );
     }
 
     #[test]

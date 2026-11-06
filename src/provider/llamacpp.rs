@@ -92,8 +92,9 @@ const DEFAULT_N_PREDICT: u32 = 128;
 
 /// Build the native `/completion` request body for a [`UnifiedRequest`].
 ///
-/// `stream` is always `true` (the client only consumes SSE); `temperature` is
-/// included only when set; `n_predict` carries `max_tokens` (or
+/// `stream` is always `true` (the client only consumes SSE); `temperature`,
+/// `top_p`, `top_k` and `seed` are included only when set, `stop` only when
+/// non-empty; `n_predict` carries `max_tokens` (or
 /// [`DEFAULT_N_PREDICT`]); `n_threads`/`n_gpu_layers`/`flash_attn` appear only
 /// when configured. The prompt is the role-marked conversation assembled by
 /// [`assemble_prompt`]. Following the effective-model pattern of
@@ -119,6 +120,18 @@ pub fn build_completion_body(req: &UnifiedRequest, cfg: &LlamaCppConfig) -> serd
         "n_predict".to_string(),
         json!(req.max_tokens.unwrap_or(DEFAULT_N_PREDICT)),
     );
+    if let Some(top_p) = req.top_p {
+        body.insert("top_p".to_string(), json!(top_p));
+    }
+    if let Some(top_k) = req.top_k {
+        body.insert("top_k".to_string(), json!(top_k));
+    }
+    if let Some(seed) = req.seed {
+        body.insert("seed".to_string(), json!(seed));
+    }
+    if !req.stop.is_empty() {
+        body.insert("stop".to_string(), json!(req.stop));
+    }
     if let Some(threads) = cfg.n_threads {
         body.insert("n_threads".to_string(), json!(threads));
     }
@@ -436,6 +449,28 @@ mod tests {
             body["prompt"],
             json!("you are a coding assistant\n### User:\nwrite a sort\n### Assistant:\nsure\n")
         );
+    }
+
+    #[test]
+    fn completion_body_maps_top_p_top_k_seed_and_stop() {
+        let req = UnifiedRequest::new("m")
+            .add_user_message("hi")
+            .set_top_p(0.95)
+            .set_top_k(64)
+            .set_seed(5)
+            .add_stop("END");
+        let body = build_completion_body(&req, &config(LlamaRoute::Completion));
+
+        assert_eq!(body["top_p"], json!(0.95_f32));
+        assert_eq!(body["top_k"], json!(64));
+        assert_eq!(body["seed"], json!(5));
+        assert_eq!(body["stop"], json!(["END"]));
+
+        let plain =
+            build_completion_body(&UnifiedRequest::new("m"), &config(LlamaRoute::Completion));
+        for key in ["top_p", "top_k", "seed", "stop"] {
+            assert!(plain.get(key).is_none(), "{key} must be omitted");
+        }
     }
 
     #[test]
