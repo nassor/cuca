@@ -195,8 +195,11 @@ Tiered placement trades speed for memory. These runs used `tests/provider_local_
 | `qwen3.6-35b-a3b-q4_0` | resident, 18.9 GiB peak resident set | 14.7 and 14.9 | not applicable |
 | `qwen3.6-35b-a3b-q4_0` | `tiered:ram=4g`, 60 of 256 experts per layer | 7.4 cold, 7.1 warm | 0.661 cold, 0.708 warm |
 | `qwen3.6-35b-a3b-q4_0` | `tiered:ram=600m`, 8 of 256 experts per layer | 6.3 cold, 6.2 warm | 0.307 cold, 0.308 warm |
+| `mistral-small-4-119b-q4_0` | resident, 67.7 GB of RAM | 8.7 | not applicable |
+| `mistral-small-4-119b-q4_0` | `tiered:ram=48g`, 100 of 128 experts per layer | 0.8 cold, 2.1 warm | 0.824 cold, 0.958 warm |
+| `mistral-small-4-119b-q4_0` | `tiered:ram=8g`, 16 of 128 experts per layer (reference: `tiered:ram=48g`) | 1.1 cold, 1.8 warm | 0.310 cold, 0.337 warm |
 
-These runs read the model from the OS page cache. Reads of an uncached file from disk are not measured.
+The first three models' runs read the model from the OS page cache. For `mistral-small-4-119b-q4_0` (a 67.7 GB file next to a 125 GB machine, so only part of it stayed cached) the experts are read from the file by offset: one expert of all 36 layers is 511.7 MB, so `ram=48g` holds 100 per layer, `ram=8g` holds 16 and the minimum is 4 per layer (2.05 GB). The cold run at `ram=48g` read 4,618 experts (65.7 GB) out of 26,205 lookups, the cold run at `ram=8g` 18,081 (257 GB); the replies of both equal the resident model's, bit for bit (the `ram=8g` run against the `ram=48g` one, which equals it). The fused `ffn_gate_up_exps` tensor is read as two strided halves (gate, up), and a model with leading dense layers has experts only in the others.
 
 For `qwen3.6-35b-a3b-q4_0` the cold runs read 18,861 experts (33.6 GB) at `ram=4g` and 38,510 (68.5 GB) at `ram=600m`, out of 55,597 lookups. A single 1,024-token reply (`examples/local_model.rs`) peaked at 18.8 GiB of resident set with resident experts, 5.95 GiB at `ram=4g` and 2.43 GiB at `ram=600m`, and the model loaded in 8.3 s resident against 0.8 s tiered. The 20.8 GB file was in the OS page cache for all of these runs, so the disk reads are memory copies, not reads from the drive.
 
