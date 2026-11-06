@@ -2,8 +2,10 @@
 //! f32 reference, for checkpoints too large or too new for the pinned
 //! `oracle` set (a layer-truncated real checkpoint, a tiny synthetic one).
 //!
-//! Gated on `CUCA_LOCAL_REF_CKPT` (the checkpoint directory) and
-//! `CUCA_LOCAL_REF_PREFIX` (`<prefix>.json` and `<prefix>.bin`, written by
+//! Gated on `CUCA_LOCAL_REF_CKPT` (the checkpoint directory) or
+//! `CUCA_LOCAL_REF_GGUF` (a GGUF file, loaded as it is: a layer-truncated
+//! published GGUF whose dequantized weights the reference script loaded too)
+//! and `CUCA_LOCAL_REF_PREFIX` (`<prefix>.json` and `<prefix>.bin`, written by
 //! the reference script: the prompt ids, the compared positions, the greedy
 //! ids and the f32 logits of those positions). Without them the test prints
 //! `SKIP:` and passes, unless `CUCA_REQUIRE_LIVE=1`. The checkpoint is
@@ -45,9 +47,12 @@ fn argmax(v: &[f32]) -> u32 {
 
 #[test]
 fn local_checkpoint_matches_the_reference() {
-    let (Some(ckpt), Some(prefix)) = (env("CUCA_LOCAL_REF_CKPT"), env("CUCA_LOCAL_REF_PREFIX"))
-    else {
-        let msg = "SKIP: set CUCA_LOCAL_REF_CKPT and CUCA_LOCAL_REF_PREFIX";
+    let source = env("CUCA_LOCAL_REF_CKPT")
+        .map(|dir| (true, dir))
+        .or_else(|| env("CUCA_LOCAL_REF_GGUF").map(|file| (false, file)));
+    let (Some((is_dir, source)), Some(prefix)) = (source, env("CUCA_LOCAL_REF_PREFIX")) else {
+        let msg =
+            "SKIP: set CUCA_LOCAL_REF_CKPT (or CUCA_LOCAL_REF_GGUF) and CUCA_LOCAL_REF_PREFIX";
         assert!(env("CUCA_REQUIRE_LIVE").is_none(), "{msg}");
         println!("{msg}");
         return;
@@ -71,14 +76,18 @@ fn local_checkpoint_matches_the_reference() {
         .map(|b| f32::from_le_bytes(*b))
         .collect();
 
-    let config = LocalModelConfig {
-        source: ModelSource::Dir(PathBuf::from(&ckpt)),
-        convert: ConvertConfig {
-            quant: WeightQuant::F16,
-        },
-        ..Default::default()
+    let path = if is_dir {
+        let config = LocalModelConfig {
+            source: ModelSource::Dir(PathBuf::from(&source)),
+            convert: ConvertConfig {
+                quant: WeightQuant::F16,
+            },
+            ..Default::default()
+        };
+        resolve_model_path(&config, &config.source).expect("conversion")
+    } else {
+        PathBuf::from(&source)
     };
-    let path = resolve_model_path(&config, &config.source).expect("conversion");
     let content =
         gguf_file::Content::read(&mut BufReader::new(File::open(&path).unwrap())).unwrap();
     let ctx = prompt.len() + greedy.len() + 8;

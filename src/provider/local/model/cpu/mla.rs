@@ -235,7 +235,7 @@ mod tests {
     use std::io::BufReader;
 
     use candle_core::quantized::GgmlDType;
-    use candle_core::quantized::gguf_file::Value;
+    use candle_core::quantized::gguf_file::{self, Value};
     use candle_core::{Device, Tensor};
 
     use super::super::Mixer;
@@ -645,5 +645,43 @@ mod tests {
             .err()
             .unwrap();
         assert!(e.to_string().contains("blk.7."), "{e}");
+    }
+    /// Env-gated (`CUCA_MISTRAL4_GGUF`): a published `mistral4` GGUF (only
+    /// its header is read) resolves to the latent geometry the engine
+    /// computes, with every layer's tensors present at the shapes the loader
+    /// expects.
+    #[test]
+    fn a_published_header_resolves_to_the_latent_geometry() {
+        let Some(path) = std::env::var_os("CUCA_MISTRAL4_GGUF") else {
+            eprintln!("SKIP: set CUCA_MISTRAL4_GGUF");
+            return;
+        };
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(path).unwrap())).unwrap();
+        let hp = read_hparams(&content).unwrap();
+        assert_eq!(hp.arch.name(), "mistral4");
+        assert_eq!((hp.n_layer, hp.n_embd), (36, 4096));
+        let ls = &hp.layers[0];
+        assert_eq!((ls.n_head, ls.n_kv_head, ls.head_dim), (32, 1, 320));
+        assert!(
+            (f64::from(ls.scale) - 0.194_977).abs() < 1e-5,
+            "{}",
+            ls.scale
+        );
+        for (il, spec) in hp.layers.iter().enumerate() {
+            let layout = LayerLayout::read(&hp, il, spec, &content).unwrap();
+            assert!(layout.mla);
+            let Ffn::Moe { ff, shared_ff, .. } = layout.ffn else {
+                panic!("layer {il} is not a mixture of experts");
+            };
+            assert_eq!((ff, shared_ff), (2048, Some(2048)), "layer {il}");
+        }
+        let bytes = crate::provider::local::model::paged::KvLayout::sized(
+            &hp,
+            8192,
+            &crate::provider::local::model::paged::Sizing::single(8192),
+        )
+        .pool_bytes(&hp);
+        eprintln!("MISTRAL4|kv_pool_bytes_at_8192|{bytes}");
     }
 }

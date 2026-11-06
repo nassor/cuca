@@ -150,6 +150,11 @@
 //!   `kv_cache_bytes` counts just the K/V-owning layers (24,576 bytes per
 //!   position for the 0.8B model: 6 attention layers with 2 KV heads of
 //!   256).
+//! - The K/V cache of a latent-attention model (Mistral Small 4) is one row of
+//!   `kv_lora + rot` floats per position and layer (`4 * 16 * (kv_lora +
+//!   rot)` bytes per block and layer, from [`params::LayerSpec::kv_floats_per_position`]):
+//!   1,280 bytes per position and layer, 46,080 over its 36 layers. The value
+//!   is the first `kv_lora` columns of the key row, so the pool holds no values.
 //! - The multi-token-prediction head of a Qwen 3.5 `*-MTP` file, when the
 //!   engine drafts with it, adds its block's quantized weights (21.7 MB for
 //!   the 0.8B model) and a K/V cache of one attention layer

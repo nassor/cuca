@@ -7388,6 +7388,39 @@ mod tests {
         }
     }
 
+    /// Latent attention (and a fused gate/up expert tensor, and a routing
+    /// scale) are CPU only: the GPU load fails with a `CucaError::Config`
+    /// naming the missing piece, before any device is opened.
+    #[test]
+    fn gpu_rejects_latent_attention_loudly() {
+        use crate::provider::local::GpuAdapter;
+        use crate::provider::local::model::tiny::{TinyMistral4, write_mistral4};
+
+        let model = write_mistral4(&TinyMistral4::default());
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let device = test_device().unwrap_or(LocalDevice::Vulkan(GpuAdapter::Default));
+        let e = GpuTransformer::load_placed(
+            &content,
+            &model.path,
+            32,
+            device,
+            &[],
+            &ExpertPlacement::Resident,
+            &Sizing::single(32),
+        )
+        .err()
+        .expect("the GPU engine cannot run mistral4");
+        match &e {
+            CucaError::Config(m) => assert!(
+                m.contains("`mistral4`") && m.contains("multi-head latent attention"),
+                "{m}"
+            ),
+            other => panic!("expected a Config error, got {other:?}"),
+        }
+    }
+
     /// Each rule of the split fails the load with a `CucaError::Config` that
     /// names it (and the numbers it failed on).
     #[test]

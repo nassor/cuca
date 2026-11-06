@@ -19,7 +19,7 @@
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
 //! `llama` (Llama 3.x and compatible), `qwen2`, `qwen3`, `phi3`
 //! (Phi 4-mini and compatible), `smollm3`, `granite`, `qwen3moe`,
-//! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `qwen35` or `qwen35moe` runs: the loader reads every
+//! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `mistral4`, `qwen35` or `qwen35moe` runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
 //! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
@@ -322,7 +322,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 21] = [
+const PRESET_TABLE: [ModelPreset; 22] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -509,6 +509,32 @@ const PRESET_TABLE: [ModelPreset; 21] = [
         16_265_565_216,
         "muse-glimmer",
     ),
+    // Two parts of `llama-gguf-split`: merged into one cached file at load.
+    // imatrix Q4_0 (Q4_1 in the layers' `ffn_down_exps`, Q5_0 in places, Q8_0
+    // for the shared experts and the latent projection, Q6_K `output`).
+    ModelPreset {
+        parts: &[
+            PresetPart {
+                file: "mistralai_Mistral-Small-4-119B-2603-Q4_0/mistralai_Mistral-Small-4-119B-2603-Q4_0-00001-of-00002.gguf",
+                sha256: "db43a5e13e55b0b75de52e66cc4e2ccfa2863a940742df880e15c4b99f9199c8",
+                size_bytes: 39_924_112_032,
+            },
+            PresetPart {
+                file: "mistralai_Mistral-Small-4-119B-2603-Q4_0/mistralai_Mistral-Small-4-119B-2603-Q4_0-00002-of-00002.gguf",
+                sha256: "3e325c6e7c0bddbbd536955983672717edbe25413cde0e317b61531ca6887112",
+                size_bytes: 27_785_630_592,
+            },
+        ],
+        ..preset(
+            "mistral-small-4-119b-q4_0",
+            "bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF",
+            "f569d04efea9546de10ec040819908fa4e8f1c92",
+            "mistralai_Mistral-Small-4-119B-2603-Q4_0/mistralai_Mistral-Small-4-119B-2603-Q4_0-00001-of-00002.gguf",
+            "db43a5e13e55b0b75de52e66cc4e2ccfa2863a940742df880e15c4b99f9199c8",
+            67_709_742_624,
+            "mistral4",
+        )
+    },
     ModelPreset {
         drafter: true,
         ..preset(
@@ -2243,8 +2269,24 @@ mod tests {
                 }
             ]
         );
-        // Single-file presets list no parts.
-        assert!(ModelSource::PRESETS.iter().all(|p| p.parts.is_empty()));
+        // Only the split presets list parts, and every part is pinned: the
+        // first is the preset's file and the sizes add up.
+        for p in ModelSource::PRESETS.iter().filter(|p| !p.parts.is_empty()) {
+            assert_eq!(p.name, "mistral-small-4-119b-q4_0");
+            assert_eq!((p.parts[0].file, p.parts[0].sha256), (p.file, p.sha256));
+            assert_eq!(
+                p.parts.iter().map(|q| q.size_bytes).sum::<u64>(),
+                p.size_bytes
+            );
+            assert!(p.parts.iter().all(|q| q.sha256.len() == 64));
+        }
+        assert_eq!(
+            ModelSource::PRESETS
+                .iter()
+                .filter(|p| !p.parts.is_empty())
+                .count(),
+            1
+        );
     }
 
     #[test]

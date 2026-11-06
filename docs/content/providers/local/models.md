@@ -51,6 +51,7 @@ Nothing here is specific to one model family. The loader reads every dimension f
 | `olmo2` | OLMo 2 | CPU, GPU |
 | `ernie4_5` | ERNIE 4.5 (dense) | CPU, GPU |
 | `muse-glimmer` | Muse Glimmer 30B | CPU; GPU on tiny models only (the 30B model does not fit a 16 GB card) |
+| `mistral4` | Mistral Small 4 (119B, 128 experts) | CPU only; the GPU engine rejects it |
 | `gemma4-assistant` | the Gemma 4 multi-token-prediction drafter | only through `LocalModelConfig::drafter` |
 
 What each architecture adds to the common forward pass:
@@ -68,13 +69,23 @@ What each architecture adds to the common forward pass:
 - `olmo2`: no pre-norms, only post-attention and post-FFN norms, and a Q/K RMSNorm that spans the whole projection.
 - `ernie4_5`: Llama-style layers with a head size larger than the width divided by the head count.
 - `muse-glimmer`: a dense decoder with a `[sliding, sliding, sliding, full]` pattern from `attention.sliding_window_pattern`. Sliding layers apply `NORM` RoPE with `rope.freq_base` (the file carries no `rope.freq_base_swa`) and full layers apply no RoPE at all. Every layer has a separate `attn_gate` projection of the normed input whose sigmoid multiplies the attention output before `attn_output`, a scale-less per-head RMS norm on Q and K (the file's `attn_q_norm` is the constant `qk_scale_factor`, 3.87, and `attn_k_norm` is ones), and Gemma-style post-attention and post-FFN norms whose epsilon is 1e-8 where the other norms use `attention.layer_norm_rms_epsilon`. The embeddings go through a scale-less RMSNorm after the lookup (no `sqrt(n_embd)` scale), and the logits are multiplied by `logit_scale` (0.196, a multiplier, not Granite's divisor) before the final soft-cap of 20.
+- `mistral4`: multi-head latent attention, a mixture of experts and Mistral's YaRN; see [Latent attention models](#latent-attention-models).
 - `qwen35`: a hybrid stack; see [Hybrid models](#hybrid-models).
 - `qwen35moe`: the `qwen35` hybrid stack with a mixture of experts in every layer: a softmax over all experts, the top k, the selected weights renormalised to sum to one, plus a shared expert (a dense gated FFN every token runs) whose output is scaled by `sigmoid(ffn_gate_inp_shexp . x)` and added to the routed output. The routed experts honor `ExpertPlacement`; the shared expert and the router stay resident.
 - `gemma4-assistant`: a four-layer, query-only decoder that reads the K/V cache of a `gemma4` target. It pairs only with a `gemma4` model of the same hidden width and vocabulary.
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
 
-Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, qwen3, phi3, smollm3, granite, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, muse-glimmer, gemma4-assistant``.
+Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, qwen3, phi3, smollm3, granite, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, muse-glimmer, mistral4, gemma4-assistant``.
+
+### Latent attention models
+
+Mistral Small 4 (`mistral4`, 36 layers, hidden 4,096, 32 heads) replaces the per-head K and V projections by a compressed latent. A layer computes `q = q_b(norm(q_a(x)))` (a rank of 1,024; every head is `nope 64 + rot 64` wide) and `kv = kv_a(x)`: its first 256 values, normed, are the latent `c` shared by every head, and its last 64 are the rotary key shared by every head too. In the reference form head `h` reads keys `K_h c` and values `V_h c`, and a position's score is `q_nope . (K_h c) + q_rot . k_rot`. The engine never builds those per-head keys and values: it absorbs `K_h` into the query (`q_abs = K_h^T q_nope`, 256 values), so the score is `[q_abs | q_rot] . [c | k_rot]` against one cached row of 320 floats per position and layer, and the weighted sum of the values is `V_h (sum_j p_j c_j)`, taken over the first 256 columns of the same cached rows. The K/V cache is therefore 1,280 bytes per position and layer (46,080 bytes over the 36 layers, 755 MB for the pool of a default 8,192-position context), against 1.18 MB per position for the expanded heads. The `attn_k_b` and `attn_v_b` tensors are held as f32 (216 MB in all) and applied one row at a time, so a row is bit-identical alone or in a batch, as for the other attention kernels.
+
+- Rotary embedding: adjacent pairs of the 64 rotary dimensions of every query head and of the shared key, YaRN (factor 128 over 8,192, `beta_fast` 32, `beta_slow` 1). The cosine and sine tables carry no magnitude scale; the YaRN `mscale` (`1 + 0.1 ln 128`, from `rope.scaling.yarn_log_multiplier`) enters twice into the softmax scale instead, `mscale^2 / sqrt(128)` as in llama.cpp's `deepseek2` graph and transformers' `Mistral4Attention`.
+- Llama 4 query scaling: the whole query of position `p` is multiplied by `1 + 0.1 ln(1 + floor(p / 8192))`, which is 1 for the first 8,192 positions. A GGUF may carry `attention.temperature_scale` and `attention.temperature_length` (zero switches the scaling off); without them the engine applies the checkpoint's own configuration, 0.1 and 8,192, which llama.cpp's converter did not write for this model (so llama.cpp runs it unscaled past 8,192 positions).
+- Mixture of experts: a softmax over all 128 experts, the top 4, their weights renormalised and multiplied by `expert_weights_scale`, plus one shared expert that is added as it is, without a gate. The gate and up matrices of the experts are one tensor (`ffn_gate_up_exps`: for every expert its gate rows, then its up rows). Experts may be tiered (see [Tiered expert placement](@/providers/local/expert-tiers.md)); the fused tensor is read as two strided halves, and the router, the shared expert and the attention stay resident.
+- Not supported: a leading dense block, grouped or sigmoid expert routing, a model without the low-rank query (`attention.q_lora_rank`), and the GPU engine: loading on a GPU fails with a `CucaError::Config` that names latent attention.
 
 ### Hybrid models
 
