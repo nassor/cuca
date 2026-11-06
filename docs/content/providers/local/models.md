@@ -152,6 +152,7 @@ Any other `tokenizer.ggml.model` fails the load with ``unsupported tokenizer mod
 | Granite 3.3 | `gpt2` | `refact` |
 | OLMo 2 | `gpt2` | `dbrx` |
 | OLMoE | `gpt2` | `olmo` |
+| Muse Glimmer | `gpt2` | `llama4` |
 
 ### Pre-tokenizers
 
@@ -177,7 +178,7 @@ Any other `pre` fails the load with ``unsupported pre-tokenizer `NAME` ``. The n
 
 The Tekken rule is verified by `tekken_words_match_the_reference_regex` (`src/provider/local/tokenizer/pretok.rs`): the pieces of 336 texts (ASCII, digits, CJK, emoji, accented mixed case, code, whitespace runs, 300 seeded random ones) equal those of Hugging Face `tokenizers`' regex splitter with Mistral Small 4's `tokenizer.json` regex. With real vocabularies, the env-gated `tokenizer_corpus_matches_reference_ids` (`CUCA_TOK_GGUF`, `CUCA_TOK_CASES`) gave identical ids for 4,537 texts (those plus every one of the model's 1,000 special tokens alone and in context) against Mistral Small 4's `tokenizer.json`, and for 1,536 texts against Mistral Small 3.2's `tekken.json` read by `mistral_common`, through the headers of the published GGUFs (pre-tokenizer `pixtral` and `tekken`).
 
-Verified by the tokenizer golden test in `src/provider/local/tokenizer/golden.rs`: for 7 models (Qwen 3, Gemma 3 270M and 1B, SmolLM 3, Phi 4 mini, R1 distill, Qwen 3.5) the ids of 16 texts and 3 chat prompts equal the HuggingFace `tokenizer.json` ids. The test reads cached model files and prints `SKIP:` for a missing one. Where llama.cpp and HuggingFace differ, the expected ids follow llama.cpp, with one exception that follows HuggingFace: the GPT-4o case classes.
+Verified by the tokenizer golden test in `src/provider/local/tokenizer/golden.rs`: for 7 models (Qwen 3, Gemma 3 270M and 1B, SmolLM 3, Phi 4 mini, R1 distill, Qwen 3.5) the ids of 16 texts and 3 chat prompts equal the HuggingFace `tokenizer.json` ids. The test reads cached model files and prints `SKIP:` for a missing one. For Muse Glimmer the ids of a corpus of 744 texts (ASCII, digits, contractions, mixed-case non-ASCII, CJK, emoji, special tokens and fuzzed strings) equal those of the HuggingFace `tokenizers` library, both through a tiny GGUF and through the real preset file's tokenizer (`tokenizer_corpus_matches_reference_ids`, driven by `CUCA_TOK_GGUF` and `CUCA_TOK_CASES`); HuggingFace's `ignore_merges` flag has no observable effect on that corpus. Where llama.cpp and HuggingFace differ, the expected ids follow llama.cpp, with one exception that follows HuggingFace: the GPT-4o case classes.
 
 ## Chat templates
 
@@ -190,6 +191,7 @@ Variables the template sees:
 - `add_generation_prompt`: always true.
 - `enable_thinking` and `thinking`: both true when the request enables thinking, otherwise both false.
 - `preserve_thinking`: always false.
+- `reasoning_strength` and `reasoning_effort`: defined only for a template that reads them; see [Reasoning](#reasoning).
 - `bos_token` and `eos_token`: the token texts, or empty.
 
 Helpers the templates rely on:
@@ -201,7 +203,7 @@ Helpers the templates rely on:
 
 Tool arguments stay JSON objects, as templates expect. The key order inside a tool's JSON schema (`parameters`) is the order of the request's `serde_json` map: sorted by key, unless your application enables the `preserve_order` feature of `serde_json`, in which case it is the order you wrote. Arguments of tool calls in the history are sorted the same way.
 
-Verified by the unit test `renders_match_the_reference_jinja_environment` in `src/provider/local/chat/golden.rs`. For 9 templates (Gemma 3 1B and 270M, Gemma 4, Granite 3.3, Phi 4 mini, Qwen 3, Qwen 3.5, the R1 Qwen distill, SmolLM 3) and 7 cases (a plain turn, a system prompt, a multi-turn history, thinking on and off, tools declared, a tool call with its result) the rendered text equals what Python `jinja2` renders with `trim_blocks`, `lstrip_blocks`, a `json.dumps(ensure_ascii=False)` `tojson` and `strftime_now` pinned to 2026-10-18 UTC. The fixtures are in `src/provider/local/testdata/`.
+Verified by the unit test `renders_match_the_reference_jinja_environment` in `src/provider/local/chat/golden.rs`. For 9 templates (Gemma 3 1B and 270M, Gemma 4, Granite 3.3, Phi 4 mini, Qwen 3, Qwen 3.5, the R1 Qwen distill, SmolLM 3) and 7 cases (a plain turn, a system prompt, a multi-turn history, thinking on and off, tools declared, a tool call with its result) the rendered text equals what Python `jinja2` renders with `trim_blocks`, `lstrip_blocks`, a `json.dumps(ensure_ascii=False)` `tojson` and `strftime_now` pinned to 2026-10-18 UTC. The fixtures are in `src/provider/local/testdata/`. Muse Glimmer's template is tested in `src/provider/local/chat/golden_new.rs` (same test name): 25 cases, with every reasoning strength among them, whose bytes equal what `transformers`' `apply_chat_template` renders (`testdata/chat_golden_new.json`).
 
 ## Reasoning
 
@@ -273,6 +275,7 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 | `olmoe-1b-7b-q4_0` | `olmoe` | `allenai/OLMoE-1B-7B-0125-Instruct-GGUF` | 3.93 GB | 2.15 GB (4,096 maximum) |
 | `qwen3.5-0.8b-q8_0` | `qwen35` | `unsloth/Qwen3.5-0.8B-MTP-GGUF` | 0.83 GB | 403 MB, plus a 20.2 MB recurrent state |
 | `qwen3.6-35b-a3b-q4_0` | `qwen35moe` | `bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` | 20.84 GB | 671 MB, plus a 65.9 MB recurrent state |
+| `muse-glimmer-30b-q4_0` | `muse-glimmer` | `NANI-Nithin/Muse-Glimmer-30B-GGUF` | 16.03 GB | about 1.84 GB |
 | `gemma4-e2b-mtp-f16` | `gemma4-assistant` | `unsloth/gemma-4-E2B-it-GGUF` | 0.17 GB | none: a drafter, reads the target's cache |
 
 - The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position. The pool holds twice `context_length` positions (see [Local limits and errors](@/providers/local/limits-and-errors.md#limits)), and a sliding-window group (the Gemma presets) holds its window plus about 270 positions per running sequence plus cached prefixes. Qwen 3 0.6B needs 3.76 GB of cache at 8,192 positions for a 0.64 GB file. Lower `context_length` to shrink it.
@@ -280,6 +283,7 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 - `gemma4-e2b-mtp-f16` has `drafter: true`: it loads only through `LocalModelConfig::drafter` and cannot be the main model.
 - `qwen3.5-0.8b-q8_0` carries the in-trunk prediction head, so `DrafterSource::InTrunk` works with it.
 - `qwen3.6-35b-a3b-q4_0` has 256 experts per layer in 40 layers, 8 used, so every layer is MoE; resident it holds about 18.9 GiB of RAM, with `tiered:ram=4g` about 6 GiB and with `tiered:ram=600m` (the minimum, 8 experts per layer) about 2.4 GiB. Its file carries a prediction block that the engine ignores; see [Hybrid models](#hybrid-models).
+- `muse-glimmer-30b-q4_0` is a 30B dense model (52 layers, hidden 6,656, 32 query and 2 K/V heads of 128). Its K/V is small for its size: only the 13 full layers cache the whole context, the other 39 keep a 2,048-position window. The file is near-pure Q4_0 (a Q6_K `output.weight`) and embeds the model's current chat template; other Q4_0 conversions of the model carry an older template or mix in Q6_K and Q4_1 tensors. On the CPU of the verification machine (16 cores, release build for the host) it decodes 3.5 tokens per second and prefills a 1,156-token prompt in 93 s (12.5 tokens per second); a warm prefix is reused (1.3 s to the first token). It always reasons (see [Reasoning](#reasoning)), so give requests a generous `max_tokens`. It does not fit a 16 GB GPU; see [GPU](@/providers/local/gpu.md).
 - Presets pin both the revision and the SHA-256; see [Model sources and presets](@/providers/local/model-sources.md#model-sources-and-presets) for the source types.
 
 ## Verification
@@ -288,13 +292,13 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 Three kinds of evidence back this page, from strongest to weakest:
 
-- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `qwen3moe`, `olmoe`, `gemma3`, `granite`, `olmo2`, `ernie4_5`; `gemma4`, `qwen35` and `qwen35moe` have their own builders).
+- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `qwen3moe`, `olmoe`, `gemma3`, `granite`, `olmo2`, `ernie4_5`, `muse-glimmer`; `gemma4`, `qwen35` and `qwen35moe` have their own builders).
 - The live suite `tests/provider_local.rs` runs one real preset per invocation. CI compiles it and every test prints a skip line, so the live results below come from recorded local runs, not from CI.
 - Oracle runs against HuggingFace `transformers` (f32, CPU) use dumps under `.omp/local-models/ref/`, which is gitignored. Those results are reproducible only with that tooling, not from a clean checkout.
 
 Per architecture:
 
-- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `qwen2` (R1 distill), `qwen3`, `qwen35`, `qwen35moe`, `phi3` (Phi 4 mini), `smollm3`, `granite`, `qwen3moe`, `olmoe`, `olmo2`. `llama` runs live through `r1-distill-llama-8b-q4_0` and is also covered by tiny-model tests and by the converter oracle on the same model's checkpoint (see [Checkpoints](@/providers/local/model-sources.md#checkpoints)).
+- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `qwen2` (R1 distill), `qwen3`, `qwen35`, `qwen35moe`, `phi3` (Phi 4 mini), `smollm3`, `granite`, `qwen3moe`, `olmoe`, `olmo2`, `muse-glimmer`. `llama` runs live through `r1-distill-llama-8b-q4_0` and is also covered by tiny-model tests and by the converter oracle on the same model's checkpoint (see [Checkpoints](@/providers/local/model-sources.md#checkpoints)).
 - Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` (Qwen3-30B-A3B with tiered experts).
 - `ernie4_5`: tiny-model tests and a recorded oracle run only. It has no preset and has not run in the live suite.
 - `qwen35moe` against HuggingFace `transformers` in f32 (`Qwen3_5MoeForCausalLM`, GGUF dequantized by `gguf`, routed experts dequantized per use): a 4-layer cut of the real Qwen3.6-35B-A3B file matches with the engine's dequantized weights to 1e-5 on the top-10 logits, top-1 equal and greedy output equal for 24 of 24 tokens on two prompts and 8 of 8 on a 321-token prompt. The full 40-layer file under the production Q4_0 path keeps the top-1 token on all three prompts, with a maximum absolute difference of 0.13 to 0.62 on the top-k logits. The oracle answers `The capital of France is **Paris**.`. Reading the value heads in grouped (HuggingFace) order instead of tiled order breaks the 4-layer match (top-10 overlap 0 to 2 of 10), which is how the tiled order was confirmed.
@@ -322,6 +326,7 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `qwen3.5-0.8b-q8_0` | on and off | yes, XML | all seven pass on the CPU; not run on Vulkan |
 | `qwen3.6-35b-a3b-q4_0` | on and off | yes, XML | all seven pass on the CPU, resident and with `tiered:ram=4g`, and on Vulkan with `tiered:device=4g,ram=12g` and `tiered:device=6g,ram=12g` |
 | `olmo2-1b-q4_0` | no | no syntax | all applicable scenarios pass, on the CPU and on Vulkan |
+| `muse-glimmer-30b-q4_0` | always (`reasoning_strength`) | yes, channel protocol | all pass on the CPU; the thinking-off scenario skips, because the model cannot switch reasoning off (the whole matrix: 702 s) |
 | `granite3.3-2b-q4_0` | switched on by the request | yes | all pass except long-context retrieval, a known limit |
 
 The Vulkan engine ran the same suite for `gemma4-e2b-q4_0`, `olmo2-1b-q4_0` and `granite3.3-2b-q4_0`, with the same results as on the CPU.
@@ -350,6 +355,8 @@ Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on 
 | The same, OLMo 2, Granite 3.3, ERNIE 4.5 | maximum absolute logit difference 0.000 on the top-k, greedy output equal on every prompt |
 | Production quantized CPU path against `transformers`, the 13 first models | top-1 token kept on all 48 prompt cases; maximum absolute logit difference between 0.05 and 1.13, the cost of quantized weights |
 | The same, the six later models | top-1 token kept on all 24 prompt cases |
+| Muse Glimmer (`muse-glimmer`), tiny random model with every norm randomized, reference arithmetic | converted GGUF bit-identical to llama.cpp's `convert_hf_to_gguf.py` output (59 of 59 tensors); maximum absolute logit difference 2.6e-4 at all 48 positions, greedy output equal for 16 of 16 tokens |
+| The same, a 4-layer cut of the real checkpoint converted to F16 (prompt of 2,600 tokens, past the 2,048 window) | maximum absolute logit difference 8.4e-5 at ten positions including 2,046 to 2,050, greedy output equal for 8 of 8 tokens |
 | Qwen 3.5 0.8B Q8_0, reference arithmetic | maximum absolute logit difference below 5e-5; the production path keeps the top-1 token |
 | Qwen 3.6 35B-A3B Q4_0 (`qwen35moe`), 4-layer cut, reference arithmetic | maximum absolute logit difference 1e-5, greedy output equal for 24 of 24 and 8 of 8 tokens |
 | The same file, 40 layers, production path | top-1 token kept on all three prompts; maximum absolute logit difference 0.13 to 0.62 |
