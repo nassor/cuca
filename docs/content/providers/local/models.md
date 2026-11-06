@@ -43,7 +43,7 @@ Nothing here is specific to one model family. The loader reads every dimension f
 | `qwen3` | Qwen 3 | CPU, GPU |
 | `qwen35` | Qwen 3.5 (0.8B) | CPU, GPU (tiny-model tests only on the GPU) |
 | `qwen35moe` | Qwen 3.6 MoE (Qwen3.6-35B-A3B) | CPU, GPU |
-| `phi3` | Phi 4 mini (and Phi 3.5) | CPU, GPU |
+| `phi3` | Phi 4 mini | CPU, GPU |
 | `smollm3` | SmolLM 3 | CPU, GPU |
 | `granite` | Granite 3.3 (dense) | CPU, GPU |
 | `qwen3moe` | Qwen 3 MoE (Qwen3-30B-A3B) | CPU, GPU |
