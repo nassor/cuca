@@ -53,6 +53,12 @@ pub(crate) enum Arch {
     /// top-k, renormalised) plus a shared expert scaled by a sigmoid gate
     /// (transformers `Qwen3_5MoeSparseMoeBlock`).
     Qwen35Moe,
+    /// Muse Glimmer (`muse-glimmer`): a dense decoder with a sliding-window
+    /// pattern whose full-attention layers apply no rotary embedding, a
+    /// separate sigmoid attention-output gate projection, Gemma-style
+    /// sandwich norms (the post norms with their own epsilon), a scale-less
+    /// norm on the embeddings and a logit multiplier ahead of the soft-cap.
+    MuseGlimmer,
     /// OLMo 2: no pre-norms, post-attention and post-FFN norms, full-width
     /// Q/K RMSNorm.
     Olmo2,
@@ -167,6 +173,27 @@ pub(crate) struct Behavior {
     /// to the routed experts' output (Qwen 3.5 MoE). Only read when `moe` is
     /// set.
     pub(crate) shared_expert: bool,
+    /// Every attention layer has an `attn_gate` projection (`n_embd` to
+    /// `n_head * head_dim`) of its normed input whose sigmoid multiplies the
+    /// attention output before `attn_output` (Muse Glimmer). Unlike
+    /// [`Behavior::gated_attention`], the gate is a tensor of its own.
+    pub(crate) attn_gate_tensor: bool,
+    /// Full-attention layers apply no rotary embedding (llama.cpp's
+    /// `rope_pattern` follows the sliding pattern); only meaningful with a
+    /// sliding pattern.
+    pub(crate) nope_full_layers: bool,
+    /// Without `{arch}.rope.freq_base_swa`, sliding layers use
+    /// `{arch}.rope.freq_base` like the full layers (the default is 10000).
+    pub(crate) swa_base_from_freq_base: bool,
+    /// A scale-less RMSNorm (the layer-norm epsilon) over every embedding row
+    /// after the embedding scale.
+    pub(crate) embd_norm: bool,
+    /// Epsilon of the post-attention and post-FFN norms when it differs from
+    /// `attention.layer_norm_rms_epsilon`; the file does not carry it.
+    pub(crate) post_norm_eps: Option<f64>,
+    /// `{arch}.logit_scale` multiplies the final logits (Granite's divides),
+    /// before the soft-cap.
+    pub(crate) logit_multiplier: bool,
 }
 
 const DEFAULT: Behavior = Behavior {
@@ -188,11 +215,17 @@ const DEFAULT: Behavior = Behavior {
     qk_norm_full: false,
     moe_norm_weights: true,
     shared_expert: false,
+    attn_gate_tensor: false,
+    nope_full_layers: false,
+    swa_base_from_freq_base: false,
+    embd_norm: false,
+    post_norm_eps: None,
+    logit_multiplier: false,
 };
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 15] = [
+    pub(crate) const ALL: [Arch; 16] = [
         Arch::Gemma4,
         Arch::Gemma3,
         Arch::Llama,
@@ -207,6 +240,7 @@ impl Arch {
         Arch::Qwen35Moe,
         Arch::Olmo2,
         Arch::Ernie4_5,
+        Arch::MuseGlimmer,
         Arch::Gemma4Assistant,
     ];
 
@@ -229,6 +263,7 @@ impl Arch {
             Arch::Olmo2 => "olmo2",
             Arch::Ernie4_5 => "ernie4_5",
             Arch::Gemma4Assistant => "gemma4-assistant",
+            Arch::MuseGlimmer => "muse-glimmer",
         }
     }
 
@@ -271,6 +306,18 @@ impl Arch {
                 embd_scale: EmbdScale::SqrtEmbd,
                 swa: Swa::Every(6),
                 attn_scale: AttnScale::Gemma3,
+                ..DEFAULT
+            },
+            Arch::MuseGlimmer => Behavior {
+                rope: RopeKind::Norm,
+                post_norms: true,
+                swa: Swa::PatternArray,
+                attn_gate_tensor: true,
+                nope_full_layers: true,
+                swa_base_from_freq_base: true,
+                embd_norm: true,
+                post_norm_eps: Some(1e-8),
+                logit_multiplier: true,
                 ..DEFAULT
             },
             Arch::Olmo2 => Behavior {
@@ -380,6 +427,24 @@ mod tests {
             assert_eq!(b.nextn_blocks, qwen35, "{arch:?}");
         }
         assert!(!Arch::Qwen35.is_drafter());
+    }
+
+    #[test]
+    fn muse_glimmer_alone_sets_the_muse_flags() {
+        for arch in Arch::ALL {
+            let b = arch.behavior();
+            let muse = arch == Arch::MuseGlimmer;
+            assert_eq!(b.attn_gate_tensor, muse, "{arch:?}");
+            assert_eq!(b.nope_full_layers, muse, "{arch:?}");
+            assert_eq!(b.swa_base_from_freq_base, muse, "{arch:?}");
+            assert_eq!(b.embd_norm, muse, "{arch:?}");
+            assert_eq!(b.logit_multiplier, muse, "{arch:?}");
+            assert_eq!(b.post_norm_eps.is_some(), muse, "{arch:?}");
+        }
+        let b = Arch::MuseGlimmer.behavior();
+        assert!(b.post_norms && !b.gated_attention);
+        assert_eq!(b.swa, Swa::PatternArray);
+        assert_eq!(b.rope, RopeKind::Norm);
     }
 
     #[test]

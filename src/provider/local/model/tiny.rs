@@ -264,6 +264,8 @@ pub(crate) struct TinySpec {
     pub(crate) pre_norms: bool,
     /// The Q/K norm weights span the whole projection (OLMo 2).
     pub(crate) qk_norm_full: bool,
+    /// Every layer has an `attn_gate` projection (Muse Glimmer).
+    pub(crate) attn_gate: bool,
     /// No `output.weight`: the LM head is the token embedding.
     pub(crate) tied: bool,
     /// `(experts, used)`; the FFN is then a mixture of experts of width `ff`.
@@ -298,6 +300,7 @@ impl TinySpec {
             post_norms: false,
             pre_norms: true,
             qk_norm_full: false,
+            attn_gate: false,
             tied: false,
             moe: None,
             embd_dtype: GgmlDType::Q8_0,
@@ -443,6 +446,33 @@ impl TinySpec {
         s
     }
 
+    /// Muse Glimmer: sliding layers (window 4, shorter than the prompt) with
+    /// rotary embedding and a full layer without, a separate attention gate
+    /// projection, a head dimension of 32 (the query is wider than the
+    /// embedding), QK-norm, sandwich norms, embedding norm, a logit
+    /// multiplier and the final soft-cap.
+    pub(crate) fn muse_glimmer() -> Self {
+        let mut s = Self::base("muse-glimmer");
+        s.head_dim = 32;
+        s.qk_norm = true;
+        s.post_norms = true;
+        s.attn_gate = true;
+        s.meta.push(kv("attention.sliding_window", u(4)));
+        s.meta.push(kv(
+            "attention.sliding_window_pattern",
+            Value::Array(vec![
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(true),
+                Value::Bool(false),
+            ]),
+        ));
+        s.meta.push(kv("final_logit_softcapping", Value::F32(20.0)));
+        s.meta.push(kv("logit_scale", Value::F32(0.35)));
+        s.meta.push(kv("rope.freq_base", Value::F32(500_000.0)));
+        s
+    }
+
     /// Every spec the cross-architecture tests run.
     pub(crate) fn all() -> Vec<Self> {
         vec![
@@ -457,6 +487,7 @@ impl TinySpec {
             Self::granite(),
             Self::olmo2(),
             Self::ernie4_5(),
+            Self::muse_glimmer(),
         ]
     }
 }
@@ -551,6 +582,9 @@ pub(crate) fn write_spec(s: &TinySpec) -> TinyModel {
             let (qn, kn) = if s.qk_norm_full { (qw, kw) } else { (d, d) };
             tensors.push((b("attn_q_norm"), norm(&mut rng, qn)));
             tensors.push((b("attn_k_norm"), norm(&mut rng, kn)));
+        }
+        if s.attn_gate {
+            tensors.push((b("attn_gate"), quantized(&mut rng, &[qw, N_EMBD], dt, 0.3)));
         }
         tensors.push((
             b("attn_output"),

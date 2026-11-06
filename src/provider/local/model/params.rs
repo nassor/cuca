@@ -246,6 +246,11 @@ pub(crate) struct Hparams {
     pub(crate) residual_scale: f32,
     /// Divisor of the final logits.
     pub(crate) logit_scale: f32,
+    /// Multiplier on the final logits, applied after the divisor
+    /// ([`Behavior::logit_multiplier`](super::arch::Behavior)).
+    pub(crate) logit_mult: f32,
+    /// Epsilon of the post-attention and post-FFN norms.
+    pub(crate) post_eps: f64,
     pub(crate) logit_softcap: Option<f64>,
     /// Width of one layer's per-layer-embedding slice (Gemma 4).
     pub(crate) ple_dim: Option<usize>,
@@ -265,6 +270,15 @@ pub(crate) struct Hparams {
 impl Hparams {
     pub(crate) fn act(&self) -> Act {
         self.behavior.act
+    }
+
+    /// Finish looked-up embedding rows (after the embedding scale): the
+    /// architecture's scale-less norm over every `n_embd` row, if it has one
+    /// ([`Behavior::embd_norm`](super::arch::Behavior)). Row-independent.
+    pub(crate) fn norm_embeddings(&self, rows: &mut [f32]) {
+        if self.behavior.embd_norm {
+            super::quant::rms_norm_rows(rows, self.n_embd, self.eps as f32);
+        }
     }
 
     /// Layers that compute their own K/V.
@@ -505,7 +519,18 @@ impl Hparams {
             Ok(RopeSpec::plain(
                 behavior.rope,
                 n_dims,
-                k.f64_opt("rope.freq_base_swa")?.unwrap_or(10_000.0),
+                k.f64_opt("rope.freq_base_swa")?
+                    .map_or_else(
+                        || {
+                            if behavior.swa_base_from_freq_base {
+                                k.f64_opt("rope.freq_base")
+                            } else {
+                                Ok(None)
+                            }
+                        },
+                        |b| Ok(Some(b)),
+                    )?
+                    .unwrap_or(10_000.0),
             ))
         };
 
@@ -545,7 +570,8 @@ impl Hparams {
             }
             let nope = behavior
                 .no_rope_interval
-                .is_some_and(|n| (il + 1).is_multiple_of(n));
+                .is_some_and(|n| (il + 1).is_multiple_of(n))
+                || (behavior.nope_full_layers && !is_sliding);
             let rope = if nope {
                 None
             } else {
@@ -627,6 +653,11 @@ impl Hparams {
         } else {
             (1.0, 1.0)
         };
+        let logit_mult = if behavior.logit_multiplier {
+            k.f64("logit_scale")? as f32
+        } else {
+            1.0
+        };
         let positive = |key: &str| -> Result<Option<f64>, CucaError> {
             match k.f64_opt(key)? {
                 Some(v) if !v.is_finite() || v <= 0.0 => Err(meta_err(
@@ -682,6 +713,8 @@ impl Hparams {
             embd_scale,
             residual_scale,
             logit_scale,
+            logit_mult,
+            post_eps: behavior.post_norm_eps.unwrap_or(eps),
             logit_softcap: positive("final_logit_softcapping")?,
             ple_dim,
             moe,
@@ -1064,6 +1097,64 @@ mod tests {
         for il in 0..8 {
             assert_eq!(p.layers[il].rope.is_none(), il % 4 == 3, "layer {il}");
         }
+    }
+
+    /// Muse Glimmer metadata: `[sliding x3, full]` twice.
+    fn muse_metadata() -> Metadata {
+        let pattern = (0..8).map(|il| Bool(il % 4 != 3)).collect();
+        md(&[
+            ("general.architecture", Str("muse-glimmer".into())),
+            ("muse-glimmer.block_count", U32(8)),
+            ("muse-glimmer.context_length", U32(4096)),
+            ("muse-glimmer.embedding_length", U32(64)),
+            ("muse-glimmer.attention.head_count", U32(4)),
+            ("muse-glimmer.attention.head_count_kv", U32(2)),
+            ("muse-glimmer.attention.key_length", U32(32)),
+            ("muse-glimmer.attention.layer_norm_rms_epsilon", F32(1e-5)),
+            ("muse-glimmer.attention.sliding_window", U32(16)),
+            (
+                "muse-glimmer.attention.sliding_window_pattern",
+                Array(pattern),
+            ),
+            ("muse-glimmer.rope.freq_base", F32(500_000.0)),
+            ("muse-glimmer.final_logit_softcapping", F32(20.0)),
+            ("muse-glimmer.logit_scale", F32(0.25)),
+        ])
+    }
+
+    #[test]
+    fn muse_glimmer_rotates_sliding_layers_only_with_the_global_base() {
+        let p = Hparams::from_metadata(&muse_metadata(), &none).unwrap();
+        assert_eq!(p.arch, Arch::MuseGlimmer);
+        for il in 0..8 {
+            let global = il % 4 == 3;
+            let l = &p.layers[il];
+            assert_eq!(l.rope.is_none(), global, "layer {il}");
+            assert_eq!(l.window, if global { None } else { Some(16) }, "layer {il}");
+            assert_eq!(l.head_dim, 32);
+        }
+        // No `rope.freq_base_swa` in the file: sliding layers use 500000.
+        assert_eq!(p.ropes.len(), 1);
+        assert_eq!(p.ropes[0].base, 500_000.0);
+        assert_eq!(p.ropes[0].n_dims, 32);
+        // The logit scale multiplies (it is not Granite's divisor), the post
+        // norms keep their own epsilon.
+        assert_eq!(p.logit_mult, 0.25);
+        assert_eq!(p.logit_scale, 1.0);
+        assert_eq!(p.logit_softcap, Some(20.0));
+        assert_eq!(p.eps, f64::from(1e-5f32));
+        assert_eq!(p.post_eps, 1e-8);
+        let mut meta = muse_metadata();
+        meta.insert("muse-glimmer.rope.freq_base_swa".into(), F32(10_000.0));
+        let p = Hparams::from_metadata(&meta, &none).unwrap();
+        assert_eq!(p.ropes[0].base, 10_000.0);
+    }
+
+    #[test]
+    fn other_architectures_keep_their_norm_epsilon_and_unit_logit_multiplier() {
+        let p = Hparams::from_metadata(&llama_metadata(), &has_rope_freqs).unwrap();
+        assert_eq!(p.post_eps, p.eps);
+        assert_eq!(p.logit_mult, 1.0);
     }
 
     #[test]

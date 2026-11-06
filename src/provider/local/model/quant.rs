@@ -139,6 +139,23 @@ pub(crate) fn dequant_row(
     Ok(())
 }
 
+/// Scale-less RMSNorm of every `row_len`-wide row of `rows`, in place: `x /
+/// sqrt(mean(x^2) + eps)`, summed in f64 so the result does not depend on a
+/// vector width.
+pub(crate) fn rms_norm_rows(rows: &mut [f32], row_len: usize, eps: f32) {
+    for row in rows.chunks_exact_mut(row_len.max(1)) {
+        let mean = row
+            .iter()
+            .map(|&x| f64::from(x) * f64::from(x))
+            .sum::<f64>()
+            / row.len() as f64;
+        let inv = (1.0 / (mean + f64::from(eps)).sqrt()) as f32;
+        for x in row {
+            *x *= inv;
+        }
+    }
+}
+
 /// The 5-bit quants (low nibble plus its high bit) of elements `j` and
 /// `j + 16` of a Q5_0 or Q5_1 block.
 fn q5_pair(q: u8, qh: u32, j: usize) -> (i16, i16) {

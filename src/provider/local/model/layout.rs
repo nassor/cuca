@@ -152,6 +152,9 @@ pub(crate) struct LayerLayout {
     pub(crate) k_norm: bool,
     pub(crate) post_attn_norm: bool,
     pub(crate) post_ffw_norm: bool,
+    /// A separate `attn_gate` projection multiplies the attention output
+    /// ([`Behavior::attn_gate_tensor`](super::arch::Behavior)).
+    pub(crate) attn_gate: bool,
     pub(crate) ffn: Ffn,
 }
 
@@ -232,6 +235,10 @@ impl LayerLayout {
                 tensor_info(content, &name::blk(il, part))?;
             }
         }
+        let attn_gate = hp.behavior.attn_gate_tensor && spec.delta().is_none();
+        if attn_gate {
+            tensor_info(content, &name::blk(il, name::ATTN_GATE))?;
+        }
         Ok(Self {
             qkv,
             biases,
@@ -239,6 +246,7 @@ impl LayerLayout {
             k_norm: owns && has_part(name::ATTN_K_NORM),
             post_attn_norm,
             post_ffw_norm,
+            attn_gate,
             ffn,
         })
     }

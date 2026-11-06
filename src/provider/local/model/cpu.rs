@@ -190,6 +190,10 @@ struct AttnWeights {
     k_norm: Option<Tensor>,
     /// Weights of the weightless value-norm (ones), Gemma 4 only.
     v_norm: Option<Tensor>,
+    /// `attn_gate`: the sigmoid gate of the attention output computed from the
+    /// normed layer input
+    /// ([`Behavior::attn_gate_tensor`](super::arch::Behavior)).
+    gate: Option<Box<QMatMul>>,
     wo: Linear,
 }
 
@@ -848,7 +852,7 @@ impl Transformer {
 
     /// [`Transformer::load`] with every matmul weight dequantized to f32: the
     /// exact-arithmetic reference the GPU engine is compared against.
-    #[cfg(all(test, feature = "provider-local-gpu"))]
+    #[cfg(test)]
     pub(crate) fn load_dequantized(
         content: &gguf_file::Content,
         path: &Path,
@@ -1111,7 +1115,8 @@ impl Transformer {
             .embed
             .as_ref()
             .ok_or_else(|| err("a drafter has no token embedding; use `draft`"))?;
-        let embeddings = embed.rows(&tokens, self.hp.embd_scale)?;
+        let mut embeddings = embed.rows(&tokens, self.hp.embd_scale)?;
+        self.hp.norm_embeddings(&mut embeddings);
         let per_layer = match (&mut self.ple, self.hp.ple_dim) {
             (Some(ple), Some(dim)) => Some(ple.table.rows(&tokens, (dim as f32).sqrt())?),
             _ => None,
@@ -1533,6 +1538,9 @@ impl Transformer {
         if hp.logit_scale != 1.0 {
             logits = logits.affine(1.0 / f64::from(hp.logit_scale), 0.0)?;
         }
+        if hp.logit_mult != 1.0 {
+            logits = logits.affine(f64::from(hp.logit_mult), 0.0)?;
+        }
         if let Some(cap) = hp.logit_softcap {
             logits = logits.affine(1.0 / cap, 0.0)?.tanh()?.affine(cap, 0.0)?;
         }
@@ -1572,6 +1580,7 @@ impl Transformer {
     ) -> candle_core::Result<Tensor> {
         let hp = &self.hp;
         let eps = hp.eps as f32;
+        let post_eps = hp.post_eps as f32;
         let rs = f64::from(hp.residual_scale);
         let scaled = |branch: Tensor| -> candle_core::Result<Tensor> {
             if hp.residual_scale == 1.0 {
@@ -1587,7 +1596,7 @@ impl Transformer {
         };
         let mut attn = mix(&h)?;
         if let Some(w) = &lw.post_attn_norm {
-            attn = rms(&attn, w, eps)?;
+            attn = rms(&attn, w, post_eps)?;
         }
         let x = (x + scaled(attn)?)?;
 
@@ -1597,7 +1606,7 @@ impl Transformer {
         };
         let mut f = lw.ffn.forward(&f, hp.act())?;
         if let Some(w) = &lw.post_ffw_norm {
-            f = rms(&f, w, eps)?;
+            f = rms(&f, w, post_eps)?;
         }
         let mut x = (&x + scaled(f)?)?;
 
@@ -1715,6 +1724,11 @@ impl Transformer {
         let q = match &aw.q_norm {
             Some(w) if !full_qk => rms(&q, w, eps)?,
             _ => q,
+        };
+        // A gate projection of its own reads the same normed input as Q.
+        let gate = match &aw.gate {
+            Some(w) => Some(w.forward(h)?),
+            None => gate,
         };
         let q = q.transpose(1, 2)?.contiguous()?;
         let q = self.rotate_calls(spec, &q, calls)?;
@@ -2112,6 +2126,13 @@ fn load_attention(
             },
         )?,
         v_norm,
+        gate: if layout.attn_gate {
+            Some(Box::new(
+                loader.matmul(&blk(name::ATTN_GATE), &[q_width, n_embd])?,
+            ))
+        } else {
+            None
+        },
         wo: loader.linear(il, name::ATTN_OUTPUT, [n_embd, q_width], layout.biases.o)?,
     })
 }
