@@ -48,7 +48,6 @@ use sha2::{Digest, Sha256};
 use self::arch::ConvArch;
 use self::gguf_writer::GgufWriter;
 use self::hf::CheckpointDir;
-use super::model::arch::Arch;
 use super::tokenizer::Tokenizer;
 use super::{DownloadProgress, DownloadProgressCallback, ModelSource, WeightQuant, download};
 use crate::error::CucaError;
@@ -277,11 +276,8 @@ fn convert_locked(
         kv.extend(v.kv);
     }
     let names: HashSet<&str> = plans.iter().map(|p| p.name.as_str()).collect();
-    // The engine's own reader validates the metadata whenever the engine
-    // implements the architecture (`mistral4` is converted ahead of it).
-    if Arch::from_name(arch.gguf_name()).is_ok() {
-        config::check(&kv, &|n| names.contains(n))?;
-    }
+    // The engine's own reader validates the metadata it will read.
+    config::check(&kv, &|n| names.contains(n))?;
     if arch != ConvArch::Gemma4Assistant {
         let md: HashMap<String, _> = kv.iter().cloned().collect();
         Tokenizer::from_gguf(&md).map_err(|e| {
