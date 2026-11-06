@@ -113,7 +113,7 @@ With none of them set, `LocalModel::load` fails with `CucaError::Config`. Downlo
 ### Model selection
 
 - `CUCA_LOCAL_MODEL_PATH` is the path of an existing GGUF file of any supported architecture. It skips the download and wins over `CUCA_LOCAL_MODEL`.
-- `CUCA_LOCAL_MODEL` names what to download: a preset from `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`, `llama3.2-1b-q4_0`; ASCII case-insensitive) or an unverified `repo:revision:file`. It is parsed with `ModelSource::from_str`, and an unknown value fails with the accepted names. Default: `gemma4-e2b-q4_0`.
+- `CUCA_LOCAL_MODEL` names what to download: a preset from `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`; ASCII case-insensitive) or an unverified `repo:revision:file`. It is parsed with `ModelSource::from_str`, and an unknown value fails with the accepted names. Default: `gemma4-e2b-q4_0`.
 - `CUCA_LOCAL_DOWNLOAD=1` downloads the default model (Gemma 4 E2B Q4_0) into the cache for a test run. Setting `CUCA_LOCAL_MODEL` downloads that model without it. The tests compare against the literal `1`.
 
 ### Device

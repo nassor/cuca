@@ -76,10 +76,46 @@
   gives the single-device replies (15 of 15 each), at about a third of the
   speed (the host-staged reduction: two readbacks per layer), and continuous
   batching works on it (8 of 8 concurrent replies equal to the serial ones).
+- `provider-local`: the `olmoe-1b-7b-q4_0` preset now pins
+  `allenai/OLMoE-1B-7B-0125-Instruct-GGUF` (Q4_0, revision `2ac1d273`, 3.93 GB,
+  published by the model's lab) instead of the September 2024
+  `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF`; same architecture and sizes.
 
-### Fixed
+### Removed
 
-- `provider-local`: the `qwen2.5-0.5b-q8_0` preset now uses `bartowski/Qwen2.5-0.5B-Instruct-GGUF` (same weights, tied output head). The official `Qwen/Qwen2.5-0.5B-Instruct-GGUF` embeds a chat template that teaches a doubled-brace tool-call syntax (`{{"name": ...}}`), which the greedy model copied and the parser rejected; the new file's template equals the Hugging Face one, and both tool scenarios pass.
+Models first released before 2025 and the engine code only they needed.
+
+- `provider-local` presets `gemma2-2b-q4_0`, `qwen2.5-0.5b-q8_0`,
+  `llama3.2-1b-q4_0`, `phi3.5-mini-q4_0`, `smollm2-360m-q8_0`,
+  `tinyllama-1.1b-q4_0` and `granite3.1-moe-1b-q4_0` (all first released
+  between December 2023 and December 2024). Any GGUF of those models still
+  loads when its architecture is supported (`llama`, `qwen2`, `phi3`).
+- The `gemma2` and `granitemoe` architectures: a GGUF with that
+  `general.architecture` now fails with the unknown-architecture error, and
+  the checkpoint classes `Gemma2ForCausalLM` and `GraniteMoeForCausalLM` fail
+  with the no-converter error, both naming the value. No official model
+  released since January 2025 uses `granitemoe` except a safety classifier,
+  and `gemma2` only TxGemma.
+- Attention logit soft-capping (the `{arch}.attn_logit_softcapping` key and
+  the `softcap` argument of the CPU attention, the paged attention and the GPU
+  decode kernel): only Gemma 2 used it. The final logit soft-cap of Gemma 4
+  stays.
+- The Llama 3 tool-call syntax (`ToolSyntax::LlamaJson`: a bare
+  `{"name": ..., "parameters": ...}` reply and the `<|python_tag|>` body that
+  became a `python` call); only Llama 3.2 used it. A model with such a
+  template now answers in plain text. The tagged-JSON syntax still reads
+  `parameters` as an alias of `arguments`.
+- The pre-tokenizer names `smollm`, `megrez`, `stablelm2`, `phi-2`, `mpt`,
+  `jais`, `jina-es`, `jina-de`, `jina-v2-es`, `jina-v2-de`, `codeshell` and
+  `minerva-7b`, whose families were first released before 2025.
+  `unsupported pre-tokenizer` names them now.
+- The Granite MoE `block_sparse_moe` expert tensors in the checkpoint
+  converter and the `TinySpec::gemma2` and `TinySpec::granitemoe` test
+  fixtures; the SmolLM 2, TinyLlama, Gemma 2 and Granite 3.1 MoE converter
+  oracle checkpoints and the fixtures, goldens, templates and known limits of
+  the removed presets. The converter oracle now covers
+  `unsloth/gemma-3-1b-it` (the ungated mirror of `google/gemma-3-1b-it`, SentencePiece),
+  `allenai/OLMoE-1B-7B-0125-Instruct` and `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` (a 2025 `LlamaForCausalLM`).
 
 ## 0.6.2
 

@@ -11,7 +11,7 @@ weight = 8
 <dt>In one line</dt>
 <dd><code>ExpertPlacement::Tiered</code> keeps a mixture-of-experts model's experts in the GGUF file and loads them on demand through caches of a byte size you choose, with the same output as the resident load.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts (<code>granitemoe</code>, <code>qwen3moe</code> or <code>olmoe</code>).</dd>
+<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts (<code>qwen3moe</code>, <code>olmoe</code> or <code>qwen35moe</code>).</dd>
 <dt>Read this if</dt>
 <dd>A mixture-of-experts model is larger than the RAM or device memory you want to spend on it, or you need the cache counters and the heat export.</dd>
 </dl>
@@ -187,8 +187,8 @@ Tiered placement trades speed for memory. These runs used `tests/provider_local_
 
 | Model | Placement | Tokens per second | Hit rate |
 |---|---|---|---|
-| `olmoe-1b-7b-q4_0` | resident | 41 | not applicable |
-| `olmoe-1b-7b-q4_0` | `tiered:ram=500m`, 9 of 64 experts per layer | 9.7 cold, 9.8 warm | 0.367 cold, 0.370 warm |
+| `olmoe-1b-7b-q4_0` | resident | 42 | not applicable |
+| `olmoe-1b-7b-q4_0` | `tiered:ram=500m`, 9 of 64 experts per layer | 10.0 cold, 10.1 warm | 0.381 cold, 0.385 warm |
 | `qwen3-30b-a3b-q4_0` | resident, 17.4 GB of RAM | 12.3 | not applicable |
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=4g`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.641 cold, 0.686 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=1100m`, 9 of 128 experts per layer | 6.2 cold, 5.3 warm | 0.381 cold, 0.383 warm |
@@ -201,6 +201,8 @@ These runs read the model from the OS page cache. Reads of an uncached file from
 For `qwen3.6-35b-a3b-q4_0` the cold runs read 18,861 experts (33.6 GB) at `ram=4g` and 38,510 (68.5 GB) at `ram=600m`, out of 55,597 lookups. A single 1,024-token reply (`examples/local_model.rs`) peaked at 18.8 GiB of resident set with resident experts, 5.95 GiB at `ram=4g` and 2.43 GiB at `ram=600m`, and the model loaded in 8.3 s resident against 0.8 s tiered. The 20.8 GB file was in the OS page cache for all of these runs, so the disk reads are memory copies, not reads from the drive.
 
 The same test on Vulkan (AMD RX 9070 XT, Windows, release build) gave the rates below. They include the first-use kernel tuning of each new matrix shape, which a short run does not amortize.
+
+The `olmoe-1b-7b-q4_0` rows were measured with the September 2024 OLMoE-1B-7B-0924 file this preset pinned before; the 0125 file has the same architecture and sizes and was not re-measured on Vulkan.
 
 | Model | Placement | Tokens per second | Hit rate |
 |---|---|---|---|

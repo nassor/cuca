@@ -38,18 +38,16 @@ Nothing here is specific to one model family. The loader reads every dimension f
 |---|---|---|
 | `gemma4` | Gemma 4 (E2B, E4B) | CPU, GPU |
 | `gemma3` | Gemma 3 (270M, 1B) | CPU, GPU |
-| `gemma2` | Gemma 2 (2B) | CPU, GPU |
-| `llama` | Llama 3.2, SmolLM 2, TinyLlama; other models published as `llama` | CPU, GPU |
-| `qwen2` | Qwen 2.5, DeepSeek-R1-Distill-Qwen | CPU, GPU |
+| `llama` | Llama-family models published as `llama` (for example DeepSeek-R1-Distill-Llama, Mistral-style models) | CPU, GPU |
+| `qwen2` | DeepSeek-R1-Distill-Qwen and other Qwen 2.5-family models | CPU, GPU |
 | `qwen3` | Qwen 3 | CPU, GPU |
 | `qwen35` | Qwen 3.5 (0.8B) | CPU, GPU (tiny-model tests only on the GPU) |
 | `qwen35moe` | Qwen 3.6 MoE (Qwen3.6-35B-A3B) | CPU, GPU |
-| `phi3` | Phi 3.5 mini, Phi 4 mini | CPU, GPU |
+| `phi3` | Phi 4 mini (and Phi 3.5) | CPU, GPU |
 | `smollm3` | SmolLM 3 | CPU, GPU |
 | `granite` | Granite 3.3 (dense) | CPU, GPU |
-| `granitemoe` | Granite 3.1 MoE | CPU, GPU |
 | `qwen3moe` | Qwen 3 MoE (Qwen3-30B-A3B) | CPU, GPU |
-| `olmoe` | OLMoE (OLMoE-1B-7B) | CPU, GPU |
+| `olmoe` | OLMoE (OLMoE-1B-7B-0125) | CPU, GPU |
 | `olmo2` | OLMo 2 | CPU, GPU |
 | `ernie4_5` | ERNIE 4.5 (dense) | CPU, GPU |
 | `gemma4-assistant` | the Gemma 4 multi-token-prediction drafter | only through `LocalModelConfig::drafter` |
@@ -58,14 +56,12 @@ What each architecture adds to the common forward pass:
 
 - `gemma4`: sliding and full layers with their own head sizes and RoPE bases, shared K/V layers (the last `shared_kv_layers` layers read an earlier layer's cache), per-layer embeddings read from the file per token, a weightless value norm, a per-layer output scale, and a final logit soft-cap.
 - `gemma3`: sliding and full layers (every sixth layer is full), QK-norm, post-attention and post-FFN norms.
-- `gemma2`: alternating sliding and full layers (every other layer is full), an attention logit soft-cap and a final logit soft-cap, post-attention and post-FFN norms, no QK-norm.
 - `llama`: the Llama 3 RoPE scaling that the file carries as `rope_freqs.weight`, optional biases, a tied or separate output head.
 - `qwen2`: Q, K and V biases.
 - `qwen3`: QK-norm, and a head size that may differ from the model width.
 - `phi3`: fused attention and gate/up projections, LongRoPE with short and long factors, partial rotary dimensions.
 - `smollm3`: Llama-style layers where every fourth layer applies no RoPE.
 - `granite`: embedding, attention, residual and logit scales.
-- `granitemoe`: the Granite scales and a top-k mixture of experts.
 - `qwen3moe`: Qwen 3 attention (a Q/K RMSNorm per head, NEOX RoPE) and a top-k mixture of experts whose selected weights are renormalised to sum to one.
 - `olmoe`: pre-norms, a Q/K RMSNorm that spans the whole projection, NEOX RoPE and a top-k mixture of experts whose selected weights are not renormalised.
 - `olmo2`: no pre-norms, only post-attention and post-FFN norms, and a Q/K RMSNorm that spans the whole projection.
@@ -76,7 +72,7 @@ What each architecture adds to the common forward pass:
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
 
-Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, gemma2, llama, qwen2, qwen3, phi3, smollm3, granite, granitemoe, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, gemma4-assistant``.
+Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, qwen3, phi3, smollm3, granite, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, gemma4-assistant``.
 
 ### Hybrid models
 
@@ -98,19 +94,19 @@ A safetensors checkpoint of any architecture in the table above loads through `M
 |---|---|
 | `LlamaForCausalLM` | `llama` |
 | `SmolLM3ForCausalLM` | `smollm3` |
-| `GraniteForCausalLM`, `GraniteMoeForCausalLM` | `granite`, `granitemoe` |
+| `GraniteForCausalLM` | `granite` |
 | `Qwen2ForCausalLM`, `Qwen3ForCausalLM`, `Qwen3MoeForCausalLM` | `qwen2`, `qwen3`, `qwen3moe` |
 | `Qwen3_5ForCausalLM`, `Qwen3_5ForConditionalGeneration` | `qwen35` |
 | `Qwen3_5MoeForCausalLM`, `Qwen3_5MoeForConditionalGeneration` | `qwen35moe` |
 | `Phi3ForCausalLM` | `phi3` |
-| `Gemma2ForCausalLM`, `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` | `gemma2`, `gemma3` |
+| `Gemma3ForCausalLM`, `Gemma3ForConditionalGeneration` | `gemma3` |
 | `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`, `Gemma4AssistantForCausalLM` | `gemma4`, `gemma4-assistant` |
 | `Olmo2ForCausalLM`, `Olmo3ForCausalLM` (without sliding layers), `OlmoeForCausalLM` | `olmo2`, `olmoe` |
 | `Ernie4_5ForCausalLM` | `ernie4_5` |
 
-Any other architecture fails with `` architecture `X` has no checkpoint converter; convert it to GGUF with llama.cpp ``. The weights, the metadata, the tokenizer (including `tokenizer.ggml.pre`, found from `tokenizer.json` and fingerprinted with llama.cpp's probe-text hash table) and the chat template are those llama.cpp's `convert_hf_to_gguf.py` writes: that script (commit `67107ac34f62882d8b53ea41ad68010ea635b9be`) was run on the same checkpoints and its GGUF files compared key by key and tensor by tensor with the converter's, with no difference but the float-rounding ones listed under [Checkpoints](@/providers/local/model-sources.md#checkpoints). Converted `f16` checkpoints also match the transformers oracle (top-1 equal, top-10 overlap at least 9 of 10, logits within 2 % relative L2) in `src/provider/local/convert/oracle.rs`, and answer the oracle's chat turn in `tests/provider_local_convert.rs`. All ten pinned repositories (SmolLM 2, TinyLlama, Gemma 2, OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 3, Granite 3.1 MoE, OLMoE-1B-7B, Qwen 3.5) passed: top-1 equal, top-10 overlap 10 of 10, greedy ids equal for all 24 (8 or 4 on the long prompts) steps, and every checkpoint answers the oracle's chat turn.
+Any other architecture fails with `` architecture `X` has no checkpoint converter; convert it to GGUF with llama.cpp ``. The weights, the metadata, the tokenizer (including `tokenizer.ggml.pre`, found from `tokenizer.json` and fingerprinted with llama.cpp's probe-text hash table) and the chat template are those llama.cpp's `convert_hf_to_gguf.py` writes: that script (commit `67107ac34f62882d8b53ea41ad68010ea635b9be`) was run on the same checkpoints and its GGUF files compared key by key and tensor by tensor with the converter's, with no difference but the float-rounding ones listed under [Checkpoints](@/providers/local/model-sources.md#checkpoints). Converted `f16` checkpoints also match the transformers oracle (top-1 equal, top-10 overlap at least 9 of 10, logits within 2 % relative L2) in `src/provider/local/convert/oracle.rs`, and answer the oracle's chat turn in `tests/provider_local_convert.rs`. All eight pinned repositories (OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 3, Gemma 3 1B through the ungated `unsloth/gemma-3-1b-it` mirror, OLMoE-1B-7B-0125-Instruct, DeepSeek-R1-Distill-Llama-8B as the 2025 `LlamaForCausalLM`, Qwen 3.5) passed: top-1 equal, top-10 overlap 10 of 10, greedy ids equal for all 24 (8 or 4 on the long prompts) steps, and every checkpoint answers the oracle's chat turn.
 
-The live matrix (`tests/provider_local.rs`, CPU, release) on converted checkpoints gives the same PASS/SKIP/KNOWN-LIMIT categories as the preset GGUF of the same model for Qwen 3 0.6B, Llama 3.2 1B, Phi 3.5 mini, Phi 4 mini, Qwen 2.5 0.5B (converted at Q8_0) and Gemma 4 E2B (converted at Q4_0: `token_embd` at Q8_0 and `per_layer_model_proj` at F16, as the published file has them). The one scenario that differs is a model effect, not a conversion one: Gemma 3 1B converted at Q8_0 writes the count in words (`One, Two, ...`) where the Q4_0 preset writes digits, so `stop_string_cuts_the_reply` fails; converted at `q4_0` it passes like the preset. The multi-token-prediction drafter check (`tests/provider_local_mtp.rs`) passes with a converted Gemma 4 E2B target and a converted `google/gemma-4-E2B-it-assistant` (output identical to plain decoding, 1.17x at 3 drafts), and the Qwen 3 0.6B matrix passes on Vulkan.
+The live matrix (`tests/provider_local.rs`, CPU, release) on converted checkpoints gives the same PASS/SKIP/KNOWN-LIMIT categories as the preset GGUF of the same model for Qwen 3 0.6B, Phi 4 mini and Gemma 4 E2B (converted at Q4_0: `token_embd` at Q8_0 and `per_layer_model_proj` at F16, as the published file has them). The one scenario that differs is a model effect, not a conversion one: Gemma 3 1B converted at Q8_0 writes the count in words (`One, Two, ...`) where the Q4_0 preset writes digits, so `stop_string_cuts_the_reply` fails; converted at `q4_0` it passes like the preset. The multi-token-prediction drafter check (`tests/provider_local_mtp.rs`) passes with a converted Gemma 4 E2B target and a converted `google/gemma-4-E2B-it-assistant` (output identical to plain decoding, 1.17x at 3 drafts), and the Qwen 3 0.6B matrix passes on Vulkan.
 
 ## Weight formats
 
@@ -125,7 +121,7 @@ The live matrix (`tests/provider_local.rs`, CPU, release) on converted checkpoin
 - Norm vectors, biases and scalars are f32 whatever their stored dtype. Resident weights are about the file size.
 - The CPU reads any dtype candle's quantized matmul reads: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants (Q2_K to Q6_K). An IQ-family tensor makes the load fail with `` `PATH` is not a supported GGUF file: ... ``.
 - A GPU requantizes every dtype other than Q4_0, Q8_0, F32, F16 and BF16 to Q8_0. Each element moves by at most half a Q8_0 step. That is a smaller error than the one a Q4_K, Q5_K or Q6_K file already carries, but GPU logits then differ from the CPU's by more than float rounding.
-- A GPU file that mixes Q4_0 and Q8_0 weights, as the Llama 3.2 and Phi 3.5 presets do, keeps the weights of the scheme with fewer bytes as f32 where the two have similar shapes. That is exact and costs extra device memory.
+- A GPU file that mixes Q4_0 and Q8_0 weights, as the Q4_0 presets with a Q8_0 embedding do, keeps the weights of the scheme with fewer bytes as f32 where the two have similar shapes. That is exact and costs extra device memory.
 - A weight over 1 GiB on the GPU is split into row chunks.
 - Measured on Vulkan with `phi4-mini-q4_k_m` (AMD RX 9070 XT, Windows): the top-1 token equals the CPU's and the relative logit error against the dequantized CPU reference is 1.8e-2.
 - Mixture of experts: by default expert tensors are split once at load into one quantized 2-D weight per expert, so memory is the file size. `LocalModelConfig::experts` can leave them in the file instead; see [Tiered expert placement](@/providers/local/expert-tiers.md).
@@ -143,17 +139,15 @@ Any other `tokenizer.ggml.model` fails the load with ``unsupported tokenizer mod
 | Family | `tokenizer.ggml.model` | `tokenizer.ggml.pre` |
 |---|---|---|
 | Gemma 4 | `gemma4` | none |
-| Gemma 3, Gemma 2, Phi 3.5, ERNIE 4.5 | `llama` | `default` |
-| TinyLlama | `llama` | absent |
-| Qwen 2.5, Qwen 3 | `gpt2` | `qwen2` |
+| Gemma 3, ERNIE 4.5 | `llama` | `default` |
+| Qwen 3 | `gpt2` | `qwen2` |
 | Qwen 3.5 | `gpt2` | `qwen35` |
 | DeepSeek-R1 distill | `gpt2` | `deepseek-r1-qwen` |
-| Llama 3.2 | `gpt2` | `llama-bpe` |
 | SmolLM 3 | `gpt2` | `smaug-bpe` |
 | Phi 4 mini | `gpt2` | `gpt-4o` |
-| Granite 3.1 and 3.3 | `gpt2` | `refact` |
+| Granite 3.3 | `gpt2` | `refact` |
 | OLMo 2 | `gpt2` | `dbrx` |
-| SmolLM 2 | `gpt2` | `smollm` |
+| OLMoE | `gpt2` | `olmo` |
 
 ### Pre-tokenizers
 
@@ -161,23 +155,23 @@ A `gpt2` model with no `pre`, or `default`, uses the default expression. Sentenc
 
 - `llama3`, `llama-v3`, `llama-bpe`, `falcon3`, `falcon-h1`, `pixtral`, `midm-2.0`, `lfm2`, `jina-v5-nano`: the Llama 3 expression. Whole words found in the vocabulary skip the merges, and a BOS token is added by default.
 - `smaug-bpe`, `dbrx`: the Llama 3 expression without that shortcut.
-- `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `megrez`, `stablelm2`, `hunyuan`, `solar-open`: the Qwen 2 expression.
+- `qwen2`, `deepseek-r1-qwen`, `kormo`, `f2llmv2`, `hunyuan`, `solar-open`: the Qwen 2 expression.
 - `qwen35`: the Qwen 2 expression with combining marks.
-- `gpt-2`, `phi-2`, `mpt`, `olmo`, `jais`, `trillion`, `granite-docling`, `exaone4`, `mellum`, `modern-bert`, `gigachat`, `a.x-4.0`, `jina-es`, `jina-de`, `jina-v2-es`, `jina-v2-de`: the GPT-2 expression.
-- `starcoder`, `refact`, `command-r`, `smollm`, `codeshell`, `exaone`, `minerva-7b`, `mellum2`: digits are split first, then the GPT-2 expression runs on the fragments between them.
+- `gpt-2`, `olmo`, `trillion`, `granite-docling`, `exaone4`, `mellum`, `modern-bert`, `gigachat`, `a.x-4.0`: the GPT-2 expression.
+- `starcoder`, `refact`, `command-r`, `exaone`, `mellum2`: digits are split first, then the GPT-2 expression runs on the fragments between them.
 - `gpt-4o`, `llama4`, `kanana2`, `talkie`, `minimax-m2`: the GPT-4o expression, with case classes from real Unicode categories.
 - `gemma4`: the space-escaped scheme above.
 
-Any other `pre` fails the load with ``unsupported pre-tokenizer `NAME` ``.
+Any other `pre` fails the load with ``unsupported pre-tokenizer `NAME` ``. The names of families first released before 2025 (`smollm`, `megrez`, `stablelm2`, `phi-2`, `mpt`, `jais`, `jina-es`, `jina-de`, `jina-v2-es`, `jina-v2-de`, `codeshell`, `minerva-7b`) are not implemented.
 
 ### Special tokens and BOS
 
 - Special tokens (control, user-defined and unknown types) are cut out of the text longest-first before the scheme runs, so `<|im_start|>` in a rendered prompt is one token.
 - The prompt gets a BOS token when `tokenizer.ggml.add_bos_token` (or the scheme's default) says so, and never a second one when the rendered template already starts with it.
 - Phi-3-family SentencePiece models strip the whitespace that follows a special token, as their reference tokenizer does. No other family does.
-- For a SentencePiece model with `add_space_prefix`, text after a special token such as `</s>` gets a leading space token, as in llama.cpp. HuggingFace's tokenizer does not add it for TinyLlama's chat template, so TinyLlama's prompt has one more token.
+- For a SentencePiece model with `add_space_prefix`, text after a special token such as `</s>` gets a leading space token, as in llama.cpp. HuggingFace's tokenizer does not add it, so such a model's prompt has one more token than the reference tokenizer's (ERNIE 4.5's GGUF files that omit the key; the default stays because llama.cpp applies it).
 
-Verified by the tokenizer golden test in `src/provider/local/tokenizer/golden.rs`: for 11 models (Qwen 3, Qwen 2.5, Llama 3.2, Gemma 3 270M and 1B, SmolLM 3, Phi 3.5, Phi 4 mini, R1 distill, Granite 3.1 MoE, Qwen 3.5) the ids of 16 texts and 3 chat prompts equal the HuggingFace `tokenizer.json` ids. The test reads cached model files and prints `SKIP:` for a missing one. Where llama.cpp and HuggingFace differ, the expected ids follow llama.cpp, with two exceptions that follow HuggingFace: Phi 3.5's `rstrip` on special tokens, and the GPT-4o case classes.
+Verified by the tokenizer golden test in `src/provider/local/tokenizer/golden.rs`: for 7 models (Qwen 3, Gemma 3 270M and 1B, SmolLM 3, Phi 4 mini, R1 distill, Qwen 3.5) the ids of 16 texts and 3 chat prompts equal the HuggingFace `tokenizer.json` ids. The test reads cached model files and prints `SKIP:` for a missing one. Where llama.cpp and HuggingFace differ, the expected ids follow llama.cpp, with one exception that follows HuggingFace: the GPT-4o case classes.
 
 ## Chat templates
 
@@ -201,7 +195,7 @@ Helpers the templates rely on:
 
 Tool arguments stay JSON objects, as templates expect. The key order inside a tool's JSON schema (`parameters`) is the order of the request's `serde_json` map: sorted by key, unless your application enables the `preserve_order` feature of `serde_json`, in which case it is the order you wrote. Arguments of tool calls in the history are sorted the same way.
 
-Verified by the unit test `renders_match_the_reference_jinja_environment` in `src/provider/local/chat/golden.rs`. For 13 templates (Gemma 3 1B and 270M, Gemma 4, Granite 3.3, Granite 3.1 MoE, Llama 3.2, Phi 3.5, Phi 4 mini, Qwen 2.5, Qwen 3, Qwen 3.5, the R1 Qwen distill, SmolLM 3) and 7 cases (a plain turn, a system prompt, a multi-turn history, thinking on and off, tools declared, a tool call with its result) the rendered text equals what Python `jinja2` renders with `trim_blocks`, `lstrip_blocks`, a `json.dumps(ensure_ascii=False)` `tojson` and `strftime_now` pinned to 2026-10-18 UTC. The fixtures are in `src/provider/local/testdata/`.
+Verified by the unit test `renders_match_the_reference_jinja_environment` in `src/provider/local/chat/golden.rs`. For 9 templates (Gemma 3 1B and 270M, Gemma 4, Granite 3.3, Phi 4 mini, Qwen 3, Qwen 3.5, the R1 Qwen distill, SmolLM 3) and 7 cases (a plain turn, a system prompt, a multi-turn history, thinking on and off, tools declared, a tool call with its result) the rendered text equals what Python `jinja2` renders with `trim_blocks`, `lstrip_blocks`, a `json.dumps(ensure_ascii=False)` `tojson` and `strftime_now` pinned to 2026-10-18 UTC. The fixtures are in `src/provider/local/testdata/`.
 
 ## Reasoning
 
@@ -228,15 +222,14 @@ Syntaxes, in detection order:
 
 - Gemma 4 custom: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>` between control tokens. Detected when the template contains `<|tool_call>` and the vocabulary has both markers.
 - XML, Qwen 3.5: `<tool_call>` ... `</tool_call>` around `<function=name>` and one `<parameter=key>` element per argument, with the value between a newline after the opening tag and a newline before the closing one. Detected when the template contains `<tool_call>`, `</tool_call>`, `<function=` and `<parameter=`.
-- Tagged JSON, Qwen 2.5, Qwen 3, SmolLM 3: `<tool_call>` ... `</tool_call>` around one call object or a list of them. Detected when the template contains `<tool_call>`; without `</tool_call>` the call runs to the end of the reply.
-- Tagged JSON with an alternate opener, Granite 3: `<|tool_call|>`, or the plain text `<tool_call>` that the model writes instead, followed by a JSON list to the end of the reply. A closing `<|/tool_call|>` is read only when the template contains it.
-- Bare JSON, Llama 3.x: a reply that is `{"name": ..., "parameters": ...}`, optionally after `<|python_tag|>`. Other `<|python_tag|>` bodies become a call to `python` with a `code` argument. Detected when the template contains `tool_calls` and `"parameters"`.
-- None, Gemma 3, Gemma 2, Phi 3.5, Phi 4 mini, OLMo 2, ERNIE 4.5, SmolLM 2, TinyLlama and the R1 distills: the output is plain text and `LocalCapabilities::tools` is false.
+- Tagged JSON, Qwen 3, SmolLM 3: `<tool_call>` ... `</tool_call>` around one call object or a list of them. Detected when the template contains `<tool_call>`; without `</tool_call>` the call runs to the end of the reply.
+- Tagged JSON with an alternate opener, Granite 3.3: `<|tool_call|>`, or the plain text `<tool_call>` that the model writes instead, followed by a JSON list to the end of the reply. A closing `<|/tool_call|>` is read only when the template contains it.
+- None, Gemma 3, Phi 4 mini, OLMo 2, ERNIE 4.5 and the R1 distills: the output is plain text and `LocalCapabilities::tools` is false.
 
 JSON call objects are read in the shapes models write them:
 
 - The name comes from `name`, from a string `function` (`{"function": "get_weather", "arguments": {...}}`), or from the nested OpenAI shape (`{"type": "function", "function": {"name": ..., "arguments": ...}}`).
-- The arguments come from `arguments` or `parameters`, in the nested object first and then beside it, as an object, `null`, or a string holding an object. A missing `arguments` means no arguments, except in a bare-JSON reply, where it marks the reply as not a call.
+- The arguments come from `arguments` or `parameters`, in the nested object first and then beside it, as an object, `null`, or a string holding an object. A missing `arguments` means no arguments.
 - An empty list, a missing name, or arguments that are not an object are a malformed call.
 
 In the XML syntax the template writes a string argument as raw text and any other value (number, boolean, object, array) as JSON. The parser reads a value as JSON when it is valid JSON and as a string otherwise. A string argument that is itself valid JSON, such as `42` or `true`, therefore comes back as that JSON value.
@@ -247,7 +240,7 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 ## Presets
 
-`ModelSource::PRESETS` has 25 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units: the block pools, which hold twice `context_length` positions. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
+`ModelSource::PRESETS` has 19 entries, each pinned to a repository commit and a SHA-256. The size is the file. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller), in decimal units: the block pools, which hold twice `context_length` positions. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
 
 | Preset | Architecture | Repository | Size | K/V |
 |---|---|---|---|---|
@@ -257,29 +250,22 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 | `gemma4-e4b-q8_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 8.03 GB | 1.27 GB |
 | `gemma3-270m-q8_0` | `gemma3` | `ggml-org/gemma-3-270m-it-GGUF` | 0.29 GB | 377 MB |
 | `gemma3-1b-q4_0` | `gemma3` | `unsloth/gemma-3-1b-it-GGUF` | 0.72 GB | 539 MB |
-| `gemma2-2b-q4_0` | `gemma2` | `second-state/gemma-2-2b-it-GGUF` | 1.63 GB | 3.08 GB |
 | `qwen3-0.6b-q8_0` | `qwen3` | `Qwen/Qwen3-0.6B-GGUF` | 0.64 GB | 3.76 GB |
 | `qwen3-1.7b-q8_0` | `qwen3` | `Qwen/Qwen3-1.7B-GGUF` | 1.83 GB | 3.76 GB |
-| `qwen2.5-0.5b-q8_0` | `qwen2` | `bartowski/Qwen2.5-0.5B-Instruct-GGUF` | 0.53 GB | 403 MB |
 | `r1-distill-qwen-1.5b-q4_0` | `qwen2` | `bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` | 1.07 GB | 940 MB |
-| `llama3.2-1b-q4_0` | `llama` | `bartowski/Llama-3.2-1B-Instruct-GGUF` | 0.77 GB | 1.07 GB |
 | `smollm3-3b-q4_0` | `smollm3` | `bartowski/HuggingFaceTB_SmolLM3-3B-GGUF` | 1.81 GB | 2.42 GB |
-| `phi3.5-mini-q4_0` | `phi3` | `bartowski/Phi-3.5-mini-instruct-GGUF` | 2.18 GB | 12.88 GB |
 | `phi4-mini-q4_0` | `phi3` | `bartowski/microsoft_Phi-4-mini-instruct-GGUF` | 2.33 GB | 4.29 GB |
 | `phi4-mini-q4_k_m` | `phi3` | `unsloth/Phi-4-mini-instruct-GGUF` | 2.49 GB | 4.29 GB |
 | `granite3.3-2b-q4_0` | `granite` | `ibm-granite/granite-3.3-2b-instruct-GGUF` | 1.45 GB | 2.68 GB |
 | `olmo2-1b-q4_0` | `olmo2` | `allenai/OLMo-2-0425-1B-Instruct-GGUF` | 0.89 GB | 2.15 GB (4,096 maximum) |
-| `smollm2-360m-q8_0` | `llama` | `bartowski/SmolLM2-360M-Instruct-GGUF` | 0.39 GB | 1.34 GB |
-| `tinyllama-1.1b-q4_0` | `llama` | `TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF` | 0.64 GB | 185 MB (2,048 maximum) |
-| `granite3.1-moe-1b-q4_0` | `granitemoe` | `bartowski/granite-3.1-1b-a400m-instruct-GGUF` | 0.77 GB | 1.61 GB |
 | `qwen3-30b-a3b-q4_0` | `qwen3moe` | `unsloth/Qwen3-30B-A3B-GGUF` | 17.38 GB | 3.22 GB |
-| `olmoe-1b-7b-q4_0` | `olmoe` | `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF` | 3.94 GB | 2.15 GB (4,096 maximum) |
+| `olmoe-1b-7b-q4_0` | `olmoe` | `allenai/OLMoE-1B-7B-0125-Instruct-GGUF` | 3.93 GB | 2.15 GB (4,096 maximum) |
 | `qwen3.5-0.8b-q8_0` | `qwen35` | `unsloth/Qwen3.5-0.8B-MTP-GGUF` | 0.83 GB | 403 MB, plus a 20.2 MB recurrent state |
 | `qwen3.6-35b-a3b-q4_0` | `qwen35moe` | `bartowski/Qwen_Qwen3.6-35B-A3B-GGUF` | 20.84 GB | 671 MB, plus a 65.9 MB recurrent state |
 | `gemma4-e2b-mtp-f16` | `gemma4-assistant` | `unsloth/gemma-4-E2B-it-GGUF` | 0.17 GB | none: a drafter, reads the target's cache |
 
-- The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position. The pool holds twice `context_length` positions (see [Local limits and errors](@/providers/local/limits-and-errors.md#limits)), and a sliding-window group (the Gemma presets) holds its window plus about 270 positions per running sequence plus cached prefixes. Phi 3.5 mini has 32 K/V heads and needs 12.88 GB of cache at 8,192 positions for a 2.18 GB file. Lower `context_length` to shrink it.
-- A model trained on fewer positions loads at its maximum by default (OLMo 2: 4,096; TinyLlama: 2,048). An explicit larger value fails with `context_length N exceeds the model maximum M`.
+- The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position. The pool holds twice `context_length` positions (see [Local limits and errors](@/providers/local/limits-and-errors.md#limits)), and a sliding-window group (the Gemma presets) holds its window plus about 270 positions per running sequence plus cached prefixes. Qwen 3 0.6B needs 3.76 GB of cache at 8,192 positions for a 0.64 GB file. Lower `context_length` to shrink it.
+- A model trained on fewer positions loads at its maximum by default (OLMo 2 and OLMoE: 4,096). An explicit larger value fails with `context_length N exceeds the model maximum M`.
 - `gemma4-e2b-mtp-f16` has `drafter: true`: it loads only through `LocalModelConfig::drafter` and cannot be the main model.
 - `qwen3.5-0.8b-q8_0` carries the in-trunk prediction head, so `DrafterSource::InTrunk` works with it.
 - `qwen3.6-35b-a3b-q4_0` has 256 experts per layer in 40 layers, 8 used, so every layer is MoE; resident it holds about 18.9 GiB of RAM, with `tiered:ram=4g` about 6 GiB and with `tiered:ram=600m` (the minimum, 8 experts per layer) about 2.4 GiB. Its file carries a prediction block that the engine ignores; see [Hybrid models](#hybrid-models).
@@ -291,14 +277,14 @@ Generation stops at an end-of-generation token: the EOS, EOT and EOM ids of the 
 
 Three kinds of evidence back this page, from strongest to weakest:
 
-- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `granitemoe`, `qwen3moe`, `olmoe`, `gemma3`, `gemma2`, `granite`, `olmo2`, `ernie4_5`; `gemma4`, `qwen35` and `qwen35moe` have their own builders).
+- Unit tests in `src/provider/local/` run in CI on tiny random GGUF files and on committed fixtures: chat template renders, tokenizer pre-splitters, dequantization against candle, and the cross-architecture forward-pass tests (`TinySpec::all()`: `llama`, `qwen2`, `qwen3`, `phi3`, `smollm3`, `qwen3moe`, `olmoe`, `gemma3`, `granite`, `olmo2`, `ernie4_5`; `gemma4`, `qwen35` and `qwen35moe` have their own builders).
 - The live suite `tests/provider_local.rs` runs one real preset per invocation. CI compiles it and every test prints a skip line, so the live results below come from recorded local runs, not from CI.
 - Oracle runs against HuggingFace `transformers` (f32, CPU) use dumps under `.omp/local-models/ref/`, which is gitignored. Those results are reproducible only with that tooling, not from a clean checkout.
 
 Per architecture:
 
-- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `gemma2`, `llama`, `qwen2`, `qwen3`, `qwen35`, `qwen35moe`, `phi3`, `smollm3`, `granite`, `granitemoe`, `qwen3moe`, `olmoe`, `olmo2`.
-- Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `llama` (Llama 3.2 1B), `phi3` (Phi 3.5 mini), `gemma2`, `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` (Qwen3-30B-A3B with tiered experts).
+- Verified in the live suite on the CPU: `gemma4`, `gemma3`, `qwen2` (R1 distill), `qwen3`, `qwen35`, `qwen35moe`, `phi3` (Phi 4 mini), `smollm3`, `granite`, `qwen3moe`, `olmoe`, `olmo2`. `llama` has no preset: it is covered by tiny-model tests and by the converter oracle on a 2025 `LlamaForCausalLM` checkpoint (see [Checkpoints](@/providers/local/model-sources.md#checkpoints)).
+- Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` (Qwen3-30B-A3B with tiered experts).
 - `ernie4_5`: tiny-model tests and a recorded oracle run only. It has no preset and has not run in the live suite.
 - `qwen35moe` against HuggingFace `transformers` in f32 (`Qwen3_5MoeForCausalLM`, GGUF dequantized by `gguf`, routed experts dequantized per use): a 4-layer cut of the real Qwen3.6-35B-A3B file matches with the engine's dequantized weights to 1e-5 on the top-10 logits, top-1 equal and greedy output equal for 24 of 24 tokens on two prompts and 8 of 8 on a 321-token prompt. The full 40-layer file under the production Q4_0 path keeps the top-1 token on all three prompts, with a maximum absolute difference of 0.13 to 0.62 on the top-k logits. The oracle answers `The capital of France is **Paris**.`. Reading the value heads in grouped (HuggingFace) order instead of tiled order breaks the 4-layer match (top-10 overlap 0 to 2 of 10), which is how the tiled order was confirmed.
 - `olmoe` against HuggingFace `transformers` in f32: the engine with dequantized weights matches the reference logits to a maximum absolute difference of 2e-5 and picks the same greedy tokens. `qwen3moe`: a 4-layer cut of the real Qwen3-30B-A3B weights matches to 1e-5, and the production Q4_0 engine's top-1 token differs from the oracle's only where two candidates are within a margin of 0.073. On Vulkan, both reproduced their reference replies with tiered experts (see [Tiered expert placement](@/providers/local/expert-tiers.md#output-guarantee)).
@@ -316,22 +302,17 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `gemma3-270m-q8_0` | no | no syntax | long-context retrieval is a known limit; the rest pass |
 | `gemma3-1b-q4_0` | no | no syntax | all applicable scenarios pass |
 | `qwen3-0.6b-q8_0`, `qwen3-1.7b-q8_0` | on and off | yes | all scenarios pass |
-| `qwen2.5-0.5b-q8_0` | no | yes | all applicable scenarios pass |
-| `llama3.2-1b-q4_0` | no | yes | the tool round trip is a known limit |
 | `smollm3-3b-q4_0` | on and off | yes | all seven run; thinking and the tool answer leg are known limits |
-| `phi3.5-mini-q4_0`, `phi4-mini-q4_0`, `phi4-mini-q4_k_m` | no | no syntax | all applicable scenarios pass |
-| `r1-distill-qwen-1.5b-q4_0` | always | no syntax | thinking and prefix reuse pass; long-context retrieval is a known limit |
-| `granite3.1-moe-1b-q4_0` | no | yes | all scenarios pass |
+| `phi4-mini-q4_0`, `phi4-mini-q4_k_m` | no | no syntax | all applicable scenarios pass |
+| `r1-distill-qwen-1.5b-q4_0` | always | no syntax | thinking passes; long-context retrieval is a known limit; the prefix-reuse scenario does not apply, because the 14-token first prompt is shorter than one block of 16 positions (the same on the previous release) |
 | `qwen3-30b-a3b-q4_0` | on and off | yes | all seven pass |
 | `olmoe-1b-7b-q4_0` | no | no syntax | greedy text and usage, long-context retrieval and prefix reuse pass; the thinking and tool scenarios skip |
 | `qwen3.5-0.8b-q8_0` | on and off | yes, XML | all seven pass on the CPU; not run on Vulkan |
 | `qwen3.6-35b-a3b-q4_0` | on and off | yes, XML | all seven pass on the CPU, resident and with `tiered:ram=4g`, and on Vulkan with `tiered:device=4g,ram=12g` and `tiered:device=6g,ram=12g` |
-| `gemma2-2b-q4_0`, `olmo2-1b-q4_0` | no | no syntax | all applicable scenarios pass, on the CPU and on Vulkan |
+| `olmo2-1b-q4_0` | no | no syntax | all applicable scenarios pass, on the CPU and on Vulkan |
 | `granite3.3-2b-q4_0` | switched on by the request | yes | all pass except long-context retrieval, a known limit |
-| `smollm2-360m-q8_0` | no | no syntax | all applicable scenarios pass |
-| `tinyllama-1.1b-q4_0` | no | no syntax | all applicable scenarios pass; the oracle prompt count has one extra token, a known limit |
 
-The Vulkan engine ran the same suite for `gemma4-e2b-q4_0`, `llama3.2-1b-q4_0`, `phi3.5-mini-q4_0`, `gemma2-2b-q4_0`, `olmo2-1b-q4_0` and `granite3.3-2b-q4_0`, with the same results as on the CPU.
+The Vulkan engine ran the same suite for `gemma4-e2b-q4_0`, `olmo2-1b-q4_0` and `granite3.3-2b-q4_0`, with the same results as on the CPU.
 
 ### Known limits
 
@@ -339,10 +320,8 @@ A known limit is reported as `MATRIX|<scenario>|KNOWN-LIMIT` by the suite, with 
 
 - `gemma3-270m-q8_0` answers with its end-of-turn token at once on prompts of 750 and 1,110 tokens, while a 570-token prompt still retrieves the code word. The HuggingFace f32 model does the same, so this is the model.
 - `gemma4-e4b-q8_0` answers `72` at once, without a reasoning block, to `What is 9 * 8?` with thinking on. This file derives from the base `google/gemma-4-E4B-it` checkpoint, and its Q4_0 sibling from the QAT checkpoint. At the first position `7` scores 28.77 against 28.37 for `<|channel>` in HuggingFace f32 and bf16, and 28.81 against 28.34 for the file's dequantized weights. The QAT-derived Q4_0 file opens the channel (29.28 against 28.91). On the harder question `What is 17 * 23? Think carefully.` the Q8_0 file does reason.
-- `llama3.2-1b-q4_0` calls the tool again after the tool result when the tool is still declared on the follow-up request. HuggingFace f32 does the same on that prompt. With no tool declared on the follow-up it answers from the result.
 - `r1-distill-qwen-1.5b-q4_0` is marginal at retrieving a code word from a 1,100-token prompt. HuggingFace f32 answers `PELCAN` (misspelled). The Q4_0 model either answers or reasons for more than 4,096 tokens, depending on how its greedy trajectory falls on near-ties.
 - `granite3.3-2b-q4_0` answers `PEICAN` where HuggingFace f32 answers `PELICAN`, on the 1,300-token retrieval prompt. HuggingFace on the same file's dequantized weights, and the engine's exact arithmetic, also give `PEICAN`: quantization flips a near-tie at the second token.
-- `tinyllama-1.1b-q4_0`: one prompt token more than HuggingFace's tokenizer, from the SentencePiece rule in [Special tokens and BOS](#special-tokens-and-bos).
 - `smollm3-3b-q4_0`, two scenarios that are quantized-arithmetic near-ties, not properties of the model. The engine's exact arithmetic (dequantized f32, no Q8_0 activation rounding) equals the dequantized reference run in HuggingFace. The production path rounds activations to Q8_0 and flips a close logit:
   - Thinking on `What is 9 * 8?`: exact arithmetic closes `</think>` at step 1,709 (HuggingFace f32 on the original weights: 535). The production path flips a 0.12-logit tie at the 154th reasoning token, then reasons for 3,070 tokens without concluding.
   - The tool round trip's answer leg with the tool still declared: exact arithmetic gives `The` 18.966 against the tool-call token 18.793 and answers. The production path flips it (18.663 against 19.237) and calls the tool again.
@@ -351,24 +330,24 @@ A known limit is reported as `MATRIX|<scenario>|KNOWN-LIMIT` by the suite, with 
 
 ### Numerical parity with HuggingFace
 
-Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on prompts of 24 chat tokens, a 700-token prompt and, for Phi and Gemma 2, a prompt of about 4,200 tokens.
+Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on prompts of 24 chat tokens, a 700-token prompt and, for Phi, a prompt of about 4,200 tokens.
 
 | Path compared | Result |
 |---|---|
-| Reference arithmetic (weights dequantized to f32) against `transformers`, the 13 first catalog models | top-1 token and top-10 set equal, maximum absolute logit difference below 5e-4, greedy output equal for 24 of 24 tokens on the chat prompt and 8 of 8 on the 700-token prompt; the Phi 4,200-token prompt exercises LongRoPE's long factors and matches |
-| The same, Gemma 2, OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 2, TinyLlama | maximum absolute logit difference 0.000 on the top-k, greedy output equal on every prompt, the 4,200-token Gemma 2 prompt included |
+| Reference arithmetic (weights dequantized to f32) against `transformers`, the 13 first catalog models (recorded before the pre-2025 presets were removed) | top-1 token and top-10 set equal, maximum absolute logit difference below 5e-4, greedy output equal for 24 of 24 tokens on the chat prompt and 8 of 8 on the 700-token prompt; the Phi 4,200-token prompt exercises LongRoPE's long factors and matches |
+| The same, OLMo 2, Granite 3.3, ERNIE 4.5 | maximum absolute logit difference 0.000 on the top-k, greedy output equal on every prompt |
 | Production quantized CPU path against `transformers`, the 13 first models | top-1 token kept on all 48 prompt cases; maximum absolute logit difference between 0.05 and 1.13, the cost of quantized weights |
 | The same, the six later models | top-1 token kept on all 24 prompt cases |
 | Qwen 3.5 0.8B Q8_0, reference arithmetic | maximum absolute logit difference below 5e-5; the production path keeps the top-1 token |
 | Qwen 3.6 35B-A3B Q4_0 (`qwen35moe`), 4-layer cut, reference arithmetic | maximum absolute logit difference 1e-5, greedy output equal for 24 of 24 and 8 of 8 tokens |
 | The same file, 40 layers, production path | top-1 token kept on all three prompts; maximum absolute logit difference 0.13 to 0.62 |
-| GPU (Vulkan) against the CPU dequantized reference | relative error 2e-6 to 2e-5, greedy token ids equal, on Qwen 3 0.6B and 1.7B, Qwen 2.5 0.5B, Llama 3.2 1B, Gemma 3 270M and 1B, SmolLM 3, Phi 3.5, Granite 3.1 MoE, Gemma 4 E2B and the R1 distill |
+| GPU (Vulkan) against the CPU dequantized reference | relative error 2e-6 to 2e-5, greedy token ids equal, on Qwen 3 0.6B and 1.7B, Gemma 3 270M and 1B, SmolLM 3, Gemma 4 E2B and the R1 distill (and, before the pre-2025 presets were removed, Qwen 2.5, Llama 3.2, Phi 3.5 and Granite 3.1 MoE) |
 
 On the CPU, every Q4_0 and Q8_0 matrix multiplication runs through cuca's own batch-invariant quantized kernel, written in safe Rust; other dtypes use candle. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output.
 
 Since the paged K/V cache, attention reads the K/V blocks in place with an online-softmax kernel (per query row and head, so a row is bit-identical alone or in a batch) instead of candle's matmul attention. Its float rounding differs slightly from 0.6.x: logits move by about 0.04 (median) and up to 0.7 on the models measured, because the quantized matmuls round activations to Q8_0, so a greedy reply can differ from 0.6.x's where two logits are within about 0.1 of each other. In the 4-model matrix every first difference sat at a margin of 0.13 or less; Phi 3.5 mini and OLMoE (tiered) replies were identical.
 
-Measured prefill speed with that kernel (1,300-token prompt in chunks of 256, release build with `-C target-cpu=native`, 32-core CPU): `gemma4-e2b-q4_0` 86.5 tokens/s, `phi3.5-mini-q4_0` 76.8, `qwen3-0.6b-q8_0` 249.6.
+Measured prefill speed with that kernel (1,300-token prompt in chunks of 256, release build with `-C target-cpu=native`, 32-core CPU): `gemma4-e2b-q4_0` 86.5 tokens/s, `qwen3-0.6b-q8_0` 249.6.
 
 ## Using another GGUF
 
