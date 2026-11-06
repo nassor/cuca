@@ -248,8 +248,8 @@ mod tests {
     use crate::provider::local::model::paged::KvPools;
     use crate::provider::local::model::tier::ExpertSlice;
     use crate::provider::local::model::tiny::{
-        M4_FF, M4_KV_LORA, M4_N_EXPERT, M4_N_HEAD, M4_NOPE, M4_ORIG_CTX, M4_ROT, M4_V_HEAD, N_EMBD,
-        PROMPT, TinyMistral4, VOCAB, load, write_mistral4,
+        M4_DENSE_FF, M4_FF, M4_KV_LORA, M4_N_EXPERT, M4_N_HEAD, M4_NOPE, M4_ORIG_CTX, M4_ROT,
+        M4_V_HEAD, N_EMBD, PROMPT, TinyMistral4, VOCAB, load, write_mistral4,
     };
     use crate::provider::local::model::{Want, read_hparams};
 
@@ -267,6 +267,13 @@ mod tests {
                 "fused, F32",
                 TinyMistral4 {
                     dtype: GgmlDType::F32,
+                    ..TinyMistral4::default()
+                },
+            ),
+            (
+                "dense first layer",
+                TinyMistral4 {
+                    dense_layers: 1,
                     ..TinyMistral4::default()
                 },
             ),
@@ -340,10 +347,19 @@ mod tests {
     /// minimum budget and at one that holds a few experts per layer.
     #[test]
     fn tiered_fused_experts_match_resident_bit_for_bit() {
-        let model = write_mistral4(&TinyMistral4::default());
+        for dense_layers in [0, 1] {
+            tiered_matches_resident(dense_layers);
+        }
+    }
+
+    fn tiered_matches_resident(dense_layers: usize) {
+        let model = write_mistral4(&TinyMistral4 {
+            dense_layers,
+            ..TinyMistral4::default()
+        });
         let content = content_of(&model);
         let hp = read_hparams(&content).unwrap();
-        let per_index: u64 = (0..hp.n_layer)
+        let per_index: u64 = (dense_layers..hp.n_layer)
             .map(|il| {
                 let both = ExpertSlice::read(
                     &content,
@@ -632,6 +648,44 @@ mod tests {
         for (a, b) in vec_of(got).iter().zip(&want) {
             assert!((f64::from(*a) - b).abs() < 1e-4, "{a} vs {b}");
         }
+    }
+
+    /// Leading dense blocks (`leading_dense_block_count`, DeepSeek style) run
+    /// a dense gated FFN in the first layers and experts in the rest.
+    #[test]
+    fn leading_dense_layers_run_a_dense_ffn() {
+        let model = write_mistral4(&TinyMistral4 {
+            dense_layers: 2,
+            ..TinyMistral4::default()
+        });
+        let content = content_of(&model);
+        let hp = read_hparams(&content).unwrap();
+        assert_eq!(hp.leading_dense, 2);
+        let ffn = |il| {
+            LayerLayout::read(&hp, il, &hp.layers[il], &content)
+                .unwrap()
+                .ffn
+        };
+        for il in 0..2 {
+            assert_eq!(
+                ffn(il),
+                Ffn::Dense {
+                    ff: M4_DENSE_FF,
+                    fused: false
+                },
+                "layer {il}"
+            );
+        }
+        assert!(matches!(ffn(2), Ffn::Moe { fused: true, .. }));
+        let m = load(&model, 32);
+        let kinds: Vec<bool> = m
+            .layers
+            .iter()
+            .map(|l| matches!(l.ffn, super::super::FfnWeights::Moe { .. }))
+            .collect();
+        assert_eq!(kinds, [false, false, true]);
+        let out = step(&mut load(&model, 32), &PROMPT, 0, Want::Last);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 
     /// The loader names what a latent model lacks.

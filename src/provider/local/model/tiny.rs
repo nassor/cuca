@@ -1061,14 +1061,21 @@ pub(crate) struct TinyMistral4 {
     pub(crate) fused: bool,
     /// Dtype of the dense matrices.
     pub(crate) dtype: GgmlDType,
+    /// Leading layers with a dense gated FFN (`leading_dense_block_count`)
+    /// instead of experts.
+    pub(crate) dense_layers: usize,
     /// Metadata keys (relative to `mistral4.`) written over the defaults.
     pub(crate) meta: Vec<(String, Value)>,
 }
+
+/// Width of the dense FFN of a tiny `mistral4` model's leading layers.
+pub(crate) const M4_DENSE_FF: usize = 96;
 
 impl Default for TinyMistral4 {
     fn default() -> Self {
         Self {
             layers: 3,
+            dense_layers: 0,
             fused: true,
             dtype: GgmlDType::Q8_0,
             meta: Vec::new(),
@@ -1137,6 +1144,19 @@ pub(crate) fn write_mistral4(s: &TinyMistral4) -> TinyModel {
             quantized(&mut rng, &[N_EMBD, M4_N_HEAD * M4_V_HEAD], dt, 0.3),
         );
         add(b("ffn_norm"), norm(&mut rng, N_EMBD));
+        if il < s.dense_layers {
+            for part in ["ffn_gate", "ffn_up"] {
+                add(
+                    b(part),
+                    quantized(&mut rng, &[M4_DENSE_FF, N_EMBD], dt, 0.3),
+                );
+            }
+            add(
+                b("ffn_down"),
+                quantized(&mut rng, &[N_EMBD, M4_DENSE_FF], dt, 0.3),
+            );
+            continue;
+        }
         add(
             b("ffn_gate_inp"),
             quantized(&mut rng, &[M4_N_EXPERT, N_EMBD], GgmlDType::F32, 0.8),
@@ -1190,7 +1210,7 @@ pub(crate) fn write_mistral4(s: &TinyMistral4) -> TinyModel {
         kv(&format!("{p}.block_count"), u(s.layers)),
         kv(&format!("{p}.context_length"), u(CONTEXT)),
         kv(&format!("{p}.embedding_length"), u(N_EMBD)),
-        kv(&format!("{p}.feed_forward_length"), u(96)),
+        kv(&format!("{p}.feed_forward_length"), u(M4_DENSE_FF)),
         kv(&format!("{p}.attention.head_count"), u(M4_N_HEAD)),
         kv(&format!("{p}.attention.head_count_kv"), u(1)),
         kv(&format!("{p}.attention.key_length"), u(M4_KV_LORA + M4_ROT)),
@@ -1231,7 +1251,7 @@ pub(crate) fn write_mistral4(s: &TinyMistral4) -> TinyModel {
         kv(&format!("{p}.expert_feed_forward_length"), u(M4_FF)),
         kv(&format!("{p}.expert_weights_scale"), Value::F32(1.5)),
         kv(&format!("{p}.expert_weights_norm"), Value::Bool(true)),
-        kv(&format!("{p}.leading_dense_block_count"), u(0)),
+        kv(&format!("{p}.leading_dense_block_count"), u(s.dense_layers)),
     ];
     for (key, value) in &s.meta {
         let full = format!("{p}.{key}");

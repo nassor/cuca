@@ -216,7 +216,7 @@ impl LayerLayout {
             o: has(&name::blk_bias(il, name::ATTN_OUTPUT)),
         };
 
-        let ffn = if hp.moe.is_some() {
+        let ffn = if hp.moe.is_some() && il >= hp.leading_dense {
             let fused = has_part(name::FFN_GATE_UP_EXPS);
             let gate = name::blk(
                 il,

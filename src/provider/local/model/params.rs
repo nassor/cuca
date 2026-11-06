@@ -328,6 +328,9 @@ pub(crate) struct Hparams {
     /// Width of one layer's per-layer-embedding slice (Gemma 4).
     pub(crate) ple_dim: Option<usize>,
     pub(crate) moe: Option<MoeSpec>,
+    /// Leading layers whose FFN is a dense gated FFN even though the model is
+    /// a mixture of experts (`leading_dense_block_count`, DeepSeek style).
+    pub(crate) leading_dense: usize,
     /// Per-position query scaling of the attention layers, when the model has
     /// it ([`Behavior::attn_temp_default`](super::arch::Behavior)).
     pub(crate) attn_temp: Option<AttnTemp>,
@@ -576,14 +579,6 @@ impl Hparams {
                 return Err(meta_err(
                     &format!("{}.attention.head_count_kv", arch.name()),
                     "latent attention keeps one shared K/V head",
-                ));
-            }
-            if k.usize_opt("leading_dense_block_count")?
-                .is_some_and(|n| n > 0)
-            {
-                return Err(meta_err(
-                    &format!("{}.leading_dense_block_count", arch.name()),
-                    "leading dense blocks are not supported",
                 ));
             }
             if k.usize_opt("expert_group_count")?.is_some_and(|n| n > 1) {
@@ -882,6 +877,18 @@ impl Hparams {
             None
         };
 
+        let leading_dense = if behavior.mla {
+            let n = k.usize_opt("leading_dense_block_count")?.unwrap_or(0);
+            if n > n_layer {
+                return Err(meta_err(
+                    &format!("{}.leading_dense_block_count", arch.name()),
+                    format!("{n} dense blocks exceed the {n_layer} layers"),
+                ));
+            }
+            n
+        } else {
+            0
+        };
         let attn_temp = if behavior.mla {
             match (
                 k.f64_opt("attention.temperature_scale")?,
@@ -929,6 +936,7 @@ impl Hparams {
             logit_softcap: positive("final_logit_softcapping")?,
             ple_dim,
             moe,
+            leading_dense,
             attn_temp,
             nextn_predict_layers,
             nextn,
@@ -1390,6 +1398,7 @@ mod tests {
             })
         );
         // The file has no temperature keys: the checkpoint's own (0.1, 8192).
+        assert_eq!(p.leading_dense, 0);
         let t = p.attn_temp.unwrap();
         assert_eq!((t.beta, t.length), (0.1, 8192));
         assert_eq!(t.at(0), 1.0);
@@ -1443,11 +1452,6 @@ mod tests {
                 "mistral4.attention.head_count_kv",
                 U32(32),
                 "one shared K/V head",
-            ),
-            (
-                "mistral4.leading_dense_block_count",
-                U32(1),
-                "leading dense",
             ),
             (
                 "mistral4.expert_group_count",
