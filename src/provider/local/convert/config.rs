@@ -133,7 +133,7 @@ impl Hp {
                 set(&mut self.map, "head_dim", Json::from(128));
                 set(&mut self.map, "rms_norm_eps", Json::from(1e-6));
             }
-            ConvArch::Qwen2 | ConvArch::Granite => {
+            ConvArch::Qwen2 | ConvArch::Granite | ConvArch::Mistral4 => {
                 set(&mut self.map, "rms_norm_eps", Json::from(1e-6));
             }
             ConvArch::Phi3 | ConvArch::Olmo2 | ConvArch::Olmoe | ConvArch::Ernie4_5 => {
@@ -425,9 +425,69 @@ fn base(arch: ConvArch, hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<(), Cuca
     ]) {
         kv.u32("expert_used_count", n)?;
     }
+    if let Some(n) = hp.uint(&["n_group"]) {
+        kv.u32("expert_group_count", n)?;
+    }
+    if let Some(n) = hp.uint(&["topk_group"]) {
+        kv.u32("expert_group_used_count", n)?;
+    }
     if let Some(d) = hp.uint(&["head_dim"]) {
         kv.u32("attention.key_length", d)?;
         kv.u32("attention.value_length", d)?;
+    }
+    Ok(())
+}
+
+/// `DeepseekV2Model.set_gguf_parameters` as `Mistral4Model` inherits it:
+/// multi-head latent attention stored as multi-query attention over the
+/// compressed cache (one KV head, `kv_lora + rope` wide keys, `kv_lora` wide
+/// values), with the per-head sizes of the uncompressed attention in the
+/// `*_mla` keys.
+fn mla(arch: ConvArch, hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<(), CucaError> {
+    base(arch, hp, kv, n_block)?;
+    kv.u32("attention.head_count_kv", 1)?;
+    let has_moe = hp.get("n_routed_experts").is_some();
+    // No MoE: every layer is dense; MoE: none is unless the config says.
+    let dense = match hp.uint(&["first_k_dense_replace"]) {
+        Some(n) => n,
+        None if has_moe => 0,
+        None => hp.n_layer()?,
+    };
+    kv.u32("leading_dense_block_count", dense)?;
+    kv.u32("vocab_size", hp.req_uint(&["vocab_size"])?)?;
+    if let Some(r) = hp.uint(&["q_lora_rank"]) {
+        kv.u32("attention.q_lora_rank", r)?;
+    }
+    let lora = hp.uint(&["kv_lora_rank"]).unwrap_or(512);
+    let nope = hp.req_uint(&["qk_nope_head_dim"])?;
+    let rope = hp.req_uint(&["qk_rope_head_dim"])?;
+    kv.u32("attention.kv_lora_rank", lora)?;
+    kv.u32("attention.key_length", lora + rope)?;
+    kv.u32("attention.value_length", lora)?;
+    kv.u32("attention.key_length_mla", nope + rope)?;
+    kv.u32("attention.value_length_mla", hp.req_uint(&["v_head_dim"])?)?;
+    kv.u32(
+        "expert_feed_forward_length",
+        hp.req_uint(&["moe_intermediate_size", "intermediate_size"])?,
+    )?;
+    if let Some(n) = hp.uint(&["n_routed_experts"]) {
+        kv.u32("expert_count", n)?;
+    }
+    kv.u32(
+        "expert_shared_count",
+        hp.uint(&["n_shared_experts"]).unwrap_or(0),
+    )?;
+    if let Some(f) = hp.float(&["routed_scaling_factor"]) {
+        kv.f32("expert_weights_scale", f);
+    }
+    if hp.get("norm_topk_prob").and_then(Json::as_bool) == Some(true) {
+        kv.bool("expert_weights_norm", true);
+    }
+    kv.u32("rope.dimension_count", rope)?;
+    // llama.cpp's DeepSeek convention: the multiplier the engine applies is
+    // `0.1 * mscale_all_dim`, not `mscale_all_dim` itself.
+    if let Some(m) = hp.rope_all().get("mscale_all_dim").and_then(Json::as_f64) {
+        kv.f32("rope.scaling.yarn_log_multiplier", 0.1 * m);
     }
     Ok(())
 }
@@ -843,6 +903,17 @@ fn guard(arch: ConvArch, hp: &Hp) -> Result<(), CucaError> {
             .and_then(Json::as_array)
             .is_some_and(|l| l.iter().any(|t| t.as_str() == Some("sliding_attention")))
     };
+    // FP8 weights are dequantized by one scale per tensor (or per expert);
+    // refuse block scales before any weight is read.
+    if hp
+        .get("quantization_config")
+        .and_then(|q| q.get("weight_block_size"))
+        .is_some_and(|b| !b.is_null())
+    {
+        return Err(cfg_err(
+            "block-scaled FP8 checkpoints (quantization_config.weight_block_size) are not supported",
+        ));
+    }
     match arch {
         ConvArch::Olmo2 if sliding_layers(hp) => {
             return Err(cfg_err(
@@ -1022,6 +1093,7 @@ pub(crate) fn build(
                 kv.i32s("rope.dimension_sections", &[11, 11, 10, 0]);
             }
         }
+        ConvArch::Mistral4 => mla(arch, hp, &mut kv, n_block)?,
         ConvArch::Phi3 => extra = phi3(hp, &mut kv, n_block)?,
         ConvArch::Gemma3 => {
             base(arch, hp, &mut kv, n_block)?;
@@ -1236,6 +1308,80 @@ mod tests {
         refuse(&|t| {
             t.remove("output_multiplier");
         });
+    }
+
+    #[test]
+    fn mistral4_metadata_follows_the_deepseek_converter() {
+        // The text model of mistralai/Mistral-Small-4-119B-2603's config.json.
+        let h = hp(serde_json::json!({
+            "architectures": ["Mistral3ForConditionalGeneration"],
+            "model_type": "mistral3",
+            "text_config": {
+                "first_k_dense_replace": 0, "head_dim": 128, "hidden_size": 4096,
+                "intermediate_size": 12288, "kv_lora_rank": 256,
+                "max_position_embeddings": 1048576, "model_type": "mistral4",
+                "moe_intermediate_size": 2048, "n_group": 1, "n_routed_experts": 128,
+                "n_shared_experts": 1, "norm_topk_prob": true, "num_attention_heads": 32,
+                "num_experts_per_tok": 4, "num_hidden_layers": 36, "num_key_value_heads": 32,
+                "q_lora_rank": 1024, "qk_nope_head_dim": 64, "qk_rope_head_dim": 64,
+                "rms_norm_eps": 1e-6,
+                "rope_parameters": {
+                    "beta_fast": 32.0, "beta_slow": 1.0, "factor": 128.0,
+                    "llama_4_scaling_beta": 0.1, "mscale": 1.0, "mscale_all_dim": 1.0,
+                    "original_max_position_embeddings": 8192, "rope_theta": 10000.0,
+                    "rope_type": "yarn", "type": "yarn"
+                },
+                "routed_scaling_factor": 1.0, "topk_group": 1, "v_head_dim": 128,
+                "vocab_size": 131072
+            }
+        }))
+        .with_defaults(ConvArch::Mistral4);
+        let m = build(ConvArch::Mistral4, &h, "t", WeightQuant::F16, 0).unwrap();
+        let u32s = |key: &str| match get(&m, &format!("mistral4.{key}")) {
+            Value::U32(n) => *n,
+            other => panic!("{key}: {other:?}"),
+        };
+        // Multi-query attention over the compressed cache.
+        assert_eq!(u32s("attention.head_count"), 32);
+        assert_eq!(u32s("attention.head_count_kv"), 1);
+        assert_eq!(u32s("attention.key_length"), 256 + 64);
+        assert_eq!(u32s("attention.value_length"), 256);
+        assert_eq!(u32s("attention.key_length_mla"), 64 + 64);
+        assert_eq!(u32s("attention.value_length_mla"), 128);
+        assert_eq!(u32s("attention.q_lora_rank"), 1024);
+        assert_eq!(u32s("attention.kv_lora_rank"), 256);
+        assert_eq!(u32s("rope.dimension_count"), 64);
+        assert_eq!(u32s("leading_dense_block_count"), 0);
+        assert_eq!(u32s("expert_count"), 128);
+        assert_eq!(u32s("expert_used_count"), 4);
+        assert_eq!(u32s("expert_shared_count"), 1);
+        assert_eq!(u32s("expert_feed_forward_length"), 2048);
+        assert_eq!(u32s("expert_group_count"), 1);
+        assert_eq!(u32s("expert_group_used_count"), 1);
+        assert_eq!(u32s("rope.scaling.original_context_length"), 8192);
+        assert!(matches!(get(&m, "mistral4.expert_weights_scale"), Value::F32(f) if *f == 1.0));
+        assert!(matches!(
+            get(&m, "mistral4.expert_weights_norm"),
+            Value::Bool(true)
+        ));
+        // llama.cpp's DeepSeek convention: 0.1 * mscale_all_dim.
+        assert!(
+            matches!(get(&m, "mistral4.rope.scaling.yarn_log_multiplier"), Value::F32(f) if *f == 0.1)
+        );
+        assert!(matches!(get(&m, "mistral4.rope.scaling.factor"), Value::F32(f) if *f == 128.0));
+        assert!(m.kv.iter().all(|(k, _)| !k.contains("temperature")));
+    }
+
+    #[test]
+    fn block_scaled_fp8_is_refused_up_front() {
+        let h = hp(serde_json::json!({
+            "num_hidden_layers": 1, "hidden_size": 8, "num_attention_heads": 2,
+            "quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}
+        }));
+        let err = build(ConvArch::Qwen2, &h, "t", WeightQuant::F16, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("weight_block_size"), "{err}");
     }
 
     #[test]

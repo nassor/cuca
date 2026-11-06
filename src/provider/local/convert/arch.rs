@@ -11,7 +11,8 @@ use crate::error::CucaError;
 /// A checkpoint family the converter handles; one per engine architecture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ConvArch {
-    /// `LlamaForCausalLM` (`LlamaModel`, Q/K rows permuted).
+    /// `LlamaForCausalLM`, `MistralForCausalLM` (`LlamaModel`, Q/K rows
+    /// permuted).
     Llama,
     /// `SmolLM3ForCausalLM`.
     Smollm3,
@@ -43,13 +44,17 @@ pub(crate) enum ConvArch {
     Ernie4_5,
     /// `MuseGlimmerForConditionalGeneration` (`MuseGlimmerModel`).
     MuseGlimmer,
+    /// `Mistral3ForConditionalGeneration` whose `text_config` is a
+    /// `mistral4` model (`Mistral3Model.Mistral4Model` over
+    /// `DeepseekV2Model`): multi-head latent attention and stacked experts.
+    Mistral4,
 }
 
 impl ConvArch {
     /// The converter for an HF `architectures[0]` string.
     pub(crate) fn from_architecture(name: &str) -> Option<Self> {
         Some(match name {
-            "LlamaForCausalLM" => Self::Llama,
+            "LlamaForCausalLM" | "MistralForCausalLM" => Self::Llama,
             "SmolLM3ForCausalLM" => Self::Smollm3,
             "GraniteForCausalLM" => Self::Granite,
             "Qwen2ForCausalLM" => Self::Qwen2,
@@ -77,6 +82,18 @@ impl ConvArch {
             .and_then(|a| a.get(0))
             .and_then(|a| a.as_str())
             .ok_or_else(|| CucaError::Config("config.json has no `architectures` entry".into()))?;
+        if name == "Mistral3ForConditionalGeneration" {
+            // One class for several text models: the converter dispatches on
+            // the text config's `model_type`.
+            let text = config.get("text_config").unwrap_or(config);
+            return match text.get("model_type").and_then(|t| t.as_str()) {
+                Some("mistral4") => Ok(Self::Mistral4),
+                other => Err(CucaError::Config(format!(
+                    "`Mistral3ForConditionalGeneration` with text model `{}` is not supported (only `mistral4`: llama.cpp converts the others to its `mistral3` architecture, which the engine does not implement)",
+                    other.unwrap_or("unknown")
+                ))),
+            };
+        }
         Self::from_architecture(name).ok_or_else(|| {
             CucaError::Config(format!(
                 "architecture `{name}` has no checkpoint converter; convert it to GGUF with llama.cpp"
@@ -103,6 +120,7 @@ impl ConvArch {
             Self::Olmoe => "olmoe",
             Self::Ernie4_5 => "ernie4_5",
             Self::MuseGlimmer => "muse-glimmer",
+            Self::Mistral4 => "mistral4",
         }
     }
 
@@ -174,13 +192,43 @@ mod tests {
             ConvArch::Olmoe,
             ConvArch::Ernie4_5,
             ConvArch::MuseGlimmer,
+            ConvArch::Mistral4,
         ];
         for conv in all {
-            assert!(Arch::from_name(conv.gguf_name()).is_ok(), "{conv:?}");
+            // `mistral4` is converted ahead of its engine implementation.
+            if conv != ConvArch::Mistral4 {
+                assert!(Arch::from_name(conv.gguf_name()).is_ok(), "{conv:?}");
+            }
         }
         for arch in Arch::ALL {
             assert!(all.iter().any(|c| c.gguf_name() == arch.name()), "{arch:?}");
         }
+    }
+
+    #[test]
+    fn mistral_checkpoints_dispatch_on_the_text_model() {
+        let class = |text: &str| {
+            serde_json::json!({
+                "architectures": ["Mistral3ForConditionalGeneration"],
+                "text_config": {"model_type": text}
+            })
+        };
+        assert_eq!(
+            ConvArch::from_config(&class("mistral4")).unwrap(),
+            ConvArch::Mistral4
+        );
+        let err = ConvArch::from_config(&class("mistral"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("`mistral`") && err.contains("mistral3"),
+            "{err}"
+        );
+        assert_eq!(
+            ConvArch::from_config(&serde_json::json!({"architectures": ["MistralForCausalLM"]}))
+                .unwrap(),
+            ConvArch::Llama
+        );
     }
 
     #[test]

@@ -26,6 +26,10 @@ pub(crate) enum StDtype {
     F32,
     F16,
     Bf16,
+    /// 8-bit float, 4 exponent and 3 mantissa bits (`float8_e4m3fn`: no
+    /// infinities, one NaN per sign). Read through its `_scale_inv` companion
+    /// tensor, see [`Shards::read_rows`].
+    F8E4m3,
     /// Any other safetensors dtype, by name; not convertible.
     Other(&'static str),
 }
@@ -43,7 +47,7 @@ impl StDtype {
             "I8" => Self::Other("I8"),
             "U8" => Self::Other("U8"),
             "BOOL" => Self::Other("BOOL"),
-            "F8_E4M3" => Self::Other("F8_E4M3"),
+            "F8_E4M3" => Self::F8E4m3,
             "F8_E5M2" => Self::Other("F8_E5M2"),
             _ => Self::Other("unknown"),
         }
@@ -54,6 +58,7 @@ impl StDtype {
         match self {
             Self::F32 => Some(4),
             Self::F16 | Self::Bf16 => Some(2),
+            Self::F8E4m3 => Some(1),
             Self::Other(_) => None,
         }
     }
@@ -63,10 +68,33 @@ impl StDtype {
             Self::F32 => "F32",
             Self::F16 => "F16",
             Self::Bf16 => "BF16",
+            Self::F8E4m3 => "F8_E4M3",
             Self::Other(n) => n,
         }
     }
 }
+
+/// `float8_e4m3fn` to `f32`, indexed by the byte: bias 7, subnormals below
+/// exponent 1, and `S.1111.111` the only NaN.
+const E4M3: [f32; 256] = {
+    let mut lut = [0.0f32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let sign = if i & 0x80 != 0 { -1.0f32 } else { 1.0 };
+        let exp = (i >> 3) & 0xF;
+        let man = (i & 7) as u32;
+        lut[i] = if exp == 0xF && man == 7 {
+            f32::NAN
+        } else if exp == 0 {
+            sign * (man as f32 / 512.0)
+        } else {
+            // (1 + man / 8) * 2^(exp - 7), the power built from its bits.
+            sign * (8 + man) as f32 * f32::from_bits(((exp as u32 + 117) & 0xFF) << 23)
+        };
+        i += 1;
+    }
+    lut
+};
 
 /// Where one tensor lives.
 #[derive(Debug, Clone)]
@@ -207,10 +235,37 @@ impl Shards {
             .ok_or_else(|| CucaError::Config(format!("checkpoint has no tensor `{name}`")))
     }
 
+    /// The dequantization factors of the `F8_E4M3` tensor `name`: its
+    /// `{name}_scale_inv` companion (`...weight_scale_inv`,
+    /// `...gate_up_proj_scale_inv`), either one value for the whole tensor
+    /// or one per index of the first dimension (`[E, 1, 1]` for `[E, R, C]`
+    /// experts), as the converter's `dequant_simple` broadcasts them.
+    fn fp8_scales(&self, name: &str, meta: &TensorMeta) -> Result<Vec<f32>, CucaError> {
+        let scale_name = format!("{name}_scale_inv");
+        let scale = self.tensor(&scale_name).ok_or_else(|| {
+            CucaError::Config(format!(
+                "FP8 tensor `{name}` has no `{scale_name}` companion"
+            ))
+        })?;
+        let lead = meta.shape.first().copied().unwrap_or(1);
+        let per_lead =
+            scale.shape.first() == Some(&lead) && scale.shape[1..].iter().all(|d| *d == 1);
+        if scale.elems() != 1 && !per_lead {
+            return Err(CucaError::Config(format!(
+                "`{scale_name}` has shape {:?}: only one scale per tensor or per first-dimension index of {:?} is supported (block-scaled FP8 is not)",
+                scale.shape, meta.shape
+            )));
+        }
+        let mut out = Vec::new();
+        self.read_rows(&scale_name, 0, scale.rows(), &mut out)?;
+        Ok(out)
+    }
+
     /// Read `n_rows` rows starting at row `first` of tensor `name` into `out`
-    /// as `f32` (`F32`, `F16` and `BF16` sources); `out` is cleared first.
-    /// Any other dtype is a [`CucaError::Config`] naming the tensor and the
-    /// dtype.
+    /// as `f32` (`F32`, `F16`, `BF16` and `F8_E4M3` sources, the last
+    /// multiplied by its scale, see [`Shards::fp8_scales`]); `out` is cleared
+    /// first. Any other dtype is a [`CucaError::Config`] naming the tensor and
+    /// the dtype.
     pub(crate) fn read_rows(
         &self,
         name: &str,
@@ -262,6 +317,15 @@ impl Shards {
                     .iter()
                     .map(|b| half::bf16::from_le_bytes(*b).to_f32()),
             ),
+            StDtype::F8E4m3 => {
+                let scales = self.fp8_scales(name, meta)?;
+                // Rows covered by one scale entry.
+                let per_scale = meta.rows() / scales.len();
+                for (i, row) in bytes.chunks_exact(row_len).enumerate() {
+                    let scale = scales[(first + i) / per_scale];
+                    out.extend(row.iter().map(|b| E4M3[usize::from(*b)] * scale));
+                }
+            }
             StDtype::Other(_) => {}
         }
         Ok(())
@@ -357,6 +421,87 @@ pub(crate) mod tests {
         assert!(err.contains("`ids`") && err.contains("I64"), "{err}");
         assert!(shards.read_rows("w", 2, 2, &mut rows).is_err());
         assert!(shards.f32("missing").is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn e4m3_table_matches_the_format() {
+        for byte in 0u32..256 {
+            let (sign, exp, man) = (byte >> 7, (byte >> 3) & 0xF, byte & 7);
+            let sign = if sign == 1 { -1.0f64 } else { 1.0 };
+            let want = if exp == 0xF && man == 7 {
+                f64::NAN
+            } else if exp == 0 {
+                sign * f64::from(man) / 8.0 * 2f64.powi(-6)
+            } else {
+                sign * (1.0 + f64::from(man) / 8.0) * 2f64.powi(exp as i32 - 7)
+            };
+            let got = f64::from(E4M3[byte as usize]);
+            assert!(
+                got == want || (got.is_nan() && want.is_nan()),
+                "byte {byte:#04x}: {got} != {want}"
+            );
+        }
+        // Largest finite value and the smallest subnormal.
+        assert_eq!(E4M3[0x7E], 448.0);
+        assert_eq!(E4M3[0x01], 2f32.powi(-9));
+    }
+
+    #[test]
+    fn fp8_tensors_are_scaled_by_their_scale_inv() {
+        let dir = temp_dir("st-fp8");
+        let p = dir.join("m.safetensors");
+        let bf = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|x| half::bf16::from_f32(*x).to_le_bytes())
+                .collect()
+        };
+        write_file(
+            &p,
+            &[
+                // 0, 2^-9, 2^-6, 0.5, 1, 448, -1, -448.
+                (
+                    "v",
+                    "F8_E4M3",
+                    &[8],
+                    vec![0x00, 0x01, 0x08, 0x30, 0x38, 0x7E, 0xB8, 0xFE],
+                ),
+                ("v_scale_inv", "BF16", &[], bf(&[2.0])),
+                // `[E, R, C]` experts, one scale per expert.
+                ("e", "F8_E4M3", &[2, 2, 2], vec![0x38; 8]),
+                ("e_scale_inv", "BF16", &[2, 1, 1], bf(&[0.5, 4.0])),
+                // A block-scaled tensor, and one with no scale at all.
+                ("b", "F8_E4M3", &[2, 2], vec![0x38; 4]),
+                ("b_scale_inv", "BF16", &[2, 2], bf(&[1.0; 4])),
+                ("n", "F8_E4M3", &[1], vec![0x38]),
+            ],
+        );
+        let shards = Shards::open(&[p]).unwrap();
+        assert_eq!(
+            shards.f32("v").unwrap(),
+            [
+                0.0,
+                2f32.powi(-8),
+                2f32.powi(-5),
+                1.0,
+                2.0,
+                896.0,
+                -2.0,
+                -896.0
+            ]
+        );
+        assert_eq!(
+            shards.f32("e").unwrap(),
+            [0.5, 0.5, 0.5, 0.5, 4.0, 4.0, 4.0, 4.0]
+        );
+        // A row block that starts inside the second expert.
+        let mut rows = Vec::new();
+        shards.read_rows("e", 1, 2, &mut rows).unwrap();
+        assert_eq!(rows, [0.5, 0.5, 4.0, 4.0]);
+        let err = shards.f32("b").unwrap_err().to_string();
+        assert!(err.contains("block-scaled"), "{err}");
+        let err = shards.f32("n").unwrap_err().to_string();
+        assert!(err.contains("n_scale_inv"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

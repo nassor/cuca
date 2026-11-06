@@ -638,13 +638,26 @@ fn added_tokens(ck: &CheckpointDir) -> Vec<(usize, String, bool)> {
     out
 }
 
+/// The checkpoint's `tokenizer.json`. A repository that ships its vocabulary
+/// only as `tekken.json` is named: llama.cpp reads that through
+/// `mistral_common` and a bundled chat template (`_set_vocab_mistral`),
+/// neither of which is ported.
+fn tokenizer_json(ck: &CheckpointDir) -> Result<&Json, CucaError> {
+    ck.tokenizer_json.as_ref().ok_or_else(|| {
+        if ck.dir.join("tekken.json").is_file() {
+            cfg_err(
+                "checkpoint ships its vocabulary only as tekken.json; the converter reads tokenizer.json (add the repository's tokenizer.json, or convert with llama.cpp)",
+            )
+        } else {
+            cfg_err("checkpoint has no tokenizer.json")
+        }
+    })
+}
+
 /// The base vocabulary of a BPE `tokenizer.json`: token by id, and the
 /// number of entries.
 fn bpe_vocab(ck: &CheckpointDir) -> Result<BTreeMap<usize, String>, CucaError> {
-    let tok = ck
-        .tokenizer_json
-        .as_ref()
-        .ok_or_else(|| cfg_err("checkpoint has no tokenizer.json"))?;
+    let tok = tokenizer_json(ck)?;
     let model = tok
         .get("model")
         .ok_or_else(|| cfg_err("tokenizer.json has no model"))?;
@@ -812,13 +825,27 @@ fn chkhsh(ids: &[u32]) -> String {
         .collect()
 }
 
-/// Settle the `pre` name: tokenize llama.cpp's probe text with this engine's
-/// tokenizer under the structural choice and look the fingerprint up.
-///
-/// A hash in llama.cpp's table gives the name llama.cpp writes for that
-/// tokenizer (`refact` for Granite, `dbrx` for OLMo 2, ...); if the engine
-/// does not implement that name the conversion fails naming both. An unknown
+/// The `pre` name for a probe-text fingerprint: the name llama.cpp's table
+/// gives it (`refact` for Granite, `dbrx` for OLMo 2, `pixtral` for Mistral
+/// Small 4 whose structure also reads as `tekken`) when the engine
+/// implements it, an error naming both when it does not; an unknown
 /// fingerprint keeps the structural name.
+fn pre_for_hash(structural: &'static str, hash: &str) -> Result<String, CucaError> {
+    let Some(&(_, name)) = PRE_BY_HASH.iter().rev().find(|(h, _)| *h == hash) else {
+        return Ok(structural.to_string());
+    };
+    if name == structural || crate::provider::local::tokenizer::supports_pre(name) {
+        Ok(name.to_string())
+    } else {
+        Err(cfg_err(format!(
+            "the tokenizer matches llama.cpp's `{name}` pre-tokenizer, which this engine does not implement (its pre-tokenizer structure reads as `{structural}`)"
+        )))
+    }
+}
+
+/// Settle the `pre` name: tokenize llama.cpp's probe text with this engine's
+/// tokenizer under the structural choice and look the fingerprint up
+/// ([`pre_for_hash`]), so a fingerprint llama.cpp knows beats the structure.
 fn settle_pre(
     structural: &'static str,
     tokens: &[String],
@@ -852,28 +879,12 @@ fn settle_pre(
     if let Some(e) = eos {
         ids.push(e);
     }
-    let hash = chkhsh(&ids);
-    let Some(&(_, name)) = PRE_BY_HASH.iter().rev().find(|(h, _)| *h == hash) else {
-        return Ok(structural.to_string());
-    };
-    if name == structural {
-        return Ok(structural.to_string());
-    }
-    if crate::provider::local::tokenizer::supports_pre(name) {
-        Ok(name.to_string())
-    } else {
-        Err(cfg_err(format!(
-            "the tokenizer matches llama.cpp's `{name}` pre-tokenizer, which this engine does not implement (its pre-tokenizer structure reads as `{structural}`)"
-        )))
-    }
+    pre_for_hash(structural, &chkhsh(&ids))
 }
 
 /// The byte-level BPE path (`_set_vocab_gpt2`).
 fn gpt2(ck: &CheckpointDir, hp: &Hp) -> Result<VocabMeta, CucaError> {
-    let tok = ck
-        .tokenizer_json
-        .as_ref()
-        .ok_or_else(|| cfg_err("checkpoint has no tokenizer.json"))?;
+    let tok = tokenizer_json(ck)?;
     let base = bpe_vocab(ck)?;
     let vocab_size = match hp.uint(&["vocab_size"]) {
         Some(n) => n,
@@ -1184,7 +1195,11 @@ pub(crate) fn build(
                 gpt2(ck, hp)?
             }
         }
-        ConvArch::Qwen35 | ConvArch::Qwen35Moe | ConvArch::Olmo2 | ConvArch::Olmoe => gpt2(ck, hp)?,
+        ConvArch::Qwen35
+        | ConvArch::Qwen35Moe
+        | ConvArch::Olmo2
+        | ConvArch::Olmoe
+        | ConvArch::Mistral4 => gpt2(ck, hp)?,
         // `MuseGlimmerModel.set_vocab`: the GPT-2 vocabulary plus `<|eot|>`
         // as the end-of-turn token (`<|eom|>` ends a message, not the turn).
         ConvArch::MuseGlimmer => {
@@ -1274,6 +1289,53 @@ mod tests {
         assert!(PRE_BY_HASH.iter().all(|(h, _)| h.len() == 64));
         assert_eq!(chkhsh(&[1, 2, 3]).len(), 64);
         assert!(CHKTXT.contains("កាន់តែពិសេសអាច"));
+    }
+
+    #[test]
+    fn a_vocabulary_shipped_only_as_tekken_json_is_refused_by_name() {
+        use crate::provider::local::convert::safetensors::tests::{
+            f32_bytes, temp_dir, write_file,
+        };
+        let dir = temp_dir("tekken-only");
+        write_file(
+            &dir.join("model.safetensors"),
+            &[("w", "F32", &[1], f32_bytes(&[1.0]))],
+        );
+        std::fs::write(dir.join("config.json"), "{}").unwrap();
+        let hp = Hp::new(&serde_json::json!({})).unwrap();
+        let open = || CheckpointDir::open(&dir).unwrap();
+        let plain = gpt2(&open(), &hp).unwrap_err().to_string();
+        assert!(plain.contains("no tokenizer.json"), "{plain}");
+        std::fs::write(dir.join("tekken.json"), "{}").unwrap();
+        let err = gpt2(&open(), &hp).unwrap_err().to_string();
+        assert!(err.contains("only as tekken.json"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_known_fingerprint_beats_the_structural_pre() {
+        // Mistral Small 4's tokenizer.json structure reads as `tekken`; its
+        // fingerprint is llama.cpp's `pixtral`, which is what gets written.
+        assert_eq!(
+            pre_for_hash(
+                "tekken",
+                "0e9433cbbb161f89e264eb32e8e64bfe69e834973ffca5d41d3948a604a3e2a3"
+            )
+            .unwrap(),
+            "pixtral"
+        );
+        // An unknown fingerprint keeps the structure; a known one the engine
+        // lacks is refused.
+        assert_eq!(pre_for_hash("tekken", &"0".repeat(64)).unwrap(), "tekken");
+        let (hash, name) = PRE_BY_HASH
+            .iter()
+            .find(|(_, n)| !crate::provider::local::tokenizer::supports_pre(n))
+            .expect("llama.cpp knows pre-tokenizers the engine lacks");
+        let err = pre_for_hash("llama-bpe", hash).unwrap_err().to_string();
+        assert!(
+            err.contains(&format!("`{name}`")) && err.contains("llama-bpe"),
+            "{err}"
+        );
     }
 
     #[test]

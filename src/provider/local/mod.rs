@@ -43,13 +43,15 @@
 //! process and in pure Rust, to a GGUF under `<cache>/converted/`, and that
 //! file then loads exactly like any other. The conversion is a port of
 //! llama.cpp's `convert_hf_to_gguf.py` for the architectures above
-//! (`LlamaForCausalLM`, `SmolLM3ForCausalLM`, `GraniteForCausalLM`,
+//! (`LlamaForCausalLM`, `MistralForCausalLM`, `SmolLM3ForCausalLM`, `GraniteForCausalLM`,
 //! `Qwen2ForCausalLM`, `Qwen3ForCausalLM`,
 //! `Qwen3MoeForCausalLM`, `Qwen3_5*`, `Qwen3_5Moe*`, `Phi3ForCausalLM`,
 //! `Gemma3*`, `Gemma4*`, `Gemma4AssistantForCausalLM`,
 //! `Olmo2ForCausalLM`, `Olmo3ForCausalLM` without sliding layers,
 //! `OlmoeForCausalLM`, `Ernie4_5ForCausalLM`,
-//! `MuseGlimmerForConditionalGeneration`; any other architecture fails
+//! `MuseGlimmerForConditionalGeneration`,
+//! `Mistral3ForConditionalGeneration` with a `mistral4` text model (FP8
+//! weights are dequantized); any other architecture fails
 //! before a weight is downloaded) and writes the file llama.cpp would write
 //! (compared with its output tensor by tensor, see the local-provider docs). [`WeightQuant`]
 //! (`LocalModelConfig::convert`, `f16`, `q8_0` by default, or `q4_0`) sets

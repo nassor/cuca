@@ -34,6 +34,17 @@ pub(crate) mod name {
     pub(crate) const ATTN_QKV: &str = "attn_qkv";
     pub(crate) const ATTN_OUTPUT: &str = "attn_output";
     pub(crate) const POST_ATTENTION_NORM: &str = "post_attention_norm";
+    // Multi-head latent attention (Mistral Small 4): low-rank Q and KV
+    // projections, the compressed KV's norm, and the per-head `k_b`
+    // `[heads, kv_lora, nope]` (transposed) and `v_b` `[heads, v_dim, kv_lora]`
+    // up-projections.
+    pub(crate) const ATTN_Q_A: &str = "attn_q_a";
+    pub(crate) const ATTN_Q_A_NORM: &str = "attn_q_a_norm";
+    pub(crate) const ATTN_Q_B: &str = "attn_q_b";
+    pub(crate) const ATTN_KV_A_MQA: &str = "attn_kv_a_mqa";
+    pub(crate) const ATTN_KV_A_NORM: &str = "attn_kv_a_norm";
+    pub(crate) const ATTN_K_B: &str = "attn_k_b";
+    pub(crate) const ATTN_V_B: &str = "attn_v_b";
     pub(crate) const FFN_NORM: &str = "ffn_norm";
     pub(crate) const FFN_GATE: &str = "ffn_gate";
     pub(crate) const FFN_UP: &str = "ffn_up";
@@ -42,6 +53,9 @@ pub(crate) mod name {
     pub(crate) const FFN_GATE_EXPS: &str = "ffn_gate_exps";
     pub(crate) const FFN_UP_EXPS: &str = "ffn_up_exps";
     pub(crate) const FFN_DOWN_EXPS: &str = "ffn_down_exps";
+    // Fused gate and up experts `[E, 2 * ff, hidden]` (gate rows first), as
+    // an alternative to the separate stacks.
+    pub(crate) const FFN_GATE_UP_EXPS: &str = "ffn_gate_up_exps";
     // Shared expert of Qwen 3.5 MoE: a dense gated FFN every token runs,
     // scaled by `sigmoid(ffn_gate_inp_shexp . x)` (a vector of `n_embd`).
     pub(crate) const FFN_GATE_SHEXP: &str = "ffn_gate_shexp";

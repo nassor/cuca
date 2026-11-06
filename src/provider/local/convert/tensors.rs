@@ -7,7 +7,8 @@
 //! transforms the pinned llama.cpp converter applies (`modify_tensors`):
 //! Q/K row permutation, the Gemma and Qwen 3.5 norm shifts, delta-net
 //! parameter rewrites, expert stacking and splitting, multi-token-prediction
-//! block renaming. [`Plan::write`] then streams one plan's values into the
+//! block renaming, the split of the latent attention's `kv_b_proj` into
+//! `k_b` and `v_b`. [`Plan::write`] then streams one plan's values into the
 //! writer, quantizing as it goes.
 //!
 //! GGUF stores `[out, in]` row-major exactly as safetensors does, so nothing
@@ -21,7 +22,7 @@ use candle_core::{Device, Tensor};
 use super::arch::ConvArch;
 use super::config::{ExtraTensor, Hp};
 use super::gguf_writer::{Dtype, TensorSpec};
-use super::safetensors::Shards;
+use super::safetensors::{Shards, StDtype};
 use crate::error::CucaError;
 use crate::provider::local::WeightQuant;
 use crate::provider::local::model::layout::name as gguf;
@@ -54,6 +55,9 @@ pub(crate) enum Op {
         nvk: usize,
         hd: usize,
     },
+    /// `k_b.transpose(1, 2)`: the rows are `batch` stacked matrices, each
+    /// transposed in place.
+    TransposeBatches { batch: usize },
 }
 
 impl Op {
@@ -258,6 +262,25 @@ fn apply(op: &Op, data: &mut Vec<f32>, rows: usize, cols: usize) -> Result<(), C
             }
             *data = out;
         }
+        Op::TransposeBatches { batch } => {
+            if batch == 0 || !rows.is_multiple_of(batch) {
+                return Err(cfg_err(format!(
+                    "cannot transpose {rows} rows as {batch} matrices"
+                )));
+            }
+            let r = rows / batch;
+            let mut out = vec![0.0f32; data.len()];
+            for b in 0..batch {
+                let src = &data[b * r * cols..(b + 1) * r * cols];
+                let dst = &mut out[b * r * cols..(b + 1) * r * cols];
+                for i in 0..r {
+                    for j in 0..cols {
+                        dst[j * r + i] = src[i * cols + j];
+                    }
+                }
+            }
+            *data = out;
+        }
     }
     Ok(())
 }
@@ -334,6 +357,13 @@ pub(crate) fn is_known(name: &str) -> bool {
         gguf::ATTN_V,
         gguf::ATTN_QKV,
         gguf::ATTN_OUTPUT,
+        gguf::ATTN_Q_A,
+        gguf::ATTN_Q_A_NORM,
+        gguf::ATTN_Q_B,
+        gguf::ATTN_KV_A_MQA,
+        gguf::ATTN_KV_A_NORM,
+        gguf::ATTN_K_B,
+        gguf::ATTN_V_B,
         gguf::POST_ATTENTION_NORM,
         gguf::FFN_NORM,
         gguf::FFN_GATE,
@@ -343,6 +373,7 @@ pub(crate) fn is_known(name: &str) -> bool {
         gguf::FFN_GATE_EXPS,
         gguf::FFN_UP_EXPS,
         gguf::FFN_DOWN_EXPS,
+        gguf::FFN_GATE_UP_EXPS,
         gguf::FFN_GATE_SHEXP,
         gguf::FFN_UP_SHEXP,
         gguf::FFN_DOWN_SHEXP,
@@ -421,6 +452,18 @@ fn skipped(name: &str) -> bool {
         || name.ends_with("rotary_emb.inv_freq")
         || name.ends_with(".attention.masked_bias")
         || name.ends_with(".attention.bias")
+}
+
+/// A tensor that exists only to dequantize an FP8 one: its `_scale_inv`
+/// (applied while reading the weight, see [`Shards::read_rows`]), or an
+/// activation scale (unused: the converter writes weights only).
+fn is_fp8_scale(name: &str, shards: &Shards) -> bool {
+    if name.ends_with(".activation_scale") || name.ends_with("_activation_scale") {
+        return true;
+    }
+    name.strip_suffix("_scale_inv")
+        .and_then(|weight| shards.tensor(weight))
+        .is_some_and(|w| w.dtype == StDtype::F8E4m3)
 }
 
 /// The checkpoint name with the language-model wrapper removed
@@ -671,6 +714,9 @@ impl Planner<'_> {
         if arch == ConvArch::MuseGlimmer && rest == "self_attn.q_proj.weight" {
             self.plan_muse_qk_norms(il)?;
         }
+        if arch == ConvArch::Mistral4 {
+            return self.plan_mla(hf, il, rest);
+        }
 
         // Q/K projections: Llama-family rows are permuted.
         if arch.permutes_qk() {
@@ -818,6 +864,80 @@ impl Planner<'_> {
             });
         }
         Ok(())
+    }
+
+    /// A layer of the latent-attention mixture-of-experts family
+    /// (`DeepseekV2Model.modify_tensors` under `Mistral4Model`): the
+    /// low-rank attention projections, `kv_b_proj` split into the per-head
+    /// `k_b` (transposed) and `v_b`, a router, shared experts, and expert
+    /// stacks that the checkpoint already holds as `[E, 2 * ff, hidden]`
+    /// (gate and up fused, kept fused) and `[E, hidden, ff]`.
+    fn plan_mla(&mut self, hf: &str, il: usize, rest: &str) -> Result<(), CucaError> {
+        let blk = |part: &str| gguf::blk(il, part);
+        let part = match rest {
+            "self_attn.q_a_proj.weight" => gguf::ATTN_Q_A,
+            "self_attn.q_a_layernorm.weight" => gguf::ATTN_Q_A_NORM,
+            "self_attn.q_b_proj.weight" => gguf::ATTN_Q_B,
+            "self_attn.kv_a_proj_with_mqa.weight" => gguf::ATTN_KV_A_MQA,
+            "self_attn.kv_a_layernorm.weight" => gguf::ATTN_KV_A_NORM,
+            "self_attn.o_proj.weight" => gguf::ATTN_OUTPUT,
+            "input_layernorm.weight" => gguf::ATTN_NORM,
+            "post_attention_layernorm.weight" => gguf::FFN_NORM,
+            "mlp.gate_proj.weight" => gguf::FFN_GATE,
+            "mlp.up_proj.weight" => gguf::FFN_UP,
+            "mlp.down_proj.weight" => gguf::FFN_DOWN,
+            "mlp.gate.weight" => gguf::FFN_GATE_INP,
+            "mlp.shared_experts.gate_proj.weight" => gguf::FFN_GATE_SHEXP,
+            "mlp.shared_experts.up_proj.weight" => gguf::FFN_UP_SHEXP,
+            "mlp.shared_experts.down_proj.weight" => gguf::FFN_DOWN_SHEXP,
+            // The experts are bare parameters, not modules: no `.weight`.
+            "mlp.experts.gate_up_proj" => gguf::FFN_GATE_UP_EXPS,
+            "mlp.experts.down_proj" => gguf::FFN_DOWN_EXPS,
+            "self_attn.kv_b_proj.weight" => return self.plan_kv_b(hf, il),
+            _ => return Err(self.unmapped(hf)),
+        };
+        self.direct(hf, blk(part), Vec::new())
+    }
+
+    /// `kv_b_proj` `[heads * (nope + v), kv_lora]`, viewed as
+    /// `[heads, nope + v, kv_lora]`, split along the second dimension into
+    /// `k_b` `[heads, kv_lora, nope]` (each head transposed) and `v_b`
+    /// `[heads, v, kv_lora]`.
+    fn plan_kv_b(&mut self, hf: &str, il: usize) -> Result<(), CucaError> {
+        // The checkpoint's head count: the converter replaces it by 1 in the
+        // metadata only after the tensors are processed.
+        let heads = self.hp.req_uint(&["num_key_value_heads"])?;
+        let nope = self.hp.req_uint(&["qk_nope_head_dim"])?;
+        let v = self.hp.req_uint(&["v_head_dim"])?;
+        let shape = self.shape(hf)?;
+        if shape.len() != 2 || shape[0] != heads * (nope + v) {
+            return Err(cfg_err(format!(
+                "`{hf}` has shape {shape:?}, expected {} rows of {heads} heads of {nope} + {v}",
+                heads * (nope + v)
+            )));
+        }
+        let lora = shape[1];
+        let head_rows = |start: usize, len: usize| -> Vec<Slice> {
+            (0..heads)
+                .map(|h| Slice {
+                    tensor: hf.to_string(),
+                    row_start: h * (nope + v) + start,
+                    rows: len,
+                })
+                .collect()
+        };
+        self.check(&gguf::blk(il, gguf::ATTN_K_B))?;
+        self.plans.push(Plan {
+            name: gguf::blk(il, gguf::ATTN_K_B),
+            dims: vec![heads, lora, nope],
+            body: Body::Slices(head_rows(0, nope)),
+            ops: vec![Op::TransposeBatches { batch: heads }],
+        });
+        self.stack_with_dims(
+            head_rows(nope, v),
+            gguf::blk(il, gguf::ATTN_V_B),
+            vec![heads, v, lora],
+        )
     }
 
     /// Gated delta-net parameters of a Qwen 3.5 layer (`modify_tensors` of
@@ -1075,7 +1195,7 @@ pub(crate) fn plan(
         });
     }
     for hf in shards.names() {
-        if skipped(hf) {
+        if skipped(hf) || is_fp8_scale(hf, shards) {
             continue;
         }
         planner.plan_one(hf)?;
@@ -1599,6 +1719,104 @@ mod tests {
         let mut want = Vec::new();
         encode(Dtype::Q8_0, all, cols, &mut want).unwrap();
         assert_eq!(got, want);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn mistral4_layers_use_the_latent_attention_layout() {
+        // 2 heads of nope 2, rope 1, v 3; kv_lora 4, q_lora 5, hidden 6;
+        // 3 experts of width 2.
+        let layer = "language_model.model.layers.0.";
+        let t = |n: &str| format!("{layer}{n}");
+        let tensors: Vec<(String, Vec<usize>)> = vec![
+            (
+                "language_model.model.embed_tokens.weight".into(),
+                vec![8, 6],
+            ),
+            ("language_model.model.norm.weight".into(), vec![6]),
+            ("language_model.lm_head.weight".into(), vec![8, 6]),
+            ("vision_tower.ln_pre.weight".into(), vec![2]),
+            ("multi_modal_projector.norm.weight".into(), vec![2]),
+            (t("input_layernorm.weight"), vec![6]),
+            (t("post_attention_layernorm.weight"), vec![6]),
+            (t("self_attn.q_a_proj.weight"), vec![5, 6]),
+            (t("self_attn.q_a_proj.activation_scale"), vec![]),
+            (t("self_attn.q_a_layernorm.weight"), vec![5]),
+            (t("self_attn.q_b_proj.weight"), vec![6, 5]),
+            (t("self_attn.kv_a_proj_with_mqa.weight"), vec![5, 6]),
+            (t("self_attn.kv_a_layernorm.weight"), vec![4]),
+            (t("self_attn.kv_b_proj.weight"), vec![10, 4]),
+            (t("self_attn.o_proj.weight"), vec![6, 6]),
+            (t("mlp.gate.weight"), vec![3, 6]),
+            (t("mlp.experts.gate_up_proj"), vec![3, 4, 6]),
+            (t("mlp.experts.gate_up_proj_activation_scale"), vec![3]),
+            (t("mlp.experts.down_proj"), vec![3, 6, 2]),
+            (t("mlp.shared_experts.gate_proj.weight"), vec![2, 6]),
+            (t("mlp.shared_experts.up_proj.weight"), vec![2, 6]),
+            (t("mlp.shared_experts.down_proj.weight"), vec![6, 2]),
+        ];
+        let refs: Vec<(&str, &[usize])> = tensors
+            .iter()
+            .map(|(n, s)| (n.as_str(), s.as_slice()))
+            .collect();
+        let (s, dir) = checkpoint("t-mistral4", &refs);
+        let h = hp(serde_json::json!({
+            "num_hidden_layers": 1, "hidden_size": 6, "num_attention_heads": 2,
+            "num_key_value_heads": 2, "qk_nope_head_dim": 2, "v_head_dim": 3,
+            "n_routed_experts": 3
+        }));
+        let plans = plan(ConvArch::Mistral4, &h, &s, Vec::new(), None).unwrap();
+        let mut names: Vec<&str> = plans.iter().map(|p| p.name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            [
+                "blk.0.attn_k_b.weight",
+                "blk.0.attn_kv_a_mqa.weight",
+                "blk.0.attn_kv_a_norm.weight",
+                "blk.0.attn_norm.weight",
+                "blk.0.attn_output.weight",
+                "blk.0.attn_q_a.weight",
+                "blk.0.attn_q_a_norm.weight",
+                "blk.0.attn_q_b.weight",
+                "blk.0.attn_v_b.weight",
+                "blk.0.ffn_down_exps.weight",
+                "blk.0.ffn_down_shexp.weight",
+                "blk.0.ffn_gate_inp.weight",
+                "blk.0.ffn_gate_shexp.weight",
+                "blk.0.ffn_gate_up_exps.weight",
+                "blk.0.ffn_norm.weight",
+                "blk.0.ffn_up_shexp.weight",
+                "output.weight",
+                "output_norm.weight",
+                "token_embd.weight",
+            ]
+        );
+        // The experts keep the checkpoint's stacked, fused layout.
+        assert_eq!(
+            by_name(&plans, "blk.0.ffn_gate_up_exps.weight").dims,
+            [3, 4, 6]
+        );
+        // `kv_b_proj` is `[2 heads, 2 + 3, 4]`: k_b is each head's first two
+        // rows transposed, v_b the other three rows.
+        let k_b = by_name(&plans, "blk.0.attn_k_b.weight");
+        assert_eq!(k_b.dims, [2, 4, 2]);
+        assert_eq!(
+            values(&s, k_b),
+            [
+                0., 4., 1., 5., 2., 6., 3., 7., 20., 24., 21., 25., 22., 26., 23., 27.
+            ]
+        );
+        let v_b = by_name(&plans, "blk.0.attn_v_b.weight");
+        assert_eq!(v_b.dims, [2, 3, 4]);
+        let want: Vec<f32> = (8..20).chain(28..40).map(|i| i as f32).collect();
+        assert_eq!(values(&s, v_b), want);
+        // Quantized, k_b and v_b stay weights; the router and norms stay f32.
+        assert_eq!(k_b.dtype(WeightQuant::F16), Dtype::F16);
+        assert_eq!(
+            by_name(&plans, "blk.0.ffn_gate_inp.weight").dtype(WeightQuant::F16),
+            Dtype::F32
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }
