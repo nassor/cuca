@@ -85,6 +85,9 @@ async fn reply(model: &LocalModel, prompt: &str) -> (String, u64) {
             _ => {}
         }
     }
+    if std::env::var_os("CUCA_LOCAL_PRINT_REPLIES").is_some() {
+        println!("REPLY|{text:?}");
+    }
     let response = handle.take().expect("terminal response");
     (text, response.completion_tokens.into())
 }

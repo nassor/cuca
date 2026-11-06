@@ -506,6 +506,9 @@ async fn ask(model: &LocalModel, request: UnifiedRequest) -> Reply {
     while let Some(item) = stream.next().await {
         blocks.push(item.expect("stream item"));
     }
+    if std::env::var_os("CUCA_LOCAL_PRINT_REPLIES").is_some() {
+        println!("REPLY|{blocks:?}");
+    }
     Reply {
         blocks,
         response: handle.take().expect("terminal response"),

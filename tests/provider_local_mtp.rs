@@ -144,6 +144,9 @@ async fn run(model: &LocalModel, prompt: &str, max_tokens: u32) -> (String, u64,
             _ => {}
         }
     }
+    if std::env::var_os("CUCA_LOCAL_PRINT_REPLIES").is_some() {
+        println!("REPLY|{text:?}");
+    }
     let elapsed = started.elapsed().as_secs_f64();
     let response = handle.take().expect("terminal response");
     (text, response.completion_tokens.into(), elapsed)
