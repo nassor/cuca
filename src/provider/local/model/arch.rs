@@ -18,13 +18,14 @@ pub(crate) enum Arch {
     Gemma4,
     /// Gemma 3: sliding/full layers (every sixth full), QK-norm, post-norms.
     Gemma3,
-    /// Llama 1/2/3 and every model that publishes as `llama` (Mistral, ...).
+    /// Llama 3.x-style models and every model that publishes as `llama`
+    /// (DeepSeek-R1-Distill-Llama, Mistral, ...).
     Llama,
     /// Qwen 2 / 2.5 (and DeepSeek-R1 distills of it): QKV biases.
     Qwen2,
     /// Qwen 3: QK-norm.
     Qwen3,
-    /// Phi 3 / 3.5 / 4-mini: fused QKV and gate-up, LongRoPE, partial rotary.
+    /// Phi 4-mini (and Phi 3.x): fused QKV and gate-up, LongRoPE, partial rotary.
     Phi3,
     /// SmolLM 3: Llama-style with NoPE layers.
     Smollm3,

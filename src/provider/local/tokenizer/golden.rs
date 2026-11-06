@@ -23,13 +23,6 @@
 //! show (`hf_repo` is the repository whose `tokenizer.json` produced a model's
 //! ids):
 //!
-//! - `lstrip`/`rstrip` on added tokens: HuggingFace's Phi-3.5 `tokenizer.json`
-//!   strips the whitespace after `<|user|>`, `<|end|>`, ...; this tokenizer
-//!   reproduces it (llama.cpp's `RSTRIP` rule, widened to the Phi-3.5 GGUF whose
-//!   `general.name` has no hyphen: see the module docs of `tokenizer`), so the
-//!   Phi-3.5 vectors are HuggingFace's with its flags unchanged. Phi-4-mini also
-//!   has the flags in `tokenizer.json` but is not a Phi-3 SPM model, gets no
-//!   stripping here, and its vectors (no whitespace after a special) agree.
 //! - Unicode normalization: Qwen-family `tokenizer.json` files NFC-normalize
 //!   the text first; llama.cpp does not, so the shared texts are NFC-stable.
 //! - GPT-4o-style case classes: llama.cpp approximates `\p{Lu}`/`\p{Ll}` with

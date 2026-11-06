@@ -17,8 +17,8 @@
 //! # Choosing a model
 //!
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
-//! `llama` (Llama 1-3.x and compatible), `qwen2`, `qwen3`, `phi3`
-//! (Phi 3, 3.5, 4-mini), `smollm3`, `granite`, `qwen3moe`,
+//! `llama` (Llama 3.x and compatible), `qwen2`, `qwen3`, `phi3`
+//! (Phi 4-mini and compatible), `smollm3`, `granite`, `qwen3moe`,
 //! `olmoe`, `olmo2`, `ernie4_5`, `qwen35` or `qwen35moe` runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
@@ -75,9 +75,9 @@
 //!   per running sequence plus cached prefixes. When the pool is full a
 //!   running request that needs a block preempts the youngest one, which
 //!   resumes later from the blocks it left in the prefix store. At 8192
-//!   positions: 422 MB for Gemma 4 E2B, 1.27 GB for E4B, 3.76 GB for
-//!   Qwen3-0.6B and 12.88 GB for Phi-3.5-mini (a full-attention model with 32
-//!   KV heads needs a smaller `context_length`). A prefix store keeps the
+//!   positions: 422 MB for Gemma 4 E2B, 1.27 GB for E4B and 3.76 GB for
+//!   Qwen3-0.6B (a full-attention model with many KV heads needs a smaller
+//!   `context_length`). A prefix store keeps the
 //!   blocks of finished requests, named by their token ids, and a prompt
 //!   reuses whole blocks of its cached prefix (a hybrid model also resumes
 //!   from a recurrent-state snapshot of that position; about 20 MB each for
@@ -996,7 +996,7 @@ pub struct LocalModelConfig {
     /// (shared by every running request; [`BatchingConfig::kv_tokens`] sets
     /// the pool), so a layer costs `2 * context_length * 2 * 4 * n_kv_head * head_dim` bytes
     /// of RAM (Gemma 4 E2B 422 MB at 8192, Qwen3-0.6B 458,752 bytes per
-    /// context position, Phi-3.5-mini 1,572,864, i.e. 12.88 GB at 8192: size it
+    /// context position, i.e. 3.76 GB at 8192: size it
     /// for the model; [`LocalModel::kv_cache_bytes`] reports the result; see
     /// [`LocalModel`]).
     /// `None` (the default)

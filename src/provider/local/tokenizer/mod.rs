@@ -23,14 +23,7 @@
 //! `tokenizer_st_partition`, then runs the scheme over each remaining fragment.
 //! `encode` never adds BOS/EOS; [`Tokenizer::encode_prompt`] adds them per the
 //! model's `add_bos`/`add_eos` flags unless the text already starts/ends with
-//! them. Special tokens carry llama.cpp's `lstrip`/`rstrip` attributes: when one
-//! is cut out of the text, `rstrip` drops the whitespace that follows it and
-//! `lstrip` the whitespace that precedes it. The GGUF has no per-token field for
-//! them, so they are derived from the metadata as llama.cpp does: Phi-3 family
-//! SPM checkpoints (see `Metadata::is_phi3`) get `rstrip` on every special token
-//! except `<unk>`, `<s>` and `<|endoftext|>`, matching the HuggingFace
-//! `tokenizer.json` added-token flags (`<|user|>\nHi<|end|>\n<|assistant|>\n`
-//! tokenizes without the newlines); no other family gets either flag.
+//! them.
 //!
 //! Memory: the vocabulary is built once into one compact string arena plus an
 //! open-addressing table ([`vocab`]) and the merge map holds 16 bytes per rule;
@@ -136,23 +129,11 @@ struct Config {
     add_eos: bool,
 }
 
-/// A special token with the whitespace-stripping attributes llama.cpp calls
-/// `LSTRIP` and `RSTRIP`: when the token is cut out of text, whitespace at the
-/// end of the text before it (`lstrip`) or at the start of the text after it
-/// (`rstrip`) is dropped.
+/// A special token.
 #[derive(Debug, Clone, Copy)]
 struct Special {
     /// Token id.
     id: u32,
-    /// Strip trailing whitespace of the preceding text.
-    lstrip: bool,
-    /// Strip leading whitespace of the following text.
-    rstrip: bool,
-}
-
-/// C `isspace` in the C locale: space, `\t`, `\n`, `\v`, `\f`, `\r`.
-fn is_c_space(c: char) -> bool {
-    matches!(c, ' ' | '\t'..='\r')
 }
 
 /// A tokenizer built from GGUF metadata.
@@ -252,25 +233,6 @@ impl<'a> Metadata<'a> {
         let id = u32::try_from(n).ok()?;
         ((id as usize) < vocab_size).then_some(id)
     }
-
-    /// Whether this is a Phi-3 family SentencePiece checkpoint, for which
-    /// llama.cpp (and the HuggingFace `tokenizer.json`) strip the whitespace
-    /// after every special token. llama.cpp tests the lower-cased
-    /// `general.name` for `phi-3`/`phi3`; the Phi-3.5 GGUF only says
-    /// `Phi 3.5 Mini Instruct`, so `general.basename` (`Phi-3.5`) is tested too,
-    /// and so is `general.architecture == "phi3"` for a `llama` (SPM) model.
-    /// Phi-4-mini shares the architecture but is a `gpt2` model named `Phi-4`,
-    /// and gets no stripping.
-    fn is_phi3(&self, model: &str) -> bool {
-        let named = ["general.name", "general.basename"]
-            .iter()
-            .filter_map(|key| self.string(key))
-            .any(|name| {
-                let name = name.to_ascii_lowercase();
-                name.contains("phi-3") || name.contains("phi3")
-            });
-        named || (model == "llama" && self.string("general.architecture") == Some("phi3"))
-    }
 }
 
 impl Tokenizer {
@@ -295,7 +257,6 @@ impl Tokenizer {
                 words: Words::Escaped,
             },
             Config::default(),
-            false,
         ))
     }
 
@@ -418,12 +379,11 @@ impl Tokenizer {
                 words: Words::Escaped,
             },
         };
-        let rstrip_specials = md.is_phi3(model);
-        Ok(Self::assemble(vocab, engine, config, rstrip_specials))
+        Ok(Self::assemble(vocab, engine, config))
     }
 
     /// Collect the special tokens and finish construction.
-    fn assemble(vocab: Vocab, engine: Engine, config: Config, rstrip_specials: bool) -> Self {
+    fn assemble(vocab: Vocab, engine: Engine, config: Config) -> Self {
         let mut specials: Vec<Special> = (0..vocab.len() as u32)
             .filter(|&id| {
                 !vocab.piece(id).is_empty()
@@ -432,12 +392,7 @@ impl Tokenizer {
                         Some(TYPE_CONTROL | TYPE_USER_DEFINED | TYPE_UNKNOWN)
                     )
             })
-            .map(|id| Special {
-                id,
-                lstrip: false,
-                rstrip: rstrip_specials
-                    && !matches!(vocab.piece(id), "<unk>" | "<s>" | "<|endoftext|>"),
-            })
+            .map(|id| Special { id })
             .collect();
         specials.sort_by(|a, b| {
             vocab
@@ -560,7 +515,7 @@ impl Tokenizer {
             pairs[key >> 6] |= 1 << (key & 63);
         }
         let mut next: Vec<Fragment<'a>> = Vec::new();
-        for &Special { id, lstrip, rstrip } in &self.specials {
+        for &Special { id } in &self.specials {
             let special = self.vocab.piece(id);
             let sb = special.as_bytes();
             let Some(&lead) = sb.first() else {
@@ -588,18 +543,12 @@ impl Tokenizer {
                     continue;
                 };
                 while let Some(pos) = rest.find(special) {
-                    let mut left = &rest[..pos];
-                    if lstrip {
-                        left = left.trim_end_matches(is_c_space);
-                    }
+                    let left = &rest[..pos];
                     if !left.is_empty() {
                         next.push(Fragment::Raw(left));
                     }
                     next.push(Fragment::Special(id));
                     rest = &rest[pos + special.len()..];
-                    if rstrip {
-                        rest = rest.trim_start_matches(is_c_space);
-                    }
                 }
                 if !rest.is_empty() {
                     next.push(Fragment::Raw(rest));
@@ -741,8 +690,7 @@ impl Tokenizer {
 
     /// True for SentencePiece models with `add_space_prefix`: encoding put a
     /// space in front of the text, so a decoder of generated text drops one
-    /// leading space of the first emitted text (llama.cpp's `lstrip` on
-    /// detokenize).
+    /// leading space of the first emitted text (llama.cpp's detokenize rule).
     pub(crate) fn strips_leading_space(&self) -> bool {
         matches!(&self.engine, Engine::Spm(spm) if spm.add_space_prefix())
     }
@@ -1261,68 +1209,5 @@ mod tests {
         md.remove("tokenizer.ggml.scores");
         let t = Tokenizer::from_gguf(&md).expect("scores are optional");
         assert_eq!(t.encode("ab"), [0, 1], "no merges without tokens like `ab`");
-    }
-
-    // ---- lstrip / rstrip ------------------------------------------------
-
-    #[test]
-    fn phi3_specials_strip_the_whitespace_after_them() {
-        let phi3 = spm(&[("general.architecture", string_value("phi3"))]);
-        // `<|u|>` (id 14) eats the newline and spaces after it; the fragment
-        // after a special still gets the SPM prefix space.
-        assert_eq!(phi3.encode("a<|u|>\n  a"), [10, 14, 10]);
-        assert_eq!(
-            phi3.encode("a<|u|>\n"),
-            [10, 14],
-            "an all-space remainder vanishes"
-        );
-        // `<s>` and `<unk>` keep the following whitespace.
-        assert_eq!(phi3.encode("<s>\na"), [1, 6, 3, 7]);
-        // Only following whitespace is stripped, not preceding.
-        assert_eq!(phi3.encode("a \n<|u|>a"), [10, 6, 3, 14, 10]);
-        // Any other SPM model keeps everything.
-        let plain = spm(&[]);
-        assert_eq!(plain.encode("a<|u|>\na"), [10, 14, 6, 3, 7]);
-        // `general.basename` alone selects it too.
-        let named = spm(&[("general.basename", string_value("Phi-3.5"))]);
-        assert_eq!(named.encode("a<|u|>\n  a"), [10, 14, 10]);
-    }
-
-    #[test]
-    fn phi3_rule_needs_the_name_or_a_llama_phi3_architecture() {
-        let md = |entries: &[(&str, &str)]| -> HashMap<String, Value> {
-            entries
-                .iter()
-                .map(|(k, v)| ((*k).to_string(), string_value(v)))
-                .collect()
-        };
-        let hit = |entries: &[(&str, &str)], model: &str| Metadata(&md(entries)).is_phi3(model);
-        assert!(hit(&[("general.name", "Phi-3-mini-4k-instruct")], "llama"));
-        assert!(hit(&[("general.name", "my phi3 tune")], "gpt2"));
-        assert!(hit(&[("general.basename", "Phi-3.5")], "llama"));
-        assert!(hit(&[("general.architecture", "phi3")], "llama"));
-        // Phi-3.5 name alone has no hyphen; Phi-4-mini is arch phi3 but gpt2.
-        assert!(!hit(&[("general.name", "Phi 3.5 Mini Instruct")], "llama"));
-        assert!(!hit(
-            &[
-                ("general.architecture", "phi3"),
-                ("general.name", "Phi 4 Mini Instruct"),
-                ("general.basename", "Phi-4"),
-            ],
-            "gpt2"
-        ));
-        assert!(!hit(&[], "llama"));
-    }
-
-    #[test]
-    fn lstrip_drops_whitespace_before_a_special() {
-        let mut t = spm(&[]);
-        for special in &mut t.specials {
-            special.lstrip = special.id == 14;
-        }
-        // Trailing whitespace of the preceding text goes; following text stays.
-        assert_eq!(t.encode("a \t<|u|>a"), [10, 14, 10]);
-        // A remainder that is only whitespace before the special disappears.
-        assert_eq!(t.encode(" <|u|> a"), [14, 6, 10]);
     }
 }

@@ -1200,7 +1200,7 @@ pub(crate) fn build(
         }
         ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite => {
             let prefix = config_str(ck, "add_prefix_space").and_then(Json::as_bool);
-            let mut m = if ck.tokenizer_model.is_some() {
+            if ck.tokenizer_model.is_some() {
                 spm_meta(ck, spm_generic(ck, hp)?, prefix)?
             } else {
                 let mut m = gpt2(ck, hp)?;
@@ -1208,12 +1208,7 @@ pub(crate) fn build(
                     m.kv.push(("tokenizer.ggml.add_space_prefix".into(), Value::Bool(p)));
                 }
                 m
-            };
-            if hp.uint(&["vocab_size"]).unwrap_or(32000) == 49152 {
-                m.kv.retain(|(k, _)| k != "tokenizer.ggml.add_bos_token");
-                m.kv.push(("tokenizer.ggml.add_bos_token".into(), Value::Bool(false)));
             }
-            m
         }
         ConvArch::Qwen2 | ConvArch::Qwen3 | ConvArch::Qwen3Moe => {
             if ck.tokenizer_model.is_some() {

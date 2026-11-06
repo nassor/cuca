@@ -272,8 +272,8 @@
 //! budget exceeded" when the replayed tile needs more than the 32 KiB the
 //! device allows); the other order happens to work, so which model fails
 //! depends on which weight a forward pass tunes first. Files that mix the
-//! schemes (a Q4_0 file with a few Q4_1 layers and a Q6_K head, as Llama 3.2
-//! and Phi 3.5 are) hit it on the first pass that tunes a Q8 weight before a
+//! schemes (a Q4_0 file with a few Q4_1 layers and a Q6_K head, as the
+//! Llama and Phi families' files are) hit it on the first pass that tunes a Q8 weight before a
 //! Q4 one of the same bucket (any prefill length, or a decode step). The
 //! autotune cache lives per process and device, so the plan covers the
 //! weights of one model and, for a drafter, those of its target. The
@@ -6217,7 +6217,7 @@ mod tests {
     /// kernel tuned for a Q8_0 weight is replayed on a Q4_0 weight of the same
     /// shape bucket and fails ("quantized view float vector size 4 must be a
     /// positive multiple of num_quants 8", or a shared-memory budget). The
-    /// weights below are the shape classes of Llama 3.2 and Phi 3.5 files
+    /// weights below are the shape classes of a wide (`wide`) and a narrow (`narrow`) Llama/Phi-style file
     /// (Q4_0 with a few Q4_1 layers and a Q6_K head) plus small ones with
     /// the same residues, uploaded as the loader does (the plan applied),
     /// Q8 weights first, then multiplied for prefill lengths of every
@@ -6237,7 +6237,7 @@ mod tests {
         type Family = (&'static str, Vec<(usize, usize, GgmlDType)>);
         let families: [Family; 3] = [
             (
-                "phi3.5",
+                "wide",
                 vec![
                     (3072, 8192, Q8_0),
                     (32064, 3072, Q8_0),
@@ -6248,7 +6248,7 @@ mod tests {
                 ],
             ),
             (
-                "llama3.2",
+                "narrow",
                 vec![
                     (512, 2048, Q8_0),
                     (2048, 8192, Q8_0),

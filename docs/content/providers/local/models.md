@@ -168,7 +168,6 @@ Any other `pre` fails the load with ``unsupported pre-tokenizer `NAME` ``. The n
 
 - Special tokens (control, user-defined and unknown types) are cut out of the text longest-first before the scheme runs, so `<|im_start|>` in a rendered prompt is one token.
 - The prompt gets a BOS token when `tokenizer.ggml.add_bos_token` (or the scheme's default) says so, and never a second one when the rendered template already starts with it.
-- Phi-3-family SentencePiece models strip the whitespace that follows a special token, as their reference tokenizer does. No other family does.
 - For a SentencePiece model with `add_space_prefix`, text after a special token such as `</s>` gets a leading space token, as in llama.cpp. HuggingFace's tokenizer does not add it, so such a model's prompt has one more token than the reference tokenizer's (ERNIE 4.5's GGUF files that omit the key; the default stays because llama.cpp applies it).
 
 Verified by the tokenizer golden test in `src/provider/local/tokenizer/golden.rs`: for 7 models (Qwen 3, Gemma 3 270M and 1B, SmolLM 3, Phi 4 mini, R1 distill, Qwen 3.5) the ids of 16 texts and 3 chat prompts equal the HuggingFace `tokenizer.json` ids. The test reads cached model files and prints `SKIP:` for a missing one. Where llama.cpp and HuggingFace differ, the expected ids follow llama.cpp, with one exception that follows HuggingFace: the GPT-4o case classes.
