@@ -320,7 +320,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 20] = [
+const PRESET_TABLE: [ModelPreset; 21] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -492,13 +492,19 @@ const PRESET_TABLE: [ModelPreset; 20] = [
         20_836_243_072,
         "qwen35moe",
     ),
+    // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers and a Q4_1
+    // `ffn_down` in 6 (those run on candle's kernels, not the row-batched
+    // ones). It embeds the earlier Muse chat template, which renders the same
+    // bytes as the current one except when the caller's system prompt itself
+    // mentions "Reasoning effort": the current template rewrites that to
+    // "Reasoning strength", this one appends a second directive.
     preset(
         "muse-glimmer-30b-q4_0",
-        "NANI-Nithin/Muse-Glimmer-30B-GGUF",
-        "41bbbd5e5a815ad2274f9a123b80777eb462c8d2",
+        "bartowski/Muse-Glimmer-30B-GGUF",
+        "01e1b7c30e19e1823ee9a73dec51d12f59ec4857",
         "Muse-Glimmer-30B-Q4_0.gguf",
-        "51a0bd1736a60825dc9204d42df52d843e55718458e9b67987622851a4111873",
-        16_032_980_544,
+        "95fd818c08f2030a51805548269690e1915fc84088e4322273c5f317e2696999",
+        16_265_565_216,
         "muse-glimmer",
     ),
     ModelPreset {
