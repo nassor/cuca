@@ -86,17 +86,48 @@ pub(crate) struct KvLayout {
     pub(crate) layer_group: Vec<Option<usize>>,
 }
 
+/// How many sequences the pools and state slots of a loaded model serve, and
+/// over how many cached positions (see [`KvLayout::new`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Sizing {
+    /// Sequences running at once: hybrid models get one recurrent-state slot
+    /// each, sliding-window groups one window each.
+    pub(crate) max_sequences: usize,
+    /// Positions of the shared pool of a full-attention group.
+    pub(crate) kv_tokens: usize,
+    /// Most rows one sequence runs in one call.
+    pub(crate) max_rows: usize,
+}
+
+impl Sizing {
+    /// One sequence over twice `context_length` positions, in the largest
+    /// calls the engine makes.
+    pub(crate) fn single(context_length: usize) -> Self {
+        Self {
+            max_sequences: 1,
+            kv_tokens: 2 * context_length,
+            max_rows: super::max_call_rows(context_length),
+        }
+    }
+}
+
 impl KvLayout {
     /// The pools of a single sequence at `context_length`: `kv_tokens` of
     /// twice the context, so a finished sequence's prefix stays cached while
     /// the next one runs.
+    #[cfg(test)]
     pub(crate) fn single(hp: &Hparams, context_length: usize) -> Self {
+        Self::sized(hp, context_length, &Sizing::single(context_length))
+    }
+
+    /// [`KvLayout::new`] for `sizing`.
+    pub(crate) fn sized(hp: &Hparams, context_length: usize, sizing: &Sizing) -> Self {
         Self::new(
             hp,
             context_length,
-            1,
-            2 * context_length,
-            super::max_call_rows(context_length),
+            sizing.max_sequences,
+            sizing.kv_tokens,
+            sizing.max_rows,
         )
     }
 
@@ -224,13 +255,24 @@ impl BlockKey {
     }
 }
 
+/// The keys of the first `blocks` full blocks of `ids`.
+pub(crate) fn block_keys(ids: &[u32], blocks: usize) -> Vec<BlockKey> {
+    let mut keys: Vec<BlockKey> = Vec::with_capacity(blocks);
+    let mut prev = 0;
+    for chunk in ids.as_chunks::<BLOCK_SIZE>().0.iter().take(blocks) {
+        let key = BlockKey::new(prev, chunk);
+        prev = key.hash;
+        keys.push(key);
+    }
+    keys
+}
+
 #[cfg(test)]
 thread_local! {
     /// Test-only: every chain hash is the same constant, to force collisions.
     static COLLIDE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
 /// Counts of one pool's blocks.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct PoolStats {
@@ -367,7 +409,6 @@ impl BlockPool {
         self.key[block as usize].is_some()
     }
 
-    #[cfg(test)]
     pub(crate) fn stats(&self) -> PoolStats {
         PoolStats {
             free: self.free.len(),
@@ -438,9 +479,42 @@ impl KvPools {
         }
     }
 
+    /// Block counts of every group's pool.
     #[cfg(test)]
     pub(crate) fn stats(&self) -> Vec<PoolStats> {
         self.pools.iter().map(BlockPool::stats).collect()
+    }
+
+    /// The group whose pool bounds how many positions the sequences hold
+    /// together: the full-attention one (the first group without a window,
+    /// or the first group).
+    fn full_group(&self) -> usize {
+        self.groups
+            .iter()
+            .position(|g| g.window.is_none())
+            .unwrap_or(0)
+    }
+
+    /// Blocks the full-attention pool can still hand out: free ones and
+    /// cached ones (evicted on demand).
+    pub(crate) fn available(&self) -> usize {
+        self.pools.get(self.full_group()).map_or(0, |p| {
+            let s = p.stats();
+            s.free + s.cached
+        })
+    }
+
+    /// Blocks `seq` holds in the full-attention pool.
+    pub(crate) fn full_blocks(&self, seq: &SeqBlocks) -> usize {
+        seq.tables.get(self.full_group()).map_or(0, Vec::len)
+    }
+
+    /// Counts of the full-attention pool.
+    pub(crate) fn full_stats(&self) -> PoolStats {
+        self.pools
+            .get(self.full_group())
+            .map(BlockPool::stats)
+            .unwrap_or_default()
     }
 
     /// Give `seq` the blocks it needs for positions `0..upto`, in every
@@ -545,6 +619,14 @@ impl KvPools {
     /// Register every full block of `seq` (its first `seq.len` positions
     /// hold `ids`), then release all its blocks: the full ones stay cached.
     pub(crate) fn finish(&mut self, seq: &mut SeqBlocks, ids: &[u32]) {
+        self.publish(seq, ids);
+        self.release(seq);
+    }
+
+    /// Register every full block of `seq` (its first `seq.len` positions
+    /// hold `ids`) in the prefix store while the sequence keeps running: a
+    /// full block is never written again, so a later prompt can share it.
+    pub(crate) fn publish(&mut self, seq: &mut SeqBlocks, ids: &[u32]) {
         let len = seq.len;
         Self::extend_chain(seq, ids, len);
         for (table, pool) in seq.tables.iter().zip(&mut self.pools) {
@@ -554,7 +636,6 @@ impl KvPools {
                 }
             }
         }
-        self.release(seq);
     }
 
     /// Release every block of `seq` without registering anything.
@@ -590,14 +671,7 @@ impl KvPools {
     /// (window - 1)` on), so the prefix shortens by whole blocks until every
     /// group has them (0 when none does).
     pub(crate) fn lookup(&mut self, prompt: &[u32]) -> Hit {
-        let max_blocks = prompt.len().saturating_sub(1) / BLOCK_SIZE;
-        let mut keys: Vec<BlockKey> = Vec::with_capacity(max_blocks);
-        let mut prev = 0;
-        for chunk in prompt.as_chunks::<BLOCK_SIZE>().0.iter().take(max_blocks) {
-            let key = BlockKey::new(prev, chunk);
-            prev = key.hash;
-            keys.push(key);
-        }
+        let keys = block_keys(prompt, prompt.len().saturating_sub(1) / BLOCK_SIZE);
         // Longest chain the full-attention group holds (no such group: any).
         let full = self.groups.iter().position(|g| g.window.is_none());
         let mut n = match full {

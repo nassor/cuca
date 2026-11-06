@@ -67,18 +67,25 @@
 //! - The K/V cache lives on the device as a paged cache (see the
 //!   [`paged`](super::paged) module docs): per K/V-owning layer one pool of
 //!   `k` and `v` tensors `[n_blocks, n_kv_head, 16, head_dim]` (f32, zeroed
-//!   once at load, `n_blocks` from [`KvLayout::single`]), and the sequence's
-//!   block tables, one per group of layers with one window, map a position
-//!   to its block and row. A pass writes its rows block by block with
-//!   `slice_assign` into the pool, after taking the layer's tensors out of
-//!   the cache so the write is in place, and attention views are dropped
-//!   before the next write, so no write copies a pool. One query row (a
-//!   decode step, every drafter layer) reads the blocks in place with the
-//!   CubeCL kernel of [`paged_kernel`] (an online softmax over the visible
-//!   keys); several rows (prefill, verification) gather the visible blocks
-//!   of the table into one contiguous view and run burn's matmul attention
-//!   with the mask. The engine owns the allocation of blocks and the tables;
-//!   this module only checks that every block a pass touches is present.
+//!   once at load, `n_blocks` from [`KvLayout::sized`] for the load's
+//!   [`Sizing`]), and each sequence's block tables, one per group of layers
+//!   with one window, map a position to its block and row. A pass writes
+//!   its rows block by block with `slice_assign` into the pool, after taking
+//!   the layer's tensors out of the cache so the write is in place, and
+//!   attention views are dropped before the next write, so no write copies a
+//!   pool. One query row (a decode step, every drafter layer) reads the
+//!   blocks in place with the CubeCL kernel of [`paged_kernel`] (an online
+//!   softmax over the visible keys), and a step whose sequences are all
+//!   single rows does it for all of them in one launch per layer; several
+//!   rows (prefill, verification) gather the visible blocks of the table
+//!   into one contiguous view and run burn's matmul attention with the mask.
+//!   The engine owns the allocation of blocks and the tables; this module
+//!   only checks that every block a pass touches is present.
+//! - A hybrid model keeps one recurrent state per sequence slot
+//!   (`Sizing::max_sequences` of them): per delta-net layer a conv history
+//!   and the delta-rule matrix, immutable device tensors, so
+//!   [`GpuTransformer::snapshot`] and [`GpuTransformer::restore`] only move
+//!   handles.
 //! - RoPE cos/sin tables for `context_length` positions, one pair per distinct
 //!   rotary embedding, live on the device.
 //! - During load the host holds the read buffer of the whole tensor (its file
@@ -90,6 +97,18 @@
 //!   and returns the freed pages to the driver (`Device::memory_cleanup`):
 //!   burn keeps freed pages in its pools otherwise, and a model loaded after
 //!   a dropped one in the same process ran out of device memory.
+//!
+//! # Batched steps
+//!
+//! [`GpuTransformer::forward_batch`] runs the rows of several sequences in
+//! one pass. Everything dense (embeddings, projections, norms, FFN or MoE,
+//! the LM head over the rows the sequences want) sees the concatenated rows,
+//! so each weight is read once per step; RoPE positions, K/V block writes,
+//! sliding windows and attention are per sequence, and a delta-net layer
+//! runs its convolution and recurrence per sequence over its row range from
+//! the sequence's own slot. A sequence's rows equal what a pass over that
+//! sequence alone computes up to float rounding (the matmul kernels differ
+//! by row count).
 //!
 //! # MoE
 //!
@@ -227,7 +246,7 @@ use super::moe::Routing;
 use super::moe_kernel::{self as mk, MoeCall, SlotLayout};
 #[cfg(test)]
 use super::paged::Solo;
-use super::paged::{BLOCK_SIZE, BlockTable, KvLayout, NO_BLOCK};
+use super::paged::{BLOCK_SIZE, BlockTable, KvLayout, NO_BLOCK, Sizing};
 use super::paged_kernel::{self, PagedCall};
 use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
 use super::quant::{RowTable, dequant_row};
@@ -235,7 +254,7 @@ use super::rope::{RopeKind, RopeSpec};
 use super::tier::{
     BuildFn, ExpertSlice, ExpertStore, LayerExperts, SlotTable, TierShared, add, sub, tier_slots,
 };
-use super::{Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
+use super::{Batch, Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
 use crate::error::CucaError;
 use crate::provider::local::{
     ExpertHeat, ExpertPlacement, ExpertTiers, LocalDevice, device_unavailable,
@@ -1106,7 +1125,7 @@ struct DeltaWeights {
 }
 
 /// The recurrent state of one delta-net layer on the device. Device tensors
-/// are immutable values, so a pass builds the next state and a checkpoint is
+/// are immutable values, so a pass builds the next state and a snapshot is
 /// just another handle to an earlier one.
 #[derive(Clone)]
 struct DeltaState {
@@ -1520,6 +1539,10 @@ enum BlockRead {
         skip: usize,
         len: usize,
     },
+    /// A single query row of a decode step whose sequences all read in one
+    /// launch (see [`StackedDecode`]): the block ids of `Decode` and its
+    /// `range`, still on the host.
+    Rows { ids: Vec<i32>, range: [i32; 2] },
 }
 
 /// What a pass does with the blocks of one window group, shared by its
@@ -1543,6 +1566,9 @@ struct BlockRows<'a> {
     hi: usize,
     /// Whether the pass writes its rows (a drafter's does not).
     write: bool,
+    /// Keep a single row's blocks as host ids ([`BlockRead::Rows`]) for a
+    /// stacked decode launch instead of uploading them.
+    stack: bool,
 }
 
 impl BlockRows<'_> {
@@ -1562,6 +1588,7 @@ impl BlockRows<'_> {
             lo,
             hi,
             write,
+            stack,
         } = *self;
         let first = lo / BLOCK_SIZE;
         let last = (hi - 1) / BLOCK_SIZE;
@@ -1598,7 +1625,12 @@ impl BlockRows<'_> {
         let ids: Vec<i32> = ids.iter().map(|&b| b as i32).collect();
         let n = ids.len();
         let skip = lo - first * BLOCK_SIZE;
-        let read = if t == 1 {
+        let read = if t == 1 && stack {
+            BlockRead::Rows {
+                ids,
+                range: [skip as i32, (hi - first * BLOCK_SIZE) as i32],
+            }
+        } else if t == 1 {
             let range = vec![skip as i32, (hi - first * BLOCK_SIZE) as i32];
             BlockRead::Decode {
                 table: Box::new(Tensor::from_data(TensorData::new(ids, [1, n]), device)),
@@ -1637,17 +1669,77 @@ enum PassKv<'a> {
     Drafter(&'a GpuExtKv),
 }
 
+/// One sequence of a pass as [`Weights::pass`] takes it: `t` rows at
+/// positions `start..`, advancing recurrent-state slot `slot`.
+struct PassSeq<'a> {
+    start: usize,
+    t: usize,
+    slot: usize,
+    kv: PassKv<'a>,
+}
+
+/// What a pass knows about one of its sequences.
+struct SeqPass {
+    /// First row among the pass's rows, and the row count.
+    off: usize,
+    t: usize,
+    /// The recurrent-state slot (hybrid models).
+    slot: usize,
+    /// One entry per distinct layer window.
+    masks: Vec<MaskInput>,
+}
+
+impl SeqPass {
+    /// The mask and the block view of the layers of `window`.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when no K/V group has this window.
+    fn visible(
+        &self,
+        il: usize,
+        window: Option<usize>,
+    ) -> Result<(&MaskInput, &GroupBlocks), CucaError> {
+        let visible = self
+            .masks
+            .iter()
+            .find(|m| m.window == window)
+            .ok_or_else(|| err(format!("layer {il}: no attention mask for its window")))?;
+        let blocks = visible.blocks.as_ref().ok_or_else(|| {
+            err(format!(
+                "layer {il}: the sequence has no block table for its window"
+            ))
+        })?;
+        Ok((visible, blocks))
+    }
+}
+
+/// The blocks of every sequence of a decode step for one window, ready for
+/// one launch of the decode kernel: `table` `[sequences, width]` block ids
+/// (a row per sequence, padded) and `range` `[sequences * 2]` visible `lo`,
+/// `hi`.
+struct StackedDecode {
+    window: Option<usize>,
+    table: Tensor<2, Int>,
+    range: Tensor<1, Int>,
+}
+
 /// What one forward pass shares between its layers.
 struct Pass {
-    /// New tokens.
+    /// New rows, all sequences'.
     t: usize,
     /// Per-layer inputs of the Gemma 4 per-layer embeddings,
     /// `[t, n_layer, ple_dim]`.
     ple: Option<Tensor<3>>,
-    /// One entry per [`Hparams::ropes`] entry.
+    /// One entry per [`Hparams::ropes`] entry, the rows of every sequence
+    /// one after the other.
     ropes: Vec<RopeRows>,
-    /// One entry per distinct layer window.
-    masks: Vec<MaskInput>,
+    /// The sequences, in row order.
+    seqs: Vec<SeqPass>,
+    /// Empty unless every sequence is one query row (and there are several):
+    /// then one entry per window with K/V blocks, replacing the sequences'
+    /// own reads.
+    stacked: Vec<StackedDecode>,
 }
 
 /// Everything read-only during a forward pass.
@@ -1659,6 +1751,35 @@ struct Weights {
     output_norm: Tensor<1>,
     lm_head: Weight,
     ropes: Vec<RopeTable>,
+}
+
+/// One sequence's recurrent state: every delta-net layer's state (`None` for
+/// attention layers) and the position it sits at (where the sequence's next
+/// forward call must start). Device tensors are immutable values, so a pass
+/// builds the next state and a [`GpuSnapshot`] is just more handles to the
+/// current one.
+struct DeltaSlot {
+    len: usize,
+    layers: Vec<Option<DeltaState>>,
+}
+
+/// The recurrent state of a hybrid model at one position: a handle to every
+/// delta-net layer's state tensors (`None` for attention layers), taken by
+/// [`GpuTransformer::snapshot`] and put back by [`GpuTransformer::restore`].
+/// Free to take (the tensors are immutable) and sized by the state alone.
+pub(crate) struct GpuSnapshot {
+    layers: Vec<Option<DeltaState>>,
+}
+
+impl GpuSnapshot {
+    /// Bytes of f32 state the snapshot keeps alive on the device.
+    pub(crate) fn bytes(&self) -> usize {
+        self.layers
+            .iter()
+            .flatten()
+            .map(|d| (d.conv.shape().num_elements() + d.s.shape().num_elements()) * 4)
+            .sum()
+    }
 }
 
 /// A loaded model on a GPU with its K/V cache; see the module docs.
@@ -1677,15 +1798,11 @@ pub(crate) struct GpuTransformer {
     /// The implicit sequence of the unit tests.
     #[cfg(test)]
     solo: Solo,
-    /// Where the recurrent state of a hybrid model sits: the end of the last
-    /// forward call (unused by an attention-only model).
-    len: usize,
-    /// The recurrent state of every delta-net layer (`None` for attention
-    /// layers), live at `len`.
-    delta: Vec<Option<DeltaState>>,
-    /// The one checkpoint a hybrid model can return to: its position and
-    /// the states there.
-    checkpoint: Option<(usize, Vec<Option<DeltaState>>)>,
+    /// The recurrent state of every sequence slot of a hybrid model
+    /// (`Sizing::max_sequences` of them; none for an attention-only model).
+    slots: Vec<DeltaSlot>,
+    /// The zero state of every delta-net layer, shared by every empty slot.
+    zero: Vec<Option<DeltaState>>,
     /// The model has delta-net layers.
     hybrid: bool,
     /// The weights held quantized, for a drafter's [`plan_dense`].
@@ -1707,8 +1824,8 @@ fn return_device_memory(device: &Device) {
 impl Drop for GpuTransformer {
     fn drop(&mut self) {
         self.kv.clear();
-        self.delta.clear();
-        self.checkpoint = None;
+        self.slots.clear();
+        self.zero.clear();
         self.weights.release();
         return_device_memory(&self.weights.device);
     }
@@ -1727,9 +1844,9 @@ impl Weights {
     /// Read every weight of the model `hp` describes through `reader` (onto
     /// the reader's device): the layers, the final norm, the LM head
     /// (`output.weight`, else the token embedding), the per-layer-embedding
-    /// projection and the RoPE tables, plus the zero recurrent state of every
-    /// delta-net layer. The K/V pools are the caller's ([`alloc_pools`]): a
-    /// drafter has none, it reads the target's.
+    /// projection and the RoPE tables. The K/V pools and the recurrent states
+    /// are the caller's ([`alloc_pools`]): a drafter has none, it reads the
+    /// target's.
     /// With `tiers`, the experts of the MoE layers stay in the file (their
     /// banks hold the tiers) instead of being read.
     fn load(
@@ -1738,7 +1855,7 @@ impl Weights {
         hp: Hparams,
         context_length: usize,
         tiers: Option<&TierPlan>,
-    ) -> Result<(Self, Vec<Option<DeltaState>>), CucaError> {
+    ) -> Result<Self, CucaError> {
         let content = reader.content;
         let device = reader.device.clone();
         let n_embd = hp.n_embd;
@@ -1777,25 +1894,20 @@ impl Weights {
             .collect();
 
         let mut layers = Vec::with_capacity(hp.n_layer);
-        let mut delta: Vec<Option<DeltaState>> = Vec::with_capacity(hp.n_layer);
         for il in 0..hp.n_layer {
             let spec = &hp.layers[il];
             let layout = LayerLayout::read(&hp, il, spec, content)?;
-            delta.push(spec.delta().map(|d| DeltaState::zeros(d, &device)));
             layers.push(load_layer(reader, &hp, il, spec, &layout, tiers)?);
         }
-        Ok((
-            Self {
-                hp,
-                device,
-                ple,
-                layers,
-                output_norm,
-                lm_head,
-                ropes,
-            },
-            delta,
-        ))
+        Ok(Self {
+            hp,
+            device,
+            ple,
+            layers,
+            output_norm,
+            lm_head,
+            ropes,
+        })
     }
 }
 
@@ -1952,7 +2064,8 @@ fn open_tiers(
 }
 
 impl GpuTransformer {
-    /// [`GpuTransformer::load_placed`] with every expert resident (tests).
+    /// [`GpuTransformer::load_placed`] with every expert resident and room
+    /// for one sequence (tests).
     #[cfg(test)]
     pub(crate) fn load(
         content: &gguf_file::Content,
@@ -1966,13 +2079,15 @@ impl GpuTransformer {
             context_length,
             device,
             &ExpertPlacement::Resident,
+            &Sizing::single(context_length),
         )
     }
 
     /// Load the model from the GGUF file at `path`, whose index `content`
-    /// was read already, onto `device` with a K/V cache for
-    /// `context_length` positions, its experts placed as `experts` says
-    /// (`Tiered`: left in the file, see the module docs).
+    /// was read already, onto `device` with K/V pools and recurrent-state
+    /// slots for `sizing` (`context_length` positions per sequence), its
+    /// experts placed as `experts` says (`Tiered`: left in the file, see the
+    /// module docs).
     ///
     /// # Errors
     ///
@@ -1989,6 +2104,7 @@ impl GpuTransformer {
         context_length: usize,
         device: LocalDevice,
         experts: &ExpertPlacement,
+        sizing: &Sizing,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         if hp.arch.is_drafter() {
@@ -2040,7 +2156,7 @@ impl GpuTransformer {
             dense,
         };
         let plan = tiers.as_ref().map(|(_, plan)| plan);
-        let (weights, delta) = Weights::load(&mut reader, path, hp, context_length, plan)?;
+        let weights = Weights::load(&mut reader, path, hp, context_length, plan)?;
         drop(reader);
         if let Some((tiers, plan)) = &tiers
             && let Some(heat) = &tiers.warm_from
@@ -2048,10 +2164,28 @@ impl GpuTransformer {
             plan.warm(&weights, heat)?;
         }
 
-        let layout = KvLayout::single(&weights.hp, context_length);
+        let layout = KvLayout::sized(&weights.hp, context_length, sizing);
         let kv = alloc_pools(&weights.hp, &layout, &weights.device)?;
         #[cfg(test)]
         let solo = Solo::new(&layout);
+        // One zero state per delta-net layer, shared by every empty slot
+        // (the states are immutable).
+        let zero: Vec<Option<DeltaState>> = weights
+            .hp
+            .layers
+            .iter()
+            .map(|spec| spec.delta().map(|d| DeltaState::zeros(d, &weights.device)))
+            .collect();
+        let slots = if hybrid {
+            (0..sizing.max_sequences)
+                .map(|_| DeltaSlot {
+                    len: 0,
+                    layers: zero.clone(),
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
         Ok(Self {
             weights,
             context_length,
@@ -2062,9 +2196,8 @@ impl GpuTransformer {
             layout,
             #[cfg(test)]
             solo,
-            len: 0,
-            delta,
-            checkpoint: None,
+            slots,
+            zero,
             hybrid,
             peers,
             tiers: tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
@@ -2077,92 +2210,124 @@ impl GpuTransformer {
         self.tiers.clone()
     }
 
-    /// Run `tokens` through the model at positions `start_pos..`, writing
-    /// their K/V into the blocks `tables` names (one table per group of
-    /// [`GpuTransformer::kv_layout`], every block the call writes already
-    /// allocated) and reading the positions before them from there; returns
-    /// the logits `want` selects and the hidden-state rows `hidden` selects
-    /// (one per row of logits, `n_embd` floats each). A hybrid model's
-    /// recurrent state sits at the position the last call ended at:
-    /// `start_pos` must equal it.
+    /// Run the rows of several sequences through the model in one pass (a
+    /// forward step): `batch.rows[i].tokens` at positions `start_pos..`,
+    /// their K/V written into the blocks of its `tables` (one table per group
+    /// of [`GpuTransformer::kv_layout`], every block the call writes already
+    /// allocated) and the positions before them read from there. Returns, per
+    /// sequence, the logits `want` selects and the final-norm hidden rows
+    /// `hidden` selects.
     ///
-    /// `exact` is ignored: a batched pass on the GPU equals single-token
-    /// steps only up to float rounding (the matmul kernels differ by shape),
-    /// so a speculative greedy run can pick a different token than plain
-    /// decoding where two logits are within that rounding.
+    /// Every dense operation (embedding, projections, FFN or MoE, norms, the
+    /// LM head) runs once over the concatenated rows of all sequences, so
+    /// each weight is read once per step; attention reads each sequence's own
+    /// blocks (one launch of the decode kernel for all sequences when every
+    /// sequence is a single row, else one launch group per sequence) and the
+    /// recurrent layers advance each sequence's own state slot.
+    ///
+    /// A hybrid model's recurrent state sits at one position per state slot
+    /// (the end of the slot's last call): `start_pos` must equal it, and a
+    /// slot appears at most once per step.
+    ///
+    /// `batch.exact` is ignored: a batched pass on the GPU equals
+    /// single-token steps only up to float rounding (the matmul kernels
+    /// differ by shape), so a speculative greedy run can pick a different
+    /// token than plain decoding where two logits are within that rounding.
     ///
     /// # Errors
     ///
-    /// [`CucaError::Provider`] when `hidden` is neither `None` nor
-    /// `PostNorm`, `tokens` is empty, a hybrid model's `start_pos` is not
-    /// its state's position, the pass exceeds the context length, a table
-    /// lacks a block the pass reads or writes, or a device operation fails (a
-    /// hybrid model then drops its recurrent state); [`CucaError::Io`] when
-    /// an embedding row cannot be read.
-    pub(crate) fn forward_seq(
-        &mut self,
-        tokens: &[u32],
-        start_pos: usize,
-        tables: &[BlockTable],
-        want: Want,
-        hidden: Hidden,
-        _exact: bool,
-    ) -> Result<Forward, CucaError> {
-        if !matches!(hidden, Hidden::None | Hidden::PostNorm) {
-            return Err(err(
-                "hidden rows beyond the logits rows are not supported on the GPU engine",
-            ));
+    /// [`CucaError::Provider`] for an empty batch or a sequence without
+    /// tokens, a hybrid model's `start_pos` other than its slot's position, a
+    /// state slot out of range or used twice, more positions than the context
+    /// length, a table that lacks a block the pass reads or writes or a
+    /// failed device operation (the slots of every sequence of the step are
+    /// then reset); [`CucaError::Io`] when an embedding row cannot be read.
+    pub(crate) fn forward_batch(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
+        if batch.rows.is_empty() {
+            return Err(err("a forward step requires at least one sequence"));
         }
-        if tokens.is_empty() {
-            return Err(err("forward requires at least one token"));
-        }
-        if self.hybrid && start_pos != self.len {
-            return Err(err(format!(
-                "forward start {start_pos} does not match the recurrent state's position {}",
-                self.len
-            )));
-        }
-        let hi = start_pos + tokens.len();
-        if hi > self.context_length {
-            return Err(err(format!(
-                "{hi} positions exceed the context length {}",
-                self.context_length
-            )));
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut segs = Vec::with_capacity(batch.rows.len());
+        for (i, r) in batch.rows.iter().enumerate() {
+            if r.tokens.is_empty() {
+                return Err(err("forward requires at least one token"));
+            }
+            let hi = r.start_pos + r.tokens.len();
+            if hi > self.context_length {
+                return Err(err(format!(
+                    "{hi} positions exceed the context length {}",
+                    self.context_length
+                )));
+            }
+            if self.hybrid {
+                let Some(state) = self.slots.get(r.state.0) else {
+                    return Err(err(format!(
+                        "state slot {} is out of range (the model has {})",
+                        r.state.0,
+                        self.slots.len()
+                    )));
+                };
+                if r.start_pos != state.len {
+                    return Err(err(format!(
+                        "forward start {} does not match the recurrent state's position {}",
+                        r.start_pos, state.len
+                    )));
+                }
+                if batch.rows[..i].iter().any(|o| o.state == r.state) {
+                    return Err(err(format!(
+                        "state slot {} appears twice in one step",
+                        r.state.0
+                    )));
+                }
+            }
+            segs.push(Seg {
+                start: r.start_pos,
+                offset: tokens.len(),
+                t: r.tokens.len(),
+                tables: r.tables,
+                slot: r.state.0,
+                want: r.want,
+                hidden: r.hidden,
+            });
+            tokens.extend_from_slice(r.tokens);
         }
         let hp = &self.weights.hp;
         let embeddings = self
             .embed
             .get_mut()
             .map_err(|_| err("the embedding table lock is poisoned"))?
-            .rows(tokens, hp.embd_scale)?;
+            .rows(&tokens, hp.embd_scale)?;
         let per_layer = match (&mut self.ple_table, hp.ple_dim) {
-            (Some(table), Some(dim)) => Some(table.rows(tokens, (dim as f32).sqrt())?),
+            (Some(table), Some(dim)) => Some(table.rows(&tokens, (dim as f32).sqrt())?),
             _ => None,
         };
-        let out = match self.weights.forward_layers(
+        let outs = match self.weights.forward_layers(
             &mut self.kv,
             &self.layout,
-            tables,
-            &mut self.delta,
+            &mut self.slots,
             embeddings,
             per_layer,
-            tokens.len(),
-            start_pos,
-            want,
-            hidden,
+            &segs,
         ) {
-            Ok(out) => out,
+            Ok(outs) => outs,
             Err(e) => {
                 // A half-advanced recurrent state cannot be repaired: as on
-                // the CPU, the state is emptied.
-                if self.hybrid {
-                    self.discard_state();
+                // the CPU, the state of every sequence of the step is
+                // emptied.
+                for seg in &segs {
+                    self.reset_slot(seg.slot);
                 }
                 return Err(e);
             }
         };
-        self.len = hi;
-        Ok(out)
+        if self.hybrid {
+            for seg in &segs {
+                if let Some(state) = self.slots.get_mut(seg.slot) {
+                    state.len = seg.start + seg.t;
+                }
+            }
+        }
+        Ok(outs)
     }
 
     /// Vocabulary size.
@@ -2252,67 +2417,79 @@ impl GpuTransformer {
         self.layout.pool_bytes(&self.weights.hp)
     }
 
-    /// Take the model state back to at most `len` positions and return the
-    /// position it now sits at: the next forward call of a hybrid model must
-    /// start there. K/V rows are positional and live in the sequence's
-    /// blocks, so an attention-only model has no state to move and returns
-    /// `len`; the caller truncates its block tables to what it gets back. A
-    /// hybrid model retains only positions it holds a recurrent state for:
-    /// the current end and the [`GpuTransformer::checkpoint`], else the
-    /// largest of those not above `len`, else `0` (the zero state). Unlike
-    /// the CPU engine it keeps no verify record (no drafter can pair with a
-    /// hybrid model on a GPU).
-    pub(crate) fn rewind(&mut self, len: usize) -> usize {
+    /// Take the recurrent state of `slot` back to at most `len` positions
+    /// and return the position it now sits at: the next forward call of a
+    /// hybrid model for the slot must start there. K/V rows are positional
+    /// and live in the sequence's blocks, so an attention-only model has no
+    /// state to move and returns `len`; the caller truncates its block tables
+    /// to what it gets back. A hybrid model's state summarises everything
+    /// before the slot's current end and cannot be undone: it retains only
+    /// that end (`len >=` the slot's position returns the position) and the
+    /// zero state (`len == 0`); any other length resets the slot and returns
+    /// `0`, so the caller recomputes from the start or
+    /// [`GpuTransformer::restore`]s a snapshot. Unlike the CPU engine it keeps
+    /// no verify record (no drafter can pair with a hybrid model on a GPU).
+    pub(crate) fn rewind(&mut self, slot: usize, len: usize) -> usize {
         if !self.hybrid {
             return len;
         }
-        if len == 0 {
-            self.discard_state();
+        let Some(state) = self.slots.get(slot) else {
             return 0;
-        }
-        if len >= self.len {
-            return self.len;
-        }
-        let kept = match &self.checkpoint {
-            Some((at, _)) if *at <= len => *at,
-            _ => 0,
         };
-        match &self.checkpoint {
-            Some((at, states)) if *at == kept && kept > 0 => self.delta = states.clone(),
-            _ => self.zero_state(),
+        if len != 0 && len >= state.len {
+            return state.len;
         }
-        if self.checkpoint.as_ref().is_some_and(|(at, _)| *at > kept) {
-            self.checkpoint = None;
-        }
-        self.len = kept;
-        kept
+        self.reset_slot(slot);
+        0
     }
 
-    /// Every delta-net layer's state back to zeros.
-    fn zero_state(&mut self) {
-        let device = &self.weights.device;
-        for (state, spec) in self.delta.iter_mut().zip(&self.weights.hp.layers) {
-            if let Some(d) = spec.delta() {
-                *state = Some(DeltaState::zeros(d, device));
-            }
+    /// The zero state at position 0 for `slot` (a sequence start, or after a
+    /// failed pass). A no-op for an attention-only model and a slot out of
+    /// range. Free: the zero tensors are shared handles.
+    pub(crate) fn reset_slot(&mut self, slot: usize) {
+        if let Some(state) = self.slots.get_mut(slot) {
+            state.layers.clone_from(&self.zero);
+            state.len = 0;
         }
     }
 
-    /// An empty state: the zero state, no checkpoint, no positions.
-    fn discard_state(&mut self) {
-        self.zero_state();
-        self.checkpoint = None;
-        self.len = 0;
+    /// Handles to the recurrent state of every delta-net layer for `slot`
+    /// (after its last forward call): `None` for an attention-only model or
+    /// a slot out of range. Free: the states are immutable device tensors.
+    pub(crate) fn snapshot(&self, slot: usize) -> Option<GpuSnapshot> {
+        self.slots.get(slot).map(|state| GpuSnapshot {
+            layers: state.layers.clone(),
+        })
     }
 
-    /// Keep the recurrent state at the current end as the one checkpoint
-    /// [`GpuTransformer::rewind`] can return to, replacing the previous one.
-    /// A no-op for an attention-only model and an empty state. Free: the
-    /// states are immutable device tensors, so this keeps handles.
-    pub(crate) fn checkpoint(&mut self) {
-        if self.hybrid && self.len > 0 {
-            self.checkpoint = Some((self.len, self.delta.clone()));
-        }
+    /// Make `snapshot` (taken from this model) the state of `slot`, which
+    /// then sits at position `len`.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a slot out of range (every slot of an
+    /// attention-only model) or a snapshot of another model (a different
+    /// layer count or mix of recurrent layers).
+    pub(crate) fn restore(
+        &mut self,
+        slot: usize,
+        snapshot: &GpuSnapshot,
+        len: usize,
+    ) -> Result<(), CucaError> {
+        let fits = snapshot.layers.len() == self.zero.len()
+            && snapshot
+                .layers
+                .iter()
+                .zip(&self.zero)
+                .all(|(a, b)| a.is_some() == b.is_some());
+        let state = self
+            .slots
+            .get_mut(slot)
+            .filter(|_| fits)
+            .ok_or_else(|| err("the snapshot does not fit this model's recurrent state"))?;
+        state.layers.clone_from(&snapshot.layers);
+        state.len = len;
+        Ok(())
     }
 
     /// Whether the model has recurrent layers.
@@ -2345,8 +2522,9 @@ impl GpuTransformer {
             .logits)
     }
 
-    /// [`GpuTransformer::forward_seq`] over the implicit sequence: its blocks
-    /// are allocated here; `start_pos` must equal its length.
+    /// [`GpuTransformer::forward_batch`] over the implicit sequence, in
+    /// state slot 0: its blocks are allocated here; `start_pos` must equal
+    /// its length.
     pub(crate) fn forward_ext(
         &mut self,
         tokens: &[u32],
@@ -2356,7 +2534,14 @@ impl GpuTransformer {
         exact: bool,
     ) -> Result<Forward, CucaError> {
         let seq = self.solo.begin(start_pos, tokens.len())?;
-        let out = self.forward_seq(tokens, start_pos, &seq.tables, want, hidden, exact);
+        let batch = Batch::single(tokens, start_pos, &seq.tables, want, hidden, exact);
+        let out = self.forward_batch(&batch).and_then(|mut outs| {
+            if outs.len() == 1 {
+                Ok(outs.swap_remove(0))
+            } else {
+                Err(err("a single-sequence step returned several results"))
+            }
+        });
         self.solo
             .finish(seq, out.is_ok().then_some(start_pos + tokens.len()));
         out
@@ -2366,10 +2551,10 @@ impl GpuTransformer {
     /// how many it retains (see [`GpuTransformer::rewind`] and
     /// [`KvPools::truncate`](super::paged::KvPools::truncate)).
     pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
-        let state = self.rewind(len).min(self.solo.len());
+        let state = self.rewind(0, len).min(self.solo.len());
         let kept = self.solo.truncate(state);
         if kept != state {
-            self.rewind(kept);
+            self.rewind(0, kept);
         }
         kept
     }
@@ -2501,7 +2686,7 @@ impl GpuDrafter {
         };
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
-        let (net, _) = Weights::load(&mut reader, path, hp, context_length, None)?;
+        let net = Weights::load(&mut reader, path, hp, context_length, None)?;
         if net.lm_head.rows() != target.vocab() {
             return Err(err(format!(
                 "drafter vocabulary {} differs from the target's {}",
@@ -2563,7 +2748,15 @@ impl GpuDrafter {
         }
         // Handles to the target's pools live for this call only.
         let ext = target.ext_kv(tables, len)?;
-        let pass = self.net.pass(None, len, 1, PassKv::Drafter(&ext))?;
+        let pass = self.net.pass(
+            None,
+            &[PassSeq {
+                start: len,
+                t: 1,
+                slot: 0,
+                kv: PassKv::Drafter(&ext),
+            }],
+        )?;
         let mut no_cache: KvLayers = Vec::new();
         let mut drafts = Vec::with_capacity(k);
         let mut hidden = hidden.to_vec();
@@ -2804,27 +2997,66 @@ fn load_layer(
     })
 }
 
+/// One sequence of a forward step, as [`Weights::forward_layers`] hands it
+/// to the K/V and recurrent-state code.
+struct Seg<'a> {
+    /// Position of its first row.
+    start: usize,
+    /// First row among the step's concatenated rows, and the row count.
+    offset: usize,
+    t: usize,
+    tables: &'a [BlockTable],
+    /// The recurrent-state slot (hybrid models).
+    slot: usize,
+    want: Want,
+    hidden: Hidden,
+}
+
+/// Host-side row ranges, coalescing a range that continues the last one.
+fn push_rows(ranges: &mut Vec<Range<usize>>, rows: Range<usize>) {
+    match ranges.last_mut() {
+        Some(last) if last.end == rows.start => last.end = rows.end,
+        _ => ranges.push(rows),
+    }
+}
+
+/// The rows `ranges` (ascending, not empty) of `x`, one after the other.
+fn take_rows(x: Tensor<2>, ranges: &[Range<usize>]) -> Tensor<2> {
+    let [total, _] = x.dims();
+    match ranges {
+        [rows] => row_range(x, rows, total),
+        _ => Tensor::cat(
+            ranges
+                .iter()
+                .map(|r| x.clone().narrow(0, r.start, r.len()))
+                .collect(),
+            0,
+        ),
+    }
+}
+
 impl Weights {
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one pass's inputs, each used once; a struct would only rename them"
-    )]
+    /// The layers over the concatenated rows `embeddings` of the sequences
+    /// `segs` describe, then the final norm and the LM head over the rows
+    /// the sequences want.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when a block table lacks a block the pass
+    /// reads or writes, a slot has no state or a device readback fails.
     fn forward_layers(
         &self,
         kv: &mut KvLayers,
         layout: &KvLayout,
-        tables: &[BlockTable],
-        delta: &mut [Option<DeltaState>],
+        slots: &mut [DeltaSlot],
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
-        t: usize,
-        start: usize,
-        want: Want,
-        hidden: Hidden,
-    ) -> Result<Forward, CucaError> {
+        segs: &[Seg<'_>],
+    ) -> Result<Vec<Forward>, CucaError> {
         let hp = &self.hp;
         let dev = &self.device;
         let eps = hp.eps;
+        let t = embeddings.len() / hp.n_embd;
         let mut x = Tensor::<2>::from_data(TensorData::new(embeddings, [t, hp.n_embd]), dev);
 
         // Gemma 4 per-layer inputs: projected embeddings merged with the
@@ -2842,35 +3074,119 @@ impl Weights {
             _ => None,
         };
 
-        let pass = self.pass(ple, start, t, PassKv::Trunk { layout, tables })?;
+        let seqs: Vec<PassSeq<'_>> = segs
+            .iter()
+            .map(|s| PassSeq {
+                start: s.start,
+                t: s.t,
+                slot: s.slot,
+                kv: PassKv::Trunk {
+                    layout,
+                    tables: s.tables,
+                },
+            })
+            .collect();
+        let pass = self.pass(ple, &seqs)?;
         for il in 0..hp.n_layer {
-            x = self.layer(il, x, &pass, kv, delta, None)?;
+            x = self.layer(il, x, &pass, kv, slots, None)?;
         }
+        self.finish(x, segs)
+    }
 
-        let rows = match want {
-            Want::None => {
-                return Ok(Forward {
-                    logits: None,
-                    hidden: None,
-                });
+    /// The final norm and the LM head over the rows of `x` (one row per
+    /// token of the step) the sequences `segs` want.
+    ///
+    /// The final norm runs over every row of a sequence that wants all
+    /// logits or every position's hidden row, else over its last row only
+    /// (it is row-independent). The selected rows of all sequences share
+    /// one norm and one LM head matmul, so the head weight is read once.
+    fn finish(&self, x: Tensor<2>, segs: &[Seg<'_>]) -> Result<Vec<Forward>, CucaError> {
+        let n_embd = self.hp.n_embd;
+        let mut outs: Vec<Forward> = segs.iter().map(|_| Forward::default()).collect();
+        let mut ranges: Vec<Range<usize>> = Vec::new();
+        // Per sequence: first row among the normed rows, row count, whether
+        // those are all of its rows.
+        let mut plan = Vec::with_capacity(segs.len());
+        let mut at = 0;
+        for seg in segs {
+            let all_hidden = seg.hidden == Hidden::PostNormAll;
+            if seg.want == Want::None && !all_hidden {
+                plan.push(None);
+                continue;
             }
-            Want::Last => x.narrow(0, t - 1, 1),
-            Want::All => x,
-        };
-        let normed = rms(rows, Some(&self.output_norm), eps);
+            let all_rows = all_hidden || seg.want == Want::All;
+            let (from, n) = if all_rows {
+                (seg.offset, seg.t)
+            } else {
+                (seg.offset + seg.t - 1, 1)
+            };
+            push_rows(&mut ranges, from..from + n);
+            plan.push(Some((at, n, all_rows)));
+            at += n;
+        }
+        if ranges.is_empty() {
+            return Ok(outs);
+        }
+        let normed = rms(take_rows(x, &ranges), Some(&self.output_norm), self.hp.eps);
+
+        // The logits rows among the normed rows, per sequence: first row
+        // among the head's rows and row count.
+        let mut logit_ranges: Vec<Range<usize>> = Vec::new();
+        let mut spans = Vec::with_capacity(segs.len());
+        let mut lat = 0;
+        for (seg, p) in segs.iter().zip(&plan) {
+            let Some((at, n, all_rows)) = *p else {
+                spans.push(None);
+                continue;
+            };
+            let (from, rows) = match seg.want {
+                Want::None => {
+                    spans.push(None);
+                    continue;
+                }
+                Want::Last if all_rows => (at + n - 1, 1),
+                Want::Last | Want::All => (at, n),
+            };
+            push_rows(&mut logit_ranges, from..from + rows);
+            spans.push(Some((lat, rows)));
+            lat += rows;
+        }
+        let wants_hidden = segs
+            .iter()
+            .zip(&plan)
+            .any(|(seg, p)| p.is_some() && seg.hidden != Hidden::None);
         // The head is queued before the hidden-state readback so the device
         // keeps working through it instead of idling at that sync point.
-        let (hidden, logits) = if hidden == Hidden::PostNorm {
-            let logits = self.head(normed.clone());
-            (Some(read_f32(normed, "hidden states")?), logits)
-        } else {
-            (None, self.head(normed))
-        };
-        let logits = read_f32(logits, "logits")?;
-        Ok(Forward {
-            logits: Some(logits),
-            hidden,
-        })
+        let logits =
+            (!logit_ranges.is_empty()).then(|| self.head(take_rows(normed.clone(), &logit_ranges)));
+        if wants_hidden {
+            let flat = read_f32(normed, "hidden states")?;
+            if let ([seg], [Some(_)]) = (segs, plan.as_slice()) {
+                if seg.hidden != Hidden::None {
+                    outs[0].hidden = Some(flat);
+                }
+            } else {
+                for ((out, seg), p) in outs.iter_mut().zip(segs).zip(&plan) {
+                    if let (Some((at, n, _)), true) = (*p, seg.hidden != Hidden::None) {
+                        out.hidden = Some(flat[at * n_embd..(at + n) * n_embd].to_vec());
+                    }
+                }
+            }
+        }
+        if let Some(logits) = logits {
+            let flat = read_f32(logits, "logits")?;
+            if let [Some(_)] = spans.as_slice() {
+                outs[0].logits = Some(flat);
+            } else {
+                let vocab = flat.len() / lat;
+                for (out, span) in outs.iter_mut().zip(&spans) {
+                    if let Some((at, n)) = *span {
+                        out.logits = Some(flat[at * vocab..(at + n) * vocab].to_vec());
+                    }
+                }
+            }
+        }
+        Ok(outs)
     }
 
     /// LM head over final-norm output rows: matmul, logit scale, soft-cap.
@@ -2887,27 +3203,43 @@ impl Weights {
     }
 
     /// The RoPE rows, visible ranges, masks and block views shared by the
-    /// layers of one forward pass of `t` queries at `start..`, reading the
-    /// blocks `kv` names.
+    /// layers of one forward pass over the sequences `seqs` (their rows one
+    /// after the other), reading the blocks each names.
+    ///
+    /// When every sequence is a single query row (a decode step), the
+    /// blocks the layers read are stacked into one launch of the decode
+    /// kernel ([`Pass::stacked`]).
     ///
     /// # Errors
     ///
     /// [`CucaError::Provider`] when a block table lacks a block the pass
     /// reads or writes.
-    fn pass(
-        &self,
-        ple: Option<Tensor<3>>,
-        start: usize,
-        t: usize,
-        kv: PassKv<'_>,
-    ) -> Result<Pass, CucaError> {
-        let hp = &self.hp;
+    fn pass(&self, ple: Option<Tensor<3>>, seqs: &[PassSeq<'_>]) -> Result<Pass, CucaError> {
+        let total: usize = seqs.iter().map(|s| s.t).sum();
+        // The position of every row, when the sequences' rows are not one
+        // contiguous range of the tables.
+        let positions = (seqs.len() > 1).then(|| {
+            let at: Vec<i32> = seqs
+                .iter()
+                .flat_map(|s| s.start..s.start + s.t)
+                // Positions are below the context length, which fits an i32.
+                .map(|p| p as i32)
+                .collect();
+            Tensor::<1, Int>::from_data(TensorData::new(at, [total]), &self.device)
+        });
         let ropes = self
             .ropes
             .iter()
             .map(|table| {
                 let [_, half] = table.cos.dims();
-                let rows = |m: &Tensor<2>| m.clone().narrow(0, start, t).reshape([1, 1, t, half]);
+                let rows = |m: &Tensor<2>| {
+                    let picked = match (&positions, seqs.first()) {
+                        (Some(at), _) => m.clone().select(0, at.clone()),
+                        (None, Some(only)) => m.clone().narrow(0, only.start, only.t),
+                        (None, None) => m.clone(),
+                    };
+                    picked.reshape([1, 1, total, half])
+                };
                 RopeRows {
                     cos: rows(&table.cos),
                     sin: rows(&table.sin),
@@ -2915,14 +3247,48 @@ impl Weights {
             })
             .collect();
 
+        let stack = seqs.len() > 1
+            && seqs
+                .iter()
+                .all(|s| s.t == 1 && matches!(s.kv, PassKv::Trunk { .. }));
+        let mut passes = Vec::with_capacity(seqs.len());
+        let mut off = 0;
+        for seq in seqs {
+            passes.push(SeqPass {
+                off,
+                t: seq.t,
+                slot: seq.slot,
+                masks: self.masks(seq, stack)?,
+            });
+            off += seq.t;
+        }
+        let stacked = if stack {
+            self.stack_decode(&passes)?
+        } else {
+            Vec::new()
+        };
+        Ok(Pass {
+            t: total,
+            ple,
+            ropes,
+            seqs: passes,
+            stacked,
+        })
+    }
+
+    /// The visible range, mask and block view of every distinct layer
+    /// window for one sequence of a pass; `stack` keeps a single row's
+    /// blocks as host ids for [`Weights::stack_decode`].
+    fn masks(&self, seq: &PassSeq<'_>, stack: bool) -> Result<Vec<MaskInput>, CucaError> {
+        let (start, t) = (seq.start, seq.t);
         let mut masks: Vec<MaskInput> = Vec::new();
-        for spec in &hp.layers {
+        for spec in &self.hp.layers {
             if masks.iter().any(|m| m.window == spec.window) {
                 continue;
             }
             // A drafter's query is not cached: it sees the `len` cached
             // positions, the sliding layers the window before it.
-            let (lo, hi) = match &kv {
+            let (lo, hi) = match &seq.kv {
                 PassKv::Trunk { .. } => (
                     spec.window.map_or(0, |w| start.saturating_sub(w - 1)),
                     start + t,
@@ -2938,7 +3304,7 @@ impl Weights {
                 let values = attention_mask(start, t, lo, hi, spec.window);
                 Tensor::from_data(TensorData::new(values, [1, 1, t, hi - lo]), &self.device)
             });
-            let blocks = match &kv {
+            let blocks = match &seq.kv {
                 PassKv::Trunk { layout, tables } => {
                     match layout.groups.iter().position(|g| g.window == spec.window) {
                         Some(g) => {
@@ -2953,6 +3319,7 @@ impl Weights {
                                 lo,
                                 hi,
                                 write: true,
+                                stack,
                             };
                             Some(rows.view(&self.device)?)
                         }
@@ -2973,6 +3340,7 @@ impl Weights {
                         lo,
                         hi,
                         write: false,
+                        stack: false,
                     };
                     Some(rows.view(&self.device)?)
                 }
@@ -2983,22 +3351,63 @@ impl Weights {
                 blocks,
             });
         }
-        Ok(Pass {
-            t,
-            ple,
-            ropes,
-            masks,
-        })
+        Ok(masks)
     }
 
-    /// One transformer block over `pass.t` positions starting at `pass.start`.
+    /// The blocks of a decode step's sequences, one row each, as the tables
+    /// and ranges of one launch of the decode kernel per window: a table
+    /// row per sequence, padded with block 0 (never read: a range stays
+    /// inside the sequence's own blocks).
+    fn stack_decode(&self, seqs: &[SeqPass]) -> Result<Vec<StackedDecode>, CucaError> {
+        let Some(first) = seqs.first() else {
+            return Ok(Vec::new());
+        };
+        let mut stacked = Vec::new();
+        for (mi, m) in first.masks.iter().enumerate() {
+            if m.blocks.is_none() {
+                continue;
+            }
+            let mut rows = Vec::with_capacity(seqs.len());
+            for seq in seqs {
+                match seq
+                    .masks
+                    .get(mi)
+                    .and_then(|m| m.blocks.as_ref())
+                    .map(|b| &b.read)
+                {
+                    Some(BlockRead::Rows { ids, range }) => rows.push((ids, range)),
+                    _ => return Err(err("a decode step's sequences disagree on their blocks")),
+                }
+            }
+            let width = rows.iter().map(|(ids, _)| ids.len()).max().unwrap_or(0);
+            let mut table: Vec<i32> = Vec::with_capacity(rows.len() * width);
+            let mut range: Vec<i32> = Vec::with_capacity(rows.len() * 2);
+            for (i, (ids, r)) in rows.iter().enumerate() {
+                table.extend_from_slice(ids);
+                table.resize((i + 1) * width, 0);
+                range.extend_from_slice(*r);
+            }
+            let n = rows.len();
+            stacked.push(StackedDecode {
+                window: m.window,
+                table: Tensor::from_data(TensorData::new(table, [n, width]), &self.device),
+                range: Tensor::from_data(TensorData::new(range, [n * 2]), &self.device),
+            });
+        }
+        Ok(stacked)
+    }
+
+    /// One transformer block over the `pass.t` rows of the step's
+    /// sequences. The projections, norms and FFN run over all rows (each
+    /// weight is read once); the K/V writes, the attention and the
+    /// recurrent layers run per sequence.
     fn layer(
         &self,
         il: usize,
         x: Tensor<2>,
         pass: &Pass,
         kv: &mut KvLayers,
-        delta: &mut [Option<DeltaState>],
+        slots: &mut [DeltaSlot],
         ext: Option<&GpuExtKv>,
     ) -> Result<Tensor<2>, CucaError> {
         let hp = &self.hp;
@@ -3025,12 +3434,26 @@ impl Weights {
         };
         let mut attn = match &lw.mixer {
             Mixer::Delta(dw) => {
-                let state = delta
-                    .get_mut(il)
-                    .and_then(Option::as_mut)
-                    .ok_or_else(|| err(format!("layer {il} has no recurrent state")))?;
-                let (y, next) = dw.forward(h, state, eps);
-                *state = next;
+                let mut states = Vec::with_capacity(pass.seqs.len());
+                for seq in &pass.seqs {
+                    let state = slots
+                        .get(seq.slot)
+                        .and_then(|s| s.layers.get(il))
+                        .and_then(Option::as_ref)
+                        .ok_or_else(|| {
+                            err(format!(
+                                "layer {il} has no recurrent state in slot {}",
+                                seq.slot
+                            ))
+                        })?;
+                    states.push((seq.off..seq.off + seq.t, state));
+                }
+                let (y, next) = dw.forward(h, &states, eps);
+                for (seq, state) in pass.seqs.iter().zip(next) {
+                    if let Some(s) = slots.get_mut(seq.slot).and_then(|s| s.layers.get_mut(il)) {
+                        *s = Some(state);
+                    }
+                }
                 y
             }
             Mixer::Attention(aw) => {
@@ -3056,16 +3479,11 @@ impl Weights {
                     _ => q,
                 };
                 let q = rotate(q.swap_dims(1, 2));
-                let visible = pass
-                    .masks
-                    .iter()
-                    .find(|m| m.window == spec.window)
-                    .ok_or_else(|| err(format!("layer {il}: no attention mask for its window")))?;
-                let blocks = visible.blocks.as_ref().ok_or_else(|| {
-                    err(format!(
-                        "layer {il}: the sequence has no block table for its window"
-                    ))
-                })?;
+                // Every sequence must have its window's blocks, also on the
+                // layers that only read.
+                for seq in &pass.seqs {
+                    seq.visible(il, spec.window)?;
+                }
 
                 if let Some((k, v)) = kv_proj {
                     let k = match &aw.k_norm {
@@ -3087,13 +3505,17 @@ impl Weights {
                         .get_mut(il)
                         .and_then(Option::take)
                         .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
-                    for w in &blocks.writes {
-                        let at = [w.block..w.block + 1, 0..nkv, w.r0..w.r1, 0..d];
-                        let rows = w.r1 - w.r0;
-                        pool.k = pool
-                            .k
-                            .slice_assign(at.clone(), k.clone().narrow(2, w.off, rows));
-                        pool.v = pool.v.slice_assign(at, v.clone().narrow(2, w.off, rows));
+                    for seq in &pass.seqs {
+                        let (_, blocks) = seq.visible(il, spec.window)?;
+                        for w in &blocks.writes {
+                            let at = [w.block..w.block + 1, 0..nkv, w.r0..w.r1, 0..d];
+                            let rows = w.r1 - w.r0;
+                            let from = seq.off + w.off;
+                            pool.k = pool
+                                .k
+                                .slice_assign(at.clone(), k.clone().narrow(2, from, rows));
+                            pool.v = pool.v.slice_assign(at, v.clone().narrow(2, from, rows));
+                        }
                     }
                     kv[il] = Some(pool);
                 }
@@ -3120,36 +3542,65 @@ impl Weights {
                     (&pool.k, &pool.v)
                 };
 
-                let attn = match &blocks.read {
-                    // One query row reads the blocks in place.
-                    BlockRead::Decode { table, range } => {
-                        let call = PagedCall {
-                            scale: spec.scale,
-                            softcap: hp.attn_softcap.map(|cap| cap as f32),
+                let call = PagedCall {
+                    scale: spec.scale,
+                    softcap: hp.attn_softcap.map(|cap| cap as f32),
+                };
+                let attn = if let Some(st) = pass.stacked.iter().find(|s| s.window == spec.window) {
+                    // A decode step: every sequence's one row in one launch.
+                    paged_kernel::decode(
+                        q.swap_dims(1, 2).reshape([t, nh, d]),
+                        pool_k.clone(),
+                        pool_v.clone(),
+                        st.table.clone(),
+                        st.range.clone(),
+                        &call,
+                    )
+                    .reshape([t, nh * d])
+                } else {
+                    let mut outs = Vec::with_capacity(pass.seqs.len());
+                    for seq in &pass.seqs {
+                        let (visible, blocks) = seq.visible(il, spec.window)?;
+                        let qs = if pass.seqs.len() == 1 {
+                            q.clone()
+                        } else {
+                            q.clone().narrow(2, seq.off, seq.t)
                         };
-                        paged_kernel::decode(
-                            q.reshape([1, nh, d]),
-                            pool_k.clone(),
-                            pool_v.clone(),
-                            Tensor::clone(table),
-                            Tensor::clone(range),
-                            &call,
-                        )
-                        .reshape([1, nh, 1, d])
+                        let out = match &blocks.read {
+                            // One query row reads the blocks in place.
+                            BlockRead::Decode { table, range } => paged_kernel::decode(
+                                qs.reshape([1, nh, d]),
+                                pool_k.clone(),
+                                pool_v.clone(),
+                                Tensor::clone(table),
+                                Tensor::clone(range),
+                                &call,
+                            )
+                            .reshape([1, nh, 1, d]),
+                            // Several rows: the blocks of the visible range as
+                            // one contiguous `[1, n_kv, len, d]` view.
+                            BlockRead::Gather { idx, skip, len } => attend(
+                                qs,
+                                gather_view(pool_k, idx, *skip, *len),
+                                gather_view(pool_v, idx, *skip, *len),
+                                visible.mask.clone(),
+                                spec.scale,
+                                hp.attn_softcap,
+                            ),
+                            BlockRead::Rows { .. } => {
+                                return Err(err(format!(
+                                    "layer {il}: the step's blocks were stacked for one launch"
+                                )));
+                            }
+                        };
+                        outs.push(out.swap_dims(1, 2).reshape([seq.t, nh * d]));
                     }
-                    // Several rows: the blocks of the visible range as one
-                    // contiguous `[1, n_kv, len, d]` view.
-                    BlockRead::Gather { idx, skip, len } => attend(
-                        q,
-                        gather_view(pool_k, idx, *skip, *len),
-                        gather_view(pool_v, idx, *skip, *len),
-                        visible.mask.clone(),
-                        spec.scale,
-                        hp.attn_softcap,
-                    ),
-                }
-                .swap_dims(1, 2)
-                .reshape([t, nh * d]);
+                    if outs.len() == 1 {
+                        outs.swap_remove(0)
+                    } else {
+                        Tensor::cat(outs, 0)
+                    }
+                };
                 let attn = match gate {
                     Some(gate) => attn * activation::sigmoid(gate),
                     None => attn,
@@ -3284,6 +3735,16 @@ fn l2_normalise(x: Tensor<3>) -> Tensor<3> {
     x * inv
 }
 
+/// Rows `rows` of the `total` rows of `m` (the tensor itself when they are
+/// all of them: no operation to queue).
+fn row_range<const D: usize>(m: Tensor<D>, rows: &Range<usize>, total: usize) -> Tensor<D> {
+    if rows.len() == total {
+        m
+    } else {
+        m.narrow(0, rows.start, rows.len())
+    }
+}
+
 /// Row `ti` of the `t` rows of `m` (the tensor itself for a single row: no
 /// operation to queue).
 fn token_row<const D: usize>(m: Tensor<D>, ti: usize, t: usize) -> Tensor<D> {
@@ -3291,22 +3752,28 @@ fn token_row<const D: usize>(m: Tensor<D>, ti: usize, t: usize) -> Tensor<D> {
 }
 
 impl DeltaWeights {
-    /// The layer's output `[t, n_embd]` for the normed input `h [t, n_embd]`
-    /// and the state before it, with the state after it (see
-    /// [`super::delta`]: the same recurrence, run per token on the device).
+    /// The layer's output `[T, n_embd]` for the normed rows `h [T, n_embd]`
+    /// of the step's sequences, and the state of each sequence after its
+    /// rows. `seqs` holds, per sequence, its row range in `h` and its state
+    /// before them (see [`super::delta`]: the same recurrence, run per token
+    /// on the device). The projections, the gate and the output matmul run
+    /// over all rows at once (each weight is read once per step); the
+    /// convolution and the recurrence run per sequence.
     ///
     /// Decode is host-bound (every queued operation costs the host about
     /// 10 us), so a single token runs few, wide operations: the convolution
     /// is one product and sum over the window, the key and query heads are
     /// normalised together, and the value heads that share a key head
     /// broadcast it instead of repeating it.
-    fn forward(&self, h: Tensor<2>, state: &DeltaState, eps: f64) -> (Tensor<2>, DeltaState) {
+    fn forward(
+        &self,
+        h: Tensor<2>,
+        seqs: &[(Range<usize>, &DeltaState)],
+        eps: f64,
+    ) -> (Tensor<2>, Vec<DeltaState>) {
         let d = &self.spec;
-        let [t, _] = h.dims();
-        let device = h.device();
-        let (nk, nv, dk, dv) = (d.n_k_heads, d.n_v_heads, d.head_k_dim, d.head_v_dim);
-        let (kd, vd, taps) = (d.key_dim(), d.value_dim(), d.conv_kernel);
-        let rep = nv / nk;
+        let [total, _] = h.dims();
+        let (nv, dv, vd) = (d.n_v_heads, d.head_v_dim, d.value_dim());
 
         let mixed = linear(h.clone(), &self.qkv);
         let z = linear(h.clone(), &self.gate);
@@ -3317,6 +3784,49 @@ impl DeltaWeights {
         let soft = pre.clone().exp().log1p();
         let soft = soft.mask_where(pre.clone().greater_elem(20.0), pre);
         let decay = (soft * self.a.clone()).exp();
+
+        let mut outs = Vec::with_capacity(seqs.len());
+        let mut states = Vec::with_capacity(seqs.len());
+        for (rows, state) in seqs {
+            let (o, next) = self.scan(
+                row_range(mixed.clone(), rows, total),
+                row_range(beta.clone(), rows, total),
+                row_range(decay.clone(), rows, total),
+                state,
+            );
+            outs.push(o);
+            states.push(next);
+        }
+        let o = if outs.len() == 1 {
+            outs.swap_remove(0)
+        } else {
+            Tensor::cat(outs, 0)
+        };
+
+        // Gated RMSNorm per head: rms(o) * weight * silu(z).
+        let z = z.reshape([total, nv, dv]);
+        let y = rms(o, Some(&self.norm), eps) * activation::silu(z);
+        let out = linear(y.reshape([total, vd]), &self.out);
+        (out, states)
+    }
+
+    /// The convolution and the delta rule over the `t` rows of one sequence:
+    /// `mixed [t, conv_dim]` (the projected `[q | k | v]`), `beta` and
+    /// `decay` `[t, n_v_heads]`, from the sequence's `state`. Returns the
+    /// outputs `[t, n_v_heads, head_v_dim]` and the state after the rows.
+    fn scan(
+        &self,
+        mixed: Tensor<2>,
+        beta: Tensor<2>,
+        decay: Tensor<2>,
+        state: &DeltaState,
+    ) -> (Tensor<3>, DeltaState) {
+        let d = &self.spec;
+        let [t, _] = mixed.dims();
+        let device = mixed.device();
+        let (nk, nv, dk, dv) = (d.n_k_heads, d.n_v_heads, d.head_k_dim, d.head_v_dim);
+        let (kd, vd, taps) = (d.key_dim(), d.value_dim(), d.conv_kernel);
+        let rep = nv / nk;
 
         // Causal depthwise convolution over `history ++ mixed`, then silu.
         let padded = Tensor::cat(vec![state.conv.clone(), mixed], 0);
@@ -3374,12 +3884,7 @@ impl DeltaWeights {
         } else {
             Tensor::cat(rows, 0)
         };
-
-        // Gated RMSNorm per head: rms(o) * weight * silu(z).
-        let z = z.reshape([t, nv, dv]);
-        let y = rms(o, Some(&self.norm), eps) * activation::silu(z);
-        let out = linear(y.reshape([t, vd]), &self.out);
-        (out, DeltaState { conv: next_conv, s })
+        (o, DeltaState { conv: next_conv, s })
     }
 }
 
@@ -3597,10 +4102,12 @@ mod tests {
     use std::io::BufReader;
 
     use super::super::cpu::Transformer;
+    use super::super::paged::{KvPools, SeqBlocks};
     use super::super::tiny::{
         PROMPT, TinyModel, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB, write_qwen35,
         write_spec, write_tiny_model_with,
     };
+    use super::super::{SeqRows, StateSlot};
     use super::*;
 
     fn f16_bytes(v: f32) -> [u8; 2] {
@@ -3869,8 +4376,10 @@ mod tests {
 
     /// A hybrid model (delta-net + gated attention, with a shared-expert MoE
     /// FFN for `qwen35moe`): the GPU engine reproduces the CPU engine
-    /// through prefill, decode, chunked prefill, the checkpoint and the
-    /// fallback of `rewind`, which retains the same positions.
+    /// through prefill, decode, chunked prefill and the rule of `rewind` (the
+    /// slot's live state is kept, any length inside the cache falls back to
+    /// the zero state), and a snapshot restored into the slot continues as
+    /// the uninterrupted run did.
     fn check_hybrid_model(model: &TinyModel, device: LocalDevice, label: &str) {
         let n = PROMPT.len();
         let (mut cpu, mut gpu) = load_both(model, device);
@@ -3879,47 +4388,45 @@ mod tests {
         compare(&mut cpu, &mut gpu, &[7], n, Want::Last, label);
         compare(&mut cpu, &mut gpu, &[9, 2], n + 1, Want::All, label);
 
-        // Chunked prefill, with a checkpoint after the first chunks.
+        // Chunked prefill, with a snapshot of the state after the first
+        // chunks (handles to the slot's immutable state tensors).
         let (mut cpu, mut gpu) = load_both(model, device);
         for (start, chunk) in [(0, &PROMPT[..3]), (3, &PROMPT[3..6])] {
             assert!(gpu.forward(chunk, start, Want::None).unwrap().is_none());
             cpu.forward(chunk, start, Want::None).unwrap();
         }
-        cpu.checkpoint();
-        gpu.checkpoint();
-        compare(
-            &mut cpu,
-            &mut gpu,
-            &PROMPT[6..],
-            6,
-            Want::Last,
-            &format!("{label} chunked"),
-        );
+        let snapshot = gpu.snapshot(0).unwrap();
+        assert!(snapshot.bytes() > 0, "{label}: the snapshot holds state");
+        assert!(gpu.snapshot(1).is_none(), "{label}: one slot");
+        let continued = gpu.forward(&PROMPT[6..], 6, Want::Last).unwrap().unwrap();
+        let reference = cpu.forward(&PROMPT[6..], 6, Want::Last).unwrap().unwrap();
+        assert_matches_cpu(&reference, &continued, &format!("{label} chunked"));
         assert_eq!(gpu.cache_len(), n);
 
-        // A length without a state falls back to the checkpoint; both
-        // engines retain the same positions and continue identically.
-        assert_eq!(gpu.truncate_cache(9), cpu.truncate_cache(9), "{label}");
-        assert_eq!(gpu.cache_len(), 6, "{label}: the checkpoint");
+        // The K/V blocks go back to position 6 (nothing there is named) and
+        // the snapshot becomes the slot's state: the continuation is the
+        // uninterrupted run's.
+        assert_eq!(gpu.solo.truncate(6), 6, "{label}");
+        gpu.restore(0, &snapshot, 6).unwrap();
+        assert!(
+            gpu.restore(1, &snapshot, 6).is_err(),
+            "{label}: slot out of range"
+        );
+        let again = gpu.forward(&PROMPT[6..], 6, Want::Last).unwrap().unwrap();
+        assert_close_logits(&[again], &[continued], &format!("{label} restored"));
+        assert_eq!(gpu.cache_len(), n);
         assert!(
             gpu.forward(&PROMPT[8..], 8, Want::Last).is_err(),
-            "{label}: gap after truncate"
+            "{label}: gap after the restored run"
         );
-        compare(
-            &mut cpu,
-            &mut gpu,
-            &[11, 13, 15],
-            6,
-            Want::Last,
-            &format!("{label} after the checkpoint"),
-        );
-        // The end of the cache is retained as is; below the checkpoint
-        // there is no state, so both engines fall back to the zero state.
+
+        // The end of the cache is retained as is; any length inside it has
+        // no state (the GPU keeps no checkpoint and no verify record), so
+        // both engines fall back to the zero state.
         assert_eq!(gpu.truncate_cache(99), cpu.truncate_cache(99), "{label}");
-        assert_eq!(gpu.truncate_cache(7), cpu.truncate_cache(7), "{label}");
-        assert_eq!(gpu.cache_len(), 6, "{label}: the checkpoint again");
-        assert_eq!(gpu.truncate_cache(5), cpu.truncate_cache(5), "{label}");
-        assert_eq!(gpu.cache_len(), 0, "{label}: no state at 5");
+        assert_eq!(gpu.cache_len(), n, "{label}: the end of the cache");
+        assert_eq!(gpu.truncate_cache(9), cpu.truncate_cache(9), "{label}");
+        assert_eq!(gpu.cache_len(), 0, "{label}: no state at 9");
         compare(
             &mut cpu,
             &mut gpu,
@@ -3929,6 +4436,325 @@ mod tests {
             &format!("{label} from the zero state"),
         );
         assert_eq!(gpu.truncate_cache(0), 0);
+    }
+
+    /// One sequence's rows of a step of [`check_batched`].
+    #[derive(Clone, Copy)]
+    struct Step {
+        seq: usize,
+        n: usize,
+        want: Want,
+        hidden: Hidden,
+    }
+
+    fn step(seq: usize, n: usize, want: Want, hidden: Hidden) -> Step {
+        Step {
+            seq,
+            n,
+            want,
+            hidden,
+        }
+    }
+
+    /// `len` tokens of test sequence `seq`: different streams per sequence.
+    fn stream(seq: usize, len: usize) -> Vec<u32> {
+        (0..len)
+            .map(|i| ((i * 7 + seq * 5 + 1) % VOCAB) as u32)
+            .collect()
+    }
+
+    fn assert_rows_close(got: &[f32], want: &[f32], what: &str) {
+        assert_eq!(got.len(), want.len(), "{what}");
+        // Batched and solo steps run different matmul shapes (and, in a
+        // mixture of experts, group different rows per expert), so they
+        // agree up to float rounding of the vector's scale.
+        let scale = want.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+        for (i, (a, b)) in got.iter().zip(want).enumerate() {
+            assert!(
+                (a - b).abs() <= 1e-3 * scale,
+                "{what}: value {i}: {a} vs {b} (scale {scale})"
+            );
+        }
+    }
+
+    /// The logits and hidden rows of two runs of one sequence's call agree
+    /// (and are present in both or neither).
+    fn assert_forward_close(got: &Forward, want: &Forward, what: &str) {
+        for (name, g, w) in [
+            ("logits", &got.logits, &want.logits),
+            ("hidden", &got.hidden, &want.hidden),
+        ] {
+            match (g, w) {
+                (Some(g), Some(w)) => assert_rows_close(g, w, &format!("{what} {name}")),
+                (None, None) => {}
+                _ => panic!("{what}: {name} is present in only one of the runs"),
+            }
+        }
+    }
+
+    /// Three sequences run as batched steps (prefill together, decode
+    /// together, one absent from a step, one prefilling a chunk next to
+    /// decoding ones, `Want::All` and every-position hidden rows) equal each
+    /// sequence run alone through the solo API of another GPU load. A hybrid
+    /// model also forks sequence 1 from a snapshot of its state in a spare
+    /// slot and the fork's continuation equals the original's.
+    fn check_batched(model: &TinyModel, device: LocalDevice, label: &str) {
+        const CTX: usize = 32;
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        // Three sequences and a spare state slot for the fork.
+        let sizing = Sizing {
+            max_sequences: 4,
+            kv_tokens: 2 * CTX,
+            max_rows: 16,
+        };
+        let mut batched = GpuTransformer::load_placed(
+            &content,
+            &model.path,
+            CTX,
+            device,
+            &ExpertPlacement::Resident,
+            &sizing,
+        )
+        .unwrap();
+        let mut solo = GpuTransformer::load(&content, &model.path, CTX, device).unwrap();
+        let hybrid = batched.is_hybrid();
+        assert_eq!(solo.is_hybrid(), hybrid, "{label}");
+
+        let (last, all, none) = (Want::Last, Want::All, Want::None);
+        let (plain, post, post_all) = (Hidden::None, Hidden::PostNorm, Hidden::PostNormAll);
+        // 14, 17 and 10 tokens per sequence in total.
+        let steps = [
+            vec![
+                step(0, 5, last, plain),
+                step(1, 9, last, post),
+                step(2, 3, last, plain),
+            ],
+            vec![
+                step(0, 1, last, post),
+                step(1, 1, last, plain),
+                step(2, 1, last, post),
+            ],
+            vec![
+                step(0, 1, last, plain),
+                step(1, 1, last, plain),
+                step(2, 1, last, plain),
+            ],
+            // Sequence 0 sits this step out.
+            vec![step(1, 1, last, plain), step(2, 1, last, plain)],
+            // Sequence 0 prefills a chunk next to two decoding ones.
+            vec![
+                step(0, 4, last, plain),
+                step(1, 1, last, post),
+                step(2, 1, last, plain),
+            ],
+            // Hidden rows only, every logits row, one logits row.
+            vec![
+                step(0, 2, none, post_all),
+                step(1, 3, all, post),
+                step(2, 1, last, plain),
+            ],
+            vec![
+                step(0, 1, last, plain),
+                step(1, 1, last, plain),
+                step(2, 2, last, post_all),
+            ],
+        ];
+        let tokens: Vec<Vec<u32>> = (0..3).map(|s| stream(s, 20)).collect();
+
+        let mut pools = KvPools::new(batched.kv_layout());
+        let mut seqs: Vec<SeqBlocks> = (0..3).map(|_| pools.seq()).collect();
+        let mut at = [0usize; 3];
+        let mut got: Vec<Vec<Forward>> = (0..3).map(|_| Vec::new()).collect();
+        let mut snapshot = None;
+        for (si, rows_of_step) in steps.iter().enumerate() {
+            for st in rows_of_step {
+                pools.reserve(&mut seqs[st.seq], at[st.seq] + st.n).unwrap();
+            }
+            let rows: Vec<SeqRows<'_>> = rows_of_step
+                .iter()
+                .map(|st| SeqRows {
+                    tokens: &tokens[st.seq][at[st.seq]..at[st.seq] + st.n],
+                    start_pos: at[st.seq],
+                    tables: &seqs[st.seq].tables,
+                    state: StateSlot(st.seq),
+                    want: st.want,
+                    hidden: st.hidden,
+                })
+                .collect();
+            let outs = batched
+                .forward_batch(&Batch { rows, exact: false })
+                .unwrap();
+            assert_eq!(outs.len(), rows_of_step.len(), "{label} step {si}");
+            for (st, out) in rows_of_step.iter().zip(outs) {
+                got[st.seq].push(out);
+                at[st.seq] += st.n;
+            }
+            if si == 2 {
+                // Sequence 1 sits at position 11.
+                snapshot = batched.snapshot(1);
+            }
+        }
+        assert_eq!(at, [14, 17, 10], "{label}");
+        assert_eq!(
+            snapshot.is_some(),
+            hybrid,
+            "{label}: a snapshot of a hybrid"
+        );
+
+        // Each sequence alone.
+        for s in 0..3 {
+            assert_eq!(solo.truncate_cache(0), 0, "{label}");
+            let (mut pos, mut k) = (0, 0);
+            for st in steps.iter().flatten().filter(|st| st.seq == s) {
+                let alone = solo
+                    .forward_ext(&tokens[s][pos..pos + st.n], pos, st.want, st.hidden, false)
+                    .unwrap();
+                assert_forward_close(&got[s][k], &alone, &format!("{label} seq {s} call {k}"));
+                pos += st.n;
+                k += 1;
+            }
+        }
+
+        let bad = |slot: usize, start_pos: usize, tables: &'static [Vec<u32>]| SeqRows {
+            tokens: &[1],
+            start_pos,
+            tables,
+            state: StateSlot(slot),
+            want: Want::Last,
+            hidden: Hidden::None,
+        };
+        assert!(
+            batched
+                .forward_batch(&Batch {
+                    rows: Vec::new(),
+                    exact: false
+                })
+                .is_err(),
+            "{label}: empty batch"
+        );
+        // A table without blocks fails the step (and empties its slot).
+        let failed = batched.forward_batch(&Batch {
+            rows: vec![bad(3, 0, &[])],
+            exact: false,
+        });
+        assert!(failed.is_err(), "{label}: no block table");
+
+        if !hybrid {
+            assert!(batched.snapshot(0).is_none(), "{label}");
+            assert_eq!(batched.rewind(0, 7), 7, "{label}: K/V only");
+            return;
+        }
+        let snapshot = snapshot.unwrap();
+        assert!(snapshot.bytes() > 0, "{label}");
+        // Slot 3 continues sequence 1 from the snapshot of its state at
+        // position 11, over sequence 1's blocks (the rows from position 11
+        // are written again with the same values).
+        let mut pos = 11;
+        batched.restore(3, &snapshot, pos).unwrap();
+        for (k, st) in (3..).zip(steps[3..].iter().flatten().filter(|st| st.seq == 1)) {
+            let rows = vec![SeqRows {
+                tokens: &tokens[1][pos..pos + st.n],
+                start_pos: pos,
+                tables: &seqs[1].tables,
+                state: StateSlot(3),
+                want: st.want,
+                hidden: st.hidden,
+            }];
+            let mut outs = batched
+                .forward_batch(&Batch { rows, exact: false })
+                .unwrap();
+            assert_forward_close(
+                &outs.swap_remove(0),
+                &got[1][k],
+                &format!("{label} fork {k}"),
+            );
+            pos += st.n;
+        }
+        assert_eq!(pos, 17, "{label}");
+
+        // The rule of `rewind`: the end is retained, anything inside the
+        // cache falls back to the zero state, a missing slot has none.
+        assert_eq!(batched.rewind(3, 99), 17, "{label}");
+        assert_eq!(batched.rewind(3, 5), 0, "{label}");
+        assert_eq!(batched.rewind(3, 99), 0, "{label}: reset");
+        assert_eq!(batched.rewind(9, 4), 0, "{label}: no such slot");
+        assert!(batched.restore(9, &snapshot, 4).is_err(), "{label}");
+        assert_eq!(batched.rewind(1, 99), 17, "{label}: slot 1 untouched");
+
+        // A failed step resets the slot it names.
+        batched.restore(3, &snapshot, 11).unwrap();
+        assert!(
+            batched
+                .forward_batch(&Batch {
+                    rows: vec![bad(3, 11, &[])],
+                    exact: false,
+                })
+                .is_err(),
+            "{label}"
+        );
+        assert_eq!(batched.rewind(3, 99), 0, "{label}: emptied by the failure");
+
+        // The same slot twice in a step and a start other than the slot's
+        // position are rejected before anything runs.
+        let twice = Batch {
+            rows: vec![
+                SeqRows {
+                    tokens: &tokens[1][17..18],
+                    start_pos: 17,
+                    tables: &seqs[1].tables,
+                    state: StateSlot(1),
+                    want: Want::Last,
+                    hidden: Hidden::None,
+                },
+                SeqRows {
+                    tokens: &tokens[1][17..18],
+                    start_pos: 17,
+                    tables: &seqs[1].tables,
+                    state: StateSlot(1),
+                    want: Want::Last,
+                    hidden: Hidden::None,
+                },
+            ],
+            exact: false,
+        };
+        assert!(
+            batched.forward_batch(&twice).is_err(),
+            "{label}: slot twice"
+        );
+        let off = Batch {
+            rows: vec![SeqRows {
+                tokens: &tokens[0][..1],
+                start_pos: 3,
+                tables: &seqs[0].tables,
+                state: StateSlot(0),
+                want: Want::Last,
+                hidden: Hidden::None,
+            }],
+            exact: false,
+        };
+        assert!(batched.forward_batch(&off).is_err(), "{label}: wrong start");
+        assert_eq!(batched.rewind(0, 99), 14, "{label}: slot 0 untouched");
+    }
+
+    #[test]
+    fn gpu_batched_matches_gpu_solo_on_every_architecture() {
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        check_batched(
+            &write_tiny_model_with(TinyOptions::default()),
+            device,
+            "gemma4",
+        );
+        for spec in TinySpec::all() {
+            check_batched(&write_spec(&spec), device, spec.arch);
+        }
+        for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
+            check_batched(&write_qwen35(&spec), device, label);
+        }
     }
 
     /// Device bytes of one expert summed over the MoE layers of `model`, as
@@ -3950,7 +4776,14 @@ mod tests {
         let content =
             gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
                 .unwrap();
-        GpuTransformer::load_placed(&content, &model.path, 32, device, experts)
+        GpuTransformer::load_placed(
+            &content,
+            &model.path,
+            32,
+            device,
+            experts,
+            &Sizing::single(32),
+        )
     }
 
     /// A 24-token prompt in chunks of 16 then 8 greedy steps: the logits of
@@ -4320,6 +5153,7 @@ mod tests {
                     lo,
                     hi,
                     write: false,
+                    stack: false,
                 };
                 let BlockRead::Gather { idx, skip, len } = rows.view(&device).unwrap().read else {
                     panic!("several rows gather");

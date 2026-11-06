@@ -58,6 +58,10 @@
 //!   (see `ExpertPlacement`): `resident` (default) or tiered caches such as
 //!   `tiered:ram=600m` (CPU) or `tiered:device=4g,ram=8g` (GPU); the tier
 //!   counters print at the end.
+//! - `CUCA_LOCAL_BATCHING`: how concurrent requests share the engine (see
+//!   `BatchingConfig`): any subset of `seqs=4,kv=16384,step=256,prefix=off`.
+//!   This example sends one request, so it only changes the memory it reserves
+//!   (`kv` sizes the shared K/V pool).
 //! - `CUCA_CACHE_DIR`: download cache directory, defaults to the platform cache
 //!   directory.
 //! - `HF_TOKEN`: Hugging Face token, only needed for gated mirrors.
@@ -137,6 +141,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !experts.is_empty()
     {
         config.experts = experts.parse()?;
+    }
+    if let Ok(batching) = std::env::var("CUCA_LOCAL_BATCHING")
+        && !batching.is_empty()
+    {
+        config.batching = batching.parse()?;
     }
     let device = config.device;
     let model = LocalModel::load(config).await?;

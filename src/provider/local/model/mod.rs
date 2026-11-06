@@ -50,11 +50,10 @@
 //! length. A delta-net layer's state summarises every token before the
 //! current end, cannot be truncated and cannot be undone, so
 //! [`Model::rewind`] returns the number of positions a model really
-//! retained, and a hybrid model retains only positions it holds a state for:
+//! retained, and a hybrid model retains only positions it holds a state for
+//! (each running sequence owns a state slot, [`StateSlot`]):
 //!
-//! - the current end (the live state);
-//! - the **checkpoint** ([`Model::checkpoint`], one slot, replaced on every
-//!   call; the engine takes it while prefilling, see below);
+//! - the slot's current end (the live state);
 //! - the **verify record**: after a `Want::All` call over `2..=17` rows
 //!   ([`cpu::MAX_VERIFY_ROWS`], one drafter verification round: the pending
 //!   token and up to 16 drafts) every position inside the call (`start ..
@@ -65,31 +64,42 @@
 //!   bit for bit as the original run computed them. That costs one state
 //!   copy per verification round instead of one per row.
 //!
-//! Any other requested length falls back to the largest of those positions
-//! not above it, `0` (recompute everything, from the zero state) if there is
-//! none. A checkpoint above the retained length is dropped: its positions are
-//! about to be overwritten. A forward call that fails half-way empties the
-//! cache (a partly advanced state cannot be repaired). A prefill in any
-//! chunking, a token-by-token run and a restore-and-replay produce the same
-//! logits and state bit for bit.
+//! Any other requested length falls back to `0` (recompute everything, from
+//! the zero state). A forward call that fails half-way empties the slots of
+//! its sequences (a partly advanced state cannot be repaired). A prefill in
+//! any chunking, a token-by-token run and a restore-and-replay produce the
+//! same logits and state bit for bit.
 //!
-//! The GPU engine follows the same rules for the live state and the
-//! checkpoint (its states are immutable device tensors, so a checkpoint is a
-//! set of handles and costs nothing) but keeps no verify record
-//! ([`Model::rollback_rows`] is 1 for a hybrid GPU model): on a GPU the
+//! A **snapshot** ([`Model::snapshot`], [`Model::restore`]) is a copy of one
+//! slot's state, which the engine's prefix store keeps next to the K/V
+//! blocks of the same prefix. The GPU engine follows the same rules for the
+//! live state and the snapshots (its states are immutable device tensors, so
+//! a snapshot is a set of handles and costs nothing) but keeps no verify
+//! record ([`Model::rollback_rows`] is 1 for a hybrid GPU model): on a GPU the
 //! batched rows equal single steps only up to float rounding, and no drafter
 //! can pair with a hybrid model there.
 //!
 //! The engine consumes the returned length: it truncates its sequence's block
 //! tables to the retained prefix, prefills from there and reports that as the
-//! reused prompt tokens. An attention-only model keeps no state besides K/V,
-//! so its requests look their prompt up in the prefix store instead
-//! ([`paged::KvPools::lookup`]); a hybrid model keeps its last sequence. While
-//! prefilling a prompt a hybrid model checkpoints the state after the last
-//! end-of-turn token (the end of the last complete message: the generation
-//! prompt that follows is what chat templates rewrite on the next turn; a
-//! prompt without one is checkpointed at its end), so the next turn of a
-//! conversation restarts from there and the output equals a cold run's.
+//! reused prompt tokens. Every model looks a prompt up in the prefix store
+//! ([`paged::KvPools::lookup`]); a hybrid model also needs the snapshot of
+//! the position, so it resumes from the nearest block boundary it has one
+//! for. While prefilling a prompt the engine snapshots a hybrid model's state
+//! at the block boundary below the last end-of-turn token (the end of the
+//! last complete message: the generation prompt that follows is what chat
+//! templates rewrite on the next turn; a prompt without one is snapshotted
+//! below its end), so the next turn of a conversation restarts from there and
+//! the output equals a cold run's.
+//!
+//! # Batching
+//!
+//! [`Model::forward_batch`] runs the rows of several sequences ([`Batch`],
+//! one [`SeqRows`] per sequence) in one pass: embeddings, projections, FFN and
+//! the LM head see the concatenation of all rows (each weight is read once
+//! per step), while attention, the K/V block writes and a hybrid model's
+//! recurrent scan stay per sequence, against that sequence's block tables and
+//! state slot. On the CPU, with `exact`, a sequence's rows are bit-identical
+//! to running it alone.
 //!
 //! # Memory
 //!
@@ -115,12 +125,13 @@
 //!   times 16 times `n_kv_head` times `head_dim` per block (f32 keys and
 //!   values) per K/V-owning layer, with that layer's own head count and head
 //!   dimension. Layers with the same window share block ids (a group). A
-//!   full-attention group holds twice `context_length` positions, so a
-//!   finished request's blocks stay cached while the next runs; a
-//!   sliding-window group holds `ceil((window - 1 + rows) / 16) + 2` blocks
-//!   per running sequence plus up to `context_length` positions of cached
-//!   prefixes ([`paged::KvLayout::new`]; [`paged::KvLayout::pool_bytes`]
-//!   sums it all). A sliding-window block is
+//!   full-attention group holds `kv_tokens` positions (twice
+//!   `context_length` by default) shared by every running sequence and the
+//!   cached prefixes, so a finished request's blocks stay cached while the
+//!   next runs; a sliding-window group holds `ceil((window - 1 + rows) / 16) +
+//!   2` blocks per running sequence plus up to `kv_tokens - context_length`
+//!   positions of cached prefixes ([`paged::KvLayout::new`];
+//!   [`paged::KvLayout::pool_bytes`] sums it all). A sliding-window block is
 //!   released once every position in it is before the window of the next
 //!   query; the rollback of a draft round (at most 16 rows past the accepted
 //!   length) never needs a released block. Prefix hits shorten by whole
@@ -129,12 +140,12 @@
 //!   [`params::Hparams::recurrent_state_bytes`] is 4 bytes times the sum, over
 //!   the delta-net layers, of `(conv_kernel - 1) * conv_dim + n_v_heads *
 //!   head_k_dim * head_v_dim` (Qwen3.5-0.8B: 18 layers of 1.12 MB, 20.2 MB).
-//!   The cache keeps that state live, plus the checkpoint (a second copy,
-//!   allocated at the first checkpoint) and, once a model verifies drafts, the
-//!   verify record: one more copy and `4 * (conv_dim + 2 * n_v_heads)` bytes
-//!   per verified row per layer (at most 17 rows: 445 KB per row over the 18
-//!   layers of the 0.8B model, 7.6 MB for 17). In all that is about three
-//!   times the recurrent state (61 MB for the 0.8B model).
+//!   Every state slot (one per sequence that can run, `max_sequences`) keeps
+//!   that state live and, once a model verifies drafts, the verify record: one
+//!   more copy and `4 * (conv_dim + 2 * n_v_heads)` bytes per verified row per
+//!   layer (at most 17 rows: 445 KB per row over the 18 layers of the 0.8B
+//!   model, 7.6 MB for 17). The prefix store keeps one more copy per snapshot
+//!   (at most `max_sequences + 4`).
 //! - The K/V cache of a hybrid model covers its attention layers only:
 //!   `kv_cache_bytes` counts just the K/V-owning layers (24,576 bytes per
 //!   position for the 0.8B model: 6 attention layers with 2 KV heads of
@@ -208,6 +219,84 @@ pub(crate) enum Want {
     /// The logits after every token: `tokens * vocab` values, row-major.
     /// Speculative verification reads one row per drafted position.
     All,
+}
+
+/// Which recurrent-state slot of a hybrid model a sequence's rows advance:
+/// each running sequence of a hybrid model owns one (`0..max_sequences`).
+/// An attention-only model has no state and ignores it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StateSlot(pub(crate) usize);
+
+/// The rows one sequence contributes to a forward step.
+pub(crate) struct SeqRows<'a> {
+    /// The tokens, at positions `start_pos..`.
+    pub(crate) tokens: &'a [u32],
+    pub(crate) start_pos: usize,
+    /// The sequence's block tables, one per K/V group of the model, holding
+    /// every block the rows write.
+    pub(crate) tables: &'a [paged::BlockTable],
+    /// The recurrent state the rows advance (hybrid models).
+    pub(crate) state: StateSlot,
+    /// Which logits the step returns for this sequence.
+    pub(crate) want: Want,
+    /// Which final-norm hidden rows it returns next to them.
+    pub(crate) hidden: cpu::Hidden,
+}
+
+/// One forward step over the rows of several sequences, see
+/// [`Model::forward_batch`].
+pub(crate) struct Batch<'a> {
+    pub(crate) rows: Vec<SeqRows<'a>>,
+    /// Every row equals, bit for bit, what a single-token step computes
+    /// (guaranteed on the CPU; on a GPU the rows agree only up to float
+    /// rounding).
+    pub(crate) exact: bool,
+}
+
+impl<'a> Batch<'a> {
+    /// A step over one sequence in state slot 0 (the unit tests).
+    #[cfg(test)]
+    pub(crate) fn single(
+        tokens: &'a [u32],
+        start_pos: usize,
+        tables: &'a [paged::BlockTable],
+        want: Want,
+        hidden: cpu::Hidden,
+        exact: bool,
+    ) -> Self {
+        Self {
+            rows: vec![SeqRows {
+                tokens,
+                start_pos,
+                tables,
+                state: StateSlot(0),
+                want,
+                hidden,
+            }],
+            exact,
+        }
+    }
+}
+
+/// The recurrent state of a hybrid model at one position (a copy of every
+/// delta-net layer's state), kept by the prefix store next to the K/V blocks
+/// of the same prefix. On a GPU the state tensors are immutable, so a
+/// snapshot is a set of handles.
+pub(crate) enum RecurrentSnapshot {
+    Cpu(Vec<delta::DeltaState>),
+    #[cfg(feature = "provider-local-gpu")]
+    Gpu(gpu::GpuSnapshot),
+}
+
+impl RecurrentSnapshot {
+    /// Bytes the snapshot holds.
+    pub(crate) fn bytes(&self) -> usize {
+        match self {
+            RecurrentSnapshot::Cpu(layers) => layers.iter().map(delta::DeltaState::bytes).sum(),
+            #[cfg(feature = "provider-local-gpu")]
+            RecurrentSnapshot::Gpu(snapshot) => snapshot.bytes(),
+        }
+    }
 }
 
 /// Additive attention mask for `t` queries at positions `start..start + t`
@@ -336,7 +425,8 @@ pub(crate) enum Model {
 impl Model {
     /// Load the model from the GGUF file at `path`, whose index `content` was
     /// read already, onto `device`, with a K/V cache for `context_length`
-    /// positions.
+    /// positions; `sizing` says how many sequences the K/V pools and the
+    /// recurrent-state slots serve.
     ///
     /// # Errors
     ///
@@ -351,6 +441,7 @@ impl Model {
         context_length: usize,
         device: LocalDevice,
         experts: &ExpertPlacement,
+        sizing: &paged::Sizing,
     ) -> Result<Self, CucaError> {
         match device {
             LocalDevice::Cpu => Ok(Model::Cpu(cpu::Transformer::load_placed(
@@ -358,6 +449,7 @@ impl Model {
                 path,
                 context_length,
                 experts,
+                sizing,
             )?)),
             #[cfg(feature = "provider-local-gpu")]
             device => Ok(Model::Gpu(gpu::GpuTransformer::load_placed(
@@ -366,6 +458,7 @@ impl Model {
                 context_length,
                 device,
                 experts,
+                sizing,
             )?)),
             #[cfg(not(feature = "provider-local-gpu"))]
             device => Err(super::device_unavailable(device).unwrap_or_else(|| {
@@ -384,33 +477,34 @@ impl Model {
         }
     }
 
-    /// Run `tokens` through the model at positions `start_pos..`, storing
-    /// their K/V in the blocks of `tables` (one block table per K/V group of
-    /// [`Model::kv_layout`], holding every block the call writes); returns
-    /// the logits `want` selects and the final-norm hidden rows `hidden`
-    /// selects (one per logits row).
+    /// Run the rows of several sequences through the model in one pass (a
+    /// forward step): each sequence's `tokens` at positions `start_pos..`,
+    /// their K/V stored in the blocks of its `tables` (one block table per
+    /// K/V group of [`Model::kv_layout`], holding every block the rows
+    /// write). Returns, per sequence, the logits `want` selects and the
+    /// final-norm hidden rows `hidden` selects (one per logits row), plus a
+    /// [`RecurrentSnapshot`] when asked. The dense layers read each weight
+    /// once for all rows of the step; a sequence's rows do not depend on the
+    /// other sequences in the step (bit for bit on the CPU with `exact`, up to
+    /// float rounding on a GPU).
     ///
-    /// `start_pos + tokens.len()` must not exceed the context length. With
-    /// `exact`, every row equals what a single-token step computes bit for
-    /// bit, which speculative verification needs: guaranteed on the CPU; on
-    /// a GPU the rows agree only up to float rounding.
+    /// Each sequence's `start_pos + tokens.len()` must not exceed the context
+    /// length. With `exact`, every row equals what a single-token step
+    /// computes bit for bit, which speculative verification needs:
+    /// guaranteed on the CPU; on a GPU the rows agree only up to float
+    /// rounding.
     ///
     /// # Errors
     ///
     /// [`CucaError::Provider`] for a rejected call or a failed forward pass.
-    pub(crate) fn forward_ext(
+    pub(crate) fn forward_batch(
         &mut self,
-        tokens: &[u32],
-        start_pos: usize,
-        tables: &[paged::BlockTable],
-        want: Want,
-        hidden: cpu::Hidden,
-        exact: bool,
-    ) -> Result<cpu::Forward, CucaError> {
+        batch: &Batch<'_>,
+    ) -> Result<Vec<cpu::Forward>, CucaError> {
         match self {
-            Model::Cpu(m) => m.forward_seq(tokens, start_pos, tables, want, hidden, exact),
+            Model::Cpu(m) => m.forward_batch(batch),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.forward_seq(tokens, start_pos, tables, want, hidden, exact),
+            Model::Gpu(m) => m.forward_batch(batch),
         }
     }
 
@@ -423,33 +517,69 @@ impl Model {
         }
     }
 
-    /// Take the model state back to at most `len` positions and return the
-    /// position it now sits at; the caller truncates its sequence's block
-    /// tables to it. An attention-only model keeps no state besides the K/V
-    /// blocks and returns `len`. A hybrid model (recurrent layers) retains
-    /// only positions it holds a state for: the current end, the
-    /// [`Model::checkpoint`] and the rows of the last multi-row `Want::All`
-    /// call; otherwise it falls back to the largest of those not above `len`
-    /// (`0`: recompute from scratch). See [`cpu::Transformer::rewind`] and
+    /// Take the recurrent state of `slot` back to at most `len` positions and
+    /// return the position it now sits at; the caller truncates its
+    /// sequence's block tables to it. An attention-only model keeps no state
+    /// besides the K/V blocks and returns `len`. A hybrid model (recurrent
+    /// layers) retains only positions it holds a state for: the slot's current
+    /// end and the rows of its last multi-row `Want::All` call; otherwise it
+    /// falls back to `0` (the zero state: recompute from scratch, or
+    /// [`Model::restore`] a snapshot). See [`cpu::Transformer::rewind`] and
     /// `Cache rollback` in the module docs.
-    pub(crate) fn rewind(&mut self, len: usize) -> usize {
+    pub(crate) fn rewind(&mut self, slot: StateSlot, len: usize) -> usize {
         match self {
-            Model::Cpu(m) => m.rewind(len),
+            Model::Cpu(m) => m.rewind(slot.0, len),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.rewind(len),
+            Model::Gpu(m) => m.rewind(slot.0, len),
         }
     }
 
-    /// Keep the recurrent state at the current end of the cache as the one
-    /// checkpoint [`Model::rewind`] can return to, replacing the previous
-    /// one. A no-op for models that can truncate anywhere (attention-only).
-    /// On a GPU the checkpoint is a set of handles to the current immutable
-    /// state tensors, so it costs nothing.
-    pub(crate) fn checkpoint(&mut self) {
+    /// A copy of the recurrent state of `slot` (after the rows of its last
+    /// forward call): the engine's prefix store keeps it next to the K/V
+    /// blocks of the same prefix. `None` for an attention-only model.
+    pub(crate) fn snapshot(&self, slot: StateSlot) -> Option<RecurrentSnapshot> {
         match self {
-            Model::Cpu(m) => m.checkpoint(),
+            Model::Cpu(m) => m.snapshot(slot.0).map(RecurrentSnapshot::Cpu),
             #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.checkpoint(),
+            Model::Gpu(m) => m.snapshot(slot.0).map(RecurrentSnapshot::Gpu),
+        }
+    }
+
+    /// Make `snapshot` (taken by [`Model::snapshot`] on a model of the same
+    /// device) the recurrent state of `slot`, now at
+    /// position `len`; `None` is the zero state at position 0. A no-op for
+    /// attention-only models.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a snapshot that does not belong to this
+    /// model.
+    pub(crate) fn restore(
+        &mut self,
+        slot: StateSlot,
+        snapshot: Option<&RecurrentSnapshot>,
+        len: usize,
+    ) -> Result<(), CucaError> {
+        if !self.is_hybrid() {
+            return Ok(());
+        }
+        match (self, snapshot) {
+            (Model::Cpu(m), None) => {
+                m.reset_slot(slot.0);
+                Ok(())
+            }
+            (Model::Cpu(m), Some(RecurrentSnapshot::Cpu(layers))) => m.restore(slot.0, layers, len),
+            #[cfg(feature = "provider-local-gpu")]
+            (Model::Gpu(m), None) => {
+                m.reset_slot(slot.0);
+                Ok(())
+            }
+            #[cfg(feature = "provider-local-gpu")]
+            (Model::Gpu(m), Some(RecurrentSnapshot::Gpu(snapshot))) => {
+                m.restore(slot.0, snapshot, len)
+            }
+            #[cfg(feature = "provider-local-gpu")]
+            _ => Err(err("the snapshot comes from another device")),
         }
     }
 

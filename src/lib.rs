@@ -116,10 +116,10 @@ pub use crate::plugins::web_search::{
 };
 #[cfg(feature = "provider-local")]
 pub use crate::provider::local::{
-    ConvertConfig, DownloadProgress, DownloadProgressCallback, DraftStats, DrafterSource,
-    ExpertHeat, ExpertPlacement, ExpertTierStats, ExpertTiers, GpuAdapter, LocalCapabilities,
-    LocalDevice, LocalModel, LocalModelConfig, ModelPreset, ModelSource, SamplingConfig,
-    WeightQuant,
+    BatchingConfig, ConvertConfig, DownloadProgress, DownloadProgressCallback, DraftStats,
+    DrafterSource, ExpertHeat, ExpertPlacement, ExpertTierStats, ExpertTiers, GpuAdapter,
+    LocalCapabilities, LocalDevice, LocalModel, LocalModelConfig, ModelPreset, ModelSource,
+    SamplingConfig, ServingStats, WeightQuant,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,

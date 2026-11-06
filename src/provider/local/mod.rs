@@ -60,18 +60,28 @@
 //!
 //! # Bounds
 //!
-//! - Single-slot FIFO engine: one request runs at a time, at most 16 queue
-//!   behind it (further callers wait), 64 output blocks buffered per request.
+//! - Continuous batching ([`BatchingConfig`]): up to `max_sequences` requests
+//!   (4 by default) run at once, each decode step one forward pass over a row
+//!   of every running sequence, prompts prefilled in chunks next to them; at
+//!   most 16 more queue behind (further callers wait), 64 output blocks are
+//!   buffered per request, and a consumer that does not keep up stalls only
+//!   its own request.
 //! - K/V cache memory: blocks of 16 positions, `2 * 4 * 16 * n_kv_head *
 //!   head_dim` bytes per block and layer that owns K/V ([`LocalModel::kv_cache_bytes`]),
-//!   in RAM or device memory. A full-attention group holds twice
-//!   `context_length` positions, a sliding-window group `ceil((window - 1 +
-//!   rows) / 16) + 2` blocks per running sequence plus cached prefixes. At 8192
+//!   in RAM or device memory. The pool is shared by every running sequence and
+//!   the cached prefixes: a full-attention group holds [`BatchingConfig::kv_tokens`]
+//!   positions (twice `context_length` by default, whatever `max_sequences`
+//!   is), a sliding-window group `ceil((window - 1 + rows) / 16) + 2` blocks
+//!   per running sequence plus cached prefixes. When the pool is full a
+//!   running request that needs a block preempts the youngest one, which
+//!   resumes later from the blocks it left in the prefix store. At 8192
 //!   positions: 422 MB for Gemma 4 E2B, 1.27 GB for E4B, 3.76 GB for
 //!   Qwen3-0.6B and 12.88 GB for Phi-3.5-mini (a full-attention model with 32
 //!   KV heads needs a smaller `context_length`). A prefix store keeps the
 //!   blocks of finished requests, named by their token ids, and a prompt
-//!   reuses whole blocks of its cached prefix.
+//!   reuses whole blocks of its cached prefix (a hybrid model also resumes
+//!   from a recurrent-state snapshot of that position; about 20 MB each for
+//!   Qwen3.5-0.8B, [`ServingStats::snapshot_bytes`]).
 //! - Gemma 4's per-layer embedding rows are read from disk per input token
 //!   instead of being held in RAM (5,040 bytes each and 1.32 GB saved in E2B
 //!   Q4_0). A mixture-of-experts model keeps every expert resident by default
@@ -79,7 +89,11 @@
 //!   [`ExpertPlacement::Tiered`] keeps the experts in the file instead and
 //!   streams them through RAM (and, on a GPU, device-memory) caches of a
 //!   configured byte size, with the same output.
-//! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix.
+//! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix,
+//!   and a step carries at most [`BatchingConfig::max_step_tokens`] rows in
+//!   all. An in-trunk drafter observes every position of its sequence, so
+//!   with one the engine serves one request at a time; a file drafter
+//!   speculates only while one request runs alone.
 //!
 //! # Determinism
 //!
@@ -1036,8 +1050,9 @@ pub struct LocalModelConfig {
     /// environment variable, then to anonymous access.
     pub hf_token: Option<String>,
     /// Maximum tokens of prompt plus completion per request. The K/V block
-    /// pools hold twice this many positions per full-attention layer group, so
-    /// a layer costs `2 * context_length * 2 * 4 * n_kv_head * head_dim` bytes
+    /// pools hold twice this many positions per full-attention layer group
+    /// (shared by every running request; [`BatchingConfig::kv_tokens`] sets
+    /// the pool), so a layer costs `2 * context_length * 2 * 4 * n_kv_head * head_dim` bytes
     /// of RAM (Gemma 4 E2B 422 MB at 8192, Qwen3-0.6B 458,752 bytes per
     /// context position, Phi-3.5-mini 1,572,864, i.e. 12.88 GB at 8192: size it
     /// for the model; [`LocalModel::kv_cache_bytes`] reports the result; see
@@ -1077,6 +1092,8 @@ pub struct LocalModelConfig {
     pub experts: ExpertPlacement,
     /// How a checkpoint source is converted to GGUF; unused for GGUF sources.
     pub convert: ConvertConfig,
+    /// How concurrent requests share the engine: see [`BatchingConfig`].
+    pub batching: BatchingConfig,
 }
 
 impl Default for LocalModelConfig {
@@ -1093,6 +1110,7 @@ impl Default for LocalModelConfig {
             on_download_progress: None,
             experts: ExpertPlacement::Resident,
             convert: ConvertConfig::default(),
+            batching: BatchingConfig::default(),
         }
     }
 }
@@ -1111,6 +1129,7 @@ impl fmt::Debug for LocalModelConfig {
             .field("on_download_progress", &self.on_download_progress)
             .field("experts", &self.experts)
             .field("convert", &self.convert)
+            .field("batching", &self.batching)
             .finish()
     }
 }
@@ -1125,6 +1144,7 @@ type Ready = Result<
         usize,
         u64,
         Option<Arc<model::tier::TierShared>>,
+        Arc<engine::ServingCounters>,
     ),
     CucaError,
 >;
@@ -1139,6 +1159,7 @@ pub(crate) struct LocalModelInner {
     context_length: usize,
     kv_cache_bytes: u64,
     draft_stats: Arc<engine::DraftCounters>,
+    serving: Arc<engine::ServingCounters>,
     /// Counters and heat of the expert tiers; `None` unless
     /// [`ExpertPlacement::Tiered`].
     tiers: Option<Arc<model::tier::TierShared>>,
@@ -1154,16 +1175,26 @@ pub(crate) struct LocalModelInner {
 ///
 /// # Concurrency and memory
 ///
-/// - The engine is a single slot: requests run one at a time in FIFO order,
-///   with at most 16 queued behind the running one. Past that,
-///   `generate_stream` waits for a free queue slot (backpressure, not an
-///   error). A running request streams through a bounded 64-block channel, so
-///   a slow consumer paces generation, and dropping the stream stops it.
+/// - The engine is a step scheduler ([`BatchingConfig`]): requests are
+///   admitted in FIFO order while fewer than `max_sequences` (4 by default)
+///   run and the pool can hold their prompts, and every step runs the decode
+///   row of each running sequence (and a chunk of each prompt still being
+///   prefilled) in one forward pass: the weights are read once per step, not
+///   once per request, so aggregate throughput rises with the number of
+///   running requests. At most 16 requests queue behind the running ones.
+///   Past that, `generate_stream` waits for a free queue slot (backpressure,
+///   not an error). A running request streams through a bounded 64-block
+///   channel; a consumer that does not keep up stalls its own request only,
+///   and dropping the stream stops it and keeps its work in the prefix store.
+///   [`LocalModel::serving_stats`] reports the running and waiting counts,
+///   free and cached blocks, prefix hits, preemptions and the rows per step.
 /// - The K/V cache is paged and preallocated: blocks of 16 positions in
 ///   pools, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and layer that
 ///   owns K/V (each layer's head count and head dimension come from the file;
-///   [`LocalModel::kv_cache_bytes`] reports the total). A full-attention
-///   group holds twice `context_length` positions, a sliding-window group its
+///   [`LocalModel::kv_cache_bytes`] reports the total). The pool is shared by
+///   all running sequences: a full-attention group holds
+///   [`BatchingConfig::kv_tokens`] positions (twice `context_length` by
+///   default, however many sequences run), a sliding-window group its
 ///   window plus about 270 positions per running sequence plus cached
 ///   prefixes. At the default 8192 that is 422 MB for Gemma 4 E2B, 1.27 GB for
 ///   E4B and 3.76 GB for Qwen3-0.6B (28 full-attention layers, 8 KV heads of
@@ -1267,18 +1298,134 @@ impl DraftStats {
     }
 }
 
+/// A snapshot of the engine's scheduler and K/V pools, see
+/// [`LocalModel::serving_stats`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub struct ServingStats {
+    /// Requests running now (prefilling or decoding).
+    pub running: usize,
+    /// Requests admitted to the engine but waiting for a slot or for K/V
+    /// blocks (including a request preempted and put back in the queue).
+    pub waiting: usize,
+    /// Free blocks in the full-attention pool (or the first pool of a model
+    /// without one).
+    pub free_blocks: usize,
+    /// Unreferenced blocks the prefix store keeps in that pool.
+    pub cached_blocks: usize,
+    /// Bytes of recurrent-state snapshots the prefix store keeps (hybrid
+    /// models; zero for the others).
+    pub snapshot_bytes: u64,
+    /// Prompt tokens served from the prefix store since load.
+    pub prefix_hit_tokens: u64,
+    /// Sequences preempted (their blocks released, the request put back in
+    /// the queue) since load.
+    pub preemptions: u64,
+    /// Forward steps the scheduler ran since load.
+    pub steps: u64,
+    /// Rows (tokens) those steps processed since load; `batched_rows > steps`
+    /// means steps carried several rows.
+    pub batched_rows: u64,
+}
+
+/// How the engine serves concurrent requests: a step scheduler that runs the
+/// decode rows of several sequences, and chunks of prompts being prefilled,
+/// in one forward pass over one shared K/V block pool (see the local-provider
+/// module docs). `FromStr` parses `seqs=4,kv=16384,step=256,prefix=off` (any
+/// subset; `kv` and `step` in tokens, `prefix` is `on`/`off`), which the
+/// tests and the example read from `CUCA_LOCAL_BATCHING`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BatchingConfig {
+    /// Most sequences running at once, `1..=64` (default 4). Each running
+    /// sequence of a hybrid model (Qwen 3.5) also holds its own recurrent
+    /// state (20 MB for the 0.8B model).
+    pub max_sequences: usize,
+    /// Positions in the shared K/V block pool: the pool of every
+    /// full-attention layer group holds this many positions for all running
+    /// sequences and the cached prefixes together (a sliding-window group
+    /// `max_sequences` windows plus cached prefixes). `None` (the default)
+    /// is twice `context_length`; an explicit value is at least
+    /// `context_length + 16` and rounds up to whole blocks of 16. It is the
+    /// K/V memory knob: [`LocalModel::kv_cache_bytes`] reports the result, and
+    /// raising `max_sequences` does not raise it.
+    pub kv_tokens: Option<usize>,
+    /// Most rows (tokens) of one forward step across all sequences, at least
+    /// `max_sequences` and at most 2048. `None` (the default) is the prefill
+    /// chunk of the context length (256 at 8192 positions).
+    pub max_step_tokens: Option<usize>,
+    /// Keep the K/V of finished requests, and of prefix blocks leaving a
+    /// sliding window, in the prefix store for later prompts (the default).
+    /// With `false` nothing is registered, so every prompt is prefilled in
+    /// full.
+    pub prefix_cache: bool,
+}
+
+impl Default for BatchingConfig {
+    fn default() -> Self {
+        Self {
+            max_sequences: 4,
+            kv_tokens: None,
+            max_step_tokens: None,
+            prefix_cache: true,
+        }
+    }
+}
+
+impl std::str::FromStr for BatchingConfig {
+    type Err = CucaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let bad = || {
+            CucaError::Config(format!(
+                "unknown batching `{s}`; expected a comma-separated subset of seqs=<n>,kv=<tokens>,step=<tokens>,prefix=on|off"
+            ))
+        };
+        let mut config = Self::default();
+        let lower = s.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return Ok(config);
+        }
+        let mut seen = Vec::new();
+        for part in lower.split(',') {
+            let (key, value) = part.split_once('=').ok_or_else(bad)?;
+            if seen.contains(&key) {
+                return Err(bad());
+            }
+            seen.push(key);
+            let number = || value.parse::<usize>().map_err(|_| bad());
+            match key {
+                "seqs" => config.max_sequences = number()?,
+                "kv" => config.kv_tokens = Some(number()?),
+                "step" => config.max_step_tokens = Some(number()?),
+                "prefix" => {
+                    config.prefix_cache = match value {
+                        "on" | "true" | "1" => true,
+                        "off" | "false" | "0" => false,
+                        _ => return Err(bad()),
+                    }
+                }
+                _ => return Err(bad()),
+            }
+        }
+        Ok(config)
+    }
+}
+
 impl LocalModel {
     /// Bytes the K/V block pools occupy, in RAM or device memory: blocks of 16
     /// positions, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and layer
-    /// that owns K/V. A full-attention group of layers holds twice
-    /// `context_length` positions; a sliding-window group `ceil((window - 1 +
-    /// rows) / 16) + 2` blocks per running sequence (rows: one call's, at
-    /// most 256) plus up to `context_length` positions of cached prefixes (see
-    /// the local-provider module docs).
+    /// that owns K/V. A full-attention group of layers holds
+    /// [`BatchingConfig::kv_tokens`] positions, shared by every running
+    /// sequence (twice `context_length` by default, whatever `max_sequences`
+    /// is); a sliding-window group `ceil((window - 1 + rows) / 16) + 2` blocks
+    /// per running sequence (rows: one call's, at most 256) plus up to
+    /// `kv_tokens - context_length` positions of cached prefixes (see the
+    /// local-provider module docs).
     ///
     /// A hybrid model (Qwen 3.5) owns K/V only in its attention layers, and
-    /// besides keeps a recurrent state of fixed size (about 20 MB for the
-    /// 0.8B model, three copies while speculating) that is not counted here.
+    /// besides keeps a recurrent state of fixed size per running sequence
+    /// (about 20 MB for the 0.8B model, two copies while speculating) plus
+    /// one per cached snapshot, none of it counted here.
     pub fn kv_cache_bytes(&self) -> u64 {
         self.inner.kv_cache_bytes
     }
@@ -1299,6 +1446,13 @@ impl LocalModel {
     /// Speculative-decoding counters (all zero without a drafter).
     pub fn draft_stats(&self) -> DraftStats {
         self.inner.draft_stats.snapshot()
+    }
+
+    /// The scheduler and K/V pool counters: requests running and waiting,
+    /// free and cached blocks, prefix-store hits, preemptions, and how many
+    /// rows the forward steps carried (see [`ServingStats`]).
+    pub fn serving_stats(&self) -> ServingStats {
+        self.inner.serving.snapshot()
     }
 
     /// Expert tier counters (hits per tier, file reads, resident bytes);
@@ -1398,6 +1552,7 @@ impl LocalModel {
                                 engine.context_length(),
                                 engine.kv_cache_bytes(),
                                 engine.expert_tiers(),
+                                engine.serving_counters(),
                             )))
                             .is_err()
                         {
@@ -1410,29 +1565,34 @@ impl LocalModel {
                         return;
                     }
                 };
-                while let Some(job) = jobs_rx.blocking_recv() {
-                    engine.run(job);
-                }
+                engine.run_loop(&mut jobs_rx);
             })
             .map_err(|e| CucaError::Io {
                 message: format!("failed to start the local engine thread: {e}"),
             })?;
 
         match ready_rx.await {
-            Ok(Ok((tokenizer, template, format, context_length, kv_cache_bytes, tiers))) => {
-                Ok(LocalModel {
-                    inner: Arc::new(LocalModelInner {
-                        jobs: jobs_tx,
-                        tokenizer,
-                        template,
-                        format,
-                        context_length,
-                        kv_cache_bytes,
-                        draft_stats,
-                        tiers,
-                    }),
-                })
-            }
+            Ok(Ok((
+                tokenizer,
+                template,
+                format,
+                context_length,
+                kv_cache_bytes,
+                tiers,
+                serving,
+            ))) => Ok(LocalModel {
+                inner: Arc::new(LocalModelInner {
+                    jobs: jobs_tx,
+                    tokenizer,
+                    template,
+                    format,
+                    context_length,
+                    kv_cache_bytes,
+                    draft_stats,
+                    serving,
+                    tiers,
+                }),
+            }),
             Ok(Err(e)) => Err(e),
             Err(_) => Err(CucaError::provider(
                 ProviderEndpoint::Local,
@@ -1448,6 +1608,21 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
         return Err(CucaError::Config(
             "context_length must be at least 1".into(),
         ));
+    }
+    let batching = &config.batching;
+    if !(1..=64).contains(&batching.max_sequences) {
+        return Err(CucaError::Config(format!(
+            "batching.max_sequences must be in 1..=64, got {}",
+            batching.max_sequences
+        )));
+    }
+    if let Some(step) = batching.max_step_tokens
+        && !(batching.max_sequences..=2048).contains(&step)
+    {
+        return Err(CucaError::Config(format!(
+            "batching.max_step_tokens must be in max_sequences..=2048 ({}..=2048), got {step}",
+            batching.max_sequences
+        )));
     }
     let temperature = config.sampling.temperature;
     if !temperature.is_finite() || temperature < 0.0 {
@@ -1996,6 +2171,79 @@ mod tests {
                 matches!(&err, CucaError::Config(m) if m.contains("unknown expert placement")),
                 "{bad}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn batching_parses_every_subset_and_validates_its_bounds() {
+        let default = BatchingConfig::default();
+        assert_eq!(
+            (
+                default.max_sequences,
+                default.kv_tokens,
+                default.max_step_tokens
+            ),
+            (4, None, None)
+        );
+        assert!(default.prefix_cache);
+        for (text, seqs, kv, step, prefix) in [
+            ("", 4, None, None, true),
+            ("seqs=8", 8, None, None, true),
+            (" SEQS=2, kv=16384 ", 2, Some(16384), None, true),
+            (
+                "seqs=4,kv=8192,step=128,prefix=off",
+                4,
+                Some(8192),
+                Some(128),
+                false,
+            ),
+            ("prefix=on,step=64", 4, None, Some(64), true),
+            ("prefix=false", 4, None, None, false),
+        ] {
+            let parsed = text.replace(' ', "").parse::<BatchingConfig>().unwrap();
+            assert_eq!(
+                (
+                    parsed.max_sequences,
+                    parsed.kv_tokens,
+                    parsed.max_step_tokens,
+                    parsed.prefix_cache
+                ),
+                (seqs, kv, step, prefix),
+                "{text}"
+            );
+        }
+        for bad in [
+            "seqs",
+            "seqs=x",
+            "seqs=-1",
+            "seqs=2,seqs=3",
+            "slots=2",
+            "prefix=maybe",
+            "kv=1k",
+        ] {
+            let err = bad.parse::<BatchingConfig>().unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains("unknown batching")),
+                "{bad}: {err}"
+            );
+        }
+        let with = |batching: BatchingConfig| LocalModelConfig {
+            batching,
+            ..LocalModelConfig::default()
+        };
+        let rejected = |text: &str| {
+            let err = validate(&with(text.parse().unwrap())).unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains("batching")),
+                "{text}: {err}"
+            );
+        };
+        rejected("seqs=0");
+        rejected("seqs=65");
+        rejected("seqs=4,step=3");
+        rejected("step=2049");
+        for ok in ["seqs=1", "seqs=64,step=64", "step=2048", "kv=1"] {
+            assert!(validate(&with(ok.parse().unwrap())).is_ok(), "{ok}");
         }
     }
 

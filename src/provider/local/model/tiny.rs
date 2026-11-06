@@ -26,6 +26,7 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
 
 use super::cpu::Transformer;
+use super::paged::Sizing;
 
 pub(crate) const VOCAB: usize = 16;
 pub(crate) const CONTEXT: usize = 32;
@@ -649,9 +650,21 @@ pub(crate) fn write_spec(s: &TinySpec) -> TinyModel {
 }
 
 pub(crate) fn load(model: &TinyModel, context_length: usize) -> Transformer {
+    load_sized(model, context_length, &Sizing::single(context_length))
+}
+
+/// [`load`] for `sizing` sequences.
+pub(crate) fn load_sized(model: &TinyModel, context_length: usize, sizing: &Sizing) -> Transformer {
     let mut reader = BufReader::new(File::open(&model.path).unwrap());
     let content = gguf_file::Content::read(&mut reader).unwrap();
-    Transformer::load(&content, &model.path, context_length).unwrap()
+    Transformer::load_placed(
+        &content,
+        &model.path,
+        context_length,
+        &crate::provider::local::ExpertPlacement::Resident,
+        sizing,
+    )
+    .unwrap()
 }
 
 pub(crate) const PROMPT: [u32; 11] = [3, 5, 7, 1, 9, 2, 4, 6, 8, 10, 12];

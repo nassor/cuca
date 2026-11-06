@@ -352,12 +352,13 @@ impl Transformer {
         let (k, v) = aw.project_kv(&h, spec.n_head, spec.n_kv_head, spec.head_dim)?;
         let call = AttnCall {
             spec,
+            offset: 0,
             start: slot,
             rope_start: first + 1,
             t: m,
             kv: KvAccess::Slab(&head.kv),
         };
-        self.store_kv(&call, aw, &k, &v)
+        self.store_kv(std::slice::from_ref(&call), aw, &k, &v)
     }
 
     /// Draft at most `k` tokens after the pending token `first`: `hidden` is
@@ -425,13 +426,14 @@ impl Transformer {
         let x = self.head_input(head, emb, hidden)?;
         let call = AttnCall {
             spec: &head.spec,
+            offset: 0,
             start: slot,
             rope_start: j + 1,
             t: 1,
             kv: KvAccess::Slab(&head.kv),
         };
         let y = self.block(&head.block, &x, None, 1, |h| {
-            self.attention_in(&call, aw, h)
+            self.attention_in(std::slice::from_ref(&call), aw, h)
         })?;
         let normed = rms(&y, &head.shared_head_norm, self.hp.eps as f32)?;
         let logits = self.head_rows(&normed, head.vocab_rows)?;

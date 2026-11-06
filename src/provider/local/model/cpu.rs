@@ -18,19 +18,19 @@ use candle_nn::ops::{rms_norm, sigmoid, softmax_last_dim};
 use candle_nn::rotary_emb::{rope, rope_i};
 
 use super::arch::Act;
-use super::delta::{DeltaCell, DeltaKernel, Rows};
+use super::delta::{DeltaCell, DeltaKernel, DeltaState, Rows};
 use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
 use super::moe::route;
 #[cfg(test)]
 use super::paged::Solo;
-use super::paged::{BLOCK_SIZE, BlockTable, KvLayout};
+use super::paged::{BLOCK_SIZE, BlockTable, KvLayout, Sizing};
 use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
 use super::qmm::QmmWeight;
 use super::quant::{RowTable, TokenEmbedding};
 use super::rope::RopeKind;
 use super::tier::{BuildFn, ExpertSlice, ExpertStore, LayerExperts, TierShared, add};
 use super::{
-    Want, attention_mask, build_rope_tables, candle_err, check_context, err, read_hparams,
+    Batch, Want, attention_mask, build_rope_tables, candle_err, check_context, err, read_hparams,
 };
 use crate::error::CucaError;
 use crate::provider::local::{ExpertPlacement, ExpertTiers};
@@ -278,7 +278,8 @@ struct PleLayer {
 
 /// Gated delta-net weights of one layer: the five projections and, in
 /// [`DeltaKernel`], the convolution, gate and norm parameters of its
-/// recurrence; the cell holds the recurrent state and its snapshots.
+/// recurrence; each cell holds the recurrent state of one sequence slot and
+/// its rollback record.
 struct DeltaWeights {
     kernel: DeltaKernel,
     /// `attn_qkv`: the convolution inputs `[q | k | v]`.
@@ -291,9 +292,9 @@ struct DeltaWeights {
     alpha: QMatMul,
     /// `ssm_out`.
     out: QMatMul,
-    /// Behind a mutex because a layer runs on a shared `&Transformer`; only
-    /// the engine thread ever locks it.
-    cell: Mutex<DeltaCell>,
+    /// One cell per state slot, each behind a mutex because a layer runs on a
+    /// shared `&Transformer`; only the engine thread ever locks them.
+    cells: Vec<Mutex<DeltaCell>>,
 }
 
 /// What mixes the tokens of one layer. The delta-net weights are boxed: they
@@ -638,16 +639,20 @@ fn open_expert_store(
 /// position restorable.
 pub(crate) const MAX_VERIFY_ROWS: usize = 17;
 
-/// The cache positions a hybrid model can return to besides its end: the
+/// What a hybrid model keeps for one sequence slot besides its K/V: where
+/// the recurrent state sits and which earlier positions it can return to. The
 /// recurrent state is not positional, so a position needs a snapshot. See
 /// [`Transformer::rewind`].
 #[derive(Debug, Default)]
-struct Rollback {
-    /// The position of the checkpoint stored in every delta-net cell.
-    checkpoint: Option<usize>,
-    /// First position and row count of the last forward call that recorded
-    /// its rows (`Want::All` over `2..=MAX_VERIFY_ROWS` rows), until the next
-    /// forward call: positions `first..first + rows` can be rebuilt.
+struct Slot {
+    /// The position the slot's state sits at: where the next forward call for
+    /// the slot must start. An attention-only model reads every position
+    /// from the block tables and keeps no slots.
+    len: usize,
+    /// First position and row count of the slot's last forward call that
+    /// recorded its rows (`Want::All` over `2..=MAX_VERIFY_ROWS` rows), until
+    /// the slot's next forward call: positions `first..first + rows` can be
+    /// rebuilt.
     verify: Option<(usize, usize)>,
 }
 
@@ -670,15 +675,13 @@ pub(crate) struct Transformer {
     /// The paged K/V of every K/V-owning layer (`None` for the others).
     kv: Vec<Option<Arc<KvLayer>>>,
     layout: KvLayout,
-    /// The position the model state sits at: where the next forward call must
-    /// start. Only a hybrid model's recurrent state makes it matter; an
-    /// attention-only model reads every position from the block tables.
-    len: usize,
+    /// One state slot per sequence the model can run at once (hybrid models
+    /// only; empty otherwise).
+    slots: Vec<Slot>,
     #[cfg(test)]
     solo: Solo,
     /// Whether any layer is a delta-net layer (has a recurrent state).
     hybrid: bool,
-    rollback: Rollback,
     /// Counters and heat of the expert tiers (`ExpertPlacement::Tiered`).
     tiers: Option<Arc<TierShared>>,
 }
@@ -699,6 +702,7 @@ pub(crate) enum Hidden {
 }
 
 /// What a forward pass returns.
+#[derive(Default)]
 pub(crate) struct Forward {
     pub(crate) logits: Option<Vec<f32>>,
     pub(crate) hidden: Option<Vec<f32>>,
@@ -735,19 +739,38 @@ enum KvAccess<'a> {
     },
 }
 
-/// One attention call: the rows it processes and the K/V storage it uses.
-/// The trunk runs a layer at `rope_start == start` over the paged cache;
+/// One attention call: the rows one sequence contributes and the K/V storage it
+/// uses. The trunk runs a layer at `rope_start == start` over the paged cache;
 /// the multi-token-prediction head (see [`head`]) runs its block over its own
 /// cache, whose slots are not RoPE positions.
 #[derive(Clone, Copy)]
 struct AttnCall<'a> {
     spec: &'a LayerSpec,
+    /// Row of the call's first row among the rows of the whole forward step
+    /// (the rows of several sequences are concatenated).
+    offset: usize,
     /// Cache index of the first row: the call's `t` rows fill `start..`.
     start: usize,
     /// RoPE position of the first row (the rows are consecutive positions).
     rope_start: usize,
     t: usize,
     kv: KvAccess<'a>,
+}
+
+/// One sequence's share of a forward step: its rows are `offset..offset + t`
+/// of the step's concatenated rows.
+struct Seg<'a> {
+    start: usize,
+    offset: usize,
+    t: usize,
+    tables: &'a [BlockTable],
+    /// The state slot (hybrid models).
+    slot: usize,
+    /// A delta-net layer keeps what cache rollback needs from this call (see
+    /// [`Transformer::rewind`]).
+    record: bool,
+    want: Want,
+    hidden: Hidden,
 }
 
 /// A drafter's input and output projections: `pre` maps the concatenation of
@@ -767,12 +790,20 @@ impl Transformer {
         path: &Path,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        Self::load_placed(content, path, context_length, &ExpertPlacement::Resident)
+        Self::load_placed(
+            content,
+            path,
+            context_length,
+            &ExpertPlacement::Resident,
+            &Sizing::single(context_length),
+        )
     }
 
     /// Load the model from the GGUF file at `path`, whose index `content`
     /// was read already, with a K/V cache for `context_length` positions and
-    /// the experts of a mixture-of-experts model placed as `experts` says.
+    /// the experts of a mixture-of-experts model placed as `experts` says;
+    /// `sizing` says how many sequences the pools and the recurrent-state
+    /// slots serve.
     ///
     /// # Errors
     ///
@@ -786,8 +817,9 @@ impl Transformer {
         path: &Path,
         context_length: usize,
         experts: &ExpertPlacement,
+        sizing: &Sizing,
     ) -> Result<Self, CucaError> {
-        Self::load_with(content, path, context_length, false, false, experts)
+        Self::load_with(content, path, context_length, false, false, experts, sizing)
     }
 
     /// Load a multi-token-prediction drafter (`gemma4-assistant`): its
@@ -810,6 +842,7 @@ impl Transformer {
             false,
             true,
             &ExpertPlacement::Resident,
+            &Sizing::single(context_length),
         )
     }
 
@@ -828,6 +861,7 @@ impl Transformer {
             true,
             false,
             &ExpertPlacement::Resident,
+            &Sizing::single(context_length),
         )
     }
 
@@ -849,6 +883,7 @@ impl Transformer {
         dequantize: bool,
         drafter: bool,
         experts: &ExpertPlacement,
+        sizing: &Sizing,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         match (drafter, hp.arch.is_drafter()) {
@@ -933,7 +968,7 @@ impl Transformer {
             })
             .collect::<Result<Vec<_>, CucaError>>()?;
 
-        let kv_layout = KvLayout::single(&hp, context_length);
+        let kv_layout = KvLayout::sized(&hp, context_length, sizing);
         let mut layers = Vec::with_capacity(hp.n_layer);
         let mut kv_layers = Vec::with_capacity(hp.n_layer);
         for (il, spec) in hp.layers.iter().enumerate() {
@@ -962,6 +997,11 @@ impl Transformer {
         };
 
         let hybrid = hp.is_hybrid();
+        for lw in &mut layers {
+            if let Mixer::Delta(dw) = &mut lw.mixer {
+                dw.set_slots(sizing.max_sequences);
+            }
+        }
         #[cfg(test)]
         let solo = Solo::new(&kv_layout);
         Ok(Self {
@@ -977,95 +1017,143 @@ impl Transformer {
             ropes,
             kv: kv_layers,
             layout: kv_layout,
-            len: 0,
             #[cfg(test)]
             solo,
             hybrid,
-            rollback: Rollback::default(),
+            slots: (0..if hybrid {
+                sizing.max_sequences.max(1)
+            } else {
+                0
+            })
+                .map(|_| Slot::default())
+                .collect(),
             tiers: store.map(|s| Arc::clone(s.shared())),
         })
     }
 
-    /// Run `tokens` through the model at positions `start_pos..`, storing
-    /// their K/V in the blocks of `tables` (one block table per group of the
-    /// model's [`KvLayout`], already holding every block the call writes);
-    /// returns the logits `want` selects and the final-norm hidden rows
-    /// `hidden` selects (one per row of logits). With `exact`, every batch row
+    /// Run the rows of every sequence of `batch` through the model in one
+    /// pass, storing their K/V in the blocks of each sequence's tables (one
+    /// block table per group of the model's [`KvLayout`], already holding
+    /// every block the rows write); returns, per sequence, the logits `want`
+    /// selects and the final-norm hidden rows `hidden` selects. The dense
+    /// layers run over all rows at once (each weight is read once for the
+    /// whole step), attention per sequence. With `batch.exact`, every row
     /// equals, bit for bit, what a single-token step at its position computes
-    /// (see [`RowExact`]).
+    /// (see [`RowExact`]), so the output of a sequence does not depend on the
+    /// other sequences in the step.
     ///
-    /// A hybrid model's recurrent state sits at one position (the end of its
-    /// last call): `start_pos` must equal it.
+    /// A hybrid model's recurrent state sits at one position per state slot
+    /// (the end of the slot's last call): `start_pos` must equal it, and a
+    /// slot appears at most once per step.
     ///
     /// # Errors
     ///
-    /// [`CucaError::Provider`] for an empty `tokens`, a hybrid model's
-    /// `start_pos` other than its state's position, more positions than the
-    /// context length or than `tables` holds, a drafter model (it has no
-    /// token embedding) or a failed pass; a hybrid model then drops its
-    /// recurrent state.
-    pub(crate) fn forward_seq(
-        &mut self,
-        tokens: &[u32],
-        start_pos: usize,
-        tables: &[BlockTable],
-        want: Want,
-        hidden: Hidden,
-        exact: bool,
-    ) -> Result<Forward, CucaError> {
-        let _exact = RowExact::enter(exact);
-        if tokens.is_empty() {
-            return Err(err("forward requires at least one token"));
+    /// [`CucaError::Provider`] for an empty batch or a sequence without
+    /// tokens, a hybrid model's `start_pos` other than its slot's position,
+    /// a state slot out of range or used twice, more positions than the
+    /// context length or than a sequence's tables hold, a drafter model (it
+    /// has no token embedding) or a failed pass; a hybrid model then drops
+    /// the recurrent state of every slot in the step.
+    pub(crate) fn forward_batch(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
+        let _exact = RowExact::enter(batch.exact);
+        if batch.rows.is_empty() {
+            return Err(err("a forward step requires at least one sequence"));
         }
-        if self.hybrid && start_pos != self.len {
-            return Err(err(format!(
-                "forward start {start_pos} does not match the recurrent state's position {}",
-                self.len
-            )));
-        }
-        let hi = start_pos + tokens.len();
-        if hi > self.context_length {
-            return Err(err(format!(
-                "{hi} positions exceed the context length {}",
-                self.context_length
-            )));
+        let mut tokens: Vec<u32> = Vec::new();
+        let mut segs = Vec::with_capacity(batch.rows.len());
+        for (i, r) in batch.rows.iter().enumerate() {
+            if r.tokens.is_empty() {
+                return Err(err("forward requires at least one token"));
+            }
+            let hi = r.start_pos + r.tokens.len();
+            if hi > self.context_length {
+                return Err(err(format!(
+                    "{hi} positions exceed the context length {}",
+                    self.context_length
+                )));
+            }
+            if self.hybrid {
+                let Some(state) = self.slots.get(r.state.0) else {
+                    return Err(err(format!(
+                        "state slot {} is out of range (the model has {})",
+                        r.state.0,
+                        self.slots.len()
+                    )));
+                };
+                if r.start_pos != state.len {
+                    return Err(err(format!(
+                        "forward start {} does not match the recurrent state's position {}",
+                        r.start_pos, state.len
+                    )));
+                }
+                if batch.rows[..i].iter().any(|o| o.state == r.state) {
+                    return Err(err(format!(
+                        "state slot {} appears twice in one step",
+                        r.state.0
+                    )));
+                }
+            }
+            segs.push(Seg {
+                start: r.start_pos,
+                offset: tokens.len(),
+                t: r.tokens.len(),
+                tables: r.tables,
+                slot: r.state.0,
+                record: self.hybrid
+                    && r.want == Want::All
+                    && (2..=MAX_VERIFY_ROWS).contains(&r.tokens.len()),
+                want: r.want,
+                hidden: r.hidden,
+            });
+            tokens.extend_from_slice(r.tokens);
         }
         let embed = self
             .embed
             .as_ref()
             .ok_or_else(|| err("a drafter has no token embedding; use `draft`"))?;
-        let embeddings = embed.rows(tokens, self.hp.embd_scale)?;
+        let embeddings = embed.rows(&tokens, self.hp.embd_scale)?;
         let per_layer = match (&mut self.ple, self.hp.ple_dim) {
-            (Some(ple), Some(dim)) => Some(ple.table.rows(tokens, (dim as f32).sqrt())?),
+            (Some(ple), Some(dim)) => Some(ple.table.rows(&tokens, (dim as f32).sqrt())?),
             _ => None,
         };
         // The call that recorded rows for rollback is over once another one
-        // starts. A hybrid model whose pass fails half-way holds a recurrent
-        // state some layers advanced and others did not: it is discarded.
-        let record =
-            self.hybrid && want == Want::All && (2..=MAX_VERIFY_ROWS).contains(&tokens.len());
-        self.rollback.verify = None;
-        let out = match self.forward_layers(
-            embeddings,
-            per_layer,
-            tokens.len(),
-            start_pos,
-            tables,
-            want,
-            hidden,
-            record,
-        ) {
-            Ok(out) => out,
+        // starts. A hybrid model whose pass fails half-way holds recurrent
+        // states some layers advanced and others did not: they are discarded.
+        if self.hybrid {
+            for seg in &segs {
+                self.slots[seg.slot].verify = None;
+            }
+        }
+        let outs = match self.forward_layers(embeddings, per_layer, &segs) {
+            Ok(outs) => outs,
             Err(e) => {
-                self.discard_state();
+                for seg in &segs {
+                    self.reset_slot(seg.slot);
+                }
                 return Err(candle_err(e));
             }
         };
-        self.len = hi;
-        if record {
-            self.rollback.verify = Some((start_pos, tokens.len()));
+        if self.hybrid {
+            for seg in &segs {
+                let slot = &mut self.slots[seg.slot];
+                slot.len = seg.start + seg.t;
+                if seg.record {
+                    slot.verify = Some((seg.start, seg.t));
+                }
+            }
         }
-        Ok(out)
+        Ok(outs)
+    }
+
+    /// Copies of the recurrent state of every delta-net layer for `slot`
+    /// (after its last forward call); `None` for an attention-only model or a
+    /// slot out of range.
+    pub(crate) fn snapshot(&self, slot: usize) -> Option<Vec<DeltaState>> {
+        (self.hybrid && slot < self.slots.len()).then(|| {
+            self.delta_layers()
+                .map(|dw| dw.with_cell(slot, |cell| cell.snapshot()))
+                .collect()
+        })
     }
 
     /// The block pools' layout: groups and blocks per group.
@@ -1179,7 +1267,17 @@ impl Transformer {
             let input = Tensor::from_vec(input.to_vec(), (1, 1, input.len()), dev)?;
             let mut x = nextn.pre.forward(&input)?;
             for il in 0..hp.n_layer {
-                x = self.layer(il, &x, None, pos, 1, &[], Some((ext, len)), false)?;
+                let seg = Seg {
+                    start: pos,
+                    offset: 0,
+                    t: 1,
+                    tables: &[],
+                    slot: 0,
+                    record: false,
+                    want: Want::None,
+                    hidden: Hidden::None,
+                };
+                x = self.layer(il, &x, None, &[seg], Some((ext, len)))?;
             }
             let normed = rms(&x, &self.output_norm, eps)?;
             let logits = self.head(&normed)?;
@@ -1192,85 +1290,82 @@ impl Transformer {
         run().map_err(candle_err)
     }
 
-    /// Take the model state back to at most `len` positions and return the
-    /// position it now sits at: the next forward call of a hybrid model must
-    /// start there. K/V rows are positional and live in the sequence's
-    /// blocks, so an attention-only model has no state to move and returns
-    /// `len`; the caller truncates its block tables to what it gets back.
+    /// Take the state of `slot` back to at most `len` positions and return
+    /// the position it now sits at: the next forward call of a hybrid model
+    /// for the slot must start there. K/V rows are positional and live in the
+    /// sequence's blocks, so an attention-only model has no state to move and
+    /// returns `len`; the caller truncates its block tables to what it gets
+    /// back.
     ///
     /// A hybrid model keeps a recurrent state that is not positional (it
     /// summarises everything before the current end and cannot be undone), so
     /// it retains only positions it holds a state for:
     ///
-    /// - the current end (`len >=` the state's position retains everything);
-    /// - the checkpoint position ([`Transformer::checkpoint`]);
-    /// - every position `first..first + rows` of the last forward call that
-    ///   recorded its rows (`Want::All` over `2..=`[`MAX_VERIFY_ROWS`] rows),
-    ///   until the next forward call: the state there is rebuilt from the
-    ///   pre-call copy and the logged rows, bit for bit as the original run
-    ///   computed it.
+    /// - the slot's current end (`len >=` the state's position retains
+    ///   everything);
+    /// - every position `first..first + rows` of the slot's last forward call
+    ///   that recorded its rows (`Want::All` over `2..=`[`MAX_VERIFY_ROWS`]
+    ///   rows), until the slot's next forward call: the state there is
+    ///   rebuilt from the pre-call copy and the logged rows, bit for bit as
+    ///   the original run computed it.
     ///
-    /// For any other `len` it falls back to the largest of those positions
-    /// not above `len`, or to `0` (the zero state): the caller recomputes from
-    /// the returned position. A checkpoint above the retained length is
-    /// dropped, because the positions it covers are about to be overwritten.
-    pub(crate) fn rewind(&mut self, len: usize) -> usize {
+    /// For any other `len` it falls back to `0` (the zero state): the caller
+    /// recomputes from there, or restores a snapshot ([`Transformer::restore`]).
+    pub(crate) fn rewind(&mut self, slot: usize, len: usize) -> usize {
         if !self.hybrid {
             return len;
         }
+        let Some(state) = self.slots.get(slot) else {
+            return 0;
+        };
         // An empty cache always means the zero state, even when a pass that
         // died half-way left some layers' state advanced past `len`.
         if len == 0 {
-            self.discard_state();
+            self.reset_slot(slot);
             return 0;
         }
-        let current = self.len;
-        if len >= current {
-            return current;
+        if len >= state.len {
+            return state.len;
         }
-        let kept = match (self.rollback.verify, self.rollback.checkpoint) {
-            (Some((first, rows)), _) if len >= first && len < first + rows => len,
-            (_, Some(at)) if at <= len => at,
-            _ => 0,
-        };
-        match (self.rollback.verify, self.rollback.checkpoint) {
-            (Some((first, rows)), _) if kept >= first && kept < first + rows => {
+        match state.verify {
+            Some((first, rows)) if len >= first && len < first + rows => {
                 for dw in self.delta_layers() {
-                    dw.restore_prefix(kept - first);
+                    dw.restore_prefix(slot, len - first);
                 }
-            }
-            (_, Some(at)) if at == kept => {
-                for dw in self.delta_layers() {
-                    dw.with_cell(DeltaCell::restore_checkpoint);
-                }
-                self.rollback.verify = None;
+                self.slots[slot].len = len;
+                len
             }
             _ => {
-                for dw in self.delta_layers() {
-                    dw.with_cell(DeltaCell::reset);
-                }
-                self.rollback.verify = None;
+                self.reset_slot(slot);
+                0
             }
         }
-        if self.rollback.checkpoint.is_some_and(|at| at > kept) {
-            self.rollback.checkpoint = None;
-        }
-        self.len = kept;
-        kept
     }
 
-    /// Keep the recurrent state at the current end as the checkpoint
-    /// [`Transformer::rewind`] can return to, replacing the previous one (one
-    /// slot). A no-op for an attention-only model, which can truncate
-    /// anywhere, and for an empty cache (the zero state needs no copy).
-    pub(crate) fn checkpoint(&mut self) {
-        if !self.hybrid || self.len == 0 {
-            return;
+    /// Make `snapshot` (one [`DeltaState`] per delta-net layer, from a
+    /// [`Forward`] that took it) the state of `slot`, which then sits at
+    /// position `len`.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a model without a recurrent state, a slot
+    /// out of range or a snapshot of another model.
+    pub(crate) fn restore(
+        &mut self,
+        slot: usize,
+        snapshot: &[DeltaState],
+        len: usize,
+    ) -> Result<(), CucaError> {
+        if slot >= self.slots.len() || snapshot.len() != self.delta_layers().count() {
+            return Err(err(
+                "the snapshot does not fit this model's recurrent state",
+            ));
         }
-        for dw in self.delta_layers() {
-            dw.with_cell(DeltaCell::save_checkpoint);
+        for (dw, state) in self.delta_layers().zip(snapshot) {
+            dw.with_cell(slot, |cell| cell.load(state));
         }
-        self.rollback.checkpoint = Some(self.len);
+        self.slots[slot] = Slot { len, verify: None };
+        Ok(())
     }
 
     /// Whether the model keeps a recurrent state (see
@@ -1298,36 +1393,31 @@ impl Transformer {
         })
     }
 
-    /// After a failed pass: an empty cache and the zero state.
-    fn discard_state(&mut self) {
-        if !self.hybrid {
+    /// The zero state at position 0 for `slot` (a sequence start, or after a
+    /// failed pass).
+    pub(crate) fn reset_slot(&mut self, slot: usize) {
+        if !self.hybrid || slot >= self.slots.len() {
             return;
         }
         for dw in self.delta_layers() {
-            dw.with_cell(DeltaCell::reset);
+            dw.with_cell(slot, DeltaCell::reset);
         }
-        self.len = 0;
-        self.rollback = Rollback::default();
+        self.slots[slot] = Slot::default();
     }
 
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one forward pass's inputs; a struct would only rename them"
-    )]
+    /// The layers over the concatenated rows `embeddings` of the sequences
+    /// `segs` describe, then the final norm and the LM head over the rows the
+    /// sequences want.
     fn forward_layers(
         &self,
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
-        t: usize,
-        start: usize,
-        tables: &[BlockTable],
-        want: Want,
-        hidden: Hidden,
-        record: bool,
-    ) -> candle_core::Result<Forward> {
+        segs: &[Seg<'_>],
+    ) -> candle_core::Result<Vec<Forward>> {
         let hp = &self.hp;
         let dev = &Device::Cpu;
         let eps = hp.eps as f32;
+        let t = embeddings.len() / hp.n_embd;
         let mut x = Tensor::from_vec(embeddings, (1, t, hp.n_embd), dev)?;
 
         // Gemma 4 per-layer inputs: projected embeddings merged with the
@@ -1347,43 +1437,83 @@ impl Transformer {
         };
 
         for il in 0..hp.n_layer {
-            x = self.layer(il, &x, ple.as_ref(), start, t, tables, None, record)?;
+            x = self.layer(il, &x, ple.as_ref(), segs, None)?;
         }
 
-        let all_hidden = hidden == Hidden::PostNormAll;
-        if want == Want::None && !all_hidden {
-            return Ok(Forward {
-                logits: None,
-                hidden: None,
-            });
-        }
-        // The final norm runs over every row when all logits or every
-        // position's hidden row are wanted, else over the last row only. It
-        // is row-independent, so a row is the same bits either way.
-        let normed_rows = all_hidden || want == Want::All;
-        let rows = if normed_rows {
-            x
-        } else {
-            x.narrow(1, t - 1, 1)?.contiguous()?
-        };
-        let normed = rms(&rows, &self.output_norm, eps)?;
-        let hidden = match hidden {
-            Hidden::None => None,
-            Hidden::PostNorm | Hidden::PostNormAll => Some(normed.flatten_all()?.to_vec1::<f32>()?),
-        };
-        let logits = match want {
-            Want::None => None,
-            Want::Last if normed_rows => {
-                Some(self.head(&normed.narrow(1, t - 1, 1)?.contiguous()?)?)
+        // The final norm runs over every row of a sequence that wants all
+        // logits or every position's hidden row, else over its last row
+        // only. It is row-independent, so a row is the same bits either way.
+        // The selected rows of all sequences share one norm and one LM head
+        // pass: the head is the largest matrix of a small model.
+        let mut outs: Vec<Forward> = (0..segs.len()).map(|_| Forward::default()).collect();
+        let mut parts = Vec::new();
+        // Per sequence: first row among the normed rows, row count, whether
+        // those are all of its rows.
+        let mut plan = Vec::with_capacity(segs.len());
+        let mut at = 0;
+        for seg in segs {
+            let all_hidden = seg.hidden == Hidden::PostNormAll;
+            if seg.want == Want::None && !all_hidden {
+                plan.push(None);
+                continue;
             }
-            Want::Last | Want::All => Some(self.head(&normed)?),
-        };
-        Ok(Forward {
-            logits: logits
-                .map(|l| l.flatten_all()?.to_vec1::<f32>())
-                .transpose()?,
-            hidden,
-        })
+            let all_rows = all_hidden || seg.want == Want::All;
+            let (from, n) = if all_rows {
+                (seg.offset, seg.t)
+            } else {
+                (seg.offset + seg.t - 1, 1)
+            };
+            parts.push(x.narrow(1, from, n)?);
+            plan.push(Some((at, n, all_rows)));
+            at += n;
+        }
+        if parts.is_empty() {
+            return Ok(outs);
+        }
+        let rows = Tensor::cat(&parts, 1)?.contiguous()?;
+        let normed = rms(&rows, &self.output_norm, eps)?;
+        let mut logit_parts = Vec::new();
+        // Per sequence: first logits row, row count.
+        let mut spans = Vec::with_capacity(segs.len());
+        let mut lat = 0;
+        for (seg, p) in segs.iter().zip(&plan) {
+            let Some((at, n, all_rows)) = *p else {
+                spans.push(None);
+                continue;
+            };
+            if seg.hidden != Hidden::None {
+                outs[spans.len()].hidden =
+                    Some(normed.narrow(1, at, n)?.flatten_all()?.to_vec1::<f32>()?);
+            }
+            let (from, rows) = match seg.want {
+                Want::None => {
+                    spans.push(None);
+                    continue;
+                }
+                Want::Last if all_rows => (at + n - 1, 1),
+                Want::Last | Want::All => (at, n),
+            };
+            logit_parts.push(normed.narrow(1, from, rows)?);
+            spans.push(Some((lat, rows)));
+            lat += rows;
+        }
+        if logit_parts.is_empty() {
+            return Ok(outs);
+        }
+        let head_in = Tensor::cat(&logit_parts, 1)?.contiguous()?;
+        let logits = self.head(&head_in)?;
+        let vocab = logits.dim(2)?;
+        let flat = logits.flatten_all()?.to_vec1::<f32>()?;
+        if let [Some((_, _))] = spans.as_slice() {
+            outs[0].logits = Some(flat);
+        } else {
+            for (out, span) in outs.iter_mut().zip(&spans) {
+                if let Some((at, n)) = *span {
+                    out.logits = Some(flat[at * vocab..(at + n) * vocab].to_vec());
+                }
+            }
+        }
+        Ok(outs)
     }
 
     /// LM head over final-norm output rows: scale, soft-cap.
@@ -1409,29 +1539,21 @@ impl Transformer {
         Ok(logits)
     }
 
-    /// One transformer block over `t` positions starting at `start`, with the
-    /// sequence's block tables `tables`. With `record`, a delta-net layer
-    /// keeps what cache rollback needs from this call (see
-    /// [`Transformer::rewind`]).
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one layer call's inputs; a struct would only rename them"
-    )]
+    /// One transformer block over the concatenated rows `x` of the
+    /// sequences `segs` describe.
     fn layer(
         &self,
         il: usize,
         x: &Tensor,
         ple: Option<&Tensor>,
-        start: usize,
-        t: usize,
-        tables: &[BlockTable],
+        segs: &[Seg<'_>],
         ext: Option<(&ExtKv, usize)>,
-        record: bool,
     ) -> candle_core::Result<Tensor> {
         let lw = &self.layers[il];
+        let t = x.dim(1)?;
         self.block(lw, x, ple.map(|p| (p, il)), t, |h| match &lw.mixer {
-            Mixer::Attention(aw) => self.attention(il, aw, h, start, t, tables, ext),
-            Mixer::Delta(dw) => dw.forward(h, t, record),
+            Mixer::Attention(aw) => self.attention(il, aw, h, segs, ext),
+            Mixer::Delta(dw) => dw.forward_segs(h, segs),
         })
     }
 
@@ -1490,81 +1612,83 @@ impl Transformer {
         }
     }
 
-    /// The attention of layer `il` over the normed input `h` `(1, t, n_embd)`
-    /// at positions `start..start + t`: projections, QK-norm, RoPE, K/V cache
-    /// write, attention, the output gate (when the architecture has one) and
-    /// the output projection. `tables` are the sequence's block tables.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one attention call's inputs; a struct would only rename them"
-    )]
+    /// The attention of layer `il` over the normed input `h` `(1, T, n_embd)`
+    /// of the concatenated rows of the sequences `segs` describe: the
+    /// projections, QK-norm, RoPE and the output gate and projection run over
+    /// all rows, the K/V cache write and the attention itself per sequence.
     fn attention(
         &self,
         il: usize,
         aw: &AttnWeights,
         h: &Tensor,
-        start: usize,
-        t: usize,
-        tables: &[BlockTable],
+        segs: &[Seg<'_>],
         ext: Option<(&ExtKv, usize)>,
     ) -> candle_core::Result<Tensor> {
         let spec = &self.hp.layers[il];
-        let kv = if spec.kv_source != usize::MAX {
-            let source = spec.kv_source;
-            let table = self.layout.layer_group[source]
-                .and_then(|g| tables.get(g))
-                .ok_or_else(|| candle_core::Error::msg("the sequence has no block table"))?;
-            KvAccess::Paged {
-                layer: self.cache(source)?,
-                write: spec.owns_kv(il),
-                table,
-                read_len: None,
-            }
-        } else {
-            let (e, len) = ext
-                .ok_or_else(|| candle_core::Error::msg("a drafter layer needs the target's K/V"))?;
-            let (layer, table) = if spec.window.is_some() {
-                &e.sliding
-            } else {
-                &e.full
-            };
-            KvAccess::Paged {
-                layer,
-                write: false,
-                table,
-                read_len: Some(len),
-            }
-        };
-        let call = AttnCall {
-            spec,
-            start,
-            rope_start: start,
-            t,
-            kv,
-        };
-        self.attention_in(&call, aw, h)
+        let calls = segs
+            .iter()
+            .map(|seg| {
+                let kv = if spec.kv_source != usize::MAX {
+                    let source = spec.kv_source;
+                    let table = self.layout.layer_group[source]
+                        .and_then(|g| seg.tables.get(g))
+                        .ok_or_else(|| {
+                            candle_core::Error::msg("the sequence has no block table")
+                        })?;
+                    KvAccess::Paged {
+                        layer: self.cache(source)?,
+                        write: spec.owns_kv(il),
+                        table,
+                        read_len: None,
+                    }
+                } else {
+                    let (e, len) = ext.ok_or_else(|| {
+                        candle_core::Error::msg("a drafter layer needs the target's K/V")
+                    })?;
+                    let (layer, table) = if spec.window.is_some() {
+                        &e.sliding
+                    } else {
+                        &e.full
+                    };
+                    KvAccess::Paged {
+                        layer,
+                        write: false,
+                        table,
+                        read_len: Some(len),
+                    }
+                };
+                Ok(AttnCall {
+                    spec,
+                    offset: seg.offset,
+                    start: seg.start,
+                    rope_start: seg.start,
+                    t: seg.t,
+                    kv,
+                })
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        self.attention_in(&calls, aw, h)
     }
 
-    /// [`Transformer::attention`] for the call `call` describes, which also
-    /// lets the multi-token-prediction head run it over its own cache.
+    /// [`Transformer::attention`] for the calls `calls` describe (all of one
+    /// layer), which also lets the multi-token-prediction head run it over
+    /// its own cache.
     fn attention_in(
         &self,
-        call: &AttnCall<'_>,
+        calls: &[AttnCall<'_>],
         aw: &AttnWeights,
         h: &Tensor,
     ) -> candle_core::Result<Tensor> {
         let hp = &self.hp;
-        let AttnCall {
-            spec,
-            start,
-            rope_start,
-            t,
-            kv,
-        } = *call;
+        let Some(first) = calls.first() else {
+            return Err(candle_core::Error::msg("attention needs a sequence"));
+        };
+        let spec = first.spec;
+        let t = h.dim(1)?;
         let eps = hp.eps as f32;
-        let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
+        let (nh, d) = (spec.n_head, spec.head_dim);
 
-        let (q, projected) = aw.project(h, nh, nkv, d)?;
+        let (q, projected) = aw.project(h, nh, spec.n_kv_head, d)?;
         // A full-width Q/K norm (OLMo 2) normalises the whole projection
         // before the heads are split.
         let full_qk = hp.behavior.qk_norm_full;
@@ -1593,13 +1717,40 @@ impl Transformer {
             _ => q,
         };
         let q = q.transpose(1, 2)?.contiguous()?;
-        let q = self.rotate_rows(spec, &q, rope_start, t)?;
+        let q = self.rotate_calls(spec, &q, calls)?;
 
         if let Some((k, v)) = &projected {
-            self.store_kv(call, aw, k, v)?;
+            self.store_kv(calls, aw, k, v)?;
         }
 
-        let attn = match kv {
+        let mut outs = Vec::with_capacity(calls.len());
+        for call in calls {
+            if let [_] = calls {
+                outs.push(self.attend_call(call, &q)?);
+            } else {
+                outs.push(self.attend_call(call, &q.narrow(2, call.offset, call.t)?)?);
+            }
+        }
+        let attn = match outs.as_mut_slice() {
+            [only] => only.clone(),
+            _ => Tensor::cat(&outs, 1)?,
+        };
+        let attn = match gate {
+            Some(gate) => (attn * sigmoid(&gate)?)?,
+            None => attn,
+        };
+        aw.wo.forward(&attn)
+    }
+
+    /// The attention output `(1, t, n_head * d)` of one sequence's queries
+    /// `q` `(1, n_head, t, d)` (RoPE applied, K/V already stored).
+    fn attend_call(&self, call: &AttnCall<'_>, q: &Tensor) -> candle_core::Result<Tensor> {
+        let hp = &self.hp;
+        let AttnCall {
+            spec, start, t, kv, ..
+        } = *call;
+        let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
+        Ok(match kv {
             KvAccess::Slab((cache_k, cache_v)) => {
                 let hi = start + t;
                 let lo = window_lo(spec, start, hi);
@@ -1612,7 +1763,7 @@ impl Transformer {
                 } else {
                     None
                 };
-                attend(&q, &k, &v, mask.as_ref(), spec.scale, hp.attn_softcap)?
+                attend(q, &k, &v, mask.as_ref(), spec.scale, hp.attn_softcap)?
                     .transpose(1, 2)?
                     .contiguous()?
                     .reshape((1, t, nh * d))?
@@ -1669,18 +1820,13 @@ impl Transformer {
                     )?;
                     let mask = attention_mask(start, t, lo, hi, spec.window);
                     let mask = Tensor::from_vec(mask, (t, l), &Device::Cpu)?;
-                    attend(&q, &k, &v, Some(&mask), spec.scale, hp.attn_softcap)?
+                    attend(q, &k, &v, Some(&mask), spec.scale, hp.attn_softcap)?
                         .transpose(1, 2)?
                         .contiguous()?
                         .reshape((1, t, nh * d))?
                 }
             }
-        };
-        let attn = match gate {
-            Some(gate) => (attn * sigmoid(&gate)?)?,
-            None => attn,
-        };
-        aw.wo.forward(&attn)
+        })
     }
 
     /// Rotate the rows `m` `(1, heads, t, d)` of a layer, the first at RoPE
@@ -1707,17 +1853,51 @@ impl Transformer {
         }
     }
 
+    /// [`Transformer::rotate_rows`] over the concatenated rows `m` `(1,
+    /// heads, T, d)` of several sequences, each at its own positions.
+    fn rotate_calls(
+        &self,
+        spec: &LayerSpec,
+        m: &Tensor,
+        calls: &[AttnCall<'_>],
+    ) -> candle_core::Result<Tensor> {
+        match (spec.rope, calls) {
+            (None, _) => Ok(m.clone()),
+            (Some(_), [only]) => self.rotate_rows(spec, m, only.rope_start, only.t),
+            (Some(r), _) => {
+                let (table, rope_spec) = (&self.ropes[r], &self.hp.ropes[r]);
+                let rows = |t: &Tensor| {
+                    calls
+                        .iter()
+                        .map(|c| t.narrow(0, c.rope_start, c.t))
+                        .collect::<candle_core::Result<Vec<_>>>()
+                };
+                apply_rope(
+                    m,
+                    &Tensor::cat(&rows(&table.cos)?, 0)?,
+                    &Tensor::cat(&rows(&table.sin)?, 0)?,
+                    rope_spec.kind,
+                    rope_spec.n_dims,
+                )
+            }
+        }
+    }
+
     /// Normalise, rotate and store the key and value projections `k` and `v`
-    /// `(1, t, n_kv * d)` of a K/V-owning layer into the cache indices
-    /// `call.start..` of its cache.
+    /// `(1, T, n_kv * d)` of a K/V-owning layer, the rows of each call into
+    /// the cache indices `start..` of its cache.
     fn store_kv(
         &self,
-        call: &AttnCall<'_>,
+        calls: &[AttnCall<'_>],
         aw: &AttnWeights,
         k: &Tensor,
         v: &Tensor,
     ) -> candle_core::Result<()> {
-        let (spec, t) = (call.spec, call.t);
+        let Some(first) = calls.first() else {
+            return Ok(());
+        };
+        let spec = first.spec;
+        let t = k.dim(1)?;
         let eps = self.hp.eps as f32;
         let (nkv, d) = (spec.n_kv_head, spec.head_dim);
         let full_qk = self.hp.behavior.qk_norm_full;
@@ -1730,38 +1910,47 @@ impl Transformer {
             Some(w) if !full_qk => rms(&k, w, eps)?,
             _ => k,
         };
-        let k = self.rotate_rows(spec, &k.transpose(1, 2)?.contiguous()?, call.rope_start, t)?;
+        let k = self.rotate_calls(spec, &k.transpose(1, 2)?.contiguous()?, calls)?;
         let v = v.reshape((1, t, nkv, d))?;
         let v = match &aw.v_norm {
             Some(ones) => rms(&v, ones, eps)?,
             None => v,
         };
         let v = v.transpose(1, 2)?.contiguous()?;
-        match call.kv {
-            KvAccess::Slab((cache_k, cache_v)) => {
-                cache_k.slice_set(&k.contiguous()?, 2, call.start)?;
-                cache_v.slice_set(&v, 2, call.start)?;
-            }
-            KvAccess::Paged {
-                layer,
-                write: true,
-                table,
-                ..
-            } => {
-                let ks = k.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
-                let vs = v.flatten_all()?.to_vec1::<f32>()?;
-                let mut data = layer.lock();
-                let KvData {
-                    k: pool_k,
-                    v: pool_v,
-                } = &mut *data;
-                store_rows(table, call.start, t, &ks, pool_k, layer.shape)?;
-                store_rows(table, call.start, t, &vs, pool_v, layer.shape)?;
-            }
-            KvAccess::Paged { write: false, .. } => {
-                return Err(candle_core::Error::msg(
-                    "a K/V projection needs a cache to store in",
-                ));
+        for call in calls {
+            let (k, v) = match calls {
+                [_] => (k.clone(), v.clone()),
+                _ => (
+                    k.narrow(2, call.offset, call.t)?,
+                    v.narrow(2, call.offset, call.t)?,
+                ),
+            };
+            match call.kv {
+                KvAccess::Slab((cache_k, cache_v)) => {
+                    cache_k.slice_set(&k.contiguous()?, 2, call.start)?;
+                    cache_v.slice_set(&v.contiguous()?, 2, call.start)?;
+                }
+                KvAccess::Paged {
+                    layer,
+                    write: true,
+                    table,
+                    ..
+                } => {
+                    let ks = k.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                    let vs = v.contiguous()?.flatten_all()?.to_vec1::<f32>()?;
+                    let mut data = layer.lock();
+                    let KvData {
+                        k: pool_k,
+                        v: pool_v,
+                    } = &mut *data;
+                    store_rows(table, call.start, call.t, &ks, pool_k, layer.shape)?;
+                    store_rows(table, call.start, call.t, &vs, pool_v, layer.shape)?;
+                }
+                KvAccess::Paged { write: false, .. } => {
+                    return Err(candle_core::Error::msg(
+                        "a K/V projection needs a cache to store in",
+                    ));
+                }
             }
         }
         Ok(())
@@ -1972,51 +2161,72 @@ fn load_delta(
         beta: loader.matmul(&name::blk(il, name::SSM_BETA), &[nv, n_embd])?,
         alpha: loader.matmul(&name::blk(il, name::SSM_ALPHA), &[nv, n_embd])?,
         out: loader.matmul(&name::blk(il, name::SSM_OUT), &[n_embd, delta.value_dim()])?,
-        cell: Mutex::new(DeltaCell::new(delta)),
+        cells: vec![Mutex::new(DeltaCell::new(delta))],
     })
 }
 
 impl DeltaWeights {
-    /// Run `f` on the layer's recurrent state and snapshots.
-    fn with_cell<R>(&self, f: impl FnOnce(&mut DeltaCell) -> R) -> R {
-        f(&mut self.cell.lock().unwrap_or_else(PoisonError::into_inner))
+    /// Run `f` on the recurrent state and rollback record of `slot`.
+    fn with_cell<R>(&self, slot: usize, f: impl FnOnce(&mut DeltaCell) -> R) -> R {
+        f(&mut self.cells[slot]
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
     }
 
-    /// Rebuild the state after the first `n` rows of the recorded call.
-    fn restore_prefix(&self, n: usize) {
-        self.with_cell(|cell| cell.restore_prefix(&self.kernel, n));
+    /// Rebuild the state of `slot` after the first `n` rows of its recorded
+    /// call.
+    fn restore_prefix(&self, slot: usize, n: usize) {
+        self.with_cell(slot, |cell| cell.restore_prefix(&self.kernel, n));
     }
 
-    /// The layer's output `(1, t, n_embd)` for the normed input `h`
-    /// `(1, t, n_embd)`, advancing the recurrent state by `t` rows. With
-    /// `record` the rows and the pre-call state are kept for rollback.
+    /// Grow to `n` state slots.
+    fn set_slots(&mut self, n: usize) {
+        let spec = *self.kernel.spec();
+        self.cells
+            .resize_with(n.max(1), || Mutex::new(DeltaCell::new(&spec)));
+    }
+
+    /// The layer's output `(1, T, n_embd)` for the normed input `h` `(1, T,
+    /// n_embd)` of the concatenated rows of the sequences `segs` describe,
+    /// advancing each sequence's slot by its rows. A sequence with `record`
+    /// keeps its rows and the pre-call state for rollback.
     ///
     /// Everything per row (the five projections, the gates, the convolution,
     /// the recurrence, the gated norm) is a function of that row and the
     /// state alone, so the output rows and the final state are the same
-    /// whatever the batch split ([`DeltaKernel`]).
-    fn forward(&self, h: &Tensor, t: usize, record: bool) -> candle_core::Result<Tensor> {
+    /// whatever the batch split ([`DeltaKernel`]): the projections run over
+    /// all rows at once, the recurrence per sequence.
+    fn forward_segs(&self, h: &Tensor, segs: &[Seg<'_>]) -> candle_core::Result<Tensor> {
+        let t = h.dim(1)?;
         let rows = |w: &QMatMul| -> candle_core::Result<Vec<f32>> {
             w.forward(h)?.flatten_all()?.to_vec1::<f32>()
         };
         let mixed = rows(&self.qkv)?;
         let z = rows(&self.gate)?;
         let (beta, decay) = self.kernel.gates(&rows(&self.beta)?, &rows(&self.alpha)?);
-        let inputs = Rows {
-            t,
-            mixed: &mixed,
-            beta: &beta,
-            decay: &decay,
-        };
-        let out = self.with_cell(|cell| {
-            if record {
-                cell.begin_record(&inputs);
-            }
-            self.kernel.scan(cell.live_mut(), &inputs, Some(&z))
-        });
-        let out =
-            out.ok_or_else(|| candle_core::Error::msg("delta-net scan returned no output"))?;
-        let out = Tensor::from_vec(out, (1, t, self.kernel.spec().value_dim()), h.device())?;
+        let spec = self.kernel.spec();
+        let (cd, nv, vd) = (spec.conv_dim(), spec.n_v_heads, spec.value_dim());
+        let mut out = vec![0.0f32; t * vd];
+        for seg in segs {
+            let (lo, hi) = (seg.offset, seg.offset + seg.t);
+            let inputs = Rows {
+                t: seg.t,
+                mixed: &mixed[lo * cd..hi * cd],
+                beta: &beta[lo * nv..hi * nv],
+                decay: &decay[lo * nv..hi * nv],
+            };
+            let rows_out = self.with_cell(seg.slot, |cell| {
+                if seg.record {
+                    cell.begin_record(&inputs);
+                }
+                self.kernel
+                    .scan(cell.live_mut(), &inputs, Some(&z[lo * vd..hi * vd]))
+            });
+            let rows_out = rows_out
+                .ok_or_else(|| candle_core::Error::msg("delta-net scan returned no output"))?;
+            out[lo * vd..hi * vd].copy_from_slice(&rows_out);
+        }
+        let out = Tensor::from_vec(out, (1, t, vd), h.device())?;
         self.out.forward(&out)
     }
 }
@@ -2247,8 +2457,8 @@ impl Transformer {
             .logits)
     }
 
-    /// [`Transformer::forward_seq`] over the implicit sequence: its blocks
-    /// are allocated here; `start_pos` must equal its length.
+    /// [`Transformer::forward_batch`] over the implicit sequence (state slot
+    /// 0): its blocks are allocated here; `start_pos` must equal its length.
     pub(crate) fn forward_ext(
         &mut self,
         tokens: &[u32],
@@ -2258,7 +2468,10 @@ impl Transformer {
         exact: bool,
     ) -> Result<Forward, CucaError> {
         let seq = self.solo.begin(start_pos, tokens.len())?;
-        let out = self.forward_seq(tokens, start_pos, &seq.tables, want, hidden, exact);
+        let batch = Batch::single(tokens, start_pos, &seq.tables, want, hidden, exact);
+        let out = self
+            .forward_batch(&batch)
+            .map(|mut outs| outs.swap_remove(0));
         self.solo
             .finish(seq, out.is_ok().then_some(start_pos + tokens.len()));
         out
@@ -2268,10 +2481,10 @@ impl Transformer {
     /// how many it retains (see [`Transformer::rewind`] and
     /// [`KvPools::truncate`](super::paged::KvPools::truncate)).
     pub(crate) fn truncate_cache(&mut self, len: usize) -> usize {
-        let state = self.rewind(len).min(self.solo.len());
+        let state = self.rewind(0, len).min(self.solo.len());
         let kept = self.solo.truncate(state);
         if kept != state {
-            self.rewind(kept);
+            self.rewind(0, kept);
         }
         kept
     }
@@ -2367,6 +2580,123 @@ mod tests {
         for spec in TinySpec::all() {
             check_invariants(&write_spec(&spec), spec.arch);
         }
+    }
+
+    /// The rows of several sequences in one forward step equal, bit for bit,
+    /// the same rows run one sequence at a time: the dense layers see all
+    /// rows, attention and the recurrent state stay per sequence. The steps
+    /// mix a joint prefill, decode rows, a sequence sitting one step out, a
+    /// prefill chunk next to decode rows and a verification-shaped call.
+    fn check_batched(model: &super::super::tiny::TinyModel, what: &str) {
+        use super::super::StateSlot;
+        use super::super::paged::KvPools;
+        use super::super::tiny::load_sized;
+        type Call = (usize, &'static [u32], Want, Hidden);
+        let steps: [&[Call]; 5] = [
+            &[
+                (0, &PROMPT[..5], Want::Last, Hidden::PostNorm),
+                (1, &PROMPT[..9], Want::Last, Hidden::PostNorm),
+                (2, &PROMPT[3..6], Want::None, Hidden::PostNormAll),
+            ],
+            &[
+                (0, &[7], Want::Last, Hidden::PostNorm),
+                (1, &[9], Want::Last, Hidden::None),
+                (2, &[4, 5], Want::All, Hidden::PostNorm),
+            ],
+            &[
+                (0, &[8], Want::Last, Hidden::PostNorm),
+                (2, &[6], Want::Last, Hidden::PostNorm),
+            ],
+            &[
+                (0, &[6, 3, 2, 5], Want::Last, Hidden::None),
+                (1, &[2], Want::Last, Hidden::PostNorm),
+                (2, &[3], Want::Last, Hidden::PostNormAll),
+            ],
+            &[
+                (1, &[4, 9, 2], Want::All, Hidden::PostNormAll),
+                (2, &[1], Want::Last, Hidden::PostNorm),
+            ],
+        ];
+        let sizing = Sizing {
+            max_sequences: 3,
+            kv_tokens: 64,
+            max_rows: 16,
+        };
+        let mut batched = load_sized(model, 32, &sizing);
+        let mut pools = KvPools::new(batched.kv_layout());
+        let mut seqs: Vec<_> = (0..3).map(|_| pools.seq()).collect();
+        let mut solo: Vec<Transformer> = (0..3).map(|_| load(model, 32)).collect();
+        let mut lens = [0usize; 3];
+        for (n, step) in steps.iter().enumerate() {
+            for &(i, tokens, ..) in *step {
+                pools.reserve(&mut seqs[i], lens[i] + tokens.len()).unwrap();
+            }
+            let batch = Batch {
+                rows: step
+                    .iter()
+                    .map(|&(i, tokens, want, hidden)| super::super::SeqRows {
+                        tokens,
+                        start_pos: lens[i],
+                        tables: &seqs[i].tables,
+                        state: StateSlot(i),
+                        want,
+                        hidden,
+                    })
+                    .collect(),
+                exact: true,
+            };
+            let outs = batched.forward_batch(&batch).unwrap();
+            for (&(i, tokens, want, hidden), out) in step.iter().zip(&outs) {
+                let alone = solo[i]
+                    .forward_ext(tokens, lens[i], want, hidden, true)
+                    .unwrap();
+                assert_eq!(out.logits, alone.logits, "{what}: step {n}, sequence {i}");
+                assert_eq!(out.hidden, alone.hidden, "{what}: step {n}, sequence {i}");
+                lens[i] += tokens.len();
+            }
+        }
+    }
+
+    #[test]
+    fn batched_rows_equal_solo_rows_for_every_architecture() {
+        for spec in TinySpec::all() {
+            check_batched(&write_spec(&spec), spec.arch);
+        }
+        check_batched(&write_tiny_model(), "gemma4");
+        check_batched(&write_qwen35(&TinyQwen35::default()), "qwen35");
+    }
+
+    #[test]
+    fn a_batched_step_is_validated_before_anything_runs() {
+        use super::super::StateSlot;
+        use super::super::paged::KvPools;
+        use super::super::tiny::load_sized;
+        let model = write_qwen35(&TinyQwen35::default());
+        let sizing = Sizing {
+            max_sequences: 2,
+            kv_tokens: 64,
+            max_rows: 16,
+        };
+        let mut m = load_sized(&model, 32, &sizing);
+        let mut pools = KvPools::new(m.kv_layout());
+        let mut a = pools.seq();
+        pools.reserve(&mut a, 4).unwrap();
+        let rows = |slot: usize, start: usize| super::super::SeqRows {
+            tokens: &PROMPT[..2],
+            start_pos: start,
+            tables: &a.tables,
+            state: StateSlot(slot),
+            want: Want::Last,
+            hidden: Hidden::None,
+        };
+        let run = |m: &mut Transformer, rows: Vec<super::super::SeqRows<'_>>| {
+            m.forward_batch(&Batch { rows, exact: true })
+        };
+        assert!(run(&mut m, vec![]).is_err(), "empty batch");
+        assert!(run(&mut m, vec![rows(2, 0)]).is_err(), "slot out of range");
+        assert!(run(&mut m, vec![rows(0, 0), rows(0, 0)]).is_err(), "twice");
+        assert!(run(&mut m, vec![rows(1, 3)]).is_err(), "wrong start");
+        assert!(run(&mut m, vec![rows(1, 0)]).is_ok());
     }
 
     #[test]
@@ -2967,7 +3297,13 @@ mod tests {
             warm_from,
             ..ExpertTiers::default()
         };
-        Transformer::load_placed(&content, &model.path, 32, &ExpertPlacement::Tiered(tiers))
+        Transformer::load_placed(
+            &content,
+            &model.path,
+            32,
+            &ExpertPlacement::Tiered(tiers),
+            &Sizing::single(32),
+        )
     }
 
     /// A 24-token prompt in chunks of 16 then 8 greedy steps: the logits of
@@ -3099,6 +3435,7 @@ mod hybrid_tests {
             true,
             false,
             &ExpertPlacement::Resident,
+            &Sizing::single(CONTEXT),
         )
         .unwrap()
     }
@@ -3117,6 +3454,20 @@ mod hybrid_tests {
             .unwrap()
     }
 
+    /// One sequence's rows `0..t` at slot 0, as a forward step builds it.
+    fn solo_seg(t: usize, tables: &[BlockTable]) -> Seg<'_> {
+        Seg {
+            start: 0,
+            offset: 0,
+            t,
+            tables,
+            slot: 0,
+            record: false,
+            want: Want::None,
+            hidden: Hidden::None,
+        }
+    }
+
     /// A model that ran `tokens` one at a time (the cold reference).
     fn cold(model: &TinyModel, tokens: &[u32]) -> Transformer {
         let mut m = load(model, CONTEXT);
@@ -3130,7 +3481,7 @@ mod hybrid_tests {
     fn live(m: &Transformer) -> Vec<Vec<f32>> {
         m.delta_layers()
             .map(|dw| {
-                dw.with_cell(|c| {
+                dw.with_cell(0, |c| {
                     let s = c.live();
                     [s.history(), s.matrices()].concat()
                 })
@@ -3141,7 +3492,7 @@ mod hybrid_tests {
     /// Floats held by every delta-net layer's state and snapshots.
     fn held(m: &Transformer) -> usize {
         m.delta_layers()
-            .map(|dw| dw.with_cell(|c| c.held_floats()))
+            .map(|dw| dw.with_cell(0, |c| c.held_floats()))
             .sum()
     }
 
@@ -3265,7 +3616,7 @@ mod hybrid_tests {
 
         let input = Tensor::from_vec(h, (1, t, N_EMBD), &Device::Cpu).unwrap();
         let got = dw
-            .forward(&input, t, false)
+            .forward_segs(&input, &[solo_seg(t, &[])])
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -3279,7 +3630,7 @@ mod hybrid_tests {
                 "output {i}: {g} vs {w}"
             );
         }
-        let (matrices, history) = dw.with_cell(|c| {
+        let (matrices, history) = dw.with_cell(0, |c| {
             let s = c.live();
             (s.matrices().to_vec(), s.history().to_vec())
         });
@@ -3386,7 +3737,7 @@ mod hybrid_tests {
         let mut seq = pools.seq();
         pools.reserve(&mut seq, t).unwrap();
         let got = m
-            .attention(3, aw, &input, 0, t, &seq.tables, None)
+            .attention(3, aw, &input, &[solo_seg(t, &seq.tables)], None)
             .unwrap()
             .flatten_all()
             .unwrap()
@@ -3471,18 +3822,17 @@ mod hybrid_tests {
         step(&mut m, &PROMPT, 0, Want::Last);
         assert_eq!(m.truncate_cache(99), 11);
         assert_eq!(m.truncate_cache(11), 11);
-        m.checkpoint(); // a no-op: it can truncate anywhere
         assert_eq!(m.truncate_cache(6), 6);
         assert_eq!(m.cache_len(), 6);
         assert_eq!(m.truncate_cache(0), 0);
         assert_eq!(m.truncate_cache(5), 0);
     }
 
-    /// Without a snapshot a hybrid model can only return to its end or to
-    /// zero; with a checkpoint also to the checkpoint, and it falls back to
-    /// the largest retained position not above the request.
+    /// A hybrid model can only return to its end (or into the rows of a
+    /// recorded call) and falls back to zero for anything else; a snapshot
+    /// brings back a position bit for bit.
     #[test]
-    fn checkpoint_and_fallback_retain_the_largest_available_position() {
+    fn rewind_falls_back_to_zero_and_a_snapshot_restores_a_position() {
         let model = write_qwen35(&TinyQwen35::default());
         let want_full = step(
             &mut cold(&model, &PROMPT[..10]),
@@ -3491,7 +3841,7 @@ mod hybrid_tests {
             Want::Last,
         );
 
-        // No checkpoint: anything below the end restarts from zero.
+        // Anything below the end restarts from zero.
         let mut m = load(&model, CONTEXT);
         step(&mut m, &PROMPT, 0, Want::Last);
         assert_eq!(m.rollback_rows(), MAX_VERIFY_ROWS);
@@ -3501,42 +3851,26 @@ mod hybrid_tests {
         assert_eq!(m.cache_len(), 0);
         assert!(live(&m).iter().flatten().all(|&v| v == 0.0));
 
-        // A checkpoint after the 6-token prefix.
+        // A snapshot after the 6-token prefix brings that position back,
+        // keys and values of the first six positions untouched.
         let mut m = load(&model, CONTEXT);
         feed(&mut m, &PROMPT[..6], 0);
-        m.checkpoint();
+        let snapshot = m.snapshot(0).unwrap();
         step(&mut m, &PROMPT[6..], 6, Want::Last);
-        assert_eq!(m.truncate_cache(99), 11);
-        assert_eq!(m.truncate_cache(8), 6, "the checkpoint is the largest <= 8");
-        assert_eq!(m.cache_len(), 6);
+        assert_eq!(m.rewind(0, 6), 0, "the state itself cannot go back");
+        m.restore(0, &snapshot, 6).unwrap();
+        assert_eq!(m.solo.truncate(6), 6);
         assert_eq!(live(&m), live(&cold(&model, &PROMPT[..6])));
-        // Replaying from the checkpoint reproduces the cold run bit for bit.
+        // Replaying from there reproduces the cold run bit for bit.
         feed(&mut m, &PROMPT[6..10], 6);
         assert_eq!(step(&mut m, &PROMPT[10..], 10, Want::Last), want_full);
-        // The checkpoint survives being restored to...
-        assert_eq!(m.truncate_cache(7), 6);
+        // The snapshot is a copy: it restores again, and a foreign one or a
+        // slot out of range is refused.
+        m.rewind(0, 6);
+        m.restore(0, &snapshot, 6).unwrap();
         assert_eq!(live(&m), live(&cold(&model, &PROMPT[..6])));
-        // ...and is dropped once the cache goes below it (its positions are
-        // about to be overwritten).
-        assert_eq!(m.truncate_cache(5), 0);
-        assert_eq!(m.cache_len(), 0);
-        feed(&mut m, &PROMPT[..8], 0);
-        assert_eq!(m.truncate_cache(7), 0, "no checkpoint left");
-
-        // A checkpoint on an empty cache is a no-op; a new one replaces the
-        // old one.
-        let mut m = load(&model, CONTEXT);
-        m.checkpoint();
-        feed(&mut m, &PROMPT[..3], 0);
-        m.checkpoint();
-        feed(&mut m, &PROMPT[3..7], 3);
-        m.checkpoint();
-        step(&mut m, &PROMPT[7..], 7, Want::Last);
-        assert_eq!(m.truncate_cache(5), 0, "the checkpoint at 3 was replaced");
-        feed(&mut m, &PROMPT[..7], 0);
-        m.checkpoint();
-        step(&mut m, &PROMPT[7..], 7, Want::Last);
-        assert_eq!(m.truncate_cache(9), 7);
+        assert!(m.restore(1, &snapshot, 6).is_err(), "one slot only");
+        assert!(m.restore(0, &snapshot[1..], 6).is_err(), "wrong layers");
     }
 
     /// After a `Want::All` call over several rows every intermediate length
@@ -3593,7 +3927,7 @@ mod hybrid_tests {
         feed(&mut m, &tokens[..3], 0);
         step(&mut m, &tokens[3..8], 3, Want::All);
         step(&mut m, &tokens[8..9], 8, Want::Last);
-        assert_eq!(m.truncate_cache(5), 0, "the record ended; no checkpoint");
+        assert_eq!(m.truncate_cache(5), 0, "the record ended");
 
         // A call over one row records nothing (there is no inside).
         let mut m = load(&model, CONTEXT);
@@ -3613,19 +3947,18 @@ mod hybrid_tests {
             }
         }
 
-        // Checkpoint and record together: below the record the checkpoint
-        // answers, inside it the record does.
+        // Below the record there is no state to return to, inside it the
+        // record answers.
         let prepare = || {
             let mut m = load(&model, CONTEXT);
             feed(&mut m, &tokens[..3], 0);
-            m.checkpoint();
             feed(&mut m, &tokens[3..5], 3);
             step(&mut m, &tokens[5..10], 5, Want::All);
             m
         };
         let mut m = prepare();
-        assert_eq!(m.truncate_cache(4), 3, "below the record: the checkpoint");
-        assert_eq!(live(&m), live(&cold(&model, &tokens[..3])));
+        assert_eq!(m.truncate_cache(4), 0, "below the record: zero");
+        assert!(live(&m).iter().flatten().all(|&v| v == 0.0));
         let mut m = prepare();
         assert_eq!(m.truncate_cache(7), 7, "inside the record");
         assert_eq!(live(&m), live(&cold(&model, &tokens[..7])));
@@ -3656,15 +3989,13 @@ mod hybrid_tests {
         assert_eq!(held(&m), state, "only the live state at first");
         feed(&mut m, &PROMPT[..5], 0);
         assert_eq!(held(&m), state);
-        m.checkpoint();
-        assert_eq!(held(&m), 2 * state, "plus the checkpoint");
         let rows = 4;
         step(&mut m, &PROMPT[5..5 + rows], 5, Want::All);
         // Plus the pre-call copy and `conv_dim + 2 n_v` floats per row.
-        assert_eq!(held(&m), 3 * state + 4 * rows * per_row);
+        assert_eq!(held(&m), 2 * state + 4 * rows * per_row);
         // Nothing grows with the context: the next record reuses the buffers.
         step(&mut m, &PROMPT[9..11], 9, Want::All);
-        assert_eq!(held(&m), 3 * state + 4 * 2 * per_row);
+        assert_eq!(held(&m), 2 * state + 4 * 2 * per_row);
     }
 
     #[test]

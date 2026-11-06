@@ -34,7 +34,8 @@
 //! the recurrence cannot be undone. [`DeltaCell`] holds, next to the live
 //! state, what cache rollback restores from:
 //!
-//! - a **checkpoint**: a copy of the state at one chosen position;
+//! - a **snapshot**: a copy of the state at one chosen position (the
+//!   engine's prefix store keeps them);
 //! - the **verify record** of the last forward call over several rows: a copy
 //!   of the state before the call and the per-row inputs of the recurrence
 //!   (the raw convolution inputs, `beta`, `exp(g)`: `conv_dim + 2 * n_v_heads`
@@ -82,6 +83,11 @@ impl DeltaState {
         }
     }
 
+    /// Bytes the state holds.
+    pub(crate) fn bytes(&self) -> usize {
+        4 * (self.conv.len() + self.s.len())
+    }
+
     /// Back to the sequence-start state.
     fn clear(&mut self) {
         self.conv.fill(0.0);
@@ -89,7 +95,7 @@ impl DeltaState {
     }
 
     /// Overwrite with `other`, reusing this state's allocation.
-    fn copy_from(&mut self, other: &Self) {
+    pub(super) fn copy_from(&mut self, other: &Self) {
         self.conv.clear();
         self.conv.extend_from_slice(&other.conv);
         self.s.clear();
@@ -486,17 +492,15 @@ impl RowLog {
 
 /// The live state of one layer with its snapshots.
 ///
-/// The live state exists from construction. The checkpoint and the verify
-/// record allocate on first use and keep their allocation, so a model that
-/// never speculates pays only the live state and the checkpoint.
+/// The live state exists from construction. The verify record allocates on
+/// first use and keeps its allocation, so a model that never speculates pays
+/// only the live state.
 #[derive(Debug)]
 pub(crate) struct DeltaCell {
     live: DeltaState,
     /// The state before the call recorded in `log`.
     pre: DeltaState,
     log: RowLog,
-    /// The state at the checkpoint position.
-    checkpoint: DeltaState,
 }
 
 impl DeltaCell {
@@ -505,7 +509,6 @@ impl DeltaCell {
             live: DeltaState::zeros(spec),
             pre: DeltaState::default(),
             log: RowLog::default(),
-            checkpoint: DeltaState::default(),
         }
     }
 
@@ -513,14 +516,14 @@ impl DeltaCell {
         &mut self.live
     }
 
-    /// Copy the live state aside as the checkpoint.
-    pub(crate) fn save_checkpoint(&mut self) {
-        self.checkpoint.copy_from(&self.live);
+    /// A copy of the live state: a prefix-store snapshot.
+    pub(crate) fn snapshot(&self) -> DeltaState {
+        self.live.clone()
     }
 
-    /// Make the checkpoint the live state again.
-    pub(crate) fn restore_checkpoint(&mut self) {
-        self.live.copy_from(&self.checkpoint);
+    /// Make `state` (a snapshot) the live state.
+    pub(crate) fn load(&mut self, state: &DeltaState) {
+        self.live.copy_from(state);
     }
 
     /// Back to the sequence-start state.
@@ -546,14 +549,13 @@ impl DeltaCell {
         }
     }
 
-    /// Floats held by the live state, the checkpoint, the pre-call copy and
-    /// the row log (for the memory documentation and tests).
+    /// Floats held by the live state, the pre-call copy and the row log (for
+    /// the memory documentation and tests).
     #[cfg(test)]
     pub(crate) fn held_floats(&self) -> usize {
         let state = |s: &DeltaState| s.conv.len() + s.s.len();
         state(&self.live)
             + state(&self.pre)
-            + state(&self.checkpoint)
             + self.log.mixed.len()
             + self.log.beta.len()
             + self.log.decay.len()
@@ -900,17 +902,17 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn checkpoint_round_trips_and_reset_clears() {
+    fn snapshot_round_trips_and_reset_clears() {
         let spec = spec();
         let (kernel, _) = kernel(spec, 19);
         let i = inputs(&spec, 4, 20);
         let mut cell = DeltaCell::new(&spec);
         kernel.scan(cell.live_mut(), &rows(&spec, &i, 0, 2), None);
         let at_two = cell.live().clone();
-        cell.save_checkpoint();
+        let snapshot = cell.snapshot();
         kernel.scan(cell.live_mut(), &rows(&spec, &i, 2, 4), None);
         assert_ne!(cell.live().matrices(), at_two.matrices());
-        cell.restore_checkpoint();
+        cell.load(&snapshot);
         assert_eq!(cell.live().matrices(), at_two.matrices());
         assert_eq!(cell.live().history(), at_two.history());
         cell.reset();
