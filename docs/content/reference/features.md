@@ -177,7 +177,7 @@ Every other public module compiles unconditionally: `types`, `error`, `request`,
 | Field | Value |
 |---|---|
 | Package name | `cuca` |
-| Version | `0.6.1` |
+| Version | `0.6.2` |
 | Edition | `2024` |
 | `rust-version` | `1.98` |
 | Pinned toolchain | `1.98.0`, from `rust-toolchain.toml` |
