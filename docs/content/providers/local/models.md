@@ -50,6 +50,7 @@ Nothing here is specific to one model family. The loader reads every dimension f
 | `olmoe` | OLMoE (OLMoE-1B-7B-0125) | CPU, GPU |
 | `olmo2` | OLMo 2 | CPU, GPU |
 | `ernie4_5` | ERNIE 4.5 (dense) | CPU, GPU |
+| `muse-glimmer` | Muse Glimmer 30B | CPU; GPU on tiny models only (the 30B model does not fit a 16 GB card) |
 | `gemma4-assistant` | the Gemma 4 multi-token-prediction drafter | only through `LocalModelConfig::drafter` |
 
 What each architecture adds to the common forward pass:
@@ -66,13 +67,14 @@ What each architecture adds to the common forward pass:
 - `olmoe`: pre-norms, a Q/K RMSNorm that spans the whole projection, NEOX RoPE and a top-k mixture of experts whose selected weights are not renormalised.
 - `olmo2`: no pre-norms, only post-attention and post-FFN norms, and a Q/K RMSNorm that spans the whole projection.
 - `ernie4_5`: Llama-style layers with a head size larger than the width divided by the head count.
+- `muse-glimmer`: a dense decoder with a `[sliding, sliding, sliding, full]` pattern from `attention.sliding_window_pattern`. Sliding layers apply `NORM` RoPE with `rope.freq_base` (the file carries no `rope.freq_base_swa`) and full layers apply no RoPE at all. Every layer has a separate `attn_gate` projection of the normed input whose sigmoid multiplies the attention output before `attn_output`, a scale-less per-head RMS norm on Q and K (the file's `attn_q_norm` is the constant `qk_scale_factor`, 3.87, and `attn_k_norm` is ones), and Gemma-style post-attention and post-FFN norms whose epsilon is 1e-8 where the other norms use `attention.layer_norm_rms_epsilon`. The embeddings go through a scale-less RMSNorm after the lookup (no `sqrt(n_embd)` scale), and the logits are multiplied by `logit_scale` (0.196, a multiplier, not Granite's divisor) before the final soft-cap of 20.
 - `qwen35`: a hybrid stack; see [Hybrid models](#hybrid-models).
 - `qwen35moe`: the `qwen35` hybrid stack with a mixture of experts in every layer: a softmax over all experts, the top k, the selected weights renormalised to sum to one, plus a shared expert (a dense gated FFN every token runs) whose output is scaled by `sigmoid(ffn_gate_inp_shexp . x)` and added to the routed output. The routed experts honor `ExpertPlacement`; the shared expert and the router stay resident.
 - `gemma4-assistant`: a four-layer, query-only decoder that reads the K/V cache of a `gemma4` target. It pairs only with a `gemma4` model of the same hidden width and vocabulary.
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
 
-Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, qwen3, phi3, smollm3, granite, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, gemma4-assistant``.
+Not supported: other recurrent architectures such as Mamba and RWKV. Their GGUF fails with ``unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, qwen3, phi3, smollm3, granite, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, muse-glimmer, gemma4-assistant``.
 
 ### Hybrid models
 
@@ -103,6 +105,7 @@ A safetensors checkpoint of any architecture in the table above loads through `M
 | `Gemma4ForCausalLM`, `Gemma4ForConditionalGeneration`, `Gemma4AssistantForCausalLM` | `gemma4`, `gemma4-assistant` |
 | `Olmo2ForCausalLM`, `Olmo3ForCausalLM` (without sliding layers), `OlmoeForCausalLM` | `olmo2`, `olmoe` |
 | `Ernie4_5ForCausalLM` | `ernie4_5` |
+| `MuseGlimmerForConditionalGeneration` (text tower; the vision tensors are skipped) | `muse-glimmer` |
 
 Any other architecture fails with `` architecture `X` has no checkpoint converter; convert it to GGUF with llama.cpp ``. The weights, the metadata, the tokenizer (including `tokenizer.ggml.pre`, found from `tokenizer.json` and fingerprinted with llama.cpp's probe-text hash table) and the chat template are those llama.cpp's `convert_hf_to_gguf.py` writes: that script (commit `67107ac34f62882d8b53ea41ad68010ea635b9be`) was run on the same checkpoints and its GGUF files compared key by key and tensor by tensor with the converter's, with no difference but the float-rounding ones listed under [Checkpoints](@/providers/local/model-sources.md#checkpoints). Converted `f16` checkpoints also match the transformers oracle (top-1 equal, top-10 overlap at least 9 of 10, logits within 2 % relative L2) in `src/provider/local/convert/oracle.rs`, and answer the oracle's chat turn in `tests/provider_local_convert.rs`. All eight pinned repositories (OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 3, Gemma 3 1B through the ungated `unsloth/gemma-3-1b-it` mirror, OLMoE-1B-7B-0125-Instruct, DeepSeek-R1-Distill-Llama-8B as the 2025 `LlamaForCausalLM`, Qwen 3.5) passed: top-1 equal, top-10 overlap 10 of 10, greedy ids equal for all 24 (8 or 4 on the long prompts) steps, and every checkpoint answers the oracle's chat turn.
 
@@ -206,12 +209,15 @@ When the template writes a reasoning block, the engine finds its markers from th
 
 - `<|channel>thought` ... `<channel|>`: Gemma 4's channel. The header word `thought` and the whitespace after the opening marker are dropped.
 - `<think>` ... `</think>`: Qwen 3, Qwen 3.5, SmolLM 3, Granite 3.3 and the R1 distills.
+- Messages addressed to `self`: Muse Glimmer's channel protocol, below.
 
 The text between the markers arrives as `Thinking` blocks. If the rendered prompt ends inside an open block, generation starts in thinking. Markers are matched on text, so a marker that the vocabulary spells as several tokens works like a single control token. A close marker with no open marker is dropped.
 
 Whether a request can switch thinking off follows the template:
 
 - Gemma 4, Qwen 3, Qwen 3.5 and SmolLM 3 read `enable_thinking`.
+- Muse Glimmer reads `reasoning_strength` (`low`, `medium`, `high` or `xhigh`, default `high`). The request's `ThinkingEffort` maps to it (`Minimal` and `Low` to `low`, then `medium`, `high`, `xhigh`); a request that disables thinking gets `low`, the least reasoning the model has, so it cannot switch it off (`can_disable_thinking` is false). `enable_thinking(None)` and no thinking configuration leave the template's `high`. The variable is defined only for a template that reads it.
+- A template that reads `reasoning_effort` (a two-mode model, `none` or `high`) is a switch like `enable_thinking`: an enabled request renders `high`, anything else `none`.
 - Granite 3.3 reads `thinking`, which the request sets to the same value.
 - The DeepSeek-R1 distills read neither and reason on every request.
 
@@ -223,6 +229,7 @@ The template says how the model was taught to call tools, and the output parser 
 
 Syntaxes, in detection order:
 
+- Channel protocol ("ATEM"), Muse Glimmer: a turn is a sequence of messages `<|start|>assistant to=RECIPIENT<|message|>BODY END`, where `END` is `<|eom|>` when more messages follow and `<|eot|>` (an end-of-generation token) at the end of the turn. The prompt ends with `<|start|>assistant`, so generation starts at ` to=...`. A message addressed to `self` is reasoning (`Thinking` blocks), one to `user` (or without a recipient) is answer text, and any other recipient is a tool call whose body is `<atem:function_calls>`, one `<atem:invoke name="NAME">` per call and one `<atem:parameter name="KEY">VALUE</atem:parameter>` per argument. `<|eom|>` ends a message and generation continues; it is not an end-of-generation token. Markup quoted inside an answer or inside the reasoning stays text. A value is read as JSON when it is a JSON number, boolean, `null`, list or object without surrounding whitespace and as the raw string otherwise (a string that looks like one of these reads back as it; the format has that ambiguity). Detected when the template contains `<atem:function_calls>` and `<|eom|>` and the vocabulary has `<|start|>`, `<|message|>`, `<|eom|>` and `<|eot|>`. The fixtures of llama.cpp's `tests/test-chat.cpp` for this format (a plain answer, a first-message call, inform-then-act, quoted markup, reasoning containing markup) are unit tests of `output/atem.rs`.
 - Gemma 4 custom: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>` between control tokens. Detected when the template contains `<|tool_call>` and the vocabulary has both markers.
 - XML, Qwen 3.5: `<tool_call>` ... `</tool_call>` around `<function=name>` and one `<parameter=key>` element per argument, with the value between a newline after the opening tag and a newline before the closing one. Detected when the template contains `<tool_call>`, `</tool_call>`, `<function=` and `<parameter=`.
 - Tagged JSON, Qwen 3, SmolLM 3: `<tool_call>` ... `</tool_call>` around one call object or a list of them. Detected when the template contains `<tool_call>`; without `</tool_call>` the call runs to the end of the reply.

@@ -19,7 +19,7 @@
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
 //! `llama` (Llama 3.x and compatible), `qwen2`, `qwen3`, `phi3`
 //! (Phi 4-mini and compatible), `smollm3`, `granite`, `qwen3moe`,
-//! `olmoe`, `olmo2`, `ernie4_5`, `qwen35` or `qwen35moe` runs: the loader reads every
+//! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `qwen35` or `qwen35moe` runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
 //! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
@@ -48,7 +48,8 @@
 //! `Qwen3MoeForCausalLM`, `Qwen3_5*`, `Qwen3_5Moe*`, `Phi3ForCausalLM`,
 //! `Gemma3*`, `Gemma4*`, `Gemma4AssistantForCausalLM`,
 //! `Olmo2ForCausalLM`, `Olmo3ForCausalLM` without sliding layers,
-//! `OlmoeForCausalLM`, `Ernie4_5ForCausalLM`; any other architecture fails
+//! `OlmoeForCausalLM`, `Ernie4_5ForCausalLM`,
+//! `MuseGlimmerForConditionalGeneration`; any other architecture fails
 //! before a weight is downloaded) and writes the file llama.cpp would write
 //! (compared with its output tensor by tensor, see the local-provider docs). [`WeightQuant`]
 //! (`LocalModelConfig::convert`, `f16`, `q8_0` by default, or `q4_0`) sets
@@ -490,6 +491,15 @@ const PRESET_TABLE: [ModelPreset; 20] = [
         "52312daa5b2190c1f5723d33c3315c01c55af4206f6c6e6eb63f3d8dd52bb85e",
         20_836_243_072,
         "qwen35moe",
+    ),
+    preset(
+        "muse-glimmer-30b-q4_0",
+        "NANI-Nithin/Muse-Glimmer-30B-GGUF",
+        "41bbbd5e5a815ad2274f9a123b80777eb462c8d2",
+        "Muse-Glimmer-30B-Q4_0.gguf",
+        "51a0bd1736a60825dc9204d42df52d843e55718458e9b67987622851a4111873",
+        16_032_980_544,
+        "muse-glimmer",
     ),
     ModelPreset {
         drafter: true,
@@ -1488,7 +1498,7 @@ impl LocalModel {
 
     /// What this model supports: reasoning, switching it off, tool calls.
     pub fn capabilities(&self) -> LocalCapabilities {
-        let reasoning = self.inner.format.reasoning().is_some();
+        let reasoning = self.inner.format.writes_reasoning();
         LocalCapabilities {
             reasoning,
             can_disable_thinking: reasoning && self.inner.template.reads_enable_thinking(),
