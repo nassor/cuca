@@ -368,10 +368,10 @@ Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on 
 
 | Path compared | Result |
 |---|---|
-| Reference arithmetic (weights dequantized to f32) against `transformers`, the 13 first catalog models (recorded before the pre-2025 presets were removed) | top-1 token and top-10 set equal, maximum absolute logit difference below 5e-4, greedy output equal for 24 of 24 tokens on the chat prompt and 8 of 8 on the 700-token prompt; the Phi 4,200-token prompt exercises LongRoPE's long factors and matches |
+| Reference arithmetic (weights dequantized to f32) against `transformers`, the first catalog models that are still supported (Gemma 3, Gemma 4, Qwen 3, R1 distills, SmolLM 3, Phi 4 mini) | top-1 token and top-10 set equal, maximum absolute logit difference below 5e-4, greedy output equal for 24 of 24 tokens on the chat prompt and 8 of 8 on the 700-token prompt (bounds recorded over a larger run that included models since removed); the Phi 4,200-token prompt exercises LongRoPE's long factors and matches |
 | The same, OLMo 2, Granite 3.3, ERNIE 4.5 | maximum absolute logit difference 0.000 on the top-k, greedy output equal on every prompt |
-| Production quantized CPU path against `transformers`, the 13 first models | top-1 token kept on all 48 prompt cases; maximum absolute logit difference between 0.05 and 1.13, the cost of quantized weights |
-| The same, the six later models | top-1 token kept on all 24 prompt cases |
+| Production quantized CPU path against `transformers`, the same models | top-1 token kept on every prompt case; maximum absolute logit difference at most 1.13 (0.05 to 1.13 over the larger run), the cost of quantized weights |
+| The same, the later models still supported | top-1 token kept on every prompt case |
 | Muse Glimmer (`muse-glimmer`), tiny random model with every norm randomized, reference arithmetic | converted GGUF bit-identical to llama.cpp's `convert_hf_to_gguf.py` output (59 of 59 tensors); maximum absolute logit difference 2.6e-4 at all 48 positions, greedy output equal for 16 of 16 tokens |
 | The same, a 4-layer cut of the real checkpoint converted to F16 (prompt of 2,600 tokens, past the 2,048 window) | maximum absolute logit difference 8.4e-5 at ten positions including 2,046 to 2,050, greedy output equal for 8 of 8 tokens |
 | Mistral Small 4 (`mistral4`), the published Q4_0 GGUF cut to its first 2 layers (35 tensors), reference arithmetic against `Mistral4ForCausalLM` in f32 on the same dequantized tensors | 300-token prompt: maximum absolute logit difference 4.1e-5, greedy output equal for 8 of 8 tokens |
@@ -386,7 +386,7 @@ Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on 
 
 On the CPU, every Q4_0 and Q8_0 matrix multiplication runs through cuca's own batch-invariant quantized kernel, written in safe Rust; other dtypes use candle. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output.
 
-Since the paged K/V cache, attention reads the K/V blocks in place with an online-softmax kernel (per query row and head, so a row is bit-identical alone or in a batch) instead of candle's matmul attention. Its float rounding differs slightly from 0.6.x: logits move by about 0.04 (median) and up to 0.7 on the models measured, because the quantized matmuls round activations to Q8_0, so a greedy reply can differ from 0.6.x's where two logits are within about 0.1 of each other. In the 4-model matrix every first difference sat at a margin of 0.13 or less; Phi 3.5 mini and OLMoE (tiered) replies were identical.
+Since the paged K/V cache, attention reads the K/V blocks in place with an online-softmax kernel (per query row and head, so a row is bit-identical alone or in a batch) instead of candle's matmul attention. Its float rounding differs slightly from 0.6.x: logits move by about 0.04 (median) and up to 0.7 on the models measured, because the quantized matmuls round activations to Q8_0, so a greedy reply can differ from 0.6.x's where two logits are within about 0.1 of each other. In the 4-model matrix every first difference sat at a margin of 0.13 or less; OLMoE (tiered) replies were identical.
 
 Measured prefill speed with that kernel (1,300-token prompt in chunks of 256, release build with `-C target-cpu=native`, 32-core CPU): `gemma4-e2b-q4_0` 86.5 tokens/s, `qwen3-0.6b-q8_0` 249.6.
 
