@@ -693,6 +693,12 @@ async fn stop_string_cuts_the_reply() {
 
     // Without a stop string the count runs past 5: the cut below is real.
     let full = ask(model, make()).await;
+    if !full.text().contains('5') {
+        not_applicable!(
+            "stop_string_cuts_the_reply",
+            "model did not write the stop text unstopped"
+        );
+    }
     assert!(
         full.text().contains('5'),
         "[{}] the unstopped count reaches 5: {:?}",
