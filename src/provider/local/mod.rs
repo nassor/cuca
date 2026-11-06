@@ -2279,6 +2279,12 @@ mod tests {
                 p.size_bytes
             );
             assert!(p.parts.iter().all(|q| q.sha256.len() == 64));
+            // `<base>-0000i-of-0000N.gguf`, in part order.
+            let n = p.parts.len();
+            for (i, part) in p.parts.iter().enumerate() {
+                let tag = format!("-{:05}-of-{n:05}.gguf", i + 1);
+                assert!(part.file.ends_with(&tag), "{}: {tag}", part.file);
+            }
         }
         assert_eq!(
             ModelSource::PRESETS

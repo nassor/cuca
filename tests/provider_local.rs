@@ -362,9 +362,11 @@ async fn loaded() -> Option<Loaded> {
                     .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
             }
             println!("MATRIX|devices|{:?} + {:?}", config.device, config.shards);
+            let started = std::time::Instant::now();
             let model = LocalModel::load(config)
                 .await
                 .unwrap_or_else(|e| panic!("local model must load: {e}"));
+            println!("MATRIX|load_seconds|{:.1}", started.elapsed().as_secs_f64());
             let reported = model.capabilities();
             let caps = Capabilities {
                 name: source_label(&source),
