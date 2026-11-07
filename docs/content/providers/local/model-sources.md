@@ -21,7 +21,7 @@ weight = 4
 `LocalModelConfig::source` is a `ModelSource`:
 
 - `ModelSource::File(path)` is a GGUF file already on disk; nothing is downloaded. A file named like a split part (`<base>-00001-of-0000N.gguf`) is merged with its siblings, see [Split GGUF files](#split-gguf-files).
-- `ModelSource::HuggingFace { repo, revision, file, sha256, parts, template }` is a file on Hugging Face. `sha256: None` skips the checksum. `parts` is empty for a single file; for a split GGUF it lists every part with its digest (see [Split GGUF files](#split-gguf-files)). `template` is `None`, or a `ModelTemplate { repo, revision, file, sha256 }`: a chat template file that replaces the GGUF's (see [Chat templates](#chat-templates)).
+- `ModelSource::HuggingFace { repo, revision, file, sha256, parts, template }` is a file on Hugging Face. `sha256: None` skips the checksum. `parts` is empty for a single file; for a split GGUF it lists every part with its digest (see [Split GGUF files](#split-gguf-files)). `template` is `None`, or a boxed `ModelTemplate { repo, revision, file, sha256 }`: a chat template file that replaces the GGUF's (see [Chat templates](#chat-templates)).
 - `ModelSource::hugging_face(repo, revision, file)` builds the same value with `sha256: None`, so the download is not verified (`parts` is empty). Use a commit hash as the revision, because the cache is keyed by it and a moving ref such as `main` pins a stale file.
 - `ModelSource::default_model()` is the preset `gemma4-e2b-q4_0`.
 - `ModelSource::Checkpoint { repo, revision }` is a Hugging Face safetensors checkpoint, and `ModelSource::Dir(path)` a checkpoint directory on disk. Both are converted to a cached GGUF (see [Checkpoints](#checkpoints)).

@@ -315,11 +315,13 @@ impl ModelPreset {
                     sha256: Some(p.sha256.to_string()),
                 })
                 .collect(),
-            template: self.template.map(|t| ModelTemplate {
-                repo: t.repo.to_string(),
-                revision: t.revision.to_string(),
-                file: t.file.to_string(),
-                sha256: Some(t.sha256.to_string()),
+            template: self.template.map(|t| {
+                Box::new(ModelTemplate {
+                    repo: t.repo.to_string(),
+                    revision: t.revision.to_string(),
+                    file: t.file.to_string(),
+                    sha256: Some(t.sha256.to_string()),
+                })
             }),
         }
     }
@@ -664,7 +666,7 @@ pub enum ModelSource {
         /// downloaded and verified like a model file, and a failed digest or
         /// a template that does not compile fails the load. `None` keeps the
         /// GGUF's own template.
-        template: Option<ModelTemplate>,
+        template: Option<Box<ModelTemplate>>,
     },
     /// A GGUF file already on disk; nothing is downloaded. A file named like a
     /// split part (`<base>-00001-of-0000N.gguf`; any part names the set) is
