@@ -225,8 +225,8 @@
 //! owns, the rules a model must meet, the all-reduce) is described in
 //! [`tp`]; the rules are checked before any weight is read and fail with
 //! `CucaError::Config("tensor parallelism: <rule> (<numbers>)")`. Hybrid
-//! (delta-net) models, a drafter and tiered experts are not supported with
-//! shards. What this module does for it:
+//! (delta-net) models, latent attention, a drafter and tiered or host experts
+//! are not supported with shards. What this module does for it:
 //!
 //! - **Weights per shard**: one [`Weights`] per device, built with the
 //!   shard's own hyperparameters (its head counts) from sliced reads
@@ -276,23 +276,18 @@
 //!   turn with the buffer of one whole tensor (a row cut reads only its
 //!   rows), so the load's host footprint does not grow with `world`.
 //!
-//! # Known burn 0.22 Vulkan bugs
+//! # Why burn's quantized matmul is not used
 //!
-//! burn's quantized matmul is not used: a quantized weight on the right of a
-//! matmul loses the device in some autotune candidates; a single-row product
-//! through a quantized weight returns wrong values with the weight on the
-//! left; its `vecmat` autotune entry is shared by every shape of a
-//! power-of-two bucket, so a candidate tuned for one shape fails to launch
-//! for another ("could not find supported vector size"), and the shapes it
-//! cannot launch fell back to dequantizing the whole weight on every token;
-//! and its autotune key holds the shapes, the element types and the strides
-//! but **not the quantization scheme**, so a Q8_0 candidate was replayed on
-//! a Q4_0 weight of the same bucket and failed at launch. The loader used to
-//! hold the minority scheme's weights as f32 to keep the keys apart. The
-//! own kernels ([`mk::dense_gemv`], [`mk::dense_dequant`]) have none of these
-//! limits, every shape works, and no weight is held as f32 for this reason.
-//! The f32 weights (the float dtypes) still follow the workarounds of
-//! [`linear`] for the `vecmat` entry.
+//! On burn 0.22 a quantized weight on the right of a matmul loses the Vulkan
+//! device in some autotune candidates, a single-row product with the weight
+//! on the left returns wrong values, the `vecmat` autotune entry is shared
+//! by every shape of a power-of-two bucket (a candidate tuned for one shape
+//! fails to launch for another), and the autotune key holds the shapes, the
+//! element types and the strides but **not the quantization scheme**, so a
+//! Q8_0 candidate was replayed on a Q4_0 weight. The own kernels
+//! ([`mk::dense_gemv`], [`mk::dense_dequant`]) have none of these limits.
+//! Only the f32 weights (the float dtypes) go through burn's matmul, and
+//! they follow the workarounds of [`linear`].
 
 #[cfg(not(target_endian = "little"))]
 compile_error!(
@@ -554,42 +549,6 @@ fn append_columns(
     Ok(())
 }
 
-/// One row chunk of a weight, converted on the host to what the device takes.
-enum PackedData {
-    /// The words of the dense kernels ([`mk::pack_dense`]) of a quantized
-    /// chunk.
-    Packed(Vec<u32>, mk::DenseLayout),
-    /// f32 values, row-major.
-    Float(Vec<f32>),
-}
-
-/// One chunk of `rows` rows of a weight.
-struct PackedPart {
-    rows: usize,
-    data: PackedData,
-}
-
-impl PackedPart {
-    /// The chunk as a device part.
-    fn upload(self, cols: usize, device: &Device) -> Part {
-        match self.data {
-            PackedData::Packed(words, layout) => {
-                let n = words.len();
-                // The words travel as the bits of an i32 tensor.
-                let words: Vec<i32> = words.into_iter().map(|w| w as i32).collect();
-                Part::Packed(Packed {
-                    pool: Tensor::<1, Int>::from_data(TensorData::new(words, [n]), device),
-                    layout,
-                })
-            }
-            PackedData::Float(values) => Part::Float(Tensor::from_data(
-                TensorData::new(values, [self.rows, cols]),
-                device,
-            )),
-        }
-    }
-}
-
 /// How a `[rows, cols]` weight of GGUF dtype `dtype` reaches the device: the
 /// layout it takes there and the row chunks it is split into.
 struct PackPlan<'a> {
@@ -662,18 +621,23 @@ impl<'a> PackPlan<'a> {
             .map(move |start| start..(start + chunk).min(rows))
     }
 
-    /// Convert the rows `rows` of the weight, whose file bytes are `raw`.
-    fn pack(&self, raw: &[u8], rows: Range<usize>) -> Result<PackedPart, CucaError> {
+    /// Convert the rows `rows` of the weight, whose file bytes are `raw`, and
+    /// upload them as one part.
+    fn upload(&self, raw: &[u8], rows: Range<usize>, device: &Device) -> Result<Part, CucaError> {
         let context = |e: CucaError| err(format!("tensor `{}`: {e}", self.tensor_name));
         let (dtype, cols, row_bytes) = (self.dtype, self.cols, self.row_bytes);
         let n = rows.len();
         let src = &raw[rows.start * row_bytes..rows.end * row_bytes];
-        let data = if self.quantized {
+        if self.quantized {
             let layout = mk::DenseLayout::new(dtype, n, cols).map_err(context)?;
-            PackedData::Packed(
-                mk::pack_dense(&layout, dtype, src).map_err(context)?,
+            let words = mk::pack_dense(&layout, dtype, src).map_err(context)?;
+            // The words travel as the bits of an i32 tensor.
+            let words: Vec<i32> = words.into_iter().map(|w| w as i32).collect();
+            let len = words.len();
+            Ok(Part::Packed(Packed {
+                pool: Tensor::from_data(TensorData::new(words, [len]), device),
                 layout,
-            )
+            }))
         } else {
             let mut floats = vec![0f32; n * cols];
             for (row, dst) in src
@@ -682,9 +646,11 @@ impl<'a> PackPlan<'a> {
             {
                 dequant_row(dtype, row, 1.0, dst).map_err(context)?;
             }
-            PackedData::Float(floats)
-        };
-        Ok(PackedPart { rows: n, data })
+            Ok(Part::Float(Tensor::from_data(
+                TensorData::new(floats, [n, cols]),
+                device,
+            )))
+        }
     }
 }
 
@@ -713,7 +679,7 @@ fn upload_matrix_with(
     let plan = PackPlan::new(tensor_name, dtype, raw.len(), rows, cols, limit)?;
     let parts = plan
         .chunks()
-        .map(|range| plan.pack(raw, range).map(|part| part.upload(cols, device)))
+        .map(|range| plan.upload(raw, range, device))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Weight { parts })
 }
@@ -728,6 +694,25 @@ struct WeightReader<'a> {
     host: Option<HostPlan>,
 }
 
+impl<'a> WeightReader<'a> {
+    /// A reader of the file at `path` (index `content`) that uploads to
+    /// `device`.
+    fn open(
+        content: &'a gguf_file::Content,
+        path: &Path,
+        device: &'a Device,
+        host: Option<HostPlan>,
+    ) -> Result<Self, CucaError> {
+        Ok(Self {
+            content,
+            file: File::open(path)?,
+            buf: Vec::new(),
+            device,
+            host,
+        })
+    }
+}
+
 /// The MoE layers `lead..lead + n` keep their experts in host RAM
 /// (`ExpertPlacement::Host`; `n` is unbounded for all of them).
 #[derive(Clone)]
@@ -738,33 +723,6 @@ struct HostPlan {
     hp: Hparams,
     /// Hold the hosted experts as f32 (the exact reference of the tests).
     dequantize: bool,
-}
-
-/// `CUCA_LOCAL_PROFILE_HOST=1`: time the phases of every host-experts layer
-/// (the readback with the device's queued work, the CPU experts, the upload) and
-/// print their averages to stderr every 288 layer passes.
-fn host_profile() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("CUCA_LOCAL_PROFILE_HOST").is_some())
-}
-
-fn host_profile_add(phases: [std::time::Duration; 3]) {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static SUM: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
-    static COUNT: AtomicU64 = AtomicU64::new(0);
-    for (sum, d) in SUM.iter().zip(phases) {
-        sum.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
-    }
-    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
-    if n.is_multiple_of(288) {
-        let avg = |i: usize| SUM[i].swap(0, Ordering::Relaxed) as f64 / 288.0 / 1000.0;
-        eprintln!(
-            "HOSTPROFILE|per layer pass ms: readback (with the device's queued work) {:.2} cpu experts {:.2} upload {:.2}",
-            avg(0),
-            avg(1),
-            avg(2)
-        );
-    }
 }
 
 impl WeightReader<'_> {
@@ -913,7 +871,7 @@ impl WeightReader<'_> {
         {
             return self.vector(tensor_name, len);
         }
-        let values = self.host_vector(tensor_name, len)?;
+        let values = self.host_floats(tensor_name, &[len])?;
         let mut kept: Vec<f32> = Vec::new();
         for r in rows {
             let part = values.get(r.clone()).ok_or_else(|| {
@@ -1009,7 +967,6 @@ impl WeightReader<'_> {
                 il,
                 layout,
                 device_slots,
-                stored_bytes: layout.bytes(),
                 store: Arc::clone(&plan.store),
                 state: Mutex::new(TierState {
                     pool: Some(pool),
@@ -1064,21 +1021,11 @@ impl WeightReader<'_> {
         })
     }
 
-    /// A 1-D tensor dequantized on the host.
-    fn host_vector(&mut self, tensor_name: &str, len: usize) -> Result<Vec<f32>, CucaError> {
-        let dtype = self.read(tensor_name, &[len])?;
-        let mut out = vec![0f32; len];
-        dequant_row(dtype, &self.buf, 1.0, &mut out)
-            .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
-        Ok(out)
-    }
-
     /// The values of the (float or quantized) tensor `tensor_name`, whose
     /// shape must be `shape`, as row-major f32.
     fn host_floats(&mut self, tensor_name: &str, shape: &[usize]) -> Result<Vec<f32>, CucaError> {
-        let len: usize = shape.iter().product();
         let dtype = self.read(tensor_name, shape)?;
-        let mut out = vec![0f32; len];
+        let mut out = vec![0f32; shape.iter().product()];
         dequant_row(dtype, &self.buf, 1.0, &mut out)
             .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
         Ok(out)
@@ -1086,7 +1033,7 @@ impl WeightReader<'_> {
 
     /// A 1-D f32 tensor on the device.
     fn vector(&mut self, tensor_name: &str, len: usize) -> Result<Tensor<1>, CucaError> {
-        let values = self.host_vector(tensor_name, len)?;
+        let values = self.host_floats(tensor_name, &[len])?;
         Ok(Tensor::from_data(
             TensorData::new(values, [len]),
             self.device,
@@ -1105,7 +1052,7 @@ impl WeightReader<'_> {
 
     /// A one-element tensor as a host scalar.
     fn scalar(&mut self, tensor_name: &str) -> Result<f64, CucaError> {
-        let values = self.host_vector(tensor_name, 1)?;
+        let values = self.host_floats(tensor_name, &[1])?;
         values
             .first()
             .map(|&v| f64::from(v))
@@ -1316,16 +1263,20 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// What the CPU needs to compute a host-experts layer: the normed rows and the
-/// routing, read back from the device.
-struct HostInput {
-    rows: Vec<f32>,
-    routing: Routing,
-    t: usize,
-    n_embd: usize,
-    act: Act,
-    /// Time the readback took (the device's queued work included).
-    read: std::time::Duration,
+/// The routing of a layer from the router output `[ids | weights]` read back
+/// to the host (`tokens * n_used` of each, see [`mk::route`]): per expert,
+/// the tokens it computes and their weights.
+fn routing_of(route: &[f32], tokens: usize, n_used: usize, n_expert: usize) -> Routing {
+    let (ids, weights) = route
+        .split_at_checked(tokens * n_used)
+        .unwrap_or((route, &[]));
+    let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_expert];
+    for (pair, (&id, &weight)) in ids.iter().zip(weights).enumerate() {
+        if let Some(picks) = per_expert.get_mut(id as usize) {
+            picks.push(((pair / n_used) as u32, weight));
+        }
+    }
+    Routing { per_expert }
 }
 
 /// The experts of one MoE layer, as slots of one `u32` tensor (the *pool*)
@@ -1354,8 +1305,6 @@ struct TieredBank {
     il: usize,
     layout: SlotLayout,
     device_slots: usize,
-    /// Device bytes of one expert of this layer.
-    stored_bytes: usize,
     store: Arc<ExpertStore<PackedExpert>>,
     state: Mutex<TierState>,
 }
@@ -1401,93 +1350,55 @@ impl GpuExpertBank {
     }
 
     /// The experts' output `[t, n_embd]` for the normed input `f` and the
-    /// router output `route` (see [`mk::route`]); `call(pairs, use_list)`
-    /// describes a kernel call.
+    /// router output `route` (see [`mk::route`]) plus the output of `shared`;
+    /// `call(pairs, use_list)` describes a kernel call.
     ///
     /// A resident bank queues the kernels and returns: the router output
     /// never leaves the device. A tiered bank reads it back to find the
-    /// experts the pool lacks.
+    /// experts the pool lacks. A host bank reads the layer's normed rows and
+    /// routing back in one buffer, queues `shared` while the CPU computes
+    /// the experts and uploads their sum in one transfer. (burn submits the
+    /// queued work lazily: forcing a submit with `Device::flush` before the
+    /// CPU experts measured 20% slower decode on Vulkan.)
     fn run(
         &self,
         f: Tensor<2>,
         route: Tensor<1>,
         call: &dyn Fn(usize, bool) -> MoeCall,
         device: &Device,
+        shared: impl FnOnce() -> Option<Tensor<2>>,
     ) -> Result<Tensor<2>, CucaError> {
         let c = call(0, false);
         let (t, k, n_embd) = (c.tokens, c.n_used, c.slot.down.rows);
-        match self {
+        let (routed, extra) = match self {
             Self::Resident { pool, no_list, .. } => {
                 let c = call(t * k, false);
                 let hidden = mk::up(f, route.clone(), no_list.clone(), pool.clone(), &c);
                 let scratch = Tensor::<2>::empty([t * k, n_embd], device);
                 let scratch = mk::down(hidden, route, no_list.clone(), pool.clone(), scratch, &c);
-                Ok(mk::sum(scratch, &c))
+                (mk::sum(scratch, &c), shared())
             }
-            Self::Tiered(bank) => bank.run(f, route, call, device),
-            Self::Host { .. } => {
-                let input = self.host_fetch(f, route, &call(0, false))?;
-                self.host_finish(input, device)
+            Self::Tiered(bank) => (bank.run(f, route, call, device)?, shared()),
+            Self::Host { experts, .. } => {
+                let rows = t * n_embd;
+                let mut host = read_f32(
+                    Tensor::cat(vec![f.reshape([rows]), route], 0),
+                    "the rows of host experts",
+                )?;
+                let routing = routing_of(&host.split_off(rows), t, k, c.n_expert);
+                let extra = shared();
+                let act = if c.act == 0 { Act::Silu } else { Act::Gelu };
+                let out = experts.forward(&host, t, n_embd, &routing, act)?;
+                (
+                    Tensor::from_data(TensorData::new(out, [t, n_embd]), device),
+                    extra,
+                )
             }
-        }
-    }
-
-    /// Host experts, first half: one readback of the layer's normed rows and
-    /// its routing (ids, then weights) in one buffer. It returns once the
-    /// device has produced them; work queued after this call runs on the
-    /// device while the CPU computes the experts ([`GpuExpertBank::host_finish`]).
-    fn host_fetch(
-        &self,
-        f: Tensor<2>,
-        route: Tensor<1>,
-        c: &MoeCall,
-    ) -> Result<HostInput, CucaError> {
-        let (t, k, n_embd) = (c.tokens, c.n_used, c.slot.down.rows);
-        let rows = t * n_embd;
-        let mark = std::time::Instant::now();
-        let mut host = read_f32(
-            Tensor::cat(vec![f.reshape([rows]), route], 0),
-            "the rows of host experts",
-        )?;
-        let read = mark.elapsed();
-        let route_host = host.split_off(rows);
-        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); c.n_expert];
-        for pair in 0..t * k {
-            if let Some(picks) = per_expert.get_mut(route_host[pair] as usize) {
-                picks.push(((pair / k) as u32, route_host[t * k + pair]));
-            }
-        }
-        Ok(HostInput {
-            rows: host,
-            routing: Routing { per_expert },
-            t,
-            n_embd,
-            act: if c.act == 0 { Act::Silu } else { Act::Gelu },
-            read,
-        })
-    }
-
-    /// Host experts, second half: the CPU computes the routed experts of
-    /// `input` and the sum goes up in one upload.
-    fn host_finish(&self, input: HostInput, device: &Device) -> Result<Tensor<2>, CucaError> {
-        let Self::Host { experts, .. } = self else {
-            return Err(err("not a host expert bank"));
         };
-        let mark = std::time::Instant::now();
-        let out = experts.forward(
-            &input.rows,
-            input.t,
-            input.n_embd,
-            &input.routing,
-            input.act,
-        )?;
-        let computed = mark.elapsed();
-        let mark = std::time::Instant::now();
-        let up = Tensor::<2>::from_data(TensorData::new(out, [input.t, input.n_embd]), device);
-        if host_profile() {
-            host_profile_add([input.read, computed, mark.elapsed()]);
-        }
-        Ok(up)
+        Ok(match extra {
+            Some(extra) => routed + extra,
+            None => routed,
+        })
     }
 
     /// Fill the pool of a tiered bank with the hottest experts of `heat`
@@ -1513,7 +1424,7 @@ impl GpuExpertBank {
                 state.table.insert(e, Arc::new(slot));
                 add(
                     &bank.store.shared().device_resident_bytes,
-                    bank.stored_bytes as u64,
+                    bank.layout.bytes() as u64,
                 );
             }
         }
@@ -1544,7 +1455,7 @@ impl TieredBank {
                     .table
                     .remove(victim)
                     .ok_or_else(|| err("the device tier lost its victim"))?;
-                sub(&shared.device_resident_bytes, self.stored_bytes as u64);
+                sub(&shared.device_resident_bytes, self.layout.bytes() as u64);
                 Ok(*slot)
             }
             _ => Err(err(format!(
@@ -1583,12 +1494,8 @@ impl TieredBank {
         let c = call(0, false);
         let (t, k, n_embd, n_expert) = (c.tokens, c.n_used, c.slot.down.rows, c.n_expert);
         let route_host = read_f32(route.clone(), "routing")?;
-        let expert_of = |pair: usize| route_host[pair] as usize;
-        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); n_expert];
-        for pair in 0..t * k {
-            per_expert[expert_of(pair)].push(((pair / k) as u32, route_host[t * k + pair]));
-        }
-        let routing = Routing { per_expert };
+        let routing = routing_of(&route_host, t, k, n_expert);
+        let expert_of: Vec<usize> = route_host.iter().take(t * k).map(|&e| e as usize).collect();
         let shared = self.store.shared();
         shared.record(self.il, &routing, t);
         let needed: Vec<u32> = routing
@@ -1631,7 +1538,7 @@ impl TieredBank {
                 let slot = self.take_slot(&mut state, &group, &mut heat)?;
                 self.write(&mut state, slot, &packed, device);
                 state.table.insert(e, Arc::new(slot));
-                add(&shared.device_resident_bytes, self.stored_bytes as u64);
+                add(&shared.device_resident_bytes, self.layout.bytes() as u64);
             }
             // The pairs of the group, with their slots.
             let mut slots = HashMap::with_capacity(group.len());
@@ -1641,8 +1548,8 @@ impl TieredBank {
                 }
             }
             let mut list: Vec<i32> = Vec::new();
-            for pair in 0..t * k {
-                if let Some(&slot) = slots.get(&expert_of(pair)) {
+            for (pair, e) in expert_of.iter().enumerate() {
+                if let Some(&slot) = slots.get(e) {
                     list.push(pair as i32);
                     list.push(slot as i32);
                 }
@@ -1707,6 +1614,46 @@ struct KvPool {
 /// The pool of every layer (`None` for layers that share another layer's
 /// pool and layers without attention).
 type KvLayers = Vec<Option<KvPool>>;
+
+impl KvPool {
+    /// The pool with new rows written: each of `writes` puts rows `base +
+    /// w.off ..` of `k` (and of `v`, for a pool that holds values), both
+    /// `[1, n_kv, rows, width]`, into rows `w.r0..w.r1` of block `w.block`.
+    /// It takes the pool by value so that the assignments own the only
+    /// handle to its tensors and write in place.
+    fn write(
+        mut self,
+        writes: &[BlockWrite],
+        base: usize,
+        k: &Tensor<4>,
+        v: Option<&Tensor<4>>,
+    ) -> Self {
+        let [_, n_kv, _, width] = self.k.dims();
+        let mut values = self.v.take();
+        for w in writes {
+            let at = [w.block..w.block + 1, 0..n_kv, w.r0..w.r1, 0..width];
+            let (from, rows) = (base + w.off, w.r1 - w.r0);
+            self.k = self
+                .k
+                .slice_assign(at.clone(), k.clone().narrow(2, from, rows));
+            values = match (values, v) {
+                (Some(pool), Some(v)) => {
+                    Some(pool.slice_assign(at, v.clone().narrow(2, from, rows)))
+                }
+                (pool, _) => pool,
+            };
+        }
+        self.v = values;
+        self
+    }
+}
+
+/// Take the pool of layer `il` out of `kv`; put it back after [`KvPool::write`].
+fn take_pool(kv: &mut KvLayers, il: usize) -> Result<KvPool, CucaError> {
+    kv.get_mut(il)
+        .and_then(Option::take)
+        .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))
+}
 
 /// The RoPE rows of the new positions: `[1, 1, t, n_dims / 2]`.
 struct RopeRows {
@@ -2321,11 +2268,7 @@ fn open_tiers(
     if let Some(heat) = &tiers.warm_from {
         shared.check(heat)?;
     }
-    let build: Arc<BuildFn<PackedExpert>> = Arc::new(
-        move |layer: &LayerExperts, gate: &[u8], up: &[u8], down: &[u8]| {
-            build_packed_expert(layer, gate, up, down)
-        },
-    );
+    let build: Arc<BuildFn<PackedExpert>> = Arc::new(build_packed_expert);
     let store = ExpertStore::open(
         path,
         hp.n_layer,
@@ -2570,13 +2513,7 @@ impl GpuTransformer {
         let plan = tiers.as_ref().map(|(_, plan)| plan);
         let mut weights: Vec<Weights> = Vec::with_capacity(world);
         for (shard, device) in devices.iter().enumerate() {
-            let mut reader = WeightReader {
-                content,
-                file: File::open(path)?,
-                buf: Vec::new(),
-                device,
-                host: host.clone(),
-            };
+            let mut reader = WeightReader::open(content, path, device, host.clone())?;
             weights.push(Weights::load(
                 &mut reader,
                 path,
@@ -3305,13 +3242,7 @@ impl GpuDrafter {
             }
         }
         let (n_embd, n_embd_out) = (hp.n_embd, hp.n_embd_out);
-        let mut reader = WeightReader {
-            content,
-            file: File::open(path)?,
-            buf: Vec::new(),
-            device: &target.weights[0].device,
-            host: None,
-        };
+        let mut reader = WeightReader::open(content, path, &target.weights[0].device, None)?;
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
         let net = Weights::load(&mut reader, path, &hp, Tp::SOLO, context_length, None, 0)?;
@@ -3583,7 +3514,7 @@ fn load_delta(
         ))],
     };
     let mut head_row = |tensor: String| -> Result<Tensor<2>, CucaError> {
-        let values = reader.host_vector(&tensor, nv)?;
+        let values = reader.host_floats(&tensor, &[nv])?;
         Ok(Tensor::from_data(
             TensorData::new(values, [1, nv]),
             reader.device,
@@ -3660,7 +3591,8 @@ fn load_layer(
                     let gate_inp = if hp.behavior.shared_expert_ungated {
                         None
                     } else {
-                        let values = reader.host_vector(&blk(name::FFN_GATE_INP_SHEXP), n_embd)?;
+                        let values =
+                            reader.host_floats(&blk(name::FFN_GATE_INP_SHEXP), &[n_embd])?;
                         Some(Tensor::from_data(
                             TensorData::new(values, [1, n_embd]),
                             reader.device,
@@ -3733,7 +3665,7 @@ struct Seg<'a> {
 }
 
 /// Host-side row ranges, coalescing a range that continues the last one.
-fn push_rows(ranges: &mut Vec<Range<usize>>, rows: Range<usize>) {
+pub(super) fn push_rows(ranges: &mut Vec<Range<usize>>, rows: Range<usize>) {
     match ranges.last_mut() {
         Some(last) if last.end == rows.start => last.end = rows.end,
         _ => ranges.push(rows),
@@ -3875,7 +3807,6 @@ impl Weights {
             let Some(mut pool) = kv[m.layer].take() else {
                 return Err(err(format!("layer {} has no mirrored K/V pool", m.layer)));
             };
-            let mut value_pool = pool.v.take();
             for ((seq, (k, v)), writes) in pass.seqs.iter().zip(&m.seqs).zip(writes) {
                 let upload = |rows: &[f32]| {
                     Tensor::<4>::from_data(
@@ -3883,18 +3814,8 @@ impl Weights {
                         &self.device,
                     )
                 };
-                let (kt, vt) = (upload(k), upload(v));
-                for w in writes {
-                    let at = [w.block..w.block + 1, 0..nkv, w.r0..w.r1, 0..d];
-                    let rows = w.r1 - w.r0;
-                    pool.k = pool
-                        .k
-                        .slice_assign(at.clone(), kt.clone().narrow(2, w.off, rows));
-                    value_pool =
-                        value_pool.map(|pv| pv.slice_assign(at, vt.clone().narrow(2, w.off, rows)));
-                }
+                pool = pool.write(writes, 0, &upload(k), Some(&upload(v)));
             }
-            pool.v = value_pool;
             kv[m.layer] = Some(pool);
         }
         Ok(())
@@ -4381,26 +4302,10 @@ impl Weights {
                     let v = v.reshape([1, t, nkv, d]);
                     let v = if aw.v_norm { rms(v, None, eps) } else { v };
                     let v = v.swap_dims(1, 2);
-                    // Take the pools out so the assignments own the only handle
-                    // and write in place.
-                    let mut pool = kv
-                        .get_mut(il)
-                        .and_then(Option::take)
-                        .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
+                    let mut pool = take_pool(kv, il)?;
                     for seq in &pass.seqs {
                         let (_, blocks) = seq.visible(il, spec.window)?;
-                        for w in &blocks.writes {
-                            let at = [w.block..w.block + 1, 0..nkv, w.r0..w.r1, 0..d];
-                            let rows = w.r1 - w.r0;
-                            let from = seq.off + w.off;
-                            pool.k = pool
-                                .k
-                                .slice_assign(at.clone(), k.clone().narrow(2, from, rows));
-                            pool.v = pool
-                                .v
-                                .take()
-                                .map(|pv| pv.slice_assign(at, v.clone().narrow(2, from, rows)));
-                        }
+                        pool = pool.write(&blocks.writes, seq.off, &k, Some(&v));
                     }
                     kv[il] = Some(pool);
                 }
@@ -4436,60 +4341,8 @@ impl Weights {
                     scale: spec.scale,
                     v_width: None,
                 };
-                let attn = if let Some(st) = pass.stacked.iter().find(|s| s.window == spec.window) {
-                    // A decode step: every sequence's one row in one launch.
-                    paged_kernel::decode(
-                        q.swap_dims(1, 2).reshape([t, nh, d]),
-                        pool_k.clone(),
-                        pool_v.clone(),
-                        st.table.clone(),
-                        st.range.clone(),
-                        &call,
-                    )
-                    .reshape([t, nh * d])
-                } else {
-                    let mut outs = Vec::with_capacity(pass.seqs.len());
-                    for seq in &pass.seqs {
-                        let (visible, blocks) = seq.visible(il, spec.window)?;
-                        let qs = if pass.seqs.len() == 1 {
-                            q.clone()
-                        } else {
-                            q.clone().narrow(2, seq.off, seq.t)
-                        };
-                        let out = match &blocks.read {
-                            // One query row reads the blocks in place.
-                            BlockRead::Decode { table, range } => paged_kernel::decode(
-                                qs.reshape([1, nh, d]),
-                                pool_k.clone(),
-                                pool_v.clone(),
-                                Tensor::clone(table),
-                                Tensor::clone(range),
-                                &call,
-                            )
-                            .reshape([1, nh, 1, d]),
-                            // Several rows: the blocks of the visible range as
-                            // one contiguous `[1, n_kv, len, d]` view.
-                            BlockRead::Gather { idx, skip, len } => attend(
-                                qs,
-                                gather_view(pool_k, idx, *skip, *len),
-                                gather_view(pool_v, idx, *skip, *len),
-                                visible.mask.clone(),
-                                spec.scale,
-                            ),
-                            BlockRead::Rows { .. } => {
-                                return Err(err(format!(
-                                    "layer {il}: the step's blocks were stacked for one launch"
-                                )));
-                            }
-                        };
-                        outs.push(out.swap_dims(1, 2).reshape([seq.t, nh * d]));
-                    }
-                    if outs.len() == 1 {
-                        outs.swap_remove(0)
-                    } else {
-                        Tensor::cat(outs, 0)
-                    }
-                };
+                let attn = attend_pass(pass, il, spec.window, &q, pool_k, pool_v, &call)?
+                    .reshape([t, nh * d]);
                 let attn = match gate {
                     Some(gate) => attn * activation::sigmoid(gate),
                     None => attn,
@@ -4542,7 +4395,6 @@ impl Weights {
         let eps = hp.eps;
         let t = pass.t;
         let (nh, nope, rot, kvl) = (spec.n_head, mla.nope, mla.rot, mla.kv_lora);
-        let width = mla.latent_width();
         let rotate = |m: Tensor<4>| rope(m, &pass.ropes[rope_at], &hp.ropes[rope_at]);
 
         // The query rows `[nope | rot]` per head: the nope part absorbed
@@ -4567,19 +4419,10 @@ impl Weights {
         let c = rms(latent.clone().narrow(1, 0, kvl), Some(&mw.kv_a_norm), eps);
         let k_rot = rotate(latent.narrow(1, kvl, rot).reshape([1, 1, t, rot]));
         let row = Tensor::cat(vec![c.reshape([1, 1, t, kvl]), k_rot], 3);
-        // Take the pool out so the assignments own the only handle and
-        // write in place.
-        let mut pool = kv
-            .get_mut(il)
-            .and_then(Option::take)
-            .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
+        let mut pool = take_pool(kv, il)?;
         for seq in &pass.seqs {
             let (_, blocks) = seq.visible(il, spec.window)?;
-            for w in &blocks.writes {
-                let at = [w.block..w.block + 1, 0..1, w.r0..w.r1, 0..width];
-                let rows = row.clone().narrow(2, seq.off + w.off, w.r1 - w.r0);
-                pool.k = pool.k.slice_assign(at, rows);
-            }
+            pool = pool.write(&blocks.writes, seq.off, &row, None);
         }
         kv[il] = Some(pool);
         let pool_k = kv
@@ -4593,60 +4436,8 @@ impl Weights {
             scale: spec.scale,
             v_width: Some(kvl),
         };
-        let attended = if let Some(st) = pass.stacked.iter().find(|s| s.window == spec.window) {
-            paged_kernel::decode(
-                q_full.swap_dims(1, 2).reshape([t, nh, width]),
-                pool_k.clone(),
-                pool_k.clone(),
-                st.table.clone(),
-                st.range.clone(),
-                &call,
-            )
-            .swap_dims(0, 1)
-        } else {
-            let mut outs = Vec::with_capacity(pass.seqs.len());
-            for seq in &pass.seqs {
-                let (visible, blocks) = seq.visible(il, spec.window)?;
-                let qs = if pass.seqs.len() == 1 {
-                    q_full.clone()
-                } else {
-                    q_full.clone().narrow(2, seq.off, seq.t)
-                };
-                let out = match &blocks.read {
-                    BlockRead::Decode { table, range } => paged_kernel::decode(
-                        qs.reshape([1, nh, width]),
-                        pool_k.clone(),
-                        pool_k.clone(),
-                        Tensor::clone(table),
-                        Tensor::clone(range),
-                        &call,
-                    )
-                    .swap_dims(0, 1),
-                    BlockRead::Gather { idx, skip, len } => {
-                        let keys = gather_view(pool_k, idx, *skip, *len);
-                        attend(
-                            qs,
-                            keys.clone(),
-                            keys.narrow(3, 0, kvl),
-                            visible.mask.clone(),
-                            spec.scale,
-                        )
-                        .reshape([nh, seq.t, kvl])
-                    }
-                    BlockRead::Rows { .. } => {
-                        return Err(err(format!(
-                            "layer {il}: the step's blocks were stacked for one launch"
-                        )));
-                    }
-                };
-                outs.push(out);
-            }
-            if outs.len() == 1 {
-                outs.swap_remove(0)
-            } else {
-                Tensor::cat(outs, 1)
-            }
-        };
+        let attended =
+            attend_pass(pass, il, spec.window, &q_full, pool_k, pool_k, &call)?.swap_dims(0, 1);
         let out = attended
             .matmul(mw.v_b.clone())
             .swap_dims(0, 1)
@@ -4807,24 +4598,9 @@ impl FfnWeights {
                         None => y,
                     }
                 };
-                if let GpuExpertBank::Host { .. } = experts {
-                    // Host experts: the readback waits for the router only and
-                    // the shared expert is queued right after it. burn submits
-                    // it lazily: forcing a submit with `Device::flush` before
-                    // the CPU experts measured 20% slower decode on Vulkan.
-                    let input = experts.host_fetch(f.clone(), route, &call(0, false))?;
-                    let shared_part = shared.as_ref().map(|sh| shared_out(sh, f));
-                    let routed = experts.host_finish(input, device)?;
-                    return Ok(match shared_part {
-                        Some(part) => routed + part,
-                        None => routed,
-                    });
-                }
-                let mut out = experts.run(f.clone(), route, &call, device)?;
-                if let Some(sh) = shared {
-                    out = out + shared_out(sh, f);
-                }
-                Ok(out)
+                experts.run(f.clone(), route, &call, device, || {
+                    shared.as_ref().map(|sh| shared_out(sh, f))
+                })
             }
         }
     }
@@ -5207,6 +4983,82 @@ fn gather_view(pool: &Tensor<4>, idx: &Tensor<1, Int>, skip: usize, len: usize) 
         .narrow(2, skip, len)
 }
 
+/// Attention of the pass's query rows `q [1, n_head, t, key_width]` over the
+/// K/V blocks of the layers with window `window`: `[t, n_head, value_width]`,
+/// the rows of the sequences one after the other.
+///
+/// A decode step of several sequences is one launch of the decode kernel
+/// (`pass.stacked`); else each sequence reads its own blocks: one query row in
+/// place with the decode kernel, several rows as the visible blocks gathered
+/// into one contiguous `[1, n_kv, len, d]` view and [`attend`]ed. `call.v_width`
+/// selects latent attention, where the values are the leading columns of the
+/// key rows (the caller passes the key pool as `pool_v` too).
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] for a sequence without blocks for `window`.
+fn attend_pass(
+    pass: &Pass,
+    il: usize,
+    window: Option<usize>,
+    q: &Tensor<4>,
+    pool_k: &Tensor<4>,
+    pool_v: &Tensor<4>,
+    call: &PagedCall,
+) -> Result<Tensor<3>, CucaError> {
+    let [_, nh, t, key_width] = q.dims();
+    let value_width = call.v_width.unwrap_or(key_width);
+    if let Some(st) = pass.stacked.iter().find(|s| s.window == window) {
+        return Ok(paged_kernel::decode(
+            q.clone().swap_dims(1, 2).reshape([t, nh, key_width]),
+            pool_k.clone(),
+            pool_v.clone(),
+            st.table.clone(),
+            st.range.clone(),
+            call,
+        ));
+    }
+    let mut outs = Vec::with_capacity(pass.seqs.len());
+    for seq in &pass.seqs {
+        let (visible, blocks) = seq.visible(il, window)?;
+        let qs = if pass.seqs.len() == 1 {
+            q.clone()
+        } else {
+            q.clone().narrow(2, seq.off, seq.t)
+        };
+        outs.push(match &blocks.read {
+            BlockRead::Decode { table, range } => paged_kernel::decode(
+                qs.reshape([1, nh, key_width]),
+                pool_k.clone(),
+                pool_v.clone(),
+                Tensor::clone(table),
+                Tensor::clone(range),
+                call,
+            ),
+            BlockRead::Gather { idx, skip, len } => {
+                let keys = gather_view(pool_k, idx, *skip, *len);
+                let values = match call.v_width {
+                    Some(width) => keys.clone().narrow(3, 0, width),
+                    None => gather_view(pool_v, idx, *skip, *len),
+                };
+                attend(qs, keys, values, visible.mask.clone(), call.scale)
+                    .swap_dims(1, 2)
+                    .reshape([seq.t, nh, value_width])
+            }
+            BlockRead::Rows { .. } => {
+                return Err(err(format!(
+                    "layer {il}: the step's blocks were stacked for one launch"
+                )));
+            }
+        });
+    }
+    Ok(if outs.len() == 1 {
+        outs.swap_remove(0)
+    } else {
+        Tensor::cat(outs, 0)
+    })
+}
+
 /// Grouped-query attention, as the CPU `attend`: `q` is `[1, n_head, t, d]`,
 /// `k` and `v` are `[1, n_kv, l, d]`, `mask` the additive `[1, 1, t, l]`
 /// mask. The scores are scaled by `scale` before the mask. The `n_head / n_kv`
@@ -5275,12 +5127,19 @@ mod tests {
     /// The GPU device under test, the first of [`test_devices`]; `None`
     /// (skip) when unset or `cpu`.
     fn test_device() -> Option<LocalDevice> {
-        test_devices().first().copied()
+        let device = test_devices().first().copied();
+        if device.is_none() {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+        }
+        device
+    }
+
+    fn content_of(model: &TinyModel) -> gguf_file::Content {
+        gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap())).unwrap()
     }
 
     fn load_both(model: &TinyModel, device: LocalDevice) -> (Transformer, GpuTransformer) {
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = content_of(model);
         (
             Transformer::load_dequantized(&content, &model.path, 32).unwrap(),
             GpuTransformer::load(&content, &model.path, 32, device).unwrap(),
@@ -5420,7 +5279,6 @@ mod tests {
     #[test]
     fn gpu_matches_cpu_on_the_tiny_gemma4() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         for (label, options) in [
@@ -5441,7 +5299,6 @@ mod tests {
     #[test]
     fn gpu_matches_cpu_on_every_architecture() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         for spec in TinySpec::all() {
@@ -5592,22 +5449,18 @@ mod tests {
             .collect()
     }
 
-    fn assert_rows_close(got: &[f32], want: &[f32], what: &str) {
-        // Batched and solo steps run different matmul shapes (and, in a
-        // mixture of experts, group different rows per expert), so they
-        // agree up to float rounding of the vector's scale.
-        assert_rows_within(got, want, 1e-3, what);
-    }
-
-    /// The logits and hidden rows of two runs of one sequence's call agree
-    /// (and are present in both or neither).
-    fn assert_forward_close(got: &Forward, want: &Forward, what: &str) {
+    /// The logits and hidden rows of two runs of one sequence's call agree to
+    /// `tol` of their scale (and are present in both or neither). Batched and
+    /// solo steps run different matmul shapes (and, in a mixture of experts,
+    /// group different rows per expert), so they agree up to float rounding
+    /// of the vector's scale.
+    fn assert_forward_within(got: &Forward, want: &Forward, tol: f32, what: &str) {
         for (name, g, w) in [
             ("logits", &got.logits, &want.logits),
             ("hidden", &got.hidden, &want.hidden),
         ] {
             match (g, w) {
-                (Some(g), Some(w)) => assert_rows_close(g, w, &format!("{what} {name}")),
+                (Some(g), Some(w)) => assert_rows_within(g, w, tol, &format!("{what} {name}")),
                 (None, None) => {}
                 _ => panic!("{what}: {name} is present in only one of the runs"),
             }
@@ -5622,9 +5475,7 @@ mod tests {
     /// slot and the fork's continuation equals the original's.
     fn check_batched(model: &TinyModel, device: LocalDevice, label: &str) {
         const CTX: usize = 32;
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = content_of(model);
         // Three sequences and a spare state slot for the fork.
         let sizing = Sizing {
             max_sequences: 4,
@@ -5734,7 +5585,12 @@ mod tests {
                 let alone = solo
                     .forward_ext(&tokens[s][pos..pos + st.n], pos, st.want, st.hidden, false)
                     .unwrap();
-                assert_forward_close(&got[s][k], &alone, &format!("{label} seq {s} call {k}"));
+                assert_forward_within(
+                    &got[s][k],
+                    &alone,
+                    1e-3,
+                    &format!("{label} seq {s} call {k}"),
+                );
                 pos += st.n;
                 k += 1;
             }
@@ -5788,9 +5644,10 @@ mod tests {
             let mut outs = batched
                 .forward_batch(&Batch { rows, exact: false })
                 .unwrap();
-            assert_forward_close(
+            assert_forward_within(
                 &outs.swap_remove(0),
                 &got[1][k],
+                1e-3,
                 &format!("{label} fork {k}"),
             );
             pos += st.n;
@@ -5864,7 +5721,6 @@ mod tests {
     #[test]
     fn gpu_batched_matches_gpu_solo_on_every_architecture() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         check_batched(
@@ -5886,9 +5742,7 @@ mod tests {
     /// Device bytes of one expert summed over the MoE layers of `model`, as
     /// the loader counts them.
     fn expert_device_bytes(model: &TinyModel) -> usize {
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = content_of(model);
         let hp = read_hparams(&content).unwrap();
         let layers = tier_layout(&content, &hp, hp.moe.unwrap(), 0).unwrap();
         layers.iter().map(|l| l.stored_bytes).sum()
@@ -5899,9 +5753,7 @@ mod tests {
         device: LocalDevice,
         experts: &ExpertPlacement,
     ) -> Result<GpuTransformer, CucaError> {
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = content_of(model);
         GpuTransformer::load_placed(
             &content,
             &model.path,
@@ -5979,7 +5831,6 @@ mod tests {
     #[test]
     fn gpu_tiered_experts_match_gpu_resident() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let qwen35moe = write_qwen35(&tiny_qwen35moe());
@@ -6087,7 +5938,6 @@ mod tests {
     #[test]
     fn gpu_host_experts_match_gpu_resident() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let mut models: Vec<(String, TinyModel)> = [TinySpec::qwen3moe(), TinySpec::olmoe()]
@@ -6112,9 +5962,7 @@ mod tests {
             let want = greedy_run(
                 &mut load_placed_gpu(model, device, &ExpertPlacement::Resident).unwrap(),
             );
-            let content =
-                gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                    .unwrap();
+            let content = content_of(model);
             for layers in [None, Some(1)] {
                 let mut host = GpuTransformer::load_host_exact(
                     &content,
@@ -6146,15 +5994,13 @@ mod tests {
     #[test]
     fn gpu_matches_cpu_on_a_bounded_sliding_cache() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let model = write_spec(&TinySpec {
             context: 1400,
             ..TinySpec::gemma3()
         });
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = content_of(&model);
         let mut cpu = Transformer::load_dequantized(&content, &model.path, 1400).unwrap();
         let mut gpu = GpuTransformer::load(&content, &model.path, 1400, device).unwrap();
         let tokens: Vec<u32> = (0..1350u32).map(|i| (i * 7 + i / 5) % 16).collect();
@@ -6259,7 +6105,6 @@ mod tests {
         use super::super::cpu::paged_attn::{PoolShape, attend_paged_row};
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6339,7 +6184,6 @@ mod tests {
         use super::super::cpu::paged_attn::{PoolShape, attend_latent_rows};
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6408,7 +6252,6 @@ mod tests {
     #[test]
     fn gpu_prefill_gather_matches_decode_rows() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6494,7 +6337,6 @@ mod tests {
     #[test]
     fn gpu_matches_cpu_on_other_weight_dtypes() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         for dtype in [
@@ -6544,7 +6386,6 @@ mod tests {
     #[test]
     fn linear_matches_host_across_shapes() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6634,7 +6475,6 @@ mod tests {
     #[test]
     fn float_dtypes_upload_exactly() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6715,7 +6555,6 @@ mod tests {
         use candle_core::quantized::QTensor;
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6777,7 +6616,6 @@ mod tests {
         use candle_core::quantized::QTensor;
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6855,7 +6693,6 @@ mod tests {
         use candle_core::quantized::QTensor;
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -6920,7 +6757,6 @@ mod tests {
         use candle_core::quantized::QTensor;
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -7136,7 +6972,6 @@ mod tests {
     #[test]
     fn forward_ext_hidden_rows_match_cpu() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let model = write_tiny_model_with(TinyOptions::default());
@@ -7184,13 +7019,11 @@ mod tests {
         use super::super::tiny::write_tiny_drafter;
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let model = write_tiny_model_with(TinyOptions::default());
         let drafter = write_tiny_drafter();
-        let mut reader = BufReader::new(File::open(&drafter.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = content_of(&drafter);
         let schedule = [5u32, 9, 2, 7];
         let k = schedule.len();
 
@@ -7288,17 +7121,12 @@ mod tests {
         use super::super::tiny::write_tiny_drafter;
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let model = write_tiny_model_with(TinyOptions::default());
         let drafter = write_tiny_drafter();
-        let read = |m: &TinyModel| {
-            let mut reader = BufReader::new(File::open(&m.path).unwrap());
-            gguf_file::Content::read(&mut reader).unwrap()
-        };
         let (_, mut gpu) = load_both(&model, device);
-        let (model_content, drafter_content) = (read(&model), read(&drafter));
+        let (model_content, drafter_content) = (content_of(&model), content_of(&drafter));
 
         let e = GpuDrafter::open(&model_content, &model.path, &gpu, 32)
             .err()
@@ -7351,7 +7179,6 @@ mod tests {
     #[test]
     fn gpu_moe_one_row_experts_match_single_tokens() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         let device = open_device(device).unwrap();
@@ -7730,9 +7557,7 @@ mod tests {
     /// rows, two sequences at once.
     fn check_offload(model: &TinyModel, device: LocalDevice, label: &str) {
         const CTX: usize = 32;
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = content_of(model);
         let sizing = Sizing {
             max_sequences: 2,
             kv_tokens: 2 * CTX,
@@ -7770,19 +7595,9 @@ mod tests {
             let got = run_steps(&mut split, &steps, &tokens);
             assert_eq!(got.len(), want.len(), "{label}");
             for (call, (g, w)) in got.iter().zip(&want).enumerate() {
-                for (what, g, w) in [
-                    ("logits", &g.logits, &w.logits),
-                    ("hidden", &g.hidden, &w.hidden),
-                ] {
-                    let at = format!(
-                        "{label}: {gpu_layers} of {n_layer} layers on the GPU, call {call} {what}"
-                    );
-                    match (g, w) {
-                        (Some(g), Some(w)) => assert_rows_within(g, w, 1e-4, &at),
-                        (None, None) => {}
-                        _ => panic!("{at}: present in only one of the runs"),
-                    }
-                }
+                let at =
+                    format!("{label}: {gpu_layers} of {n_layer} layers on the GPU, call {call}");
+                assert_forward_within(g, w, 1e-4, &at);
             }
         }
     }
@@ -7815,7 +7630,6 @@ mod tests {
     #[test]
     fn gpu_offload_matches_single_device_at_every_split() {
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         for spec in TinySpec::all() {
@@ -7843,14 +7657,11 @@ mod tests {
         use super::super::split::mirrored;
 
         let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
             return;
         };
         const CTX: usize = 32;
         let model = write_tiny_model_with(TinyOptions::default());
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = content_of(&model);
         let hp = read_hparams(&content).unwrap();
         let first = (1..hp.n_layer)
             .find(|&f| !mirrored(&hp, f).is_empty())
@@ -7926,9 +7737,7 @@ mod tests {
     /// least the single device's, and the split model reports its world.
     fn check_sharded(model: &TinyModel, devices: &[LocalDevice], tol: f32, label: &str) {
         const CTX: usize = 32;
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = content_of(model);
         let sizing = Sizing {
             max_sequences: 2,
             kv_tokens: 2 * CTX,
@@ -7967,17 +7776,7 @@ mod tests {
         drop(split);
         assert_eq!(got.len(), want.len(), "{label}");
         for (i, (g, w)) in got.iter().zip(&want).enumerate() {
-            for (name, g, w) in [
-                ("logits", &g.logits, &w.logits),
-                ("hidden", &g.hidden, &w.hidden),
-            ] {
-                let what = format!("{label} call {i} {name}");
-                match (g, w) {
-                    (Some(g), Some(w)) => assert_rows_within(g, w, tol, &what),
-                    (None, None) => {}
-                    _ => panic!("{what}: present in only one of the runs"),
-                }
-            }
+            assert_forward_within(g, w, tol, &format!("{label} call {i}"));
         }
 
         // Determinism: the first sharded load tuned burn's kernels, so the
@@ -8055,10 +7854,11 @@ mod tests {
     ) {
         use crate::provider::local::GpuAdapter;
 
-        let device = test_device().unwrap_or(LocalDevice::Vulkan(GpuAdapter::Default));
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let device = test_devices()
+            .first()
+            .copied()
+            .unwrap_or(LocalDevice::Vulkan(GpuAdapter::Default));
+        let content = content_of(model);
         let e = GpuTransformer::load_placed(
             &content,
             &model.path,
@@ -8212,18 +8012,10 @@ mod tests {
             },
         ] {
             let model = write_spec(&spec);
-            let content =
-                gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                    .unwrap();
+            let content = content_of(&model);
             let hp = read_hparams(&content).unwrap();
             let device = Device::default();
-            let mut reader = WeightReader {
-                content: &content,
-                file: File::open(&model.path).unwrap(),
-                buf: Vec::new(),
-                device: &device,
-                host: None,
-            };
+            let mut reader = WeightReader::open(&content, &model.path, &device, None).unwrap();
             let matrices: Vec<(String, usize, usize)> = content
                 .tensor_infos
                 .iter()
