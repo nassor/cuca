@@ -110,10 +110,7 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> Result<serde_json::Va
     if let Some(max_tokens) = req.max_tokens {
         body.insert("max_tokens".to_string(), serde_json::json!(max_tokens));
     }
-    if let Some(top_p) = req.top_p {
-        body.insert("top_p".to_string(), serde_json::json!(top_p));
-    }
-    if let Some(top_k) = req.top_k {
+    if req.top_k.is_some() {
         let unsupported = match req.provider {
             ProviderEndpoint::LlamaCpp | ProviderEndpoint::Vllm | ProviderEndpoint::LmStudio => {
                 None
@@ -127,14 +124,17 @@ pub fn build_chat_completion_body(req: &UnifiedRequest) -> Result<serde_json::Va
                 "`top_k` is not supported by {name}"
             )));
         }
-        body.insert("top_k".to_string(), serde_json::json!(top_k));
     }
-    if let Some(seed) = req.seed {
-        body.insert("seed".to_string(), serde_json::json!(seed));
-    }
-    if !req.stop.is_empty() {
-        body.insert("stop".to_string(), serde_json::json!(req.stop));
-    }
+    super::insert_sampling(
+        &mut body,
+        req,
+        &super::SamplingKeys {
+            top_p: "top_p",
+            top_k: "top_k",
+            seed: Some("seed"),
+            stop: "stop",
+        },
+    );
     if !req.tools.is_empty() {
         let tools: Vec<serde_json::Value> = req
             .tools

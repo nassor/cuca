@@ -58,3 +58,53 @@ pub(crate) mod llamacpp;
 /// In-process GGUF language-model engine: model download, GGUF load, tokenizer, chat template, and generation on a dedicated thread.
 #[cfg(feature = "provider-local")]
 pub(crate) mod local;
+
+/// Wire key names for the per-request sampling fields of one adapter.
+#[cfg(any(
+    feature = "provider-openai",
+    feature = "provider-anthropic",
+    feature = "provider-vllm",
+    feature = "provider-lmstudio",
+    feature = "provider-deepseek",
+    feature = "provider-gemini",
+    feature = "provider-llamacpp",
+))]
+pub(crate) struct SamplingKeys {
+    pub top_p: &'static str,
+    pub top_k: &'static str,
+    /// `None` when the API has no seed (the caller rejects a set seed first).
+    pub seed: Option<&'static str>,
+    pub stop: &'static str,
+}
+
+/// Insert `top_p`, `top_k`, `seed` and `stop` into a request body under the
+/// adapter's key names, each only when set (`stop` only when non-empty).
+#[cfg(any(
+    feature = "provider-openai",
+    feature = "provider-anthropic",
+    feature = "provider-vllm",
+    feature = "provider-lmstudio",
+    feature = "provider-deepseek",
+    feature = "provider-gemini",
+    feature = "provider-llamacpp",
+))]
+pub(crate) fn insert_sampling(
+    body: &mut serde_json::Map<String, serde_json::Value>,
+    req: &crate::request::UnifiedRequest,
+    keys: &SamplingKeys,
+) {
+    use serde_json::Value;
+    if let Some(top_p) = req.top_p {
+        body.insert(keys.top_p.to_string(), Value::from(top_p));
+    }
+    if let Some(top_k) = req.top_k {
+        body.insert(keys.top_k.to_string(), Value::from(top_k));
+    }
+    if let (Some(key), Some(seed)) = (keys.seed, req.seed) {
+        body.insert(key.to_string(), Value::from(seed));
+    }
+    if !req.stop.is_empty() {
+        let stop = req.stop.iter().cloned().map(Value::String).collect();
+        body.insert(keys.stop.to_string(), Value::Array(stop));
+    }
+}

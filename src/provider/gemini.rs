@@ -93,18 +93,16 @@ pub fn build_generate_content_body(req: &UnifiedRequest) -> Result<serde_json::V
     if let Some(max_tokens) = req.max_tokens {
         generation.insert("maxOutputTokens".to_string(), serde_json::json!(max_tokens));
     }
-    if let Some(top_p) = req.top_p {
-        generation.insert("topP".to_string(), serde_json::json!(top_p));
-    }
-    if let Some(top_k) = req.top_k {
-        generation.insert("topK".to_string(), serde_json::json!(top_k));
-    }
-    if let Some(seed) = req.seed {
-        generation.insert("seed".to_string(), serde_json::json!(seed));
-    }
-    if !req.stop.is_empty() {
-        generation.insert("stopSequences".to_string(), serde_json::json!(req.stop));
-    }
+    super::insert_sampling(
+        &mut generation,
+        req,
+        &super::SamplingKeys {
+            top_p: "topP",
+            top_k: "topK",
+            seed: Some("seed"),
+            stop: "stopSequences",
+        },
+    );
     if !generation.is_empty() {
         body.insert(
             "generationConfig".to_string(),

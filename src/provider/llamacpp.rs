@@ -120,18 +120,16 @@ pub fn build_completion_body(req: &UnifiedRequest, cfg: &LlamaCppConfig) -> serd
         "n_predict".to_string(),
         json!(req.max_tokens.unwrap_or(DEFAULT_N_PREDICT)),
     );
-    if let Some(top_p) = req.top_p {
-        body.insert("top_p".to_string(), json!(top_p));
-    }
-    if let Some(top_k) = req.top_k {
-        body.insert("top_k".to_string(), json!(top_k));
-    }
-    if let Some(seed) = req.seed {
-        body.insert("seed".to_string(), json!(seed));
-    }
-    if !req.stop.is_empty() {
-        body.insert("stop".to_string(), json!(req.stop));
-    }
+    super::insert_sampling(
+        &mut body,
+        req,
+        &super::SamplingKeys {
+            top_p: "top_p",
+            top_k: "top_k",
+            seed: Some("seed"),
+            stop: "stop",
+        },
+    );
     if let Some(threads) = cfg.n_threads {
         body.insert("n_threads".to_string(), json!(threads));
     }

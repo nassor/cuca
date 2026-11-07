@@ -372,15 +372,16 @@ pub fn build_anthropic_request(req: &UnifiedRequest) -> Result<serde_json::Value
     if let Some(temperature) = req.temperature {
         body.insert("temperature".to_string(), serde_json::json!(temperature));
     }
-    if let Some(top_p) = req.top_p {
-        body.insert("top_p".to_string(), serde_json::json!(top_p));
-    }
-    if let Some(top_k) = req.top_k {
-        body.insert("top_k".to_string(), serde_json::json!(top_k));
-    }
-    if !req.stop.is_empty() {
-        body.insert("stop_sequences".to_string(), serde_json::json!(req.stop));
-    }
+    super::insert_sampling(
+        &mut body,
+        req,
+        &super::SamplingKeys {
+            top_p: "top_p",
+            top_k: "top_k",
+            seed: None,
+            stop: "stop_sequences",
+        },
+    );
     body.insert("stream".to_string(), serde_json::Value::Bool(true));
     if !system.is_empty() {
         body.insert("system".to_string(), system_value(&system));
