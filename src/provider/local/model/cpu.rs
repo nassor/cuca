@@ -142,6 +142,56 @@ impl QMatMul {
             y.narrow(D::Minus1, 0, rows)
         }
     }
+
+    /// A copy for a drafter that ranks several rows through this weight at
+    /// once (a block of draft rows through the LM head): candle's per-row
+    /// kernel, which serves the K-quants, reads the whole weight once per row,
+    /// while the row-batched kernel reads it once for all rows. The copy is
+    /// [`requantize_q8_0`] of the weight, `None` when the weight is already
+    /// served by the row-batched kernel or is a float tensor. A proposal only
+    /// picks tokens the target verifies, so the half-Q8_0-step rounding it adds
+    /// to the logits cannot change the output.
+    fn proposal_copy(&self) -> candle_core::Result<Option<Self>> {
+        let Weight::Candle(CandleMatMul::QTensor(qt)) = &self.0 else {
+            return Ok(None);
+        };
+        let q = requantize_q8_0(qt)?;
+        Self::from_arc_row_batched(Arc::new(q)).map(Some)
+    }
+}
+
+/// Rows of a matrix [`requantize_q8_0`] converts at a time: bounds the f32
+/// copy it holds to a few tens of MB.
+const REQUANTIZE_ROWS: usize = 4096;
+
+/// The 2-D quantized `qt` as Q8_0, converted `REQUANTIZE_ROWS` rows at a time
+/// (a whole f32 copy of an LM head would take several GB).
+fn requantize_q8_0(qt: &QTensor) -> candle_core::Result<QTensor> {
+    let (rows, cols) = qt.shape().dims2()?;
+    let (dtype, q8) = (qt.dtype(), GgmlDType::Q8_0);
+    if !cols.is_multiple_of(q8.block_size()) || !cols.is_multiple_of(dtype.block_size()) {
+        candle_core::bail!(
+            "a row of {cols} values is not a whole number of {dtype:?} or Q8_0 blocks"
+        );
+    }
+    let from_bytes = |dtype: GgmlDType, rows: usize, bytes: &[u8]| {
+        gguf_file::TensorInfo {
+            ggml_dtype: dtype,
+            shape: (rows, cols).into(),
+            offset: 0,
+        }
+        .read(&mut Cursor::new(bytes), 0, &Device::Cpu)
+    };
+    let row_bytes = cols / dtype.block_size() * dtype.type_size();
+    let bytes = qt.data()?;
+    let mut out = Vec::with_capacity(rows * (cols / q8.block_size() * q8.type_size()));
+    for first in (0..rows).step_by(REQUANTIZE_ROWS) {
+        let n = REQUANTIZE_ROWS.min(rows - first);
+        let part = from_bytes(dtype, n, &bytes[first * row_bytes..(first + n) * row_bytes])?;
+        let q = QTensor::quantize(&part.dequantize(&Device::Cpu)?, q8)?;
+        out.extend_from_slice(&q.data()?);
+    }
+    from_bytes(q8, rows, &out)
 }
 
 /// `x * w^T` over the first `rows` rows of `w`.
@@ -3725,6 +3775,61 @@ mod tests {
             .filter(|(name, _)| name.ends_with(".weight"))
             .map(|(_, info)| format!("{:?}", info.ggml_dtype))
             .collect()
+    }
+
+    /// A drafter's proposal copy of a K-quant matrix is a Q8_0 matrix within
+    /// a Q8_0 step of it (rows past a conversion chunk included); a weight the
+    /// row-batched kernel serves already, or a float one, needs none.
+    #[test]
+    fn a_proposal_copy_requantizes_only_what_candle_serves_per_row() {
+        let (rows, cols) = (REQUANTIZE_ROWS + 37, 512);
+        let noise = |n: usize, salt: u64| -> Vec<f32> {
+            (0..n as u64)
+                .map(|i| {
+                    let z = (i + salt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                    (z >> 40) as f32 / 8_388_608.0 - 1.0
+                })
+                .collect()
+        };
+        let dense = Tensor::from_vec(noise(rows * cols, 1), (rows, cols), &Device::Cpu).unwrap();
+        let q6 = Arc::new(QTensor::quantize(&dense, GgmlDType::Q6K).unwrap());
+        let weight = QMatMul::from_arc_row_batched(q6).unwrap();
+        assert!(
+            matches!(weight.0, Weight::Candle(_)),
+            "a K-quant stays on candle's kernel"
+        );
+        let copy = weight
+            .proposal_copy()
+            .unwrap()
+            .expect("a K-quant gets a copy");
+        let Weight::RowBatched(w) = &copy.0 else {
+            panic!("the copy is served by the row-batched kernel");
+        };
+        assert_eq!((w.n(), w.k()), (rows, cols));
+
+        let x = Tensor::from_vec(noise(3 * cols, 7), (3, cols), &Device::Cpu).unwrap();
+        let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let (want, got) = (
+            flat(weight.forward(&x).unwrap()),
+            flat(copy.forward(&x).unwrap()),
+        );
+        assert_eq!(want.len(), got.len());
+        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        let worst = want
+            .iter()
+            .zip(&got)
+            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
+        assert!(
+            worst <= 0.02 * scale,
+            "worst difference {worst}, largest output {scale}"
+        );
+
+        for dtype in [GgmlDType::Q4_0, GgmlDType::Q8_0] {
+            let q = Arc::new(QTensor::quantize(&dense, dtype).unwrap());
+            let served = QMatMul::from_arc_row_batched(q).unwrap();
+            assert!(served.proposal_copy().unwrap().is_none(), "{dtype:?}");
+        }
+        assert!(QMatMul::tensor(dense).proposal_copy().unwrap().is_none());
     }
 
     /// The mixed models really mix: every dtype the row-batched kernel serves
