@@ -17,6 +17,16 @@
 //!    token in expert order;
 //! 5. [`MoeKernels::moe_write_slot`]: one expert's packed words into a slot.
 //!
+//! The dense weights (attention projections, dense FFNs, the LM head) use the
+//! same block formats and dot-row arithmetic through two more operations,
+//! with a block-major word order ([`DenseLayout`]) so that the threads of a
+//! launch, one per output row, read consecutive blocks:
+//!
+//! - [`MoeKernels::dense_gemv`]: `x . w` for a few input rows (decode,
+//!   batched decode, verification);
+//! - [`MoeKernels::dense_dequant`]: a slice of rows of the weight as f32,
+//!   which a prefill multiplies with burn's float matmul.
+//!
 //! The kernels are the only code here that is not plain tensor algebra. They
 //! are written in safe Rust (`#[cube(launch)]` with the checked `launch`),
 //! reach the backend through burn's `backend_extension` (the generated
@@ -39,6 +49,7 @@
     clippy::eq_op,
     clippy::assign_op_pattern,
     clippy::collapsible_if,
+    clippy::manual_div_ceil,
     clippy::too_many_arguments
 )]
 
@@ -347,6 +358,131 @@ pub(crate) fn pack_expert(
     pack_matrix(&layout.up, dtypes[1], up, &mut words)?;
     pack_matrix(&layout.down, dtypes[2], down, &mut words)?;
     Ok(words.into())
+}
+
+/// A dense `[rows, cols]` weight (an attention projection, a dense FFN
+/// matrix, the LM head) in the layout of the dense kernels: like a slot's
+/// matrix, but in **block-major** order, so that the threads of a launch, one
+/// per row, read consecutive blocks. The block `b` of row `r` is block `b *
+/// rows + r`; the values of all blocks come first (4 words per Q4 block, 8
+/// per Q8 block), then the f16 scales and, for Q4_1, the f16 minimums, two
+/// per word, in the same block order.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DenseLayout {
+    pub(crate) format: ExpertFormat,
+    pub(crate) rows: usize,
+    pub(crate) cols: usize,
+}
+
+impl DenseLayout {
+    /// The layout of a `[rows, cols]` weight held as GGUF dtype `dtype`:
+    /// Q4_0, Q4_1 and Q8_0 as they are, every other quantized dtype
+    /// requantized to Q8_0.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] for a float dtype (floats stay f32 tensors) or
+    /// a row that is not whole 32-element blocks.
+    pub(crate) fn new(dtype: GgmlDType, rows: usize, cols: usize) -> Result<Self, CucaError> {
+        let format = ExpertFormat::of(dtype);
+        if format == ExpertFormat::F32 || !cols.is_multiple_of(BLOCK) {
+            return Err(CucaError::Config(format!(
+                "a dense {dtype:?} weight of rows of {cols} values has no block layout"
+            )));
+        }
+        Ok(Self { format, rows, cols })
+    }
+
+    pub(crate) fn blocks_per_row(&self) -> usize {
+        self.cols / BLOCK
+    }
+
+    fn blocks(&self) -> usize {
+        self.rows * self.blocks_per_row()
+    }
+
+    fn half_words(&self) -> usize {
+        self.blocks().div_ceil(2)
+    }
+
+    fn scale_offset(&self) -> usize {
+        self.blocks() * self.format.value_words()
+    }
+
+    fn min_offset(&self) -> usize {
+        self.scale_offset() + self.half_words()
+    }
+
+    /// Words of the weight.
+    pub(crate) fn words(&self) -> usize {
+        self.min_offset()
+            + if self.format.has_min() {
+                self.half_words()
+            } else {
+                0
+            }
+    }
+
+    /// Device bytes of the weight.
+    pub(crate) fn bytes(&self) -> usize {
+        self.words() * 4
+    }
+}
+
+/// The words of the `[rows, cols]` weight of GGUF dtype `dtype` whose file
+/// bytes are `raw`, in the order of [`DenseLayout`].
+///
+/// # Errors
+///
+/// As [`pack_matrix`].
+pub(crate) fn pack_dense(
+    layout: &DenseLayout,
+    dtype: GgmlDType,
+    raw: &[u8],
+) -> Result<Vec<u32>, CucaError> {
+    let matrix = MatrixLayout {
+        format: layout.format,
+        rows: layout.rows,
+        cols: layout.cols,
+        offset: 0,
+    };
+    let mut row_major = Vec::with_capacity(matrix.words());
+    pack_matrix(&matrix, dtype, raw, &mut row_major)?;
+    let (rows, bpr, vw) = (
+        layout.rows,
+        layout.blocks_per_row(),
+        layout.format.value_words(),
+    );
+    let mut out = vec![0u32; layout.words()];
+    let half = |words: &[u32], i: usize| (words[i / 2] >> (16 * (i % 2))) as u16;
+    let (src_values, src_rest) = row_major.split_at(layout.blocks() * vw);
+    let (dst_values, dst_rest) = out.split_at_mut(layout.blocks() * vw);
+    let half_words = layout.half_words();
+    let (dst_scales, dst_mins) = dst_rest.split_at_mut(half_words);
+    for r in 0..rows {
+        for b in 0..bpr {
+            let (from, to) = (r * bpr + b, b * rows + r);
+            dst_values[to * vw..(to + 1) * vw]
+                .copy_from_slice(&src_values[from * vw..(from + 1) * vw]);
+            put_half(dst_scales, to, half(src_rest, from));
+            if layout.format.has_min() {
+                put_half(dst_mins, to, half(&src_rest[half_words..], from));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// One call of a dense kernel: the weight, the rows of the input and (for
+/// the dequantizing kernel) the rows of the weight it expands.
+#[derive(Clone, Debug)]
+pub(crate) struct DenseCall {
+    pub(crate) layout: DenseLayout,
+    /// Input rows (tokens) of the matrix-vector kernel.
+    pub(crate) tokens: usize,
+    /// First weight row and row count the dequantizing kernel expands.
+    pub(crate) row0: usize,
+    pub(crate) count: usize,
 }
 
 /// What one kernel call is about: shapes, formats and offsets.
@@ -707,6 +843,193 @@ fn write_kernel(pool: &mut Tensor<u32>, data: &Tensor<u32>, offset: u32, words: 
     }
 }
 
+/// Threads of a cube of [`dense_gemv_kernel`].
+const GEMV_GROUP: usize = 64;
+
+/// Threads per row of [`dense_gemv_kernel`] for a weight of `rows` rows of
+/// `blocks_per_row` blocks and `tokens` input rows: a power of two up to
+/// [`GEMV_GROUP`] and the blocks per row, growing while the launch has fewer
+/// than 256 cubes, so that a weight with few rows still fills the device.
+fn gemv_lanes(rows: usize, blocks_per_row: usize, tokens: usize) -> usize {
+    let mut lanes = 1;
+    while lanes < GEMV_GROUP
+        && lanes * 2 <= blocks_per_row
+        && rows.div_ceil(GEMV_GROUP / lanes) * tokens < 256
+    {
+        lanes *= 2;
+    }
+    lanes
+}
+
+/// Partial dot product of row `row` of the dense weight (block-major, see
+/// [`DenseLayout`]) with `x[x_base..]` over the blocks `first`, `first +
+/// step`, ... (`count` of them).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn dense_dot(
+    pool: &Tensor<u32>,
+    row: usize,
+    rows: usize,
+    first: usize,
+    step: usize,
+    count: usize,
+    format: u32,
+    scales: usize,
+    mins: usize,
+    x: &Tensor<f32>,
+    x_base: usize,
+) -> f32 {
+    let mut acc = 0.0f32;
+    for i in 0..count {
+        let b = first + i * step;
+        let block = b * rows + row;
+        let xo = x_base + b * 32usize;
+        if format == 2u32 {
+            let wb = block * 8usize;
+            let mut s = 0.0f32;
+            for w in 0..8usize {
+                let word = pool[wb + w];
+                for k in 0..4usize {
+                    let byte = (word >> (u32::cast_from(k) * 8u32)) & 0xFFu32;
+                    let q = i32::cast_from(byte & 0x7Fu32) - i32::cast_from(byte & 0x80u32);
+                    s += f32::cast_from(q) * x[xo + w * 4usize + k];
+                }
+            }
+            acc += half_at(pool, scales, block) * s;
+        } else {
+            let wb = block * 4usize;
+            let mut s = 0.0f32;
+            let mut sx = 0.0f32;
+            for w in 0..4usize {
+                let word = pool[wb + w];
+                for k in 0..8usize {
+                    let q = (word >> (u32::cast_from(k) * 4u32)) & 0xFu32;
+                    let xv = x[xo + w * 8usize + k];
+                    s += f32::cast_from(q) * xv;
+                    sx += xv;
+                }
+            }
+            if format == 0u32 {
+                acc += half_at(pool, scales, block) * (s - 8.0f32 * sx);
+            } else {
+                acc += half_at(pool, scales, block) * s + half_at(pool, mins, block) * sx;
+            }
+        }
+    }
+    acc
+}
+
+/// `out[token, row] = weight[row] . x[token]`. A cube of `group` threads
+/// serves `group / lanes` rows, `lanes` threads per row: thread `tid` is
+/// lane `tid / (group / lanes)` of row `tid % (group / lanes)`, so the
+/// threads of a wavefront read the consecutive blocks of consecutive rows.
+/// Lane `l` takes the blocks `l`, `l + lanes`, ... in f32; lane 0 adds the
+/// lanes' partial sums in lane order. Short weights (few rows) take more
+/// lanes to fill the device.
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn dense_gemv_kernel(
+    x: &Tensor<f32>,
+    pool: &Tensor<u32>,
+    out: &mut Tensor<f32>,
+    rows: u32,
+    blocks_per_row: u32,
+    format: u32,
+    scales: u32,
+    mins: u32,
+    lanes: u32,
+    #[comptime] group: usize,
+) {
+    let tid = UNIT_POS_X as usize;
+    let lanes = usize::cast_from(lanes);
+    let per_group = group / lanes;
+    let local = tid % per_group;
+    let lane = tid / per_group;
+    let rows = usize::cast_from(rows);
+    let row = CUBE_POS_X as usize * per_group + local;
+    let token = CUBE_POS_Y as usize;
+    let bpr = usize::cast_from(blocks_per_row);
+    let mut partial = Shared::<[f32]>::new_slice(group);
+    let mut acc = f32::cast_from(tid - tid);
+    if row < rows {
+        let count = (bpr - lane + lanes - 1usize) / lanes;
+        acc = dense_dot(
+            pool,
+            row,
+            rows,
+            lane,
+            lanes,
+            count,
+            format,
+            usize::cast_from(scales),
+            usize::cast_from(mins),
+            x,
+            token * bpr * 32usize,
+        );
+    }
+    partial[tid] = acc;
+    sync_cube();
+    if lane == 0usize && row < rows {
+        let mut total = partial[local];
+        for l in 1..lanes {
+            total += partial[l * per_group + local];
+        }
+        out[token * rows + row] = total;
+    }
+}
+
+/// `out[r, c]` = element `c` of row `row0 + r` of the weight, for `count`
+/// rows: one thread per (row, block).
+#[cube(launch)]
+#[allow(clippy::too_many_arguments)]
+fn dense_dequant_kernel(
+    pool: &Tensor<u32>,
+    out: &mut Tensor<f32>,
+    rows: u32,
+    row0: u32,
+    count: u32,
+    blocks_per_row: u32,
+    format: u32,
+    scales: u32,
+    mins: u32,
+) {
+    let i = ABSOLUTE_POS;
+    let bpr = usize::cast_from(blocks_per_row);
+    if i < usize::cast_from(count) * bpr {
+        let r = i / bpr;
+        let b = i % bpr;
+        let block = b * usize::cast_from(rows) + usize::cast_from(row0) + r;
+        let d = half_at(pool, usize::cast_from(scales), block);
+        let dst = i * 32usize;
+        if format == 2u32 {
+            for w in 0..8usize {
+                let word = pool[block * 8usize + w];
+                for k in 0..4usize {
+                    let byte = (word >> (u32::cast_from(k) * 8u32)) & 0xFFu32;
+                    let q = i32::cast_from(byte & 0x7Fu32) - i32::cast_from(byte & 0x80u32);
+                    out[dst + w * 4usize + k] = d * f32::cast_from(q);
+                }
+            }
+        } else {
+            let mut m = 0.0f32;
+            if format == 1u32 {
+                m = half_at(pool, usize::cast_from(mins), block);
+            }
+            for w in 0..4usize {
+                let word = pool[block * 4usize + w];
+                for k in 0..8usize {
+                    let q = f32::cast_from((word >> (u32::cast_from(k) * 4u32)) & 0xFu32);
+                    if format == 0u32 {
+                        out[dst + w * 8usize + k] = d * (q - 8.0f32);
+                    } else {
+                        out[dst + w * 8usize + k] = d * q + m;
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --------------------------------------------------------------- extension
 
 /// Backend operations of the MoE kernels (see the module docs).
@@ -750,6 +1073,25 @@ pub trait MoeKernels: burn::backend::Backend {
         data: IntTensor<Self>,
         offset: usize,
     ) -> IntTensor<Self>;
+
+    /// `x [tokens, cols]` through the dense weight in `pool`: `[tokens,
+    /// rows]`.
+    #[fusion(dtype = x, shape = Shape::new([call.tokens, call.layout.rows]))]
+    fn dense_gemv(
+        x: FloatTensor<Self>,
+        pool: IntTensor<Self>,
+        call: DenseCall,
+    ) -> FloatTensor<Self>;
+
+    /// Rows `call.row0..call.row0 + call.count` of the dense weight in
+    /// `pool` as f32 `[count, cols]` (`like` only carries the output's
+    /// dtype).
+    #[fusion(dtype = like, shape = Shape::new([call.count, call.layout.cols]))]
+    fn dense_dequant(
+        like: FloatTensor<Self>,
+        pool: IntTensor<Self>,
+        call: DenseCall,
+    ) -> FloatTensor<Self>;
 }
 
 fn f32_tensor(like: &CubeTensor, shape: Shape) -> CubeTensor {
@@ -874,6 +1216,55 @@ impl MoeKernels for CubeBackend {
         out
     }
 
+    fn dense_gemv(x: CubeTensor, pool: CubeTensor, call: DenseCall) -> CubeTensor {
+        let x = into_contiguous(x);
+        let l = &call.layout;
+        let out = f32_tensor(&x, Shape::new([call.tokens, l.rows]));
+        let lanes = gemv_lanes(l.rows, l.blocks_per_row(), call.tokens);
+        let per_group = GEMV_GROUP / lanes;
+        let client = x.client.clone();
+        dense_gemv_kernel::launch(
+            &client,
+            CubeCount::Static(l.rows.div_ceil(per_group) as u32, call.tokens as u32, 1),
+            CubeDim::new_1d(GEMV_GROUP as u32),
+            x.into_tensor_arg(),
+            pool.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            l.rows as u32,
+            l.blocks_per_row() as u32,
+            l.format.code(),
+            l.scale_offset() as u32,
+            l.min_offset() as u32,
+            lanes as u32,
+            GEMV_GROUP,
+        );
+        out
+    }
+
+    fn dense_dequant(like: CubeTensor, pool: CubeTensor, call: DenseCall) -> CubeTensor {
+        let l = &call.layout;
+        let out = f32_tensor(&like, Shape::new([call.count, l.cols]));
+        let client = like.client.clone();
+        let threads = call.count * l.blocks_per_row();
+        let dim = CubeDim::new(&client, threads);
+        let count = calculate_cube_count_elemwise(&client, threads, dim);
+        dense_dequant_kernel::launch(
+            &client,
+            count,
+            dim,
+            pool.into_tensor_arg(),
+            out.clone().into_tensor_arg(),
+            l.rows as u32,
+            call.row0 as u32,
+            call.count as u32,
+            l.blocks_per_row() as u32,
+            l.format.code(),
+            l.scale_offset() as u32,
+            l.min_offset() as u32,
+        );
+        out
+    }
+
     fn moe_write_slot(pool: CubeTensor, data: CubeTensor, offset: usize) -> CubeTensor {
         // In place when nothing else holds the pool, else into a copy.
         let pool = if pool.can_mut() { pool } else { pool.copy() };
@@ -962,5 +1353,27 @@ pub(crate) fn write_slot(
         pool.into_dispatch(),
         data.into_dispatch(),
         offset,
+    ))
+}
+
+/// [`MoeKernels::dense_gemv`] on tensors.
+pub(crate) fn dense_gemv(x: BTensor<2>, pool: BTensor<1, Int>, call: &DenseCall) -> BTensor<2> {
+    BTensor::from_dispatch(<Dispatch as MoeKernels>::dense_gemv(
+        x.into_dispatch(),
+        pool.into_dispatch(),
+        call.clone(),
+    ))
+}
+
+/// [`MoeKernels::dense_dequant`] on tensors; `like` is any f32 tensor.
+pub(crate) fn dense_dequant(
+    like: BTensor<1>,
+    pool: BTensor<1, Int>,
+    call: &DenseCall,
+) -> BTensor<2> {
+    BTensor::from_dispatch(<Dispatch as MoeKernels>::dense_dequant(
+        like.into_dispatch(),
+        pool.into_dispatch(),
+        call.clone(),
     ))
 }
