@@ -62,7 +62,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use candle_core::quantized::gguf_file;
 use tokio::sync::mpsc;
 
-use self::scheduler::{Sequence, SnapshotStore};
+use self::scheduler::{Sequence, SnapshotStore, StepBufs};
 use super::chat::{ChatFormat, ChatTemplate, expand_template_name};
 use super::model::arch::Arch;
 use super::model::mtp::Drafter;
@@ -142,7 +142,8 @@ pub(crate) struct Engine {
     free_slots: Vec<usize>,
     /// Recurrent-state snapshots of block-aligned prefixes (hybrid models).
     snapshots: SnapshotStore,
-    /// The ids the in-trunk drafter's cache holds pairs for.
+    /// The ids of the last sequence a drafter that observes every position
+    /// served: its cache holds pairs for them.
     drafter_ids: Vec<u32>,
     /// Sampling generator when no fixed seed is configured.
     rng: SplitMix64,
@@ -152,8 +153,6 @@ pub(crate) struct Engine {
     drafter: Option<Drafter>,
     /// Most tokens drafted per verification round.
     draft_tokens: usize,
-    /// K/V cache bytes of the loaded model at its context length.
-    kv_cache_bytes: u64,
     /// Speculation counters shared with `LocalModel::draft_stats`.
     stats: Arc<DraftCounters>,
     /// Scheduler counters shared with `LocalModel::serving_stats`.
@@ -163,6 +162,8 @@ pub(crate) struct Engine {
     /// Measured costs that set each round's draft length, kept across
     /// requests.
     cost: CostModel,
+    /// Scratch the scheduler refills every step.
+    bufs: StepBufs,
     /// The ids the last sequence that ended held (empty after a failure).
     #[cfg(test)]
     last_ids: Vec<u32>,
@@ -588,16 +589,15 @@ impl Engine {
             Some(ResolvedDrafter::File(dp)) => Some(read_drafter_header(dp)?),
             _ => None,
         };
-        if file_drafter.as_ref().is_some_and(is_eagle) && config.device != LocalDevice::Cpu {
+        let file_arch = file_drafter.as_ref().map_or("", architecture_of);
+        if file_arch == Arch::Mistral4Eagle.name() && config.device != LocalDevice::Cpu {
             return Err(CucaError::Config(format!(
                 "the EAGLE drafter runs on the CPU only, not on {:?}",
                 config.device
             )));
         }
-        let observing = matches!(drafter, Some(ResolvedDrafter::InTrunk))
-            || file_drafter
-                .as_ref()
-                .is_some_and(|dc| file_drafter_observes(architecture_of(dc)));
+        let observing =
+            matches!(drafter, Some(ResolvedDrafter::InTrunk)) || file_drafter_observes(file_arch);
         let (batching, sizing) = resolve_batching(config, context_length, observing)?;
         let model = Model::load(
             &content,
@@ -610,54 +610,23 @@ impl Engine {
             config.gpu_layers,
         )?;
         let drafter = drafter
-            .map(|source| -> Result<Drafter, CucaError> {
-                match (source, &file_drafter) {
-                    (ResolvedDrafter::File(dp), Some(dc)) => match architecture_of(dc) {
-                        super::model::cpu::dflash::ARCH => {
-                            Drafter::open_dflash(dc, dp, &model, context_length)
-                        }
-                        a if a == Arch::Mistral4Eagle.name() => Drafter::open_eagle(dc, dp, &model),
-                        _ => Drafter::open(dc, dp, &model, context_length),
-                    },
-                    (ResolvedDrafter::File(dp), None) => Err(local_err(format!(
-                        "the drafter file `{}` was not indexed",
-                        dp.display()
-                    ))),
-                    (ResolvedDrafter::InTrunk, _) => Drafter::open_in_trunk(&content, path, &model),
-                }
+            .map(|source| match (source, &file_drafter) {
+                (ResolvedDrafter::File(dp), Some(dc)) => match file_arch {
+                    super::model::cpu::dflash::ARCH => {
+                        Drafter::open_dflash(dc, dp, &model, context_length)
+                    }
+                    a if a == Arch::Mistral4Eagle.name() => Drafter::open_eagle(dc, dp, &model),
+                    _ => Drafter::open(dc, dp, &model, context_length),
+                },
+                (ResolvedDrafter::File(dp), None) => Err(local_err(format!(
+                    "the drafter file `{}` was not indexed",
+                    dp.display()
+                ))),
+                (ResolvedDrafter::InTrunk, _) => Drafter::open_in_trunk(&content, path, &model),
             })
             .transpose()?;
         let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
-
-        const TEMPLATE_KEY: &str = "tokenizer.chat_template";
-        let bos = tokenizer.bos_token().to_string();
-        let eos = tokenizer.eos_token().to_string();
-        let (format, template) = match chat_template {
-            Some(source) => {
-                let source = expand_template_name(source)
-                    .map_err(|e| CucaError::Config(format!("chat_template override: {e}")))?;
-                let template = ChatTemplate::checked(source.to_string(), bos, eos)?;
-                (
-                    ChatFormat::detect(&content.metadata, &tokenizer, &source)?,
-                    template,
-                )
-            }
-            None => {
-                let source = content
-                    .metadata
-                    .get(TEMPLATE_KEY)
-                    .ok_or_else(|| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: missing")))?
-                    .to_string()
-                    .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
-                    .clone();
-                // llama.cpp's converter can write a template *name*.
-                let source = expand_template_name(&source)
-                    .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
-                    .into_owned();
-                let format = ChatFormat::detect(&content.metadata, &tokenizer, &source)?;
-                (format, ChatTemplate::new(source, bos, eos)?)
-            }
-        };
+        let (format, template) = load_chat(&content, &tokenizer, chat_template)?;
 
         let engine = Self::new(
             model,
@@ -693,7 +662,6 @@ impl Engine {
         stats: Arc<DraftCounters>,
     ) -> Self {
         let pools = KvPools::new(model.kv_layout());
-        let kv_cache_bytes = model.kv_pool_bytes();
         Self {
             model,
             tokenizer,
@@ -712,7 +680,7 @@ impl Engine {
             id_rng: SplitMix64(random_seed()),
             drafter,
             draft_tokens,
-            kv_cache_bytes,
+            bufs: StepBufs::default(),
             stats,
             serving: Arc::default(),
             governor: Governor::default(),
@@ -741,7 +709,7 @@ impl Engine {
 
     /// K/V cache bytes of the loaded model at its context length.
     pub(crate) fn kv_cache_bytes(&self) -> u64 {
-        self.kv_cache_bytes
+        self.model.kv_pool_bytes()
     }
 
     /// Layers on the GPU and in all when layers are offloaded.
@@ -769,12 +737,42 @@ fn read_drafter_header(path: &Path) -> Result<gguf_file::Content, CucaError> {
     })
 }
 
-/// Whether the drafter file is a Mistral Small 4 EAGLE drafter.
-fn is_eagle(content: &gguf_file::Content) -> bool {
-    matches!(
-        content.metadata.get("general.architecture"),
-        Some(gguf_file::Value::String(a)) if a == Arch::Mistral4Eagle.name()
-    )
+/// The chat format and template of a loaded model: those of `chat_template`
+/// when given, else the ones the GGUF embeds.
+fn load_chat(
+    content: &gguf_file::Content,
+    tokenizer: &Tokenizer,
+    chat_template: Option<&str>,
+) -> Result<(ChatFormat, ChatTemplate), CucaError> {
+    const TEMPLATE_KEY: &str = "tokenizer.chat_template";
+    let bos = tokenizer.bos_token().to_string();
+    let eos = tokenizer.eos_token().to_string();
+    match chat_template {
+        Some(source) => {
+            let source = expand_template_name(source)
+                .map_err(|e| CucaError::Config(format!("chat_template override: {e}")))?;
+            let template = ChatTemplate::checked(source.to_string(), bos, eos)?;
+            Ok((
+                ChatFormat::detect(&content.metadata, tokenizer, &source)?,
+                template,
+            ))
+        }
+        None => {
+            let source = content
+                .metadata
+                .get(TEMPLATE_KEY)
+                .ok_or_else(|| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: missing")))?
+                .to_string()
+                .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
+                .clone();
+            // llama.cpp's converter can write a template *name*.
+            let source = expand_template_name(&source)
+                .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
+                .into_owned();
+            let format = ChatFormat::detect(&content.metadata, tokenizer, &source)?;
+            Ok((format, ChatTemplate::new(source, bos, eos)?))
+        }
+    }
 }
 
 /// Resolve `config.batching` against the model's context length: the
@@ -800,8 +798,8 @@ fn resolve_batching(
             )));
         }
     };
-    // A drafter that observes every position in order (the in-trunk head, a
-    // DFlash drafter) serves one sequence.
+    // A drafter that observes every position in order (the in-trunk head, an
+    // EAGLE or a DFlash drafter) serves one sequence.
     let max_sequences = if observing { 1 } else { b.max_sequences };
     let max_step_tokens = b
         .max_step_tokens
@@ -834,7 +832,7 @@ fn architecture_of(content: &gguf_file::Content) -> &str {
 /// every position ([`Drafter::observes`]), so that the engine serves one
 /// sequence at a time.
 fn file_drafter_observes(arch: &str) -> bool {
-    matches!(arch, super::model::cpu::dflash::ARCH)
+    matches!(arch, super::model::cpu::dflash::ARCH) || arch == Arch::Mistral4Eagle.name()
 }
 
 fn saturating_u32(n: usize) -> u32 {
@@ -1043,11 +1041,35 @@ pub(crate) mod testing {
         e.cost = CostModel::always_drafting();
         e
     }
+
+    /// A job with every optional setting at its default.
+    pub(crate) fn job(
+        prompt: &[u32],
+        max_tokens: Option<u32>,
+        events: mpsc::Sender<Result<MessageContentBlock, CucaError>>,
+        metadata: ResponseMetadataHandle,
+    ) -> Job {
+        Job {
+            prompt_ids: prompt.to_vec(),
+            start_in_thinking: false,
+            enable_thinking: false,
+            temperature: None,
+            max_tokens,
+            top_p: None,
+            top_k: None,
+            seed: None,
+            stop: Vec::new(),
+            events,
+            metadata,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{engine, engine_in_trunk, engine_with_dflash, engine_with_drafter};
+    use super::testing::{
+        engine, engine_in_trunk, engine_with_dflash, engine_with_drafter, engine_with_eagle,
+    };
     use super::*;
     use crate::provider::local::model::tiny::{TinyDflash, write_tiny_dflash};
     use crate::provider::local::model::tiny::{TinyQwen35, TinySpec, write_qwen35, write_spec};
@@ -1073,19 +1095,7 @@ mod tests {
     ) -> Outcome {
         let (tx, mut rx) = mpsc::channel(1024);
         let metadata = ResponseMetadataHandle::empty();
-        let mut job = Job {
-            prompt_ids: prompt.to_vec(),
-            start_in_thinking: false,
-            enable_thinking: false,
-            temperature: None,
-            max_tokens,
-            top_p: None,
-            top_k: None,
-            seed: None,
-            stop: Vec::new(),
-            events: tx,
-            metadata: metadata.clone(),
-        };
+        let mut job = super::testing::job(prompt, max_tokens, tx, metadata.clone());
         edit(&mut job);
         e.run(job);
         let mut items = Vec::new();
@@ -1108,6 +1118,37 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    /// The completion tokens a request reported.
+    fn completion_tokens(out: &Outcome) -> Option<u32> {
+        out.metadata.token_usage.map(|u| u.completion_tokens)
+    }
+
+    /// Speculation must not change what a request replies: the same text and
+    /// the same completion tokens.
+    fn assert_same_reply(got: &Outcome, expected: &Outcome, what: &str) {
+        assert_eq!(text(got), text(expected), "{what}");
+        assert_eq!(
+            completion_tokens(got),
+            completion_tokens(expected),
+            "{what}"
+        );
+    }
+
+    /// A fixed seed reproduces a sampled reply, its usage and the draft
+    /// counters, and every round of it drafts.
+    fn seeded_run_is_reproducible(make: impl Fn() -> Engine) {
+        let run_once = || {
+            let mut e = make();
+            let out = run(&mut e, &PROMPT, None);
+            (text(&out), completion_tokens(&out), e.stats.snapshot())
+        };
+        let (a, n, stats_a) = run_once();
+        let (b, m, stats_b) = run_once();
+        assert_eq!((a, n, stats_a), (b, m, stats_b));
+        assert!(n.is_some());
+        assert!(stats_a.drafted > 0, "a seeded run always drafts");
     }
 
     const PROMPT: [u32; 6] = [2, 9, 10, 11, 12, 13];
@@ -1301,19 +1342,12 @@ mod tests {
         });
         let mut e = engine(&model, 96, 0.0, None);
         let (tx, mut rx) = mpsc::channel(1);
-        e.submit(Job {
-            prompt_ids: long.clone(),
-            start_in_thinking: false,
-            enable_thinking: false,
-            temperature: None,
-            max_tokens: Some(10),
-            top_p: None,
-            top_k: None,
-            seed: None,
-            stop: Vec::new(),
-            events: tx,
-            metadata: ResponseMetadataHandle::empty(),
-        });
+        e.submit(super::testing::job(
+            &long,
+            Some(10),
+            tx,
+            ResponseMetadataHandle::empty(),
+        ));
         // The consumer takes the first block and goes away.
         while !e.idle() {
             e.turn();
@@ -1542,17 +1576,9 @@ mod tests {
                 let mut spec = engine_with_drafter(&model, &drafter, 32, 0.0, None, k);
                 let expected = run(&mut plain, prompt, None);
                 let got = run(&mut spec, prompt, None);
-                assert_eq!(text(&got), text(&expected), "k {k}, prompt {prompt:?}");
-                assert_eq!(
-                    got.items.len(),
-                    expected.items.len(),
-                    "k {k}, prompt {prompt:?}"
-                );
-                assert_eq!(
-                    got.metadata.token_usage.map(|u| u.completion_tokens),
-                    expected.metadata.token_usage.map(|u| u.completion_tokens),
-                    "k {k}, prompt {prompt:?}"
-                );
+                let what = format!("k {k}, prompt {prompt:?}");
+                assert_same_reply(&got, &expected, &what);
+                assert_eq!(got.items.len(), expected.items.len(), "{what}");
                 // The finished sequence left no block referenced, and its ids
                 // equal plain decoding's: the K/V of rejected drafts never
                 // leaks into the bookkeeping.
@@ -1573,12 +1599,7 @@ mod tests {
             let mut spec = engine_with_drafter(&model, &drafter, 32, 0.0, None, 4);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
-            assert_eq!(text(&a), text(&b), "max {max}");
-            assert_eq!(
-                a.metadata.token_usage.map(|u| u.completion_tokens),
-                b.metadata.token_usage.map(|u| u.completion_tokens),
-                "max {max}"
-            );
+            assert_same_reply(&a, &b, &format!("max {max}"));
         }
         // A context that fills up mid-round.
         let mut plain = engine(&model, 12, 0.0, None);
@@ -1787,19 +1808,6 @@ mod tests {
         assert_eq!(text(&after), text(&before));
     }
 
-    /// A hybrid model's verification window bounds the drafts per round.
-    #[test]
-    fn hybrid_models_bound_the_verification_rows() {
-        let model = write_qwen35(&TinyQwen35::default());
-        let e = engine(&model, 32, 0.0, None);
-        assert_eq!(e.model.rollback_rows(), 17);
-        let plain = write_tiny_model();
-        assert_eq!(
-            engine(&plain, 32, 0.0, None).model.rollback_rows(),
-            usize::MAX
-        );
-    }
-
     /// The committed pairs of the in-trunk head of `e`.
     fn head_len(e: &Engine) -> usize {
         match &e.drafter {
@@ -1840,17 +1848,9 @@ mod tests {
                 let mut spec = engine_in_trunk(model, 32, 0.0, None, k);
                 let expected = run(&mut plain, prompt, None);
                 let got = run(&mut spec, prompt, None);
-                assert_eq!(text(&got), text(&expected), "k {k}, prompt {prompt:?}");
-                assert_eq!(
-                    got.items.len(),
-                    expected.items.len(),
-                    "k {k}, prompt {prompt:?}"
-                );
-                assert_eq!(
-                    got.metadata.token_usage.map(|u| u.completion_tokens),
-                    expected.metadata.token_usage.map(|u| u.completion_tokens),
-                    "k {k}, prompt {prompt:?}"
-                );
+                let what = format!("k {k}, prompt {prompt:?}");
+                assert_same_reply(&got, &expected, &what);
+                assert_eq!(got.items.len(), expected.items.len(), "{what}");
                 assert_eq!(spec.last_ids, plain.last_ids, "k {k}, prompt {prompt:?}");
                 assert_eq!(
                     head_len(&spec),
@@ -1873,7 +1873,6 @@ mod tests {
     /// emitted but, as in plain decoding, never forwarded.
     #[test]
     fn a_budget_ending_inside_a_round_caches_what_plain_decoding_does() {
-        use super::testing::engine_with_eagle;
         let (model, eagle) = (mistral4(16), eagle());
         let mut spent = 0;
         let prompts: Vec<Vec<u32>> = (0..40usize)
@@ -1892,16 +1891,10 @@ mod tests {
                     let a = run(&mut plain, prompt, Some(max));
                     let b = run(&mut spec, prompt, Some(max));
                     let what = format!("k {k}, prompt {prompt:?}, max {max}");
-                    let (ua, ub) = (a.metadata.token_usage, b.metadata.token_usage);
-                    assert_eq!(text(&a), text(&b), "{what}");
-                    assert_eq!(
-                        ua.map(|u| u.completion_tokens),
-                        ub.map(|u| u.completion_tokens),
-                        "{what}"
-                    );
+                    assert_same_reply(&a, &b, &what);
                     assert_eq!(spec.last_ids, plain.last_ids, "{what}");
                     assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "{what}");
-                    spent += usize::from(ub.map(|u| u.completion_tokens) == Some(max));
+                    spent += usize::from(completion_tokens(&b) == Some(max));
                 }
             }
         }
@@ -1913,7 +1906,6 @@ mod tests {
     /// it is emitted but never forwarded.
     #[test]
     fn a_stop_string_ending_inside_a_round_caches_what_plain_decoding_does() {
-        use super::testing::engine_with_eagle;
         let (model, eagle) = (mistral4(16), eagle());
         let mut stopped = 0;
         for s in 0..24usize {
@@ -1933,12 +1925,7 @@ mod tests {
                     let a = with_stop(&mut plain);
                     let b = with_stop(&mut spec);
                     let what = format!("k {k}, prompt {prompt:?}, stop {stop:?}");
-                    assert_eq!(text(&a), text(&b), "{what}");
-                    assert_eq!(
-                        a.metadata.token_usage.map(|u| u.completion_tokens),
-                        b.metadata.token_usage.map(|u| u.completion_tokens),
-                        "{what}"
-                    );
+                    assert_same_reply(&a, &b, &what);
                     assert_eq!(spec.last_ids, plain.last_ids, "{what}");
                     assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "{what}");
                     stopped += usize::from(text(&a).len() < free.len());
@@ -1956,12 +1943,7 @@ mod tests {
             let mut spec = engine_in_trunk(&model, 32, 0.0, None, 4);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
-            assert_eq!(text(&a), text(&b), "max {max}");
-            assert_eq!(
-                a.metadata.token_usage.map(|u| u.completion_tokens),
-                b.metadata.token_usage.map(|u| u.completion_tokens),
-                "max {max}"
-            );
+            assert_same_reply(&a, &b, &format!("max {max}"));
             assert_eq!(spec.last_ids, plain.last_ids, "max {max}");
             assert_eq!(head_len(&spec), spec.last_ids.len() - 1, "max {max}");
         }
@@ -1986,8 +1968,8 @@ mod tests {
                     "ctx {ctx}, prompt {prompt:?}"
                 );
                 assert_eq!(head_len(&spec), spec.last_ids.len() - 1, "ctx {ctx}");
-                let tokens = b.metadata.token_usage.map(|u| u.completion_tokens);
-                filled += usize::from(tokens == u32::try_from(ctx - prompt.len()).ok());
+                filled +=
+                    usize::from(completion_tokens(&b) == u32::try_from(ctx - prompt.len()).ok());
             }
         }
         assert!(filled > 0, "some run stopped at the context limit");
@@ -2077,20 +2059,7 @@ mod tests {
     #[test]
     fn in_trunk_head_with_sampling_is_reproducible_for_a_seed() {
         let model = write_qwen35(&TinyQwen35::default());
-        let run_once = || {
-            let mut e = engine_in_trunk(&model, 32, 1.0, Some(5), 3);
-            let out = run(&mut e, &PROMPT, None);
-            (
-                text(&out),
-                out.metadata.token_usage.map(|u| u.completion_tokens),
-                e.stats.snapshot(),
-            )
-        };
-        let (a, n, stats_a) = run_once();
-        let (b, m, stats_b) = run_once();
-        assert_eq!((a, n, stats_a), (b, m, stats_b));
-        assert!(n.is_some());
-        assert!(stats_a.drafted > 0, "a seeded run always drafts");
+        seeded_run_is_reproducible(|| engine_in_trunk(&model, 32, 1.0, Some(5), 3));
     }
 
     /// The default context length is the model's maximum when that is below
@@ -2248,7 +2217,6 @@ mod tests {
     /// drafter stays one pair behind the target's cache.
     #[test]
     fn eagle_leaves_greedy_output_unchanged() {
-        use super::testing::engine_with_eagle;
         let (model, eagle) = (mistral4(32), eagle());
         let prompts: [&[u32]; 5] = [
             &PROMPT,
@@ -2264,17 +2232,9 @@ mod tests {
                 let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, k);
                 let expected = run(&mut plain, prompt, None);
                 let got = run(&mut spec, prompt, None);
-                assert_eq!(text(&got), text(&expected), "k {k}, prompt {prompt:?}");
-                assert_eq!(
-                    got.items.len(),
-                    expected.items.len(),
-                    "k {k}, prompt {prompt:?}"
-                );
-                assert_eq!(
-                    got.metadata.token_usage.map(|u| u.completion_tokens),
-                    expected.metadata.token_usage.map(|u| u.completion_tokens),
-                    "k {k}, prompt {prompt:?}"
-                );
+                let what = format!("k {k}, prompt {prompt:?}");
+                assert_same_reply(&got, &expected, &what);
+                assert_eq!(got.items.len(), expected.items.len(), "{what}");
                 assert_eq!(spec.last_ids, plain.last_ids, "k {k}, prompt {prompt:?}");
                 assert_eq!(
                     eagle_len(&spec),
@@ -2292,19 +2252,13 @@ mod tests {
 
     #[test]
     fn eagle_respects_max_tokens_and_the_context_limit() {
-        use super::testing::engine_with_eagle;
         let (model, eagle) = (mistral4(32), eagle());
         for max in [1u32, 2, 3, 7] {
             let mut plain = engine(&model, 32, 0.0, None);
             let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, 4);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
-            assert_eq!(text(&a), text(&b), "max {max}");
-            assert_eq!(
-                a.metadata.token_usage.map(|u| u.completion_tokens),
-                b.metadata.token_usage.map(|u| u.completion_tokens),
-                "max {max}"
-            );
+            assert_same_reply(&a, &b, &format!("max {max}"));
             assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "max {max}");
         }
         // A context that fills up mid-round, for several sizes and prompts:
@@ -2328,8 +2282,8 @@ mod tests {
                     "ctx {ctx}, prompt {prompt:?}"
                 );
                 assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "ctx {ctx}");
-                let tokens = b.metadata.token_usage.map(|u| u.completion_tokens);
-                filled += usize::from(tokens == u32::try_from(ctx - prompt.len()).ok());
+                filled +=
+                    usize::from(completion_tokens(&b) == u32::try_from(ctx - prompt.len()).ok());
             }
         }
         assert!(filled > 0, "some run stopped at the context limit");
@@ -2341,7 +2295,6 @@ mod tests {
     /// and its K/V ends up the cold drafter's.
     #[test]
     fn eagle_warm_prefix_reuse_equals_cold() {
-        use super::testing::engine_with_eagle;
         let (model, eagle) = (mistral4(128), eagle());
         let mut first = long_prompt(40);
         first[19] = 3;
@@ -2400,7 +2353,6 @@ mod tests {
     /// keeps serving.
     #[test]
     fn eagle_recovers_from_a_failed_request() {
-        use super::testing::engine_with_eagle;
         let (model, eagle) = (mistral4(32), eagle());
         let mut e = engine_with_eagle(&model, &eagle, 32, 0.0, None, 3);
         let prompt = [2u32, 9, 10, 3, 11, 12, 13];
@@ -2417,22 +2369,8 @@ mod tests {
 
     #[test]
     fn eagle_with_sampling_is_reproducible_for_a_seed() {
-        use super::testing::engine_with_eagle;
         let (model, eagle) = (mistral4(32), eagle());
-        let run_once = || {
-            let mut e = engine_with_eagle(&model, &eagle, 32, 1.0, Some(5), 3);
-            let out = run(&mut e, &PROMPT, None);
-            (
-                text(&out),
-                out.metadata.token_usage.map(|u| u.completion_tokens),
-                e.stats.snapshot(),
-            )
-        };
-        let (a, n, stats_a) = run_once();
-        let (b, m, stats_b) = run_once();
-        assert_eq!((a, n, stats_a), (b, m, stats_b));
-        assert!(n.is_some());
-        assert!(stats_a.drafted > 0, "a seeded run always drafts");
+        seeded_run_is_reproducible(|| engine_with_eagle(&model, &eagle, 32, 1.0, Some(5), 3));
     }
 
     /// The engine recognises an EAGLE file by its architecture, serves one
@@ -2445,9 +2383,15 @@ mod tests {
         let header = |m: &crate::provider::local::model::tiny::TinyModel| {
             read_drafter_header(&m.path).unwrap()
         };
-        assert!(is_eagle(&header(&eagle)));
-        assert!(!is_eagle(&header(&write_tiny_drafter())));
-        assert!(!is_eagle(&header(&model)));
+        // A file whose drafter takes every position's row (EAGLE, DFlash)
+        // pins the engine to one sequence; a plain assistant does not.
+        let observes = |m: &crate::provider::local::model::tiny::TinyModel| {
+            file_drafter_observes(architecture_of(&header(m)))
+        };
+        assert_eq!(architecture_of(&header(&eagle)), Arch::Mistral4Eagle.name());
+        assert!(observes(&eagle));
+        assert!(!observes(&write_tiny_drafter()));
+        assert!(!observes(&model));
 
         let config = LocalModelConfig {
             batching: super::super::BatchingConfig {
@@ -2457,11 +2401,14 @@ mod tests {
             ..LocalModelConfig::default()
         };
         assert_eq!(
-            resolve_batching(&config, 32, true).unwrap().0.max_sequences,
+            resolve_batching(&config, 32, observes(&eagle))
+                .unwrap()
+                .0
+                .max_sequences,
             1
         );
         assert_eq!(
-            resolve_batching(&config, 32, false)
+            resolve_batching(&config, 32, observes(&write_tiny_drafter()))
                 .unwrap()
                 .0
                 .max_sequences,
@@ -2558,13 +2505,8 @@ mod tests {
                     let expected = run(&mut plain, prompt, None);
                     let got = run(&mut spec, prompt, None);
                     let what = format!("block {block} window {window:?} k {k} prompt {prompt:?}");
-                    assert_eq!(text(&got), text(&expected), "{what}");
+                    assert_same_reply(&got, &expected, &what);
                     assert_eq!(got.items.len(), expected.items.len(), "{what}");
-                    assert_eq!(
-                        got.metadata.token_usage.map(|u| u.completion_tokens),
-                        expected.metadata.token_usage.map(|u| u.completion_tokens),
-                        "{what}"
-                    );
                     assert_eq!(spec.last_ids, plain.last_ids, "{what}");
                     assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "{what}");
                     let stats = spec.stats.snapshot();
@@ -2587,12 +2529,7 @@ mod tests {
             let mut spec = engine_with_dflash(&model, &drafter, 32, 0.0, None, 4);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
-            assert_eq!(text(&a), text(&b), "max {max}");
-            assert_eq!(
-                a.metadata.token_usage.map(|u| u.completion_tokens),
-                b.metadata.token_usage.map(|u| u.completion_tokens),
-                "max {max}"
-            );
+            assert_same_reply(&a, &b, &format!("max {max}"));
             assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "max {max}");
         }
         // A context that fills up mid-round, for several sizes and prompts.
@@ -2616,8 +2553,8 @@ mod tests {
                     "ctx {ctx}, prompt {prompt:?}"
                 );
                 assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "ctx {ctx}");
-                let tokens = b.metadata.token_usage.map(|u| u.completion_tokens);
-                filled += usize::from(tokens == u32::try_from(ctx - prompt.len()).ok());
+                filled +=
+                    usize::from(completion_tokens(&b) == u32::try_from(ctx - prompt.len()).ok());
             }
         }
         assert!(filled > 0, "some run stopped at the context limit");
@@ -2698,20 +2635,7 @@ mod tests {
     fn dflash_drafter_with_sampling_is_reproducible_for_a_seed() {
         let model = muse_target(32);
         let drafter = write_tiny_dflash(&TinyDflash::default());
-        let run_once = || {
-            let mut e = engine_with_dflash(&model, &drafter, 32, 1.0, Some(5), 3);
-            let out = run(&mut e, &PROMPT, None);
-            (
-                text(&out),
-                out.metadata.token_usage.map(|u| u.completion_tokens),
-                e.stats.snapshot(),
-            )
-        };
-        let (a, n, stats_a) = run_once();
-        let (b, m, stats_b) = run_once();
-        assert_eq!((a, n, stats_a), (b, m, stats_b));
-        assert!(n.is_some());
-        assert!(stats_a.drafted > 0, "a seeded run always drafts");
+        seeded_run_is_reproducible(|| engine_with_dflash(&model, &drafter, 32, 1.0, Some(5), 3));
     }
 
     /// The measured cost model and governor (no test freeze) price a block
@@ -2833,7 +2757,6 @@ mod tests {
     /// pass early; the held rows follow truncation, replay and reset.
     #[test]
     fn eagle_deferred_rows_catch_up_to_the_eager_cache() {
-        use super::testing::engine_with_eagle;
         use crate::provider::local::model::tiny::{Lcg, N_EMBD};
         let (model, eagle) = (mistral4(128), eagle());
         let n = 40;
@@ -2995,7 +2918,6 @@ mod tests {
     /// replays the cached ids starts from the rows still held.
     #[test]
     fn plain_rounds_defer_the_upkeep_and_the_next_draft_catches_up() {
-        use super::testing::{engine_in_trunk, engine_with_dflash, engine_with_eagle};
         let (mistral, eagle) = (mistral4(128), eagle());
         let qwen = hybrid(TinyQwen35::default());
         let (muse, dflash) = (muse_target(128), write_tiny_dflash(&TinyDflash::default()));

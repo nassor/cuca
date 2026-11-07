@@ -50,14 +50,17 @@ use tokio::sync::mpsc::{self, error::TrySendError};
 use super::{Engine, Job, local_err, saturating_u32, take_block_draft, take_draft};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
-use crate::provider::local::model::cpu::Hidden;
+use crate::provider::local::model::cpu::{Forward, Hidden};
 use crate::provider::local::model::mtp::Drafter;
 use crate::provider::local::model::paged::{BLOCK_SIZE, BlockKey, SeqBlocks, block_keys};
-use crate::provider::local::model::{Batch, RecurrentSnapshot, SeqRows, StateSlot, Want};
+use crate::provider::local::model::{
+    Batch, RecurrentSnapshot, SeqRows, StateSlot, Want, prefill_chunk,
+};
 use crate::provider::local::output::OutputParser;
 use crate::provider::local::sampler::{
     Dist, Scratch, SplitMix64, greedy, greedy_with_prob, sample,
 };
+use crate::provider::local::tokenizer::Tokenizer;
 use crate::request::{PromptCacheUsage, TokenUsage};
 use crate::types::MessageContentBlock;
 
@@ -126,6 +129,11 @@ impl Stopper {
             out.push_back(Ok(MessageContentBlock::Text(held)));
         }
     }
+}
+
+/// A fresh tool-call id.
+fn call_id(rng: &mut SplitMix64) -> String {
+    format!("call_{:016x}", rng.next_u64())
 }
 
 /// One request being served: its tokens, K/V blocks, sampling state and
@@ -233,6 +241,33 @@ impl Sequence {
     fn reproducible(&self) -> bool {
         self.temperature > 0.0 && self.seeded.is_some()
     }
+
+    /// Count `id` as generated and move what the output parser and the stop
+    /// matcher make of it to the pending output. `items` is scratch: empty
+    /// before and after.
+    fn emit(
+        &mut self,
+        id: u32,
+        tokenizer: &Tokenizer,
+        id_rng: &mut SplitMix64,
+        items: &mut Vec<Item>,
+    ) {
+        self.completion += 1;
+        self.parser
+            .push(id, tokenizer, &mut || call_id(id_rng), items);
+        self.stopper.push(items, &mut self.pending);
+    }
+
+    /// Release what the output parser and the stop matcher still hold, unless
+    /// a stop string already ended the reply. `items` is scratch.
+    fn flush_output(&mut self, id_rng: &mut SplitMix64, items: &mut Vec<Item>) {
+        if self.stopper.stopped {
+            return;
+        }
+        self.parser.finish(&mut || call_id(id_rng), items);
+        self.stopper.push(items, &mut self.pending);
+        self.stopper.finish(&mut self.pending);
+    }
 }
 
 /// The hybrid-model prefix snapshots the engine keeps: the recurrent state
@@ -327,13 +362,34 @@ enum Kind {
 struct Round {
     q_dists: Vec<Dist>,
     spec_round: bool,
-    draft_steps: usize,
     /// Drafter passes the round cost: one per step for a chained drafter,
     /// one for the whole block of a block drafter (zero when it did not run).
     draft_passes: usize,
     draft_secs: f64,
     predicted: f64,
     started: Instant,
+}
+
+/// Buffers the scheduler refills every step instead of allocating anew.
+#[derive(Default)]
+pub(super) struct StepBufs {
+    /// The step's planned rows.
+    plans: Vec<Plan>,
+    /// Token buffers of applied plans, spare for the next step's (at most
+    /// one per running sequence).
+    tokens: Vec<Vec<u32>>,
+    /// What the output parser made of one token, on its way to the stop
+    /// matcher: empty between tokens.
+    items: Vec<Item>,
+}
+
+impl StepBufs {
+    /// An empty token buffer: a spare one when there is one.
+    fn take_tokens(&mut self) -> Vec<u32> {
+        let mut tokens = self.tokens.pop().unwrap_or_default();
+        tokens.clear();
+        tokens
+    }
 }
 
 impl Engine {
@@ -359,6 +415,12 @@ impl Engine {
     /// Requests waiting for a slot.
     pub(super) fn queued(&self) -> usize {
         self.waiting.len()
+    }
+
+    /// Whether the drafter takes the trunk's rows of every position
+    /// ([`Drafter::observes`]): the engine then serves one sequence.
+    fn observes(&self) -> bool {
+        self.drafter.as_ref().is_some_and(Drafter::observes)
     }
 
     /// One turn of the scheduler (see the module docs): returns whether
@@ -533,6 +595,16 @@ impl Engine {
             .sum()
     }
 
+    /// How many leading ids of `prompt` the drafter's cache still holds
+    /// pairs for: the ids the last sequence left behind, `drafter_ids`.
+    fn drafter_shared(&self, prompt: &[u32]) -> usize {
+        self.drafter_ids
+            .iter()
+            .zip(prompt)
+            .take_while(|(a, b)| a == b)
+            .count()
+    }
+
     /// The longest prefix of `prompt` the store can resume from, with a
     /// reference to its blocks: whole blocks of the full-attention pool (and
     /// the sliding windows before its end); a hybrid model also needs the
@@ -545,13 +617,8 @@ impl Engine {
             return self.pools.seq();
         }
         let mut blocks = self.pools.lookup(prompt).into_seq();
-        if self.drafter.as_ref().is_some_and(Drafter::observes) {
-            let shared = self
-                .drafter_ids
-                .iter()
-                .zip(prompt)
-                .take_while(|(a, b)| a == b)
-                .count();
+        if self.observes() {
+            let shared = self.drafter_shared(prompt);
             self.pools
                 .truncate(&mut blocks, shared / BLOCK_SIZE * BLOCK_SIZE);
         }
@@ -601,13 +668,11 @@ impl Engine {
             let restored = if reuse == 0 {
                 self.model.restore(StateSlot(slot), None, 0)
             } else if self.model.is_hybrid() {
-                let key = block_keys(&prompt, reuse / BLOCK_SIZE)
+                let snapshot = block_keys(&prompt, reuse / BLOCK_SIZE)
                     .pop()
-                    .and_then(|k| self.snapshots.get(&k).map(|s| (k, s)));
-                match key {
-                    Some((_, snapshot)) => {
-                        self.model.restore(StateSlot(slot), Some(snapshot), reuse)
-                    }
+                    .and_then(|k| self.snapshots.get(&k));
+                match snapshot {
+                    Some(snapshot) => self.model.restore(StateSlot(slot), Some(snapshot), reuse),
                     None => Err(local_err("the prefix has no recurrent-state snapshot")),
                 }
             } else {
@@ -625,13 +690,8 @@ impl Engine {
             // An in-trunk head keeps the pairs the shared tokens still
             // determine, `reuse` and more; the replayed rows replace the
             // rest.
+            let shared = self.drafter_shared(&prompt);
             if let Some(drafter) = &mut self.drafter {
-                let shared = self
-                    .drafter_ids
-                    .iter()
-                    .zip(&prompt)
-                    .take_while(|(a, b)| a == b)
-                    .count();
                 drafter.truncate(shared);
             }
             self.serving
@@ -661,7 +721,9 @@ impl Engine {
     // ---- ending a sequence ----
 
     /// Give back what `seq` holds: its blocks (filed in the prefix store when
-    /// `share`) and its state slot.
+    /// `share`) and its state slot. A drafter that observes every position
+    /// keeps the pairs of the ids the sequence left, which the next prompt
+    /// may share ([`Engine::drafter_shared`]).
     fn release_seq(&mut self, seq: &mut Sequence, share: bool) {
         if share && self.batching.prefix_cache {
             self.pools.finish(&mut seq.blocks, &seq.ids);
@@ -671,19 +733,15 @@ impl Engine {
         if let Some(slot) = seq.slot.take() {
             self.free_slots.push(slot);
         }
+        if self.observes() {
+            self.drafter_ids.clone_from(&seq.ids);
+        }
     }
 
     /// Send the end of `seq`'s reply: what the parser and the stop matcher
     /// still hold, unless a stop string ended it, and the usage.
     fn finish_reply(&mut self, seq: &mut Sequence) {
-        if !seq.stopper.stopped {
-            let mut items = Vec::new();
-            let id_rng = &mut self.id_rng;
-            let mut next_call_id = || format!("call_{:016x}", id_rng.next_u64());
-            seq.parser.finish(&mut next_call_id, &mut items);
-            seq.stopper.push(&mut items, &mut seq.pending);
-            seq.stopper.finish(&mut seq.pending);
-        }
+        seq.flush_output(&mut self.id_rng, &mut self.bufs.items);
         seq.metadata.set_token_usage(TokenUsage {
             prompt_tokens: saturating_u32(seq.prompt_len),
             completion_tokens: saturating_u32(seq.completion),
@@ -734,6 +792,7 @@ impl Engine {
         self.pools.reset();
         self.snapshots.clear();
         self.drafter_ids.clear();
+        self.bufs.items.clear();
         if let Some(drafter) = &mut self.drafter {
             drafter.reset();
         }
@@ -785,10 +844,26 @@ impl Engine {
 
     /// Plan, run and apply one forward step; returns whether work was done.
     fn step(&mut self) -> bool {
+        let mut plans = std::mem::take(&mut self.bufs.plans);
+        let mut progressed = self.plan_step(&mut plans);
+        if plans.is_empty() {
+            self.retire_ended();
+        } else {
+            self.run_step(&mut plans);
+            progressed = true;
+        }
+        plans.clear();
+        self.bufs.plans = plans;
+        progressed
+    }
+
+    /// Plan the rows of one step into `plans`: the decoding sequences' tokens
+    /// first, oldest first, then chunks of the prefilling sequences' prompts
+    /// in the rows left. Returns whether a sequence ended, failed or was
+    /// preempted on the way.
+    fn plan_step(&mut self, plans: &mut Vec<Plan>) -> bool {
         let mut progressed = false;
-        let observes = self.drafter.as_ref().is_some_and(Drafter::observes);
         let budget = self.batching.max_step_tokens;
-        let mut plans: Vec<Plan> = Vec::new();
         let mut used = 0usize;
 
         // Decoding sequences, oldest first: one row each (a lone sequence
@@ -825,56 +900,27 @@ impl Engine {
         }
 
         // Prefilling sequences, in admission order, share what is left.
-        let chunk = crate::provider::local::model::prefill_chunk(self.context_length);
-        let tap = self.drafter.is_some() && self.running.len() == 1;
-        let features = self.drafter.as_ref().and_then(Drafter::feature_rows);
         for i in 0..self.running.len() {
-            let seq = &self.running[i];
-            if seq.phase != Phase::Prefill {
+            if self.running[i].phase != Phase::Prefill {
                 continue;
             }
             let room = budget.saturating_sub(used);
             if room == 0 {
                 break;
             }
-            let pos = seq.ids.len();
-            let mut n = (seq.prompt.len() - pos).min(chunk).min(room);
-            // A chunk ends where the snapshot goes.
-            if let Some(at) = seq.snapshot_at.filter(|&at| pos < at && at < pos + n) {
-                n = at - pos;
-            }
-            let end = pos + n;
-            let last = end == seq.prompt.len();
-            let tokens = seq.prompt[pos..end].to_vec();
-            if let Err(e) = self.pools.reserve(&mut self.running[i].blocks, end) {
-                self.fail(i, e);
+            if let Some(plan) = self.plan_prefill(i, room) {
+                used += plan.tokens.len();
+                plans.push(plan);
+            } else {
                 progressed = true;
-                continue;
             }
-            used += n;
-            plans.push(Plan {
-                seq: i,
-                start: pos,
-                tokens,
-                want: if last { Want::Last } else { Want::None },
-                hidden: if let Some(rows) = features {
-                    rows
-                } else if observes {
-                    Hidden::PostNormAll
-                } else if last && tap {
-                    Hidden::PostNorm
-                } else {
-                    Hidden::None
-                },
-                kind: Kind::Prefill { last },
-            });
         }
+        progressed
+    }
 
-        if plans.is_empty() {
-            self.retire_ended();
-            return progressed;
-        }
-
+    /// Run the forward pass over `plans` and apply what it computed; a failed
+    /// pass ends every running sequence.
+    fn run_step(&mut self, plans: &mut Vec<Plan>) {
         // The tokens planned above go out before the forward pass that
         // computes the next ones, as a sequence's first token would with a
         // blocking send: a step costs tens of milliseconds.
@@ -904,49 +950,78 @@ impl Engine {
             Ok(outs) => outs,
             Err(e) => {
                 self.fail_running(&e);
-                return true;
+                return;
             }
         };
+        let rows: usize = plans.iter().map(|p| p.tokens.len()).sum();
         self.serving.steps.fetch_add(1, Ordering::Relaxed);
         self.serving
             .batched_rows
-            .fetch_add(used as u64, Ordering::Relaxed);
+            .fetch_add(rows as u64, Ordering::Relaxed);
 
-        for (plan, out) in plans.into_iter().zip(outs) {
-            match plan.kind {
-                Kind::Prefill { last } => self.apply_prefill(
-                    plan.seq,
-                    plan.start,
-                    &plan.tokens,
-                    last,
-                    out.logits,
-                    out.hidden,
-                ),
-                Kind::Decode(round) => self.apply_decode(
-                    plan.seq,
-                    plan.start,
-                    plan.tokens,
-                    plan.want == Want::All,
-                    round,
-                    out.logits,
-                    out.hidden,
-                    started,
-                ),
+        for (plan, out) in plans.drain(..).zip(outs) {
+            let Plan {
+                seq,
+                start,
+                tokens,
+                kind,
+                ..
+            } = plan;
+            match kind {
+                Kind::Prefill { last } => self.apply_prefill(seq, start, &tokens, last, out),
+                Kind::Decode(round) => self.apply_decode(seq, start, &tokens, round, out, started),
             }
-        }
-        if observes && let Some(seq) = self.running.first() {
-            self.drafter_ids.clone_from(&seq.ids);
+            self.bufs.tokens.push(tokens);
         }
         self.retire_ended();
-        true
+    }
+
+    /// Plan the next chunk of the prompt of prefilling sequence `i`, at most
+    /// `room` rows. `None` when its blocks cannot be reserved (the sequence
+    /// is marked failed).
+    fn plan_prefill(&mut self, i: usize, room: usize) -> Option<Plan> {
+        let chunk = prefill_chunk(self.context_length);
+        let observes = self.observes();
+        let tap = self.drafter.is_some() && self.running.len() == 1;
+        let features = self.drafter.as_ref().and_then(Drafter::feature_rows);
+        let (pos, end, last) = {
+            let seq = &self.running[i];
+            let pos = seq.ids.len();
+            let mut n = (seq.prompt.len() - pos).min(chunk).min(room);
+            // A chunk ends where the snapshot goes.
+            if let Some(at) = seq.snapshot_at.filter(|&at| pos < at && at < pos + n) {
+                n = at - pos;
+            }
+            (pos, pos + n, pos + n == seq.prompt.len())
+        };
+        if let Err(e) = self.pools.reserve(&mut self.running[i].blocks, end) {
+            self.fail(i, e);
+            return None;
+        }
+        let mut tokens = self.bufs.take_tokens();
+        tokens.extend_from_slice(&self.running[i].prompt[pos..end]);
+        Some(Plan {
+            seq: i,
+            start: pos,
+            tokens,
+            want: if last { Want::Last } else { Want::None },
+            hidden: if let Some(rows) = features {
+                rows
+            } else if observes {
+                Hidden::PostNormAll
+            } else if last && tap {
+                Hidden::PostNorm
+            } else {
+                Hidden::None
+            },
+            kind: Kind::Prefill { last },
+        })
     }
 
     /// Take the next token of decoding sequence `i` (sampled, or the one a
-    /// rejected draft resampled), emit it, and plan its row: the token and,
-    /// for a lone sequence, the tokens the drafter proposes after it. `None`
-    /// when the reply ended with the token (the sequence is marked ended).
-    fn plan_decode(&mut self, i: usize, room_rows: usize) -> Option<Plan> {
-        let round_start = Instant::now();
+    /// rejected draft resampled) and emit it. `None` when the reply ended
+    /// with the token (the sequence is marked ended).
+    fn take_token(&mut self, i: usize) -> Option<u32> {
         let ctx = self.context_length;
         let seq = &mut self.running[i];
         let shared_rng = &mut self.rng;
@@ -966,29 +1041,30 @@ impl Engine {
             seq.phase = Phase::Ended { failed: false };
             return None;
         }
-        seq.completion += 1;
-        {
-            let mut items = Vec::new();
-            let id_rng = &mut self.id_rng;
-            let mut next_call_id = || format!("call_{:016x}", id_rng.next_u64());
-            seq.parser
-                .push(id, &self.tokenizer, &mut next_call_id, &mut items);
-            seq.stopper.push(&mut items, &mut seq.pending);
-        }
+        seq.emit(id, &self.tokenizer, &mut self.id_rng, &mut self.bufs.items);
         if seq.stopper.stopped || seq.completion == seq.budget || seq.ids.len() == ctx {
             seq.phase = Phase::Ended { failed: false };
             return None;
         }
-        let observes = self.drafter.as_ref().is_some_and(Drafter::observes);
+        Some(id)
+    }
+
+    /// Take the next token of decoding sequence `i` and plan its row: the
+    /// token and, for a lone sequence, the tokens the drafter proposes after
+    /// it. `None` when the reply ended with the token or the round failed
+    /// (the sequence is marked ended).
+    fn plan_decode(&mut self, i: usize, room_rows: usize) -> Option<Plan> {
+        let round_start = Instant::now();
+        let id = self.take_token(i)?;
+        let observes = self.observes();
         let alone = self.running.len() == 1 && self.waiting.is_empty();
         let tap = observes || (self.drafter.is_some() && self.running.len() == 1);
         let features = self.drafter.as_ref().and_then(Drafter::feature_rows);
-        let seq = &mut self.running[i];
-        let mut tokens = vec![id];
+        let mut tokens = self.bufs.take_tokens();
+        tokens.push(id);
         let mut round = Round {
             q_dists: Vec::new(),
             spec_round: false,
-            draft_steps: 0,
             draft_passes: 0,
             draft_secs: 0.0,
             predicted: 0.0,
@@ -1001,9 +1077,10 @@ impl Engine {
         // timing dependent on/off decision or draft length would change how
         // many random numbers are drawn, so it always drafts the full cap.
         if alone && self.drafter.is_some() {
+            let seq = &self.running[i];
             let reproducible = seq.reproducible();
             round.spec_round = reproducible || self.governor.want_spec();
-            let room = ctx - seq.ids.len() - 1;
+            let room = self.context_length - seq.ids.len() - 1;
             // A hybrid model can roll back only the rows of one bounded
             // verification call (`Model::rollback_rows`).
             let k = if round.spec_round {
@@ -1016,115 +1093,29 @@ impl Engine {
                 0
             };
             if k > 0
-                && let (Some(drafter), Some(h)) = (&mut self.drafter, seq.hidden.as_deref())
+                && let Err(e) = self.draft(i, id, k, &mut tokens, &mut round)
             {
-                // A drafter that skipped the upkeep of plain rounds takes
-                // the rows it missed now, in one batched pass. The time is
-                // a cost of switching, not of either mode: the round the
-                // governor times starts after it.
-                let caught_up = Instant::now();
-                if let Err(e) = drafter.catch_up(&self.model) {
-                    self.fail(i, e);
-                    return None;
-                }
-                let spent = caught_up.elapsed();
-                round.started = round.started.checked_add(spent).unwrap_or(round.started);
-                let greedy_mode = seq.temperature <= 0.0;
-                let (temperature, top_k, top_p) = (seq.temperature, seq.top_k, seq.top_p);
-                let shared_rng = &mut self.rng;
-                let rng = seq.seeded.as_mut().unwrap_or(shared_rng);
-                // Draft `j` is kept while its predicted acceptance (the
-                // drafter's chained confidence, calibrated) makes the round's
-                // expected tokens per second rise (`take_draft`); `k` is the
-                // cap.
-                let adaptive = !reproducible;
-                let cost = &self.cost;
-                let block = drafter.block();
-                let kappa = cost.calibration();
-                let step_secs = cost.draft_secs();
-                let mut chained = 1.0f64;
-                let mut expected = 1.0f64;
-                let Round {
-                    q_dists,
-                    draft_steps,
-                    predicted,
-                    ..
-                } = &mut round;
-                let scratch = &mut seq.scratch;
-                let mut pick = |l: &mut [f32]| -> Option<u32> {
-                    *draft_steps += 1;
-                    let j = *draft_steps;
-                    let (d, q) = if greedy_mode {
-                        greedy_with_prob(l)
-                    } else {
-                        let dist = Dist::warp(l, temperature, top_k, top_p, scratch);
-                        let d = dist.draw(rng);
-                        let q = dist.prob(d);
-                        q_dists.push(dist);
-                        (d, q)
-                    };
-                    chained *= f64::from(q);
-                    // The first draft of a speculative round is always
-                    // verified: the governor already decided that the round
-                    // drafts, and its acceptance keeps the calibration live.
-                    if adaptive {
-                        let a = if block {
-                            cost.block_acceptance(j)
-                        } else {
-                            (kappa * chained).min(1.0)
-                        };
-                        let (t_j, t_next) = (cost.verify_secs(j), cost.verify_secs(j + 1));
-                        let keep = if block {
-                            take_block_draft(a, expected, t_j, t_next, step_secs)
-                        } else {
-                            take_draft(a, expected, j, t_j, t_next, step_secs)
-                        };
-                        if j > 1 && !keep {
-                            return None;
-                        }
-                        expected += a;
-                    }
-                    *predicted += chained;
-                    Some(d)
-                };
-                let draft_start = Instant::now();
-                match drafter.draft(
-                    &self.model,
-                    &seq.blocks.tables,
-                    h,
-                    id,
-                    seq.ids.len(),
-                    k,
-                    &mut pick,
-                ) {
-                    Ok(d) => tokens.extend_from_slice(&d),
-                    Err(e) => {
-                        self.fail(i, e);
-                        return None;
-                    }
-                }
-                round.draft_secs = draft_start.elapsed().as_secs_f64();
-                // A block drafter runs one pass however many drafts `pick`
-                // took, and none when it had nothing to condition on.
-                round.draft_passes = if block {
-                    usize::from(round.draft_steps > 0)
-                } else {
-                    round.draft_steps
-                };
+                self.fail(i, e);
+                return None;
             }
         }
 
-        let seq = &mut self.running[i];
-        let drafted = tokens.len() > 1;
-        let start = seq.ids.len();
-        if let Err(e) = self.pools.reserve(&mut seq.blocks, start + tokens.len()) {
+        let start = self.running[i].ids.len();
+        if let Err(e) = self
+            .pools
+            .reserve(&mut self.running[i].blocks, start + tokens.len())
+        {
             self.fail(i, e);
             return None;
         }
         Some(Plan {
             seq: i,
             start,
-            want: if drafted { Want::All } else { Want::Last },
+            want: if tokens.len() > 1 {
+                Want::All
+            } else {
+                Want::Last
+            },
             hidden: if let Some(rows) = features {
                 rows
             } else if tap {
@@ -1137,17 +1128,111 @@ impl Engine {
         })
     }
 
-    /// Record what a prefill chunk computed.
-    fn apply_prefill(
+    /// Draft up to `k` tokens after `id`, the pending token of the lone
+    /// sequence `i`, onto `tokens`; what the cost model learns from the
+    /// proposals goes into `round`. Nothing is drafted for a sequence with
+    /// no hidden row to start from.
+    fn draft(
         &mut self,
         i: usize,
-        pos: usize,
-        tokens: &[u32],
-        last: bool,
-        logits: Option<Vec<f32>>,
-        hidden: Option<Vec<f32>>,
-    ) {
-        let observes = self.drafter.as_ref().is_some_and(Drafter::observes);
+        id: u32,
+        k: usize,
+        tokens: &mut Vec<u32>,
+        round: &mut Round,
+    ) -> Result<(), CucaError> {
+        let seq = &mut self.running[i];
+        let (Some(drafter), Some(h)) = (&mut self.drafter, seq.hidden.as_deref()) else {
+            return Ok(());
+        };
+        // A drafter that skipped the upkeep of plain rounds takes the rows it
+        // missed now, in one batched pass. The time is a cost of switching,
+        // not of either mode: the round the governor times starts after it.
+        let caught_up = Instant::now();
+        drafter.catch_up(&self.model)?;
+        let spent = caught_up.elapsed();
+        round.started = round.started.checked_add(spent).unwrap_or(round.started);
+        let reproducible = seq.reproducible();
+        let greedy_mode = seq.temperature <= 0.0;
+        let (temperature, top_k, top_p) = (seq.temperature, seq.top_k, seq.top_p);
+        let shared_rng = &mut self.rng;
+        let rng = seq.seeded.as_mut().unwrap_or(shared_rng);
+        // Draft `j` is kept while its predicted acceptance (the drafter's
+        // chained confidence, calibrated) makes the round's expected tokens
+        // per second rise (`take_draft`); `k` is the cap.
+        let adaptive = !reproducible;
+        let cost = &self.cost;
+        let block = drafter.block();
+        let kappa = cost.calibration();
+        let step_secs = cost.draft_secs();
+        let mut chained = 1.0f64;
+        let mut expected = 1.0f64;
+        let mut draft_steps = 0usize;
+        let Round {
+            q_dists, predicted, ..
+        } = &mut *round;
+        let scratch = &mut seq.scratch;
+        let mut pick = |l: &mut [f32]| -> Option<u32> {
+            draft_steps += 1;
+            let j = draft_steps;
+            let (d, q) = if greedy_mode {
+                greedy_with_prob(l)
+            } else {
+                let dist = Dist::warp(l, temperature, top_k, top_p, scratch);
+                let d = dist.draw(rng);
+                let q = dist.prob(d);
+                q_dists.push(dist);
+                (d, q)
+            };
+            chained *= f64::from(q);
+            // The first draft of a speculative round is always verified: the
+            // governor already decided that the round drafts, and its
+            // acceptance keeps the calibration live.
+            if adaptive {
+                let a = if block {
+                    cost.block_acceptance(j)
+                } else {
+                    (kappa * chained).min(1.0)
+                };
+                let (t_j, t_next) = (cost.verify_secs(j), cost.verify_secs(j + 1));
+                let keep = if block {
+                    take_block_draft(a, expected, t_j, t_next, step_secs)
+                } else {
+                    take_draft(a, expected, j, t_j, t_next, step_secs)
+                };
+                if j > 1 && !keep {
+                    return None;
+                }
+                expected += a;
+            }
+            *predicted += chained;
+            Some(d)
+        };
+        let draft_start = Instant::now();
+        let drafted = drafter.draft(
+            &self.model,
+            &seq.blocks.tables,
+            h,
+            id,
+            seq.ids.len(),
+            k,
+            &mut pick,
+        )?;
+        tokens.extend_from_slice(&drafted);
+        round.draft_secs = draft_start.elapsed().as_secs_f64();
+        // A block drafter runs one pass however many drafts `pick` took, and
+        // none when it had nothing to condition on.
+        round.draft_passes = if block {
+            usize::from(draft_steps > 0)
+        } else {
+            draft_steps
+        };
+        Ok(())
+    }
+
+    /// Record what a prefill chunk computed.
+    fn apply_prefill(&mut self, i: usize, pos: usize, tokens: &[u32], last: bool, out: Forward) {
+        let Forward { logits, hidden } = out;
+        let observes = self.observes();
         let share = self.batching.prefix_cache;
         let end = pos + tokens.len();
         if observes
@@ -1200,34 +1285,25 @@ impl Engine {
     }
 
     /// Accept what the verification pass of a decode round computed.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "one round's plan and result; a struct would only rename them"
-    )]
     fn apply_decode(
         &mut self,
         i: usize,
         start: usize,
-        batch: Vec<u32>,
-        all_rows: bool,
+        batch: &[u32],
         round: Round,
-        logits: Option<Vec<f32>>,
-        hidden: Option<Vec<f32>>,
+        out: Forward,
         verify_start: Instant,
     ) {
-        let observes = self.drafter.as_ref().is_some_and(Drafter::observes);
+        let Forward { logits, hidden } = out;
+        let observes = self.observes();
         let share = self.batching.prefix_cache;
         let Some(mut rows) = logits else {
             self.fail(i, local_err("decode step produced no logits"));
             return;
         };
         let drafts = &batch[1..];
-        // `Want::Last` returns one row, `Want::All` one per batch token.
-        let vocab = if all_rows {
-            rows.len() / batch.len()
-        } else {
-            rows.len()
-        };
+        // `Want::Last` returned one row, `Want::All` one per batch token.
+        let vocab = rows.len() / batch.len();
         let seq = &mut self.running[i];
         let greedy_mode = seq.temperature <= 0.0;
         let (temperature, top_k, top_p) = (seq.temperature, seq.top_k, seq.top_p);
@@ -1281,13 +1357,7 @@ impl Engine {
                 cached = j;
                 break;
             }
-            seq.completion += 1;
-            let mut items = Vec::new();
-            let id_rng = &mut self.id_rng;
-            let mut next_call_id = || format!("call_{:016x}", id_rng.next_u64());
-            seq.parser
-                .push(d, &self.tokenizer, &mut next_call_id, &mut items);
-            seq.stopper.push(&mut items, &mut seq.pending);
+            seq.emit(d, &self.tokenizer, &mut self.id_rng, &mut self.bufs.items);
             if seq.stopper.stopped || seq.completion == seq.budget {
                 ended = true;
                 cached = j;
@@ -1389,7 +1459,7 @@ fn last_row(mut h: Vec<f32>, rows: usize) -> Vec<f32> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::testing::{engine_sized, engine_with};
+    use super::super::testing::{engine_sized, engine_with, job};
     use super::*;
     use crate::provider::local::model::tiny::{
         TinyModel, TinyQwen35, TinySpec, write_qwen35, write_spec,
@@ -1439,19 +1509,7 @@ mod tests {
     fn submit(e: &mut Engine, prompt: &[u32], max_tokens: u32, capacity: usize) -> Client {
         let (tx, rx) = mpsc::channel(capacity);
         let metadata = ResponseMetadataHandle::empty();
-        e.submit(Job {
-            prompt_ids: prompt.to_vec(),
-            start_in_thinking: false,
-            enable_thinking: false,
-            temperature: None,
-            max_tokens: Some(max_tokens),
-            top_p: None,
-            top_k: None,
-            seed: None,
-            stop: Vec::new(),
-            events: tx,
-            metadata: metadata.clone(),
-        });
+        e.submit(job(prompt, Some(max_tokens), tx, metadata.clone()));
         Client {
             rx,
             metadata,
