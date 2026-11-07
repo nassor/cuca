@@ -74,17 +74,18 @@ An engine-side governor drafts only while drafting is measurably faster than pla
 - While plain decoding is faster, it re-probes with two speculative rounds after 32 plain rounds. Each failed probe doubles the interval, up to 512 rounds.
 - A run with a fixed `seed` and a temperature above `0.0` always drafts the full `draft_tokens`, so equal prompts still reproduce equal tokens.
 - The governor state is kept across requests.
+- A drafter that keeps a cache of its own (the EAGLE drafter, the DFlash block drafter and the Qwen 3.5 head) does not pay for it in plain rounds. A round that drafts nothing only hands its hidden rows (the features, for DFlash) to the drafter, which holds them and the range of positions it has not seen, at most 1,024 positions and 16 MiB. When a round drafts again (a probe or a resumed drafting), the drafter first takes the held rows into its cache in one batched pass, in chunks of the trunk's prefill size; at the bound it catches up first. The CPU kernels are row-exact, so the cache after catching up equals the one a per-round upkeep leaves, bit for bit: the proposals and the output do not change, only where the cost falls. The pass is a cost of switching and the governor charges it to neither mode. A new prompt drops the held rows it does not share, and a failed request forgets them. Measured per token (plain round, then catching up per row): EAGLE 4.4 ms of 86.6 ms and 0.89 ms, DFlash 3.5 ms of 288 ms and 1.2 ms, the Qwen 3.5 head 0.09 ms of 17.3 ms and 0.05 ms. The Gemma 4 assistant reads the target's K/V and has no upkeep.
 
 ### Measured speedups
 
 Speedup is speculative throughput over plain decoding on the same device, in release builds, CPU builds with `-C target-cpu=native`, 128-token replies, at the default `draft_tokens` of 5, on a 32-core CPU and an AMD RX 9070 XT (Windows).
 
 - Gemma 4 E2B Q4_0 with `gemma4-e2b-mtp-f16`: on the CPU 1.32x on a code prompt, 1.31x on a list and 1.01x on prose; on Vulkan 0.97x to 1.00x, because single-token GPU decoding is bound by the host and the governor keeps the run near plain decoding. The drafter pays on the CPU.
-- Qwen 3.5 0.8B Q8_0 with the in-trunk head, CPU: 1.59x on code, 1.40x on a list and 0.98x on prose; with `draft_tokens` 3, 1.86x, 1.37x and 0.99x. Prose text is hard to predict, so the governor mostly turns drafting off there.
+- Qwen 3.5 0.8B Q8_0 with the in-trunk head, CPU: 1.59x on code, 1.40x on a list and 0.98x on prose; with `draft_tokens` 3, 1.86x, 1.37x and 0.99x. Prose text is hard to predict, so the governor mostly turns drafting off there. Its upkeep is 0.09 ms of a 17.3 ms token (0.5 %), so lazy upkeep changes little: 1.25x over the three prompts at `draft_tokens` 3 with per-round upkeep and 1.27x with it, in two traced runs.
 
 #### EAGLE on Mistral Small 4 (CPU)
 
-`mistral-small-4-119b-q4_0` with the EAGLE drafter, release build with `-C target-cpu=native`, 128-token replies, three prompts, `tests/provider_local_mtp.rs` (plain 11.7 tok/s; greedy output equal to plain in all twelve runs):
+`mistral-small-4-119b-q4_0` with the EAGLE drafter, release build with `-C target-cpu=native`, 128-token replies, three prompts, `tests/provider_local_mtp.rs`, before lazy upkeep (plain 11.7 tok/s; greedy output equal to plain in all twelve runs):
 
 | `draft_tokens` | code | list | prose | all three | drafts accepted | drafting rounds |
 |---|---|---|---|---|---|---|
@@ -97,9 +98,27 @@ Two further runs at `draft_tokens` 2 (one with the round trace) measured 1.05x a
 
 - A verification forward over one row takes 90 ms (11 tok/s); over 2 rows 153 ms and over 3 rows 201 ms. The model is mixture-of-experts with 4 of 128 experts per token, and every row routes to its own experts, so extra rows share no expert weights: each costs 48 to 63 ms, 53 to 70 % of a decode step, where a dense model's extra row costs a few percent.
 - A draft pass costs 15 ms (two layers and the vocabulary ranking). By the engine's cost model a first extra draft pays only above an acceptance of about 0.74 (the 55 ms of its row plus the 15 ms pass against a 95 ms token), and the governor drafts only then.
-- The drafter must also take every committed position into its own cache, 4.4 ms per token (5 %), plain rounds included, so a prompt where the governor drafts nothing (the list and the story) runs below plain decoding: 0.95x to 0.98x in the traced runs, 0.81x to 0.87x in the four-length run above, whose extra slowdown the trace does not explain (the same engine and prompts, measured an hour apart on a machine whose memory also misbehaved: see the machine note).
-- Over the traced run a round that kept two drafts averaged 2.85 tokens (92 % of the drafts accepted) and the drafting rounds together 2.5, against 2.0 to 2.3 in community SGLang runs. At 237 ms for 2.85 tokens that is 83 ms a token against 90 ms plain, a 1.08x round before the 4.4 ms of upkeep and the rounds that keep a single draft (186 ms for 1.77 tokens, slower than plain), which bring the run back to about 1.0x.
+- The drafter had to take every committed position into its own cache, 4.4 ms per token (5 %), plain rounds included, so a prompt where the governor drafts nothing (the list and the story) ran below plain decoding: 0.95x to 0.98x in the traced runs and 0.81x to 0.87x in the four-length run above. Plain rounds no longer pay it: see *Lazy upkeep* below.
+- Over the traced run a round that kept two drafts averaged 2.85 tokens (92 % of the drafts accepted) and the drafting rounds together 2.5, against 2.0 to 2.3 in community SGLang runs. At 237 ms for 2.85 tokens that is 83 ms a token against 90 ms plain, a 1.08x round before the 4.4 ms of upkeep (still paid in a round that drafts) and the rounds that keep a single draft (186 ms for 1.77 tokens, slower than plain), which bring the run back to about 1.0x.
 - The 65,536-id proposal cap of the in-trunk head does nothing here: it only shortens the product on weights the row-batched kernel serves, and this model's output head is Q6_K (candle computes the whole product). A draft pass measured 14.9 ms with the cap and 15.1 ms without.
+
+##### Lazy upkeep
+
+Plain rounds no longer take their rows into the drafter's cache (see *Governor*). `draft_tokens` 2: the engine before the change and the engine after it, run back to back (old, new, old, new) on one machine state with `CUCA_LOCAL_ALLOW_MISMATCH=1`, then the traced runs of the new engine (plain 11.2 to 11.3 tok/s overall):
+
+| engine | code | list | story | all three | drafted tokens |
+|---|---|---|---|---|---|
+| old, run 1 | 1.06x | 1.05x | 0.96x | 1.02x | 221 |
+| new, run 1 | 0.99x | 1.00x | 0.98x | 0.99x | 90 |
+| old, run 2 | 1.08x | 1.00x | 0.96x | 1.01x | 189 |
+| new, run 2 | 1.02x | 0.99x | 1.00x | 1.00x | 86 |
+| new, traced | 1.03x | 0.99x | 1.00x | 1.00x | 118 |
+| new, traced, three loads of one process | 0.99x, 1.00x, 0.99x | 0.99x, 0.99x, 1.00x | 0.99x, 0.98x, 0.99x | 0.99x each | 45, 54, 53 |
+
+- **The worst case is plain decoding.** The story prompt, where the new engine drafted 0 to 2 tokens in every run, measured 0.98x, 1.00x, 1.00x, 0.99x, 0.98x and 0.99x (six runs), the list 1.00x, 0.99x, 0.99x, 0.98x, 0.99x, 0.99x and 1.00x (seven runs); the old engine measured 0.96x on the story in both runs. A plain round of the new engine runs 86.4 to 86.8 ms (11.5 tok/s) in the four traced loads (5th to 95th percentile 85.6 to 88.9 ms in the first), with 0.00 ms of upkeep where the old engine paid 4.4 ms.
+- **Catching up costs 0.89 ms a row**, against 4.4 ms for a row observed on a round of its own (11 passes of 2 to 63 rows in the first traced run, 302 rows, 268 ms, 0.4 % of the run; 0.65 % in the three-load run), because the two layers' weights are read once for all the rows. A round that drafts still pays its own upkeep (4.7 to 5.0 ms in a verification of 140 to 190 ms). The probes (stretches of at most four drafting rounds) cost 0.5 % to 0.6 % of the traced runs.
+- **It drafts less, and the overall number is 1.0x.** The old engine measured plain decoding 5 % slow (its upkeep) and drafted 189 to 221 tokens a run; the new one measures the true plain rate, and over the first traced run the drafting rounds gain only 2 % on it (168 tokens in 14.2 s, 84.7 ms a token against 86.6), under the governor's 1.02 margin once its estimate, a moving average of per-round rates that weighs the last round by 0.3, takes a rejected round: in one traced probe three rounds that gained 16 % to 21 % (215 to 224 ms for three tokens) were followed by one fully rejected round (216 ms for one token), which dropped the estimate under plain decoding. So the new engine drafts 86 to 90 tokens a run and the code prompt falls from 1.06x and 1.08x to 0.99x and 1.02x. The drafter does not pay on this CPU: its gain is the 2 %, within the spread of the plain figure.
+- **The earlier 0.81x to 0.87x did not reproduce.** In the session above the old engine measured 0.96x on the story prompt twice, which is its 5 % upkeep. Ten loads of a speculative engine (seven in ordinary runs of the live test, three in one traced process after the plain load) showed no load-order or load-to-load slowdown: the four traced loads ran plain rounds at 86.4 to 86.8 ms, the speed of the plain engine, and no load of the old or the new engine measured below 0.96x on a prompt where it drafts nothing. The plain engine's own figure moved by 4 % between sessions (11.7 tok/s in the four-length run, 11.2 to 11.3 here). Upkeep (5 %) and probing plus catching up (about 1 %) cannot make 13 % to 19 %, so [INFERENCE] the gap was that run's machine state, as its machine note says (memory that misbehaved), not the engine; it cannot be settled now.
 
 #### DFlash on Muse Glimmer 30B (CPU)
 
@@ -111,6 +130,7 @@ Two further runs at `draft_tokens` 2 (one with the round trace) measured 1.05x a
 | 7, first version | 1.01x | 1.00x | 0.97x | 1.00x | 92 % | 2.0 |
 | 15, first version | 0.97x | 0.97x | 0.97x | 0.97x | 62 % | |
 | 3 | 1.74x | 1.69x | 1.12x | 1.46x | 70 % (424 of 607) | 3.1 |
+| 3, lazy upkeep | 1.76x | 1.69x | 1.13x | 1.47x | 68 % (446 of 655) | 3.0 |
 | 7 | 1.64x | 1.66x | 1.20x | 1.47x | 69 % (425 of 617) | 3.2 |
 | 15 | 1.18x | 1.14x | 1.15x | 1.15x | 64 % (324 of 506) | 3.9 |
 
@@ -125,6 +145,10 @@ Cost per round now (milliseconds, medians over the run): one plain token 287 for
 
 Two loads of the same 67.7 GB `mistral-small-4-119b-q4_0` file on the measurement machine sometimes differ by one bit in one tensor (5 of 579 tensors across three loads of one run, found by hashing each tensor after `read_exact` and again after an independent positional re-read), which moves first-token logits by up to 1 %. The read paths are audited and tested; a ten-minute RAM and file-read probe did not reproduce it, so hardware or OS memory is suspected. `tests/provider_local_mtp.rs` loads the plain and the speculative model separately, so on that machine a mismatch between them has to be repeated before it is believed: speculative output was equal to plain in all twelve runs of the table above, and different in one extra run, whose plain model alone produced a story that the six other loads whose stories were compared all agreed on.
 
+In the session that measured lazy upkeep, 7 of 30 prompt runs (nine runs of the live test) printed `identical false`, in four of the nine runs: three of the nine prompt runs of the old engine and four of the 21 of the new one, each with a story or a list whose first sentence or two matched plain decoding's. The old engine differs as often, so the change is not the cause; the unit tests (below) assert bit-exact output, and `CUCA_LOCAL_ALLOW_MISMATCH=1` makes the live test report such a run (`identical false`) and go on instead of aborting before its timing line.
+
 ### Verified
 
 `tests/provider_local_mtp.rs` loads a target alone, records its greedy outputs (cold and warm, which must agree), drops it, and then loads the target once per draft length with its drafter and compares greedy output (one resident copy at a time, so a target that fills the machine's memory is never held twice). It asserts identical output and token counts on the CPU, and reports identity without asserting it on a GPU. Recorded CPU runs matched plain greedy decoding for the Gemma 4 E2B pair, the Qwen 3.5 in-trunk head, the Mistral Small 4 EAGLE drafter (draft lengths 1 to 4) and the Muse Glimmer DFlash drafter (3, 7 and 15), and recorded Vulkan runs of the Gemma 4 pair produced identical output.
+
+Lazy upkeep is covered by unit tests: for each of the EAGLE drafter, the in-trunk head and the DFlash drafter an engine test forces the governor plain for 0, 1, 3, 10, 30 and 1,000 rounds and then drafts, and asserts greedy output equal to plain, the drafter holding the rows back while the rounds are plain, no round drafting before the drafter has caught up, the cache after catching up equal bit for bit to the cache of an engine that drafted all along (K/V of every committed slot; the whole context ring for DFlash), the same proposals and statistics as the same schedule with eager upkeep, and a following request that replays the cached ids from the rows still held; a drafter-level test checks chunking, the row and byte caps, truncation, replay at an earlier position, gaps and reset. Each was checked to fail when the catch-up positions, the replay trim, the truncation trim, the cap flush, the deferral or the catch-up before a draft is removed.
