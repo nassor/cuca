@@ -45,16 +45,10 @@
 
 #![cfg(feature = "provider-local")]
 
-use cuca::types::{MessageContentBlock, ProviderEndpoint};
-use cuca::{
-    ConvertConfig, CucaClient, LocalModel, LocalModelConfig, ModelSource, UnifiedRequest,
-    WeightQuant,
-};
-use serde_json::Value;
-use tokio_stream::StreamExt;
+mod local_env;
 
-/// The user turn of the oracle dumps' `chat_a` prompt.
-const ORACLE_USER: &str = "What is the capital of France? Answer in one word.";
+use cuca::{ConvertConfig, LocalModel, LocalModelConfig, ModelSource, UnifiedRequest, WeightQuant};
+use serde_json::Value;
 
 /// `(repo, revision)` of the checkpoints with a safetensors oracle.
 const PINNED: &[(&str, &str)] = &[
@@ -92,29 +86,12 @@ const PINNED: &[(&str, &str)] = &[
     ),
 ];
 
-fn skip(reason: &str) {
-    if std::env::var("CUCA_REQUIRE_LIVE").as_deref() == Ok("1") {
-        panic!("{reason}");
-    }
-    println!("SKIP: {reason}");
-}
-
 /// The oracle dump made from `repo@revision`'s own safetensors.
 fn dump_for(dir: &std::path::Path, repo: &str, revision: &str) -> Option<Value> {
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        if entry.path().extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let Ok(dump) = serde_json::from_str::<Value>(&std::fs::read_to_string(entry.path()).ok()?)
-        else {
-            continue;
-        };
+    local_env::oracle_dumps(dir).find(|dump| {
         let s = &dump["source"];
-        if s["type"] == "safetensors" && s["repo"] == repo && s["revision"] == revision {
-            return Some(dump);
-        }
-    }
-    None
+        s["type"] == "safetensors" && s["repo"] == repo && s["revision"] == revision
+    })
 }
 
 /// The length of the common prefix of two strings, in characters.
@@ -124,17 +101,17 @@ fn common_prefix(a: &str, b: &str) -> usize {
 
 #[tokio::test]
 async fn converted_checkpoints_answer_like_the_oracle() {
-    let Some(ref_dir) = std::env::var_os("CUCA_LOCAL_REF_DIR").map(std::path::PathBuf::from) else {
-        return skip("set CUCA_LOCAL_REF_DIR to the oracle dumps");
+    let Some(ref_dir) = local_env::ref_dir() else {
+        return local_env::skip("SKIP: set CUCA_LOCAL_REF_DIR to the oracle dumps");
     };
-    let only = std::env::var("CUCA_LOCAL_CONVERT_ONLY").ok();
+    let only = local_env::convert_only();
     for (repo, revision) in PINNED {
         if only.as_ref().is_some_and(|o| !repo.contains(o.as_str())) {
             continue;
         }
         let Some(dump) = dump_for(&ref_dir, repo, revision) else {
-            skip(&format!(
-                "{repo}: no safetensors oracle dump for {revision}"
+            local_env::skip(&format!(
+                "SKIP: {repo}: no safetensors oracle dump for {revision}"
             ));
             continue;
         };
@@ -156,37 +133,20 @@ async fn converted_checkpoints_answer_like_the_oracle() {
         {
             Ok(m) => m,
             Err(cuca::CucaError::Transport { message }) => {
-                return skip(&format!("{repo} cannot be downloaded: {message}"));
+                return local_env::skip(&format!("SKIP: {repo} cannot be downloaded: {message}"));
             }
             Err(e) => panic!("{repo}: the checkpoint must convert and load: {e}"),
         };
-        let client = CucaClient::builder()
-            .with_provider(ProviderEndpoint::Local)
-            .with_local_model(model)
-            .build()
-            .expect("client builds");
-        let (mut stream, handle) = client
-            .generate_stream_with_response(
-                UnifiedRequest::new("local")
-                    .add_user_message(ORACLE_USER)
-                    .set_temperature(0.0)
-                    .set_max_tokens(24),
-            )
-            .await
-            .expect("request dispatches");
-        let mut text = String::new();
-        while let Some(item) = stream.next().await {
-            match item.expect("stream item") {
-                MessageContentBlock::Text(t) => text.push_str(&t),
-                MessageContentBlock::Thinking { reasoning, .. } => text.push_str(&reasoning),
-                _ => {}
-            }
-        }
-        let usage = handle
-            .take()
-            .expect("terminal response")
-            .usage
-            .expect("usage");
+        let (blocks, response) = local_env::drain(
+            &model,
+            UnifiedRequest::new("local")
+                .add_user_message(local_env::ORACLE_USER)
+                .set_temperature(0.0)
+                .set_max_tokens(24),
+        )
+        .await;
+        let text = local_env::written(&blocks);
+        let usage = response.usage.expect("usage");
 
         let want = chat["greedy_text"].as_str().unwrap_or_default().trim();
         let got = text.trim();

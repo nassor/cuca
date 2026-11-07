@@ -88,19 +88,14 @@
 
 #![cfg(feature = "provider-local")]
 
-use cuca::types::{
-    MessageContentBlock, MessageRole, ProviderEndpoint, ToolDefinition, UnifiedMessage,
-};
-use cuca::{
-    ConvertConfig, CucaClient, DownloadProgressCallback, LocalModel, LocalModelConfig, ModelSource,
-    UnifiedRequest, UnifiedResponse, WeightQuant,
-};
+mod local_env;
+
+use cuca::types::{MessageContentBlock, MessageRole, ToolDefinition, UnifiedMessage};
+use cuca::{LocalModel, LocalModelConfig, ModelSource, UnifiedRequest, UnifiedResponse};
+use local_env::ORACLE_USER;
 use serde_json::json;
 use tokio::sync::{Mutex, OnceCell};
 use tokio_stream::StreamExt;
-
-/// The user turn of the oracle dumps' `chat_a` prompt.
-const ORACLE_USER: &str = "What is the capital of France? Answer in one word.";
 
 static MODEL: OnceCell<Option<Loaded>> = OnceCell::const_new();
 static ENGINE_TURN: Mutex<()> = Mutex::const_new(());
@@ -186,28 +181,6 @@ fn known_limit(model: &str, scenario: &str) -> Option<&'static str> {
              (HuggingFace f32 margin 2.06) and answers; the production path's Q8_0 activation \
              rounding flips it (18.663 against 19.237) and the model calls the tool again",
         ),
-        _ => None,
-    }
-}
-
-/// The model to load, from the environment; `None` when none is configured.
-fn model_source() -> Option<ModelSource> {
-    if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        let path = std::path::PathBuf::from(path);
-        return Some(if path.is_dir() {
-            ModelSource::Dir(path)
-        } else {
-            ModelSource::File(path)
-        });
-    }
-    match std::env::var("CUCA_LOCAL_MODEL") {
-        Ok(name) if !name.is_empty() => Some(
-            name.parse()
-                .unwrap_or_else(|e| panic!("CUCA_LOCAL_MODEL={name:?}: {e}")),
-        ),
-        _ if std::env::var("CUCA_LOCAL_DOWNLOAD").as_deref() == Ok("1") => {
-            Some(ModelSource::default_model())
-        }
         _ => None,
     }
 }
@@ -306,17 +279,8 @@ fn oracle_prompt(source: &ModelSource) -> Option<OraclePrompt> {
     ) {
         return None;
     }
-    let dir = std::env::var_os("CUCA_LOCAL_REF_DIR")?;
-    for entry in std::fs::read_dir(dir).ok()?.flatten() {
-        if entry.path().extension().is_none_or(|e| e != "json") {
-            continue;
-        }
-        let Ok(text) = std::fs::read_to_string(entry.path()) else {
-            continue;
-        };
-        let Ok(dump) = serde_json::from_str::<serde_json::Value>(&text) else {
-            continue;
-        };
+    let dir = local_env::ref_dir()?;
+    for dump in local_env::oracle_dumps(&dir) {
         if dump_matches(&dump, source) {
             let chat_a = dump["prompts"]
                 .as_array()?
@@ -337,59 +301,17 @@ fn oracle_prompt(source: &ModelSource) -> Option<OraclePrompt> {
 async fn loaded() -> Option<Loaded> {
     MODEL
         .get_or_init(|| async {
-            let source = model_source()?;
+            let source = local_env::model_source(true)?;
             let mut config = LocalModelConfig {
                 source: source.clone(),
-                experts: std::env::var("CUCA_LOCAL_EXPERTS")
-                    .ok()
-                    .filter(|s| !s.is_empty())
-                    .map(|s| {
-                        s.parse()
-                            .unwrap_or_else(|e| panic!("CUCA_LOCAL_EXPERTS={s:?}: {e}"))
-                    })
-                    .unwrap_or_default(),
-                convert: ConvertConfig {
-                    quant: std::env::var("CUCA_LOCAL_CONVERT_QUANT")
-                        .ok()
-                        .filter(|s| !s.is_empty())
-                        .map(|s| {
-                            s.parse::<WeightQuant>()
-                                .unwrap_or_else(|e| panic!("CUCA_LOCAL_CONVERT_QUANT={s:?}: {e}"))
-                        })
-                        .unwrap_or_default(),
-                },
-                on_download_progress: Some(DownloadProgressCallback::new(|p| {
-                    eprint!(
-                        "\rdownloading: {} / {:?} bytes",
-                        p.downloaded_bytes, p.total_bytes
-                    );
-                })),
+                experts: local_env::parsed("CUCA_LOCAL_EXPERTS").unwrap_or_default(),
+                convert: local_env::convert(),
+                on_download_progress: Some(local_env::download_progress()),
+                chat_template: local_env::chat_template(),
+                gpu_layers: local_env::gpu_layers(),
                 ..Default::default()
             };
-            if let Ok(devices) = std::env::var("CUCA_LOCAL_DEVICE")
-                && !devices.is_empty()
-            {
-                config
-                    .set_devices(&devices)
-                    .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
-            }
-            if let Ok(path) = std::env::var("CUCA_LOCAL_CHAT_TEMPLATE")
-                && !path.is_empty()
-            {
-                config.chat_template = Some(
-                    std::fs::read_to_string(&path)
-                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_CHAT_TEMPLATE={path:?}: {e}")),
-                );
-            }
-            if let Ok(layers) = std::env::var("CUCA_LOCAL_GPU_LAYERS")
-                && !layers.is_empty()
-            {
-                config.gpu_layers = Some(
-                    layers
-                        .parse()
-                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_GPU_LAYERS={layers:?}: {e}")),
-                );
-            }
+            local_env::set_devices(&mut config);
             println!("MATRIX|devices|{:?} + {:?}", config.device, config.shards);
             let started = std::time::Instant::now();
             let model = LocalModel::load(config)
@@ -415,21 +337,11 @@ async fn loaded() -> Option<Loaded> {
         .clone()
 }
 
-/// Skip (or, under `CUCA_REQUIRE_LIVE=1`, fail) when no model is configured.
-fn skip_or_fail() {
-    let reason = "SKIP: local model not available: set CUCA_LOCAL_MODEL_PATH, \
-                  CUCA_LOCAL_MODEL or CUCA_LOCAL_DOWNLOAD=1";
-    if std::env::var("CUCA_REQUIRE_LIVE").as_deref() == Ok("1") {
-        panic!("{reason}");
-    }
-    println!("{reason}");
-}
-
 /// Bind the shared model and hold the engine turn, or return from the test.
 macro_rules! live_model {
     ($loaded:ident, $turn:ident) => {
         let Some($loaded) = loaded().await else {
-            skip_or_fail();
+            local_env::skip_no_model();
             return;
         };
         let $turn = ENGINE_TURN.lock().await;
@@ -542,26 +454,9 @@ async fn ask_decoding(model: &LocalModel, request: UnifiedRequest, decoding: Dec
         Decoding::Greedy => request.set_temperature(0.0),
         Decoding::ModelDefaults => request.set_seed(SAMPLING_SEED),
     };
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::Local)
-        .with_local_model(model.clone())
-        .build()
-        .expect("client builds");
-    let (mut stream, handle) = client
-        .generate_stream_with_response(request)
-        .await
-        .expect("request dispatches");
-    let mut blocks = Vec::new();
-    while let Some(item) = stream.next().await {
-        blocks.push(item.expect("stream item"));
-    }
-    if std::env::var_os("CUCA_LOCAL_PRINT_REPLIES").is_some() {
-        println!("REPLY|{blocks:?}");
-    }
-    Reply {
-        blocks,
-        response: handle.take().expect("terminal response"),
-    }
+    let (blocks, response) = local_env::drain(model, request).await;
+    local_env::print_reply(&blocks);
+    Reply { blocks, response }
 }
 
 fn request() -> UnifiedRequest {
@@ -1063,7 +958,7 @@ async fn long_context_needle() {
 /// prints `PERF|...` lines, asserts nothing).
 #[tokio::test]
 async fn perf_long_prompt() {
-    if std::env::var_os("CUCA_LOCAL_PERF").is_none() {
+    if !local_env::perf() {
         return;
     }
     live_model!(live, _turn);
@@ -1071,7 +966,7 @@ async fn perf_long_prompt() {
     // `CUCA_LOCAL_PERF_COLD=1` changes the first words of every round's
     // prompt, so no round hits the prefix cache: `first` is then a real
     // prefill of the whole prompt (round 0 still includes kernel compilation).
-    let cold = std::env::var_os("CUCA_LOCAL_PERF_COLD").is_some();
+    let cold = local_env::perf_cold();
     for round in 0..3 {
         let word = if cold {
             ["PELICAN", "HERON", "OSPREY"][round]
@@ -1081,11 +976,7 @@ async fn perf_long_prompt() {
         let mut prompt = format!("The secret code word is {word}. ");
         prompt.push_str(&"This sentence is filler text. ".repeat(180));
         prompt.push_str("Now write a numbered list of one hundred different animals.");
-        let client = CucaClient::builder()
-            .with_provider(ProviderEndpoint::Local)
-            .with_local_model(model.clone())
-            .build()
-            .expect("client builds");
+        let client = local_env::client(model);
         let started = std::time::Instant::now();
         let (mut stream, handle) = client
             .generate_stream_with_response(

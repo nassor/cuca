@@ -85,4 +85,4 @@ The example `examples/local_model.rs` reads these; the library never does:
 | `CUCA_LOCAL_EXPERTS` | `ExpertPlacement` text form, for example `tiered:ram=4g`; default `resident` |
 | `CUCA_LOCAL_CHAT_TEMPLATE` | path of a `.jinja` chat template file, read into `LocalModelConfig::chat_template` |
 
-The live tests read the same variables. `tests/provider_local_tiers.rs` also reads `CUCA_LOCAL_EXPERTS_REF`, the reference placement it compares against. Their other variables and run commands are in `AGENTS.md`.
+The live tests read the same variables, all parsed in `tests/local_env/mod.rs`. `tests/provider_local_tiers.rs` also reads `CUCA_LOCAL_EXPERTS_REF`, the reference placement it compares against. Their other variables and run commands are in `AGENTS.md`.

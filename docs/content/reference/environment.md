@@ -20,7 +20,7 @@ No HTTP adapter reads an environment variable. Base URLs, API keys and bearer to
 
 Under `provider-local`, the library reads `CUCA_CACHE_DIR`, the platform cache variables and `HF_TOKEN`, only when the matching `LocalModelConfig` field (`cache_dir`, `hf_token`) is `None`. See [Local configuration](@/providers/local/configuration.md#environment-variables).
 
-Everything else below is read by `examples/`, `tests/` or unit-test fixtures in `src/`. The `std::env::temp_dir()` calls in other `src/` tests read no variable.
+Everything else below is read by `examples/`, `tests/` or unit-test fixtures in `src/`. The `provider-local` test files (`tests/provider_local*.rs`) parse their variables in one shared module, `tests/local_env/mod.rs`; `examples/local_model.rs` reads its own. The `std::env::temp_dir()` calls in other `src/` tests read no variable.
 
 ## Variables at a glance
 
@@ -33,10 +33,10 @@ Everything else below is read by `examples/`, `tests/` or unit-test fixtures in 
 | `CUCA_SEARCH_BASE_URL` | `examples/web_search.rs` | `https://api.firecrawl.dev` |
 | `CUCA_CACHE_DIR` | the library (`provider-local`), the tokenizer and chat golden unit tests | the platform cache directory |
 | `HF_TOKEN` | the library (`provider-local`) | none; anonymous access |
-| `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the gemma4 golden unit tests | none |
-| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs` | `gemma4-e2b-q4_0`; `tests/provider_local_tiers.rs` has no default and skips without a model |
-| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs`, `tests/provider_local_mtp.rs` | unset |
-| `CUCA_LOCAL_DEVICE` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the `gpu_` unit tests | `cpu` |
+| `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the gemma4 golden unit tests | none |
+| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs` | `gemma4-e2b-q4_0`; `tests/provider_local_tiers.rs` has no default and skips without a model |
+| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs` | unset |
+| `CUCA_LOCAL_DEVICE` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the `gpu_` unit tests | `cpu` |
 | `CUCA_LOCAL_EXPERTS` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_tiers.rs` | `resident` |
 | `CUCA_LOCAL_EXPERTS_REF` | `tests/provider_local_tiers.rs` | `resident` |
 | `CUCA_LOCAL_DRAFTER_PATH` | `examples/local_model.rs`, `tests/provider_local_mtp.rs` | none |

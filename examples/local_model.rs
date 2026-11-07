@@ -122,50 +122,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } else {
             ModelSource::File(path)
         };
-    } else if let Ok(name) = std::env::var("CUCA_LOCAL_MODEL")
-        && !name.is_empty()
-    {
+    } else if let Some(name) = env("CUCA_LOCAL_MODEL") {
         config.source = name.parse()?;
     }
     if let Some(path) = std::env::var_os("CUCA_LOCAL_DRAFTER_PATH") {
         config.drafter = Some(ModelSource::File(PathBuf::from(path)).into());
-    } else if let Ok(name) = std::env::var("CUCA_LOCAL_DRAFTER")
-        && !name.is_empty()
-    {
+    } else if let Some(name) = env("CUCA_LOCAL_DRAFTER") {
         config.drafter = Some(if name.eq_ignore_ascii_case("in-trunk") {
             DrafterSource::InTrunk
         } else {
             name.parse::<ModelSource>()?.into()
         });
     }
-    if let Ok(quant) = std::env::var("CUCA_LOCAL_CONVERT_QUANT")
-        && !quant.is_empty()
-    {
+    if let Some(quant) = env("CUCA_LOCAL_CONVERT_QUANT") {
         config.convert.quant = quant.parse::<WeightQuant>()?;
     }
-    if let Ok(device) = std::env::var("CUCA_LOCAL_DEVICE")
-        && !device.is_empty()
-    {
+    if let Some(device) = env("CUCA_LOCAL_DEVICE") {
         config.set_devices(&device)?;
     }
-    if let Ok(layers) = std::env::var("CUCA_LOCAL_GPU_LAYERS")
-        && !layers.is_empty()
-    {
+    if let Some(layers) = env("CUCA_LOCAL_GPU_LAYERS") {
         config.gpu_layers = Some(layers.parse()?);
     }
-    if let Ok(experts) = std::env::var("CUCA_LOCAL_EXPERTS")
-        && !experts.is_empty()
-    {
+    if let Some(experts) = env("CUCA_LOCAL_EXPERTS") {
         config.experts = experts.parse()?;
     }
-    if let Ok(batching) = std::env::var("CUCA_LOCAL_BATCHING")
-        && !batching.is_empty()
-    {
+    if let Some(batching) = env("CUCA_LOCAL_BATCHING") {
         config.batching = batching.parse()?;
     }
-    if let Ok(path) = std::env::var("CUCA_LOCAL_CHAT_TEMPLATE")
-        && !path.is_empty()
-    {
+    if let Some(path) = env("CUCA_LOCAL_CHAT_TEMPLATE") {
         config.chat_template = Some(std::fs::read_to_string(&path)?);
     }
     let devices = std::iter::once(config.device)
@@ -174,9 +158,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect::<Vec<_>>()
         .join(" + ");
     let model = LocalModel::load(config).await?;
-    let stats_handle = model.clone();
     eprintln!();
-    match stats_handle.layer_split() {
+    match model.layer_split() {
         Some((gpu, total)) => eprintln!(
             "loaded on {devices}: {gpu} of {total} layers on the GPU (layers {} to {}), layers 0 to {} and the embeddings on the CPU",
             total - gpu,
@@ -190,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // model name is not used for routing.
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::Local)
-        .with_local_model(model)
+        .with_local_model(model.clone())
         .build()?;
 
     // Stage 3: build the request. Thinking is on, so a model that reasons
@@ -225,7 +208,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         stdout().flush()?;
     }
     println!();
-    let stats = stats_handle.draft_stats();
+    let stats = model.draft_stats();
     if let Some(rate) = stats.acceptance_rate() {
         eprintln!(
             "drafter: {} of {} drafted tokens accepted ({:.0}%) in {} rounds",
@@ -235,8 +218,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stats.rounds
         );
     }
-    if let Some(tiers) = stats_handle.expert_tier_stats() {
+    if let Some(tiers) = model.expert_tier_stats() {
         eprintln!("expert tiers: {tiers:?}");
     }
     Ok(())
+}
+
+/// A non-empty environment variable.
+fn env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|value| !value.is_empty())
 }

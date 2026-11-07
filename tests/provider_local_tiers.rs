@@ -30,14 +30,14 @@
 
 #![cfg(feature = "provider-local")]
 
+mod local_env;
+
 use std::time::Instant;
 
-use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{
-    ConvertConfig, CucaClient, ExpertPlacement, ExpertTierStats, LocalDevice, LocalModel,
-    LocalModelConfig, ModelSource, UnifiedRequest, WeightQuant,
+    ExpertPlacement, ExpertTierStats, LocalDevice, LocalModel, LocalModelConfig, ModelSource,
+    UnifiedRequest,
 };
-use tokio_stream::StreamExt;
 
 const PROMPTS: [&str; 3] = [
     "Write a Python function that returns the n-th Fibonacci number.",
@@ -47,50 +47,15 @@ const PROMPTS: [&str; 3] = [
 
 const MAX_TOKENS: u32 = 48;
 
-fn skip(reason: &str) {
-    if std::env::var("CUCA_REQUIRE_LIVE").as_deref() == Ok("1") {
-        panic!("{reason}");
-    }
-    println!("{reason}");
-}
-
-fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.is_empty())
-}
-
-fn placement(key: &str, value: &str) -> ExpertPlacement {
-    value
-        .parse()
-        .unwrap_or_else(|e| panic!("{key}={value:?}: {e}"))
-}
-
 /// One greedy reply: its text (reasoning included) and completion tokens.
 async fn reply(model: &LocalModel, prompt: &str) -> (String, u64) {
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::Local)
-        .with_local_model(model.clone())
-        .build()
-        .expect("client builds");
     let request = UnifiedRequest::new("local")
         .add_user_message(prompt)
         .set_temperature(0.0)
         .set_max_tokens(MAX_TOKENS);
-    let (mut stream, handle) = client
-        .generate_stream_with_response(request)
-        .await
-        .expect("request dispatches");
-    let mut text = String::new();
-    while let Some(item) = stream.next().await {
-        match item.expect("stream item") {
-            MessageContentBlock::Text(t) => text.push_str(&t),
-            MessageContentBlock::Thinking { reasoning, .. } => text.push_str(&reasoning),
-            _ => {}
-        }
-    }
-    if std::env::var_os("CUCA_LOCAL_PRINT_REPLIES").is_some() {
-        println!("REPLY|{text:?}");
-    }
-    let response = handle.take().expect("terminal response");
+    let (blocks, response) = local_env::drain(model, request).await;
+    let text = local_env::written(&blocks);
+    local_env::print_reply(&text);
     (text, response.completion_tokens.into())
 }
 
@@ -110,19 +75,9 @@ async fn phase(
         source: source.clone(),
         context_length: Some(2048),
         device,
-        gpu_layers: env("CUCA_LOCAL_GPU_LAYERS").map(|s| {
-            s.parse()
-                .unwrap_or_else(|e| panic!("CUCA_LOCAL_GPU_LAYERS={s:?}: {e}"))
-        }),
+        gpu_layers: local_env::gpu_layers(),
         experts,
-        convert: ConvertConfig {
-            quant: env("CUCA_LOCAL_CONVERT_QUANT")
-                .map(|s| {
-                    s.parse::<WeightQuant>()
-                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_CONVERT_QUANT={s:?}: {e}"))
-                })
-                .unwrap_or_default(),
-        },
+        convert: local_env::convert(),
         ..Default::default()
     })
     .await
@@ -159,35 +114,20 @@ fn release(model: LocalModel) {
 
 #[tokio::test]
 async fn tiered_experts_reproduce_the_reference_replies() {
-    let source = if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        let path = std::path::PathBuf::from(path);
-        if path.is_dir() {
-            ModelSource::Dir(path)
-        } else {
-            ModelSource::File(path)
-        }
-    } else if let Some(name) = env("CUCA_LOCAL_MODEL") {
-        name.parse()
-            .unwrap_or_else(|e| panic!("CUCA_LOCAL_MODEL={name:?}: {e}"))
-    } else {
-        return skip("SKIP: set CUCA_LOCAL_MODEL_PATH or CUCA_LOCAL_MODEL to a MoE model");
+    let Some(source) = local_env::model_source(false) else {
+        return local_env::skip(
+            "SKIP: set CUCA_LOCAL_MODEL_PATH or CUCA_LOCAL_MODEL to a MoE model",
+        );
     };
-    let Some(tested) = env("CUCA_LOCAL_EXPERTS") else {
-        return skip("SKIP: set CUCA_LOCAL_EXPERTS to a tiered placement");
+    let Some(tested) = local_env::parsed::<ExpertPlacement>("CUCA_LOCAL_EXPERTS") else {
+        return local_env::skip("SKIP: set CUCA_LOCAL_EXPERTS to a tiered placement");
     };
-    let tested = placement("CUCA_LOCAL_EXPERTS", &tested);
     let ExpertPlacement::Tiered(tiers) = tested.clone() else {
         panic!("CUCA_LOCAL_EXPERTS must be a tiered placement");
     };
-    let reference = env("CUCA_LOCAL_EXPERTS_REF")
-        .map(|s| placement("CUCA_LOCAL_EXPERTS_REF", &s))
-        .unwrap_or_default();
-    let device: LocalDevice = env("CUCA_LOCAL_DEVICE")
-        .map(|s| {
-            s.parse()
-                .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={s:?}: {e}"))
-        })
-        .unwrap_or_default();
+    let reference =
+        local_env::parsed::<ExpertPlacement>("CUCA_LOCAL_EXPERTS_REF").unwrap_or_default();
+    let device = local_env::device();
 
     let (want, _, model) = phase("reference", &source, device, reference).await;
     release(model);

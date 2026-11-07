@@ -31,49 +31,20 @@
 
 #![cfg(feature = "provider-local")]
 
+mod local_env;
+
 use std::time::Instant;
 
-use cuca::types::{MessageContentBlock, ProviderEndpoint};
-use cuca::{
-    CucaClient, DownloadProgressCallback, LocalModel, LocalModelConfig, ModelSource, UnifiedRequest,
-};
+use cuca::{LocalModel, LocalModelConfig, ModelSource, UnifiedRequest};
 use tokio::sync::OnceCell;
-use tokio_stream::StreamExt;
 
 static MODEL: OnceCell<Option<(LocalModel, String)>> = OnceCell::const_new();
-
-/// The model to load, from the environment; `None` when none is configured.
-fn model_source() -> Option<ModelSource> {
-    if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        return Some(ModelSource::File(path.into()));
-    }
-    match std::env::var("CUCA_LOCAL_MODEL") {
-        Ok(name) if !name.is_empty() => Some(
-            name.parse()
-                .unwrap_or_else(|e| panic!("CUCA_LOCAL_MODEL={name:?}: {e}")),
-        ),
-        _ if std::env::var("CUCA_LOCAL_DOWNLOAD").as_deref() == Ok("1") => {
-            Some(ModelSource::default_model())
-        }
-        _ => None,
-    }
-}
-
-fn env_parsed<T: std::str::FromStr>(key: &str) -> Option<T>
-where
-    T::Err: std::fmt::Display,
-{
-    std::env::var(key)
-        .ok()
-        .filter(|s| !s.is_empty())
-        .map(|s| s.parse().unwrap_or_else(|e| panic!("{key}={s:?}: {e}")))
-}
 
 /// The shared model and a label for it, loaded on first use.
 async fn loaded() -> Option<(LocalModel, String)> {
     MODEL
         .get_or_init(|| async {
-            let source = model_source()?;
+            let source = local_env::model_source(true)?;
             let label = match &source {
                 ModelSource::File(path) => path.display().to_string(),
                 ModelSource::HuggingFace { repo, file, .. } => format!("{repo}:{file}"),
@@ -81,31 +52,13 @@ async fn loaded() -> Option<(LocalModel, String)> {
             };
             let mut config = LocalModelConfig {
                 source,
-                on_download_progress: Some(DownloadProgressCallback::new(|p| {
-                    eprint!(
-                        "\rdownloading: {} / {:?} bytes",
-                        p.downloaded_bytes, p.total_bytes
-                    );
-                })),
+                on_download_progress: Some(local_env::download_progress()),
+                batching: local_env::batching().unwrap_or_default(),
+                chat_template: local_env::chat_template(),
+                gpu_layers: local_env::gpu_layers(),
                 ..Default::default()
             };
-            if let Some(devices) = env_parsed::<String>("CUCA_LOCAL_DEVICE") {
-                config
-                    .set_devices(&devices)
-                    .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
-            }
-            if let Some(layers) = env_parsed::<usize>("CUCA_LOCAL_GPU_LAYERS") {
-                config.gpu_layers = Some(layers);
-            }
-            if let Some(batching) = env_parsed("CUCA_LOCAL_BATCHING") {
-                config.batching = batching;
-            }
-            if let Some(path) = env_parsed::<String>("CUCA_LOCAL_CHAT_TEMPLATE") {
-                config.chat_template = Some(
-                    std::fs::read_to_string(&path)
-                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_CHAT_TEMPLATE={path:?}: {e}")),
-                );
-            }
+            local_env::set_devices(&mut config);
             let model = LocalModel::load(config)
                 .await
                 .unwrap_or_else(|e| panic!("local model must load: {e}"));
@@ -113,16 +66,6 @@ async fn loaded() -> Option<(LocalModel, String)> {
         })
         .await
         .clone()
-}
-
-/// Skip (or, under `CUCA_REQUIRE_LIVE=1`, fail) when no model is configured.
-fn skip_or_fail() {
-    let reason = "SKIP: local model not available: set CUCA_LOCAL_MODEL_PATH, \
-                  CUCA_LOCAL_MODEL or CUCA_LOCAL_DOWNLOAD=1";
-    if std::env::var("CUCA_REQUIRE_LIVE").as_deref() == Ok("1") {
-        panic!("{reason}");
-    }
-    println!("{reason}");
 }
 
 /// What one request reported.
@@ -137,11 +80,6 @@ struct Reply {
 
 /// One greedy request: `question` after `preamble`, at most `max_tokens`.
 async fn ask(model: &LocalModel, preamble: &str, question: &str, max_tokens: u32) -> Reply {
-    let client = CucaClient::builder()
-        .with_provider(ProviderEndpoint::Local)
-        .with_local_model(model.clone())
-        .build()
-        .expect("client builds");
     let request = UnifiedRequest::new("local")
         .add_user_message(if preamble.is_empty() {
             question.to_string()
@@ -150,22 +88,10 @@ async fn ask(model: &LocalModel, preamble: &str, question: &str, max_tokens: u32
         })
         .set_max_tokens(max_tokens)
         .set_temperature(0.0);
-    let (mut stream, handle) = client
-        .generate_stream_with_response(request)
-        .await
-        .expect("request dispatches");
-    let mut output = String::new();
-    while let Some(item) = stream.next().await {
-        match item.expect("stream item") {
-            MessageContentBlock::Text(t) => output.push_str(&t),
-            MessageContentBlock::Thinking { reasoning, .. } => output.push_str(&reasoning),
-            _ => {}
-        }
-    }
-    let response = handle.take().expect("terminal response");
+    let (blocks, response) = local_env::drain(model, request).await;
     let usage = response.usage.expect("usage");
     Reply {
-        output,
+        output: local_env::written(&blocks),
         prompt_tokens: usage.prompt_tokens,
         completion_tokens: usage.completion_tokens,
         read_tokens: response
@@ -215,16 +141,13 @@ const QUESTIONS: [&str; 4] = [
 
 /// Whether the device computes rows independently of their batch (the CPU).
 fn rows_are_exact() -> bool {
-    std::env::var("CUCA_LOCAL_DEVICE")
-        .ok()
-        .filter(|s| !s.is_empty())
-        .is_none_or(|d| d.eq_ignore_ascii_case("cpu"))
+    local_env::device_list().is_none_or(|d| d.eq_ignore_ascii_case("cpu"))
 }
 
 #[tokio::test]
 async fn shared_prefix_clients() {
     let Some((model, label)) = loaded().await else {
-        skip_or_fail();
+        local_env::skip_no_model();
         return;
     };
     let lower = label.to_lowercase();
@@ -317,7 +240,7 @@ async fn shared_prefix_clients() {
 #[tokio::test]
 async fn aggregate_throughput() {
     let Some((model, _)) = loaded().await else {
-        skip_or_fail();
+        local_env::skip_no_model();
         return;
     };
     // Short prompts and long replies, so decode (not prefill) dominates.
