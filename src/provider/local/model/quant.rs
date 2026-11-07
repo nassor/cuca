@@ -264,7 +264,7 @@ impl RowTable {
         let row_bytes = row_len / dtype.block_size() * dtype.type_size();
         let base = content.tensor_data_offset + info.offset;
         let file = File::open(path)?;
-        let end = base + (dims[0] * row_bytes) as u64;
+        let end = base + dims[0] as u64 * row_bytes as u64;
         if file.metadata()?.len() < end {
             return Err(err(format!(
                 "tensor `{tensor}` extends past the end of the file: truncated GGUF"
@@ -299,7 +299,9 @@ impl RowTable {
                 )));
             }
             self.file
-                .seek(SeekFrom::Start(self.base + (id * self.row_bytes) as u64))
+                .seek(SeekFrom::Start(
+                    self.base + id as u64 * self.row_bytes as u64,
+                ))
                 .map_err(io_err)?;
             self.file.read_exact(&mut self.buf).map_err(io_err)?;
             dequant_row(self.dtype, &self.buf, scale, dst)?;

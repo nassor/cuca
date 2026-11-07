@@ -69,40 +69,68 @@ use crate::error::CucaError;
 /// Routed rows of one layer after which its heat counts halve.
 pub(crate) const HEAT_DECAY_ROWS: u32 = 4096;
 
-/// Read exactly `buf.len()` bytes of `file` at `offset`, without moving any
-/// shared cursor: one handle serves every loader thread.
+/// Fill `buf` with the bytes of a source starting at `offset`, calling
+/// `read_some(rest, at)` (one positional read of at most `rest.len()` bytes at
+/// source offset `at`, returning the count read) until the buffer is full.
+///
+/// Operating systems return short reads (Windows `ReadFile` caps one call at
+/// `u32::MAX` bytes, any platform may stop early), so the loop advances the
+/// buffer slice and the source offset together by the bytes actually read.
 ///
 /// # Errors
 ///
-/// The I/O error; [`std::io::ErrorKind::UnexpectedEof`] when the file ends first.
-pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+/// The I/O error of `read_some` (a retry on [`std::io::ErrorKind::Interrupted`]),
+/// or [`std::io::ErrorKind::UnexpectedEof`] when `read_some` returns 0 bytes.
+fn read_fully_at(
+    buf: &mut [u8],
+    offset: u64,
+    mut read_some: impl FnMut(&mut [u8], u64) -> std::io::Result<usize>,
+) -> std::io::Result<()> {
+    let mut done = 0usize;
+    while done < buf.len() {
+        match read_some(&mut buf[done..], offset + done as u64) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => done += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// One positional read of `file` at `offset` into `buf`: the number of bytes
+/// read, possibly fewer than `buf.len()`.
+fn read_some_at(file: &File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::FileExt;
-        file.read_exact_at(buf, offset)
+        file.read_at(buf, offset)
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::FileExt;
-        let mut done = 0;
-        while done < buf.len() {
-            match file.seek_read(&mut buf[done..], offset + done as u64) {
-                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
-                Ok(n) => done += n,
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
+        file.seek_read(buf, offset)
     }
     #[cfg(not(any(unix, windows)))]
     {
-        let _ = (file, offset, buf);
+        let _ = (file, buf, offset);
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "positional file reads are not available on this platform",
         ))
     }
+}
+
+/// Read exactly `buf.len()` bytes of `file` at `offset`, without relying on
+/// the handle's cursor: one handle serves every loader thread. (On Windows
+/// `seek_read` does move the cursor, so a handle used with this function must
+/// never also be used with `Read`/`Seek`.)
+///
+/// # Errors
+///
+/// The I/O error; [`std::io::ErrorKind::UnexpectedEof`] when the file ends first.
+pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io::Result<()> {
+    read_fully_at(buf, offset, |rest, at| read_some_at(file, rest, at))
 }
 
 /// Where one expert's `[rows, cols]` matrix of a stacked `[n_expert, rows,
@@ -183,7 +211,7 @@ impl ExpertSlice {
 
     /// File offset of expert `e`'s matrix.
     pub(crate) fn offset(&self, e: usize) -> u64 {
-        self.start + (e * self.stride) as u64
+        self.start + e as u64 * self.stride as u64
     }
 }
 
@@ -993,6 +1021,142 @@ mod tests {
         assert_eq!(&buf[..2], &[3, 4]);
         let e = read_exact_at(&file, 250, &mut buf).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    /// xorshift64: a deterministic stream for the short-read injector.
+    struct Xorshift(u64);
+
+    impl Xorshift {
+        fn step(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.step() % n.max(1) as u64) as usize
+        }
+    }
+
+    /// The byte a position-keyed source holds at `at`.
+    fn byte_at(at: u64) -> u8 {
+        (at.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8
+    }
+
+    /// Wrap a positional `source` so that every call returns a random number
+    /// of bytes (1 up to what was asked) and sometimes `Interrupted`, the way
+    /// a loaded operating system may.
+    fn flaky<'a>(
+        rng: &'a mut Xorshift,
+        mut source: impl FnMut(&mut [u8], u64) -> std::io::Result<usize> + 'a,
+    ) -> impl FnMut(&mut [u8], u64) -> std::io::Result<usize> + 'a {
+        move |rest, at| {
+            if rng.below(8) == 0 {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            let n = 1 + rng.below(rest.len());
+            source(&mut rest[..n], at)
+        }
+    }
+
+    #[test]
+    fn concurrent_positional_reads_with_random_short_reads_return_the_file_bytes() {
+        const LEN: usize = 1 << 20;
+        let bytes: Vec<u8> = (0..LEN as u64).map(byte_at).collect();
+        let tmp = TempFile::new("short", &bytes);
+        // One handle, shared by every thread, as the expert loaders share it.
+        let file = File::open(&tmp.0).unwrap();
+        std::thread::scope(|s| {
+            for t in 0..8u64 {
+                let (file, bytes) = (&file, &bytes);
+                s.spawn(move || {
+                    let mut rng = Xorshift(0x9E37_79B9 + t);
+                    for _ in 0..400 {
+                        let len = 1 + rng.below(1 << 16);
+                        let offset = rng.below(LEN - len + 1);
+                        let mut buf = vec![0u8; len];
+                        read_fully_at(
+                            &mut buf,
+                            offset as u64,
+                            flaky(&mut rng, |rest, at| read_some_at(file, rest, at)),
+                        )
+                        .unwrap();
+                        assert!(
+                            buf == bytes[offset..offset + len],
+                            "thread {t}: {len} bytes at {offset} differ from the file"
+                        );
+                        read_exact_at(file, offset as u64, &mut buf).unwrap();
+                        assert!(
+                            buf == bytes[offset..offset + len],
+                            "thread {t}: read_exact_at of {len} bytes at {offset} differs"
+                        );
+                    }
+                });
+            }
+        });
+    }
+
+    #[test]
+    fn short_reads_advance_buffer_and_offset_together_beyond_4_gib() {
+        let mut rng = Xorshift(7);
+        for base in [
+            0u64,
+            u64::from(u32::MAX) - 100,
+            u64::from(u32::MAX) + 1,
+            5 << 32,
+            (1 << 40) + 12345,
+        ] {
+            let mut buf = vec![0u8; 300];
+            let mut calls: Vec<(u64, usize)> = Vec::new();
+            let source = |rest: &mut [u8], at: u64| {
+                for (i, b) in rest.iter_mut().enumerate() {
+                    *b = byte_at(at + i as u64);
+                }
+                calls.push((at, rest.len()));
+                Ok(rest.len())
+            };
+            read_fully_at(&mut buf, base, flaky(&mut rng, source)).unwrap();
+            assert!(
+                buf.iter()
+                    .enumerate()
+                    .all(|(i, &b)| b == byte_at(base + i as u64)),
+                "bytes at {base} differ"
+            );
+            assert_eq!(calls.first().map(|c| c.0), Some(base));
+            for w in calls.windows(2) {
+                assert_eq!(w[1].0, w[0].0 + w[0].1 as u64, "gap or overlap at {base}");
+            }
+            assert_eq!(calls.iter().map(|c| c.1).sum::<usize>(), buf.len());
+        }
+    }
+
+    #[test]
+    fn read_fully_at_stops_at_the_end_of_the_source_and_surfaces_errors() {
+        let mut rng = Xorshift(3);
+        let end = 1000u64;
+        let source = |rest: &mut [u8], at: u64| {
+            let n = rest.len().min(end.saturating_sub(at) as usize);
+            for (i, b) in rest[..n].iter_mut().enumerate() {
+                *b = byte_at(at + i as u64);
+            }
+            Ok(n)
+        };
+        let mut buf = [0u8; 64];
+        read_fully_at(&mut buf, end - 64, flaky(&mut rng, source)).unwrap();
+        let e = read_fully_at(&mut buf, end - 63, flaky(&mut rng, source)).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        let mut served = 0;
+        let e = read_fully_at(&mut buf, 0, |rest, _| {
+            served += 1;
+            if served == 3 {
+                Err(std::io::Error::other("boom"))
+            } else {
+                Ok(rest.len().min(5))
+            }
+        })
+        .unwrap_err();
+        assert_eq!(e.to_string(), "boom");
     }
 
     #[test]
