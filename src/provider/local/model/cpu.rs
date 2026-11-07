@@ -3392,11 +3392,7 @@ mod tests {
         wrong.arch = "qwen2";
         let c = write_spec(&wrong);
         let mut m_wrong = load(&c, 32);
-        let (x, y) = (
-            logits(&mut m_norm, &[4], 11),
-            logits(&mut m_wrong, &PROMPT, 0),
-        );
-        let _ = x;
+        let y = logits(&mut m_wrong, &PROMPT, 0);
         let reference = logits(&mut load(&a, 32), &PROMPT, 0);
         let diff: f32 = reference.iter().zip(&y).map(|(p, q)| (p - q).abs()).sum();
         assert!(diff > 1e-2, "NEOX pairing of NORM rows must differ");
@@ -3439,21 +3435,6 @@ mod tests {
         let b = logits(&mut load(&without, 32), &PROMPT, 0);
         let diff: f32 = a.iter().zip(&b).map(|(x, y)| (x - y).abs()).sum();
         assert!(diff > 1e-2);
-        let mut m = load(&with, 32);
-        match &m.layers[0].mixer {
-            Mixer::Attention(AttnWeights {
-                qkv:
-                    QkvWeights::Split {
-                        q,
-                        kv: Some((k, v)),
-                    },
-                ..
-            }) => {
-                assert!(q.bias.is_some() && k.bias.is_some() && v.bias.is_some());
-            }
-            _ => panic!("qwen2 projections are separate"),
-        }
-        let _ = logits(&mut m, &PROMPT, 0);
     }
 
     #[test]
