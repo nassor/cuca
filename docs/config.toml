@@ -1,6 +1,6 @@
 base_url = "https://nassor.github.io/cuca"
 title = "CUCA Documentation"
-description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, eight provider adapters."
+description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, eight provider adapters, twelve plugins and seven services."
 default_language = "en"
 compile_sass = false
 build_search_index = false
@@ -26,10 +26,6 @@ style = "class"
 [extra]
 # `github_repo` is read by `base.html`, for the header icon and the sidebar note.
 github_repo = "https://github.com/nassor/cuca"
-# `docs_rs` is declared but deliberately not linked from any template: docs.rs
-# builds from a crates.io release, and `cuca-core` is not published, so the URL
-# would 404 today. `crates_io` is omitted for the same reason.
-docs_rs = "https://docs.rs/cuca-core"
 
 # The reading order, declared once. `base.html` renders the sidebar, the
 # breadcrumb and the previous/next pager from this list, so all three agree.
@@ -108,8 +104,20 @@ path = "@/providers/local/limits-and-errors.md"
 title = "Model sources and presets"
 path = "@/providers/local/model-sources.md"
 [[extra.nav.items.children]]
+title = "Checkpoint conversion"
+path = "@/providers/local/checkpoints.md"
+[[extra.nav.items.children]]
 title = "Local models and formats"
 path = "@/providers/local/models.md"
+[[extra.nav.items.children]]
+title = "Tokenizers"
+path = "@/providers/local/tokenizers.md"
+[[extra.nav.items.children]]
+title = "Chat templates, reasoning and tool calls"
+path = "@/providers/local/chat-templates.md"
+[[extra.nav.items.children]]
+title = "Verification and known limits"
+path = "@/providers/local/verification.md"
 [[extra.nav.items.children]]
 title = "Speculative decoding"
 path = "@/providers/local/drafting.md"

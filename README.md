@@ -20,6 +20,7 @@ Nothing is compiled by default. You pick Cargo features, and the build fails unt
 - [Plugins](https://nassor.github.io/cuca/plugins/) watch the request and the stream: MCP, WASM sandbox, memory, guardrails, subagents, human approval, web search, skills, telemetry, session log, cost accounting and redaction.
 - [Services](https://nassor.github.io/cuca/services/) are called directly: prompt cache, entity extraction, session replay, speculative fast/slow routing, rate limiting, a vector store and a call scheduler.
 - Thinking: one effort level, `minimal` to `xhigh`, maps onto each provider's native reasoning control. Providers without one ignore it.
+- Sampling: `temperature`, `max_tokens`, `top_p`, `top_k`, `seed` and `stop` are fields of the request. An adapter whose backend has no equivalent returns `CucaError::Config` instead of dropping the value.
 
 Start with the [Quick start](#quick-start) below, or read the [documentation site](https://nassor.github.io/cuca/).
 
@@ -125,7 +126,7 @@ You will start the model on port 1234, create a small crate, and stream one repl
 
 ### Run a model with no server
 
-`provider-local` runs a GGUF model inside your process, on the CPU. It downloads the default model, Gemma 4 E2B Q4_0 (2.84 GB), on first use. Inside an async function:
+`provider-local` runs a GGUF model inside your process, on the CPU unless a GPU feature (`provider-local-vulkan`, `-metal`, `-cuda` or `-rocm`) and a device are set. It downloads the default model, Gemma 4 E2B Q4_0 (2.84 GB), on first use. Inside an async function:
 
 ```rust
 use cuca::types::ProviderEndpoint;
@@ -138,9 +139,9 @@ let client = CucaClient::builder()
     .build()?;
 ```
 
-`generate_stream` then works as in the Quick start. The [Local page](https://nassor.github.io/cuca/providers/local/) has the full example, the presets, GPU features and the build command. [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) lists the supported architectures.
+`generate_stream` then works as in the Quick start. The [Local page](https://nassor.github.io/cuca/providers/local/) has the full example, the presets, the GPU features and the build command. [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) lists the supported architectures.
 
-A Hugging Face safetensors checkpoint needs no GGUF either: `"Qwen/Qwen3-0.6B:<commit>".parse::<ModelSource>()?` (or `ModelSource::Dir` for a local directory) is downloaded, converted once to a cached GGUF in pure Rust (`LocalModelConfig::convert` picks `f16`, `q8_0` or `q4_0`), and loaded like any other file; the conversion is a port of llama.cpp's converter whose output was checked against the original script. See [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/#checkpoints).
+A Hugging Face safetensors checkpoint needs no GGUF: `"Qwen/Qwen3-0.6B:<commit>".parse::<ModelSource>()?`, or `ModelSource::Dir` for a local directory, is converted once to a cached GGUF in pure Rust and loaded like any other file. See [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/#checkpoints).
 
 ### Run the live tests
 
