@@ -168,6 +168,10 @@ impl Drafter {
                 target,
                 context_length,
             )?)),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(_) => Err(CucaError::Config(
+                "a drafter cannot be combined with `gpu_layers`".into(),
+            )),
         }
     }
 
@@ -188,6 +192,10 @@ impl Drafter {
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(_) => Err(err(
                 "the in-trunk prediction head runs on the CPU only: use `LocalDevice::Cpu`",
+            )),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(_) => Err(CucaError::Config(
+                "the in-trunk prediction head runs on the CPU only: it cannot be combined with `gpu_layers`".into(),
             )),
         }
     }

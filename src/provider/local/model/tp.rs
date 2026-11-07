@@ -165,10 +165,22 @@ pub(super) fn validate(
             format!("layer {il}"),
         ));
     }
+    if let Some(il) = hp.layers.iter().position(|l| l.mla.is_some()) {
+        return Err(rule(
+            "multi-head latent attention layers cannot be split (one shared latent K/V row per position; the per-head up-projections are not sliced)",
+            format!("layer {il}, architecture {}", hp.arch.name()),
+        ));
+    }
     if hp.behavior.qk_norm_full {
         return Err(rule(
             "a full-width Q/K norm cannot be split across heads",
             format!("architecture {}", hp.arch.name()),
+        ));
+    }
+    if matches!(experts, ExpertPlacement::Host { .. }) {
+        return Err(rule(
+            "host experts cannot be split across shards",
+            "ExpertPlacement::Host",
         ));
     }
     if matches!(experts, ExpertPlacement::Tiered(_)) {

@@ -28,6 +28,8 @@ weight = 3
 | K/V cache | `batching.kv_tokens` positions (twice `context_length` by default) in blocks of 16 per full-attention group, shared by all running sequences and the cached prefixes; a window plus about 270 positions per running sequence plus cached prefixes per sliding-window group; preallocated | no growth; unreferenced blocks are evicted least recently used; a running request that needs a block preempts the youngest one; the prefix cache is reused across requests |
 | Step rows | `batching.max_step_tokens`, at most 2048, default the prefill chunk | the decode rows come first, prompts prefill in the rest |
 | `draft_tokens` | `1..=16` with a drafter | `CucaError::Config` at load |
+| `gpu_layers` | at most the model's layer count; a GPU `device`; no `shards`, no drafter | `CucaError::Config` (the count is checked once the file header is read) |
+| `ExpertPlacement::Host` | a GPU `device`, a model with experts; no `tiered`, no `shards` | `CucaError::Config` |
 | Prefill chunk | 256 tokens at most | a longer prompt prefills in chunks |
 | Download stall | 60 seconds without data | `CucaError::Transport`; the partial file stays for a later resume |
 | Download connect | 30 seconds | `CucaError::Transport` |
@@ -42,6 +44,7 @@ weight = 3
 - Gemma 4's per-layer embedding table (`per_layer_token_embd`: 1.32 GB in E2B Q4_0, 1.59 GB in E4B Q4_0) is not loaded. The engine reads one row per input token from the GGUF file, usually from the OS page cache, so E2B Q4_0 holds 1.5 GB of its 2.84 GB file.
 - Mixture of experts: by default expert tensors are split once at load into one quantized 2-D weight per expert. Memory is the file size, and a pass computes only the experts its tokens route to. With `ExpertPlacement::Tiered` the experts stay in the GGUF file and memory is the dense weights plus the RAM and device budgets you set; see [Tiered expert placement](@/providers/local/expert-tiers.md).
 - Hybrid models (Qwen 3.5) keep a recurrent state of fixed size next to the K/V cache. For the 0.8B model it is 20.2 MB per running sequence (`max_sequences` slots), about 40 MB with the rollback copy, plus 445 KB per verified row, and one more 20.2 MB per snapshot in the prefix store (at most `max_sequences + 4`). See [Architectures](@/providers/local/models.md#architectures).
+- Layer offload (`gpu_layers`) and host experts (`ExpertPlacement::Host`): the CPU half keeps its layers' weights and K/V pools in RAM and the GPU half its own in device memory (see [Layer offload](@/providers/local/gpu.md#layer-offload-gpu-layers)); host experts read every hosted expert into RAM at load (the file's size for those layers). The Gemma 4 mirror pools of a split across a shared-K/V boundary are small and not counted in `kv_cache_bytes`. Neither combines with tensor parallelism.
 - On a GPU the weights and the K/V cache are in device memory instead of RAM, at the sizes in [Devices and GPU features](@/providers/local/gpu.md#devices-and-gpu-features).
 
 ## Errors

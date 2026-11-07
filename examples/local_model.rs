@@ -58,6 +58,11 @@
 //!   `+`-separated list such as `cuda:0+cuda:1` splits the model over those
 //!   GPUs (tensor parallelism, `LocalModelConfig::shards`; a device may
 //!   repeat, e.g. `vulkan:0+vulkan:0`); the line `loaded on ...` lists them.
+//! - `CUCA_LOCAL_GPU_LAYERS`: layer offload (`LocalModelConfig::gpu_layers`,
+//!   llama.cpp's `-ngl`): the last `n` layers run on the GPU device and the
+//!   rest on the CPU, for a model that does not fit the device; the line
+//!   `loaded on ...` prints the split. Not combinable with `+` device lists
+//!   or a drafter.
 //! - `CUCA_LOCAL_EXPERTS`: where a mixture-of-experts model's experts live
 //!   (see `ExpertPlacement`): `resident` (default) or tiered caches such as
 //!   `tiered:ram=600m` (CPU) or `tiered:device=4g,ram=8g` (GPU); the tier
@@ -143,6 +148,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         config.set_devices(&device)?;
     }
+    if let Ok(layers) = std::env::var("CUCA_LOCAL_GPU_LAYERS")
+        && !layers.is_empty()
+    {
+        config.gpu_layers = Some(layers.parse()?);
+    }
     if let Ok(experts) = std::env::var("CUCA_LOCAL_EXPERTS")
         && !experts.is_empty()
     {
@@ -166,7 +176,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let model = LocalModel::load(config).await?;
     let stats_handle = model.clone();
     eprintln!();
-    eprintln!("loaded on {devices}");
+    match stats_handle.layer_split() {
+        Some((gpu, total)) => eprintln!(
+            "loaded on {devices}: {gpu} of {total} layers on the GPU (layers {} to {}), layers 0 to {} and the embeddings on the CPU",
+            total - gpu,
+            total - 1,
+            total - gpu - 1
+        ),
+        None => eprintln!("loaded on {devices}"),
+    }
 
     // Stage 2: build the client. `Local` needs the model attached; the request's
     // model name is not used for routing.

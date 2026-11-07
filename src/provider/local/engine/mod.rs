@@ -60,7 +60,7 @@ use candle_core::quantized::gguf_file;
 use tokio::sync::mpsc;
 
 use self::scheduler::{Sequence, SnapshotStore};
-use super::chat::{ChatFormat, ChatTemplate};
+use super::chat::{ChatFormat, ChatTemplate, expand_template_name};
 use super::model::arch::Arch;
 use super::model::mtp::Drafter;
 use super::model::paged::{KvPools, Sizing};
@@ -575,6 +575,7 @@ impl Engine {
             &config.shards,
             &config.experts,
             &sizing,
+            config.gpu_layers,
         )?;
         let drafter = drafter
             .map(|source| -> Result<Drafter, CucaError> {
@@ -601,9 +602,11 @@ impl Engine {
         let eos = tokenizer.eos_token().to_string();
         let (format, template) = match chat_template {
             Some(source) => {
+                let source = expand_template_name(source)
+                    .map_err(|e| CucaError::Config(format!("chat_template override: {e}")))?;
                 let template = ChatTemplate::checked(source.to_string(), bos, eos)?;
                 (
-                    ChatFormat::detect(&content.metadata, &tokenizer, source)?,
+                    ChatFormat::detect(&content.metadata, &tokenizer, &source)?,
                     template,
                 )
             }
@@ -615,6 +618,10 @@ impl Engine {
                     .to_string()
                     .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
                     .clone();
+                // llama.cpp's converter can write a template *name*.
+                let source = expand_template_name(&source)
+                    .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
+                    .into_owned();
                 let format = ChatFormat::detect(&content.metadata, &tokenizer, &source)?;
                 (format, ChatTemplate::new(source, bos, eos)?)
             }
@@ -703,6 +710,11 @@ impl Engine {
     /// K/V cache bytes of the loaded model at its context length.
     pub(crate) fn kv_cache_bytes(&self) -> u64 {
         self.kv_cache_bytes
+    }
+
+    /// Layers on the GPU and in all when layers are offloaded.
+    pub(crate) fn layer_split(&self) -> Option<(usize, usize)> {
+        self.model.layer_split()
     }
 
     /// Counters and heat of the expert tiers; `None` unless the model loaded
@@ -1962,7 +1974,8 @@ mod tests {
                 device,
                 &[],
                 &resident,
-                &Sizing::single(resolved)
+                &Sizing::single(resolved),
+                None,
             )
             .is_ok()
         );
@@ -1974,6 +1987,7 @@ mod tests {
             &[],
             &resident,
             &Sizing::single(33),
+            None,
         )
         .err();
         assert!(

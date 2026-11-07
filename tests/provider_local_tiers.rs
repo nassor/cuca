@@ -17,6 +17,8 @@
 //!   `resident`); set it to a small tiered placement when the resident model
 //!   does not fit the device.
 //! - `CUCA_LOCAL_DEVICE`: `LocalDevice` syntax; a GPU needs its feature.
+//! - `CUCA_LOCAL_GPU_LAYERS`: `LocalModelConfig::gpu_layers` (layer offload:
+//!   the last `n` layers on the GPU, the rest on the CPU with the RAM tier).
 //!
 //! Without a model or `CUCA_LOCAL_EXPERTS` the test prints `SKIP` and passes,
 //! unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic.
@@ -108,6 +110,10 @@ async fn phase(
         source: source.clone(),
         context_length: Some(2048),
         device,
+        gpu_layers: env("CUCA_LOCAL_GPU_LAYERS").map(|s| {
+            s.parse()
+                .unwrap_or_else(|e| panic!("CUCA_LOCAL_GPU_LAYERS={s:?}: {e}"))
+        }),
         experts,
         convert: ConvertConfig {
             quant: env("CUCA_LOCAL_CONVERT_QUANT")

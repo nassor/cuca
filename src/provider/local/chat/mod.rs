@@ -11,6 +11,7 @@
 //! stay JSON objects (templates reject strings), and `ImageBase64` blocks are
 //! refused because the engine is text-only.
 
+mod builtin;
 mod format;
 #[cfg(test)]
 mod golden;
@@ -18,6 +19,7 @@ mod golden;
 mod golden_new;
 mod template;
 
+pub(crate) use self::builtin::expand as expand_template_name;
 pub(crate) use self::format::{Atem, ChatFormat, ToolSyntax};
 pub(crate) use self::template::ChatTemplate;
 

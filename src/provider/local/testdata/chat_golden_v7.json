@@ -1,0 +1,92 @@
+{
+ "multi_turn": {
+  "messages": [
+   {
+    "content": "What is 2+2?",
+    "role": "user"
+   },
+   {
+    "content": "4",
+    "role": "assistant"
+   },
+   {
+    "content": "And 3+3?",
+    "role": "user"
+   }
+  ],
+  "text": "<s>[INST]What is 2+2?[/INST]4</s>[INST]And 3+3?[/INST]"
+ },
+ "multiline": {
+  "messages": [
+   {
+    "content": "Line one\nLine two",
+    "role": "system"
+   },
+   {
+    "content": "a\n\nb",
+    "role": "user"
+   }
+  ],
+  "text": "<s>[SYSTEM_PROMPT]Line one\nLine two[/SYSTEM_PROMPT][INST]a\n\nb[/INST]"
+ },
+ "system_multi_turn": {
+  "messages": [
+   {
+    "content": "Be brief.",
+    "role": "system"
+   },
+   {
+    "content": "Hi",
+    "role": "user"
+   },
+   {
+    "content": "Hello!",
+    "role": "assistant"
+   },
+   {
+    "content": "Who are you",
+    "role": "user"
+   },
+   {
+    "content": "An assistant.",
+    "role": "assistant"
+   },
+   {
+    "content": "Another question",
+    "role": "user"
+   }
+  ],
+  "text": "<s>[SYSTEM_PROMPT]Be brief.[/SYSTEM_PROMPT][INST]Hi[/INST]Hello!</s>[INST]Who are you[/INST]An assistant.</s>[INST]Another question[/INST]"
+ },
+ "system_user": {
+  "messages": [
+   {
+    "content": "You are a helpful assistant",
+    "role": "system"
+   },
+   {
+    "content": "Hello",
+    "role": "user"
+   }
+  ],
+  "text": "<s>[SYSTEM_PROMPT]You are a helpful assistant[/SYSTEM_PROMPT][INST]Hello[/INST]"
+ },
+ "unicode": {
+  "messages": [
+   {
+    "content": "日本語 éè 😀 \"quotes\" <tag> & more",
+    "role": "user"
+   }
+  ],
+  "text": "<s>[INST]日本語 éè 😀 \"quotes\" <tag> & more[/INST]"
+ },
+ "user_only": {
+  "messages": [
+   {
+    "content": "Hello",
+    "role": "user"
+   }
+  ],
+  "text": "<s>[INST]Hello[/INST]"
+ }
+}

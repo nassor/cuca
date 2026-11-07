@@ -106,6 +106,11 @@
 //!   [`ExpertPlacement::Tiered`] keeps the experts in the file instead and
 //!   streams them through RAM (and, on a GPU, device-memory) caches of a
 //!   configured byte size, with the same output.
+//! - [`LocalModelConfig::gpu_layers`] runs only the last `n` layers (and the
+//!   head) on the GPU and the first layers on the CPU (llama.cpp's `-ngl`),
+//!   and [`ExpertPlacement::Host`] keeps the routed experts in RAM and
+//!   computes them on the CPU while the GPU runs the rest (`--cpu-moe`); both
+//!   are for models that do not fit the device and compose with batching.
 //! - [`LocalModelConfig::shards`] splits a model over several GPUs (tensor
 //!   parallelism): attention heads and FFN widths are split evenly, each
 //!   device holds its slice of the weights and of the K/V pools, and the
@@ -614,18 +619,28 @@ const PRESET_TABLE: [ModelPreset; 25] = [
             "mistral3",
         )
     },
-    // imatrix Q4_0 of Ministral 3 Instruct. Its embedded chat template is the
-    // earlier one: the same except for the wording of the default system
-    // prompt (the current template adds a tool-calling paragraph there).
-    preset(
-        "ministral3-3b-instruct-q4_0",
-        "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
-        "0a9035302dea19872c96076896304552890a73c2",
-        "mistralai_Ministral-3-3B-Instruct-2512-Q4_0.gguf",
-        "c2993f4b86ddcae94031b2e384169889ceecd51b148ceda30c0f826fcce721c8",
-        2_046_375_904,
-        "mistral3",
-    ),
+    // imatrix Q4_0 of Ministral 3 Instruct. Every published GGUF of this
+    // model embeds the December 2025 chat template (an earlier default system
+    // prompt, without the tool-calling paragraph); the preset pins the
+    // repository's current `chat_template.jinja` ("update to match
+    // mistral-common", 2026-07-15) and uses it instead.
+    ModelPreset {
+        template: Some(PresetTemplate {
+            repo: "mistralai/Ministral-3-3B-Instruct-2512",
+            revision: "b35d4dfe56c142746f54dbd64f579faab2744308",
+            file: "chat_template.jinja",
+            sha256: "0701cfbdc2b7d44fdbad104dff604faee4b0543e8247624568777fe465746f9b",
+        }),
+        ..preset(
+            "ministral3-3b-instruct-q4_0",
+            "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
+            "0a9035302dea19872c96076896304552890a73c2",
+            "mistralai_Ministral-3-3B-Instruct-2512-Q4_0.gguf",
+            "c2993f4b86ddcae94031b2e384169889ceecd51b148ceda30c0f826fcce721c8",
+            2_046_375_904,
+            "mistral3",
+        )
+    },
     // Two parts of `llama-gguf-split`: merged into one cached file at load.
     // imatrix Q4_0 (Q4_1 in the layers' `ffn_down_exps`, Q5_0 in places, Q8_0
     // for the shared experts and the latent projection, Q6_K `output`).
@@ -1128,7 +1143,8 @@ pub struct ConvertConfig {
 /// `resident`, or `tiered:` followed by comma-separated `ram=<size>`,
 /// `device=<size>` and `threads=<n>` in any order (each at most once), where
 /// `<size>` is a byte count with an optional `k`, `m` or `g` suffix (powers
-/// of 1024): `tiered:ram=4g`, `tiered:device=6g,ram=12g,threads=8`.
+/// of 1024): `tiered:ram=4g`, `tiered:device=6g,ram=12g,threads=8`; or
+/// `host` / `host:layers=<n>` ([`ExpertPlacement::Host`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExpertPlacement {
     /// Every expert is loaded at startup and stays in RAM (CPU) or device
@@ -1138,6 +1154,24 @@ pub enum ExpertPlacement {
     /// The experts stay in the GGUF file and are loaded on demand through
     /// bounded caches; mixture-of-experts models only.
     Tiered(ExpertTiers),
+    /// llama.cpp's `--cpu-moe` / `--n-cpu-moe` for a GPU device: the routed
+    /// experts of the MoE layers stay in host RAM and the CPU computes them,
+    /// while attention, the router, the shared expert, the norms and the head
+    /// run on the GPU. Per MoE layer the GPU computes the router and the
+    /// layer's normed rows are read back once; the CPU runs the routed
+    /// experts of every token and sums them, and the sum is uploaded once and
+    /// added. `layers: None` hosts every MoE layer, `Some(n)` the first `n`
+    /// (the other MoE layers keep their experts resident on the device).
+    /// Every hosted expert is read into RAM at load (the file's size, as
+    /// [`ExpertPlacement::Resident`] on the CPU). GPU devices and
+    /// mixture-of-experts models only; it cannot be combined with
+    /// [`ExpertTiers`] or with `shards`. It composes with
+    /// [`LocalModelConfig::gpu_layers`]: the CPU layers then use their
+    /// experts as a CPU model does, the GPU layers host theirs.
+    Host {
+        /// The first this many MoE layers, `None` for all of them.
+        layers: Option<usize>,
+    },
 }
 
 /// The caches of [`ExpertPlacement::Tiered`].
@@ -1214,12 +1248,21 @@ impl std::str::FromStr for ExpertPlacement {
         let s = s.trim();
         let bad = || {
             CucaError::Config(format!(
-                "unknown expert placement `{s}`; expected resident or tiered:ram=<size>[,device=<size>][,threads=<n>]"
+                "unknown expert placement `{s}`; expected resident, host[:layers=<n>] or tiered:ram=<size>[,device=<size>][,threads=<n>]"
             ))
         };
         let lower = s.to_ascii_lowercase();
         if lower == "resident" {
             return Ok(Self::Resident);
+        }
+        if lower == "host" {
+            return Ok(Self::Host { layers: None });
+        }
+        if let Some(n) = lower.strip_prefix("host:layers=") {
+            let layers = n.parse::<usize>().map_err(|_| bad())?;
+            return Ok(Self::Host {
+                layers: Some(layers),
+            });
         }
         let rest = lower.strip_prefix("tiered:").ok_or_else(bad)?;
         let size = |v: &str| -> Option<u64> {
@@ -1347,6 +1390,28 @@ pub struct LocalModelConfig {
     /// copy of each K/V head on every device), a delta-net (hybrid) layer or
     /// a full-width Q/K norm cannot be split. See [`LocalModelConfig::set_devices`].
     pub shards: Vec<LocalDevice>,
+    /// Layer offload (llama.cpp's `-ngl`): run only this many transformer
+    /// layers on [`device`](Self::device) and the rest on the CPU, for a
+    /// model that does not fit the device. `None` (the default) runs the
+    /// whole model on `device`.
+    ///
+    /// The *last* `n` layers go to the GPU together with the final norm and
+    /// the LM head; the first layers, the token embeddings (and Gemma 4's
+    /// per-layer embeddings) stay on the CPU, so the residual stream crosses
+    /// to the device once per forward pass. `Some(0)` loads the model on the
+    /// CPU (no device opens), `Some(n_layer)` is the same as `None`. Each
+    /// layer's K/V pool lives on its layer's device under the same block
+    /// tables, a hybrid model's recurrent state likewise, and with
+    /// [`ExpertPlacement::Tiered`] the experts of the CPU layers use the RAM
+    /// tier and those of the GPU layers the device tier (the `ram` budget is
+    /// shared out in proportion to the MoE layers on each side). See the GPU
+    /// page of the documentation for the memory and speed trade-off.
+    ///
+    /// [`LocalModel::load`] fails with [`CucaError::Config`] when `device`
+    /// is [`LocalDevice::Cpu`], when there are `shards` or a `drafter`
+    /// (neither combines with offload), or, once the file is read, when the
+    /// count exceeds the model's layer count.
+    pub gpu_layers: Option<usize>,
 }
 
 impl Default for LocalModelConfig {
@@ -1366,6 +1431,7 @@ impl Default for LocalModelConfig {
             convert: ConvertConfig::default(),
             batching: BatchingConfig::default(),
             shards: Vec::new(),
+            gpu_layers: None,
         }
     }
 }
@@ -1416,6 +1482,7 @@ impl fmt::Debug for LocalModelConfig {
             .field("convert", &self.convert)
             .field("batching", &self.batching)
             .field("shards", &self.shards)
+            .field("gpu_layers", &self.gpu_layers)
             .finish()
     }
 }
@@ -1432,6 +1499,7 @@ type Ready = Result<
         Option<Arc<model::tier::TierShared>>,
         Arc<engine::ServingCounters>,
         SamplingConfig,
+        Option<(usize, usize)>,
     ),
     CucaError,
 >;
@@ -1453,6 +1521,9 @@ pub(crate) struct LocalModelInner {
     /// Counters and heat of the expert tiers; `None` unless
     /// [`ExpertPlacement::Tiered`].
     tiers: Option<Arc<model::tier::TierShared>>,
+    /// Layers on the GPU and in all when the model runs split over the CPU
+    /// and the GPU ([`LocalModelConfig::gpu_layers`]).
+    layer_split: Option<(usize, usize)>,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -1731,6 +1802,13 @@ impl LocalModel {
         self.inner.sampling
     }
 
+    /// How the layers are placed when [`LocalModelConfig::gpu_layers`] split
+    /// the model over the CPU and the GPU: `(layers on the GPU, layers in
+    /// all)`; `None` when the whole model runs on one device.
+    pub fn layer_split(&self) -> Option<(usize, usize)> {
+        self.inner.layer_split
+    }
+
     /// What this model supports: reasoning, switching it off, tool calls.
     pub fn capabilities(&self) -> LocalCapabilities {
         let reasoning = self.inner.format.writes_reasoning();
@@ -1861,6 +1939,7 @@ impl LocalModel {
                                 engine.expert_tiers(),
                                 engine.serving_counters(),
                                 engine.sampling().config(),
+                                engine.layer_split(),
                             )))
                             .is_err()
                         {
@@ -1889,6 +1968,7 @@ impl LocalModel {
                 tiers,
                 serving,
                 sampling,
+                layer_split,
             ))) => Ok(LocalModel {
                 inner: Arc::new(LocalModelInner {
                     jobs: jobs_tx,
@@ -1901,6 +1981,7 @@ impl LocalModel {
                     draft_stats,
                     serving,
                     tiers,
+                    layer_split,
                 }),
             }),
             Ok(Err(e)) => Err(e),
@@ -1948,6 +2029,23 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
             ));
         }
     }
+    if config.gpu_layers.is_some() {
+        if config.device == LocalDevice::Cpu {
+            return Err(CucaError::Config(
+                "gpu_layers needs a GPU `device`, got cpu".into(),
+            ));
+        }
+        if !config.shards.is_empty() {
+            return Err(CucaError::Config(
+                "gpu_layers cannot be combined with tensor parallelism (`shards`)".into(),
+            ));
+        }
+        if config.drafter.is_some() {
+            return Err(CucaError::Config(
+                "gpu_layers cannot be combined with a `drafter`".into(),
+            ));
+        }
+    }
     let batching = &config.batching;
     if !(1..=64).contains(&batching.max_sequences) {
         return Err(CucaError::Config(format!(
@@ -1991,6 +2089,11 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
             "draft_tokens must be in 1..={MAX_DRAFT_TOKENS}, got {}",
             config.draft_tokens
         )));
+    }
+    if matches!(config.experts, ExpertPlacement::Host { .. }) && config.device == LocalDevice::Cpu {
+        return Err(CucaError::Config(
+            "ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does".into(),
+        ));
     }
     if let ExpertPlacement::Tiered(t) = &config.experts {
         if !(1..=MAX_LOADER_THREADS).contains(&t.loader_threads) {
@@ -3036,6 +3139,92 @@ mod tests {
             config(vulkan, &[LocalDevice::Metal(GpuAdapter::Default)]),
             "same GPU backend",
         );
+    }
+
+    #[test]
+    fn host_expert_placement_parses_and_is_validated() {
+        let host = |s: &str| s.parse::<ExpertPlacement>();
+        assert_eq!(
+            host("host").unwrap(),
+            ExpertPlacement::Host { layers: None }
+        );
+        assert_eq!(
+            host(" HOST:layers=20 ").unwrap(),
+            ExpertPlacement::Host { layers: Some(20) }
+        );
+        for bad in [
+            "host:",
+            "host:layers=",
+            "host:layers=x",
+            "host:layers=-1",
+            "host:ram=1g",
+            "hosted",
+        ] {
+            assert!(host(bad).is_err(), "{bad}");
+        }
+        // The CPU already computes its experts from RAM.
+        let cpu = LocalModelConfig {
+            experts: ExpertPlacement::Host { layers: None },
+            ..LocalModelConfig::default()
+        };
+        let err = validate(&cpu).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("ExpertPlacement::Host")),
+            "{err}"
+        );
+        // Tensor parallelism keeps experts resident.
+        #[cfg(feature = "provider-local-vulkan")]
+        {
+            let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
+            let mut config = LocalModelConfig {
+                device: vulkan,
+                experts: ExpertPlacement::Host { layers: None },
+                ..LocalModelConfig::default()
+            };
+            assert!(validate(&config).is_ok());
+            config.shards = vec![vulkan];
+            assert!(validate(&config).is_err());
+        }
+    }
+
+    #[test]
+    fn validate_enforces_the_layer_offload_rules() {
+        let config = |device, gpu_layers| LocalModelConfig {
+            device,
+            gpu_layers,
+            ..LocalModelConfig::default()
+        };
+        let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
+        let rejects = |config: LocalModelConfig, what: &str| {
+            let err = validate(&config).unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains(what)),
+                "{what}: {err}"
+            );
+        };
+        // Offload needs a GPU to offload to.
+        rejects(
+            config(LocalDevice::Cpu, Some(4)),
+            "gpu_layers needs a GPU `device`",
+        );
+        assert!(validate(&config(LocalDevice::Cpu, None)).is_ok());
+        // A backend that is compiled out names its feature.
+        #[cfg(not(feature = "provider-local-vulkan"))]
+        rejects(config(vulkan, Some(4)), "`provider-local-vulkan`");
+        #[cfg(feature = "provider-local-vulkan")]
+        {
+            assert!(validate(&config(vulkan, Some(4))).is_ok());
+            assert!(validate(&config(vulkan, Some(0))).is_ok());
+            let mut shards = config(vulkan, Some(4));
+            shards.shards = vec![vulkan];
+            rejects(
+                shards,
+                "gpu_layers cannot be combined with tensor parallelism",
+            );
+            let mut drafted = config(vulkan, Some(4));
+            drafted.drafter = Some(DrafterSource::File(ModelSource::File("d.gguf".into())));
+            rejects(drafted, "gpu_layers cannot be combined with a `drafter`");
+        }
     }
 
     #[test]
