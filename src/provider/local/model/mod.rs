@@ -14,8 +14,8 @@
 //! [`arch::Arch::behavior`] and per layer by [`params::LayerSpec`]:
 //!
 //! - grouped-query attention with an optional Q/K/V/O bias, fused `attn_qkv`,
-//!   per-head QK-norm, a per-layer score scale, an optional tanh soft-cap on
-//!   the scores, and causal or sliding-window masks (per-layer pattern);
+//!   per-head QK-norm, a per-layer score scale, and causal or
+//!   sliding-window masks (per-layer pattern);
 //! - RoPE ([`rope`]): adjacent-pair (`NORM`) or half-split (`NEOX`) pairing,
 //!   partial rotary dimensions, a base per layer type, linear and YaRN
 //!   scaling, per-pair factors (`rope_freqs`, LongRoPE short/long with the
