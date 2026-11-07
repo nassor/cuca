@@ -122,7 +122,7 @@ You will start the model on port 1234, create a small crate, and stream one repl
 
 - Enable only the provider features you use. The [Providers](https://nassor.github.io/cuca/providers/) pages list what each one talks to.
 - Any OpenAI-compatible server (Ollama, vLLM, a remote gateway) works with `provider-openai`, a different `with_base_url` and your model name. Ollama serves at `http://localhost:11434/v1`. LM Studio has its own `provider-lmstudio`, which defaults to `http://127.0.0.1:1234/v1`.
-- The `examples/` folder has a runnable demo for the core client, every plugin and every service. All except `local_model` read `CUCA_BASE_URL` and `CUCA_MODEL`. Each plugin and service page on the site shows the `cargo run` command and its output.
+- The `examples/` folder has a runnable demo for the core client, every plugin and every service. All except `local_model` read `CUCA_BASE_URL`, and all except `local_model` and `speculative` read `CUCA_MODEL` (`speculative` reads `CUCA_FAST_MODEL` and `CUCA_SLOW_MODEL`). Each plugin and service page on the site shows the `cargo run` command and its output.
 
 ### Run a model with no server
 
