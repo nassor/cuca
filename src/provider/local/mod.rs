@@ -1744,6 +1744,8 @@ impl LocalModel {
     /// [`SamplingConfig`]). `seed` is the configured one.
     pub fn sampling(&self) -> SamplingConfig {
         self.inner.sampling
+    }
+
     /// How the layers are placed when [`LocalModelConfig::gpu_layers`] split
     /// the model over the CPU and the GPU: `(layers on the GPU, layers in
     /// all)`; `None` when the whole model runs on one device.
