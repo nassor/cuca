@@ -200,7 +200,7 @@ impl Transformer {
                 Arch::Mistral4Eagle.name()
             )));
         }
-        self.check_eagle(&hp, content)?;
+        check_compat(&self.hp, self.vocab, &hp, content)?;
         let n = hp.n_embd;
         let mut loader = Loader {
             content,
@@ -238,76 +238,6 @@ impl Transformer {
             pairs: Vec::new(),
             tail: None,
         })
-    }
-
-    /// Reject a drafter that was not trained for this model. Its layers run
-    /// on this model's RoPE tables, query scaling, norm epsilon and
-    /// activation, and its input is this model's hidden state and embedding,
-    /// so each of those must be the same.
-    fn check_eagle(&self, hp: &Hparams, content: &gguf_file::Content) -> Result<(), CucaError> {
-        let target = &self.hp;
-        let differs = |what: &str, drafter: String, model: String| {
-            Err(err(format!(
-                "the EAGLE drafter's {what} is {drafter} but the model's is {model}: it was trained for another model"
-            )))
-        };
-        if hp.n_embd != target.n_embd || hp.n_embd_out != target.n_embd {
-            return differs(
-                "hidden width",
-                format!("{} (target side {})", hp.n_embd, hp.n_embd_out),
-                target.n_embd.to_string(),
-            );
-        }
-        let key = format!("{}.vocab_size", hp.arch.name());
-        let vocab = content
-            .metadata
-            .get(&key)
-            .and_then(|v| v.to_u32().ok())
-            .ok_or_else(|| err(format!("GGUF metadata `{key}`: missing or not an integer")))?;
-        if vocab as usize != self.vocab {
-            return differs("vocabulary", vocab.to_string(), self.vocab.to_string());
-        }
-        if (hp.eps - target.eps).abs() > 1e-9 * target.eps.abs() {
-            return differs("norm epsilon", hp.eps.to_string(), target.eps.to_string());
-        }
-        if hp.act() != target.act() || hp.residual_scale != target.residual_scale {
-            return differs(
-                "activation or residual scale",
-                format!("{:?}/{}", hp.act(), hp.residual_scale),
-                format!("{:?}/{}", target.act(), target.residual_scale),
-            );
-        }
-        if hp.ropes != target.ropes {
-            return differs(
-                "RoPE",
-                format!("{:?}", hp.ropes),
-                format!("{:?}", target.ropes),
-            );
-        }
-        if hp.attn_temp != target.attn_temp {
-            return differs(
-                "query scaling",
-                format!("{:?}", hp.attn_temp),
-                format!("{:?}", target.attn_temp),
-            );
-        }
-        // Every layer of the drafter attends like the model's first layer.
-        let Some(t) = target.layers.first() else {
-            return Err(err("the model has no layers"));
-        };
-        for (il, l) in hp.layers.iter().enumerate() {
-            let same = (l.n_head, l.n_kv_head, l.head_dim, l.window, l.rope, l.mla)
-                == (t.n_head, t.n_kv_head, t.head_dim, t.window, t.rope, t.mla)
-                && (l.scale - t.scale).abs() <= 1e-6 * t.scale.abs();
-            if !same {
-                return differs(
-                    &format!("layer {il} attention"),
-                    format!("{l:?}"),
-                    format!("{t:?}"),
-                );
-            }
-        }
-        Ok(())
     }
 
     /// The drafter inputs `eh_proj(cat(embedding, hidden))` of `m` pairs:
@@ -511,6 +441,80 @@ impl Transformer {
             normed.flatten_all()?.to_vec1::<f32>()?,
         ))
     }
+}
+
+/// Reject a drafter that was not trained for this model. Its layers run
+/// on this model's RoPE tables, query scaling, norm epsilon and
+/// activation, and its input is this model's hidden state and embedding,
+/// so each of those must be the same.
+fn check_compat(
+    target: &Hparams,
+    model_vocab: usize,
+    hp: &Hparams,
+    content: &gguf_file::Content,
+) -> Result<(), CucaError> {
+    let differs = |what: &str, drafter: String, model: String| {
+        Err(err(format!(
+            "the EAGLE drafter's {what} is {drafter} but the model's is {model}: it was trained for another model"
+        )))
+    };
+    if hp.n_embd != target.n_embd || hp.n_embd_out != target.n_embd {
+        return differs(
+            "hidden width",
+            format!("{} (target side {})", hp.n_embd, hp.n_embd_out),
+            target.n_embd.to_string(),
+        );
+    }
+    let key = format!("{}.vocab_size", hp.arch.name());
+    let vocab = content
+        .metadata
+        .get(&key)
+        .and_then(|v| v.to_u32().ok())
+        .ok_or_else(|| err(format!("GGUF metadata `{key}`: missing or not an integer")))?;
+    if vocab as usize != model_vocab {
+        return differs("vocabulary", vocab.to_string(), model_vocab.to_string());
+    }
+    if (hp.eps - target.eps).abs() > 1e-9 * target.eps.abs() {
+        return differs("norm epsilon", hp.eps.to_string(), target.eps.to_string());
+    }
+    if hp.act() != target.act() || hp.residual_scale != target.residual_scale {
+        return differs(
+            "activation or residual scale",
+            format!("{:?}/{}", hp.act(), hp.residual_scale),
+            format!("{:?}/{}", target.act(), target.residual_scale),
+        );
+    }
+    if hp.ropes != target.ropes {
+        return differs(
+            "RoPE",
+            format!("{:?}", hp.ropes),
+            format!("{:?}", target.ropes),
+        );
+    }
+    if hp.attn_temp != target.attn_temp {
+        return differs(
+            "query scaling",
+            format!("{:?}", hp.attn_temp),
+            format!("{:?}", target.attn_temp),
+        );
+    }
+    // Every layer of the drafter attends like the model's first layer.
+    let Some(t) = target.layers.first() else {
+        return Err(err("the model has no layers"));
+    };
+    for (il, l) in hp.layers.iter().enumerate() {
+        let same = (l.n_head, l.n_kv_head, l.head_dim, l.window, l.rope, l.mla)
+            == (t.n_head, t.n_kv_head, t.head_dim, t.window, t.rope, t.mla)
+            && (l.scale - t.scale).abs() <= 1e-6 * t.scale.abs();
+        if !same {
+            return differs(
+                &format!("layer {il} attention"),
+                format!("{l:?}"),
+                format!("{t:?}"),
+            );
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -959,5 +963,41 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(e.contains("keeps a K/V cache of its own"), "{e}");
+    }
+
+    /// The published drafter against the published target's header (no
+    /// weights are read): `CUCA_LOCAL_MODEL_PATH` (a `mistral4` GGUF) and
+    /// `CUCA_LOCAL_DRAFTER_PATH` (the drafter checkpoint directory). Skips
+    /// without them.
+    #[test]
+    fn the_published_drafter_matches_the_published_target_header() {
+        let (Some(model), Some(dir)) = (
+            std::env::var_os("CUCA_LOCAL_MODEL_PATH"),
+            std::env::var_os("CUCA_LOCAL_DRAFTER_PATH"),
+        ) else {
+            eprintln!("SKIP: set CUCA_LOCAL_MODEL_PATH and CUCA_LOCAL_DRAFTER_PATH");
+            return;
+        };
+        let out = std::env::temp_dir().join(format!("cuca-eagle-real-{}.gguf", std::process::id()));
+        convert(
+            &CheckpointDir::open(std::path::Path::new(&dir)).unwrap(),
+            &out,
+            WeightQuant::Q8_0,
+            None,
+        )
+        .unwrap();
+        let read = |p: &std::path::Path| {
+            gguf_file::Content::read(&mut BufReader::new(File::open(p).unwrap())).unwrap()
+        };
+        let (target, drafter) = (read(std::path::Path::new(&model)), read(&out));
+        let thp = read_hparams(&target).unwrap();
+        let vocab = target.tensor_infos["token_embd.weight"].shape.dims()[0];
+        let hp = read_hparams(&drafter).unwrap();
+        check_compat(&thp, vocab, &hp, &drafter).unwrap();
+        eprintln!(
+            "EAGLE header check: compatible, vocab {vocab}, {} layers",
+            hp.n_layer
+        );
+        let _ = std::fs::remove_file(&out);
     }
 }
