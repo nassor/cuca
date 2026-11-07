@@ -4212,9 +4212,67 @@ impl Weights {
         slots: &mut [DeltaSlot],
         ext: Option<&GpuExtKv>,
     ) -> Result<Tensor<2>, CucaError> {
+        let lw = &self.layers[il - self.first];
+        let h = match &lw.attn_norm {
+            Some(w) => rms(x.clone(), Some(w), self.hp.eps),
+            None => x.clone(),
+        };
+        match &lw.mixer {
+            Mixer::Mla(mw) => self.mla(il, h, mw, pass, kv),
+            Mixer::Delta(dw) => self.delta(il, h, dw, pass, slots),
+            Mixer::Attention(aw) => self.attention(il, h, aw, pass, kv, ext),
+        }
+    }
+
+    /// The gated delta-net mixer of layer `il` over the normed rows `h`: each
+    /// sequence's convolution and recurrence run from its slot's state, which
+    /// then moves to the end of its rows.
+    fn delta(
+        &self,
+        il: usize,
+        h: Tensor<2>,
+        dw: &DeltaWeights,
+        pass: &Pass,
+        slots: &mut [DeltaSlot],
+    ) -> Result<Tensor<2>, CucaError> {
+        let mut states = Vec::with_capacity(pass.seqs.len());
+        for seq in &pass.seqs {
+            let state = slots
+                .get(seq.slot)
+                .and_then(|s| s.layers.get(il))
+                .and_then(Option::as_ref)
+                .ok_or_else(|| {
+                    err(format!(
+                        "layer {il} has no recurrent state in slot {}",
+                        seq.slot
+                    ))
+                })?;
+            states.push((seq.off..seq.off + seq.t, state));
+        }
+        let (y, next) = dw.forward(h, &states, self.hp.eps);
+        for (seq, state) in pass.seqs.iter().zip(next) {
+            if let Some(s) = slots.get_mut(seq.slot).and_then(|s| s.layers.get_mut(il)) {
+                *s = Some(state);
+            }
+        }
+        Ok(y)
+    }
+
+    /// The attention mixer of layer `il` over the normed rows `h`: the
+    /// projections, norms and RoPE, the K/V writes of a layer that owns K/V,
+    /// the paged attention over the layer's source pools ([`attend_pass`]),
+    /// the output gate and the output projection.
+    fn attention(
+        &self,
+        il: usize,
+        h: Tensor<2>,
+        aw: &AttnWeights,
+        pass: &Pass,
+        kv: &mut KvLayers,
+        ext: Option<&GpuExtKv>,
+    ) -> Result<Tensor<2>, CucaError> {
         let hp = &self.hp;
         let spec = &hp.layers[il];
-        let lw = &self.layers[il - self.first];
         let eps = hp.eps;
         let (nh, nkv, d) = (spec.n_head, spec.n_kv_head, spec.head_dim);
         let t = pass.t;
@@ -4223,136 +4281,103 @@ impl Weights {
             None => m,
         };
 
-        let h = match &lw.attn_norm {
-            Some(w) => rms(x.clone(), Some(w), eps),
-            None => x.clone(),
+        // A gate projection of its own reads the same normed input.
+        let own_gate = aw.gate.as_ref().map(|g| g.forward(h.clone()));
+        let (q, kv_proj) = aw.project(h, nh, nkv, d);
+        let full_qk = hp.behavior.qk_norm_full;
+        let q = match &aw.q_norm {
+            Some(w) if full_qk => rms(q, Some(w), eps),
+            _ => q,
         };
-        let attn = match &lw.mixer {
-            Mixer::Mla(mw) => self.mla(il, h, mw, pass, kv)?,
-            Mixer::Delta(dw) => {
-                let mut states = Vec::with_capacity(pass.seqs.len());
-                for seq in &pass.seqs {
-                    let state = slots
-                        .get(seq.slot)
-                        .and_then(|s| s.layers.get(il))
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| {
-                            err(format!(
-                                "layer {il} has no recurrent state in slot {}",
-                                seq.slot
-                            ))
-                        })?;
-                    states.push((seq.off..seq.off + seq.t, state));
-                }
-                let (y, next) = dw.forward(h, &states, eps);
-                for (seq, state) in pass.seqs.iter().zip(next) {
-                    if let Some(s) = slots.get_mut(seq.slot).and_then(|s| s.layers.get_mut(il)) {
-                        *s = Some(state);
-                    }
-                }
-                y
-            }
-            Mixer::Attention(aw) => {
-                // A gate projection of its own reads the same normed input.
-                let own_gate = aw.gate.as_ref().map(|g| g.forward(h.clone()));
-                let (q, kv_proj) = aw.project(h, nh, nkv, d);
-                let full_qk = hp.behavior.qk_norm_full;
-                let q = match &aw.q_norm {
-                    Some(w) if full_qk => rms(q, Some(w), eps),
-                    _ => q,
-                };
-                // A gated attention packs `[query | gate]` per head into the query
-                // projection (each head's `2 * d` values contiguous).
-                let (q, gate) = if hp.behavior.gated_attention {
-                    let packed = q.reshape([t, nh, 2 * d]);
-                    (
-                        packed.clone().narrow(2, 0, d).reshape([1, t, nh, d]),
-                        Some(packed.narrow(2, d, d).reshape([t, nh * d])),
-                    )
-                } else {
-                    (q.reshape([1, t, nh, d]), None)
-                };
-                let gate = own_gate.or(gate);
-                let q = match &aw.q_norm {
-                    Some(w) if !full_qk => rms(q, Some(w), eps),
-                    _ => q,
-                };
-                let q = rotate(q.swap_dims(1, 2));
-                let q = match (&pass.q_scale, spec.rope) {
-                    (Some(s), Some(_)) => q * s.clone(),
-                    _ => q,
-                };
-                // Every sequence must have its window's blocks, also on the
-                // layers that only read.
-                for seq in &pass.seqs {
-                    seq.visible(il, spec.window)?;
-                }
-
-                if let Some((k, v)) = kv_proj {
-                    let k = match &aw.k_norm {
-                        Some(w) if full_qk => rms(k, Some(w), eps),
-                        _ => k,
-                    };
-                    let k = k.reshape([1, t, nkv, d]);
-                    let k = match &aw.k_norm {
-                        Some(w) if !full_qk => rms(k, Some(w), eps),
-                        _ => k,
-                    };
-                    let k = rotate(k.swap_dims(1, 2));
-                    let v = v.reshape([1, t, nkv, d]);
-                    let v = if aw.v_norm { rms(v, None, eps) } else { v };
-                    let v = v.swap_dims(1, 2);
-                    let mut pool = take_pool(kv, il)?;
-                    for seq in &pass.seqs {
-                        let (_, blocks) = seq.visible(il, spec.window)?;
-                        pool = pool.write(&blocks.writes, seq.off, &k, Some(&v));
-                    }
-                    kv[il] = Some(pool);
-                }
-
-                let src = spec.kv_source;
-                let (pool_k, pool_v) = if src == usize::MAX {
-                    // A drafter layer reads the target's pools.
-                    let ext = ext.ok_or_else(|| {
-                        err(format!(
-                            "layer {il}: a drafter layer needs the target's K/V"
-                        ))
-                    })?;
-                    let group = if spec.window.is_some() {
-                        &ext.sliding
-                    } else {
-                        &ext.full
-                    };
-                    (&group.k, &group.v)
-                } else {
-                    let pool = kv
-                        .get(src)
-                        .and_then(Option::as_ref)
-                        .ok_or_else(|| err(format!("layer {src} owns no K/V cache")))?;
-                    let v = pool.v.as_ref().ok_or_else(|| {
-                        err(format!(
-                            "layer {src} has a latent K/V cache, which holds no value pool"
-                        ))
-                    })?;
-                    (&pool.k, v)
-                };
-
-                let call = PagedCall {
-                    scale: spec.scale,
-                    v_width: None,
-                };
-                let attn = attend_pass(pass, il, spec.window, &q, pool_k, pool_v, &call)?
-                    .reshape([t, nh * d]);
-                let attn = match gate {
-                    Some(gate) => attn * activation::sigmoid(gate),
-                    None => attn,
-                };
-                // The output projection's product only: its bias is added
-                // after the shards' products are summed ([`Weights::attn_tail`]).
-                linear(attn, &aw.wo.w)
-            }
+        // A gated attention packs `[query | gate]` per head into the query
+        // projection (each head's `2 * d` values contiguous).
+        let (q, gate) = if hp.behavior.gated_attention {
+            let packed = q.reshape([t, nh, 2 * d]);
+            (
+                packed.clone().narrow(2, 0, d).reshape([1, t, nh, d]),
+                Some(packed.narrow(2, d, d).reshape([t, nh * d])),
+            )
+        } else {
+            (q.reshape([1, t, nh, d]), None)
         };
-        Ok(attn)
+        let gate = own_gate.or(gate);
+        let q = match &aw.q_norm {
+            Some(w) if !full_qk => rms(q, Some(w), eps),
+            _ => q,
+        };
+        let q = rotate(q.swap_dims(1, 2));
+        let q = match (&pass.q_scale, spec.rope) {
+            (Some(s), Some(_)) => q * s.clone(),
+            _ => q,
+        };
+        // Every sequence must have its window's blocks, also on the layers
+        // that only read.
+        for seq in &pass.seqs {
+            seq.visible(il, spec.window)?;
+        }
+
+        if let Some((k, v)) = kv_proj {
+            let k = match &aw.k_norm {
+                Some(w) if full_qk => rms(k, Some(w), eps),
+                _ => k,
+            };
+            let k = k.reshape([1, t, nkv, d]);
+            let k = match &aw.k_norm {
+                Some(w) if !full_qk => rms(k, Some(w), eps),
+                _ => k,
+            };
+            let k = rotate(k.swap_dims(1, 2));
+            let v = v.reshape([1, t, nkv, d]);
+            let v = if aw.v_norm { rms(v, None, eps) } else { v };
+            let v = v.swap_dims(1, 2);
+            let mut pool = take_pool(kv, il)?;
+            for seq in &pass.seqs {
+                let (_, blocks) = seq.visible(il, spec.window)?;
+                pool = pool.write(&blocks.writes, seq.off, &k, Some(&v));
+            }
+            kv[il] = Some(pool);
+        }
+
+        let src = spec.kv_source;
+        let (pool_k, pool_v) = if src == usize::MAX {
+            // A drafter layer reads the target's pools.
+            let ext = ext.ok_or_else(|| {
+                err(format!(
+                    "layer {il}: a drafter layer needs the target's K/V"
+                ))
+            })?;
+            let group = if spec.window.is_some() {
+                &ext.sliding
+            } else {
+                &ext.full
+            };
+            (&group.k, &group.v)
+        } else {
+            let pool = kv
+                .get(src)
+                .and_then(Option::as_ref)
+                .ok_or_else(|| err(format!("layer {src} owns no K/V cache")))?;
+            let v = pool.v.as_ref().ok_or_else(|| {
+                err(format!(
+                    "layer {src} has a latent K/V cache, which holds no value pool"
+                ))
+            })?;
+            (&pool.k, v)
+        };
+
+        let call = PagedCall {
+            scale: spec.scale,
+            v_width: None,
+        };
+        let attn =
+            attend_pass(pass, il, spec.window, &q, pool_k, pool_v, &call)?.reshape([t, nh * d]);
+        let attn = match gate {
+            Some(gate) => attn * activation::sigmoid(gate),
+            None => attn,
+        };
+        // The output projection's product only: its bias is added after the
+        // shards' products are summed ([`Weights::attn_tail`]).
+        Ok(linear(attn, &aw.wo.w))
     }
 
     /// The latent attention of layer `il` (Mistral Small 4) over the normed
@@ -4821,10 +4846,7 @@ const DEQUANT_SLICE_BYTES: usize = 64 << 20;
 ///   matrix-vector kernel of this crate (f32 accumulation straight from the
 ///   blocks, one thread per row and token). More rows dequantize slices of
 ///   the weight to f32 ([`mk::dense_dequant`]) and use burn's float matmul.
-///   burn's own quantized matmul is not used: its autotune keys do not hold
-///   the quantization scheme, its single-row path needs shapes that are
-///   multiples of the plane width, and the shapes it fell back on dequantized
-///   the whole weight on every token.
+///   burn's own quantized matmul is not used (see the module docs).
 /// - An **f32** chunk follows burn 0.22's rules on Vulkan: `t > 1` runs
 ///   `(w · xᵀ)ᵀ`; `t == 1` runs `x · wᵀ` ([`vecmat_fits`]) or, for other
 ///   shapes, a product of the token duplicated into two rows (the `vecmat`
