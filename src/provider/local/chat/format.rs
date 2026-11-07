@@ -486,6 +486,20 @@ pub(super) mod tests {
         );
         assert!(f.is_marker(5));
 
+        // The current Ministral 3 Reasoning template (the one the preset
+        // pins in place of the GGUF's): `[THINK]` and no call ids.
+        let ministral = include_str!("../testdata/templates/ministral3-reasoning.jinja");
+        let f = ChatFormat::detect(&metadata(0), &t, ministral).expect("detects");
+        assert_eq!(f.reasoning().map(|r| r.open.as_str()), Some("[THINK]"));
+        assert_eq!(
+            f.tool_syntax(),
+            &ToolSyntax::MistralArgs {
+                open: "[TOOL_CALLS]".into(),
+                args: "[ARGS]".into(),
+                call_id: None
+            }
+        );
+
         // A vocabulary without the control tokens leaves the output plain.
         let bare = tokenizer(&["</s>", "x"]);
         let f = ChatFormat::detect(&metadata(0), &bare, small_4).expect("detects");

@@ -1155,6 +1155,63 @@ pub(crate) fn build(
     })
 }
 
+/// `general.sampling.*` from `generation_config.json`, the way gguf-py's
+/// `Metadata.load` and `Metadata.set_gguf_meta_model` write them (llama.cpp
+/// master, and the pinned commit): `sequence` (string), `top_k`,
+/// `penalty_last_n` and `mirostat` (int32), `top_p`, `min_p`,
+/// `xtc_probability`, `xtc_threshold`, `temperature` (as `temp`),
+/// `penalty_repeat` (or `repetition_penalty`), `mirostat_tau` and
+/// `mirostat_eta` (float32). A key absent or `null` in the file writes
+/// nothing, an empty file writes nothing, and so does a value of the wrong
+/// type (the Python converter would fail on it). The engine itself reads
+/// `temp`, `top_k` and `top_p` only (`sampling.rs`).
+pub(crate) fn sampling_defaults(generation_config: Option<&Json>) -> Vec<(String, Value)> {
+    let Some(Json::Object(gen_cfg)) = generation_config else {
+        return Vec::new();
+    };
+    let int = |key: &str| -> Option<Value> {
+        let n = gen_cfg.get(key)?.as_i64()?;
+        i32::try_from(n).ok().map(Value::I32)
+    };
+    let float = |keys: &[&str]| -> Option<Value> {
+        // The first key present decides, even when it is null (Python's
+        // `get(a, get(b))`).
+        keys.iter()
+            .find_map(|k| gen_cfg.get(*k))?
+            .as_f64()
+            .map(|f| Value::F32(f as f32))
+    };
+    let text = |key: &str| -> Option<Value> {
+        gen_cfg
+            .get(key)?
+            .as_str()
+            .map(|s| Value::String(s.to_string()))
+    };
+    [
+        ("general.sampling.sequence", text("sequence")),
+        ("general.sampling.top_k", int("top_k")),
+        ("general.sampling.top_p", float(&["top_p"])),
+        ("general.sampling.min_p", float(&["min_p"])),
+        (
+            "general.sampling.xtc_probability",
+            float(&["xtc_probability"]),
+        ),
+        ("general.sampling.xtc_threshold", float(&["xtc_threshold"])),
+        ("general.sampling.temp", float(&["temperature"])),
+        ("general.sampling.penalty_last_n", int("penalty_last_n")),
+        (
+            "general.sampling.penalty_repeat",
+            float(&["penalty_repeat", "repetition_penalty"]),
+        ),
+        ("general.sampling.mirostat", int("mirostat")),
+        ("general.sampling.mirostat_tau", float(&["mirostat_tau"])),
+        ("general.sampling.mirostat_eta", float(&["mirostat_eta"])),
+    ]
+    .into_iter()
+    .filter_map(|(key, value)| Some((key.to_string(), value?)))
+    .collect()
+}
+
 /// Load the metadata through the engine's own reader, so a key the engine
 /// needs but the converter did not write fails the conversion, naming it.
 ///
@@ -1210,6 +1267,50 @@ mod tests {
             Value::U32(16)
         ));
         assert!(matches!(get(&m, "llama.rope.freq_base"), Value::F32(f) if *f == 500000.0));
+    }
+
+    /// `generation_config.json` becomes `general.sampling.*` like gguf-py's
+    /// `Metadata`: names, types, `repetition_penalty` as a fallback, nothing
+    /// for absent or null keys, and nothing at all for no file.
+    #[test]
+    fn generation_config_writes_the_sampling_keys() {
+        let kv = sampling_defaults(Some(&serde_json::json!({
+            "bos_token_id": 2, "do_sample": true, "max_length": 4096,
+            "temperature": 0.6, "top_k": 20, "top_p": 0.95, "min_p": 0.05,
+            "repetition_penalty": 1.1, "penalty_last_n": 64, "top_a": null
+        })));
+        let get = |key: &str| kv.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone());
+        assert!(matches!(get("general.sampling.temp"), Some(Value::F32(t)) if t == 0.6f32));
+        assert!(matches!(
+            get("general.sampling.top_k"),
+            Some(Value::I32(20))
+        ));
+        assert!(matches!(get("general.sampling.top_p"), Some(Value::F32(p)) if p == 0.95f32));
+        assert!(matches!(get("general.sampling.min_p"), Some(Value::F32(p)) if p == 0.05f32));
+        assert!(
+            matches!(get("general.sampling.penalty_repeat"), Some(Value::F32(p)) if p == 1.1f32)
+        );
+        assert!(matches!(
+            get("general.sampling.penalty_last_n"),
+            Some(Value::I32(64))
+        ));
+        assert_eq!(kv.len(), 6, "{kv:?}: no key for the other fields");
+        // `penalty_repeat` wins over `repetition_penalty`; an integer is a float.
+        let kv = sampling_defaults(Some(&serde_json::json!({
+            "penalty_repeat": 1.2, "repetition_penalty": 1.1, "top_p": 1
+        })));
+        assert!(matches!(&kv[..], [(a, Value::F32(p)), (b, Value::F32(r))]
+            if a == "general.sampling.top_p" && *p == 1.0
+            && b == "general.sampling.penalty_repeat" && *r == 1.2f32));
+        // Mistral-style files name no sampling field: no keys.
+        assert!(
+            sampling_defaults(Some(
+                &serde_json::json!({"bos_token_id": 1, "max_length": 262144})
+            ))
+            .is_empty()
+        );
+        assert!(sampling_defaults(Some(&serde_json::json!({}))).is_empty());
+        assert!(sampling_defaults(None).is_empty());
     }
 
     #[test]

@@ -272,6 +272,7 @@ fn convert_locked(
     let plans = tensors::plan(arch, &hp, &shards, meta.extra, n_vocab)?;
 
     let mut kv = meta.kv;
+    kv.extend(config::sampling_defaults(ck.generation_config.as_ref()));
     if let Some(v) = vocab {
         kv.extend(v.kv);
     }

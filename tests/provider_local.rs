@@ -23,6 +23,9 @@
 //! test prints `SKIP: local model not available: ...` and passes, unless
 //! `CUCA_REQUIRE_LIVE=1` turns the skip into a panic.
 //!
+//! `CUCA_LOCAL_CHAT_TEMPLATE=<path to a .jinja file>` sets
+//! `LocalModelConfig::chat_template` (the template replaces the GGUF's).
+//!
 //! `CUCA_LOCAL_DEVICE` selects where the model runs (`LocalDevice` syntax):
 //! `cpu` (the default), `vulkan`, `vulkan:<n>`, `metal`, `cuda[:<n>]` or
 //! `rocm[:<n>]`; a GPU device needs its feature
@@ -367,6 +370,14 @@ async fn loaded() -> Option<Loaded> {
                 config
                     .set_devices(&devices)
                     .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
+            }
+            if let Ok(path) = std::env::var("CUCA_LOCAL_CHAT_TEMPLATE")
+                && !path.is_empty()
+            {
+                config.chat_template = Some(
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_CHAT_TEMPLATE={path:?}: {e}")),
+                );
             }
             println!("MATRIX|devices|{:?} + {:?}", config.device, config.shards);
             let started = std::time::Instant::now();

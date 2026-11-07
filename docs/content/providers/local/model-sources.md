@@ -21,13 +21,13 @@ weight = 4
 `LocalModelConfig::source` is a `ModelSource`:
 
 - `ModelSource::File(path)` is a GGUF file already on disk; nothing is downloaded. A file named like a split part (`<base>-00001-of-0000N.gguf`) is merged with its siblings, see [Split GGUF files](#split-gguf-files).
-- `ModelSource::HuggingFace { repo, revision, file, sha256, parts }` is a file on Hugging Face. `sha256: None` skips the checksum. `parts` is empty for a single file; for a split GGUF it lists every part with its digest (see [Split GGUF files](#split-gguf-files)).
+- `ModelSource::HuggingFace { repo, revision, file, sha256, parts, template }` is a file on Hugging Face. `sha256: None` skips the checksum. `parts` is empty for a single file; for a split GGUF it lists every part with its digest (see [Split GGUF files](#split-gguf-files)). `template` is `None`, or a `ModelTemplate { repo, revision, file, sha256 }`: a chat template file that replaces the GGUF's (see [Chat templates](#chat-templates)).
 - `ModelSource::hugging_face(repo, revision, file)` builds the same value with `sha256: None`, so the download is not verified (`parts` is empty). Use a commit hash as the revision, because the cache is keyed by it and a moving ref such as `main` pins a stale file.
 - `ModelSource::default_model()` is the preset `gemma4-e2b-q4_0`.
 - `ModelSource::Checkpoint { repo, revision }` is a Hugging Face safetensors checkpoint, and `ModelSource::Dir(path)` a checkpoint directory on disk. Both are converted to a cached GGUF (see [Checkpoints](#checkpoints)).
 - `"name".parse::<ModelSource>()?` accepts a preset name (ASCII case-insensitive), `repo:revision:file` (a GGUF, none of the three parts contains `:`), or `repo:revision` (a checkpoint: `repo` is `owner/name`). The result of `repo:revision:file` has no checksum; a checkpoint is pinned by its revision only. Anything else fails with `` unknown model `…`: expected a preset (…), `repo:revision:file` (a GGUF), or `repo:revision` (a checkpoint) ``.
 
-`ModelSource::PRESETS` has 25 entries, each pinned to one Hugging Face commit and one SHA-256. A `ModelPreset` has `name`, `repo`, `revision`, `file`, `sha256`, `size_bytes`, `architecture`, `drafter` and `parts` (empty unless the model is a split GGUF; a `PresetPart` is `file`, `sha256`, `size_bytes`). `preset.source()` returns its pinned `ModelSource`, and `ModelSource::preset(name)` finds one by name. A preset with `drafter: true` is used through `LocalModelConfig::drafter` and cannot be loaded as the main model. The table with sizes and K/V cost is on [Local models and formats](@/providers/local/models.md#presets).
+`ModelSource::PRESETS` has 25 entries, each pinned to one Hugging Face commit and one SHA-256. A `ModelPreset` has `name`, `repo`, `revision`, `file`, `sha256`, `size_bytes`, `architecture`, `drafter`, `parts` (empty unless the model is a split GGUF; a `PresetPart` is `file`, `sha256`, `size_bytes`) and `template` (`None`, or a `PresetTemplate` of `repo`, `revision`, `file`, `sha256`: see [Chat templates](#chat-templates)). `preset.source()` returns its pinned `ModelSource`, and `ModelSource::preset(name)` finds one by name. A preset with `drafter: true` is used through `LocalModelConfig::drafter` and cannot be loaded as the main model. The table with sizes and K/V cost is on [Local models and formats](@/providers/local/models.md#presets).
 
 ```rust,name=List the presets
 use cuca::ModelSource;
@@ -64,6 +64,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 A file of an architecture the engine does not know fails to load with a `CucaError::Provider` that names the architecture and lists the supported ones. The chat template and the tokenizer come from the file; a tokenizer model the engine does not implement fails the same way.
+
+## Chat templates
+
+The chat template normally comes from the GGUF (`tokenizer.chat_template`). Two things replace it, as llama.cpp's `--chat-template-file` and vLLM's `--chat-template` do:
+
+- `LocalModelConfig::chat_template: Option<String>`, the template text (the live tests and `examples/local_model.rs` read it from the file `CUCA_LOCAL_CHAT_TEMPLATE` names). It wins over everything else.
+- A template a source pins: `ModelSource::HuggingFace::template`, which a preset sets through `ModelPreset::template`. The file is downloaded once into the cache like a model file (`<cache>/huggingface/<repo>/<revision>/<file>`), verified against its SHA-256, and read at load.
+
+The replacement is used for everything derived from the template: the reasoning markers and whether a request can switch reasoning off, the tool-call syntax, the end-of-turn tokens, and the `enable_thinking`, `reasoning_effort` and `reasoning_strength` variables. A template that does not compile, or cannot render a one-message conversation, fails the load with `CucaError::Config` (`chat_template override does not compile: …` or `… does not render a one-message conversation: …`), not the first request.
+
+Published GGUFs often embed an older template than their original repository. `ministral3-3b-reasoning-q4_0` pins `chat_template.jinja` of `mistralai/Ministral-3-3B-Reasoning-2512` at revision `4a36357c` ("update to match mistral-common", 2026-07-15), because every GGUF of that model (mistralai, ggml-org, lmstudio-community, unsloth, bartowski) embeds the December 2025 template instead. `muse-glimmer-30b-q8_0` is ggml-org's file because its embedded template is byte-identical to the repository's current one (bartowski's Q4_0 embeds the earlier one, which differs when a system prompt mentions "Reasoning effort").
 
 ## Checkpoints
 

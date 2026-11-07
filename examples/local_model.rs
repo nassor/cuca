@@ -66,6 +66,8 @@
 //!   `BatchingConfig`): any subset of `seqs=4,kv=16384,step=256,prefix=off`.
 //!   This example sends one request, so it only changes the memory it reserves
 //!   (`kv` sizes the shared K/V pool).
+//! - `CUCA_LOCAL_CHAT_TEMPLATE`: path of a Jinja chat template (`.jinja`) that
+//!   replaces the one in the GGUF (`LocalModelConfig::chat_template`).
 //! - `CUCA_CACHE_DIR`: download cache directory, defaults to the platform cache
 //!   directory.
 //! - `HF_TOKEN`: Hugging Face token, only needed for gated mirrors.
@@ -150,6 +152,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         && !batching.is_empty()
     {
         config.batching = batching.parse()?;
+    }
+    if let Ok(path) = std::env::var("CUCA_LOCAL_CHAT_TEMPLATE")
+        && !path.is_empty()
+    {
+        config.chat_template = Some(std::fs::read_to_string(&path)?);
     }
     let devices = std::iter::once(config.device)
         .chain(config.shards.iter().copied())

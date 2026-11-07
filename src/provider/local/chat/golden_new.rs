@@ -1,5 +1,9 @@
 //! Golden chat-template renders for the architectures added after the first
-//! catalog (`golden.rs`): Muse Glimmer, Mistral Small 4 and Mistral Small 3.2.
+//! catalog (`golden.rs`): Muse Glimmer (the current repository template,
+//! `meta-models/Muse-Glimmer-30B` at cec94fcf), Mistral Small 4, Mistral Small
+//! 3.2 and Ministral 3 Reasoning (the current `chat_template.jinja` of
+//! `mistralai/Ministral-3-3B-Reasoning-2512` at 4a36357c, the template the
+//! preset pins).
 //!
 //! `testdata/chat_golden_new.json` maps an entry name to its `template`
 //! (`testdata/templates/<name>.jinja`, the model repository's own
@@ -25,6 +29,7 @@ fn template_source(name: &str) -> &'static str {
         "muse-glimmer" => include_str!("../testdata/templates/muse-glimmer.jinja"),
         "mistral-small-4" => include_str!("../testdata/templates/mistral-small-4.jinja"),
         "mistral-small-3.2" => include_str!("../testdata/templates/mistral-small-3.2.jinja"),
+        "ministral3-reasoning" => include_str!("../testdata/templates/ministral3-reasoning.jinja"),
         other => panic!("no template fixture for {other}"),
     }
 }

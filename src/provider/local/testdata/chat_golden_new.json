@@ -1,4 +1,1376 @@
 {
+ "ministral-3-reasoning": {
+  "bos": "<s>",
+  "cases": {
+   "answer_after_tool": {
+    "messages": [
+     {
+      "content": "Weather?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Oslo"
+         },
+         "name": "get_weather"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "cold",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "c1"
+     },
+     {
+      "content": "It is cold.",
+      "role": "assistant"
+     },
+     {
+      "content": "Thanks",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "complex_args": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "a_list": [
+           1,
+           2,
+           "x"
+          ],
+          "b_flag": true,
+          "c_none": null,
+          "d_obj": {
+           "k": "v",
+           "n": 1.5
+          },
+          "e_text": "line1\nline2 é \"q\"",
+          "f_num": 42,
+          "g_str_num": "42"
+         },
+         "name": "calc"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "default_system_with_reasoning_history": {
+    "messages": [
+     {
+      "content": "Think.",
+      "role": "user"
+     },
+     {
+      "content": "Done.",
+      "reasoning_content": "Let me think.",
+      "role": "assistant"
+     },
+     {
+      "content": "Again.",
+      "role": "user"
+     },
+     {
+      "content": "Fine.",
+      "reasoning": "Short.",
+      "role": "assistant"
+     },
+     {
+      "content": "Last.",
+      "role": "user"
+     }
+    ],
+    "thinking": "on"
+   },
+   "empty_args": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {},
+         "name": "calc"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "empty_string_args": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "",
+         "name": "calc"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "empty_tools_list": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "tools": []
+   },
+   "error_assistant_first": {
+    "messages": [
+     {
+      "content": "Hello",
+      "role": "assistant"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ]
+   },
+   "error_bad_role": {
+    "messages": [
+     {
+      "content": "a",
+      "role": "user"
+     },
+     {
+      "content": "x",
+      "role": "developer"
+     }
+    ]
+   },
+   "error_empty_assistant": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant"
+     }
+    ]
+   },
+   "error_empty_user_content": {
+    "messages": [
+     {
+      "content": [],
+      "role": "user"
+     }
+    ]
+   },
+   "error_tool_first": {
+    "messages": [
+     {
+      "content": "x",
+      "role": "tool",
+      "tool_call_id": "c1"
+     },
+     {
+      "content": "a",
+      "role": "user"
+     }
+    ]
+   },
+   "multi_turn": {
+    "messages": [
+     {
+      "content": "What is 2+2?",
+      "role": "user"
+     },
+     {
+      "content": "4",
+      "role": "assistant"
+     },
+     {
+      "content": "And 3+3?",
+      "role": "user"
+     }
+    ]
+   },
+   "parallel_calls": {
+    "messages": [
+     {
+      "content": "Both.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Paris"
+         },
+         "name": "get_weather"
+        },
+        "id": "c1",
+        "type": "function"
+       },
+       {
+        "function": {
+         "arguments": {
+          "q": "rain"
+         },
+         "name": "web.search"
+        },
+        "id": "c2",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "18C",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "c1"
+     },
+     {
+      "content": "none",
+      "name": "web.search",
+      "role": "tool",
+      "tool_call_id": "c2"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     },
+     {
+      "function": {
+       "description": "Search the web.",
+       "name": "web.search",
+       "parameters": {
+        "properties": {
+         "q": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "q"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "plain": {
+    "messages": [
+     {
+      "content": "Hello",
+      "role": "user"
+     }
+    ]
+   },
+   "reasoning_and_blocks_conflict": {
+    "messages": [
+     {
+      "content": "x",
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "thinking": "A",
+        "type": "thinking"
+       }
+      ],
+      "reasoning_content": "B",
+      "role": "assistant"
+     }
+    ]
+   },
+   "reasoning_history": {
+    "messages": [
+     {
+      "content": "Think.",
+      "role": "user"
+     },
+     {
+      "content": "Done.",
+      "reasoning_content": "Let me think about it.",
+      "role": "assistant"
+     },
+     {
+      "content": "Again.",
+      "role": "user"
+     }
+    ]
+   },
+   "reasoning_key": {
+    "messages": [
+     {
+      "content": "Think.",
+      "role": "user"
+     },
+     {
+      "content": "Done.",
+      "reasoning": "Short thought.",
+      "role": "assistant"
+     },
+     {
+      "content": "Again.",
+      "role": "user"
+     }
+    ]
+   },
+   "reasoning_then_call": {
+    "messages": [
+     {
+      "content": "Weather?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "reasoning_content": "I should call the tool.",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Oslo"
+         },
+         "name": "get_weather"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "same_role_twice": {
+    "messages": [
+     {
+      "content": "a",
+      "role": "user"
+     },
+     {
+      "content": "b",
+      "role": "assistant"
+     },
+     {
+      "content": "c",
+      "role": "assistant"
+     },
+     {
+      "content": "d",
+      "role": "user"
+     }
+    ]
+   },
+   "string_args": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": "{\"city\": \"Oslo\", \"unit\":\"c\"}",
+         "name": "get_weather"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "cold",
+      "role": "tool",
+      "tool_call_id": "c1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "system_in_the_middle": {
+    "messages": [
+     {
+      "content": "a",
+      "role": "user"
+     },
+     {
+      "content": "Switch.",
+      "role": "system"
+     },
+     {
+      "content": "b",
+      "role": "user"
+     }
+    ]
+   },
+   "system_list_content": {
+    "messages": [
+     {
+      "content": [
+       {
+        "text": "Be nice.",
+        "type": "text"
+       }
+      ],
+      "role": "system"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ]
+   },
+   "system_prompt_mentions_think": {
+    "messages": [
+     {
+      "content": "Use [THINK] blocks.",
+      "role": "system"
+     },
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on"
+   },
+   "system_user": {
+    "messages": [
+     {
+      "content": "You are concise.",
+      "role": "system"
+     },
+     {
+      "content": "Hi there",
+      "role": "user"
+     }
+    ]
+   },
+   "text_and_call": {
+    "messages": [
+     {
+      "content": "Weather?",
+      "role": "user"
+     },
+     {
+      "content": "Let me check.",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Oslo"
+         },
+         "name": "get_weather"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "cold",
+      "role": "tool",
+      "tool_call_id": "c1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "thinking_block_in_content": {
+    "messages": [
+     {
+      "content": "Think.",
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "thinking": "Hmm.",
+        "type": "thinking"
+       },
+       {
+        "text": "Done.",
+        "type": "text"
+       }
+      ],
+      "role": "assistant"
+     },
+     {
+      "content": "Again.",
+      "role": "user"
+     }
+    ]
+   },
+   "thinking_block_unclosed": {
+    "messages": [
+     {
+      "content": "Think.",
+      "role": "user"
+     },
+     {
+      "content": [
+       {
+        "closed": false,
+        "thinking": "Hmm.",
+        "type": "thinking"
+       }
+      ],
+      "role": "assistant"
+     },
+     {
+      "content": "Again.",
+      "role": "user"
+     }
+    ]
+   },
+   "thinking_off": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "off"
+   },
+   "thinking_off_tools": {
+    "messages": [
+     {
+      "content": "Weather?",
+      "role": "user"
+     }
+    ],
+    "thinking": "off",
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "thinking_on": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on"
+   },
+   "thinking_on_high": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on:high"
+   },
+   "thinking_on_low": {
+    "messages": [
+     {
+      "content": "Hi",
+      "role": "user"
+     }
+    ],
+    "thinking": "on:low"
+   },
+   "thinking_on_tools": {
+    "messages": [
+     {
+      "content": "Be brief.",
+      "role": "system"
+     },
+     {
+      "content": "Weather?",
+      "role": "user"
+     }
+    ],
+    "thinking": "on",
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tool_calls_in_two_messages": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "one",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "expr": "1"
+         },
+         "name": "calc"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "two",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "expr": "2"
+         },
+         "name": "calc"
+        },
+        "id": "c2",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "1",
+      "role": "tool",
+      "tool_call_id": "c1"
+     },
+     {
+      "content": "2",
+      "role": "tool",
+      "tool_call_id": "c2"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tool_list_content": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "expr": "1"
+         },
+         "name": "calc"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": [
+       {
+        "text": "two",
+        "type": "text"
+       },
+       {
+        "text": "parts",
+        "type": "text"
+       }
+      ],
+      "role": "tool",
+      "tool_call_id": "c1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tool_result_multiline": {
+    "messages": [
+     {
+      "content": "Go.",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "expr": "1+1"
+         },
+         "name": "calc"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "line1\nline2 \"quoted\" é",
+      "role": "tool",
+      "tool_call_id": "c1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Calculate.",
+       "name": "calc",
+       "parameters": {
+        "properties": {
+         "expr": {
+          "type": "string"
+         }
+        },
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tool_round_trip": {
+    "messages": [
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Paris"
+         },
+         "name": "get_weather"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "sunny",
+      "name": "get_weather",
+      "role": "tool",
+      "tool_call_id": "c1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tool_round_trip_no_name": {
+    "messages": [
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     },
+     {
+      "content": "",
+      "role": "assistant",
+      "tool_calls": [
+       {
+        "function": {
+         "arguments": {
+          "city": "Paris"
+         },
+         "name": "get_weather"
+        },
+        "id": "c1",
+        "type": "function"
+       }
+      ]
+     },
+     {
+      "content": "sunny",
+      "role": "tool",
+      "tool_call_id": "c1"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tools_declared": {
+    "messages": [
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     },
+     {
+      "function": {
+       "description": "Search the web.",
+       "name": "web.search",
+       "parameters": {
+        "properties": {
+         "q": {
+          "type": "string"
+         }
+        },
+        "required": [
+         "q"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tools_two_user_turns": {
+    "messages": [
+     {
+      "content": "a",
+      "role": "user"
+     },
+     {
+      "content": "b",
+      "role": "assistant"
+     },
+     {
+      "content": "Weather?",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "tools_with_system": {
+    "messages": [
+     {
+      "content": "Be brief.",
+      "role": "system"
+     },
+     {
+      "content": "Weather in Paris?",
+      "role": "user"
+     }
+    ],
+    "tools": [
+     {
+      "function": {
+       "description": "Get the weather.",
+       "name": "get_weather",
+       "parameters": {
+        "properties": {
+         "city": {
+          "type": "string"
+         },
+         "unit": {
+          "enum": [
+           "c",
+           "f"
+          ],
+          "type": "string"
+         }
+        },
+        "required": [
+         "city"
+        ],
+        "type": "object"
+       }
+      },
+      "type": "function"
+     }
+    ]
+   },
+   "unicode": {
+    "messages": [
+     {
+      "content": "日本語 éè 😀 \"quotes\" <tag> & more",
+      "role": "user"
+     }
+    ]
+   },
+   "user_list_content": {
+    "messages": [
+     {
+      "content": [
+       {
+        "text": "part one",
+        "type": "text"
+       },
+       {
+        "text": "part two",
+        "type": "text"
+       }
+      ],
+      "role": "user"
+     }
+    ]
+   },
+   "user_twice": {
+    "messages": [
+     {
+      "content": "a",
+      "role": "user"
+     },
+     {
+      "content": "b",
+      "role": "user"
+     }
+    ]
+   }
+  },
+  "eos": "</s>",
+  "renders": {
+   "answer_after_tool": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather?[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Oslo\"}</s>[TOOL_RESULTS]cold[/TOOL_RESULTS]It is cold.</s>[INST]Thanks[/INST]",
+   "complex_args": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Go.[/INST][TOOL_CALLS]calc[ARGS]{\"a_list\": [1, 2, \"x\"], \"b_flag\": true, \"c_none\": null, \"d_obj\": {\"k\": \"v\", \"n\": 1.5}, \"e_text\": \"line1\\nline2 é \\\"q\\\"\", \"f_num\": 42, \"g_str_num\": \"42\"}</s>",
+   "default_system_with_reasoning_history": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Think.[/INST][THINK]Let me think.[/THINK]Done.</s>[INST]Again.[/INST][THINK]Short.[/THINK]Fine.</s>[INST]Last.[/INST]",
+   "empty_args": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Go.[/INST][TOOL_CALLS]calc[ARGS]{}</s>",
+   "empty_string_args": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Go.[/INST][TOOL_CALLS]calc[ARGS]{}</s>",
+   "empty_tools_list": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "error_assistant_first": {
+    "error": "Conversation must start with a user or system message, got assistant."
+   },
+   "error_bad_role": {
+    "error": "Unexpected role 'developer' after role 'user'"
+   },
+   "error_empty_assistant": {
+    "error": "Assistant message must have a string or a list of chunks in content or a list of tool calls."
+   },
+   "error_empty_user_content": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST][/INST]",
+   "error_tool_first": {
+    "error": "Conversation must start with a user or system message, got tool."
+   },
+   "multi_turn": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]What is 2+2?[/INST]4</s>[INST]And 3+3?[/INST]",
+   "parallel_calls": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"web.search\", \"description\": \"Search the web.\", \"parameters\": {\"properties\": {\"q\": {\"type\": \"string\"}}, \"required\": [\"q\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Both.[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}[TOOL_CALLS]web.search[ARGS]{\"q\": \"rain\"}</s>[TOOL_RESULTS]18C[/TOOL_RESULTS][TOOL_RESULTS]none[/TOOL_RESULTS]",
+   "plain": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Hello[/INST]",
+   "reasoning_and_blocks_conflict": {
+    "error": "Message cannot have both thinking chunks in content and a top-level `reasoning` or `reasoning_content` field."
+   },
+   "reasoning_history": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Think.[/INST][THINK]Let me think about it.[/THINK]Done.</s>[INST]Again.[/INST]",
+   "reasoning_key": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Think.[/INST][THINK]Short thought.[/THINK]Done.</s>[INST]Again.[/INST]",
+   "reasoning_then_call": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather?[/INST][THINK]I should call the tool.[/THINK][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Oslo\"}</s>",
+   "same_role_twice": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]a[/INST]b\n\nc</s>[INST]d[/INST]",
+   "string_args": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Go.[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Oslo\", \"unit\":\"c\"}</s>[TOOL_RESULTS]cold[/TOOL_RESULTS]",
+   "system_in_the_middle": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]a[/INST][SYSTEM_PROMPT]Switch.[/SYSTEM_PROMPT][INST]b[/INST]",
+   "system_list_content": "<s>[SYSTEM_PROMPT]Be nice.[/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "system_prompt_mentions_think": "<s>[SYSTEM_PROMPT]Use [THINK] blocks.[/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "system_user": "<s>[SYSTEM_PROMPT]You are concise.[/SYSTEM_PROMPT][INST]Hi there[/INST]",
+   "text_and_call": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather?[/INST]Let me check.[TOOL_CALLS]get_weather[ARGS]{\"city\": \"Oslo\"}</s>[TOOL_RESULTS]cold[/TOOL_RESULTS]",
+   "thinking_block_in_content": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Think.[/INST][THINK]Hmm.[/THINK]Done.</s>[INST]Again.[/INST]",
+   "thinking_block_unclosed": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Think.[/INST][THINK]Hmm.</s>[INST]Again.[/INST]",
+   "thinking_off": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "thinking_off_tools": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather?[/INST]",
+   "thinking_on": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "thinking_on_high": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "thinking_on_low": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]Hi[/INST]",
+   "thinking_on_tools": "<s>[SYSTEM_PROMPT]Be brief.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather?[/INST]",
+   "tool_calls_in_two_messages": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Go.[/INST]one\n\ntwo[TOOL_CALLS]calc[ARGS]{\"expr\": \"1\"}[TOOL_CALLS]calc[ARGS]{\"expr\": \"2\"}</s>[TOOL_RESULTS]1[/TOOL_RESULTS][TOOL_RESULTS]2[/TOOL_RESULTS]",
+   "tool_list_content": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Go.[/INST][TOOL_CALLS]calc[ARGS]{\"expr\": \"1\"}</s>[TOOL_RESULTS][{'text': 'two', 'type': 'text'}, {'text': 'parts', 'type': 'text'}][/TOOL_RESULTS]",
+   "tool_result_multiline": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"calc\", \"description\": \"Calculate.\", \"parameters\": {\"properties\": {\"expr\": {\"type\": \"string\"}}, \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Go.[/INST][TOOL_CALLS]calc[ARGS]{\"expr\": \"1+1\"}</s>[TOOL_RESULTS]line1\nline2 \"quoted\" é[/TOOL_RESULTS]",
+   "tool_round_trip": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather in Paris?[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}</s>[TOOL_RESULTS]sunny[/TOOL_RESULTS]",
+   "tool_round_trip_no_name": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather in Paris?[/INST][TOOL_CALLS]get_weather[ARGS]{\"city\": \"Paris\"}</s>[TOOL_RESULTS]sunny[/TOOL_RESULTS]",
+   "tools_declared": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}, {\"type\": \"function\", \"function\": {\"name\": \"web.search\", \"description\": \"Search the web.\", \"parameters\": {\"properties\": {\"q\": {\"type\": \"string\"}}, \"required\": [\"q\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather in Paris?[/INST]",
+   "tools_two_user_turns": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]a[/INST]b</s>[INST]Weather?[/INST]",
+   "tools_with_system": "<s>[SYSTEM_PROMPT]Be brief.[/SYSTEM_PROMPT][AVAILABLE_TOOLS][{\"type\": \"function\", \"function\": {\"name\": \"get_weather\", \"description\": \"Get the weather.\", \"parameters\": {\"properties\": {\"city\": {\"type\": \"string\"}, \"unit\": {\"enum\": [\"c\", \"f\"], \"type\": \"string\"}}, \"required\": [\"city\"], \"type\": \"object\"}}}][/AVAILABLE_TOOLS][INST]Weather in Paris?[/INST]",
+   "unicode": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]日本語 éè 😀 \"quotes\" <tag> & more[/INST]",
+   "user_list_content": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]part one\n\npart two[/INST]",
+   "user_twice": "<s>[SYSTEM_PROMPT]# HOW YOU SHOULD THINK AND ANSWER\n\nFirst draft your thinking process (inner monologue) until you arrive at a response. Format your response using Markdown, and use LaTeX for any mathematical equations. Write both your thoughts and the response in the same language as the input.\n\nYour thinking process must follow the template below:[THINK]Your thoughts or/and draft, like working through an exercise on scratch paper. Be as casual and as long as you want until you are confident to generate the response to the user.[/THINK]Here, provide a self-contained response.[/SYSTEM_PROMPT][INST]a\n\nb[/INST]"
+  },
+  "template": "ministral3-reasoning"
+ },
  "mistral-small-3.2": {
   "bos": "<s>",
   "cases": {
