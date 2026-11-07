@@ -131,7 +131,7 @@
   recurrent state snapshot, taken below the last end of turn token of each prompt. Breaking:
   `prompt_cache_usage.read_tokens` is a multiple of 16 (the trailing partial block, at most 15
   tokens, is recomputed); the pool of a full attention layer group holds twice `context_length`
-  positions, so `LocalModel::kv_cache_bytes` grows (Gemma 4 E2B at 8192: 422 MB); and CPU attention
+  positions, so `LocalModel::kv_cache_bytes` grows (Gemma 4 E2B at 8192: 481 MB); and CPU attention
   sums in a different order than candle's matmul attention, so a greedy reply can differ from 0.6.2
   where two logits are close.
 - `provider-local`: continuous batching. The engine is a step scheduler: up to
