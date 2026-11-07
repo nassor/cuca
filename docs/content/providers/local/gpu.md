@@ -109,17 +109,17 @@ Each layer's K/V pool lives on its layer's device under the same block tables, a
 
 Measured on this machine (Ryzen 9 9950X3D2, RX 9070 XT, Windows, native release build, `perf_long_prompt`, a 1,100-token prompt and 96 generated tokens, runs back to back on a quiet machine with 14-14.7 GiB of the 15.9 GiB card free):
 
-| Model and mode | Decode, tokens/s | Prefill of the whole prompt, no prefix hit (after the first run) | Device memory (peak) |
+| Model and mode | Decode, tokens/s | Prefill of the whole prompt, no prefix hit (after the first run) | Adapter memory in use at the peak, GiB (1.2-1.9 before the run) |
 |---|---|---|---|
 | `mistral-small-4-119b-q4_0`, CPU only | 11.2-11.4 | 33.5-33.8 s (33 tokens/s) | 0 |
-| the same, GPU with `host` experts | 8.0-8.3 | 22.0-28.3 s (39-51 tokens/s) | 9.9 GiB |
+| the same, GPU with `host` experts | 8.0-8.3 | 22.0-28.3 s (39-51 tokens/s) | 9.9 |
 | `qwen3.6-35b-a3b-q4_0`, CPU only | 18.2-18.8 | (first run 24.3 s) | 0 |
-| the same, GPU with `host` experts | 9.3-9.9 | (first run 50.7 s) | 10.7 GiB |
-| the same, GPU with `tiered:device=6g,ram=12g` | 11.0-11.2 | (first run 33.4 s) | 14.0 GiB |
+| the same, GPU with `host` experts | 9.3-9.9 | (first run 50.7 s) | 10.7 |
+| the same, GPU with `tiered:device=6g,ram=12g` | 11.0-11.2 | (first run 33.4 s) | 14.0 |
 | `muse-glimmer-30b-q4_0`, CPU only | 3.6 | | 0 |
-| the same, `gpu_layers = 26` of 52 | 3.0-3.1 | | 12.5 GiB (14.4 GiB used of 15.9 with the desktop) |
-| `gemma4-e2b-q4_0`, GPU only | 30.6 | | 4.3 GiB |
-| the same, `gpu_layers = 17` of 35 | 22.3 | | 3.5 GiB |
+| the same, `gpu_layers = 26` of 52 | 3.0-3.1 | | 14.4 |
+| `gemma4-e2b-q4_0`, GPU only | 30.6 | | 6.0 |
+| the same, `gpu_layers = 17` of 35 | 22.3 | | 5.2 |
 | the same, CPU only | 27.6 | | 0 |
 
 The GPU modes therefore win only the Mistral Small 4 prefill; they lose decode everywhere on this machine, and none of them is a speedup for decode:
