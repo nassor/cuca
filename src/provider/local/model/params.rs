@@ -499,113 +499,14 @@ impl Hparams {
             kv_sources(&sliding, n_layer_kv)?
         };
 
-        // Hybrid stacks: the full-attention interval and the delta-net
-        // dimensions. Layer `il` is full attention when `(il + 1)` is a
-        // multiple of the interval, a delta-net layer otherwise.
-        let nonzero = |key: &str| -> Result<usize, CucaError> {
-            match k.usize(key)? {
-                0 => Err(meta_err(
-                    &format!("{}.{key}", arch.name()),
-                    "must be non-zero",
-                )),
-                n => Ok(n),
-            }
-        };
-        let hybrid = if behavior.hybrid_delta_net {
-            let interval = nonzero("full_attention_interval")?;
-            let conv_kernel = nonzero("ssm.conv_kernel")?;
-            let head_k_dim = nonzero("ssm.state_size")?;
-            let n_k_heads = nonzero("ssm.group_count")?;
-            let n_v_heads = nonzero("ssm.time_step_rank")?;
-            let inner = nonzero("ssm.inner_size")?;
-            if !n_v_heads.is_multiple_of(n_k_heads) {
-                return Err(meta_err(
-                    &format!("{}.ssm.time_step_rank", arch.name()),
-                    format!(
-                        "{n_v_heads} value heads are not a multiple of the {n_k_heads} key heads (ssm.group_count)"
-                    ),
-                ));
-            }
-            if !inner.is_multiple_of(n_v_heads) {
-                return Err(meta_err(
-                    &format!("{}.ssm.inner_size", arch.name()),
-                    format!(
-                        "{inner} is not a multiple of the {n_v_heads} value heads (ssm.time_step_rank)"
-                    ),
-                ));
-            }
-            let delta = DeltaSpec {
-                conv_kernel,
-                n_k_heads,
-                n_v_heads,
-                head_k_dim,
-                head_v_dim: inner / n_v_heads,
-            };
-            Some((interval, delta))
-        } else {
-            None
-        };
-
-        // Latent attention (Mistral Small 4): the low-rank query, the latent
-        // and the per-head dimensions. The cache holds one shared row per
-        // position, so `attention.key_length` / `value_length` are the
-        // absorbed widths (`kv_lora + rot` and `kv_lora`).
-        let mla = if behavior.mla {
-            let q_lora = nonzero("attention.q_lora_rank")?;
-            let kv_lora = nonzero("attention.kv_lora_rank")?;
-            let rot = nonzero("rope.dimension_count")?;
-            let k_head = nonzero("attention.key_length_mla")?;
-            let v_head = nonzero("attention.value_length_mla")?;
-            if !rot.is_multiple_of(2) || k_head <= rot {
-                return Err(err(format!(
-                    "GGUF metadata `{0}.rope.dimension_count`: {rot} rotary dimensions must be even and below the head key length {k_head} (`{0}.attention.key_length_mla`)",
-                    arch.name()
-                )));
-            }
-            for (key, want) in [
-                ("attention.key_length", kv_lora + rot),
-                ("attention.value_length", kv_lora),
-            ] {
-                if let Some(v) = k.usize_opt(key)?
-                    && v != want
-                {
-                    return Err(meta_err(
-                        &format!("{}.{key}", arch.name()),
-                        format!(
-                            "{v} differs from the latent width {want} (kv_lora_rank and rope.dimension_count)"
-                        ),
-                    ));
-                }
-            }
-            if n_kv_head.iter().any(|&n| n != 1) {
-                return Err(meta_err(
-                    &format!("{}.attention.head_count_kv", arch.name()),
-                    "latent attention keeps one shared K/V head",
-                ));
-            }
-            if k.usize_opt("expert_group_count")?.is_some_and(|n| n > 1) {
-                return Err(meta_err(
-                    &format!("{}.expert_group_count", arch.name()),
-                    "grouped expert routing is not supported",
-                ));
-            }
-            // llama.cpp: 1 softmax, 2 sigmoid.
-            if k.usize_opt("expert_gating_func")?.is_some_and(|n| n != 1) {
-                return Err(meta_err(
-                    &format!("{}.expert_gating_func", arch.name()),
-                    "only softmax expert gating is supported",
-                ));
-            }
-            Some(MlaSpec {
-                q_lora,
-                kv_lora,
-                nope: k_head - rot,
-                rot,
-                v_head,
-            })
-        } else {
-            None
-        };
+        let hybrid = behavior
+            .hybrid_delta_net
+            .then(|| read_delta_net(&k, arch))
+            .transpose()?;
+        let mla = behavior
+            .mla
+            .then(|| read_mla(&k, arch, &n_kv_head))
+            .transpose()?;
 
         // Rotary embeddings.
         let n_ctx_orig = k
@@ -858,36 +759,7 @@ impl Hparams {
         } else {
             None
         };
-        let moe = if behavior.moe {
-            let n_expert = k.usize("expert_count")?;
-            let n_used = k.usize("expert_used_count")?;
-            if n_expert == 0 || n_used == 0 || n_used > n_expert {
-                return Err(err(format!(
-                    "GGUF metadata: {n_used} used experts of {n_expert} is not a valid top-k"
-                )));
-            }
-            Some(MoeSpec {
-                n_expert,
-                n_used,
-                norm_weights: if behavior.mla {
-                    k.bool_opt("expert_weights_norm")?
-                        .unwrap_or(behavior.moe_norm_weights)
-                } else {
-                    behavior.moe_norm_weights
-                },
-                scale: match k.f64_opt("expert_weights_scale")? {
-                    Some(s) if s.is_finite() && s != 0.0 => s as f32,
-                    _ => 1.0,
-                },
-            })
-        } else if k.usize_opt("expert_count")?.is_some_and(|n| n > 0) {
-            return Err(err(format!(
-                "`{}` checkpoints with experts are not supported",
-                arch.name()
-            )));
-        } else {
-            None
-        };
+        let moe = read_moe(&k, arch, &behavior)?;
 
         let leading_dense = if behavior.mla {
             let n = k.usize_opt("leading_dense_block_count")?.unwrap_or(0);
@@ -901,45 +773,7 @@ impl Hparams {
         } else {
             0
         };
-        let attn_temp = if behavior.mla {
-            match (
-                k.f64_opt("attention.temperature_scale")?,
-                k.usize_opt("attention.temperature_length")?,
-            ) {
-                (Some(beta), Some(length)) if length > 0 => (beta != 0.0).then_some(AttnTemp {
-                    beta: beta as f32,
-                    length,
-                }),
-                (None, None) => behavior.attn_temp_default.map(|(beta, length)| AttnTemp {
-                    beta: beta as f32,
-                    length,
-                }),
-                _ => {
-                    return Err(meta_err(
-                        &format!("{}.attention.temperature_length", arch.name()),
-                        "`temperature_scale` and a non-zero `temperature_length` come together",
-                    ));
-                }
-            }
-        } else if behavior.attn_temp_orig_ctx {
-            match k.f64_opt("attention.temperature_scale")? {
-                Some(beta) if beta != 0.0 => {
-                    if n_ctx_orig == 0 {
-                        return Err(meta_err(
-                            &format!("{}.rope.scaling.original_context_length", arch.name()),
-                            "the query scaling needs a non-zero original context",
-                        ));
-                    }
-                    Some(AttnTemp {
-                        beta: beta as f32,
-                        length: n_ctx_orig,
-                    })
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let attn_temp = read_attn_temp(&k, arch, &behavior, n_ctx_orig)?;
 
         Ok(Self {
             arch,
@@ -969,6 +803,194 @@ impl Hparams {
             nextn_predict_layers,
             nextn,
         })
+    }
+}
+
+/// A required metadata integer that must be non-zero.
+fn nonzero(k: &Keys<'_>, arch: Arch, key: &str) -> Result<usize, CucaError> {
+    match k.usize(key)? {
+        0 => Err(meta_err(
+            &format!("{}.{key}", arch.name()),
+            "must be non-zero",
+        )),
+        n => Ok(n),
+    }
+}
+
+/// Hybrid stacks (Qwen 3.5): the full-attention interval and the delta-net
+/// dimensions. Layer `il` is full attention when `(il + 1)` is a multiple of
+/// the interval, a delta-net layer otherwise.
+fn read_delta_net(k: &Keys<'_>, arch: Arch) -> Result<(usize, DeltaSpec), CucaError> {
+    let interval = nonzero(k, arch, "full_attention_interval")?;
+    let conv_kernel = nonzero(k, arch, "ssm.conv_kernel")?;
+    let head_k_dim = nonzero(k, arch, "ssm.state_size")?;
+    let n_k_heads = nonzero(k, arch, "ssm.group_count")?;
+    let n_v_heads = nonzero(k, arch, "ssm.time_step_rank")?;
+    let inner = nonzero(k, arch, "ssm.inner_size")?;
+    if !n_v_heads.is_multiple_of(n_k_heads) {
+        return Err(meta_err(
+            &format!("{}.ssm.time_step_rank", arch.name()),
+            format!(
+                "{n_v_heads} value heads are not a multiple of the {n_k_heads} key heads (ssm.group_count)"
+            ),
+        ));
+    }
+    if !inner.is_multiple_of(n_v_heads) {
+        return Err(meta_err(
+            &format!("{}.ssm.inner_size", arch.name()),
+            format!(
+                "{inner} is not a multiple of the {n_v_heads} value heads (ssm.time_step_rank)"
+            ),
+        ));
+    }
+    let delta = DeltaSpec {
+        conv_kernel,
+        n_k_heads,
+        n_v_heads,
+        head_k_dim,
+        head_v_dim: inner / n_v_heads,
+    };
+    Ok((interval, delta))
+}
+
+/// Latent attention (Mistral Small 4): the low-rank query, the latent and the
+/// per-head dimensions. The cache holds one shared row per position, so
+/// `attention.key_length` / `value_length` are the absorbed widths
+/// (`kv_lora + rot` and `kv_lora`).
+fn read_mla(k: &Keys<'_>, arch: Arch, n_kv_head: &[usize]) -> Result<MlaSpec, CucaError> {
+    let q_lora = nonzero(k, arch, "attention.q_lora_rank")?;
+    let kv_lora = nonzero(k, arch, "attention.kv_lora_rank")?;
+    let rot = nonzero(k, arch, "rope.dimension_count")?;
+    let k_head = nonzero(k, arch, "attention.key_length_mla")?;
+    let v_head = nonzero(k, arch, "attention.value_length_mla")?;
+    if !rot.is_multiple_of(2) || k_head <= rot {
+        return Err(err(format!(
+            "GGUF metadata `{0}.rope.dimension_count`: {rot} rotary dimensions must be even and below the head key length {k_head} (`{0}.attention.key_length_mla`)",
+            arch.name()
+        )));
+    }
+    for (key, want) in [
+        ("attention.key_length", kv_lora + rot),
+        ("attention.value_length", kv_lora),
+    ] {
+        if let Some(v) = k.usize_opt(key)?
+            && v != want
+        {
+            return Err(meta_err(
+                &format!("{}.{key}", arch.name()),
+                format!(
+                    "{v} differs from the latent width {want} (kv_lora_rank and rope.dimension_count)"
+                ),
+            ));
+        }
+    }
+    if n_kv_head.iter().any(|&n| n != 1) {
+        return Err(meta_err(
+            &format!("{}.attention.head_count_kv", arch.name()),
+            "latent attention keeps one shared K/V head",
+        ));
+    }
+    if k.usize_opt("expert_group_count")?.is_some_and(|n| n > 1) {
+        return Err(meta_err(
+            &format!("{}.expert_group_count", arch.name()),
+            "grouped expert routing is not supported",
+        ));
+    }
+    // llama.cpp: 1 softmax, 2 sigmoid.
+    if k.usize_opt("expert_gating_func")?.is_some_and(|n| n != 1) {
+        return Err(meta_err(
+            &format!("{}.expert_gating_func", arch.name()),
+            "only softmax expert gating is supported",
+        ));
+    }
+    Ok(MlaSpec {
+        q_lora,
+        kv_lora,
+        nope: k_head - rot,
+        rot,
+        v_head,
+    })
+}
+
+/// The mixture-of-experts routing of the architecture (`None` for a dense
+/// one).
+fn read_moe(k: &Keys<'_>, arch: Arch, behavior: &Behavior) -> Result<Option<MoeSpec>, CucaError> {
+    if !behavior.moe {
+        if k.usize_opt("expert_count")?.is_some_and(|n| n > 0) {
+            return Err(err(format!(
+                "`{}` checkpoints with experts are not supported",
+                arch.name()
+            )));
+        }
+        return Ok(None);
+    }
+    let n_expert = k.usize("expert_count")?;
+    let n_used = k.usize("expert_used_count")?;
+    if n_expert == 0 || n_used == 0 || n_used > n_expert {
+        return Err(err(format!(
+            "GGUF metadata: {n_used} used experts of {n_expert} is not a valid top-k"
+        )));
+    }
+    Ok(Some(MoeSpec {
+        n_expert,
+        n_used,
+        norm_weights: if behavior.mla {
+            k.bool_opt("expert_weights_norm")?
+                .unwrap_or(behavior.moe_norm_weights)
+        } else {
+            behavior.moe_norm_weights
+        },
+        scale: match k.f64_opt("expert_weights_scale")? {
+            Some(s) if s.is_finite() && s != 0.0 => s as f32,
+            _ => 1.0,
+        },
+    }))
+}
+
+/// The Llama 4 per-position query scaling of the architecture, from the file
+/// or the architecture's default (`None` for a model without it).
+fn read_attn_temp(
+    k: &Keys<'_>,
+    arch: Arch,
+    behavior: &Behavior,
+    n_ctx_orig: usize,
+) -> Result<Option<AttnTemp>, CucaError> {
+    if behavior.mla {
+        return match (
+            k.f64_opt("attention.temperature_scale")?,
+            k.usize_opt("attention.temperature_length")?,
+        ) {
+            (Some(beta), Some(length)) if length > 0 => Ok((beta != 0.0).then_some(AttnTemp {
+                beta: beta as f32,
+                length,
+            })),
+            (None, None) => Ok(behavior.attn_temp_default.map(|(beta, length)| AttnTemp {
+                beta: beta as f32,
+                length,
+            })),
+            _ => Err(meta_err(
+                &format!("{}.attention.temperature_length", arch.name()),
+                "`temperature_scale` and a non-zero `temperature_length` come together",
+            )),
+        };
+    }
+    if !behavior.attn_temp_orig_ctx {
+        return Ok(None);
+    }
+    match k.f64_opt("attention.temperature_scale")? {
+        Some(beta) if beta != 0.0 => {
+            if n_ctx_orig == 0 {
+                return Err(meta_err(
+                    &format!("{}.rope.scaling.original_context_length", arch.name()),
+                    "the query scaling needs a non-zero original context",
+                ));
+            }
+            Ok(Some(AttnTemp {
+                beta: beta as f32,
+                length: n_ctx_orig,
+            }))
+        }
+        _ => Ok(None),
     }
 }
 

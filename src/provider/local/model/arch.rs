@@ -365,7 +365,6 @@ impl Arch {
                 ..DEFAULT
             },
             Arch::MuseGlimmer => Behavior {
-                rope: RopeKind::Norm,
                 post_norms: true,
                 swa: Swa::PatternArray,
                 attn_gate_tensor: true,
@@ -381,7 +380,6 @@ impl Arch {
                 ..DEFAULT
             },
             Arch::Mistral4 => Behavior {
-                rope: RopeKind::Norm,
                 moe: true,
                 shared_expert: true,
                 shared_expert_ungated: true,
@@ -392,7 +390,6 @@ impl Arch {
             // The drafter's layers are the target's attention with a dense
             // FFN: no experts, no shared expert.
             Arch::Mistral4Eagle => Behavior {
-                rope: RopeKind::Norm,
                 mla: true,
                 attn_temp_default: Some((0.1, 8192)),
                 ..DEFAULT
