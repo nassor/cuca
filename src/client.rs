@@ -519,8 +519,7 @@ impl CucaClient {
     /// The configured llama.cpp adapter config, when one was set.
     ///
     /// `dispatch_llamacpp` reads it to resolve the route and runtime knobs;
-    /// when `None` the dispatch uses
-    /// [`LlamaCppConfig::default`].
+    /// when `None` the dispatch uses the default `LlamaCppConfig`.
     #[cfg(feature = "provider-llamacpp")]
     pub fn llamacpp_config(&self) -> Option<&LlamaCppConfig> {
         self.llamacpp_config.as_ref()

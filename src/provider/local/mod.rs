@@ -17,7 +17,7 @@
 //! # Choosing a model
 //!
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
-//! `llama` (Llama 3.x and compatible), `qwen2`, `qwen3`, `phi3`
+//! `llama` (Llama-style models), `qwen2`, `qwen3`, `phi3`
 //! (Phi 4-mini and compatible), `smollm3`, `granite`, `qwen3moe`,
 //! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `mistral3`, `mistral4`,
 //! `qwen35` or `qwen35moe` runs: the loader reads every
@@ -94,7 +94,7 @@
 //!   per running sequence plus cached prefixes. When the pool is full a
 //!   running request that needs a block preempts the youngest one, which
 //!   resumes later from the blocks it left in the prefix store. At 8192
-//!   positions: 422 MB for Gemma 4 E2B, 1.27 GB for E4B and 3.76 GB for
+//!   positions: 481 MB for Gemma 4 E2B, 1.47 GB for E4B and 3.76 GB for
 //!   Qwen3-0.6B (a full-attention model with many KV heads needs a smaller
 //!   `context_length`). A prefix store keeps the
 //!   blocks of finished requests, named by their token ids, and a prompt
@@ -129,8 +129,10 @@
 //! On the CPU a token's logits do not depend on how the prompt was split:
 //! prefill and speculative verification run in a row-exact mode (float
 //! matmuls per row, paged attention per query row on candle's worker pool,
-//! and a safe Q4_0/Q8_0 matmul kernel whose rows are independent of their
-//! batch) that equals single-token decoding bit for bit, at no cost in
+//! and a safe row-batched matmul kernel for Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0
+//! weights whose rows are independent of their batch; the K-quants and other
+//! dtypes run on candle's per-row kernel, also row independent) that equals
+//! single-token decoding bit for bit, at no cost in
 //! prefill throughput. A request that reuses a cached prefix therefore
 //! generates what a cold request generates. (Quantized matmuls round
 //! activations to Q8_0, which otherwise amplifies the batch-shape rounding of
@@ -163,11 +165,9 @@
 //! Measured on Gemma 4 E2B Q4_0 with the E2B assistant at the default
 //! `draft_tokens` 5 (128-token replies, quiet development machine, speed
 //! against plain decoding on the same device): CPU 1.32x on a code prompt,
-//! 1.31x on a list, 1.01x on prose; Vulkan (RX 9070 XT) 0.97x, 0.97x and
-//! 1.00x: GPU single-token decoding is host-bound (38 tok/s), so the
-//! drafter's own launches cost as much as the verification saves, and the
-//! governor keeps the run within about 3 % of plain decoding. Drafting is
-//! off by default; it pays on the CPU.
+//! 1.31x on a list, 1.01x on prose. On Vulkan (RX 9070 XT) the same prompts
+//! gave 0.97x, 0.97x and 1.00x; that run predates the fused dense kernels
+//! and was not repeated. Drafting is off by default; it pays on the CPU.
 //!
 //! `DrafterSource::InTrunk` drafts with the prediction head embedded in a
 //! Qwen 3.5 `*-MTP` file (for example `unsloth/Qwen3.5-0.8B-MTP-GGUF`): no
@@ -1352,7 +1352,7 @@ pub struct LocalModelConfig {
     /// pools hold twice this many positions per full-attention layer group
     /// (shared by every running request; [`BatchingConfig::kv_tokens`] sets
     /// the pool), so a layer costs `2 * context_length * 2 * 4 * n_kv_head * head_dim` bytes
-    /// of RAM (Gemma 4 E2B 422 MB at 8192, Qwen3-0.6B 458,752 bytes per
+    /// of RAM (Gemma 4 E2B 481 MB at 8192, Qwen3-0.6B 458,752 bytes per
     /// context position, i.e. 3.76 GB at 8192: size it
     /// for the model; [`LocalModel::kv_cache_bytes`] reports the result; see
     /// [`LocalModel`]).
@@ -1588,7 +1588,7 @@ struct LocalModelInner {
 ///   [`BatchingConfig::kv_tokens`] positions (twice `context_length` by
 ///   default, however many sequences run), a sliding-window group its
 ///   window plus about 270 positions per running sequence plus cached
-///   prefixes. At the default 8192 that is 422 MB for Gemma 4 E2B, 1.27 GB for
+///   prefixes. At the default 8192 that is 481 MB for Gemma 4 E2B, 1.47 GB for
 ///   E4B and 3.76 GB for Qwen3-0.6B (28 full-attention layers, 8 KV heads of
 ///   128). Blocks are named by the token ids they hold, so a finished
 ///   request's blocks stay cached (least recently used evicted first) and a
@@ -1606,12 +1606,12 @@ struct LocalModelInner {
 ///   usually from the OS page cache. Resident weights are therefore about
 ///   the file size minus that table (E2B Q4_0: 1.5 GB of 2.84 GB).
 /// - On a GPU device the weights and the K/V cache live in device memory.
-///   Q4_0 and Q8_0 weights stay quantized there; F32, F16 and BF16 weights
-///   (including `per_layer_model_proj`, 92 MB as f32 for E2B) are f32; every
-///   other dtype (Q4_1, Q5_x, the K-quants) is requantized to Q8_0 at load
-///   (its error is far below the K-quant error), and a weight over 1 GiB
-///   is split into row chunks. Embedding rows are still read from the file
-///   on the host.
+///   Q4_0, Q4_1 and Q8_0 weights stay quantized there; F32, F16 and BF16
+///   weights (including `per_layer_model_proj`, 92 MB as f32 for E2B) are
+///   f32; every other quantized dtype (Q5_0, Q5_1, Q8_1, the K-quants) is
+///   requantized to Q8_0 at load (its error is far below the K-quant error),
+///   and a weight over 256 MiB is split into row chunks. Embedding rows are
+///   still read from the file on the host.
 ///
 /// # Behavior
 ///

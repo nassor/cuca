@@ -6325,11 +6325,12 @@ mod tests {
         }
     }
 
-    /// A model whose matmul weights are float or Q8_0 matches the dequantized
-    /// CPU reference as closely as a Q4_0 one: no requantization happens.
-    /// A model in Q4_1, Q5_0 or Q5_1, which the engine requantizes to Q8_0,
+    /// A model whose matmul weights are float, Q4_0, Q4_1 or Q8_0 matches the
+    /// dequantized CPU reference as closely as a Q4_0 one: no requantization
+    /// happens. A model in Q5_0 or Q5_1, which the engine requantizes to Q8_0,
     /// is within the Q8_0 rounding of it: at most 8% of the largest logit
-    /// (a random-weight model amplifies the rounding).
+    /// (a random-weight model amplifies the rounding). The loop gives Q4_1 the
+    /// same loose bound, which it does not need.
     #[test]
     fn gpu_matches_cpu_on_other_weight_dtypes() {
         let Some(device) = test_device() else {

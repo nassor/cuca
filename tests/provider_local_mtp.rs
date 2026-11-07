@@ -21,11 +21,11 @@
 //! comma-separated list (`1,2,3,4`) to run one comparison per value (default
 //! 3).
 //!
-//! `CUCA_LOCAL_ALLOW_MISMATCH=1` reports a CPU output that differs from plain
-//! decoding (`identical false`) instead of failing the test. It is for timing
-//! a target so large (67 GB) that two loads of it on one machine can differ
-//! by a flipped bit, which breaks the exactness check without a speculation
-//! fault.
+//! `CUCA_LOCAL_ALLOW_MISMATCH` (any value) reports a CPU output that differs
+//! from plain decoding (`identical false`) instead of failing the test. It is
+//! for timing a target so large (67 GB) that two loads of it have differed by
+//! one bit on the development machine, which breaks the exactness check
+//! without a speculation fault.
 //!
 //! With the target or the drafter missing the test prints `SKIP` and passes,
 //! unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build for the host
