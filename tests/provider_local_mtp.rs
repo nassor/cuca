@@ -1,6 +1,8 @@
 //! Live test of multi-token-prediction speculative decoding in `provider-local`.
 //!
-//! A target model runs once alone and once with a drafter
+//! A target model runs once alone (its outputs are recorded and the model is
+//! dropped, so a target that fills the machine's memory never has two copies
+//! resident) and then once per draft length with a drafter
 //! (`LocalModelConfig::drafter`); greedy output must be identical on the CPU,
 //! and the run reports acceptance and decode speed per prompt (code, a list,
 //! prose; 128 new tokens each). Two kinds of drafter:
@@ -176,6 +178,10 @@ async fn drafter_output_equals_plain_greedy_decoding() {
         })
         .unwrap_or_default();
     let exact = device == LocalDevice::Cpu;
+    // The plain run goes first and the plain model is dropped before any
+    // speculative model loads: two resident copies of a large target do not
+    // fit in memory together, and a machine that pages would time both runs
+    // by the paging, not by the engines.
     let plain = LocalModel::load(LocalModelConfig {
         source: target.clone(),
         context_length: Some(2048),
@@ -185,6 +191,24 @@ async fn drafter_output_equals_plain_greedy_decoding() {
     })
     .await
     .expect("target loads");
+    let mut plain_runs = Vec::new();
+    for prompt in PROMPTS {
+        // A first pass warms the kernels (GPU autotune) and fills the prefix
+        // store; the second pass, which reuses the prefix, is what is
+        // compared and timed.
+        let (cold, ..) = run(&plain, prompt, 128).await;
+        let (text, tokens, secs) = run(&plain, prompt, 128).await;
+        if exact {
+            assert_eq!(
+                text, cold,
+                "a warm plain run must equal the cold one for {prompt:?}"
+            );
+        }
+        plain_runs.push((text, tokens, secs));
+    }
+    drop(plain);
+    // The engine thread frees the model once its last handle is gone.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     for draft_tokens in draft_token_counts() {
         let speculative = LocalModel::load(LocalModelConfig {
@@ -200,12 +224,10 @@ async fn drafter_output_equals_plain_greedy_decoding() {
         .expect("target and drafter load");
 
         let (mut plain_secs, mut spec_secs, mut tokens) = (0.0, 0.0, 0u64);
-        for prompt in PROMPTS {
-            // A first pass warms the kernels (GPU autotune) and the governor.
-            run(&plain, prompt, 128).await;
+        for (prompt, (expected, n_plain, t_plain)) in PROMPTS.into_iter().zip(&plain_runs) {
+            // A first pass warms the kernels and the governor.
             run(&speculative, prompt, 128).await;
             let before = speculative.draft_stats();
-            let (expected, n_plain, t_plain) = run(&plain, prompt, 128).await;
             let (got, n_spec, t_spec) = run(&speculative, prompt, 128).await;
             let after = speculative.draft_stats();
             // On the CPU the engine is row-exact, so output must be identical.
@@ -214,18 +236,18 @@ async fn drafter_output_equals_plain_greedy_decoding() {
             // asserting it.
             if exact {
                 assert_eq!(
-                    got, expected,
+                    &got, expected,
                     "speculative output must equal plain greedy output for {prompt:?}"
                 );
-                assert_eq!(n_spec, n_plain);
+                assert_eq!(n_spec, *n_plain);
             }
             println!(
                 "k {draft_tokens} {:?}: plain {:.1} tok/s, speculative {:.1} tok/s ({:.2}x), identical {}, drafted {} accepted {}",
                 &prompt[..30],
-                n_plain as f64 / t_plain,
+                *n_plain as f64 / t_plain,
                 n_spec as f64 / t_spec,
-                (n_plain as f64 / t_plain).recip() * (n_spec as f64 / t_spec),
-                got == expected,
+                (*n_plain as f64 / t_plain).recip() * (n_spec as f64 / t_spec),
+                &got == expected,
                 after.drafted - before.drafted,
                 after.accepted - before.accepted,
             );
@@ -246,5 +268,8 @@ async fn drafter_output_equals_plain_greedy_decoding() {
             100.0 * stats.acceptance_rate().unwrap_or(0.0),
             stats.rounds,
         );
+        // Free this speculative model before the next one loads.
+        drop(speculative);
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
     }
 }

@@ -1626,7 +1626,7 @@ mod tests {
     }
 
     /// A hybrid model mixing every weight dtype of the row-batched kernel,
-    /// K-quant FFN down projections (trunk and head) included.
+    /// with K-quant FFN down projections (trunk and head) on candle's kernel.
     fn mixed_qwen35() -> TinyQwen35 {
         TinyQwen35 {
             ff: 256,
@@ -1807,6 +1807,86 @@ mod tests {
         }
     }
 
+    /// A token budget that runs out inside a speculative round caches exactly
+    /// the ids plain decoding does: the draft that spends the last token is
+    /// emitted but, as in plain decoding, never forwarded.
+    #[test]
+    fn a_budget_ending_inside_a_round_caches_what_plain_decoding_does() {
+        use super::testing::engine_with_eagle;
+        let (model, eagle) = (mistral4(16), eagle());
+        let mut spent = 0;
+        let prompts: Vec<Vec<u32>> = (0..40usize)
+            .map(|s| {
+                let n = 1 + s % 5;
+                let mut p = vec![2u32];
+                p.extend((0..n).map(|i| 9 + ((i * 7 + s * 3 + i * s) % 7) as u32));
+                p
+            })
+            .collect();
+        for prompt in &prompts {
+            for max in 1..=10u32 {
+                for k in [1usize, 2, 4, 8] {
+                    let mut plain = engine(&model, 16, 0.0, None);
+                    let mut spec = engine_with_eagle(&model, &eagle, 16, 0.0, None, k);
+                    let a = run(&mut plain, prompt, Some(max));
+                    let b = run(&mut spec, prompt, Some(max));
+                    let what = format!("k {k}, prompt {prompt:?}, max {max}");
+                    let (ua, ub) = (a.metadata.token_usage, b.metadata.token_usage);
+                    assert_eq!(text(&a), text(&b), "{what}");
+                    assert_eq!(
+                        ua.map(|u| u.completion_tokens),
+                        ub.map(|u| u.completion_tokens),
+                        "{what}"
+                    );
+                    assert_eq!(spec.last_ids, plain.last_ids, "{what}");
+                    assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "{what}");
+                    spent += usize::from(ub.map(|u| u.completion_tokens) == Some(max));
+                }
+            }
+        }
+        assert!(spent > 0, "some reply spent its whole budget");
+    }
+
+    /// A stop string that completes inside a speculative round ends the reply
+    /// and caches exactly what plain decoding does: the draft that completes
+    /// it is emitted but never forwarded.
+    #[test]
+    fn a_stop_string_ending_inside_a_round_caches_what_plain_decoding_does() {
+        use super::testing::engine_with_eagle;
+        let (model, eagle) = (mistral4(16), eagle());
+        let mut stopped = 0;
+        for s in 0..24usize {
+            let n = 1 + s % 5;
+            let mut prompt = vec![2u32];
+            prompt.extend((0..n).map(|i| 9 + ((i * 7 + s * 3 + i * s) % 7) as u32));
+            let free = text(&run(&mut engine(&model, 16, 0.0, None), &prompt, Some(10)));
+            let chars: Vec<char> = free.chars().collect();
+            for at in 0..chars.len().saturating_sub(1) {
+                let stop: String = chars[at..at + 2].iter().collect();
+                for k in [1usize, 2, 4, 8] {
+                    let mut plain = engine(&model, 16, 0.0, None);
+                    let mut spec = engine_with_eagle(&model, &eagle, 16, 0.0, None, k);
+                    let with_stop = |e: &mut Engine| {
+                        run_with(e, &prompt, Some(10), |job| job.stop = vec![stop.clone()])
+                    };
+                    let a = with_stop(&mut plain);
+                    let b = with_stop(&mut spec);
+                    let what = format!("k {k}, prompt {prompt:?}, stop {stop:?}");
+                    assert_eq!(text(&a), text(&b), "{what}");
+                    assert_eq!(
+                        a.metadata.token_usage.map(|u| u.completion_tokens),
+                        b.metadata.token_usage.map(|u| u.completion_tokens),
+                        "{what}"
+                    );
+                    assert_eq!(spec.last_ids, plain.last_ids, "{what}");
+                    assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "{what}");
+                    stopped += usize::from(text(&a).len() < free.len());
+                }
+            }
+        }
+        assert!(stopped > 0, "some reply ended on its stop string");
+    }
+
     #[test]
     fn in_trunk_head_respects_max_tokens_and_the_context_limit() {
         let model = write_qwen35(&TinyQwen35::default());
@@ -1821,6 +1901,7 @@ mod tests {
                 b.metadata.token_usage.map(|u| u.completion_tokens),
                 "max {max}"
             );
+            assert_eq!(spec.last_ids, plain.last_ids, "max {max}");
             assert_eq!(head_len(&spec), spec.last_ids.len() - 1, "max {max}");
         }
         // A context that fills up mid-round, for several sizes and prompts:
@@ -1839,10 +1920,8 @@ mod tests {
                 let a = run(&mut plain, prompt, None);
                 let b = run(&mut spec, prompt, None);
                 assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
-                // A budget that ends inside a round leaves the last accepted
-                // draft cached, which plain decoding never forwards.
-                assert!(
-                    spec.last_ids.starts_with(&plain.last_ids),
+                assert_eq!(
+                    spec.last_ids, plain.last_ids,
                     "ctx {ctx}, prompt {prompt:?}"
                 );
                 assert_eq!(head_len(&spec), spec.last_ids.len() - 1, "ctx {ctx}");
@@ -2183,10 +2262,8 @@ mod tests {
                 let a = run(&mut plain, prompt, None);
                 let b = run(&mut spec, prompt, None);
                 assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
-                // A budget that ends inside a round leaves the last accepted
-                // draft cached, which plain decoding never forwards.
-                assert!(
-                    spec.last_ids.starts_with(&plain.last_ids),
+                assert_eq!(
+                    spec.last_ids, plain.last_ids,
                     "ctx {ctx}, prompt {prompt:?}"
                 );
                 assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "ctx {ctx}");
@@ -2470,8 +2547,8 @@ mod tests {
                 let a = run(&mut plain, prompt, None);
                 let b = run(&mut spec, prompt, None);
                 assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
-                assert!(
-                    spec.last_ids.starts_with(&plain.last_ids),
+                assert_eq!(
+                    spec.last_ids, plain.last_ids,
                     "ctx {ctx}, prompt {prompt:?}"
                 );
                 assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "ctx {ctx}");
