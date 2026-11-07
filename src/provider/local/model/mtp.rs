@@ -34,9 +34,10 @@
 //!
 //! # Memory
 //!
-//! The drafter's F16 weights are held as f32 (about twice the file: 340 MB
-//! for the E2B drafter) and its K/V is the target's cache, shared by
-//! reference. A separate drafter file runs on the CPU or on one GPU device,
+//! On the CPU the drafter's float weights with a row length that is a
+//! multiple of 32 are requantized to Q8_0 at load; the others stay as they
+//! are. Its K/V is the target's cache, shared by reference. A separate
+//! drafter file runs on the CPU or on one GPU device,
 //! not together with `gpu_layers` ([`Drafter::open`]).
 //!
 //! # In-trunk head (`DrafterSource::InTrunk`)

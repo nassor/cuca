@@ -7985,7 +7985,7 @@ mod tests {
         }
     }
 
-    /// What a shard reads of every per-layer matrix of a tiny Phi 4 mini (fused
+    /// What a shard reads of every per-layer matrix of a tiny `phi3` model (fused
     /// QKV and gate-up, several row ranges per cut), Llama (separate
     /// projections) and Gemma 3 (one KV head, replicated) equals the rows
     /// and columns of the whole tensor read the plain way, at world 2 for
