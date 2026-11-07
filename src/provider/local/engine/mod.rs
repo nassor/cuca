@@ -193,6 +193,10 @@ impl Ema {
     }
 }
 
+/// Per-round decay of the accepted and judged draft counts behind
+/// [`CostModel::block_acceptance`]: about the last twenty rounds count.
+const ACCEPT_DECAY: f64 = 0.95;
+
 /// Cost model of a speculative round: verification seconds by row count,
 /// drafter-step seconds, and how the drafter's confidence calibrates against
 /// realised acceptance. It sets how many drafts a round verifies
@@ -209,6 +213,11 @@ struct CostModel {
     /// ratio calibrates the confidence.
     predicted: Ema,
     accepted: Ema,
+    /// Drafts accepted and drafts judged (an accepted one or the first
+    /// rejected one of a round), summed over recent rounds with a decay of
+    /// [`ACCEPT_DECAY`] per round.
+    accept_hits: f64,
+    accept_trials: f64,
     /// Test-only: record nothing, so every proposal is drafted.
     #[cfg(test)]
     frozen: bool,
@@ -256,6 +265,20 @@ impl CostModel {
         }
     }
 
+    /// Predicted acceptance of draft `j` (1-based) of a block drafter's
+    /// round: `rho^j`, `rho` the observed fraction of judged drafts that were
+    /// accepted (1 before any round, so the first rounds draft the full cap).
+    /// A block drafter's own confidence is no guide: its mask rows are
+    /// deliberately flat while the drafts are right nine times in ten.
+    fn block_acceptance(&self, j: usize) -> f64 {
+        let rho = if self.accept_trials > 0.0 {
+            self.accept_hits / self.accept_trials
+        } else {
+            1.0
+        };
+        rho.powi(i32::try_from(j).unwrap_or(i32::MAX))
+    }
+
     /// Record a finished round: a verification over `rows` rows took
     /// `verify_secs`; `draft_steps` drafter steps took `draft_secs`; the
     /// verified drafts carried `predicted` summed confidence and `accepted`
@@ -284,6 +307,12 @@ impl CostModel {
         if rows > 1 {
             self.predicted.record(predicted);
             self.accepted.record(accepted as f64);
+            // A draft behind a rejected one is never judged: the trials of
+            // a round are the accepted drafts plus the first rejected one.
+            let drafts = rows - 1;
+            self.accept_hits = self.accept_hits * ACCEPT_DECAY + accepted as f64;
+            self.accept_trials =
+                self.accept_trials * ACCEPT_DECAY + (accepted + 1).min(drafts) as f64;
         }
     }
 }
@@ -1438,6 +1467,35 @@ mod tests {
         eager.record_round(2, 0.1, 1, 0.001, 0.01, 1);
         eager.record_round(2, 0.1, 1, 0.001, 0.01, 1);
         assert_eq!(eager.calibration(), 4.0);
+    }
+
+    /// A block drafter's draft `j` is predicted to be accepted with the
+    /// observed per-draft acceptance to the power `j`; a draft behind a
+    /// rejected one is not judged, and before any round every draft counts
+    /// as accepted (the first rounds draft the full cap).
+    #[test]
+    fn block_acceptance_follows_the_judged_drafts() {
+        let close = |a: f64, b: f64| (a - b).abs() < 1e-12;
+        let mut c = CostModel::default();
+        assert_eq!(c.block_acceptance(7), 1.0);
+        // Three drafts, all accepted: three judged, three hits.
+        c.record_round(4, 0.1, 1, 0.01, 0.0, 3);
+        assert!(close(c.block_acceptance(1), 1.0));
+        // Seven drafts, the first rejected: one judged (the second to
+        // seventh are not), no hit.
+        c.record_round(8, 0.1, 1, 0.01, 0.0, 0);
+        let rho = 3.0 * ACCEPT_DECAY / (3.0 * ACCEPT_DECAY + 1.0);
+        assert!(close(c.block_acceptance(1), rho));
+        assert!(close(c.block_acceptance(3), rho.powi(3)));
+        // Two drafts, one accepted: two judged, one hit.
+        c.record_round(3, 0.1, 1, 0.01, 0.0, 1);
+        let hits = 3.0 * ACCEPT_DECAY * ACCEPT_DECAY + ACCEPT_DECAY * 0.0 + 1.0;
+        let trials = 3.0 * ACCEPT_DECAY * ACCEPT_DECAY + ACCEPT_DECAY + 2.0;
+        assert!(close(c.block_acceptance(2), (hits / trials).powi(2)));
+        // A plain round (one row) says nothing about drafts.
+        let before = c.block_acceptance(2);
+        c.record_round(1, 0.1, 0, 0.0, 0.0, 0);
+        assert_eq!(c.block_acceptance(2), before);
     }
 
     /// With an affine verification cost the chain stops at the first draft

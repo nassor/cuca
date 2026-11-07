@@ -1057,7 +1057,11 @@ impl Engine {
                     // verified: the governor already decided that the round
                     // drafts, and its acceptance keeps the calibration live.
                     if adaptive {
-                        let a = (kappa * chained).min(1.0);
+                        let a = if block {
+                            cost.block_acceptance(j)
+                        } else {
+                            (kappa * chained).min(1.0)
+                        };
                         let (t_j, t_next) = (cost.verify_secs(j), cost.verify_secs(j + 1));
                         let keep = if block {
                             take_block_draft(a, expected, t_j, t_next, step_secs)
