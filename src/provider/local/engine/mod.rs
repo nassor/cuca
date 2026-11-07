@@ -20,13 +20,13 @@
 //!    recurrent state is not positional: the engine keeps a snapshot of it at
 //!    a block boundary of every prompt it prefills (the end of its last
 //!    complete message) and resumes only from prefixes it has one for. An
-//!    in-trunk drafter keeps the pairs the shared tokens still determine
-//!    (`Drafter::truncate`) and re-observes the replayed rows; it serves one
-//!    sequence at a time.
+//!    in-trunk head or an EAGLE drafter keeps the pairs the shared tokens
+//!    still determine (`Drafter::truncate`) and re-observes the replayed rows;
+//!    it serves one sequence at a time.
 //! 2. **Prefill** in chunks of [`prefill_chunk`] tokens, interleaved with the
 //!    decode rows of the other sequences within the step's row budget; only
-//!    the last chunk computes logits. An in-trunk head takes the final-norm
-//!    hidden row of every position (`Drafter::observe`).
+//!    the last chunk computes logits. An in-trunk head or an EAGLE drafter
+//!    takes the final-norm hidden row of every position (`Drafter::observe`).
 //! 3. **Decode**: sample, stop on an end-of-generation id, feed the id through
 //!    the [`OutputParser`], cut its text at the first stop string of the job
 //!    (`StopMatcher`; thinking and tool calls pass through, and text a stop
@@ -34,7 +34,7 @@
 //!    for the stream (`try_send`: a slow consumer stalls its own sequence
 //!    only), then run the model one token further (a round: for a lone
 //!    sequence draft, verify one batch, roll back the rejected positions, let
-//!    the in-trunk head observe the kept rows). Generation stops at the
+//!    the in-trunk head or the EAGLE drafter observe the kept rows). Generation stops at the
 //!    end-of-generation id, at a stop string, at `max_tokens`, or when the
 //!    context is full; held text is released at every end but a stop string.
 //! 4. **Usage**: exact prompt and completion token counts are recorded in the
@@ -61,12 +61,13 @@ use tokio::sync::mpsc;
 
 use self::scheduler::{Sequence, SnapshotStore};
 use super::chat::{ChatFormat, ChatTemplate};
+use super::model::arch::Arch;
 use super::model::mtp::Drafter;
 use super::model::paged::{KvPools, Sizing};
 use super::model::{Model, prefill_chunk};
 use super::sampler::{SplitMix64, random_seed};
 use super::tokenizer::Tokenizer;
-use super::{LocalModelConfig, MAX_DRAFT_TOKENS, SamplingConfig};
+use super::{LocalDevice, LocalModelConfig, MAX_DRAFT_TOKENS, SamplingConfig};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
 use crate::types::{MessageContentBlock, ProviderEndpoint};
@@ -534,9 +535,22 @@ impl Engine {
 
         let hp = super::model::read_hparams(&content)?;
         let context_length = super::resolve_context_length(config.context_length, hp.n_ctx_train);
-        // An in-trunk drafter observes every position of its one sequence.
-        let in_trunk = matches!(drafter, Some(ResolvedDrafter::InTrunk));
-        let (batching, sizing) = resolve_batching(config, context_length, in_trunk)?;
+        // A file drafter's header is read before the model loads: an EAGLE
+        // drafter observes every position of its one sequence (like the
+        // in-trunk head, which sets the batching) and runs on the CPU only.
+        let file_drafter = match drafter {
+            Some(ResolvedDrafter::File(dp)) => Some(read_drafter_header(dp)?),
+            _ => None,
+        };
+        let eagle = file_drafter.as_ref().is_some_and(is_eagle);
+        if eagle && config.device != LocalDevice::Cpu {
+            return Err(CucaError::Config(format!(
+                "the EAGLE drafter runs on the CPU only, not on {:?}",
+                config.device
+            )));
+        }
+        let observing = eagle || matches!(drafter, Some(ResolvedDrafter::InTrunk));
+        let (batching, sizing) = resolve_batching(config, context_length, observing)?;
         let model = Model::load(
             &content,
             path,
@@ -546,26 +560,18 @@ impl Engine {
             &config.experts,
             &sizing,
         )?;
-        let drafter = drafter
-            .map(|source| -> Result<Drafter, CucaError> {
-                match source {
-                    ResolvedDrafter::File(dp) => {
-                        let mut reader =
-                            BufReader::new(File::open(dp).map_err(|e| CucaError::Io {
-                                message: format!("reading GGUF `{}`: {e}", dp.display()),
-                            })?);
-                        let dc = gguf_file::Content::read(&mut reader).map_err(|e| {
-                            local_err(format!(
-                                "`{}` is not a supported GGUF file: {e}",
-                                dp.display()
-                            ))
-                        })?;
-                        Drafter::open(&dc, dp, &model, context_length)
-                    }
-                    ResolvedDrafter::InTrunk => Drafter::open_in_trunk(&content, path, &model),
-                }
-            })
-            .transpose()?;
+        let drafter = match (drafter, file_drafter) {
+            (Some(ResolvedDrafter::File(dp)), Some(dc)) if eagle => {
+                Some(Drafter::open_eagle(&dc, dp, &model)?)
+            }
+            (Some(ResolvedDrafter::File(dp)), Some(dc)) => {
+                Some(Drafter::open(&dc, dp, &model, context_length)?)
+            }
+            (Some(ResolvedDrafter::InTrunk), _) => {
+                Some(Drafter::open_in_trunk(&content, path, &model)?)
+            }
+            _ => None,
+        };
         let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
 
         const TEMPLATE_KEY: &str = "tokenizer.chat_template";
@@ -666,6 +672,27 @@ impl Engine {
     }
 }
 
+/// The index of the drafter GGUF at `path`.
+fn read_drafter_header(path: &Path) -> Result<gguf_file::Content, CucaError> {
+    let mut reader = BufReader::new(File::open(path).map_err(|e| CucaError::Io {
+        message: format!("reading GGUF `{}`: {e}", path.display()),
+    })?);
+    gguf_file::Content::read(&mut reader).map_err(|e| {
+        local_err(format!(
+            "`{}` is not a supported GGUF file: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// Whether the drafter file is a Mistral Small 4 EAGLE drafter.
+fn is_eagle(content: &gguf_file::Content) -> bool {
+    matches!(
+        content.metadata.get("general.architecture"),
+        Some(gguf_file::Value::String(a)) if a == Arch::Mistral4Eagle.name()
+    )
+}
+
 /// Resolve `config.batching` against the model's context length: the
 /// scheduler's limits and the sizing of the K/V pools and state slots.
 ///
@@ -689,7 +716,8 @@ fn resolve_batching(
             )));
         }
     };
-    // The in-trunk head observes every position in order: one sequence.
+    // The in-trunk head and the EAGLE drafter observe every position in
+    // order: one sequence.
     let max_sequences = if in_trunk { 1 } else { b.max_sequences };
     let max_step_tokens = b
         .max_step_tokens
@@ -865,6 +893,28 @@ pub(crate) mod testing {
             gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
                 .unwrap();
         e.drafter = Some(Drafter::open_in_trunk(&content, &model.path, &e.model).unwrap());
+        e.draft_tokens = draft_tokens;
+        e.governor = Governor::always_speculating();
+        e.cost = CostModel::always_drafting();
+        e
+    }
+
+    /// [`engine`] drafting with the EAGLE drafter in the file `eagle` for the
+    /// tiny `mistral4` `model`, `draft_tokens` per round, and a governor and
+    /// cost model that always draft the full cap.
+    pub(crate) fn engine_with_eagle(
+        model: &TinyModel,
+        eagle: &TinyModel,
+        context_length: usize,
+        temperature: f32,
+        seed: Option<u64>,
+        draft_tokens: usize,
+    ) -> Engine {
+        let mut e = engine(model, context_length, temperature, seed);
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&eagle.path).unwrap()))
+                .unwrap();
+        e.drafter = Some(Drafter::open_eagle(&content, &eagle.path, &e.model).unwrap());
         e.draft_tokens = draft_tokens;
         e.governor = Governor::always_speculating();
         e.cost = CostModel::always_drafting();
@@ -1925,5 +1975,305 @@ mod tests {
         let usage = out.metadata.token_usage.expect("usage reported");
         assert_eq!(usage.prompt_tokens, 6);
         assert!(usage.completion_tokens <= 4);
+    }
+
+    // ---- the EAGLE drafter ----
+
+    /// A tiny `mistral4` target (latent attention over a dense FFN in its
+    /// first layer and experts after it) with a context of `context`.
+    fn mistral4(context: usize) -> crate::provider::local::model::tiny::TinyModel {
+        use crate::provider::local::model::tiny::{TinyMistral4, write_mistral4};
+        write_mistral4(&TinyMistral4 {
+            dense_layers: 1,
+            meta: vec![(
+                "context_length".into(),
+                gguf_file::Value::U32(context as u32),
+            )],
+            ..TinyMistral4::default()
+        })
+    }
+
+    fn eagle() -> crate::provider::local::model::tiny::TinyModel {
+        use crate::provider::local::model::tiny::{TinyEagle, write_tiny_eagle};
+        write_tiny_eagle(&TinyEagle::default())
+    }
+
+    /// The committed pairs of the EAGLE drafter of `e`.
+    fn eagle_len(e: &Engine) -> usize {
+        match &e.drafter {
+            Some(Drafter::Eagle(head)) => head.len(),
+            _ => panic!("the engine has no EAGLE drafter"),
+        }
+    }
+
+    /// The EAGLE drafter must not change greedy output: the same tokens, the
+    /// same usage and the same cache bookkeeping as plain decoding, whatever
+    /// the draft length and however many drafts the target rejects; and the
+    /// drafter stays one pair behind the target's cache.
+    #[test]
+    fn eagle_leaves_greedy_output_unchanged() {
+        use super::testing::engine_with_eagle;
+        let (model, eagle) = (mistral4(32), eagle());
+        let prompts: [&[u32]; 5] = [
+            &PROMPT,
+            &[2, 9, 9, 9, 10],
+            &[2, 13, 12, 11, 10, 9, 13],
+            &[2, 11],
+            &[2, 12, 10, 14, 13, 11, 9, 15, 10, 12, 14, 11],
+        ];
+        let (mut drafted, mut accepted) = (0, 0);
+        for k in [1usize, 2, 4, 8] {
+            for prompt in prompts {
+                let mut plain = engine(&model, 32, 0.0, None);
+                let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, k);
+                let expected = run(&mut plain, prompt, None);
+                let got = run(&mut spec, prompt, None);
+                assert_eq!(text(&got), text(&expected), "k {k}, prompt {prompt:?}");
+                assert_eq!(
+                    got.items.len(),
+                    expected.items.len(),
+                    "k {k}, prompt {prompt:?}"
+                );
+                assert_eq!(
+                    got.metadata.token_usage.map(|u| u.completion_tokens),
+                    expected.metadata.token_usage.map(|u| u.completion_tokens),
+                    "k {k}, prompt {prompt:?}"
+                );
+                // An accepted draft that ends the reply is cached with its
+                // round; plain decoding stops at it without forwarding it.
+                assert!(
+                    spec.last_ids.starts_with(&plain.last_ids)
+                        && spec.last_ids[plain.last_ids.len()..]
+                            .iter()
+                            .all(|&id| spec.format.is_eog(id)),
+                    "k {k}, prompt {prompt:?}: {:?} vs {:?}",
+                    spec.last_ids,
+                    plain.last_ids
+                );
+                assert_eq!(
+                    eagle_len(&spec),
+                    spec.last_ids.len() - 1,
+                    "k {k}, prompt {prompt:?}"
+                );
+                let stats = spec.stats.snapshot();
+                drafted += stats.drafted;
+                accepted += stats.accepted;
+            }
+        }
+        assert!(drafted > 0, "the drafter proposed tokens");
+        assert!(accepted > 0, "some drafts were accepted and rolled forward");
+    }
+
+    #[test]
+    fn eagle_respects_max_tokens_and_the_context_limit() {
+        use super::testing::engine_with_eagle;
+        let (model, eagle) = (mistral4(32), eagle());
+        for max in [1u32, 2, 3, 7] {
+            let mut plain = engine(&model, 32, 0.0, None);
+            let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, 4);
+            let a = run(&mut plain, &PROMPT, Some(max));
+            let b = run(&mut spec, &PROMPT, Some(max));
+            assert_eq!(text(&a), text(&b), "max {max}");
+            assert_eq!(
+                a.metadata.token_usage.map(|u| u.completion_tokens),
+                b.metadata.token_usage.map(|u| u.completion_tokens),
+                "max {max}"
+            );
+            assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "max {max}");
+        }
+        // A context that fills up mid-round, for several sizes and prompts:
+        // the completion stops at the room the context leaves.
+        let mut filled = 0;
+        for ctx in [7usize, 8, 9, 10, 12, 16] {
+            for prompt in [
+                &PROMPT[..],
+                &[2u32, 9, 9, 9, 10][..],
+                &[2u32, 11][..],
+                &[2u32, 12, 10, 14][..],
+                &[2u32, 13, 12, 11, 10][..],
+            ] {
+                let mut plain = engine(&model, ctx, 0.0, None);
+                let mut spec = engine_with_eagle(&model, &eagle, ctx, 0.0, None, 8);
+                let a = run(&mut plain, prompt, None);
+                let b = run(&mut spec, prompt, None);
+                assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
+                // A budget that ends inside a round leaves the last accepted
+                // draft cached, which plain decoding never forwards.
+                assert!(
+                    spec.last_ids.starts_with(&plain.last_ids),
+                    "ctx {ctx}, prompt {prompt:?}"
+                );
+                assert_eq!(eagle_len(&spec), spec.last_ids.len() - 1, "ctx {ctx}");
+                let tokens = b.metadata.token_usage.map(|u| u.completion_tokens);
+                filled += usize::from(tokens == u32::try_from(ctx - prompt.len()).ok());
+            }
+        }
+        assert!(filled > 0, "some run stopped at the context limit");
+    }
+
+    /// Warm prefix reuse with the EAGLE drafter equals a cold run, bit for
+    /// bit: the target resumes from the shared blocks, the drafter keeps what
+    /// the shared tokens still determine and re-observes the replayed rows,
+    /// and its K/V ends up the cold drafter's.
+    #[test]
+    fn eagle_warm_prefix_reuse_equals_cold() {
+        use super::testing::engine_with_eagle;
+        let (model, eagle) = (mistral4(128), eagle());
+        let mut first = long_prompt(40);
+        first[19] = 3;
+        let mut second = first[..30].to_vec();
+        second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
+        let kv_of = |e: &Engine| match &e.drafter {
+            Some(Drafter::Eagle(head)) => head.kv_prefix(),
+            _ => panic!("the engine has no EAGLE drafter"),
+        };
+        let mut warm = engine_with_eagle(&model, &eagle, 128, 0.0, None, 3);
+        let a = run(&mut warm, &first, Some(6));
+        assert_eq!(usage(&a), (0, 40));
+        assert_eq!(eagle_len(&warm), warm.last_ids.len() - 1);
+
+        // Resumes from the first shared block: 16 of the 30 shared tokens.
+        let b = run(&mut warm, &second, Some(6));
+        assert_eq!(usage(&b), (16, 24));
+        let mut cold_engine = engine_with_eagle(&model, &eagle, 128, 0.0, None, 3);
+        let cold = run(&mut cold_engine, &second, Some(6));
+        let plain = run(&mut engine(&model, 128, 0.0, None), &second, Some(6));
+        assert_eq!(text(&b), text(&cold));
+        assert_eq!(text(&b), text(&plain));
+        assert_eq!(eagle_len(&warm), warm.last_ids.len() - 1);
+        assert_eq!(warm.last_ids, cold_engine.last_ids);
+        assert_eq!(kv_of(&warm), kv_of(&cold_engine));
+
+        // The same prompt again reads both full blocks below its last token.
+        let c = run(&mut warm, &second, Some(6));
+        assert_eq!(usage(&c), (32, 8));
+        assert_eq!(text(&c), text(&plain));
+        assert_eq!(eagle_len(&warm), warm.last_ids.len() - 1);
+        assert_eq!(kv_of(&warm), kv_of(&cold_engine));
+
+        // The cached ids plus more tokens: the drafter's tail bridges the
+        // request boundary.
+        let mut extended = warm.last_ids.clone();
+        extended.extend([15, 14]);
+        let d = run(&mut warm, &extended, Some(4));
+        assert_eq!(usage(&d).0 % 16, 0);
+        assert!(usage(&d).0 >= 32, "{:?}", usage(&d));
+        let expected = run(&mut engine(&model, 128, 0.0, None), &extended, Some(4));
+        assert_eq!(text(&d), text(&expected));
+        assert_eq!(eagle_len(&warm), warm.last_ids.len() - 1);
+
+        // A prompt that diverges inside the second block keeps the first.
+        let mut diverging = first[..18].to_vec();
+        diverging.extend([15, 14, 13, 12, 11, 10, 9, 15, 14, 13, 12, 11]);
+        let e = run(&mut warm, &diverging, Some(5));
+        assert_eq!(usage(&e), (16, 14));
+        let expected = run(&mut engine(&model, 128, 0.0, None), &diverging, Some(5));
+        assert_eq!(text(&e), text(&expected));
+        assert_eq!(eagle_len(&warm), warm.last_ids.len() - 1);
+    }
+
+    /// A failed request resets the drafter with the target, and the engine
+    /// keeps serving.
+    #[test]
+    fn eagle_recovers_from_a_failed_request() {
+        use super::testing::engine_with_eagle;
+        let (model, eagle) = (mistral4(32), eagle());
+        let mut e = engine_with_eagle(&model, &eagle, 32, 0.0, None, 3);
+        let prompt = [2u32, 9, 10, 3, 11, 12, 13];
+        let before = run(&mut e, &prompt, Some(4));
+        let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
+        assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
+        assert!(e.last_ids.is_empty());
+        assert_eq!(eagle_len(&e), 0);
+        let after = run(&mut e, &prompt, Some(4));
+        assert_eq!(usage(&after), (0, 7));
+        assert_eq!(text(&after), text(&before));
+        assert_eq!(eagle_len(&e), e.last_ids.len() - 1);
+    }
+
+    #[test]
+    fn eagle_with_sampling_is_reproducible_for_a_seed() {
+        use super::testing::engine_with_eagle;
+        let (model, eagle) = (mistral4(32), eagle());
+        let run_once = || {
+            let mut e = engine_with_eagle(&model, &eagle, 32, 1.0, Some(5), 3);
+            let out = run(&mut e, &PROMPT, None);
+            (
+                text(&out),
+                out.metadata.token_usage.map(|u| u.completion_tokens),
+                e.stats.snapshot(),
+            )
+        };
+        let (a, n, stats_a) = run_once();
+        let (b, m, stats_b) = run_once();
+        assert_eq!((a, n, stats_a), (b, m, stats_b));
+        assert!(n.is_some());
+        assert!(stats_a.drafted > 0, "a seeded run always drafts");
+    }
+
+    /// The engine recognises an EAGLE file by its architecture, serves one
+    /// sequence at a time with it, pairs it with a `mistral4` target only,
+    /// and refuses a GPU before loading anything.
+    #[test]
+    fn the_eagle_drafter_serves_one_mistral4_sequence_on_the_cpu() {
+        use crate::provider::local::model::mtp::Drafter;
+        let (model, eagle) = (mistral4(32), eagle());
+        let header = |m: &crate::provider::local::model::tiny::TinyModel| {
+            read_drafter_header(&m.path).unwrap()
+        };
+        assert!(is_eagle(&header(&eagle)));
+        assert!(!is_eagle(&header(&write_tiny_drafter())));
+        assert!(!is_eagle(&header(&model)));
+
+        let config = LocalModelConfig {
+            batching: super::super::BatchingConfig {
+                max_sequences: 4,
+                ..Default::default()
+            },
+            ..LocalModelConfig::default()
+        };
+        assert_eq!(
+            resolve_batching(&config, 32, true).unwrap().0.max_sequences,
+            1
+        );
+        assert_eq!(
+            resolve_batching(&config, 32, false)
+                .unwrap()
+                .0
+                .max_sequences,
+            4
+        );
+
+        // Another target model is refused, loudly.
+        let gemma = engine(&write_tiny_model(), 32, 0.0, None);
+        let content = header(&eagle);
+        let e = Drafter::open_eagle(&content, &eagle.path, &gemma.model)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(
+            e.contains("pairs with a `mistral4` model, not `gemma4`"),
+            "{e}"
+        );
+
+        // A GPU fails before the target is read any further.
+        let gpu = LocalModelConfig {
+            device: LocalDevice::Vulkan(super::super::GpuAdapter::Default),
+            ..LocalModelConfig::default()
+        };
+        let result = Engine::open(
+            &model.path,
+            Some(&ResolvedDrafter::File(eagle.path.clone())),
+            Arc::default(),
+            &gpu,
+        );
+        let e = match result {
+            Err(e) => e,
+            Ok(_) => panic!("opened an EAGLE drafter on a GPU"),
+        };
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("EAGLE drafter runs on the CPU only")),
+            "{e}"
+        );
     }
 }

@@ -1118,6 +1118,23 @@ pub(crate) fn build(
             }
         }
         ConvArch::Mistral4 => mla(arch, hp, &mut kv, n_block)?,
+        ConvArch::Mistral4Eagle => {
+            mla(arch, hp, &mut kv, n_block)?;
+            kv.u32("embedding_length_out", hp.n_embd()?)?;
+            // The Llama 4 query scaling is written out (the target's file
+            // leaves it to the engine's default of the same two numbers): the
+            // drafter must scale exactly as its target, which the engine
+            // checks when it pairs them.
+            let rope = hp.rope_full();
+            if let (Some(beta), Some(length)) = (
+                rope.get("llama_4_scaling_beta").and_then(Json::as_f64),
+                rope.get("original_max_position_embeddings")
+                    .and_then(as_usize),
+            ) {
+                kv.f32("attention.temperature_scale", beta);
+                kv.u32("attention.temperature_length", length)?;
+            }
+        }
         ConvArch::Phi3 => extra = phi3(hp, &mut kv, n_block)?,
         ConvArch::Gemma3 => {
             base(arch, hp, &mut kv, n_block)?;

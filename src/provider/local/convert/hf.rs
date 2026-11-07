@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::arch::ConvArch;
+use super::eagle;
 use crate::error::CucaError;
 use crate::provider::local::DownloadProgressCallback;
 use crate::provider::local::download;
@@ -56,6 +57,18 @@ fn read_json_opt(path: &Path) -> Result<Option<Value>, CucaError> {
     path.is_file().then(|| read_json(path)).transpose()
 }
 
+/// `config.json`, or, for the Mistral-format EAGLE drafter (which ships
+/// `params.json` and no `config.json`), the config [`eagle::config_from_params`]
+/// derives. A directory with neither fails reading `config.json`.
+fn read_config(dir: &Path) -> Result<Value, CucaError> {
+    let config = dir.join("config.json");
+    let params = dir.join(eagle::PARAMS_FILE);
+    if !config.is_file() && params.is_file() {
+        return eagle::config_from_params(&read_json(&params)?);
+    }
+    read_json(&config)
+}
+
 /// The shard files named by a `model.safetensors.index.json`, sorted.
 fn index_shards(dir: &Path, index: &Value) -> Result<Vec<PathBuf>, CucaError> {
     let map = index
@@ -85,7 +98,7 @@ impl CheckpointDir {
     /// are the `weight_map` values of `model.safetensors.index.json` when
     /// present, else `model.safetensors`, else every `*.safetensors` file.
     pub(crate) fn open(dir: &Path) -> Result<Self, CucaError> {
-        let config = read_json(&dir.join("config.json"))?;
+        let config = read_config(dir)?;
         let shards = if let Some(index) = read_json_opt(&dir.join(INDEX_FILE))? {
             index_shards(dir, &index)?
         } else if dir.join(SINGLE_FILE).is_file() {
@@ -155,7 +168,10 @@ pub(crate) async fn fetch(
         .parent()
         .map(Path::to_path_buf)
         .ok_or_else(|| CucaError::Config("checkpoint path has no parent".into()))?;
-    download::ensure_downloaded(
+    // `config.json` comes first: an architecture without a converter fails
+    // before any weight is downloaded. The Mistral-format EAGLE drafter has
+    // `params.json` in its place.
+    let has_config = download::ensure_downloaded_optional(
         client,
         endpoint,
         repo,
@@ -167,7 +183,27 @@ pub(crate) async fn fetch(
         progress,
     )
     .await?;
-    ConvArch::from_config(&read_json(&dir.join("config.json"))?)?;
+    if !has_config {
+        let has_params = download::ensure_downloaded_optional(
+            client,
+            endpoint,
+            repo,
+            revision,
+            eagle::PARAMS_FILE,
+            None,
+            &path(eagle::PARAMS_FILE)?,
+            token,
+            progress,
+        )
+        .await?;
+        if !has_params {
+            return Err(CucaError::Config(format!(
+                "checkpoint `{repo}` at `{revision}` has neither config.json nor {}",
+                eagle::PARAMS_FILE
+            )));
+        }
+    }
+    ConvArch::from_config(&read_config(&dir)?)?;
 
     for file in OPTIONAL_FILES.iter().chain(&[INDEX_FILE]) {
         download::ensure_downloaded_optional(
@@ -188,7 +224,8 @@ pub(crate) async fn fetch(
             .iter()
             .filter_map(|p| p.file_name().and_then(|n| n.to_str()).map(str::to_string))
             .collect(),
-        None => vec![SINGLE_FILE.to_string()],
+        None if has_config => vec![SINGLE_FILE.to_string()],
+        None => vec![eagle::WEIGHTS_FILE.to_string()],
     };
     for shard in &shards {
         download::ensure_downloaded(
@@ -244,6 +281,43 @@ mod tests {
             [dir.join("s-1.safetensors"), dir.join("s-2.safetensors")]
         );
         assert_eq!(c.chat_template_file.as_deref(), Some("{{ x }}"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The Mistral-format EAGLE drafter has `params.json` and
+    /// `consolidated.safetensors` and no `config.json`: its config is derived.
+    #[test]
+    fn opens_a_params_json_drafter_without_config_json() {
+        let dir = temp_dir("hf-eagle");
+        assert!(CheckpointDir::open(&dir).is_err(), "nothing there");
+        std::fs::write(dir.join("consolidated.safetensors"), b"x").unwrap();
+        std::fs::write(dir.join("params.json"), r#"{"moe": {"num_experts": 4}}"#).unwrap();
+        let err = CheckpointDir::open(&dir).unwrap_err().to_string();
+        assert!(err.contains("mixture-of-experts"), "{err}");
+        std::fs::write(
+            dir.join("params.json"),
+            r#"{"dim": 64, "n_layers": 2, "hidden_dim": 96, "n_heads": 4, "n_kv_heads": 4,
+                "norm_eps": 1e-6, "vocab_size": 16, "q_lora_rank": 32, "kv_lora_rank": 16,
+                "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 16,
+                "yarn": {"original_max_position_embeddings": 8, "factor": 2, "beta": 32, "alpha": 1},
+                "llama_4_scaling": {"original_max_position_embeddings": 8, "beta": 0.3},
+                "moe": null}"#,
+        )
+        .unwrap();
+        let c = CheckpointDir::open(&dir).unwrap();
+        assert_eq!(c.shards, [dir.join("consolidated.safetensors")]);
+        assert_eq!(
+            ConvArch::from_config(&c.config).unwrap(),
+            ConvArch::Mistral4Eagle
+        );
+        // A `config.json` wins over `params.json`.
+        std::fs::write(
+            dir.join("config.json"),
+            r#"{"architectures":["LlamaForCausalLM"]}"#,
+        )
+        .unwrap();
+        let c = CheckpointDir::open(&dir).unwrap();
+        assert_eq!(ConvArch::from_config(&c.config).unwrap(), ConvArch::Llama);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

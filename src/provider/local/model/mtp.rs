@@ -61,13 +61,27 @@
 //! shared prefix of the cached ids and the new prompt before prefilling, the
 //! replayed rows (whatever length the trunk could keep) are observed from the
 //! position the trunk resumes at, and a failed pass resets it.
+//!
+//! # EAGLE drafter (`mistral4-eagle`)
+//!
+//! Mistral's EAGLE head for Mistral Small 4 is a separate GGUF (converted from
+//! the published `mistralai/Mistral-Small-4-119B-2603-eagle`) of two
+//! latent-attention layers with a dense FFN. It has no embedding and no LM
+//! head: it reads the target's, and a draft step ranks the whole vocabulary.
+//! Like the in-trunk head it keeps a K/V cache of its own over every trunk
+//! position, is fed by [`Drafter::observe`] with the trunk's final-norm
+//! hidden rows, follows [`Drafter::truncate`] and [`Drafter::reset`] by the
+//! same pair rule, serves one sequence at a time, and runs on the CPU only.
+//! See [`super::cpu::EagleHead`] for the semantics (embedding first, then the
+//! hidden row; RoPE position of the hidden row), the cost of committing a
+//! pair, and the memory.
 
 use std::path::Path;
 
 use candle_core::quantized::gguf_file;
 
 use super::arch::Arch;
-use super::cpu::{NextnHead, Transformer};
+use super::cpu::{EagleHead, NextnHead, Transformer};
 #[cfg(feature = "provider-local-gpu")]
 use super::gpu::GpuDrafter;
 use super::paged::BlockTable;
@@ -86,6 +100,9 @@ pub(crate) enum Drafter {
     Gpu(GpuDrafter),
     /// The prediction head embedded in the target's own file (CPU only).
     InTrunk(NextnHead),
+    /// The EAGLE drafter of a Mistral Small 4 model, a separate file with a
+    /// K/V cache of its own (CPU only).
+    Eagle(EagleHead),
 }
 
 impl Drafter {
@@ -159,10 +176,38 @@ impl Drafter {
         }
     }
 
+    /// The EAGLE drafter in the GGUF file at `path` (index `content`) for
+    /// `target`.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when `target` is not a `mistral4` model on the
+    /// CPU, the file is not an EAGLE drafter, or it was trained for another
+    /// model (see [`Transformer::load_eagle`]).
+    pub(crate) fn open_eagle(
+        content: &gguf_file::Content,
+        path: &Path,
+        target: &Model,
+    ) -> Result<Self, CucaError> {
+        if target.arch() != Arch::Mistral4 {
+            return Err(err(format!(
+                "the `mistral4-eagle` drafter pairs with a `mistral4` model, not `{}`",
+                target.arch().name()
+            )));
+        }
+        match target {
+            Model::Cpu(target) => Ok(Self::Eagle(target.load_eagle(content, path)?)),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(_) => Err(err(
+                "the EAGLE drafter runs on the CPU only: use `LocalDevice::Cpu`",
+            )),
+        }
+    }
+
     /// Whether the drafter needs the trunk's hidden row of every position
     /// ([`Drafter::observe`]), not just the last one.
     pub(crate) fn observes(&self) -> bool {
-        matches!(self, Self::InTrunk(_))
+        matches!(self, Self::InTrunk(_) | Self::Eagle(_))
     }
 
     /// Tell the drafter the trunk ran the tokens `tokens[i]` at positions
@@ -185,10 +230,15 @@ impl Drafter {
             (Self::InTrunk(head), Model::Cpu(target)) => {
                 target.head_observe(head, pos, tokens, hidden)
             }
+            (Self::Eagle(head), Model::Cpu(target)) => {
+                target.eagle_observe(head, pos, tokens, hidden)
+            }
             #[cfg(feature = "provider-local-gpu")]
             (Self::InTrunk(_), _) => {
                 Err(err("the drafter and its target run on different devices"))
             }
+            #[cfg(feature = "provider-local-gpu")]
+            (Self::Eagle(_), _) => Err(err("the drafter and its target run on different devices")),
             _ => Ok(()),
         }
     }
@@ -198,16 +248,20 @@ impl Drafter {
     /// cached ids): forget what depended on the rest. A no-op for the file
     /// drafters.
     pub(crate) fn truncate(&mut self, shared: usize) {
-        if let Self::InTrunk(head) = self {
-            head.truncate(shared);
+        match self {
+            Self::InTrunk(head) => head.truncate(shared),
+            Self::Eagle(head) => head.truncate(shared),
+            _ => {}
         }
     }
 
     /// Forget everything the drafter learned from the trunk (the trunk's
     /// cache was emptied). A no-op for the file drafters.
     pub(crate) fn reset(&mut self) {
-        if let Self::InTrunk(head) = self {
-            head.reset();
+        match self {
+            Self::InTrunk(head) => head.reset(),
+            Self::Eagle(head) => head.reset(),
+            _ => {}
         }
     }
 
@@ -258,6 +312,9 @@ impl Drafter {
             }
             (Self::InTrunk(head), Model::Cpu(target)) => {
                 target.head_draft(head, hidden, first, len, k, pick)
+            }
+            (Self::Eagle(head), Model::Cpu(target)) => {
+                target.eagle_draft(head, hidden, first, len, k, pick)
             }
             #[cfg(feature = "provider-local-gpu")]
             (Self::Gpu(drafter), Model::Gpu(target)) => {

@@ -82,6 +82,13 @@ pub(crate) enum Arch {
     /// target model. It is loaded through `LocalModelConfig::drafter`, never
     /// as a main model.
     Gemma4Assistant,
+    /// The Mistral Small 4 EAGLE drafter (`mistral4-eagle`): two latent
+    /// attention layers with a dense FFN that read the target's final-norm
+    /// hidden state and the embedding of the token after it, and predict the
+    /// token after that. Unlike the Gemma 4 drafter it keeps a K/V cache of
+    /// its own and shares the target's embedding table and LM head. It is
+    /// loaded through `LocalModelConfig::drafter`, never as a main model.
+    Mistral4Eagle,
 }
 
 /// FFN gate activation.
@@ -261,7 +268,7 @@ const DEFAULT: Behavior = Behavior {
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 18] = [
+    pub(crate) const ALL: [Arch; 19] = [
         Arch::Gemma4,
         Arch::Gemma3,
         Arch::Llama,
@@ -280,6 +287,7 @@ impl Arch {
         Arch::Mistral3,
         Arch::Mistral4,
         Arch::Gemma4Assistant,
+        Arch::Mistral4Eagle,
     ];
 
     /// The `general.architecture` string, which is also the metadata key
@@ -304,6 +312,7 @@ impl Arch {
             Arch::MuseGlimmer => "muse-glimmer",
             Arch::Mistral3 => "mistral3",
             Arch::Mistral4 => "mistral4",
+            Arch::Mistral4Eagle => "mistral4-eagle",
         }
     }
 
@@ -323,6 +332,13 @@ impl Arch {
 
     /// Whether this architecture is a drafter rather than a standalone model.
     pub(crate) fn is_drafter(self) -> bool {
+        matches!(self, Arch::Gemma4Assistant | Arch::Mistral4Eagle)
+    }
+
+    /// Whether this drafter has no K/V of its own and attends to the
+    /// target's cache (the Gemma 4 assistant), as opposed to keeping its own
+    /// (the EAGLE drafter).
+    pub(crate) fn reads_target_kv(self) -> bool {
         self == Arch::Gemma4Assistant
     }
 
@@ -369,6 +385,14 @@ impl Arch {
                 moe: true,
                 shared_expert: true,
                 shared_expert_ungated: true,
+                mla: true,
+                attn_temp_default: Some((0.1, 8192)),
+                ..DEFAULT
+            },
+            // The drafter's layers are the target's attention with a dense
+            // FFN: no experts, no shared expert.
+            Arch::Mistral4Eagle => Behavior {
+                rope: RopeKind::Norm,
                 mla: true,
                 attn_temp_default: Some((0.1, 8192)),
                 ..DEFAULT
@@ -528,10 +552,10 @@ mod tests {
     }
 
     #[test]
-    fn mistral4_alone_is_latent_attention_with_llama4_query_scaling() {
+    fn only_the_mistral4_family_is_latent_attention_with_llama4_query_scaling() {
         for arch in Arch::ALL {
             let b = arch.behavior();
-            let m = arch == Arch::Mistral4;
+            let m = matches!(arch, Arch::Mistral4 | Arch::Mistral4Eagle);
             assert_eq!(b.mla, m, "{arch:?}");
             assert_eq!(b.attn_temp_default.is_some(), m, "{arch:?}");
         }
@@ -539,5 +563,20 @@ mod tests {
         assert_eq!(b.rope, RopeKind::Norm);
         assert!(b.moe && b.moe_norm_weights && !b.post_norms);
         assert_eq!(b.attn_temp_default, Some((0.1, 8192)));
+    }
+
+    /// The EAGLE drafter is the Mistral 4 attention over a dense FFN, owns
+    /// its K/V and is a drafter; the Gemma 4 assistant reads the target's.
+    #[test]
+    fn the_eagle_drafter_is_a_dense_mistral4_with_its_own_kv() {
+        let (eagle, target) = (Arch::Mistral4Eagle.behavior(), Arch::Mistral4.behavior());
+        assert_eq!(eagle.rope, target.rope);
+        assert_eq!(eagle.attn_temp_default, target.attn_temp_default);
+        assert!(!eagle.moe && !eagle.shared_expert && !eagle.shared_expert_ungated);
+        for arch in Arch::ALL {
+            let drafter = matches!(arch, Arch::Gemma4Assistant | Arch::Mistral4Eagle);
+            assert_eq!(arch.is_drafter(), drafter, "{arch:?}");
+            assert_eq!(arch.reads_target_kv(), arch == Arch::Gemma4Assistant);
+        }
     }
 }

@@ -53,6 +53,11 @@ pub(crate) enum ConvArch {
     /// `LlamaModel`): Llama layers, YaRN with a log multiplier and the Llama 4
     /// query scaling.
     Mistral3,
+    /// The Mistral Small 4 EAGLE drafter, published in Mistral's own format
+    /// (`params.json`, `consolidated.safetensors`): [`ConvArch::from_config`]
+    /// sees it as the `EagleMistralLarge3ForCausalLM` class of the config
+    /// that [`super::eagle::config_from_params`] derives from `params.json`.
+    Mistral4Eagle,
 }
 
 impl ConvArch {
@@ -76,6 +81,7 @@ impl ConvArch {
             "Ernie4_5ForCausalLM" | "Ernie4_5_ForCausalLM" => Self::Ernie4_5,
             "MuseGlimmerForConditionalGeneration" => Self::MuseGlimmer,
             "Ministral3ForCausalLM" => Self::Mistral3,
+            super::eagle::ARCHITECTURE => Self::Mistral4Eagle,
             _ => return None,
         })
     }
@@ -133,6 +139,7 @@ impl ConvArch {
             Self::MuseGlimmer => "muse-glimmer",
             Self::Mistral4 => "mistral4",
             Self::Mistral3 => "mistral3",
+            Self::Mistral4Eagle => "mistral4-eagle",
         }
     }
 
@@ -206,6 +213,7 @@ mod tests {
             ConvArch::MuseGlimmer,
             ConvArch::Mistral4,
             ConvArch::Mistral3,
+            ConvArch::Mistral4Eagle,
         ];
         for conv in all {
             assert!(Arch::from_name(conv.gguf_name()).is_ok(), "{conv:?}");

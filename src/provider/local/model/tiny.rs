@@ -29,6 +29,9 @@ use candle_core::{Device, Tensor};
 use super::cpu::Transformer;
 use super::paged::Sizing;
 
+mod eagle;
+pub(crate) use eagle::{TinyEagle, write_tiny_eagle};
+
 pub(crate) const VOCAB: usize = 16;
 pub(crate) const CONTEXT: usize = 32;
 pub(crate) const N_EMBD: usize = 64;
@@ -1138,6 +1141,10 @@ pub(crate) struct TinyMistral4 {
     pub(crate) dense_layers: usize,
     /// Metadata keys (relative to `mistral4.`) written over the defaults.
     pub(crate) meta: Vec<(String, Value)>,
+    /// `token_embd.weight` and `output.weight` (`VOCAB x N_EMBD` values
+    /// each), stored as `f32`, in place of the random ones.
+    pub(crate) embd: Option<Vec<f32>>,
+    pub(crate) output: Option<Vec<f32>>,
 }
 
 /// Width of the dense FFN of a tiny `mistral4` model's leading layers.
@@ -1151,6 +1158,8 @@ impl Default for TinyMistral4 {
             fused: true,
             dtype: GgmlDType::Q8_0,
             meta: Vec::new(),
+            embd: None,
+            output: None,
         }
     }
 }
@@ -1330,6 +1339,13 @@ pub(crate) fn write_mistral4(s: &TinyMistral4) -> TinyModel {
         match meta.iter_mut().find(|(k, _)| *k == full) {
             Some(entry) => entry.1 = value.clone(),
             None => meta.push((full, value.clone())),
+        }
+    }
+    for (name, values) in [("token_embd.weight", &s.embd), ("output.weight", &s.output)] {
+        if let Some(values) = values
+            && let Some(entry) = tensors.iter_mut().find(|(n, _)| n == name)
+        {
+            entry.1 = quantize(values.clone(), &[VOCAB, N_EMBD], GgmlDType::F32);
         }
     }
     write(&path, &meta, &tensors);

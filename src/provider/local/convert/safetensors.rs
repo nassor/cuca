@@ -237,11 +237,20 @@ impl Shards {
 
     /// The dequantization factors of the `F8_E4M3` tensor `name`: its
     /// `{name}_scale_inv` companion (`...weight_scale_inv`,
-    /// `...gate_up_proj_scale_inv`), either one value for the whole tensor
+    /// `...gate_up_proj_scale_inv`), or, in a Mistral-format checkpoint, the
+    /// `{module}.qscale_weight` next to `{module}.weight`; either one value
+    /// for the whole tensor
     /// or one per index of the first dimension (`[E, 1, 1]` for `[E, R, C]`
     /// experts), as the converter's `dequant_simple` broadcasts them.
     fn fp8_scales(&self, name: &str, meta: &TensorMeta) -> Result<Vec<f32>, CucaError> {
-        let scale_name = format!("{name}_scale_inv");
+        let hf = format!("{name}_scale_inv");
+        let scale_name = match name
+            .strip_suffix(".weight")
+            .map(|module| format!("{module}.qscale_weight"))
+        {
+            Some(native) if self.tensor(&hf).is_none() && self.tensor(&native).is_some() => native,
+            _ => hf,
+        };
         let scale = self.tensor(&scale_name).ok_or_else(|| {
             CucaError::Config(format!(
                 "FP8 tensor `{name}` has no `{scale_name}` companion"
@@ -502,6 +511,38 @@ pub(crate) mod tests {
         assert!(err.contains("block-scaled"), "{err}");
         let err = shards.f32("n").unwrap_err().to_string();
         assert!(err.contains("n_scale_inv"), "{err}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A Mistral-format checkpoint names the scale `<module>.qscale_weight`
+    /// next to `<module>.weight`; the HF `_scale_inv` name wins when both
+    /// exist, and the error for a missing one names the HF companion.
+    #[test]
+    fn fp8_tensors_are_scaled_by_their_qscale_weight() {
+        let dir = temp_dir("st-qscale");
+        let p = dir.join("consolidated.safetensors");
+        let bf = |v: &[f32]| -> Vec<u8> {
+            v.iter()
+                .flat_map(|x| half::bf16::from_f32(*x).to_le_bytes())
+                .collect()
+        };
+        write_file(
+            &p,
+            &[
+                ("m.weight", "F8_E4M3", &[2, 2], vec![0x38, 0x38, 0xB8, 0x30]),
+                ("m.qscale_weight", "BF16", &[], bf(&[4.0])),
+                ("m.qscale_act", "BF16", &[], bf(&[0.75])),
+                ("both.weight", "F8_E4M3", &[1, 1], vec![0x38]),
+                ("both.weight_scale_inv", "BF16", &[], bf(&[2.0])),
+                ("both.qscale_weight", "BF16", &[], bf(&[8.0])),
+                ("lone.weight", "F8_E4M3", &[1, 1], vec![0x38]),
+            ],
+        );
+        let shards = Shards::open(&[p]).unwrap();
+        assert_eq!(shards.f32("m.weight").unwrap(), [4.0, 4.0, -4.0, 2.0]);
+        assert_eq!(shards.f32("both.weight").unwrap(), [2.0]);
+        let err = shards.f32("lone.weight").unwrap_err().to_string();
+        assert!(err.contains("lone.weight_scale_inv"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
     }
 

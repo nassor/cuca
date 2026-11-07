@@ -244,7 +244,7 @@ impl Transformer {
 
     /// The embedding rows of `ids`, concatenated (scaled as the first trunk
     /// layer sees them).
-    fn embedding_rows(&self, ids: &[u32]) -> Result<Vec<f32>, CucaError> {
+    pub(super) fn embedding_rows(&self, ids: &[u32]) -> Result<Vec<f32>, CucaError> {
         self.embed
             .as_ref()
             .ok_or_else(|| err("this model has no token embedding"))?

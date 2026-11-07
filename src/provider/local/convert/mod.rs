@@ -26,6 +26,7 @@
 pub(crate) mod arch;
 pub(crate) mod chktxt;
 pub(crate) mod config;
+pub(crate) mod eagle;
 pub(crate) mod gguf_merge;
 pub(crate) mod gguf_writer;
 pub(crate) mod hf;
@@ -100,9 +101,9 @@ fn dir_key(dir: &Path) -> Result<String, CucaError> {
         .map(|e| e.path())
         .filter(|p| {
             p.is_file()
-                && p.file_name()
-                    .and_then(|n| n.to_str())
-                    .is_some_and(|n| n == "config.json" || n.ends_with(".safetensors"))
+                && p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n == "config.json" || n == eagle::PARAMS_FILE || n.ends_with(".safetensors")
+                })
         })
         .collect();
     files.sort();
@@ -278,7 +279,7 @@ fn convert_locked(
     let names: HashSet<&str> = plans.iter().map(|p| p.name.as_str()).collect();
     // The engine's own reader validates the metadata it will read.
     config::check(&kv, &|n| names.contains(n))?;
-    if arch != ConvArch::Gemma4Assistant {
+    if !matches!(arch, ConvArch::Gemma4Assistant | ConvArch::Mistral4Eagle) {
         let md: HashMap<String, _> = kv.iter().cloned().collect();
         Tokenizer::from_gguf(&md).map_err(|e| {
             CucaError::Config(format!("the converted tokenizer does not load: {e}"))

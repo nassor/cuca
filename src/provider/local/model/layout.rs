@@ -86,6 +86,11 @@ pub(crate) mod name {
     pub(crate) const NEXTN_ENORM: &str = "nextn.enorm";
     pub(crate) const NEXTN_HNORM: &str = "nextn.hnorm";
     pub(crate) const NEXTN_SHARED_HEAD_NORM: &str = "nextn.shared_head_norm";
+    /// The EAGLE drafter's fusion projection `[n_embd, 2 * n_embd]` over the
+    /// concatenation `[token embedding | target hidden state]` (Qwen 3.5's
+    /// `nextn.eh_proj` in a file of its own: a drafter has no blocks to hold
+    /// it).
+    pub(crate) const EAGLE_EH_PROJ: &str = "nextn.eh_proj.weight";
 
     /// Full tensor name of the weight `part` in block `layer`.
     pub(crate) fn blk(layer: usize, part: &str) -> String {

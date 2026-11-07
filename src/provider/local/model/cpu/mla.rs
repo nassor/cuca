@@ -101,6 +101,99 @@ pub(super) fn expand_values(
 }
 
 impl Transformer {
+    /// The latent row `[c | k_rot]` of every row of the normed input `h`
+    /// `(1, T, n_embd)` of the rows the `calls` describe: `c` is the
+    /// compressed latent (`kv_lora` values, normed), `k_rot` the shared rotary
+    /// key rotated to its row's position (`rot` values). Returns both as
+    /// row-major `[T][kv_lora]` and `[T][rot]` floats.
+    fn mla_latent(
+        &self,
+        calls: &[AttnCall<'_>],
+        mw: &MlaWeights,
+        h: &Tensor,
+    ) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
+        let first = calls
+            .first()
+            .ok_or_else(|| candle_core::Error::msg("attention needs a sequence"))?;
+        let spec = first.spec;
+        let mla = spec
+            .mla
+            .ok_or_else(|| candle_core::Error::msg("not a latent attention layer"))?;
+        let t = h.dim(1)?;
+        let (kvl, rot) = (mla.kv_lora, mla.rot);
+        let kv = mw.kv_a.forward(h)?;
+        let c = rms(
+            &kv.narrow(2, 0, kvl)?.contiguous()?,
+            &mw.kv_a_norm,
+            self.hp.eps as f32,
+        )?;
+        let k_rot = kv
+            .narrow(2, kvl, rot)?
+            .contiguous()?
+            .reshape((1, 1, t, rot))?;
+        // The rotated dimensions are the whole rotary slice, so the adjacent
+        // pair rotation applies to it unchanged (the leading `n_dims` of a
+        // `rot`-wide row).
+        let k_rot = self.rotate_calls(spec, &k_rot, calls)?;
+        Ok((
+            c.flatten_all()?.to_vec1::<f32>()?,
+            k_rot.flatten_all()?.to_vec1::<f32>()?,
+        ))
+    }
+
+    /// Store the latent rows `[c | k_rot]` ([`Transformer::mla_latent`]) of
+    /// every row in its sequence's blocks.
+    fn mla_store(
+        &self,
+        calls: &[AttnCall<'_>],
+        c: &[f32],
+        k_rot: &[f32],
+    ) -> candle_core::Result<()> {
+        let mla = calls
+            .first()
+            .and_then(|call| call.spec.mla)
+            .ok_or_else(|| candle_core::Error::msg("not a latent attention layer"))?;
+        let (kvl, rot) = (mla.kv_lora, mla.rot);
+        for call in calls {
+            let mut rows = Vec::with_capacity(call.t * mla.latent_width());
+            for i in 0..call.t {
+                let row = call.offset + i;
+                rows.extend_from_slice(&c[row * kvl..][..kvl]);
+                rows.extend_from_slice(&k_rot[row * rot..][..rot]);
+            }
+            match call.kv {
+                KvAccess::Paged {
+                    layer,
+                    write: true,
+                    table,
+                    ..
+                } => {
+                    let mut data = layer.lock();
+                    store_rows(table, call.start, call.t, &rows, &mut data.k, layer.shape)?;
+                }
+                _ => {
+                    return Err(candle_core::Error::msg(
+                        "a latent attention layer needs a paged cache of its own",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Only the cache write of a latent attention layer: the latent rows of
+    /// the normed input `h` go into the cache, and no query, attention or
+    /// output projection runs. [`Transformer::mla_in`] stores the same bits.
+    pub(super) fn mla_store_in(
+        &self,
+        calls: &[AttnCall<'_>],
+        mw: &MlaWeights,
+        h: &Tensor,
+    ) -> candle_core::Result<()> {
+        let (c, k_rot) = self.mla_latent(calls, mw, h)?;
+        self.mla_store(calls, &c, &k_rot)
+    }
+
     /// The latent attention of one layer over the normed input `h` `(1, T,
     /// n_embd)` of the rows the `calls` describe (all one layer's): the
     /// projections and RoPE run over all rows, the cache write and the
@@ -129,18 +222,9 @@ impl Transformer {
         let q = mw.q_b.forward(&cq)?.reshape((1, t, nh, mla.q_head()))?;
         let q_nope = q.narrow(3, 0, nope)?.contiguous()?;
         let q_rot = q.narrow(3, nope, rot)?.transpose(1, 2)?.contiguous()?;
-        // Latent and the shared rotary key.
-        let kv = mw.kv_a.forward(h)?;
-        let c = rms(&kv.narrow(2, 0, kvl)?.contiguous()?, &mw.kv_a_norm, eps)?;
-        let k_rot = kv
-            .narrow(2, kvl, rot)?
-            .contiguous()?
-            .reshape((1, 1, t, rot))?;
-        // The rotated dimensions are the whole rotary slice, so the adjacent
-        // pair rotation applies to it unchanged (the leading `n_dims` of a
-        // `rot`-wide row).
         let q_rot = self.rotate_calls(spec, &q_rot, calls)?;
-        let k_rot = self.rotate_calls(spec, &k_rot, calls)?;
+        // Latent and the shared rotary key.
+        let (c, k_rot) = self.mla_latent(calls, mw, h)?;
 
         let q_nope = q_nope.flatten_all()?.to_vec1::<f32>()?;
         let q_rot = q_rot
@@ -148,8 +232,6 @@ impl Transformer {
             .contiguous()?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        let c = c.flatten_all()?.to_vec1::<f32>()?;
-        let k_rot = k_rot.flatten_all()?.to_vec1::<f32>()?;
 
         // Absorbed query rows `[q_abs | q_rot]`, each scaled by the Llama 4
         // factor of its absolute position.
@@ -175,30 +257,7 @@ impl Transformer {
         }
 
         // Store `[c | k_rot]` of every row in its sequence's blocks.
-        for call in calls {
-            let mut rows = Vec::with_capacity(call.t * width);
-            for i in 0..call.t {
-                let row = call.offset + i;
-                rows.extend_from_slice(&c[row * kvl..][..kvl]);
-                rows.extend_from_slice(&k_rot[row * rot..][..rot]);
-            }
-            match call.kv {
-                KvAccess::Paged {
-                    layer,
-                    write: true,
-                    table,
-                    ..
-                } => {
-                    let mut data = layer.lock();
-                    store_rows(table, call.start, call.t, &rows, &mut data.k, layer.shape)?;
-                }
-                _ => {
-                    return Err(candle_core::Error::msg(
-                        "a latent attention layer needs a paged cache of its own",
-                    ));
-                }
-            }
-        }
+        self.mla_store(calls, &c, &k_rot)?;
 
         // Attend over the latent rows, then expand the attended latent of
         // every head through `v_b`.

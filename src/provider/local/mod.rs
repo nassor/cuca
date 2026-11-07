@@ -178,6 +178,17 @@
 //! 19-22 ms trunk step because it ranks only the first 65,536 of the 248,320
 //! token ids: 5x cheaper than the whole vocabulary for 4 % fewer accepted
 //! tokens per round.
+//!
+//! A [`DrafterSource::File`] checkpoint source that names Mistral Small 4's
+//! EAGLE drafter (`mistralai/Mistral-Small-4-119B-2603-eagle`, Mistral-format
+//! `params.json` and FP8 `consolidated.safetensors`) is converted to a
+//! `mistral4-eagle` GGUF and drafts for a `mistral4` target on the CPU: two
+//! latent-attention layers over a dense FFN reading
+//! `fc(cat(embed(t[j+1]), h[j]))` with the target's embedding and LM head, a
+//! K/V cache of its own over every position (so one request at a time, like
+//! the in-trunk head), and a draft step that ranks the whole vocabulary.
+//! Verification is unchanged, so greedy output equals plain decoding bit for
+//! bit; no speedup is claimed here: it is measured by `provider_local_mtp`.
 
 mod chat;
 mod convert;
@@ -899,10 +910,15 @@ impl fmt::Debug for DownloadProgressCallback {
 /// [`DrafterSource::File`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DrafterSource {
-    /// A separate drafter GGUF file, resolved and downloaded like any
+    /// A separate drafter file, resolved and downloaded like any
     /// [`ModelSource`]: Gemma 4's assistant (preset `gemma4-e2b-mtp-f16`),
     /// which pairs with a Gemma 4 E2B target, shares the target's K/V cache
-    /// and runs on the target's device.
+    /// and runs on the target's device; or Mistral Small 4's EAGLE drafter
+    /// (`mistralai/Mistral-Small-4-119B-2603-eagle`), a checkpoint source
+    /// (`"mistralai/Mistral-Small-4-119B-2603-eagle:<revision>"`) that is
+    /// converted once to a GGUF at [`LocalModelConfig::convert`]'s precision,
+    /// pairs with a `mistral4` target on the CPU, and keeps a K/V cache of its
+    /// own (2.5 KB per context position).
     File(ModelSource),
     /// The prediction head embedded in the main model's own GGUF file:
     /// Qwen 3.5 `*-MTP` files (for example `unsloth/Qwen3.5-0.8B-MTP-GGUF`)
@@ -1151,7 +1167,8 @@ pub struct LocalModelConfig {
     pub device: LocalDevice,
     /// Optional multi-token-prediction drafter for self-speculative decoding:
     /// a separate file (the `gemma4-e2b-mtp-f16` preset pairs with the Gemma 4
-    /// E2B presets, [`DrafterSource::File`]) or the head inside the main
+    /// E2B presets, Mistral Small 4's EAGLE checkpoint with the
+    /// `mistral-small-4-119b-q4_0` preset; [`DrafterSource::File`]) or the head inside the main
     /// model's own file ([`DrafterSource::InTrunk`], Qwen 3.5 `*-MTP`). It
     /// needs a matching target; see the module docs for the exactness
     /// guarantee and measured speedups. `None` (the default) keeps plain

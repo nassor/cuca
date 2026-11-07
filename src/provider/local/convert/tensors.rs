@@ -323,7 +323,7 @@ fn encode(dtype: Dtype, data: Vec<f32>, cols: usize, out: &mut Vec<u8>) -> Resul
 
 /// Whether the engine knows a GGUF tensor name (`layout::name`).
 pub(crate) fn is_known(name: &str) -> bool {
-    const GLOBAL: [&str; 11] = [
+    const GLOBAL: [&str; 12] = [
         gguf::TOKEN_EMBD,
         gguf::OUTPUT,
         gguf::OUTPUT_NORM,
@@ -335,6 +335,7 @@ pub(crate) fn is_known(name: &str) -> bool {
         gguf::PER_LAYER_PROJ_NORM,
         "nextn.pre_projection.weight",
         "nextn.post_projection.weight",
+        gguf::EAGLE_EH_PROJ,
     ];
     if GLOBAL.contains(&name) {
         return true;
@@ -460,6 +461,16 @@ fn skipped(name: &str) -> bool {
 fn is_fp8_scale(name: &str, shards: &Shards) -> bool {
     if name.ends_with(".activation_scale") || name.ends_with("_activation_scale") {
         return true;
+    }
+    // Mistral format: `<module>.qscale_act` and `<module>.qscale_weight`
+    // next to an FP8 `<module>.weight`.
+    if let Some(module) = name
+        .strip_suffix(".qscale_act")
+        .or_else(|| name.strip_suffix(".qscale_weight"))
+    {
+        return shards
+            .tensor(&format!("{module}.weight"))
+            .is_some_and(|w| w.dtype == StDtype::F8E4m3);
     }
     name.strip_suffix("_scale_inv")
         .and_then(|weight| shards.tensor(weight))
@@ -642,6 +653,9 @@ impl Planner<'_> {
     }
 
     fn plan_one(&mut self, hf: &str) -> Result<(), CucaError> {
+        if self.arch == ConvArch::Mistral4Eagle {
+            return self.plan_eagle(hf);
+        }
         let canon = canonical(hf);
         let arch = self.arch;
         // Multi-token-prediction head tensors of Qwen 3.5 (`mtp.*`) take the
@@ -694,6 +708,45 @@ impl Planner<'_> {
             return Err(self.unmapped(hf));
         };
         self.plan_layer(hf, il, rest)
+    }
+
+    /// A tensor of the Mistral-format EAGLE drafter: the HF names of
+    /// `convert_mistral4_weight_to_hf.py` read backwards (`attention_norm` is
+    /// `input_layernorm`, `wkv_a_with_mqa` is `kv_a_proj_with_mqa`, `w1`/`w3`/`w2`
+    /// are the gate, up and down projections), the latent attention exactly as
+    /// the full model's, plus the fusion projection `eagle_linear` and the
+    /// final `norm`. The drafter has no embedding and no LM head.
+    fn plan_eagle(&mut self, hf: &str) -> Result<(), CucaError> {
+        match hf {
+            "eagle_linear.weight" => {
+                return self.direct(hf, gguf::EAGLE_EH_PROJ.into(), Vec::new());
+            }
+            "norm.weight" => return self.direct(hf, gguf::OUTPUT_NORM.into(), Vec::new()),
+            _ => {}
+        }
+        let layer = hf
+            .strip_prefix("layers.")
+            .and_then(|r| r.split_once('.'))
+            .and_then(|(idx, rest)| Some((idx.parse::<usize>().ok()?, rest)));
+        let Some((il, rest)) = layer else {
+            return Err(self.unmapped(hf));
+        };
+        let part = match rest {
+            "attention_norm.weight" => gguf::ATTN_NORM,
+            "ffn_norm.weight" => gguf::FFN_NORM,
+            "attention.wq_a.weight" => gguf::ATTN_Q_A,
+            "attention.q_a_norm.weight" => gguf::ATTN_Q_A_NORM,
+            "attention.wq_b.weight" => gguf::ATTN_Q_B,
+            "attention.wkv_a_with_mqa.weight" => gguf::ATTN_KV_A_MQA,
+            "attention.kv_a_norm.weight" => gguf::ATTN_KV_A_NORM,
+            "attention.wo.weight" => gguf::ATTN_OUTPUT,
+            "feed_forward.w1.weight" => gguf::FFN_GATE,
+            "feed_forward.w3.weight" => gguf::FFN_UP,
+            "feed_forward.w2.weight" => gguf::FFN_DOWN,
+            "attention.wkv_b.weight" => return self.plan_kv_b(hf, il),
+            _ => return Err(self.unmapped(hf)),
+        };
+        self.direct(hf, gguf::blk(il, part), Vec::new())
     }
 
     fn unmapped(&self, hf: &str) -> CucaError {

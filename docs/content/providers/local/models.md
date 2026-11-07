@@ -53,6 +53,7 @@ Nothing here is specific to one model family. The loader reads every dimension f
 | `muse-glimmer` | Muse Glimmer 30B | CPU; GPU on tiny models only (the 30B model does not fit a 16 GB card) |
 | `mistral3` | Ministral 3 (3B, 8B, 14B), Devstral Small 2 | CPU, GPU (tiny-model tests only on the GPU) |
 | `mistral4` | Mistral Small 4 (119B, 128 experts) | CPU only; the GPU engine rejects it |
+| `mistral4-eagle` | Mistral Small 4 EAGLE drafter (`mistralai/Mistral-Small-4-119B-2603-eagle`, 2 layers, dense FFN); a drafter, never a main model | CPU only; converted from the Mistral-format checkpoint, see the drafting page |
 | `gemma4-assistant` | the Gemma 4 multi-token-prediction drafter | only through `LocalModelConfig::drafter` |
 
 What each architecture adds to the common forward pass:

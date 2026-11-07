@@ -490,8 +490,9 @@ impl Hparams {
                     format!("{shared_kv} shared layers leave no K/V owner among {n_layer} layers"),
                 )
             })?;
-        // A drafter owns no K/V at all: every layer reads the target's cache.
-        let kv_source = if arch.is_drafter() {
+        // The Gemma 4 drafter owns no K/V at all: every layer reads the
+        // target's cache. The EAGLE drafter keeps its own like any model.
+        let kv_source = if arch.reads_target_kv() {
             vec![usize::MAX; n_layer]
         } else {
             kv_sources(&sliding, n_layer_kv)?

@@ -2453,7 +2453,7 @@ impl GpuTransformer {
         let hp = read_hparams(content)?;
         if hp.arch.is_drafter() {
             return Err(err(format!(
-                "`{}` is a multi-token-prediction drafter, not a standalone model: pass it as the `drafter` of a Gemma 4 model",
+                "`{}` is a multi-token-prediction drafter, not a standalone model: pass it as the `drafter` of the model it was trained for",
                 hp.arch.name()
             )));
         }

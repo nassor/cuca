@@ -1153,7 +1153,7 @@ pub(crate) fn build(
     hp: &Hp,
 ) -> Result<Option<VocabMeta>, CucaError> {
     let meta = match arch {
-        ConvArch::Gemma4Assistant => return Ok(None),
+        ConvArch::Gemma4Assistant | ConvArch::Mistral4Eagle => return Ok(None),
         ConvArch::Gemma4 => gemma4(ck)?,
         ConvArch::Gemma3 => {
             if ck.tokenizer_model.is_some() {

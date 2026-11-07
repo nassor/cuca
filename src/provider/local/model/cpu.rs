@@ -35,9 +35,11 @@ use super::{
 use crate::error::CucaError;
 use crate::provider::local::{ExpertPlacement, ExpertTiers};
 
+mod eagle;
 mod head;
 mod mla;
 pub(super) mod paged_attn;
+pub(crate) use eagle::EagleHead;
 pub(crate) use head::NextnHead;
 use paged_attn::{PoolShape, attend_paged_rows, gather, store_rows};
 
@@ -977,13 +979,19 @@ impl Transformer {
         match (drafter, hp.arch.is_drafter()) {
             (false, true) => {
                 return Err(err(format!(
-                    "`{}` is a multi-token-prediction drafter, not a standalone model: pass it as the `drafter` of a Gemma 4 model",
+                    "`{}` is a multi-token-prediction drafter, not a standalone model: pass it as the `drafter` of the model it was trained for",
                     hp.arch.name()
                 )));
             }
             (true, false) => {
                 return Err(err(format!(
                     "`{}` is not a drafter architecture",
+                    hp.arch.name()
+                )));
+            }
+            (true, true) if !hp.arch.reads_target_kv() => {
+                return Err(err(format!(
+                    "`{}` keeps a K/V cache of its own: it loads through `Transformer::load_eagle`, not as a shared-K/V assistant",
                     hp.arch.name()
                 )));
             }
