@@ -19,7 +19,7 @@ use crate::error::CucaError;
 pub(crate) type Metadata = HashMap<String, Value>;
 
 /// An unsigned integer value of any width.
-fn value_usize(v: &Value) -> Option<usize> {
+pub(crate) fn value_usize(v: &Value) -> Option<usize> {
     match v {
         Value::U8(n) => Some(usize::from(*n)),
         Value::U16(n) => Some(usize::from(*n)),

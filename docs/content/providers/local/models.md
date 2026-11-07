@@ -75,6 +75,7 @@ What each architecture adds to the common forward pass:
 - `qwen35`: a hybrid stack; see [Hybrid models](#hybrid-models).
 - `qwen35moe`: the `qwen35` hybrid stack with a mixture of experts in every layer: a softmax over all experts, the top k, the selected weights renormalised to sum to one, plus a shared expert (a dense gated FFN every token runs) whose output is scaled by `sigmoid(ffn_gate_inp_shexp . x)` and added to the routed output. The routed experts honor `ExpertPlacement`; the shared expert and the router stay resident.
 - `gemma4-assistant`: a four-layer, query-only decoder that reads the K/V cache of a `gemma4` target. It pairs only with a `gemma4` model of the same hidden width and vocabulary.
+- `dflash`: the DFlash block drafter (Muse Glimmer's `MuseGlimmerAssistantModel`, converted from `meta-models/Muse-Glimmer-30B-assistant`, or llama.cpp's `dflash-*.gguf`). It pairs with a `muse-glimmer` target on the CPU through `LocalModelConfig::drafter`; as a main model it is refused with an error that says so.
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
 

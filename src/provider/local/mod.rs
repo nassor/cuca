@@ -49,7 +49,8 @@
 //! `Gemma3*`, `Gemma4*`, `Gemma4AssistantForCausalLM`,
 //! `Olmo2ForCausalLM`, `Olmo3ForCausalLM` without sliding layers,
 //! `OlmoeForCausalLM`, `Ernie4_5ForCausalLM`,
-//! `MuseGlimmerForConditionalGeneration`,
+//! `MuseGlimmerForConditionalGeneration`, `MuseGlimmerAssistantModel` (the
+//! DFlash drafter of Muse Glimmer, below),
 //! `Mistral3ForConditionalGeneration` with a `mistral4` text model (FP8
 //! weights are dequantized); any other architecture fails
 //! before a weight is downloaded) and writes the file llama.cpp would write
@@ -178,6 +179,33 @@
 //! 19-22 ms trunk step because it ranks only the first 65,536 of the 248,320
 //! token ids: 5x cheaper than the whole vocabulary for 4 % fewer accepted
 //! tokens per round.
+//!
+//! A DFlash block drafter (`DrafterSource::File` on a GGUF of architecture
+//! `dflash`, the file llama.cpp's converter writes
+//! (`ggml-org/Muse-Glimmer-30B-GGUF`'s `dflash-*.gguf`), or the
+//! `meta-models/Muse-Glimmer-30B-assistant` checkpoint as a
+//! [`ModelSource::Checkpoint`], which the converter writes in the same layout
+//! minus the target's vocabulary) proposes a whole block in one pass instead
+//! of chaining one pass per token. It reads the residual stream of five
+//! target layers (the outputs of layers 1, 13, 25, 37 and 49 of Muse
+//! Glimmer's 52) at every accepted position, keeps its own K/V of those
+//! features (one ring of the last 2,048 positions, 82 MB at the Muse size),
+//! runs five sliding-window layers over a block of `1 + draft_tokens` rows (at
+//! most 16: the pending token and mask tokens, the target's raw embeddings,
+//! attending to each other in both directions and to the context) and ranks the
+//! block's rows with the target's own LM head, so one pass yields every draft
+//! of the round. Its cost is flat per round, not per draft: the engine's cost
+//! model prices it that way (`take_block_draft`), and the governor measures
+//! whole rounds as before. Greedy output equals plain decoding bit for bit and
+//! sampling keeps the target's distribution, as for every drafter. CPU only
+//! (the target's per-layer features come from the CPU forward pass); like the
+//! in-trunk head it observes every position of its one sequence, so the
+//! engine runs one request at a time. Published numbers for the method (not
+//! measured here): average accepted length 4.35 to 7.84 tokens on Qwen3-4B at
+//! blocks of 16 (the DFlash paper, arXiv 2602.06036, Table 1), 2.4 to 5.0 for
+//! `RedHatAI/Mistral-Small-4-119B-2603.dflash` at seven drafts, and for Muse
+//! Glimmer 30B a 3.1x speedup on an RTX 5090 with llama.cpp and 1.5x/1.8x on
+//! Apple M4/M5 Max (the Muse Glimmer assistant's model card).
 
 mod chat;
 mod convert;

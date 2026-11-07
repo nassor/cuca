@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::arch::ConvArch;
 use crate::error::CucaError;
 use crate::provider::local::DownloadProgressCallback;
 use crate::provider::local::download;
@@ -167,7 +166,7 @@ pub(crate) async fn fetch(
         progress,
     )
     .await?;
-    ConvArch::from_config(&read_json(&dir.join("config.json"))?)?;
+    super::dflash::check_architecture(&read_json(&dir.join("config.json"))?)?;
 
     for file in OPTIONAL_FILES.iter().chain(&[INDEX_FILE]) {
         download::ensure_downloaded_optional(

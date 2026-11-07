@@ -415,7 +415,23 @@ pub(crate) fn check_context(hp: &Hparams, context_length: usize) -> Result<(), C
 }
 
 /// Read the hyperparameters of the file whose index is `content`.
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] for a DFlash drafter file (it needs a target, see
+/// [`mtp::Drafter`]) or whatever [`Hparams::from_metadata`] rejects.
 pub(crate) fn read_hparams(content: &gguf_file::Content) -> Result<Hparams, CucaError> {
+    if content
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok())
+        .is_some_and(|a| a == cpu::dflash::ARCH)
+    {
+        return Err(err(format!(
+            "`{}` is a block-diffusion drafter, not a standalone model: pass it as the `drafter` of the model it was trained for",
+            cpu::dflash::ARCH
+        )));
+    }
     Hparams::from_metadata(&content.metadata, &|n| content.tensor_infos.contains_key(n))
 }
 

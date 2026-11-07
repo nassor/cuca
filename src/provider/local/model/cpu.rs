@@ -35,6 +35,7 @@ use super::{
 use crate::error::CucaError;
 use crate::provider::local::{ExpertPlacement, ExpertTiers};
 
+pub(crate) mod dflash;
 mod head;
 mod mla;
 pub(super) mod paged_attn;
@@ -787,6 +788,45 @@ pub(crate) enum Hidden {
     /// `Want::None` the LM head is skipped, only the norm runs. The logits
     /// `want` selects are bit-equal to what `PostNorm` returns.
     PostNormAll,
+    /// The residual stream after each decoder layer of the set, for every row
+    /// of the call, whatever `want` selects: row `r` of the result holds the
+    /// layers' `n_embd`-wide outputs one after the other in ascending layer
+    /// order (`set.len() * n_embd` floats per row, `tokens * set.len() *
+    /// n_embd` in all). Nothing else changes: the logits `want` selects are
+    /// bit-equal to what `PostNorm` computes, and with `Want::None` the final
+    /// norm and the LM head are skipped altogether. A block-diffusion drafter
+    /// reads these rows ([`dflash`]).
+    Layers(LayerSet),
+}
+
+/// A set of decoder layer indices (at most 128 layers), for
+/// [`Hidden::Layers`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayerSet(u128);
+
+impl LayerSet {
+    /// The set of `layers`; `None` when an index does not fit (`>= 128`).
+    pub(crate) fn new(layers: impl IntoIterator<Item = usize>) -> Option<Self> {
+        let mut bits = 0u128;
+        for il in layers {
+            if il >= u128::BITS as usize {
+                return None;
+            }
+            bits |= 1u128 << il;
+        }
+        Some(Self(bits))
+    }
+
+    /// Whether layer `il` is in the set.
+    pub(crate) fn contains(self, il: usize) -> bool {
+        il < u128::BITS as usize && (self.0 >> il) & 1 == 1
+    }
+
+    /// Number of layers in the set.
+    #[cfg(test)]
+    pub(crate) fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
 }
 
 /// What a forward pass returns.
@@ -1525,8 +1565,23 @@ impl Transformer {
             _ => None,
         };
 
+        // `Hidden::Layers`: the rows of each sequence after every layer of
+        // its set, read as the layer finishes (the residual stream before
+        // the final norm), per sequence and captured layer.
+        let mut captured: Vec<Vec<Vec<f32>>> = vec![Vec::new(); segs.len()];
         for il in 0..hp.n_layer {
             x = self.layer(il, &x, ple.as_ref(), segs, None)?;
+            for (seg, rows) in segs.iter().zip(&mut captured) {
+                if let Hidden::Layers(set) = seg.hidden
+                    && set.contains(il)
+                {
+                    rows.push(
+                        x.narrow(1, seg.offset, seg.t)?
+                            .flatten_all()?
+                            .to_vec1::<f32>()?,
+                    );
+                }
+            }
         }
 
         // The final norm runs over every row of a sequence that wants all
@@ -1535,6 +1590,11 @@ impl Transformer {
         // The selected rows of all sequences share one norm and one LM head
         // pass: the head is the largest matrix of a small model.
         let mut outs: Vec<Forward> = (0..segs.len()).map(|_| Forward::default()).collect();
+        for ((seg, layers), out) in segs.iter().zip(&captured).zip(&mut outs) {
+            if matches!(seg.hidden, Hidden::Layers(_)) {
+                out.hidden = Some(interleave_rows(layers, seg.t, hp.n_embd));
+            }
+        }
         let mut parts = Vec::new();
         // Per sequence: first row among the normed rows, row count, whether
         // those are all of its rows.
@@ -1570,7 +1630,7 @@ impl Transformer {
                 spans.push(None);
                 continue;
             };
-            if seg.hidden != Hidden::None {
+            if matches!(seg.hidden, Hidden::PostNorm | Hidden::PostNormAll) {
                 outs[spans.len()].hidden =
                     Some(normed.narrow(1, at, n)?.flatten_all()?.to_vec1::<f32>()?);
             }
@@ -2528,6 +2588,19 @@ fn activate(x: &Tensor, act: Act) -> candle_core::Result<Tensor> {
 /// RMSNorm with a learned weight (no `1 + w`).
 fn rms(x: &Tensor, weight: &Tensor, eps: f32) -> candle_core::Result<Tensor> {
     rms_norm(&x.contiguous()?, weight, eps)
+}
+
+/// The captured layer outputs `layers` (each `t * width` floats, one row per
+/// position) as `t` rows holding every layer's row one after the other
+/// ([`Hidden::Layers`]).
+fn interleave_rows(layers: &[Vec<f32>], t: usize, width: usize) -> Vec<f32> {
+    let mut out = Vec::with_capacity(t * width * layers.len());
+    for r in 0..t {
+        for layer in layers {
+            out.extend_from_slice(&layer[r * width..(r + 1) * width]);
+        }
+    }
+    out
 }
 
 /// Rotate the first `n_dims` values of every head of `x` `(1, heads, t, d)`

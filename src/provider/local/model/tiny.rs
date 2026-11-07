@@ -1100,6 +1100,127 @@ pub(crate) fn write_tiny_drafter() -> TinyModel {
 }
 
 // ---------------------------------------------------------------------------
+// DFlash drafter
+// ---------------------------------------------------------------------------
+
+/// A tiny `dflash` block drafter for a tiny model of width 64 (the tiny
+/// `muse-glimmer`: four layers, vocabulary 16): `layers` sliding layers of
+/// width 64 with 4 query heads over 2 KV heads of 16, blocks of `block` rows
+/// (the mask token is id 14) reading the outputs of the target layers
+/// `target_ids`.
+#[derive(Clone)]
+pub(crate) struct TinyDflash {
+    pub(crate) layers: usize,
+    /// Sliding window of every layer; `None`: full attention.
+    pub(crate) window: Option<usize>,
+    pub(crate) block: usize,
+    /// The target layers whose outputs feed the drafter (transformers'
+    /// `target_layer_ids`; the file stores each plus one, as llama.cpp does).
+    pub(crate) target_ids: Vec<usize>,
+    /// Dtype of the matrices.
+    pub(crate) dtype: GgmlDType,
+    /// Seed of the weights.
+    pub(crate) seed: u64,
+    /// Metadata entries (full keys) that replace or extend the defaults.
+    pub(crate) meta: Vec<(String, Value)>,
+}
+
+impl Default for TinyDflash {
+    fn default() -> Self {
+        Self {
+            layers: 2,
+            window: Some(6),
+            block: 8,
+            target_ids: vec![0, 2],
+            dtype: GgmlDType::Q4_0,
+            seed: 29,
+            meta: Vec::new(),
+        }
+    }
+}
+
+pub(crate) const DFLASH_HEADS: usize = 4;
+pub(crate) const DFLASH_KV_HEADS: usize = 2;
+pub(crate) const DFLASH_HEAD_DIM: usize = 16;
+pub(crate) const DFLASH_FF: usize = 96;
+/// The mask token of a tiny DFlash drafter.
+pub(crate) const DFLASH_MASK: u32 = 14;
+
+/// Write the drafter `s` describes.
+pub(crate) fn write_tiny_dflash(s: &TinyDflash) -> TinyModel {
+    let path = temp_path("dflash");
+    let mut rng = Lcg(s.seed);
+    let mut tensors: Vec<(String, QTensor)> = Vec::new();
+    let n = N_EMBD;
+    let d = DFLASH_HEAD_DIM;
+    tensors.push((
+        "fc.weight".into(),
+        quantized(&mut rng, &[n, s.target_ids.len() * n], s.dtype, 0.2),
+    ));
+    tensors.push(("enc.output_norm.weight".into(), norm(&mut rng, n)));
+    tensors.push(("output_norm.weight".into(), norm(&mut rng, n)));
+    for il in 0..s.layers {
+        let b = |part: &str| format!("blk.{il}.{part}.weight");
+        let mut push = |part: &str, dims: &[usize]| {
+            tensors.push((b(part), quantized(&mut rng, dims, s.dtype, 0.3)));
+        };
+        push("attn_q", &[DFLASH_HEADS * d, n]);
+        push("attn_k", &[DFLASH_KV_HEADS * d, n]);
+        push("attn_v", &[DFLASH_KV_HEADS * d, n]);
+        push("attn_output", &[n, DFLASH_HEADS * d]);
+        push("ffn_gate", &[DFLASH_FF, n]);
+        push("ffn_up", &[DFLASH_FF, n]);
+        push("ffn_down", &[n, DFLASH_FF]);
+        for (part, len) in [
+            ("attn_norm", n),
+            ("attn_q_norm", d),
+            ("attn_k_norm", d),
+            ("ffn_norm", n),
+        ] {
+            tensors.push((b(part), norm(&mut rng, len)));
+        }
+    }
+    let p = "dflash";
+    let mut meta = vec![
+        kv("general.architecture", Value::String(p.into())),
+        kv(&format!("{p}.block_count"), u(s.layers)),
+        kv(&format!("{p}.context_length"), u(CONTEXT)),
+        kv(&format!("{p}.embedding_length"), u(n)),
+        kv(&format!("{p}.feed_forward_length"), u(DFLASH_FF)),
+        kv(&format!("{p}.attention.head_count"), u(DFLASH_HEADS)),
+        kv(&format!("{p}.attention.head_count_kv"), u(DFLASH_KV_HEADS)),
+        kv(&format!("{p}.attention.key_length"), u(d)),
+        kv(&format!("{p}.attention.value_length"), u(d)),
+        kv(&format!("{p}.rope.freq_base"), Value::F32(500_000.0)),
+        kv(
+            &format!("{p}.attention.layer_norm_rms_epsilon"),
+            Value::F32(1e-5),
+        ),
+        kv(&format!("{p}.block_size"), u(s.block)),
+        kv(
+            &format!("{p}.target_layers"),
+            Value::Array(s.target_ids.iter().map(|&i| u(i + 1)).collect()),
+        ),
+        kv("tokenizer.ggml.mask_token_id", Value::U32(DFLASH_MASK)),
+    ];
+    if let Some(w) = s.window {
+        meta.push(kv(&format!("{p}.attention.sliding_window"), u(w)));
+        meta.push(kv(
+            &format!("{p}.attention.sliding_window_pattern"),
+            Value::Array(vec![Value::Bool(true); s.layers]),
+        ));
+    }
+    for (key, value) in &s.meta {
+        match meta.iter_mut().find(|(k, _)| k == key) {
+            Some(slot) => slot.1 = value.clone(),
+            None => meta.push((key.clone(), value.clone())),
+        }
+    }
+    write(&path, &meta, &tensors);
+    TinyModel { path }
+}
+
+// ---------------------------------------------------------------------------
 // Mistral Small 4
 // ---------------------------------------------------------------------------
 

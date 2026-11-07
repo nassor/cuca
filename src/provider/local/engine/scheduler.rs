@@ -47,7 +47,7 @@ use std::time::Instant;
 
 use tokio::sync::mpsc::{self, error::TrySendError};
 
-use super::{Engine, Job, local_err, saturating_u32, take_draft};
+use super::{Engine, Job, local_err, saturating_u32, take_block_draft, take_draft};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
 use crate::provider::local::model::cpu::Hidden;
@@ -328,6 +328,9 @@ struct Round {
     q_dists: Vec<Dist>,
     spec_round: bool,
     draft_steps: usize,
+    /// Drafter passes the round cost: one per step for a chained drafter,
+    /// one for the whole block of a block drafter (zero when it did not run).
+    draft_passes: usize,
     draft_secs: f64,
     predicted: f64,
     started: Instant,
@@ -824,6 +827,7 @@ impl Engine {
         // Prefilling sequences, in admission order, share what is left.
         let chunk = crate::provider::local::model::prefill_chunk(self.context_length);
         let tap = self.drafter.is_some() && self.running.len() == 1;
+        let features = self.drafter.as_ref().and_then(Drafter::feature_rows);
         for i in 0..self.running.len() {
             let seq = &self.running[i];
             if seq.phase != Phase::Prefill {
@@ -853,7 +857,9 @@ impl Engine {
                 start: pos,
                 tokens,
                 want: if last { Want::Last } else { Want::None },
-                hidden: if observes {
+                hidden: if let Some(rows) = features {
+                    rows
+                } else if observes {
                     Hidden::PostNormAll
                 } else if last && tap {
                     Hidden::PostNorm
@@ -976,12 +982,14 @@ impl Engine {
         let observes = self.drafter.as_ref().is_some_and(Drafter::observes);
         let alone = self.running.len() == 1 && self.waiting.is_empty();
         let tap = observes || (self.drafter.is_some() && self.running.len() == 1);
+        let features = self.drafter.as_ref().and_then(Drafter::feature_rows);
         let seq = &mut self.running[i];
         let mut tokens = vec![id];
         let mut round = Round {
             q_dists: Vec::new(),
             spec_round: false,
             draft_steps: 0,
+            draft_passes: 0,
             draft_secs: 0.0,
             predicted: 0.0,
             started: round_start,
@@ -1020,6 +1028,7 @@ impl Engine {
                 // cap.
                 let adaptive = !reproducible;
                 let cost = &self.cost;
+                let block = drafter.block();
                 let kappa = cost.calibration();
                 let step_secs = cost.draft_secs();
                 let mut chained = 1.0f64;
@@ -1050,7 +1059,12 @@ impl Engine {
                     if adaptive {
                         let a = (kappa * chained).min(1.0);
                         let (t_j, t_next) = (cost.verify_secs(j), cost.verify_secs(j + 1));
-                        if j > 1 && !take_draft(a, expected, j, t_j, t_next, step_secs) {
+                        let keep = if block {
+                            take_block_draft(a, expected, t_j, t_next, step_secs)
+                        } else {
+                            take_draft(a, expected, j, t_j, t_next, step_secs)
+                        };
+                        if j > 1 && !keep {
                             return None;
                         }
                         expected += a;
@@ -1075,6 +1089,13 @@ impl Engine {
                     }
                 }
                 round.draft_secs = draft_start.elapsed().as_secs_f64();
+                // A block drafter runs one pass however many drafts `pick`
+                // took, and none when it had nothing to condition on.
+                round.draft_passes = if block {
+                    usize::from(round.draft_steps > 0)
+                } else {
+                    round.draft_steps
+                };
             }
         }
 
@@ -1089,7 +1110,13 @@ impl Engine {
             seq: i,
             start,
             want: if drafted { Want::All } else { Want::Last },
-            hidden: if tap { Hidden::PostNorm } else { Hidden::None },
+            hidden: if let Some(rows) = features {
+                rows
+            } else if tap {
+                Hidden::PostNorm
+            } else {
+                Hidden::None
+            },
             tokens,
             kind: Kind::Decode(round),
         })
@@ -1285,7 +1312,7 @@ impl Engine {
             self.cost.record_round(
                 batch.len(),
                 verify_secs,
-                round.draft_steps,
+                round.draft_passes,
                 round.draft_secs,
                 round.predicted,
                 accepted,
