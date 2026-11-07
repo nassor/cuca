@@ -470,6 +470,20 @@ pub(crate) enum Model {
     Split(split::SplitModel),
 }
 
+/// Run `$call` with `$m` bound to the engine of whichever device the model
+/// is on.
+macro_rules! on_model {
+    ($model:expr, $m:ident => $call:expr) => {
+        match $model {
+            Model::Cpu($m) => $call,
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu($m) => $call,
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split($m) => $call,
+        }
+    };
+}
+
 impl Model {
     /// Load the model from the GGUF file at `path`, whose index `content` was
     /// read already, onto `device`, with a K/V cache for `context_length`
@@ -629,13 +643,7 @@ impl Model {
     /// Counters and heat of the expert tiers; `None` unless the model loaded
     /// with `ExpertPlacement::Tiered`.
     pub(crate) fn expert_tiers(&self) -> Option<std::sync::Arc<tier::TierShared>> {
-        match self {
-            Model::Cpu(m) => m.expert_tiers(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.expert_tiers(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.expert_tiers(),
-        }
+        on_model!(self, m => m.expert_tiers())
     }
 
     /// Run the rows of several sequences through the model in one pass (a
@@ -662,24 +670,12 @@ impl Model {
         &mut self,
         batch: &Batch<'_>,
     ) -> Result<Vec<cpu::Forward>, CucaError> {
-        match self {
-            Model::Cpu(m) => m.forward_batch(batch),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.forward_batch(batch),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.forward_batch(batch),
-        }
+        on_model!(self, m => m.forward_batch(batch))
     }
 
     /// The architecture.
     pub(crate) fn arch(&self) -> arch::Arch {
-        match self {
-            Model::Cpu(m) => m.arch(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.arch(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.arch(),
-        }
+        on_model!(self, m => m.arch())
     }
 
     /// Take the recurrent state of `slot` back to at most `len` positions and
@@ -692,13 +688,7 @@ impl Model {
     /// [`Model::restore`] a snapshot). See [`cpu::Transformer::rewind`] and
     /// `Cache rollback` in the module docs.
     pub(crate) fn rewind(&mut self, slot: StateSlot, len: usize) -> usize {
-        match self {
-            Model::Cpu(m) => m.rewind(slot.0, len),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.rewind(slot.0, len),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.rewind(slot.0, len),
-        }
+        on_model!(self, m => m.rewind(slot.0, len))
     }
 
     /// A copy of the recurrent state of `slot` (after the rows of its last
@@ -765,13 +755,7 @@ impl Model {
     /// delta-net layers): its state can then return only to the positions
     /// [`Model::rewind`] lists.
     pub(crate) fn is_hybrid(&self) -> bool {
-        match self {
-            Model::Cpu(m) => m.is_hybrid(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.is_hybrid(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.is_hybrid(),
-        }
+        on_model!(self, m => m.is_hybrid())
     }
 
     /// Most rows of one `Want::All` forward call after which every
@@ -779,35 +763,17 @@ impl Model {
     /// [`Model::rewind`]: unbounded unless the model is hybrid. A hybrid GPU
     /// model keeps no verify record (1: only the end of a call).
     pub(crate) fn rollback_rows(&self) -> usize {
-        match self {
-            Model::Cpu(m) => m.rollback_rows(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.rollback_rows(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.rollback_rows(),
-        }
+        on_model!(self, m => m.rollback_rows())
     }
 
     /// The K/V block pools' layout: the groups, and the blocks each holds.
     pub(crate) fn kv_layout(&self) -> &paged::KvLayout {
-        match self {
-            Model::Cpu(m) => m.kv_layout(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.kv_layout(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.kv_layout(),
-        }
+        on_model!(self, m => m.kv_layout())
     }
 
     /// Bytes of K/V data the block pools hold.
     pub(crate) fn kv_pool_bytes(&self) -> u64 {
-        match self {
-            Model::Cpu(m) => m.kv_pool_bytes(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(m) => m.kv_pool_bytes(),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(m) => m.kv_pool_bytes(),
-        }
+        on_model!(self, m => m.kv_pool_bytes())
     }
 }
 
