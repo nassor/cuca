@@ -133,8 +133,8 @@ The live matrix (`tests/provider_local.rs`, CPU, release) on converted checkpoin
 |---|---|---|
 | Q4_0, Q8_0 | stays quantized; cuca's batch-invariant quantized matmul kernel | repacked at load into burn's block layout; stays quantized |
 | F32, F16, BF16 | held as f32 | uploaded as f32 (4 bytes per element) |
-| Q4_1, Q5_0, Q5_1, K-quants | stays quantized; candle's quantized matmul | dequantized row by row at load, requantized to Q8_0 (stacked expert tensors: Q4_1 is read as Q4_1 by the MoE kernels) |
-| Q8_1 | not covered by a test | dequantized row by row at load, requantized to Q8_0 |
+| Q4_1, Q5_0, Q5_1, K-quants (Q2_K to Q6_K) | stays quantized; cuca's batch-invariant quantized matmul kernel | dequantized row by row at load, requantized to Q8_0 (stacked expert tensors: Q4_1 is read as Q4_1 by the MoE kernels) |
+| Q8_1 | stays quantized; candle's quantized matmul (no model ships it; not covered by a test) | dequantized row by row at load, requantized to Q8_0 |
 | IQ family | rejected | rejected |
 
 - Norm vectors, biases and scalars are f32 whatever their stored dtype. Resident weights are about the file size.
@@ -397,7 +397,7 @@ Method: HuggingFace `transformers`, f32, CPU, against the engine's CPU path, on 
 | The same file, 40 layers, production path | top-1 token kept on all three prompts; maximum absolute logit difference 0.13 to 0.62 |
 | GPU (Vulkan) against the CPU dequantized reference | relative error 2e-6 to 2e-5, greedy token ids equal, on Qwen 3 0.6B and 1.7B, Gemma 3 270M and 1B, SmolLM 3, Gemma 4 E2B and the R1 distill |
 
-On the CPU, every Q4_0 and Q8_0 matrix multiplication runs through cuca's own batch-invariant quantized kernel, written in safe Rust; other dtypes use candle. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output.
+On the CPU, every Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and K-quant (Q2_K to Q6_K) matrix multiplication, the MoE experts and tiered experts included, runs through cuca's own batch-invariant quantized kernel, written in safe Rust; other dtypes use candle. Each dtype is paired with the activation format ggml pairs it with (Q8_0 for Q4_0, Q5_0 and Q8_0, Q8_1 for Q4_1 and Q5_1, Q8_K for the K-quants), so a quantized file loses no more accuracy than under llama.cpp's CPU backend. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output.
 
 Since the paged K/V cache, attention reads the K/V blocks in place with an online-softmax kernel (per query row and head, so a row is bit-identical alone or in a batch) instead of candle's matmul attention. Its float rounding differs slightly from 0.6.x: logits move by about 0.04 (median) and up to 0.7 on the models measured, because the quantized matmuls round activations to Q8_0, so a greedy reply can differ from 0.6.x's where two logits are within about 0.1 of each other. In the 4-model matrix every first difference sat at a margin of 0.13 or less; OLMoE (tiered) replies were identical.
 
