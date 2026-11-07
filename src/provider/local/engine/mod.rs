@@ -549,6 +549,7 @@ impl Engine {
             &config.shards,
             &config.experts,
             &sizing,
+            config.gpu_layers,
         )?;
         let drafter = drafter
             .map(|source| -> Result<Drafter, CucaError> {
@@ -685,6 +686,11 @@ impl Engine {
     /// K/V cache bytes of the loaded model at its context length.
     pub(crate) fn kv_cache_bytes(&self) -> u64 {
         self.kv_cache_bytes
+    }
+
+    /// Layers on the GPU and in all when layers are offloaded.
+    pub(crate) fn layer_split(&self) -> Option<(usize, usize)> {
+        self.model.layer_split()
     }
 
     /// Counters and heat of the expert tiers; `None` unless the model loaded
@@ -1825,7 +1831,8 @@ mod tests {
                 device,
                 &[],
                 &resident,
-                &Sizing::single(resolved)
+                &Sizing::single(resolved),
+                None,
             )
             .is_ok()
         );
@@ -1837,6 +1844,7 @@ mod tests {
             &[],
             &resident,
             &Sizing::single(33),
+            None,
         )
         .err();
         assert!(

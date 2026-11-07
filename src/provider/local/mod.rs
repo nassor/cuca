@@ -1301,6 +1301,28 @@ pub struct LocalModelConfig {
     /// copy of each K/V head on every device), a delta-net (hybrid) layer or
     /// a full-width Q/K norm cannot be split. See [`LocalModelConfig::set_devices`].
     pub shards: Vec<LocalDevice>,
+    /// Layer offload (llama.cpp's `-ngl`): run only this many transformer
+    /// layers on [`device`](Self::device) and the rest on the CPU, for a
+    /// model that does not fit the device. `None` (the default) runs the
+    /// whole model on `device`.
+    ///
+    /// The *last* `n` layers go to the GPU together with the final norm and
+    /// the LM head; the first layers, the token embeddings (and Gemma 4's
+    /// per-layer embeddings) stay on the CPU, so the residual stream crosses
+    /// to the device once per forward pass. `Some(0)` loads the model on the
+    /// CPU (no device opens), `Some(n_layer)` is the same as `None`. Each
+    /// layer's K/V pool lives on its layer's device under the same block
+    /// tables, a hybrid model's recurrent state likewise, and with
+    /// [`ExpertPlacement::Tiered`] the experts of the CPU layers use the RAM
+    /// tier and those of the GPU layers the device tier (the `ram` budget is
+    /// shared out in proportion to the MoE layers on each side). See the GPU
+    /// page of the documentation for the memory and speed trade-off.
+    ///
+    /// [`LocalModel::load`] fails with [`CucaError::Config`] when `device`
+    /// is [`LocalDevice::Cpu`], when there are `shards` or a `drafter`
+    /// (neither combines with offload), or, once the file is read, when the
+    /// count exceeds the model's layer count.
+    pub gpu_layers: Option<usize>,
 }
 
 impl Default for LocalModelConfig {
@@ -1320,6 +1342,7 @@ impl Default for LocalModelConfig {
             convert: ConvertConfig::default(),
             batching: BatchingConfig::default(),
             shards: Vec::new(),
+            gpu_layers: None,
         }
     }
 }
@@ -1370,6 +1393,7 @@ impl fmt::Debug for LocalModelConfig {
             .field("convert", &self.convert)
             .field("batching", &self.batching)
             .field("shards", &self.shards)
+            .field("gpu_layers", &self.gpu_layers)
             .finish()
     }
 }
@@ -1386,6 +1410,7 @@ type Ready = Result<
         Option<Arc<model::tier::TierShared>>,
         Arc<engine::ServingCounters>,
         SamplingConfig,
+        Option<(usize, usize)>,
     ),
     CucaError,
 >;
@@ -1407,6 +1432,9 @@ pub(crate) struct LocalModelInner {
     /// Counters and heat of the expert tiers; `None` unless
     /// [`ExpertPlacement::Tiered`].
     tiers: Option<Arc<model::tier::TierShared>>,
+    /// Layers on the GPU and in all when the model runs split over the CPU
+    /// and the GPU ([`LocalModelConfig::gpu_layers`]).
+    layer_split: Option<(usize, usize)>,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -1683,6 +1711,11 @@ impl LocalModel {
     /// [`SamplingConfig`]). `seed` is the configured one.
     pub fn sampling(&self) -> SamplingConfig {
         self.inner.sampling
+    /// How the layers are placed when [`LocalModelConfig::gpu_layers`] split
+    /// the model over the CPU and the GPU: `(layers on the GPU, layers in
+    /// all)`; `None` when the whole model runs on one device.
+    pub fn layer_split(&self) -> Option<(usize, usize)> {
+        self.inner.layer_split
     }
 
     /// What this model supports: reasoning, switching it off, tool calls.
@@ -1815,6 +1848,7 @@ impl LocalModel {
                                 engine.expert_tiers(),
                                 engine.serving_counters(),
                                 engine.sampling().config(),
+                                engine.layer_split(),
                             )))
                             .is_err()
                         {
@@ -1843,6 +1877,7 @@ impl LocalModel {
                 tiers,
                 serving,
                 sampling,
+                layer_split,
             ))) => Ok(LocalModel {
                 inner: Arc::new(LocalModelInner {
                     jobs: jobs_tx,
@@ -1855,6 +1890,7 @@ impl LocalModel {
                     draft_stats,
                     serving,
                     tiers,
+                    layer_split,
                 }),
             }),
             Ok(Err(e)) => Err(e),
@@ -1899,6 +1935,23 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
         if config.experts != ExpertPlacement::Resident {
             return Err(CucaError::Config(
                 "tensor parallelism: tiered experts are not supported with `shards`".into(),
+            ));
+        }
+    }
+    if config.gpu_layers.is_some() {
+        if config.device == LocalDevice::Cpu {
+            return Err(CucaError::Config(
+                "gpu_layers needs a GPU `device`, got cpu".into(),
+            ));
+        }
+        if !config.shards.is_empty() {
+            return Err(CucaError::Config(
+                "gpu_layers cannot be combined with tensor parallelism (`shards`)".into(),
+            ));
+        }
+        if config.drafter.is_some() {
+            return Err(CucaError::Config(
+                "gpu_layers cannot be combined with a `drafter`".into(),
             ));
         }
     }
@@ -2989,6 +3042,46 @@ mod tests {
             config(vulkan, &[LocalDevice::Metal(GpuAdapter::Default)]),
             "same GPU backend",
         );
+    }
+
+    #[test]
+    fn validate_enforces_the_layer_offload_rules() {
+        let config = |device, gpu_layers| LocalModelConfig {
+            device,
+            gpu_layers,
+            ..LocalModelConfig::default()
+        };
+        let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
+        let rejects = |config: LocalModelConfig, what: &str| {
+            let err = validate(&config).unwrap_err();
+            assert!(
+                matches!(&err, CucaError::Config(m) if m.contains(what)),
+                "{what}: {err}"
+            );
+        };
+        // Offload needs a GPU to offload to.
+        rejects(
+            config(LocalDevice::Cpu, Some(4)),
+            "gpu_layers needs a GPU `device`",
+        );
+        assert!(validate(&config(LocalDevice::Cpu, None)).is_ok());
+        // A backend that is compiled out names its feature.
+        #[cfg(not(feature = "provider-local-vulkan"))]
+        rejects(config(vulkan, Some(4)), "`provider-local-vulkan`");
+        #[cfg(feature = "provider-local-vulkan")]
+        {
+            assert!(validate(&config(vulkan, Some(4))).is_ok());
+            assert!(validate(&config(vulkan, Some(0))).is_ok());
+            let mut shards = config(vulkan, Some(4));
+            shards.shards = vec![vulkan];
+            rejects(
+                shards,
+                "gpu_layers cannot be combined with tensor parallelism",
+            );
+            let mut drafted = config(vulkan, Some(4));
+            drafted.drafter = Some(DrafterSource::File(ModelSource::File("d.gguf".into())));
+            rejects(drafted, "gpu_layers cannot be combined with a `drafter`");
+        }
     }
 
     #[test]

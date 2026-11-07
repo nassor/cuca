@@ -28,6 +28,8 @@ use super::params::{DeltaSpec, Hparams, LayerSpec, MlaSpec, MoeSpec};
 use super::qmm::QmmWeight;
 use super::quant::{RowTable, TokenEmbedding};
 use super::rope::RopeKind;
+#[cfg(feature = "provider-local-gpu")]
+use super::split::MirrorRows;
 use super::tier::{BuildFn, ExpertSlice, ExpertStore, LayerExperts, TierShared, add};
 use super::{
     Batch, Want, attention_mask, build_rope_tables, candle_err, check_context, err, read_hparams,
@@ -659,6 +661,8 @@ fn open_expert_store(
     path: &Path,
     hp: &Hparams,
     tiers: &ExpertTiers,
+    upto: usize,
+    shared: Option<Arc<TierShared>>,
 ) -> Result<Arc<ExpertStore<CpuExpert>>, CucaError> {
     let spec = hp.moe.ok_or_else(|| {
         CucaError::Config(format!(
@@ -667,7 +671,7 @@ fn open_expert_store(
         ))
     })?;
     let mut layers = Vec::new();
-    for (il, ls) in hp.layers.iter().enumerate() {
+    for (il, ls) in hp.layers.iter().enumerate().take(upto) {
         if let Ffn::Moe { ff, fused, .. } = LayerLayout::read(hp, il, ls, content)?.ffn {
             let slice = |part: &str, rows, cols| {
                 ExpertSlice::read(content, &name::blk(il, part), spec.n_expert, rows, cols)
@@ -696,7 +700,7 @@ fn open_expert_store(
             });
         }
     }
-    let shared = Arc::new(TierShared::new(hp.n_layer, spec.n_expert));
+    let shared = shared.unwrap_or_else(|| Arc::new(TierShared::new(hp.n_layer, spec.n_expert)));
     if let Some(heat) = &tiers.warm_from {
         shared.check(heat)?;
     }
@@ -755,7 +759,9 @@ pub(crate) struct Transformer {
     ple: Option<PleWeights>,
     layers: Vec<LayerWeights>,
     output_norm: Tensor,
-    lm_head: QMatMul,
+    /// `None` on a [`Front`], whose layers hand their output to the model
+    /// that holds the head.
+    lm_head: Option<QMatMul>,
     /// Drafter projections between the target's hidden width and its own.
     nextn: Option<Nextn>,
     ropes: Vec<RopeTable>,
@@ -771,6 +777,11 @@ pub(crate) struct Transformer {
     hybrid: bool,
     /// Counters and heat of the expert tiers (`ExpertPlacement::Tiered`).
     tiers: Option<Arc<TierShared>>,
+    /// K/V-owning layers whose new rows the layers after a [`Front`] read
+    /// (Gemma 4's shared-K/V layers on the GPU): [`Transformer::forward_front`]
+    /// returns them.
+    #[cfg(feature = "provider-local-gpu")]
+    export: Vec<usize>,
 }
 
 /// Which hidden-state rows a forward pass returns next to the logits.
@@ -869,6 +880,35 @@ struct Nextn {
     post: QMatMul,
 }
 
+/// The first `layers` layers of a model, run on the CPU while a GPU holds the
+/// rest and the LM head (layer offload, see [`split`](super::split)): the
+/// embeddings, the per-layer-embedding inputs and the layers `0..layers`, the
+/// weights, K/V pools and recurrent states of no other layer.
+#[cfg_attr(not(feature = "provider-local-gpu"), allow(dead_code))]
+pub(crate) struct Front {
+    /// Layers the CPU holds, `1..n_layer`.
+    pub(crate) layers: usize,
+    /// The expert-tier counters and heat shared with the other half's expert
+    /// store, so that one set of statistics covers the whole model.
+    pub(crate) shared: Option<Arc<TierShared>>,
+    /// The K/V-owning layers among `0..layers` that a layer after them
+    /// reads the K/V of ([`mirrored`](super::split::mirrored)).
+    pub(crate) export: Vec<usize>,
+}
+
+/// What a [`Front`] hands to the layers after it: the residual stream
+/// and, for Gemma 4, the per-layer inputs every layer reads.
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) struct FrontOut {
+    /// `[rows, n_embd]` row-major.
+    pub(crate) hidden: Vec<f32>,
+    /// `[rows, n_layer, ple_dim]` row-major, `(ctx + tok) / sqrt(2)`.
+    pub(crate) per_layer: Option<Vec<f32>>,
+    /// The rows the pass wrote into the cache of every layer of
+    /// [`Front::export`].
+    pub(crate) kv: Vec<MirrorRows>,
+}
+
 impl Transformer {
     /// [`Transformer::load_placed`] with every expert resident (tests).
     #[cfg(test)]
@@ -906,7 +946,45 @@ impl Transformer {
         experts: &ExpertPlacement,
         sizing: &Sizing,
     ) -> Result<Self, CucaError> {
-        Self::load_with(content, path, context_length, false, false, experts, sizing)
+        Self::load_with(
+            content,
+            path,
+            context_length,
+            false,
+            false,
+            experts,
+            sizing,
+            None,
+        )
+    }
+
+    /// Load only the layers of `front` (and the embeddings) of the model,
+    /// with the experts of those layers placed as `experts` says;
+    /// `dequantize` holds every matmul weight as f32 (tests).
+    ///
+    /// # Errors
+    ///
+    /// As [`Transformer::load_placed`].
+    #[cfg(feature = "provider-local-gpu")]
+    pub(crate) fn load_front(
+        content: &gguf_file::Content,
+        path: &Path,
+        context_length: usize,
+        experts: &ExpertPlacement,
+        sizing: &Sizing,
+        front: &Front,
+        dequantize: bool,
+    ) -> Result<Self, CucaError> {
+        Self::load_with(
+            content,
+            path,
+            context_length,
+            dequantize,
+            false,
+            experts,
+            sizing,
+            Some(front),
+        )
     }
 
     /// Load a multi-token-prediction drafter (`gemma4-assistant`): its
@@ -930,6 +1008,7 @@ impl Transformer {
             true,
             &ExpertPlacement::Resident,
             &Sizing::single(context_length),
+            None,
         )
     }
 
@@ -949,6 +1028,7 @@ impl Transformer {
             false,
             &ExpertPlacement::Resident,
             &Sizing::single(context_length),
+            None,
         )
     }
 
@@ -963,6 +1043,10 @@ impl Transformer {
         self.tiers.clone()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the file, the flavours of the load and the part of the model are independent inputs"
+    )]
     fn load_with(
         content: &gguf_file::Content,
         path: &Path,
@@ -971,6 +1055,7 @@ impl Transformer {
         drafter: bool,
         experts: &ExpertPlacement,
         sizing: &Sizing,
+        front: Option<&Front>,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         match (drafter, hp.arch.is_drafter()) {
@@ -989,6 +1074,7 @@ impl Transformer {
             _ => {}
         }
         check_context(&hp, context_length)?;
+        let upto = front.map_or(hp.n_layer, |f| f.layers);
         let store = match experts {
             ExpertPlacement::Resident => None,
             ExpertPlacement::Tiered(_) if dequantize || drafter => {
@@ -996,7 +1082,14 @@ impl Transformer {
                     "expert tiers apply to a quantized main model only".into(),
                 ));
             }
-            ExpertPlacement::Tiered(tiers) => Some(open_expert_store(content, path, &hp, tiers)?),
+            ExpertPlacement::Tiered(tiers) => Some(open_expert_store(
+                content,
+                path,
+                &hp,
+                tiers,
+                upto,
+                front.and_then(|f| f.shared.clone()),
+            )?),
         };
         let mut loader = Loader {
             content,
@@ -1019,10 +1112,12 @@ impl Transformer {
         } else {
             Some(TokenEmbedding::new(Arc::clone(&embd))?)
         };
-        let lm_head = if loader.has(name::OUTPUT) {
-            loader.matmul(name::OUTPUT, &[vocab, n_embd])?
+        let lm_head = if front.is_some() {
+            None
+        } else if loader.has(name::OUTPUT) {
+            Some(loader.matmul(name::OUTPUT, &[vocab, n_embd])?)
         } else {
-            loader.to_matmul(embd, name::TOKEN_EMBD)?
+            Some(loader.to_matmul(embd, name::TOKEN_EMBD)?)
         };
         let output_norm = loader.vector(name::OUTPUT_NORM, n_embd)?;
 
@@ -1056,9 +1151,9 @@ impl Transformer {
             .collect::<Result<Vec<_>, CucaError>>()?;
 
         let kv_layout = KvLayout::sized(&hp, context_length, sizing);
-        let mut layers = Vec::with_capacity(hp.n_layer);
-        let mut kv_layers = Vec::with_capacity(hp.n_layer);
-        for (il, spec) in hp.layers.iter().enumerate() {
+        let mut layers = Vec::with_capacity(upto);
+        let mut kv_layers = Vec::with_capacity(upto);
+        for (il, spec) in hp.layers.iter().enumerate().take(upto) {
             let layout = LayerLayout::read(&hp, il, spec, content)?;
             match kv_layout.layer_group[il].filter(|_| spec.owns_kv(il)) {
                 Some(g) => kv_layers.push(Some(KvLayer::zeros(spec, kv_layout.blocks[g]))),
@@ -1115,6 +1210,8 @@ impl Transformer {
                 .map(|_| Slot::default())
                 .collect(),
             tiers: store.map(|s| Arc::clone(s.shared())),
+            #[cfg(feature = "provider-local-gpu")]
+            export: front.map_or_else(Vec::new, |f| f.export.clone()),
         })
     }
 
@@ -1142,6 +1239,62 @@ impl Transformer {
     /// has no token embedding) or a failed pass; a hybrid model then drops
     /// the recurrent state of every slot in the step.
     pub(crate) fn forward_batch(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
+        self.run_batch(batch, |m, embeddings, per_layer, segs| {
+            m.forward_layers(embeddings, per_layer, segs)
+        })
+    }
+
+    /// [`Transformer::forward_batch`] for a [`Front`]: the rows through the
+    /// layers it holds, returned as the residual stream (and the per-layer
+    /// inputs) for the model that holds the rest. The recurrent state of
+    /// its delta-net layers advances as in a whole pass.
+    ///
+    /// # Errors
+    ///
+    /// As [`Transformer::forward_batch`].
+    #[cfg(feature = "provider-local-gpu")]
+    pub(crate) fn forward_front(&mut self, batch: &Batch<'_>) -> Result<FrontOut, CucaError> {
+        self.run_batch(batch, |m, embeddings, per_layer, segs| {
+            let (x, ple) = m.trunk(embeddings, per_layer, segs)?;
+            // The rows the pass just cached for the layers on the GPU that
+            // read the K/V of a layer here.
+            let mut kv = Vec::with_capacity(m.export.len());
+            for &il in &m.export {
+                let layer = m.cache(il)?;
+                let data = layer.lock();
+                let mut seqs = Vec::with_capacity(segs.len());
+                for seg in segs {
+                    let table = m.layout.layer_group[il]
+                        .and_then(|g| seg.tables.get(g))
+                        .ok_or_else(|| {
+                            candle_core::Error::msg("the sequence has no block table")
+                        })?;
+                    let (lo, hi) = (seg.start, seg.start + seg.t);
+                    seqs.push((
+                        gather(table, lo, hi, &data.k, layer.shape)?,
+                        gather(table, lo, hi, &data.v, layer.shape)?,
+                    ));
+                }
+                kv.push(MirrorRows { layer: il, seqs });
+            }
+            Ok(FrontOut {
+                hidden: x.flatten_all()?.to_vec1::<f32>()?,
+                per_layer: ple
+                    .map(|p| p.flatten_all().and_then(|p| p.to_vec1::<f32>()))
+                    .transpose()?,
+                kv,
+            })
+        })
+    }
+
+    /// The body of a forward step: validate the batch, embed its rows, run
+    /// `pass(self, embeddings, per_layer, segs)` over them and keep the
+    /// recurrent-state bookkeeping of the sequences.
+    fn run_batch<R>(
+        &mut self,
+        batch: &Batch<'_>,
+        pass: impl FnOnce(&Self, Vec<f32>, Option<Vec<f32>>, &[Seg<'_>]) -> candle_core::Result<R>,
+    ) -> Result<R, CucaError> {
         let _exact = RowExact::enter(batch.exact);
         if batch.rows.is_empty() {
             return Err(err("a forward step requires at least one sequence"));
@@ -1212,7 +1365,7 @@ impl Transformer {
                 self.slots[seg.slot].verify = None;
             }
         }
-        let outs = match self.forward_layers(embeddings, per_layer, &segs) {
+        let outs = match pass(self, embeddings, per_layer, &segs) {
             Ok(outs) => outs,
             Err(e) => {
                 for seg in &segs {
@@ -1493,15 +1646,15 @@ impl Transformer {
         self.slots[slot] = Slot::default();
     }
 
-    /// The layers over the concatenated rows `embeddings` of the sequences
-    /// `segs` describe, then the final norm and the LM head over the rows the
-    /// sequences want.
-    fn forward_layers(
+    /// The concatenated rows `embeddings` of the sequences `segs` describe
+    /// through every layer this model holds: the residual stream `(1, t,
+    /// n_embd)` after them and Gemma 4's per-layer inputs.
+    fn trunk(
         &self,
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
         segs: &[Seg<'_>],
-    ) -> candle_core::Result<Vec<Forward>> {
+    ) -> candle_core::Result<(Tensor, Option<Tensor>)> {
         let hp = &self.hp;
         let dev = &Device::Cpu;
         let eps = hp.eps as f32;
@@ -1524,9 +1677,24 @@ impl Transformer {
             _ => None,
         };
 
-        for il in 0..hp.n_layer {
+        for il in 0..self.layers.len() {
             x = self.layer(il, &x, ple.as_ref(), segs, None)?;
         }
+        Ok((x, ple))
+    }
+
+    /// The layers over the concatenated rows `embeddings` of the sequences
+    /// `segs` describe, then the final norm and the LM head over the rows the
+    /// sequences want.
+    fn forward_layers(
+        &self,
+        embeddings: Vec<f32>,
+        per_layer: Option<Vec<f32>>,
+        segs: &[Seg<'_>],
+    ) -> candle_core::Result<Vec<Forward>> {
+        let hp = &self.hp;
+        let eps = hp.eps as f32;
+        let (x, _) = self.trunk(embeddings, per_layer, segs)?;
 
         // The final norm runs over every row of a sequence that wants all
         // logits or every position's hidden row, else over its last row
@@ -1606,13 +1774,20 @@ impl Transformer {
 
     /// LM head over final-norm output rows: scale, soft-cap.
     fn head(&self, normed: &Tensor) -> candle_core::Result<Tensor> {
-        self.cap_logits(self.lm_head.forward(normed)?)
+        self.cap_logits(self.lm_head()?.forward(normed)?)
+    }
+
+    /// The LM head.
+    fn lm_head(&self) -> candle_core::Result<&QMatMul> {
+        self.lm_head.as_ref().ok_or_else(|| {
+            candle_core::Error::msg("this model holds the first layers only: no LM head")
+        })
     }
 
     /// [`Transformer::head`] over the first `rows` vocabulary entries only
     /// (a proposal head that need not rank the whole vocabulary).
     fn head_rows(&self, normed: &Tensor, rows: usize) -> candle_core::Result<Tensor> {
-        self.cap_logits(self.lm_head.forward_rows(normed, rows)?)
+        self.cap_logits(self.lm_head()?.forward_rows(normed, rows)?)
     }
 
     /// The logit scale and soft-cap.
@@ -3625,6 +3800,7 @@ mod hybrid_tests {
             false,
             &ExpertPlacement::Resident,
             &Sizing::single(CONTEXT),
+            None,
         )
         .unwrap()
     }

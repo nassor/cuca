@@ -94,6 +94,9 @@ async fn loaded() -> Option<(LocalModel, String)> {
                     .set_devices(&devices)
                     .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
             }
+            if let Some(layers) = env_parsed::<usize>("CUCA_LOCAL_GPU_LAYERS") {
+                config.gpu_layers = Some(layers);
+            }
             if let Some(batching) = env_parsed("CUCA_LOCAL_BATCHING") {
                 config.batching = batching;
             }

@@ -32,7 +32,10 @@
 //! (`--features provider-local-vulkan`, ...). A `+`-separated list
 //! (`vulkan:0+vulkan:1`, `vulkan:0+vulkan:0`) splits the model over those
 //! devices (`LocalModelConfig::shards`: tensor parallelism; a device may
-//! repeat, which exercises the path on one GPU). `CUCA_LOCAL_EXPERTS` sets
+//! repeat, which exercises the path on one GPU). `CUCA_LOCAL_GPU_LAYERS=<n>`
+//! sets `LocalModelConfig::gpu_layers` (layer offload: the last `n` layers on
+//! the GPU device, the rest on the CPU; the model's layer split is printed as
+//! `MATRIX|layer_split|...`). `CUCA_LOCAL_EXPERTS` sets
 //! `LocalModelConfig::experts` (`ExpertPlacement` syntax, e.g.
 //! `tiered:ram=4g`; unset = resident), so the whole matrix runs on tiered
 //! experts. Build for the host CPU, since
@@ -378,12 +381,22 @@ async fn loaded() -> Option<Loaded> {
                         .unwrap_or_else(|e| panic!("CUCA_LOCAL_CHAT_TEMPLATE={path:?}: {e}")),
                 );
             }
+            if let Ok(layers) = std::env::var("CUCA_LOCAL_GPU_LAYERS")
+                && !layers.is_empty()
+            {
+                config.gpu_layers = Some(
+                    layers
+                        .parse()
+                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_GPU_LAYERS={layers:?}: {e}")),
+                );
+            }
             println!("MATRIX|devices|{:?} + {:?}", config.device, config.shards);
             let started = std::time::Instant::now();
             let model = LocalModel::load(config)
                 .await
                 .unwrap_or_else(|e| panic!("local model must load: {e}"));
             println!("MATRIX|load_seconds|{:.1}", started.elapsed().as_secs_f64());
+            println!("MATRIX|layer_split|{:?}", model.layer_split());
             let reported = model.capabilities();
             let caps = Capabilities {
                 name: source_label(&source),

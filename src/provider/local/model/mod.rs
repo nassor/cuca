@@ -183,6 +183,7 @@ pub(crate) mod params;
 pub(crate) mod qmm;
 pub(crate) mod quant;
 pub(crate) mod rope;
+pub(crate) mod split;
 pub(crate) mod tier;
 #[cfg(test)]
 pub(crate) mod tiny;
@@ -199,7 +200,7 @@ use candle_core::quantized::gguf_file;
 use self::layout::name;
 use self::params::Hparams;
 use self::rope::{CosSin, Factors};
-use super::{ExpertPlacement, LocalDevice};
+use super::{ExpertPlacement, ExpertTiers, LocalDevice};
 use crate::error::CucaError;
 use crate::types::ProviderEndpoint;
 
@@ -293,6 +294,9 @@ pub(crate) enum RecurrentSnapshot {
     Cpu(Vec<delta::DeltaState>),
     #[cfg(feature = "provider-local-gpu")]
     Gpu(gpu::GpuSnapshot),
+    /// Both halves of a model with layers offloaded to the GPU.
+    #[cfg(feature = "provider-local-gpu")]
+    Split(split::SplitSnapshot),
 }
 
 impl RecurrentSnapshot {
@@ -302,6 +306,8 @@ impl RecurrentSnapshot {
             RecurrentSnapshot::Cpu(layers) => layers.iter().map(delta::DeltaState::bytes).sum(),
             #[cfg(feature = "provider-local-gpu")]
             RecurrentSnapshot::Gpu(snapshot) => snapshot.bytes(),
+            #[cfg(feature = "provider-local-gpu")]
+            RecurrentSnapshot::Split(snapshot) => snapshot.bytes(),
         }
     }
 }
@@ -418,8 +424,21 @@ pub(crate) fn read_hparams(content: &gguf_file::Content) -> Result<Hparams, Cuca
     Hparams::from_metadata(&content.metadata, &|n| content.tensor_infos.contains_key(n))
 }
 
+/// The placement of a model that runs entirely on the CPU, from one set for
+/// a GPU device: the same tiers without the device tier.
+fn cpu_experts(experts: &ExpertPlacement) -> ExpertPlacement {
+    match experts {
+        ExpertPlacement::Resident => ExpertPlacement::Resident,
+        ExpertPlacement::Tiered(tiers) => ExpertPlacement::Tiered(ExpertTiers {
+            device_bytes: 0,
+            ..tiers.clone()
+        }),
+    }
+}
+
 /// The loaded model on the device `LocalModelConfig::device` selected: candle
-/// on the CPU, or burn on a GPU. Both expose the same calls the engine makes.
+/// on the CPU, burn on a GPU, or both with some layers offloaded to the GPU
+/// ([`split`]). All expose the same calls the engine makes.
 // One `Model` exists per engine, so the size gap between the variants costs
 // nothing worth a box.
 #[allow(clippy::large_enum_variant)]
@@ -427,6 +446,8 @@ pub(crate) enum Model {
     Cpu(cpu::Transformer),
     #[cfg(feature = "provider-local-gpu")]
     Gpu(gpu::GpuTransformer),
+    #[cfg(feature = "provider-local-gpu")]
+    Split(split::SplitModel),
 }
 
 impl Model {
@@ -444,6 +465,10 @@ impl Model {
     /// budgets do not fit the model; [`CucaError::Provider`] for unsupported
     /// or malformed checkpoints; [`CucaError::Io`] when the file cannot be
     /// read.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the file, the devices, the placements and the sizing are independent inputs"
+    )]
     pub(crate) fn load(
         content: &gguf_file::Content,
         path: &Path,
@@ -452,7 +477,20 @@ impl Model {
         shards: &[LocalDevice],
         experts: &ExpertPlacement,
         sizing: &paged::Sizing,
+        gpu_layers: Option<usize>,
     ) -> Result<Self, CucaError> {
+        if let Some(n) = gpu_layers {
+            return Self::load_offloaded(
+                content,
+                path,
+                context_length,
+                device,
+                shards,
+                experts,
+                sizing,
+                n,
+            );
+        }
         match device {
             LocalDevice::Cpu => Ok(Model::Cpu(cpu::Transformer::load_placed(
                 content,
@@ -482,6 +520,92 @@ impl Model {
         }
     }
 
+    /// [`Model::load`] with `gpu_layers` layers on `device` and the rest on
+    /// the CPU (see [`split`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] for more layers than the model has, `shards`
+    /// (tensor parallelism cannot be combined with layer offload), a CPU
+    /// `device`, or a GPU compiled out; otherwise as [`Model::load`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the file, the devices, the placements and the sizing are independent inputs"
+    )]
+    fn load_offloaded(
+        content: &gguf_file::Content,
+        path: &Path,
+        context_length: usize,
+        device: LocalDevice,
+        shards: &[LocalDevice],
+        experts: &ExpertPlacement,
+        sizing: &paged::Sizing,
+        gpu_layers: usize,
+    ) -> Result<Self, CucaError> {
+        if !shards.is_empty() {
+            return Err(CucaError::Config(
+                "gpu_layers cannot be combined with tensor parallelism (`shards`)".into(),
+            ));
+        }
+        if device == LocalDevice::Cpu {
+            return Err(CucaError::Config(
+                "gpu_layers needs a GPU `device`, got cpu".into(),
+            ));
+        }
+        let hp = read_hparams(content)?;
+        let placement = split::plan(&hp, gpu_layers)?;
+        match placement {
+            // Nothing on the GPU: a CPU model, no device opens.
+            split::Placement::Cpu => Self::load(
+                content,
+                path,
+                context_length,
+                LocalDevice::Cpu,
+                &[],
+                &cpu_experts(experts),
+                sizing,
+                None,
+            ),
+            split::Placement::Gpu => Self::load(
+                content,
+                path,
+                context_length,
+                device,
+                &[],
+                experts,
+                sizing,
+                None,
+            ),
+            #[cfg(feature = "provider-local-gpu")]
+            split::Placement::Split { first } => Ok(Model::Split(split::SplitModel::load(
+                content,
+                path,
+                context_length,
+                device,
+                experts,
+                sizing,
+                first,
+            )?)),
+            #[cfg(not(feature = "provider-local-gpu"))]
+            split::Placement::Split { .. } => Err(super::device_unavailable(device)
+                .unwrap_or_else(|| {
+                    CucaError::Config(format!("device {device:?} is not available"))
+                })),
+        }
+    }
+
+    /// Layers on the GPU and layers in all when layers are offloaded
+    /// ([`split`]); `None` for a model on one device.
+    pub(crate) fn layer_split(&self) -> Option<(usize, usize)> {
+        match self {
+            Model::Cpu(_) => None,
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(_) => None,
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => Some((m.gpu_layers(), m.n_layer())),
+        }
+    }
+
     /// Counters and heat of the expert tiers; `None` unless the model loaded
     /// with `ExpertPlacement::Tiered`.
     pub(crate) fn expert_tiers(&self) -> Option<std::sync::Arc<tier::TierShared>> {
@@ -489,6 +613,8 @@ impl Model {
             Model::Cpu(m) => m.expert_tiers(),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.expert_tiers(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.expert_tiers(),
         }
     }
 
@@ -520,6 +646,8 @@ impl Model {
             Model::Cpu(m) => m.forward_batch(batch),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.forward_batch(batch),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.forward_batch(batch),
         }
     }
 
@@ -529,6 +657,8 @@ impl Model {
             Model::Cpu(m) => m.arch(),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.arch(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.arch(),
         }
     }
 
@@ -546,6 +676,8 @@ impl Model {
             Model::Cpu(m) => m.rewind(slot.0, len),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.rewind(slot.0, len),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.rewind(slot.0, len),
         }
     }
 
@@ -557,6 +689,8 @@ impl Model {
             Model::Cpu(m) => m.snapshot(slot.0).map(RecurrentSnapshot::Cpu),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.snapshot(slot.0).map(RecurrentSnapshot::Gpu),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.snapshot(slot.0).map(RecurrentSnapshot::Split),
         }
     }
 
@@ -594,6 +728,15 @@ impl Model {
                 m.restore(slot.0, snapshot, len)
             }
             #[cfg(feature = "provider-local-gpu")]
+            (Model::Split(m), None) => {
+                m.reset_slot(slot.0);
+                Ok(())
+            }
+            #[cfg(feature = "provider-local-gpu")]
+            (Model::Split(m), Some(RecurrentSnapshot::Split(snapshot))) => {
+                m.restore(slot.0, snapshot, len)
+            }
+            #[cfg(feature = "provider-local-gpu")]
             _ => Err(err("the snapshot comes from another device")),
         }
     }
@@ -606,6 +749,8 @@ impl Model {
             Model::Cpu(m) => m.is_hybrid(),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.is_hybrid(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.is_hybrid(),
         }
     }
 
@@ -618,6 +763,8 @@ impl Model {
             Model::Cpu(m) => m.rollback_rows(),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.rollback_rows(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.rollback_rows(),
         }
     }
 
@@ -627,6 +774,8 @@ impl Model {
             Model::Cpu(m) => m.kv_layout(),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.kv_layout(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.kv_layout(),
         }
     }
 
@@ -636,6 +785,8 @@ impl Model {
             Model::Cpu(m) => m.kv_pool_bytes(),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.kv_pool_bytes(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.kv_pool_bytes(),
         }
     }
 }
