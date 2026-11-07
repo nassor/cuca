@@ -23,6 +23,9 @@
 //! test prints `SKIP: local model not available: ...` and passes, unless
 //! `CUCA_REQUIRE_LIVE=1` turns the skip into a panic.
 //!
+//! `CUCA_LOCAL_CHAT_TEMPLATE=<path to a .jinja file>` sets
+//! `LocalModelConfig::chat_template` (the template replaces the GGUF's).
+//!
 //! `CUCA_LOCAL_DEVICE` selects where the model runs (`LocalDevice` syntax):
 //! `cpu` (the default), `vulkan`, `vulkan:<n>`, `metal`, `cuda[:<n>]` or
 //! `rocm[:<n>]`; a GPU device needs its feature
@@ -72,7 +75,13 @@
 //!
 //! One model is loaded for the whole binary and the tests take turns on its
 //! single engine, so they run sequentially whatever the test harness does.
-//! Every request is greedy (`temperature = 0`).
+//! Every request is greedy (`temperature = 0`), except the two tool scenarios
+//! of a model whose template forces reasoning (`Capabilities::always_thinks`):
+//! greedy decoding of such a model can loop in its reasoning until the token
+//! budget ends (Ministral 3 Reasoning), so those requests use the model's own
+//! sampling defaults (`LocalModel::sampling`: the GGUF's `general.sampling.*`,
+//! else the built-in `SamplingConfig` ones) with the fixed request seed 1, and
+//! print `MATRIX|<scenario>|DECODING|...`; the run stays reproducible.
 
 #![cfg(feature = "provider-local")]
 
@@ -173,13 +182,6 @@ fn known_limit(model: &str, scenario: &str) -> Option<&'static str> {
              (margin 0.173), identical to the dequantized reference run in HuggingFace \
              (HuggingFace f32 margin 2.06) and answers; the production path's Q8_0 activation \
              rounding flips it (18.663 against 19.237) and the model calls the tool again",
-        ),
-        ("ministral3-3b-reasoning-q4_0", "tool_call_leg") => Some(
-            "the model never reaches the call within the 2,048-token budget: the HuggingFace f32 \
-             model on the original BF16 weights, given the same rendered prompt (`Use the \
-             tool.`), also reasons in circles (\"Alternatively, perhaps ... I'll simulate the \
-             call\") for 2,100 greedy tokens, never closes `[/THINK]` and never writes \
-             `[TOOL_CALLS]`; the engine's replies loop the same way",
         ),
         _ => None,
     }
@@ -368,6 +370,14 @@ async fn loaded() -> Option<Loaded> {
                     .set_devices(&devices)
                     .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
             }
+            if let Ok(path) = std::env::var("CUCA_LOCAL_CHAT_TEMPLATE")
+                && !path.is_empty()
+            {
+                config.chat_template = Some(
+                    std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| panic!("CUCA_LOCAL_CHAT_TEMPLATE={path:?}: {e}")),
+                );
+            }
             println!("MATRIX|devices|{:?} + {:?}", config.device, config.shards);
             let started = std::time::Instant::now();
             let model = LocalModel::load(config)
@@ -470,15 +480,62 @@ impl Reply {
     }
 }
 
+/// How a scenario's requests decode.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Decoding {
+    /// Greedy (`temperature` 0): the default, deterministic and exactly
+    /// comparable between runs.
+    Greedy,
+    /// The model's own sampling defaults (`LocalModel::sampling`: the GGUF's
+    /// `general.sampling.*`, else the built-in ones) with the fixed seed
+    /// [`SAMPLING_SEED`], so a run is still reproducible. For a model whose
+    /// template forces reasoning: greedy decoding of such a model can loop in
+    /// its reasoning until the token budget runs out. Ministral 3 Reasoning
+    /// repeats `Alternatively, perhaps ... I'll simulate the call` for the
+    /// whole budget (7,965 greedy tokens at an 8,192 context, so a larger
+    /// `max_tokens` does not help; HuggingFace f32 did the same for 2,100
+    /// tokens), while sampling at the model card's temperature 0.7 closes
+    /// `[/THINK]` and writes `[TOOL_CALLS]` within 66 to 137 tokens in the
+    /// engine and 94 to 149 in HuggingFace bf16 (seeds 1 to 3, the same
+    /// prompt text). The old and the current chat template render the same
+    /// prompt for this request, and the parser reads the sampled replies, so
+    /// the cause is greedy decoding, not the template, the budget or the parser.
+    ModelDefaults,
+}
+
+/// The request seed of [`Decoding::ModelDefaults`] runs.
+const SAMPLING_SEED: u64 = 1;
+
+impl Capabilities {
+    /// How the tool-call scenarios decode: sampled for a model that always
+    /// reasons, greedy otherwise.
+    fn tool_decoding(&self) -> Decoding {
+        if self.always_thinks() {
+            Decoding::ModelDefaults
+        } else {
+            Decoding::Greedy
+        }
+    }
+}
+
 /// Run `request` greedily on `model` and drain its stream.
 async fn ask(model: &LocalModel, request: UnifiedRequest) -> Reply {
+    ask_decoding(model, request, Decoding::Greedy).await
+}
+
+/// Run `request` on `model` with the given decoding and drain its stream.
+async fn ask_decoding(model: &LocalModel, request: UnifiedRequest, decoding: Decoding) -> Reply {
+    let request = match decoding {
+        Decoding::Greedy => request.set_temperature(0.0),
+        Decoding::ModelDefaults => request.set_seed(SAMPLING_SEED),
+    };
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::Local)
         .with_local_model(model.clone())
         .build()
         .expect("client builds");
     let (mut stream, handle) = client
-        .generate_stream_with_response(request.set_temperature(0.0))
+        .generate_stream_with_response(request)
         .await
         .expect("request dispatches");
     let mut blocks = Vec::new();
@@ -740,12 +797,20 @@ async fn tool_round_trip(live: &Loaded, scenario: &str, tools_on_follow_up: bool
     let (model, caps) = (&live.model, &live.caps);
     let question = "What's the weather in Paris right now? Use the tool.";
 
-    let first = ask(
+    let decoding = caps.tool_decoding();
+    if decoding == Decoding::ModelDefaults {
+        println!(
+            "MATRIX|{scenario}|DECODING|sampled with the model's defaults {:?}",
+            model.sampling()
+        );
+    }
+    let first = ask_decoding(
         model,
         request()
             .add_tool(weather_tool())
             .add_user_message(question)
             .set_max_tokens(caps.budget(256, 2048)),
+        decoding,
     )
     .await;
     let call = first.blocks.iter().find_map(|b| match b {
@@ -785,7 +850,7 @@ async fn tool_round_trip(live: &Loaded, scenario: &str, tools_on_follow_up: bool
     if tools_on_follow_up {
         follow_up = follow_up.add_tool(weather_tool());
     }
-    let second = ask(
+    let second = ask_decoding(
         model,
         follow_up
             .add_user_message(question)
@@ -809,6 +874,7 @@ async fn tool_round_trip(live: &Loaded, scenario: &str, tools_on_follow_up: bool
                 tool_call_id: Some(id),
             })
             .set_max_tokens(caps.budget(128, 2048)),
+        decoding,
     )
     .await;
     let text = second.text();

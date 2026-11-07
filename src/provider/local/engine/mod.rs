@@ -66,8 +66,9 @@ use super::model::mtp::Drafter;
 use super::model::paged::{KvPools, Sizing};
 use super::model::{Model, prefill_chunk};
 use super::sampler::{SplitMix64, random_seed};
+use super::sampling::{FileSampling, Sampling};
 use super::tokenizer::Tokenizer;
-use super::{LocalDevice, LocalModelConfig, MAX_DRAFT_TOKENS, SamplingConfig};
+use super::{LocalDevice, LocalModelConfig, MAX_DRAFT_TOKENS};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
 use crate::types::{MessageContentBlock, ProviderEndpoint};
@@ -122,7 +123,7 @@ pub(crate) struct Engine {
     model: Model,
     tokenizer: Arc<Tokenizer>,
     format: ChatFormat,
-    sampling: SamplingConfig,
+    sampling: Sampling,
     /// The K/V block pools and the prefix store over them, shared by every
     /// running sequence.
     pools: KvPools,
@@ -519,12 +520,15 @@ impl Engine {
     /// weight dtype the GPU engine does not read), a missing tensor or
     /// metadata key, a drafter that does not match the model (an in-trunk
     /// head the file does not carry, or one asked for on a GPU), or an
-    /// unusable tokenizer.
+    /// unusable tokenizer. `chat_template`, when given, replaces the GGUF's
+    /// template for everything derived from it; a template that does not
+    /// compile or render is a [`CucaError::Config`].
     pub(crate) fn open(
         path: &Path,
         drafter: Option<&ResolvedDrafter>,
         stats: Arc<DraftCounters>,
         config: &LocalModelConfig,
+        chat_template: Option<&str>,
     ) -> Result<(Self, Arc<Tokenizer>, ChatTemplate, ChatFormat), CucaError> {
         let io_err = |e: &dyn std::fmt::Display| CucaError::Io {
             message: format!("reading GGUF `{}`: {e}", path.display()),
@@ -593,25 +597,37 @@ impl Engine {
         let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
 
         const TEMPLATE_KEY: &str = "tokenizer.chat_template";
-        let source = content
-            .metadata
-            .get(TEMPLATE_KEY)
-            .ok_or_else(|| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: missing")))?
-            .to_string()
-            .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
-            .clone();
-        let format = ChatFormat::detect(&content.metadata, &tokenizer, &source)?;
-        let template = ChatTemplate::new(
-            source,
-            tokenizer.bos_token().to_string(),
-            tokenizer.eos_token().to_string(),
-        )?;
+        let bos = tokenizer.bos_token().to_string();
+        let eos = tokenizer.eos_token().to_string();
+        let (format, template) = match chat_template {
+            Some(source) => {
+                let template = ChatTemplate::checked(source.to_string(), bos, eos)?;
+                (
+                    ChatFormat::detect(&content.metadata, &tokenizer, source)?,
+                    template,
+                )
+            }
+            None => {
+                let source = content
+                    .metadata
+                    .get(TEMPLATE_KEY)
+                    .ok_or_else(|| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: missing")))?
+                    .to_string()
+                    .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
+                    .clone();
+                let format = ChatFormat::detect(&content.metadata, &tokenizer, &source)?;
+                (format, ChatTemplate::new(source, bos, eos)?)
+            }
+        };
 
         let engine = Self::new(
             model,
             Arc::clone(&tokenizer),
             format.clone(),
-            config.sampling,
+            Sampling::resolve(
+                &config.sampling,
+                &FileSampling::from_metadata(&content.metadata),
+            ),
             context_length,
             batching,
             drafter,
@@ -630,7 +646,7 @@ impl Engine {
         model: Model,
         tokenizer: Arc<Tokenizer>,
         format: ChatFormat,
-        sampling: SamplingConfig,
+        sampling: Sampling,
         context_length: usize,
         batching: Batching,
         drafter: Option<Drafter>,
@@ -670,6 +686,12 @@ impl Engine {
     /// The scheduler counters `LocalModel::serving_stats` reads.
     pub(crate) fn serving_counters(&self) -> Arc<ServingCounters> {
         Arc::clone(&self.serving)
+    }
+
+    /// The load-time sampling parameters after the config/file/built-in
+    /// precedence.
+    pub(crate) fn sampling(&self) -> Sampling {
+        self.sampling
     }
 
     /// The context length the engine runs with: the configured value, or the
@@ -875,7 +897,7 @@ pub(crate) mod testing {
             model,
             Arc::clone(&tokenizer),
             tiny_format(&tokenizer),
-            SamplingConfig {
+            Sampling {
                 temperature,
                 top_k: 64,
                 top_p: 0.95,
@@ -1296,7 +1318,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let config = LocalModelConfig::default();
-        let result = Engine::open(&path, None, Arc::default(), &config);
+        let result = Engine::open(&path, None, Arc::default(), &config, None);
         let _ = std::fs::remove_file(&path);
         let err = match result {
             Err(e) => e,
@@ -1981,6 +2003,7 @@ mod tests {
                 Some(&ResolvedDrafter::InTrunk),
                 Arc::default(),
                 &config,
+                None,
             );
             let e = match result {
                 Err(e) => e,
@@ -2019,6 +2042,7 @@ mod tests {
             Some(&ResolvedDrafter::InTrunk),
             Arc::default(),
             &config,
+            None,
         );
         let e = match result {
             Err(e) => e,
@@ -2314,6 +2338,7 @@ mod tests {
             Some(&ResolvedDrafter::File(eagle.path.clone())),
             Arc::default(),
             &gpu,
+            None,
         );
         let e = match result {
             Err(e) => e,
@@ -2601,6 +2626,7 @@ mod tests {
                 Some(&ResolvedDrafter::File(drafter.path.clone())),
                 Arc::default(),
                 &config,
+                None,
             )
             .err()
             .expect("the tiny model has no tokenizer")
@@ -2618,7 +2644,7 @@ mod tests {
 
         // The file is a drafter, not a model.
         let drafter = write_tiny_dflash(&TinyDflash::default());
-        let err = Engine::open(&drafter.path, None, Arc::default(), &config)
+        let err = Engine::open(&drafter.path, None, Arc::default(), &config, None)
             .err()
             .expect("a drafter is not a main model");
         assert!(err.to_string().contains("not a standalone model"), "{err}");

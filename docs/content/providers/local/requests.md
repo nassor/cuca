@@ -47,7 +47,7 @@ Read the usage per call with `CucaClient::generate_stream_with_response`.
 
 ## Thinking
 
-- Thinking is on or off. A request whose `thinking` is enabled sets the template variables `enable_thinking` and `thinking` to true; its effort level is ignored. A disabled or missing `thinking` sets both to false. `preserve_thinking` is always false.
+- Thinking is on or off. A request whose `thinking` is enabled sets the template variables `enable_thinking` and `thinking` to true; its effort level is ignored. A disabled or missing `thinking` sets both to false. A template that reads `reasoning_effort` (Mistral Small 4) gets `high` when thinking is enabled and `none` otherwise, whatever the effort level. A template that reads `reasoning_strength` (Muse Glimmer, which cannot switch reasoning off) gets the effort level as `low` (minimal, low, and a disabled request), `medium`, `high` or `xhigh`, and the template's own default when the request names no effort. `preserve_thinking` is always false.
 - Reasoning arrives as `Thinking` blocks. If the rendered prompt ends inside an open reasoning block, generation starts in thinking.
 - A model whose template reads neither variable, such as the DeepSeek-R1 distills, reasons on every request.
 - `LocalModel::capabilities()` reports what the model supports, derived from its own chat template and output conventions: `reasoning` (it writes a reasoning block), `can_disable_thinking` (the template reads `enable_thinking`) and `tools` (it has a tool syntax the output parser understands).

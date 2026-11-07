@@ -225,6 +225,7 @@ mod engine;
 mod model;
 mod output;
 mod sampler;
+mod sampling;
 mod tokenizer;
 
 use std::fmt;
@@ -304,6 +305,26 @@ pub struct ModelPreset {
     /// the parts; loading downloads and verifies every part, merges them into
     /// one cached `<base>.gguf` and deletes the parts.
     pub parts: &'static [PresetPart],
+    /// A chat template that replaces the one embedded in the GGUF (a file of
+    /// the model's original repository, pinned like a model part), for a
+    /// model whose published GGUFs carry an older template than the
+    /// repository. `None` keeps the GGUF's own template.
+    pub template: Option<PresetTemplate>,
+}
+
+/// The pinned chat template file of a preset, see [`ModelPreset::template`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PresetTemplate {
+    /// Hugging Face repository id the template is read from (usually the
+    /// model's original repository, not the GGUF one).
+    pub repo: &'static str,
+    /// Commit hash of that repository.
+    pub revision: &'static str,
+    /// File name inside the repository, a Jinja template
+    /// (`chat_template.jinja`).
+    pub file: &'static str,
+    /// Lowercase hex SHA-256 of the file.
+    pub sha256: &'static str,
 }
 
 /// One file of a split preset, see [`ModelPreset::parts`].
@@ -333,6 +354,14 @@ impl ModelPreset {
                     sha256: Some(p.sha256.to_string()),
                 })
                 .collect(),
+            template: self.template.map(|t| {
+                Box::new(ModelTemplate {
+                    repo: t.repo.to_string(),
+                    revision: t.revision.to_string(),
+                    file: t.file.to_string(),
+                    sha256: Some(t.sha256.to_string()),
+                })
+            }),
         }
     }
 }
@@ -358,6 +387,7 @@ const fn preset(
         architecture,
         drafter: false,
         parts: &[],
+        template: None,
     }
 }
 
@@ -537,29 +567,53 @@ const PRESET_TABLE: [ModelPreset; 25] = [
     // `ffn_down` in 6 (all served by the row-batched kernels). It embeds the earlier Muse chat template, which renders the same
     // bytes as the current one except when the caller's system prompt itself
     // mentions "Reasoning effort": the current template rewrites that to
-    // "Reasoning strength", this one appends a second directive.
-    preset(
-        "muse-glimmer-30b-q4_0",
-        "bartowski/Muse-Glimmer-30B-GGUF",
-        "01e1b7c30e19e1823ee9a73dec51d12f59ec4857",
-        "Muse-Glimmer-30B-Q4_0.gguf",
-        "95fd818c08f2030a51805548269690e1915fc84088e4322273c5f317e2696999",
-        16_265_565_216,
-        "muse-glimmer",
-    ),
-    // imatrix Q4_0 (Q4_1 and Q6_K in places) with the earlier chat template of
-    // Ministral 3 Reasoning: identical to the current one except that the
-    // reasoning of earlier assistant turns is not written back into the
-    // history. mistralai publishes no Q4_0 of this model.
-    preset(
-        "ministral3-3b-reasoning-q4_0",
-        "bartowski/mistralai_Ministral-3-3B-Reasoning-2512-GGUF",
-        "36cf98fc920c42a4c89c78880723a8ec4aabe931",
-        "mistralai_Ministral-3-3B-Reasoning-2512-Q4_0.gguf",
-        "72ba5a30221864a7355c92336e639214e122dad4d11345139d2669d7c8bf7c3c",
-        2_046_374_368,
-        "mistral3",
-    ),
+    // "Reasoning strength", this one appends a second directive. The preset
+    // pins the repository's current `chat_template.jinja` (meta-models at
+    // cec94fcf) and uses it instead. The only published Q4_0/Q8_0 whose
+    // embedded template equals the current one is ggml-org's Q8_0, twice the
+    // memory and half the CPU speed.
+    ModelPreset {
+        template: Some(PresetTemplate {
+            repo: "meta-models/Muse-Glimmer-30B",
+            revision: "cec94fcfd6512f2cfe708138c32533b346ea4f69",
+            file: "chat_template.jinja",
+            sha256: "cfc67e5f349f37690dfd31ed1f18bc4442a9dd32fe39a648f993cb4eb3cae678",
+        }),
+        ..preset(
+            "muse-glimmer-30b-q4_0",
+            "bartowski/Muse-Glimmer-30B-GGUF",
+            "01e1b7c30e19e1823ee9a73dec51d12f59ec4857",
+            "Muse-Glimmer-30B-Q4_0.gguf",
+            "95fd818c08f2030a51805548269690e1915fc84088e4322273c5f317e2696999",
+            16_265_565_216,
+            "muse-glimmer",
+        )
+    },
+    // imatrix Q4_0 (Q4_1 and Q6_K in places; mistralai publishes no Q4_0 of
+    // this model). Every published GGUF of Ministral 3 Reasoning (mistralai,
+    // ggml-org, lmstudio-community, unsloth, bartowski) embeds the December
+    // 2025 chat template, a different and shorter one than the repository's
+    // current `chat_template.jinja` ("update to match mistral-common",
+    // 2026-07-15: it merges consecutive messages, writes `reasoning` back as
+    // `[THINK]` blocks and accepts system content lists). The preset pins
+    // that file and uses it instead of the embedded one.
+    ModelPreset {
+        template: Some(PresetTemplate {
+            repo: "mistralai/Ministral-3-3B-Reasoning-2512",
+            revision: "4a36357c811bf511a7b625d132e12f22408aac91",
+            file: "chat_template.jinja",
+            sha256: "6b5044075f09f4daa57beebe2d989d9fbe67dea351f220e1a84e19ddc893f2c2",
+        }),
+        ..preset(
+            "ministral3-3b-reasoning-q4_0",
+            "bartowski/mistralai_Ministral-3-3B-Reasoning-2512-GGUF",
+            "36cf98fc920c42a4c89c78880723a8ec4aabe931",
+            "mistralai_Ministral-3-3B-Reasoning-2512-Q4_0.gguf",
+            "72ba5a30221864a7355c92336e639214e122dad4d11345139d2669d7c8bf7c3c",
+            2_046_374_368,
+            "mistral3",
+        )
+    },
     // imatrix Q4_0 of Ministral 3 Instruct. Its embedded chat template is the
     // earlier one: the same except for the wording of the default system
     // prompt (the current template adds a tool-calling paragraph there).
@@ -657,6 +711,12 @@ pub enum ModelSource {
         /// the parts were downloaded and deletes the parts. `parts[0]` must
         /// be `file`.
         parts: Vec<ModelPart>,
+        /// A chat template file that replaces the GGUF's embedded one (see
+        /// [`LocalModelConfig::chat_template`], which wins over it);
+        /// downloaded and verified like a model file, and a failed digest or
+        /// a template that does not compile fails the load. `None` keeps the
+        /// GGUF's own template.
+        template: Option<Box<ModelTemplate>>,
     },
     /// A GGUF file already on disk; nothing is downloaded. A file named like a
     /// split part (`<base>-00001-of-0000N.gguf`; any part names the set) is
@@ -684,6 +744,20 @@ pub enum ModelSource {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPart {
     /// File name inside the repository.
+    pub file: String,
+    /// Expected lowercase hex SHA-256 of the file; `None` skips the check.
+    pub sha256: Option<String>,
+}
+
+/// A chat template file on Hugging Face, see
+/// [`ModelSource::HuggingFace::template`](ModelSource).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelTemplate {
+    /// Repository id the file is read from.
+    pub repo: String,
+    /// Commit hash the download is pinned to.
+    pub revision: String,
+    /// File name inside the repository (`chat_template.jinja`).
     pub file: String,
     /// Expected lowercase hex SHA-256 of the file; `None` skips the check.
     pub sha256: Option<String>,
@@ -729,6 +803,7 @@ impl ModelSource {
             file: file.into(),
             sha256: None,
             parts: Vec::new(),
+            template: None,
         }
     }
 }
@@ -775,35 +850,45 @@ impl std::str::FromStr for ModelSource {
     }
 }
 
-/// Default sampling parameters of a [`LocalModel`].
+/// Default sampling parameters of a [`LocalModel`], the values you set
+/// yourself.
 ///
-/// Each value is overridden per request by the matching [`UnifiedRequest`]
-/// field (`set_temperature`, `set_top_k`, `set_top_p`, `set_seed`) and holds
-/// for requests that set none. A request `seed` restarts the generator for
-/// that request only; the load-time `seed` restarts it for every request.
-#[derive(Debug, Clone, Copy, PartialEq)]
+/// A field left `None` is not set: the model file's own default applies (the
+/// GGUF keys `general.sampling.temp`, `general.sampling.top_k` and
+/// `general.sampling.top_p`, which llama.cpp reads the same way and which
+/// the checkpoint converter writes from `generation_config.json`), and
+/// failing that the built-in default ([`SamplingConfig::DEFAULT_TEMPERATURE`],
+/// [`DEFAULT_TOP_K`](SamplingConfig::DEFAULT_TOP_K),
+/// [`DEFAULT_TOP_P`](SamplingConfig::DEFAULT_TOP_P)). Precedence, highest
+/// first: the request's own `temperature`/`top_k`/`top_p`/`seed`
+/// ([`UnifiedRequest::set_temperature`], `set_top_k`, `set_top_p`,
+/// `set_seed`), then a field set here, then the file's default, then the
+/// built-in one; each of the three values resolves on its own.
+/// [`LocalModel::sampling`] reports what the load resolved to. A request
+/// `seed` restarts the generator for that request only; the load-time `seed`
+/// restarts it for every request.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub struct SamplingConfig {
-    /// Softmax temperature; `0.0` selects the greedy argmax.
-    pub temperature: f32,
-    /// Keep only the `top_k` most likely tokens; `0` disables the filter.
-    pub top_k: usize,
-    /// Nucleus threshold in `(0, 1]`; `1.0` disables the filter.
-    pub top_p: f32,
+    /// Softmax temperature; `Some(0.0)` selects the greedy argmax.
+    pub temperature: Option<f32>,
+    /// Keep only the `top_k` most likely tokens; `Some(0)` disables the
+    /// filter.
+    pub top_k: Option<usize>,
+    /// Nucleus threshold in `(0, 1]`; `Some(1.0)` disables the filter.
+    pub top_p: Option<f32>,
     /// Fixed RNG seed: with `Some`, every request restarts the generator from
     /// the seed, so equal prompts sample equal tokens. `None` seeds the
-    /// generator from the system once at load.
+    /// generator from the system once at load. The file carries no seed.
     pub seed: Option<u64>,
 }
 
-impl Default for SamplingConfig {
-    fn default() -> Self {
-        Self {
-            temperature: 1.0,
-            top_k: 64,
-            top_p: 0.95,
-            seed: None,
-        }
-    }
+impl SamplingConfig {
+    /// Temperature when neither the config nor the file sets one.
+    pub const DEFAULT_TEMPERATURE: f32 = 1.0;
+    /// `top_k` when neither the config nor the file sets one.
+    pub const DEFAULT_TOP_K: usize = 64;
+    /// `top_p` when neither the config nor the file sets one.
+    pub const DEFAULT_TOP_P: f32 = 0.95;
 }
 
 /// Which GPU adapter a wgpu-backed device ([`LocalDevice::Vulkan`],
@@ -1203,6 +1288,18 @@ pub struct LocalModelConfig {
     pub context_length: Option<usize>,
     /// Default sampling parameters.
     pub sampling: SamplingConfig,
+    /// The Jinja chat template to use instead of the one in the GGUF (what
+    /// llama.cpp's `--chat-template-file` and vLLM's `--chat-template`
+    /// do), for example a newer template than the one a published GGUF
+    /// embeds. Everything derived from the template follows the override:
+    /// the reasoning markers, the tool-call syntax, the end-of-turn tokens
+    /// and the `enable_thinking`/`reasoning_effort` variables. It wins over
+    /// the template a preset pins ([`ModelPreset::template`]). A template
+    /// that does not compile, or fails to render a one-message
+    /// conversation, makes [`LocalModel::load`] fail with
+    /// [`CucaError::Config`]. `None` (the default) uses the preset's
+    /// pinned template, else the GGUF's.
+    pub chat_template: Option<String>,
     /// Where the forward pass runs; [`LocalDevice::Cpu`] by default.
     pub device: LocalDevice,
     /// Optional multi-token-prediction drafter for self-speculative decoding:
@@ -1260,6 +1357,7 @@ impl Default for LocalModelConfig {
             hf_token: None,
             context_length: None,
             sampling: SamplingConfig::default(),
+            chat_template: None,
             device: LocalDevice::Cpu,
             drafter: None,
             draft_tokens: DEFAULT_DRAFT_TOKENS,
@@ -1303,6 +1401,13 @@ impl fmt::Debug for LocalModelConfig {
             .field("hf_token", &self.hf_token.as_ref().map(|_| "<redacted>"))
             .field("context_length", &self.context_length)
             .field("sampling", &self.sampling)
+            .field(
+                "chat_template",
+                &self
+                    .chat_template
+                    .as_ref()
+                    .map(|t| format!("<{} bytes>", t.len())),
+            )
             .field("device", &self.device)
             .field("drafter", &self.drafter)
             .field("draft_tokens", &self.draft_tokens)
@@ -1326,6 +1431,7 @@ type Ready = Result<
         u64,
         Option<Arc<model::tier::TierShared>>,
         Arc<engine::ServingCounters>,
+        SamplingConfig,
     ),
     CucaError,
 >;
@@ -1339,6 +1445,9 @@ pub(crate) struct LocalModelInner {
     format: ChatFormat,
     context_length: usize,
     kv_cache_bytes: u64,
+    /// The load-time sampling parameters after the precedence of
+    /// [`SamplingConfig`].
+    sampling: SamplingConfig,
     draft_stats: Arc<engine::DraftCounters>,
     serving: Arc<engine::ServingCounters>,
     /// Counters and heat of the expert tiers; `None` unless
@@ -1404,8 +1513,11 @@ pub(crate) struct LocalModelInner {
 ///
 /// # Behavior
 ///
-/// - Thinking is binary: a request with thinking enabled opens the model's
-///   reasoning channel, and its effort level is ignored.
+/// - Thinking is on or off for most templates (`enable_thinking`/`thinking`,
+///   and a two-mode `reasoning_effort` of `none` or `high`): the request's
+///   effort level is ignored. A template that reads `reasoning_strength`
+///   (Muse Glimmer) gets the effort level as `low`, `medium`, `high` or
+///   `xhigh`; a request without an effort leaves the template's default.
 /// - The engine is text-only: image blocks are rejected.
 /// - `UnifiedRequest::model` is not used for routing, since one client holds
 ///   one model. `temperature`, `max_tokens`, `top_p`, `top_k`, `seed` and
@@ -1611,6 +1723,14 @@ impl LocalModel {
         self.inner.kv_cache_bytes
     }
 
+    /// The sampling parameters a request that sets none runs with, every field
+    /// resolved: the [`LocalModelConfig::sampling`] value where set, else the
+    /// model file's default (`general.sampling.*`), else the built-in one (see
+    /// [`SamplingConfig`]). `seed` is the configured one.
+    pub fn sampling(&self) -> SamplingConfig {
+        self.inner.sampling
+    }
+
     /// What this model supports: reasoning, switching it off, tool calls.
     pub fn capabilities(&self) -> LocalCapabilities {
         let reasoning = self.inner.format.writes_reasoning();
@@ -1685,8 +1805,14 @@ impl LocalModel {
                 )),
                 Some(DrafterSource::InTrunk) => Some(engine::ResolvedDrafter::InTrunk),
             };
-            let (engine, tokenizer, template, format) =
-                engine::Engine::open(&path, drafter.as_ref(), shared, &config)?;
+            let chat_template = resolve_chat_template(&config)?;
+            let (engine, tokenizer, template, format) = engine::Engine::open(
+                &path,
+                drafter.as_ref(),
+                shared,
+                &config,
+                chat_template.as_deref(),
+            )?;
             Ok((engine, tokenizer, template, format))
         })
         .await
@@ -1734,6 +1860,7 @@ impl LocalModel {
                                 engine.kv_cache_bytes(),
                                 engine.expert_tiers(),
                                 engine.serving_counters(),
+                                engine.sampling().config(),
                             )))
                             .is_err()
                         {
@@ -1761,6 +1888,7 @@ impl LocalModel {
                 kv_cache_bytes,
                 tiers,
                 serving,
+                sampling,
             ))) => Ok(LocalModel {
                 inner: Arc::new(LocalModelInner {
                     jobs: jobs_tx,
@@ -1769,6 +1897,7 @@ impl LocalModel {
                     format,
                     context_length,
                     kv_cache_bytes,
+                    sampling,
                     draft_stats,
                     serving,
                     tiers,
@@ -1834,14 +1963,16 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
             batching.max_sequences
         )));
     }
-    let temperature = config.sampling.temperature;
-    if !temperature.is_finite() || temperature < 0.0 {
+    if let Some(temperature) = config.sampling.temperature
+        && (!temperature.is_finite() || temperature < 0.0)
+    {
         return Err(CucaError::Config(format!(
             "sampling.temperature must be a finite value >= 0, got {temperature}"
         )));
     }
-    let top_p = config.sampling.top_p;
-    if !(top_p > 0.0 && top_p <= 1.0) {
+    if let Some(top_p) = config.sampling.top_p
+        && !(top_p > 0.0 && top_p <= 1.0)
+    {
         return Err(CucaError::Config(format!(
             "sampling.top_p must be in (0, 1], got {top_p}"
         )));
@@ -1938,6 +2069,7 @@ fn resolve_model_path(
             file,
             sha256,
             parts,
+            template: _,
         } => {
             let cache_dir = cache_dir()?;
             let split = convert::gguf_merge::repo_parts(file);
@@ -2059,6 +2191,52 @@ fn resolve_model_path(
             Ok(out)
         }
     }
+}
+
+/// The chat template that replaces the GGUF's, if any:
+/// [`LocalModelConfig::chat_template`], else the file the source pins
+/// ([`ModelSource::HuggingFace::template`](ModelSource), downloaded and
+/// checked against its digest once, like a model file).
+///
+/// Runs on the engine thread, like [`resolve_model_path`].
+fn resolve_chat_template(config: &LocalModelConfig) -> Result<Option<String>, CucaError> {
+    if let Some(text) = &config.chat_template {
+        return Ok(Some(text.clone()));
+    }
+    let ModelSource::HuggingFace {
+        template: Some(t), ..
+    } = &config.source
+    else {
+        return Ok(None);
+    };
+    let cache_dir =
+        download::resolve_cache_dir(config.cache_dir.as_deref(), &|key| std::env::var_os(key))?;
+    let path = download::cached_path(&cache_dir, &t.repo, &t.revision, &t.file)?;
+    if !path.exists() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()?;
+        let client = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .build()?;
+        runtime.block_on(download::ensure_downloaded(
+            &client,
+            download::HF_ENDPOINT,
+            &t.repo,
+            &t.revision,
+            &t.file,
+            t.sha256.as_deref(),
+            &path,
+            hf_token(config).as_deref(),
+            config.on_download_progress.as_ref(),
+        ))?;
+    }
+    let bytes = std::fs::read(&path).map_err(|e| CucaError::Io {
+        message: format!("reading chat template `{}`: {e}", path.display()),
+    })?;
+    String::from_utf8(bytes)
+        .map(Some)
+        .map_err(|_| CucaError::Config(format!("chat template `{}` is not UTF-8", path.display())))
 }
 
 /// The Hugging Face token: the configured one, else `HF_TOKEN`.
@@ -2212,7 +2390,8 @@ mod tests {
         assert_eq!(resolve_context_length(None, 2048), 2048);
         assert_eq!(resolve_context_length(Some(100_000), 4096), 100_000);
         assert_eq!(config.sampling, SamplingConfig::default());
-        assert_eq!(config.sampling.top_k, 64);
+        assert_eq!(config.sampling.top_k, None);
+        assert_eq!(SamplingConfig::DEFAULT_TOP_K, 64);
         assert_eq!(config.source, ModelSource::default_model());
         let ModelSource::HuggingFace {
             repo,
@@ -2260,6 +2439,16 @@ mod tests {
                 panic!("presets are Hugging Face files");
             };
             assert_eq!(sha256.as_deref(), Some(p.sha256));
+            if let Some(t) = p.template {
+                assert_eq!(t.revision.len(), 40, "{}", p.name);
+                assert_eq!(t.sha256.len(), 64, "{}", p.name);
+                assert!(
+                    t.sha256.bytes().all(|b| b.is_ascii_hexdigit()),
+                    "{}",
+                    p.name
+                );
+                assert!(t.file.ends_with(".jinja"), "{}", p.name);
+            }
         }
         // The default stays Gemma 4 E2B Q4_0 and sits first in the table.
         assert_eq!(ModelSource::PRESETS[0].name, "gemma4-e2b-q4_0");
@@ -2304,6 +2493,37 @@ mod tests {
         let err = resolve(&parts[0]).unwrap_err().to_string();
         assert!(err.contains("tiny-00003-of-00003.gguf"), "{err}");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A source's pinned template is read from its cache location (no network
+    /// when it is there), and `LocalModelConfig::chat_template` wins over it.
+    #[test]
+    fn a_chat_template_override_wins_over_the_pinned_template() {
+        let preset = ModelSource::preset("ministral3-3b-reasoning-q4_0").unwrap();
+        let t = preset.template.expect("the preset pins a template");
+        let cache = std::env::temp_dir().join(format!("cuca-tpl-cache-{}", std::process::id()));
+        let path = download::cached_path(&cache, t.repo, t.revision, t.file).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "pinned {{ messages | length }}").unwrap();
+        let mut config = LocalModelConfig {
+            source: preset.source(),
+            cache_dir: Some(cache.clone()),
+            ..LocalModelConfig::default()
+        };
+        assert_eq!(
+            resolve_chat_template(&config).unwrap().as_deref(),
+            Some("pinned {{ messages | length }}")
+        );
+        config.chat_template = Some("override".into());
+        assert_eq!(
+            resolve_chat_template(&config).unwrap().as_deref(),
+            Some("override")
+        );
+        // A source without a pinned template keeps the GGUF's own.
+        config.chat_template = None;
+        config.source = ModelSource::preset("qwen3-0.6b-q8_0").unwrap().source();
+        assert_eq!(resolve_chat_template(&config).unwrap(), None);
+        let _ = std::fs::remove_dir_all(cache);
     }
 
     #[test]
@@ -2391,6 +2611,7 @@ mod tests {
                     sha256: None,
                 })
                 .collect(),
+            template: None,
         };
         let config = |source| LocalModelConfig {
             source,
@@ -2464,7 +2685,7 @@ mod tests {
             (
                 LocalModelConfig {
                     sampling: SamplingConfig {
-                        temperature: f32::NAN,
+                        temperature: Some(f32::NAN),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -2474,7 +2695,7 @@ mod tests {
             (
                 LocalModelConfig {
                     sampling: SamplingConfig {
-                        temperature: -0.5,
+                        temperature: Some(-0.5),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -2484,7 +2705,7 @@ mod tests {
             (
                 LocalModelConfig {
                     sampling: SamplingConfig {
-                        top_p: 0.0,
+                        top_p: Some(0.0),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -2494,7 +2715,7 @@ mod tests {
             (
                 LocalModelConfig {
                     sampling: SamplingConfig {
-                        top_p: 1.5,
+                        top_p: Some(1.5),
                         ..Default::default()
                     },
                     ..Default::default()

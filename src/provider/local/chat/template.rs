@@ -112,6 +112,33 @@ impl ChatTemplate {
         })
     }
 
+    /// [`ChatTemplate::new`] for a template the caller supplied instead of
+    /// the GGUF's own: besides compiling, it must render a one-message
+    /// conversation, so a template that parses but cannot run fails at load
+    /// rather than on the first request. Both failures are
+    /// [`CucaError::Config`].
+    pub(crate) fn checked(
+        source: String,
+        bos_token: String,
+        eos_token: String,
+    ) -> Result<Self, CucaError> {
+        let config_err = |what: &str, e: CucaError| {
+            CucaError::Config(format!("chat_template override {what}: {e}"))
+        };
+        let template = Self::new(source, bos_token, eos_token)
+            .map_err(|e| config_err("does not compile", e))?;
+        let probe = ChatPrompt {
+            messages: serde_json::json!([{ "role": "user", "content": "Hello" }]),
+            tools: serde_json::Value::Array(Vec::new()),
+            enable_thinking: false,
+            thinking: super::ThinkingRequest::Unset,
+        };
+        template
+            .render(&probe)
+            .map_err(|e| config_err("does not render a one-message conversation", e))?;
+        Ok(template)
+    }
+
     /// Whether the template reads `enable_thinking`.
     pub(crate) fn reads_enable_thinking(&self) -> bool {
         self.reads_enable_thinking
@@ -676,6 +703,27 @@ mod tests {
     fn render(source: &str, prompt: &ChatPrompt) -> Result<String, CucaError> {
         ChatTemplate::new(source.to_string(), "<s>".into(), "</s>".into())?
             .render_at(prompt, 1_792_281_600)
+    }
+
+    /// A caller-supplied template that does not compile, or compiles but
+    /// cannot render a one-message conversation, is a configuration error that
+    /// names the problem; a working one is accepted.
+    #[test]
+    fn a_template_override_is_checked_at_load() {
+        let check = |source: &str| {
+            ChatTemplate::checked(source.to_string(), "<s>".into(), "</s>".into()).map(|_| ())
+        };
+        check("{{ bos_token }}{{ messages[0]['content'] }}").unwrap();
+        let err = check("{% if %}").unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("does not compile")),
+            "{err:?}"
+        );
+        let err = check("{{ raise_exception('no system prompt') }}").unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("does not render") && m.contains("no system prompt")),
+            "{err:?}"
+        );
     }
 
     /// The reasoning knobs of a request reach only templates that read them.

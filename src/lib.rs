@@ -119,7 +119,8 @@ pub use crate::provider::local::{
     BatchingConfig, ConvertConfig, DownloadProgress, DownloadProgressCallback, DraftStats,
     DrafterSource, ExpertHeat, ExpertPlacement, ExpertTierStats, ExpertTiers, GpuAdapter,
     LocalCapabilities, LocalDevice, LocalModel, LocalModelConfig, ModelPart, ModelPreset,
-    ModelSource, PresetPart, SamplingConfig, ServingStats, WeightQuant,
+    ModelSource, ModelTemplate, PresetPart, PresetTemplate, SamplingConfig, ServingStats,
+    WeightQuant,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,
