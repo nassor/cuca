@@ -79,7 +79,7 @@
 //!
 //! # DFlash block drafter (`dflash` file)
 //!
-//! A DFlash drafter ([`super::cpu::DflashNet`]) proposes a whole block of
+//! A DFlash drafter ([`super::cpu::dflash::DflashNet`]) proposes a whole block of
 //! tokens in one pass from the target's per-layer hidden features instead of
 //! chaining one step per token. It observes every position like the in-trunk
 //! head, but the rows it takes are the residual streams after chosen target
@@ -381,7 +381,7 @@ impl Drafter {
     ///
     /// [`CucaError::Provider`] when `target` runs on a GPU or the file is not
     /// a plain DFlash drafter this target can feed (see
-    /// [`DflashNet::open`](super::cpu::DflashNet)).
+    /// [`DflashNet::open`](super::cpu::dflash::DflashNet)).
     pub(crate) fn open_dflash(
         content: &gguf_file::Content,
         path: &Path,

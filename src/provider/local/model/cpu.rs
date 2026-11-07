@@ -1,11 +1,11 @@
 //! The generic transformer on candle CPU tensors; see the [module
 //! docs](super) for what it covers and what it costs in memory.
 //!
-//! [`Transformer::load`] builds the weights from [`Hparams`] and the
-//! per-layer [`LayerLayout`]; [`Transformer::forward`] runs the layers over a
-//! batch of tokens against the K/V cache. The burn GPU engine mirrors it
-//! operation for operation and shares the host-side pieces (hyperparameters,
-//! RoPE tables, masks, MoE routing).
+//! [`Transformer::load_placed`] builds the weights from [`Hparams`] and the
+//! per-layer [`LayerLayout`]; [`Transformer::forward_batch`] runs the layers
+//! over the rows of several sequences against their K/V blocks. The burn GPU
+//! engine mirrors it operation for operation and shares the host-side pieces
+//! (hyperparameters, RoPE tables, masks, MoE routing).
 
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
@@ -88,7 +88,7 @@ impl Drop for RowExact {
 enum QMatMul {
     Candle(CandleMatMul),
     /// A Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0 weight read once for all activation
-    /// rows (see [`qmm`]).
+    /// rows (see [`qmm`](super::qmm)).
     RowBatched(QmmWeight),
 }
 

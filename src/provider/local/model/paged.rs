@@ -20,7 +20,7 @@
 //! A full block is named by a hash chain over the token ids it holds
 //! (FNV-1a over the previous block's hash, then the block's 16 ids; the first
 //! block chains from 0), so two sequences with the same token prefix name the
-//! same blocks. [`KvPools::register`] files a sequence's full blocks under
+//! same blocks. [`KvPools::publish`] files a sequence's full blocks under
 //! their hashes; a block whose last reference is released while hashed stays
 //! in the pool as *cached* (an LRU of unreferenced blocks) and is the first
 //! thing an allocation evicts when no free block is left. A block without a
