@@ -62,7 +62,7 @@ impl FileSampling {
     /// Read the defaults from a file's metadata. A value that is missing, not
     /// a number, or outside what [`SamplingConfig`] accepts (a negative or
     /// non-finite temperature, a `top_p` outside `(0, 1]`) is treated as
-    /// absent, so a odd file never fails the load. A `top_k` of zero or less
+    /// absent, so an odd file never fails the load. A `top_k` of zero or less
     /// disables the filter, as in llama.cpp.
     pub(crate) fn from_metadata(md: &HashMap<String, Value>) -> Self {
         let get = |key: &str| md.get(key).and_then(number);

@@ -37,17 +37,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use minijinja::value::{Enumerator, Kwargs, Object, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, Value};
 
-use super::ChatPrompt;
+use super::{ChatPrompt, local_err};
 use crate::error::CucaError;
-use crate::types::ProviderEndpoint;
 
 /// Name under which the template is registered in the environment.
 const TEMPLATE_NAME: &str = "chat";
-
-/// Build a local-provider error.
-fn local_err(message: impl Into<String>) -> CucaError {
-    CucaError::provider(ProviderEndpoint::Local, message)
-}
 
 /// Wrap a minijinja error as a provider error.
 fn template_err(e: Error) -> CucaError {

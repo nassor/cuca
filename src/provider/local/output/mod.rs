@@ -291,30 +291,29 @@ impl OutputParser {
         next_call_id: &mut dyn FnMut() -> String,
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
-        loop {
-            if self.pending.is_empty() {
-                return;
-            }
-            let (valid, invalid_len) = match std::str::from_utf8(&self.pending) {
-                Ok(_) => (self.pending.len(), None),
-                Err(e) => (e.valid_up_to(), Some(e.error_len())),
-            };
-            if valid > 0 {
-                // The prefix is valid UTF-8 by construction; it moves straight
-                // into the hold buffer without an intermediate string.
-                if let Ok(text) = std::str::from_utf8(&self.pending[..valid]) {
+        while !self.pending.is_empty() {
+            let error = match std::str::from_utf8(&self.pending) {
+                Ok(text) => {
                     self.hold.push_str(text);
+                    self.pending.clear();
+                    self.process_hold(next_call_id, out);
+                    return;
                 }
+                Err(e) => e,
+            };
+            let valid = error.valid_up_to();
+            if valid > 0 {
+                self.hold
+                    .push_str(&String::from_utf8_lossy(&self.pending[..valid]));
                 self.pending.drain(..valid);
                 self.process_hold(next_call_id, out);
             }
-            match invalid_len {
-                None | Some(None) => return,
-                Some(Some(n)) => {
-                    self.pending.drain(..n);
-                    self.feed_text("\u{FFFD}", next_call_id, out);
-                }
-            }
+            let Some(invalid) = error.error_len() else {
+                // An incomplete character: wait for the rest of it.
+                return;
+            };
+            self.pending.drain(..invalid);
+            self.feed_text("\u{FFFD}", next_call_id, out);
         }
     }
 
@@ -369,53 +368,42 @@ impl OutputParser {
             };
             match found {
                 Some((pos, len, action)) => {
-                    let before = self.hold[..pos].to_owned();
-                    self.hold.drain(..pos + len);
-                    self.route(before, out);
+                    self.route_hold(pos, out);
+                    self.hold.drain(..len);
                     self.apply(action, next_call_id, out);
                 }
                 None => {
                     let ready_len = self.hold.len() - keep;
-                    if ready_len > 0 {
-                        self.route_hold(ready_len, out);
-                    }
+                    self.route_hold(ready_len, out);
                     return;
                 }
             }
         }
     }
 
-    /// Hand the first `len` bytes of the hold buffer to the current state.
-    /// States that only accumulate text take it by reference; states that emit
-    /// a block take it as that block's string.
+    /// Hand the first `len` bytes of the hold buffer (marker-free text) to the
+    /// current state: a tool-call body or a reasoning header appends it, the
+    /// other states emit it as a block.
     fn route_hold(&mut self, len: usize, out: &mut Vec<Result<MessageContentBlock, CucaError>>) {
-        match &mut self.state {
-            State::ToolCall(body) => {
-                body.push_str(&self.hold[..len]);
-                self.hold.drain(..len);
-            }
-            _ => {
-                let text = self.hold[..len].to_owned();
-                self.hold.drain(..len);
-                self.route(text, out);
-            }
-        }
-    }
-
-    /// Hand marker-free text to the current state.
-    fn route(&mut self, text: String, out: &mut Vec<Result<MessageContentBlock, CucaError>>) {
-        if text.is_empty() {
+        if len == 0 {
             return;
         }
         match &mut self.state {
-            State::Content => self.emit_content(text, out),
-            State::Thinking => self.emit_thinking(text, out),
+            State::ToolCall(body) => body.push_str(&self.hold[..len]),
             State::Header(header) => {
-                header.push_str(&text);
+                header.push_str(&self.hold[..len]);
                 self.resolve_header(false, out);
             }
-            State::ToolCall(body) => body.push_str(&text),
+            State::Content => {
+                let text = self.hold[..len].to_owned();
+                self.emit_content(text, out);
+            }
+            State::Thinking => {
+                let text = self.hold[..len].to_owned();
+                self.emit_thinking(text, out);
+            }
         }
+        self.hold.drain(..len);
     }
 
     /// Carry out a recognised marker.
@@ -468,10 +456,9 @@ impl OutputParser {
         text: String,
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
-        let Some(text) = self.trim_prefix(text) else {
-            return;
-        };
-        self.emit_text_block(text, out);
+        if let Some(text) = self.trim_prefix(text) {
+            out.push(Ok(MessageContentBlock::Text(text)));
+        }
     }
 
     /// Emit reasoning text, dropping prefix whitespace as configured.
@@ -485,13 +472,6 @@ impl OutputParser {
                 reasoning: text,
                 signature: None,
             }));
-        }
-    }
-
-    /// Push a text block unless it is empty.
-    fn emit_text_block(&self, text: String, out: &mut Vec<Result<MessageContentBlock, CucaError>>) {
-        if !text.is_empty() {
-            out.push(Ok(MessageContentBlock::Text(text)));
         }
     }
 

@@ -92,7 +92,7 @@ impl AtemParser {
         }
         let in_thinking = matches!(self.state, State::Thinking);
         if format.is_marker(id) {
-            self.drain(true, next_call_id, out);
+            self.drain(true, out);
             let text = tok.token_text(id);
             let m = &self.markers;
             if text == m.start {
@@ -104,11 +104,11 @@ impl AtemParser {
                 self.end_message(next_call_id, out);
                 self.begin_header();
             } else {
-                self.route(text, next_call_id, out);
+                Self::route(&mut self.state, text, out);
             }
         } else {
             tok.decode_into(id, &mut self.pending);
-            self.drain(false, next_call_id, out);
+            self.drain(false, out);
         }
         if in_thinking || matches!(self.state, State::Thinking) {
             self.reasoning_tokens = self.reasoning_tokens.saturating_add(1);
@@ -117,7 +117,7 @@ impl AtemParser {
 
     /// End of generation: flush undecoded bytes and finish the open message.
     pub(super) fn finish(&mut self, next_call_id: &mut dyn FnMut() -> String, out: &mut Out) {
-        self.drain(true, next_call_id, out);
+        self.drain(true, out);
         self.end_message(next_call_id, out);
         self.begin_header();
     }
@@ -172,45 +172,49 @@ impl AtemParser {
     }
 
     /// Route all complete UTF-8 in `pending` (all of it, lossily, when
-    /// `flush`), keeping an incomplete tail otherwise.
-    fn drain(&mut self, flush: bool, next_call_id: &mut dyn FnMut() -> String, out: &mut Out) {
-        while !self.pending.is_empty() {
-            match std::str::from_utf8(&self.pending) {
+    /// `flush`), keeping an incomplete tail otherwise. An invalid sequence
+    /// becomes U+FFFD.
+    fn drain(&mut self, flush: bool, out: &mut Out) {
+        let mut done = 0;
+        while done < self.pending.len() {
+            let rest = &self.pending[done..];
+            let error = match std::str::from_utf8(rest) {
                 Ok(text) => {
-                    let text = text.to_owned();
-                    self.pending.clear();
-                    self.route(&text, next_call_id, out);
+                    Self::route(&mut self.state, text, out);
+                    done = self.pending.len();
+                    break;
                 }
-                Err(e) => {
-                    let valid = e.valid_up_to();
-                    if valid > 0 {
-                        let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
-                        self.pending.drain(..valid);
-                        self.route(&text, next_call_id, out);
-                    }
-                    match e.error_len() {
-                        Some(n) => {
-                            self.pending.drain(..n);
-                            self.route("\u{FFFD}", next_call_id, out);
-                        }
-                        None if flush => {
-                            let text = String::from_utf8_lossy(&self.pending).into_owned();
-                            self.pending.clear();
-                            self.route(&text, next_call_id, out);
-                        }
-                        None => return,
-                    }
+                Err(e) => e,
+            };
+            let valid = error.valid_up_to();
+            Self::route(
+                &mut self.state,
+                &String::from_utf8_lossy(&rest[..valid]),
+                out,
+            );
+            done += valid;
+            match error.error_len() {
+                Some(n) => {
+                    done += n;
+                    Self::route(&mut self.state, "\u{FFFD}", out);
                 }
+                None if flush => {
+                    let text = String::from_utf8_lossy(&self.pending[done..]);
+                    Self::route(&mut self.state, &text, out);
+                    done = self.pending.len();
+                }
+                None => break,
             }
         }
+        self.pending.drain(..done);
     }
 
     /// Hand text to the current message.
-    fn route(&mut self, text: &str, _next_call_id: &mut dyn FnMut() -> String, out: &mut Out) {
+    fn route(state: &mut State, text: &str, out: &mut Out) {
         if text.is_empty() {
             return;
         }
-        match &mut self.state {
+        match state {
             State::Header(header) => header.push_str(text),
             State::Call(body) => body.push_str(text),
             State::Thinking => out.push(Ok(MessageContentBlock::Thinking {

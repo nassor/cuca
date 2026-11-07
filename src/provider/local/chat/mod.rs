@@ -5,11 +5,14 @@
 //! [`ChatTemplate`] renders that through minijinja, and [`ChatFormat`] derives
 //! from the GGUF what the output side needs: end-of-generation ids, reasoning
 //! markers and the tool-call syntax. The template ships inside the GGUF
-//! (`tokenizer.chat_template`); its text is never modified here (beyond
-//! neutralising HuggingFace's no-output `{% generation %}` tags). Two
-//! deliberate differences from the OpenAI wire mapping: tool-call `arguments`
-//! stay JSON objects (templates reject strings), and `ImageBase64` blocks are
-//! refused because the engine is text-only.
+//! (`tokenizer.chat_template`) unless the caller overrides it
+//! (`LocalModelConfig::chat_template`); either may be a bare llama.cpp
+//! template name, which [`expand_template_name`] turns into Jinja. Its text is
+//! never modified here (beyond neutralising HuggingFace's no-output
+//! `{% generation %}` tags). Two deliberate differences from the OpenAI wire
+//! mapping: tool-call `arguments` stay JSON objects (templates reject
+//! strings), and `ImageBase64` blocks are refused because the engine is
+//! text-only.
 
 mod builtin;
 mod format;

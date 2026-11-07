@@ -4,8 +4,8 @@
 //! temperature scaling, top-k, softmax, top-p (nucleus), then a single draw
 //! from a seedable [`SplitMix64`] generator. Temperature `<= 0` selects the
 //! argmax (first maximum wins). Candidates are built in a caller-owned
-//! [`Scratch`], so sampling a token allocates nothing once it has grown to the
-//! vocabulary size.
+//! [`Scratch`], so sampling a token allocates nothing once it has grown to
+//! `2 * top_k` (with `top_k`) or the vocabulary size (without).
 
 use std::cmp::Ordering;
 use std::collections::hash_map::RandomState;
@@ -39,8 +39,9 @@ pub(crate) fn random_seed() -> u64 {
     RandomState::new().hash_one(SystemTime::now())
 }
 
-/// Index of the first maximum of `logits` (0 for an empty slice).
-fn argmax(logits: &[f32]) -> u32 {
+/// Index of the first maximum of `logits` (0 for an empty slice): the greedy
+/// choice.
+pub(crate) fn greedy(logits: &[f32]) -> u32 {
     let mut best = 0usize;
     let mut best_value = f32::NEG_INFINITY;
     for (i, &v) in logits.iter().enumerate() {
@@ -52,7 +53,8 @@ fn argmax(logits: &[f32]) -> u32 {
     best as u32
 }
 
-/// Descending order on `(logit, id)`; NaN logits sort last.
+/// Descending total order on `(logit, id)`, equal logits by ascending id
+/// (so no two distinct candidates compare equal).
 fn by_logit_desc(a: &(f32, u32), b: &(f32, u32)) -> Ordering {
     b.0.total_cmp(&a.0).then(a.1.cmp(&b.1))
 }
@@ -69,15 +71,14 @@ pub(crate) struct Dist {
 }
 
 /// Reusable candidate buffer for [`sample`] and [`Dist::warp`]: it keeps its
-/// capacity (up to the vocabulary size) between tokens.
+/// capacity between tokens.
 #[derive(Debug, Default)]
 pub(crate) struct Scratch(Vec<(f32, u32)>);
 
 impl Dist {
     /// Warp `logits` (scaled in place by `temperature`): top-k, softmax,
     /// top-p. `temperature` must be positive. The returned distribution owns
-    /// only the surviving candidates; `scratch` keeps the full-vocabulary
-    /// working buffer.
+    /// only the surviving candidates; `scratch` keeps the working buffer.
     pub(crate) fn warp(
         logits: &mut [f32],
         temperature: f32,
@@ -150,11 +151,11 @@ const NUCLEUS_FIRST: usize = 256;
 /// first; without one (whole vocabulary, `top_p >= 1`) they stay in
 /// vocabulary order, which [`sample`] and [`Dist`] do not depend on.
 ///
-/// With `top_k` set, the `top_k` best are selected and sorted. Without it the
-/// vocabulary is never sorted: the softmax runs over every logit, and a top-p
-/// cut ranks only the best [`NUCLEUS_FIRST`] (widening while their mass falls
-/// short of `top_p`), so the probabilities stay those of the full
-/// distribution.
+/// With `top_k` set, only the `top_k` best are kept ([`select_top_k`]) and
+/// sorted. Without it the vocabulary is never sorted: the softmax runs over
+/// every logit, and a top-p cut ranks only the best [`NUCLEUS_FIRST`]
+/// (widening while their mass falls short of `top_p`), so the probabilities
+/// stay those of the full distribution.
 fn warp_candidates(
     logits: &mut [f32],
     temperature: f32,
@@ -162,16 +163,9 @@ fn warp_candidates(
     top_p: f32,
     candidates: &mut Vec<(f32, u32)>,
 ) {
-    for l in logits.iter_mut() {
-        *l /= temperature;
-    }
-
     candidates.clear();
-    candidates.extend(logits.iter().enumerate().map(|(i, &l)| (l, i as u32)));
-    if top_k > 0 && top_k < candidates.len() {
-        candidates.select_nth_unstable_by(top_k - 1, by_logit_desc);
-        candidates.truncate(top_k);
-        candidates.sort_unstable_by(by_logit_desc);
+    if top_k > 0 && top_k < logits.len() {
+        select_top_k(logits, temperature, top_k, candidates);
         let max = candidates[0].0;
         let mut sum = 0.0f32;
         for c in candidates.iter_mut() {
@@ -185,14 +179,23 @@ fn warp_candidates(
         return;
     }
 
+    candidates.extend(logits.iter_mut().enumerate().map(|(i, l)| {
+        *l /= temperature;
+        (*l, i as u32)
+    }));
     let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
     if top_p >= 1.0 {
+        let mut sum = 0.0f32;
         for c in candidates.iter_mut() {
-            c.0 = (c.0 - max).exp() / sum;
+            c.0 = (c.0 - max).exp();
+            sum += c.0;
+        }
+        for c in candidates.iter_mut() {
+            c.0 /= sum;
         }
         return;
     }
+    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
     let v = candidates.len();
     let mut m = NUCLEUS_FIRST.min(v);
     loop {
@@ -215,6 +218,41 @@ fn warp_candidates(
         c.0 = (c.0 - max).exp() / sum;
     }
     cut_top_p(candidates, top_p);
+}
+
+/// Scale `logits` in place by `temperature` and leave the `top_k` best
+/// `(logit, id)` pairs in `candidates`, best first (`0 < top_k <
+/// logits.len()`). One pass: a pair that sorts after the `top_k`-th best seen
+/// so far can never make the cut and is not stored; the buffer is cut back to
+/// `top_k` by a selection each time it reaches `2 * top_k`. [`by_logit_desc`]
+/// is total, so the survivors are exactly those of a full sort.
+fn select_top_k(
+    logits: &mut [f32],
+    temperature: f32,
+    top_k: usize,
+    candidates: &mut Vec<(f32, u32)>,
+) {
+    let limit = 2 * top_k;
+    candidates.reserve(limit.min(logits.len()));
+    let mut kth: Option<(f32, u32)> = None;
+    for (i, l) in logits.iter_mut().enumerate() {
+        *l /= temperature;
+        let pair = (*l, i as u32);
+        if kth.is_some_and(|k| by_logit_desc(&pair, &k) == Ordering::Greater) {
+            continue;
+        }
+        candidates.push(pair);
+        if candidates.len() == limit {
+            candidates.select_nth_unstable_by(top_k - 1, by_logit_desc);
+            candidates.truncate(top_k);
+            kth = Some(candidates[top_k - 1]);
+        }
+    }
+    if candidates.len() > top_k {
+        candidates.select_nth_unstable_by(top_k - 1, by_logit_desc);
+        candidates.truncate(top_k);
+    }
+    candidates.sort_unstable_by(by_logit_desc);
 }
 
 /// Keep the shortest prefix of `candidates` (most likely first) whose
@@ -248,7 +286,7 @@ pub(crate) fn sample(
     scratch: &mut Scratch,
 ) -> u32 {
     if temperature <= 0.0 || logits.len() <= 1 {
-        return argmax(logits);
+        return greedy(logits);
     }
     let candidates = &mut scratch.0;
     warp_candidates(logits, temperature, top_k, top_p, candidates);
@@ -262,11 +300,6 @@ pub(crate) fn sample(
         }
     }
     candidates[candidates.len() - 1].1
-}
-
-/// Index of the first maximum of `logits` (the greedy choice).
-pub(crate) fn greedy(logits: &[f32]) -> u32 {
-    argmax(logits)
 }
 
 /// The greedy choice of `logits` (as [`greedy`]) and its probability under a
@@ -507,6 +540,26 @@ mod tests {
                     assert!((p - q).abs() <= 1e-5 * q, "{id}: {p} vs {q}");
                 }
             }
+        }
+    }
+
+    /// With `top_k` the warper keeps exactly the `top_k` best of a full sort,
+    /// in order, among many equal logits too (they break by ascending id) and
+    /// for every `top_k` (small ones cut the buffer back many times).
+    #[test]
+    fn top_k_selection_matches_full_sort() {
+        let mut rng = SplitMix64(23);
+        let logits: Vec<f32> = (0..1000).map(|_| (rng.next_f32() * 16.0).floor()).collect();
+        let mut full: Vec<(f32, u32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(i, &l)| (l, i as u32))
+            .collect();
+        full.sort_unstable_by(by_logit_desc);
+        for top_k in [1, 2, 7, 40, 333, 999] {
+            let mut got = Vec::new();
+            select_top_k(&mut logits.clone(), 1.0, top_k, &mut got);
+            assert_eq!(got, full[..top_k], "top_k {top_k}");
         }
     }
 }

@@ -117,7 +117,7 @@ enum Fragment<'a> {
     Special(u32),
 }
 
-/// Special token ids and BOS/EOS flags, before the tokenizer is assembled.
+/// BOS/EOS ids and flags, before the tokenizer is assembled.
 #[derive(Debug, Clone, Copy, Default)]
 struct Config {
     /// Beginning-of-sequence id.
@@ -130,13 +130,6 @@ struct Config {
     add_eos: bool,
 }
 
-/// A special token.
-#[derive(Debug, Clone, Copy)]
-struct Special {
-    /// Token id.
-    id: u32,
-}
-
 /// A tokenizer built from GGUF metadata.
 #[derive(Clone)]
 pub(crate) struct Tokenizer {
@@ -144,8 +137,9 @@ pub(crate) struct Tokenizer {
     vocab: Vocab,
     /// The encoding scheme.
     engine: Engine,
-    /// Special tokens with their strip attributes, longest text first.
-    specials: Vec<Special>,
+    /// Ids of the special tokens (control, user-defined and unknown types),
+    /// longest text first.
+    specials: Vec<u32>,
     /// Ids and BOS/EOS flags.
     config: Config,
 }
@@ -385,7 +379,7 @@ impl Tokenizer {
 
     /// Collect the special tokens and finish construction.
     fn assemble(vocab: Vocab, engine: Engine, config: Config) -> Self {
-        let mut specials: Vec<Special> = (0..vocab.len() as u32)
+        let mut specials: Vec<u32> = (0..vocab.len() as u32)
             .filter(|&id| {
                 !vocab.piece(id).is_empty()
                     && matches!(
@@ -393,14 +387,13 @@ impl Tokenizer {
                         Some(TYPE_CONTROL | TYPE_USER_DEFINED | TYPE_UNKNOWN)
                     )
             })
-            .map(|id| Special { id })
             .collect();
-        specials.sort_by(|a, b| {
+        specials.sort_by(|&a, &b| {
             vocab
-                .piece(b.id)
+                .piece(b)
                 .len()
-                .cmp(&vocab.piece(a.id).len())
-                .then(a.id.cmp(&b.id))
+                .cmp(&vocab.piece(a).len())
+                .then(a.cmp(&b))
         });
         Self {
             vocab,
@@ -516,7 +509,7 @@ impl Tokenizer {
             pairs[key >> 6] |= 1 << (key & 63);
         }
         let mut next: Vec<Fragment<'a>> = Vec::new();
-        for &Special { id } in &self.specials {
+        for &id in &self.specials {
             let special = self.vocab.piece(id);
             let sb = special.as_bytes();
             let Some(&lead) = sb.first() else {
