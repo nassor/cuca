@@ -60,10 +60,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 A DFlash drafter proposes a whole block of tokens in one pass instead of one pass per token. `DrafterSource::File` takes either the GGUF llama.cpp's converter writes (`dflash-Muse-Glimmer-30B-Q4_0.gguf` in `ggml-org/Muse-Glimmer-30B-GGUF`, as `repo:revision:file`) or the safetensors checkpoint `meta-models/Muse-Glimmer-30B-assistant:c676cce91658f9568aaf264a416211e2782735b7` as a `ModelSource::Checkpoint`, converted at `LocalModelConfig::convert.quant` (about 1.4 GB at `q4_0`, 2.7 GB at the default `q8_0`; the converter writes the same tensors and keys as llama.cpp, without the target's vocabulary).
 
 - It reads the residual stream after five target layers (the outputs of layers 1, 13, 25, 37 and 49 of 52; the file stores llama.cpp's `target_layers` `[2, 14, 26, 38, 50]`, the inputs of the next layer) at every accepted position, and keeps its own K/V of them: a ring of the last 2,048 positions, 82 MB, whatever the context length.
-- A round runs five sliding-window layers once over a block of `1 + draft_tokens` rows (at most 16: the pending token and mask tokens, embedded with the target's raw table; the rows attend to each other in both directions and to the context) and ranks them with the target's LM head, logit multiplier and soft-cap included. The cost is one pass per round, not per draft, and the engine's cost model prices it that way. `draft_tokens` therefore also sets the block length; the DFlash paper (Table 8) measures 6.33 against 5.09 average accepted tokens for blocks of 16 against 8.
+- A round runs five sliding-window layers once over a block of `1 + draft_tokens` rows (at most 16: the pending token and mask tokens, embedded with the target's raw table; the rows attend to each other in both directions and to the context) and ranks them with the target's LM head, logit multiplier and soft-cap included (through a Q8_0 copy of the head when the target's head is a K-quant: see *Measured speedups*). The cost is one pass per round, not per draft, and the engine's cost model prices it that way; it prices the drafts by the acceptance it has observed (`rho^j`) rather than by the drafter's confidence, which is flat on the mask rows. `draft_tokens` therefore also sets the block length; the DFlash paper (Table 8) measures 6.33 against 5.09 average accepted tokens for blocks of 16 against 8.
 - It is CPU only and observes every position of one sequence, so the engine runs one request at a time. The context cache follows the trunk's prefix reuse, truncation and failed requests; a gap in it costs proposal quality, never output.
-- Published numbers, not measured here: average accepted length 4.35 to 7.84 on Qwen3-4B (paper Table 1, H200), 2.4 to 5.0 for `RedHatAI/Mistral-Small-4-119B-2603.dflash` at seven drafts, and for Muse Glimmer 30B 3.1x on an RTX 5090 (llama.cpp), 1.5x and 1.8x on Apple M4 and M5 Max (the assistant's model card).
-- Verified by unit tests (greedy output equals plain for several blocks, windows and caps; warm equals cold; failed-request recovery; a plain-loop reference of the block) and, with `CUCA_LOCAL_DFLASH_REF`, by a transformers oracle on a tiny checkpoint (max |dlogit| below 2e-4, equal drafts); the live Muse run is `tests/provider_local_mtp.rs` with `CUCA_LOCAL_MODEL=muse-glimmer-30b-q4_0 CUCA_LOCAL_DRAFTER=meta-models/Muse-Glimmer-30B-assistant:c676cce91658f9568aaf264a416211e2782735b7 CUCA_LOCAL_DRAFT_TOKENS=5,7,15`.
+- Published numbers (not reproduced here, except the last): average accepted length 4.35 to 7.84 on Qwen3-4B (paper Table 1, H200), 2.4 to 5.0 for `RedHatAI/Mistral-Small-4-119B-2603.dflash` at seven drafts, and for Muse Glimmer 30B 3.1x on an RTX 5090 (llama.cpp), 1.5x and 1.8x on Apple M4 and M5 Max (the assistant's model card); measured on the CPU of this project: 3.1 to 3.9 tokens per drafting round and 1.15x to 1.47x.
+- Verified by unit tests (greedy output equals plain for several blocks, windows and caps; warm equals cold; failed-request recovery; a plain-loop reference of the block; the Q8_0 copy of a K-quant head against the original) and, with `CUCA_LOCAL_DFLASH_REF`, by a transformers oracle on a tiny checkpoint (max |dlogit| below 2e-4, equal drafts); the live Muse run is `tests/provider_local_mtp.rs` with `CUCA_LOCAL_MODEL=muse-glimmer-30b-q4_0 CUCA_LOCAL_DRAFTER=muse-glimmer-30b-dflash-q4_0 CUCA_LOCAL_DRAFT_TOKENS=3,7,15`, 1.46x, 1.47x and 1.15x (see *Measured speedups*).
 
 ### Governor
 
@@ -82,6 +82,49 @@ Speedup is speculative throughput over plain decoding on the same device, in rel
 - Gemma 4 E2B Q4_0 with `gemma4-e2b-mtp-f16`: on the CPU 1.32x on a code prompt, 1.31x on a list and 1.01x on prose; on Vulkan 0.97x to 1.00x, because single-token GPU decoding is bound by the host and the governor keeps the run near plain decoding. The drafter pays on the CPU.
 - Qwen 3.5 0.8B Q8_0 with the in-trunk head, CPU: 1.59x on code, 1.40x on a list and 0.98x on prose; with `draft_tokens` 3, 1.86x, 1.37x and 0.99x. Prose text is hard to predict, so the governor mostly turns drafting off there.
 
+#### EAGLE on Mistral Small 4 (CPU)
+
+`mistral-small-4-119b-q4_0` with the EAGLE drafter, release build with `-C target-cpu=native`, 128-token replies, three prompts, `tests/provider_local_mtp.rs` (plain 11.7 tok/s; greedy output equal to plain in all twelve runs):
+
+| `draft_tokens` | code | list | prose | all three | drafts accepted | drafting rounds |
+|---|---|---|---|---|---|---|
+| 1 | 0.96x | 0.81x | 0.85x | 0.87x | 76 % (31 of 41) | 41 |
+| 2 | 0.95x | 0.87x | 0.85x | 0.89x | 90 % (156 of 173) | 106 |
+| 3 | 0.94x | 0.83x | 0.85x | 0.87x | 92 % (129 of 141) | 66 |
+| 4 | 0.91x | 0.84x | 0.84x | 0.86x | 88 % (126 of 143) | 62 |
+
+Two further runs at `draft_tokens` 2 (one with the round trace) measured 1.05x and 0.98x on code, 0.98x and 0.95x on the list and 0.97x on the story: run to run the same prompt moves by about 10 %. The drafter does not pay on this CPU, for these reasons (measured per round with the trace, `draft_tokens` 2):
+
+- A verification forward over one row takes 90 ms (11 tok/s); over 2 rows 153 ms and over 3 rows 201 ms. The model is mixture-of-experts with 4 of 128 experts per token, and every row routes to its own experts, so extra rows share no expert weights: each costs 48 to 63 ms, 53 to 70 % of a decode step, where a dense model's extra row costs a few percent.
+- A draft pass costs 15 ms (two layers and the vocabulary ranking). By the engine's cost model a first extra draft pays only above an acceptance of about 0.74 (the 55 ms of its row plus the 15 ms pass against a 95 ms token), and the governor drafts only then.
+- The drafter must also take every committed position into its own cache, 4.4 ms per token (5 %), plain rounds included, so a prompt where the governor drafts nothing (the list and the story) runs below plain decoding: 0.95x to 0.98x in the traced runs, 0.81x to 0.87x in the four-length run above, whose extra slowdown the trace does not explain (the same engine and prompts, measured an hour apart on a machine whose memory also misbehaved: see the machine note).
+- Over the traced run a round that kept two drafts averaged 2.85 tokens (92 % of the drafts accepted) and the drafting rounds together 2.5, against 2.0 to 2.3 in community SGLang runs. At 237 ms for 2.85 tokens that is 83 ms a token against 90 ms plain, a 1.08x round before the 4.4 ms of upkeep and the rounds that keep a single draft (186 ms for 1.77 tokens, slower than plain), which bring the run back to about 1.0x.
+- The 65,536-id proposal cap of the in-trunk head does nothing here: it only shortens the product on weights the row-batched kernel serves, and this model's output head is Q6_K (candle computes the whole product). A draft pass measured 14.9 ms with the cap and 15.1 ms without.
+
+#### DFlash on Muse Glimmer 30B (CPU)
+
+`muse-glimmer-30b-q4_0` with `muse-glimmer-30b-dflash-q4_0`, same conditions (plain 3.4 tok/s; greedy output equal to plain in all runs of every row below):
+
+| `draft_tokens` | code | list | prose | all three | accepted | tokens per drafting round |
+|---|---|---|---|---|---|---|
+| 3, first version | 1.38x | 1.32x | 0.98x | 1.20x | 90 % | 1.9 |
+| 7, first version | 1.01x | 1.00x | 0.97x | 1.00x | 92 % | 2.0 |
+| 15, first version | 0.97x | 0.97x | 0.97x | 0.97x | 62 % | |
+| 3 | 1.74x | 1.69x | 1.12x | 1.46x | 70 % (424 of 607) | 3.1 |
+| 7 | 1.64x | 1.66x | 1.20x | 1.47x | 69 % (425 of 617) | 3.2 |
+| 15 | 1.18x | 1.14x | 1.15x | 1.15x | 64 % (324 of 506) | 3.9 |
+
+The first-version rows are the engine before two changes that only affect which tokens are proposed and how many are verified, never the output:
+
+- **Ranking through a Q8_0 copy of the head.** The block's rows go through the target's LM head, which in this file is Q6_K (1.1 GB, 202,048 rows). candle's kernel for K-quants reads the whole head once per row, 24 ms a row: 194 ms for a block of 7 and 404 ms for a block of 15, a pass that should have cost a fraction of a plain token (287 ms). The drafter now ranks through a Q8_0 copy of the head (1.4 GB, built when it opens) that the row-batched kernel reads once for all rows: 65 ms a round at `draft_tokens` 3 and 7, 206 ms at 15.
+- **Pricing drafts by observed acceptance.** The keep rule priced draft `j` by the drafter's own chained confidence, which on a block drafter's mask rows is flat while the drafts are right about nine times in ten; every round kept one draft (336 drafted in 332 rounds at `draft_tokens` 3). Block drafters now price draft `j` as `rho^j`, `rho` the accepted fraction of the drafts judged over the last twenty rounds, and a round keeps three drafts where they pay.
+
+Cost per round now (milliseconds, medians over the run): one plain token 287 forward; 2 rows 352, 4 rows 457, 8 rows 853, 16 rows 1,667 to verify (65 ms an extra row for the first rows, 80 to 92 for 8 to 16); at 3 drafts 63 for the draft pass, 456 for the verification, 525 for the round, 3.1 tokens, 170 ms a token (1.7x a plain token). With the head copy alone (the old keep rule) the three rows read 1.22x, 1.12x and 0.98x. The prose prompt stays at 1.12 to 1.20x: its drafts are accepted less often. For comparison the paper reports 4.35 to 7.84 accepted tokens per round on Qwen3-4B, `RedHatAI/Mistral-Small-4-119B-2603.dflash` 2.4 to 5.0 at seven drafts, and the assistant's model card 3.1x on an RTX 5090 and 1.5x on an Apple M4 Max; 1.5x on this CPU matches the last. At `draft_tokens` 15 the block pass alone costs 206 ms and a 16-row verification 1.7 s, so the rule keeps 4.6 drafts on average and the run reaches 1.15x.
+
+#### Machine note
+
+Two loads of the same 67.7 GB `mistral-small-4-119b-q4_0` file on the measurement machine sometimes differ by one bit in one tensor (5 of 579 tensors across three loads of one run, found by hashing each tensor after `read_exact` and again after an independent positional re-read), which moves first-token logits by up to 1 %. The read paths are audited and tested; a ten-minute RAM and file-read probe did not reproduce it, so hardware or OS memory is suspected. `tests/provider_local_mtp.rs` loads the plain and the speculative model separately, so on that machine a mismatch between them has to be repeated before it is believed: speculative output was equal to plain in all twelve runs of the table above, and different in one extra run, whose plain model alone produced a story that the six other loads whose stories were compared all agreed on.
+
 ### Verified
 
-`tests/provider_local_mtp.rs` loads a target alone and with its drafter and compares greedy output. It asserts identical output and token counts on the CPU, and reports identity without asserting it on a GPU. Recorded CPU runs matched plain greedy decoding for the Gemma 4 E2B pair and for the Qwen 3.5 in-trunk head, and recorded Vulkan runs of the Gemma 4 pair produced identical output.
+`tests/provider_local_mtp.rs` loads a target alone, records its greedy outputs (cold and warm, which must agree), drops it, and then loads the target once per draft length with its drafter and compares greedy output (one resident copy at a time, so a target that fills the machine's memory is never held twice). It asserts identical output and token counts on the CPU, and reports identity without asserting it on a GPU. Recorded CPU runs matched plain greedy decoding for the Gemma 4 E2B pair, the Qwen 3.5 in-trunk head, the Mistral Small 4 EAGLE drafter (draft lengths 1 to 4) and the Muse Glimmer DFlash drafter (3, 7 and 15), and recorded Vulkan runs of the Gemma 4 pair produced identical output.
