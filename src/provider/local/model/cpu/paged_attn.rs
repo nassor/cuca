@@ -19,7 +19,7 @@
 //! batched (non-exact) path, which multiplies it with candle's matmul.
 
 use super::super::paged::{BLOCK_SIZE, NO_BLOCK};
-use super::super::pool::par_chunks;
+use super::super::pool::par_chunks_with;
 
 /// The geometry of one layer's pools.
 #[derive(Clone, Copy)]
@@ -103,9 +103,11 @@ impl Values<'_> {
 }
 
 /// One query head over the keys `lo..hi`: `q` is its `head_dim` query values,
-/// `kvh` the KV head it reads, `acc` is its zeroed output (the value width),
-/// which holds the running weighted sum and ends as the result. The ranges
-/// were checked by [`check_range`].
+/// `kvh` the KV head it reads, `acc` the caller's scratch (the value width)
+/// that holds the running weighted sum, `out` receives the result, written
+/// once at the end: summing in `out` itself would make every worker rewrite a
+/// cache line it shares with the next head's piece. The ranges were checked
+/// by [`check_range`].
 #[expect(
     clippy::too_many_arguments,
     reason = "one attention head's inputs; a struct would only rename them"
@@ -121,8 +123,10 @@ fn attend_head(
     shape: PoolShape,
     scale: f32,
     acc: &mut [f32],
+    out: &mut [f32],
 ) {
     let d = shape.head_dim;
+    acc.fill(0.0);
     let mut max = f32::NEG_INFINITY;
     let mut sum = 0f32;
     let mut scores = [0f32; BLOCK_SIZE];
@@ -131,7 +135,6 @@ fn attend_head(
         let end = hi.min((pos / BLOCK_SIZE + 1) * BLOCK_SIZE);
         let n = end - pos;
         let Some(first) = row_offset(table, pos, kvh, shape) else {
-            acc.fill(0.0);
             return;
         };
         let mut block_max = f32::NEG_INFINITY;
@@ -166,8 +169,8 @@ fn attend_head(
         }
         pos = end;
     }
-    for a in acc.iter_mut() {
-        *a /= sum;
+    for (o, a) in out.iter_mut().zip(acc.iter()) {
+        *o = a / sum;
     }
 }
 
@@ -280,22 +283,28 @@ fn attend_rows(
     let vw = values.width(d);
     let group = n_head / n_kv_head;
     let mut out = vec![0f32; t * n_head * vw];
-    par_chunks(&mut out, vw, |job, slot| {
-        let (row, head) = (job / n_head, job % n_head);
-        let (lo, hi) = range(row);
-        attend_head(
-            &q[job * d..(job + 1) * d],
-            head / group,
-            table,
-            lo,
-            hi,
-            pool_k,
-            values,
-            shape,
-            scale,
-            slot,
-        );
-    });
+    par_chunks_with(
+        &mut out,
+        vw,
+        || vec![0f32; vw],
+        |acc, job, slot| {
+            let (row, head) = (job / n_head, job % n_head);
+            let (lo, hi) = range(row);
+            attend_head(
+                &q[job * d..(job + 1) * d],
+                head / group,
+                table,
+                lo,
+                hi,
+                pool_k,
+                values,
+                shape,
+                scale,
+                acc,
+                slot,
+            );
+        },
+    );
     Ok(out)
 }
 
