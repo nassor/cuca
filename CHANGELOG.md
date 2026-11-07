@@ -4,153 +4,205 @@
 
 ### Added
 
-- `provider-local`: the Mistral Small 4 EAGLE drafter (`mistralai/Mistral-Small-4-119B-2603-eagle`, architecture `mistral4-eagle`) as `DrafterSource::File` with a checkpoint source, on the CPU. The converter reads the Mistral-format files (`params.json` mapped as Mistral's own `convert_mistral4_weight_to_hf.py` does, FP8 `consolidated.safetensors` with per-tensor `qscale_weight`) to a GGUF at `convert.quant`; the drafter is two latent-attention layers over a dense FFN on `fc(cat(embed(t[j+1]), h[j]))` with the target's embedding and LM head and a K/V cache of its own. Verified against a transformers `Mistral4Model` on a tiny FP8 checkpoint (max abs logit difference 3.2e-4 over a four-step chain, 1.2e-5 per teacher-forced step, with negative controls for the concatenation order, the Llama 4 query scaling and the RoPE position), and speculative output equals plain greedy in the engine tests. Mistral publishes no acceptance figure; community SGLang runs report accept lengths of 2.0 to 2.3, and the CPU run measured 2.5 tokens per drafting round (2.85 where two drafts are kept). Measured on `mistral-small-4-119b-q4_0` (CPU, three 128-token replies, `draft_tokens` 1 to 4): speculative output equal to plain in all twelve runs, but 0.86x to 0.89x of plain decoding (11.7 tok/s): every verification row of this mixture-of-experts model routes to its own experts, so an extra row costs 55 ms (53 to 70 % of a decode step), a draft pass costs 15 ms and the drafter's upkeep adds 4.4 ms to every plain token; only code (92 to 97 % of drafts accepted) reaches 0.95x to 1.05x. The in-trunk head's 65,536-row ranking cap does nothing for it (its Q6_K head computes whole products).
-- `provider-local`: a DFlash block-diffusion drafter (`dflash` GGUF, Muse Glimmer 30B's `meta-models/Muse-Glimmer-30B-assistant`, pinned revision `c676cce91658f9568aaf264a416211e2782735b7`, or the preset `muse-glimmer-30b-dflash-q4_0`, llama.cpp's `dflash-Muse-Glimmer-30B-Q4_0.gguf`; llama.cpp's other `dflash-*.gguf` files load too). `DrafterSource::File` proposes a block of up to 15 tokens in one pass from the target's hidden features at five layers (`Hidden::Layers`, a row-exact capture that leaves the logits' bits alone), with its own 2,048-position K/V ring (`model/cpu/dflash.rs`), CPU only, one sequence like the in-trunk head. The engine prices such a drafter per round (`take_block_draft`, `Round::draft_passes`) and, for a block drafter, prices draft `j` by the observed per-draft acceptance to the power `j` (`CostModel::block_acceptance`) instead of the drafter's chained confidence, which is flat on the mask rows and had cut every round to one draft. The block is ranked through a Q8_0 copy of a K-quant LM head (`QMatMul::proposal_copy`, 1.4 GB for Muse) because candle's per-row K-quant kernel read the 1.1 GB head once per block row (194 ms for 7 drafts, 65 ms with the copy). The converter (`convert/dflash.rs`) writes llama.cpp's layout from the safetensors checkpoint at the chosen precision. Checked against transformers on a tiny checkpoint (max |dlogit| 8.6e-5 over three incremental rounds, equal drafts; negative controls for the layer convention, the embedding norm and the window fail loudly). Measured on the CPU (Muse Glimmer 30B Q4_0, plain 3.4 tok/s, three 128-token replies): speculative output equal to plain in all nine runs, 1.46x, 1.47x and 1.15x at `draft_tokens` 3, 7 and 15 (1.7x on code and lists; 1.20x, 1.00x and 0.97x before the two changes above), 3.1 to 3.9 tokens per drafting round.
-- `provider-local`: the CPU row-batched quantized matmul (`model/qmm.rs`) now serves Q4_1, Q5_0 and Q5_1 as well as Q4_0 and Q8_0, MoE experts and tiered experts included. Activations are quantised as ggml pairs them (Q8_0, or Q8_1 with its sum term for Q4_1 and Q5_1); a row's result is bit-identical alone or in any batch, and Q4_1/Q5_0/Q5_1 run 2-4x faster than candle's per-row kernel at m >= 4. The K-quants (Q2_K to Q6_K) and every other dtype stay on candle's per-row kernel (also row independent): on the Ryzen 9 9950X3D2 (96 MB L3) candle's K-quant prefill is already at parity with Q4_0's (`phi4-mini-q4_k_m` against `phi4-mini-q4_0`), and a row-batched safe-Rust K-quant kernel (Q8_K activations) was 2-3x slower than candle's at m = 1, so it was deleted; a dtype is never dispatched to different kernels by m, because a row's bits must not depend on the batch size. Tests: every served dtype against dequantise-then-f64 (tolerance from the activation rounding) and candle, a batch-invariance test per dtype, and tiny models mixing every dtype (`tiny::mix_dtypes`: K-quants on candle, the rest on the kernel) for batched == solo, chunked == token by token, tiered == resident, speculative == plain and warm == cold.
-- `provider-local`: llama.cpp's named chat templates `mistral-v7` and `mistral-v7-tekken` (what its converter writes for Mistral Small 3.0/3.1 and Devstral Small 2505 checkpoints, rendered in C++ by llama.cpp) are expanded to equivalent Jinja at load, from `tokenizer.chat_template` or `LocalModelConfig::chat_template`. The port follows `llm_chat_apply_template` exactly (system message in place, any other role as an assistant turn, no BOS, no generation prompt, tools ignored) and equals llama.cpp's expected output in `test-chat-template.cpp` and `mistral_common`'s Tekken v7 rendering on six conversations. Any other bare name is a load error naming the supported ones (no pre-2025 name is added). The checkpoint converter accepts v7 `tekken.json` files (no `special_tokens` list: mistral_common's 20 defaults) and writes the name, as llama.cpp does: 0 differences against the pinned converter on a 2-layer Mistral Small 3.1 truncation; the vocabulary encodes the 1,536-text corpus like `mistral_common`.
-- `provider-local`: `ministral3-3b-instruct-q4_0` pins the repository's current `chat_template.jinja` (`mistralai/Ministral-3-3B-Instruct-2512` at `b35d4dfe`) instead of the embedded December 2025 template; 44 byte-compared jinja2 cases, live matrix: every applicable scenario passes (the two reasoning ones skip).
-- `provider-local`: `LocalModelConfig::chat_template` replaces the GGUF's chat template (llama.cpp's `--chat-template-file`, vLLM's `--chat-template`); the reasoning markers, tool syntax, end-of-turn tokens and the `enable_thinking`/`reasoning_effort`/`reasoning_strength` variables follow it, and a template that does not compile or cannot render a one-message conversation fails `LocalModel::load` with `CucaError::Config`. A preset can pin one: `ModelPreset::template` (`PresetTemplate { repo, revision, file, sha256 }`, downloaded and verified like a model file; `ModelSource::HuggingFace` gains `template: Option<Box<ModelTemplate>>`, a breaking change for code that builds the variant). `ministral3-3b-reasoning-q4_0` pins `chat_template.jinja` of `mistralai/Ministral-3-3B-Reasoning-2512` at `4a36357c` (every published GGUF of that model embeds the older December 2025 template) and `muse-glimmer-30b-q4_0` pins the one of `meta-models/Muse-Glimmer-30B` at `cec94fcf` (the embedded one differs when a system prompt mentions "Reasoning effort"). `CUCA_LOCAL_CHAT_TEMPLATE=<path>` sets it in the live tests and `examples/local_model.rs`. The Ministral template renders byte for byte like Python jinja2 on 44 cases.
-- `provider-local`: the model file's sampling defaults apply. The GGUF keys `general.sampling.temp`, `top_k` and `top_p` (llama.cpp's names) are read at load, and the converter writes `general.sampling.*` from `generation_config.json` exactly as llama.cpp's does (identical to the pinned converter on a Mistral Small 3.2 truncation). Precedence per value: request, then `SamplingConfig`, then the file, then the built-in default. `SamplingConfig`'s `temperature`, `top_k` and `top_p` are now `Option` (`None` = not set; the constants `DEFAULT_TEMPERATURE`, `DEFAULT_TOP_K`, `DEFAULT_TOP_P` hold the built-in values) and `LocalModel::sampling()` reports the resolved values. `min_p` is not added: no supported model's generation config sets it.
-- `provider-local`: checkpoints that ship only `tekken.json` (Mistral Small 3.1/3.2, Magistral 2506-2509, Devstral Small 2505/2507) convert, as llama.cpp's `MistralVocab` path does: the 1,000 special tokens and the ranked byte vocabulary become a `gpt2` vocabulary with the `tekken` pre-tokenizer, the BPE merges are rebuilt from the ranks, and the chat template is the community one llama.cpp bundles for tokenizer version v11 or v13 (v1/v3/v7, whose template llama.cpp only names, and other versions are refused). Level 0 against llama.cpp `67107ac3` on a 2-layer Mistral Small 3.2 truncation: 0 differences in 35 keys and 21 tensors; the converted vocabulary encodes 1,536 texts to the same ids as `mistral_common`.
-- `provider-local`: Mistral Small 4 (`mistral4`) on the GPU engine: multi-head latent attention with a shared 320-wide latent pool and a decode kernel that reads the value as a prefix of the key row (no per-head K/V), fused gate/up experts, the ungated shared expert and `expert_weights_scale` in the CubeCL MoE kernels, resident or with tiered experts. Tensor parallelism still rejects it.
-- `provider-local`: `LocalModelConfig::gpu_layers` (llama.cpp's `-ngl`): the last `n` layers and the head on the GPU, the first layers and the embeddings on the CPU, one hidden-state crossing per pass, per-layer K/V pools and recurrent state on their layer's device (a Gemma 4 shared-K/V reader across the boundary gets its source's rows mirrored), tiered experts split between the halves; `CUCA_LOCAL_GPU_LAYERS` in the tests and the example, `LocalModel::layer_split()`.
-- `provider-local`: `ExpertPlacement::Host { layers }` (`host`, `host:layers=<n>`; llama.cpp's `--cpu-moe` / `--n-cpu-moe`): the routed experts stay in host RAM and the CPU computes them while the GPU runs everything else, one readback and one upload per MoE layer per pass (measured on the 119B model: faster prefill than the CPU alone, slower decode).
-- `provider-local`: Ministral 3 and Devstral Small 2 (`mistral3`, presets `ministral3-3b-reasoning-q4_0` and `ministral3-3b-instruct-q4_0`, bartowski's Q4_0, 2.05 GB each) on the CPU and the GPU engine, by table flags only: the `llama` graph plus the Llama 4 query scaling (`attention.temperature_scale`, length = the YaRN original context; `Hparams::attn_temp`, shared with `mistral4`). `rope.scaling.yarn_log_multiplier` now sets the YaRN cos/sin magnitude for every architecture (`get_mscale(f, 1) / get_mscale(f, m)`, llama.cpp's rule; before, such a `llama` file, e.g. Devstral 2 123B, got ggml's `1 + 0.1 ln f` boost). The converter reads `Ministral3ForCausalLM` and `Mistral3ForConditionalGeneration` with a `ministral3` text model (as `mistral3`, with the log multiplier and temperature written as llama.cpp does: zero-problem diff on 2 layers of Ministral-3-3B-Reasoning) and with a `mistral` text model (Mistral Small 3.1/3.2, Magistral 2509; also `mistral3`, as llama.cpp's converter writes them; their published GGUFs say `llama` and load as before). Verified: the converted 2-layer cut against `Ministral3ForCausalLM` in f32 at 17,000 tokens (2.8e-5, greedy equal; a reference without the query scaling differs by 0.5 from 16,384), a tiny model through the CPU/GPU comparison and the batching invariants, and the live CPU matrix of the preset (reasoning and the rest pass; the two tool scenarios are known limits shared with HuggingFace f32) next to the Instruct preset passing all eight scenarios including the `[TOOL_CALLS]` round trip.
-- `provider-local`: Mistral Small 4 (`mistral4`, preset `mistral-small-4-119b-q4_0`, bartowski's two-part Q4_0, 67.71 GB) on the CPU, resident or with tiered experts. Multi-head latent attention: the per-head keys and values are never built; the key up-projection is absorbed into the query and the K/V cache is one `kv_lora + rot` row (320 floats) per position and layer, 1,280 bytes, 46,080 over the 36 layers (755 MB for the default pool; 1.18 MB per position for the expanded heads), the value being the first 256 columns of the key row (`KvLayer` holds no value pool). YaRN keeps its magnitude scale out of cos/sin and puts `mscale^2` into the softmax scale as llama.cpp's `deepseek2` graph does; the Llama 4 per-position query scaling (`1 + 0.1 ln(1 + floor(pos / 8192))`) uses the file's `attention.temperature_scale`/`temperature_length` or, absent, the checkpoint's own 0.1 and 8,192 (which llama.cpp does not apply). The mixture of experts takes a fused `ffn_gate_up_exps` tensor (tiers read it as two strided halves: `ExpertSlice::stride`), an ungated shared expert, `expert_weights_scale` (`MoeSpec::scale`, applied by the router for every architecture) and leading dense blocks (`leading_dense_block_count`). Verified: an f64 implementation of transformers' expanded attention, the MoE FFN, fused-equals-split and tiered-equals-resident on tiny models; the real model's first two layers against `Mistral4ForCausalLM` in f32 (maximum absolute logit difference 4.1e-5 at 300 tokens and 7.0e-5 at 8,400, greedy equal; transformers' own float32 rotary angles show 1.1e-3 at 8k, the reference was run with float64 angles; switching the reference's query scaling off makes the positions from 8,192 differ by 0.25 to 0.45); the converter's output for the FP8 checkpoint and its tiny synthetic FP8 checkpoint with a dense first layer against transformers; and the live CPU matrix (all eight scenarios pass resident, 10.5 to 11.3 tokens per second decoding, 26 to 32 prefilling, 209 s to load, and with `tiered:ram=48g`), plus `provider_local_tiers` at `ram=48g` and `ram=8g` (replies equal the resident ones). The GPU engine rejects the architecture with a `CucaError::Config` naming latent attention: a known gap.
-- `provider-local`: the chat side of Mistral Small 4 (and Devstral, Ministral 3, Mistral Small 3.2). The reasoning markers `[THINK]` ... `[/THINK]` are detected from the template and the vocabulary (an opener inside a reasoning block stays reasoning text), and a new tool syntax reads `[TOOL_CALLS]name[ARGS]{json}` once per call with no closing marker (a call ends at the next opener or at the end of the reply; Mistral Small 3.2's `[CALL_ID]id` becomes the call's id). A template that reads `reasoning_effort` (`none` or `high`) is driven by the request's thinking setting. The parser follows llama.cpp's Ministral 3, Devstral and Mistral Small 3.2 fixtures, and the Mistral Small 4 and Small 3.2 chat templates render byte for byte like Python `jinja2` (transformers' environment) on 42 and 29 cases, error cases included. `testdata/chat_golden_new.json` now has LF line endings.
-- `provider-local`: the checkpoint converter handles Mistral Small 4 (`Mistral3ForConditionalGeneration` with a `mistral4` text model) and `MistralForCausalLM` (Mistral Small 3 and Nemo style checkpoints, as `llama`). `F8_E4M3` weights are dequantized while converting (multiplied by their `*_scale_inv`, per tensor or per expert; activation scales dropped; block-scaled FP8 refused up front) and written at the chosen precision. Mistral Small 4 is written in llama.cpp's `mistral4` layout (latent attention with `kv_b_proj` split into `attn_k_b` and `attn_v_b`, stacked fused `ffn_gate_up_exps`, shared experts, the `mistral4.*` keys); the engine runs that architecture on the CPU (see the `mistral4` entry). The `tokenizer.ggml.pre` name from llama.cpp's probe-text hash table now wins over the `tokenizer.json` structure when the engine implements it (Mistral Small 4: `pixtral`), and a repository that ships only `tekken.json` is refused by name. Every tensor and key equals llama.cpp's converter output at F16 on a synthetic FP8 checkpoint, the first two layers of the real FP8 Mistral Small 4 shards and two layers of Mistral Small 24B 2501.
-- `provider-local`: Muse Glimmer 30B (`muse-glimmer`, preset `muse-glimmer-30b-q4_0`, bartowski's imatrix Q4_0 file, which embeds the earlier chat template: it differs from the current one only when the caller's system prompt mentions "Reasoning effort"). A dense decoder with a `[sliding, sliding, sliding, full]` pattern (RoPE on the sliding layers only, with the one `rope.freq_base`; the full layers apply none), a separate sigmoid attention-gate projection per layer, a scale-less per-head Q/K norm (the file's Q norm carries the constant scale), post-attention and post-FFN norms with epsilon 1e-8, a scale-less norm on the embeddings and a logit multiplier before the soft-cap. The behaviour is table-driven (`Behavior` flags `attn_gate_tensor`, `nope_full_layers`, `swa_base_from_freq_base`, `embd_norm`, `post_norm_eps`, `logit_multiplier`) on the CPU and the GPU engine (the gate is cut by heads under tensor parallelism). The converter reads `MuseGlimmerForConditionalGeneration` checkpoints (text tower; the vision tensors are skipped) and its output is bit-identical to llama.cpp's for a tiny random model. The model speaks a channel protocol: the output parser reads messages addressed to `self` as `Thinking`, to `user` as text and to any other recipient as a tool call (`<atem:function_calls>`), and `<|eom|>` ends a message, not the turn. The request's `ThinkingEffort` maps to the template's `reasoning_strength` (a model that reads `reasoning_effort` gets `none` or `high`); the model cannot switch reasoning off, so `can_disable_thinking` is false. Verified: the tiny model against `transformers` f32 (maximum absolute logit difference 2.6e-4, greedy equal), a 4-layer cut of the real checkpoint with a 2,600-token prompt (8.4e-5, greedy equal), 744 tokenizer cases and 25 chat-template renders equal to the reference, llama.cpp's Muse parser fixtures as unit tests, and the live CPU suite (every applicable scenario passes; about 3.3 tokens per second decoding on 16 cores). The 30B preset has not run on a GPU (16.27 GB of weights); the tiny-model GPU tests pass on Vulkan.
-- `provider-local`: Hugging Face checkpoints load without a GGUF. `ModelSource::Checkpoint { repo, revision }` (parses from `repo:revision`) and `ModelSource::Dir(path)` are converted once, in process and in pure Rust, to a cached GGUF (`<cache>/converted/<repo>/<revision>/model-<quant>.gguf`), which the existing loader, tokenizer and chat template read unchanged. `LocalModelConfig::convert` (`ConvertConfig { quant: WeightQuant }`, `F16`, `Q8_0` default or `Q4_0`) picks the precision. The converter ports llama.cpp's `convert_hf_to_gguf.py` for all sixteen engine architectures and the Gemma 4 assistant, and streams tensor by tensor (a block of at most 32 MiB of `f32` in flight). Its output was compared with the real script's, key by key and tensor by tensor: identical F16 files for thirteen real checkpoints and four synthetic ones, identical Q8_0 for SmolLM 2. `ModelSource::from_str` gains the `repo:revision` form; `LocalModelConfig::on_download_progress` also reports conversion progress (tensors written out of the tensor count).
-- `provider-local`: new preset `r1-distill-llama-8b-q4_0`
-  (`unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF`, Q4_0, 4.68 GB), so the `llama`
-  architecture keeps a live test; its embedded chat template equals the
-  Hugging Face one (the bartowski file's lacks the trailing `<think>`).
-- `provider-local`: split GGUF files (`llama-gguf-split`, `<base>-00001-of-0000N.gguf`) load. `ModelSource::File` naming any part merges the set into one cached GGUF under `<cache>/merged/`; a Hugging Face source whose file is a split name downloads and verifies every part, merges them into `<base>.gguf` in the repository's cache directory and deletes the parts. `ModelSource::HuggingFace` gains `parts: Vec<ModelPart>`, `ModelPreset` gains `parts: &[PresetPart]` (empty for every current preset), and `on_download_progress` reports the merge. A merge needs about twice the model's size free and a deleted merged file means a re-download; see the model sources page.
-- `provider-local`: the `tekken` pre-tokenizer (Mistral Nemo, Pixtral, Mistral Small 3 and 4), built from the GPT-4o word rule with optional contraction suffixes and a digit-group size as parameters, and the checkpoint converter's structural name for the Tekken regex. Equal ids to Hugging Face `tokenizers` (Mistral Small 4) and `mistral_common` (Mistral Small 3.2) on 4,537 and 1,536 texts.
+- `UnifiedRequest` has the per request fields `top_p`, `top_k`, `seed` and `stop` (`set_top_p`,
+  `set_top_k`, `set_seed`, `add_stop`). Every provider sends them under its own keys: `top_p`,
+  `seed` and `stop` on OpenAI-compatible routes (plus `top_k` on llama.cpp, vLLM and LM Studio),
+  `top_p`, `top_k` and `stop_sequences` on Anthropic, `topP`, `topK`, `seed` and `stopSequences` in
+  Gemini's `generationConfig`, and all four on llama.cpp's native route and in the local engine. A
+  backend without an equivalent fails with `CucaError::Config`: `top_k` on OpenAI, DeepSeek's native
+  route and custom endpoints, `seed` on Anthropic and DeepSeek's Anthropic bridge. Breaking: a
+  `UnifiedRequest { .. }` struct literal must add the four fields (serde defaults keep stored JSON
+  loading), and the `PromptCache` digest includes them, so every key changes and importing a
+  snapshot exported by 0.6.2 fails with `PromptCacheError::Validation`.
+- `provider-local`: Hugging Face checkpoints load without a GGUF. `ModelSource::Checkpoint { repo,
+  revision }` (parsed from `repo:revision`) and `ModelSource::Dir(path)` are converted once, in
+  process and in pure Rust, to a GGUF cached under `<cache>/converted/`, by a port of llama.cpp's
+  `convert_hf_to_gguf.py` that covers every engine architecture. `LocalModelConfig::convert`
+  (`ConvertConfig { quant: WeightQuant }`: `F16`, `Q8_0` by default, `Q4_0`) picks the precision,
+  and `on_download_progress` reports the tensors written. Breaking: `ModelSource` gains the variants
+  `Checkpoint` and `Dir`.
+- `provider-local`: split GGUF files (`llama-gguf-split`, `<base>-00001-of-0000N.gguf`) load.
+  `ModelSource::File` naming any part merges the set into one GGUF under `<cache>/merged/`, and a
+  Hugging Face source whose file is a split name downloads and verifies every part, merges them
+  into `<base>.gguf` and deletes the parts; the merge needs about twice the model's size free and
+  `on_download_progress` reports it. Breaking: `ModelSource::HuggingFace` gains `parts:
+  Vec<ModelPart>` and `ModelPreset` gains `parts: &[PresetPart]`, set for
+  `mistral-small-4-119b-q4_0`.
+- `provider-local-gpu`: tensor parallelism. `LocalModelConfig::shards` (or
+  `LocalModelConfig::set_devices("cuda:0+cuda:1")`) splits a model over `1 + shards.len()` GPUs of
+  one backend: attention heads and FFN widths are divided evenly, each device holds its slice of the
+  weights and of the K/V pools, and the partial outputs are summed twice per layer. The sum runs on
+  NCCL for distinct CUDA devices on Linux (compile-checked, not run) and host-staged in a fixed
+  order everywhere else, so runs are deterministic, and a device may repeat (`vulkan:0+vulkan:0`).
+  The load fails with `CucaError::Config` for a drafter, tiered or host experts, delta-net layers
+  (`qwen35`, `qwen35moe`), latent attention (`mistral4`), full-width Q/K norms (`olmo2`, `olmoe`)
+  and models whose head count or widths do not divide.
+- `provider-local-gpu`: `LocalModelConfig::gpu_layers` (llama.cpp's `-ngl`) runs the last `n`
+  layers and the LM head on the GPU and the first layers and the embeddings on the CPU, so the
+  hidden state crosses once per forward pass. Each layer's K/V pool and recurrent state live on its
+  layer's device, tiered experts split between the two halves, and `LocalModel::layer_split()`
+  returns `(layers on the GPU, layers in all)`. The load fails with `CucaError::Config` on the CPU
+  device or combined with `shards` or a drafter.
+- `provider-local-gpu`: `ExpertPlacement::Host { layers }` (`host`, `host:layers=<n>`; llama.cpp's
+  `--cpu-moe` and `--n-cpu-moe`) keeps the routed experts of the MoE layers in host RAM and computes
+  them on the CPU while the GPU runs the rest, with one readback and one upload per MoE layer per
+  pass. It needs a GPU device and a mixture of experts model and does not combine with tiered
+  experts or `shards`. Breaking: `ExpertPlacement` gains the variant `Host`.
+- `provider-local`: Muse Glimmer 30B (`muse-glimmer`, preset `muse-glimmer-30b-q4_0`, Q4_0 from
+  `bartowski/Muse-Glimmer-30B-GGUF`) on the CPU and the GPU engine: a dense decoder with sliding
+  window and full attention layers and a sigmoid attention gate per layer. The output parser reads
+  its channel protocol (a message addressed to `self` becomes `Thinking`, one addressed to `user`
+  text, any other recipient a tool call), and `ThinkingEffort` selects the template's
+  `reasoning_strength`; the model cannot switch reasoning off, so `can_disable_thinking` is false.
+  The converter reads `MuseGlimmerForConditionalGeneration` checkpoints.
+- `provider-local`: Ministral 3 and Devstral Small 2 (`mistral3`; presets
+  `ministral3-3b-reasoning-q4_0` and `ministral3-3b-instruct-q4_0`, Q4_0 from bartowski) on the CPU
+  and the GPU engine: the `llama` graph with YaRN and the Llama 4 query scaling
+  (`attention.temperature_scale`, over the YaRN original context length). The converter reads
+  `Ministral3ForCausalLM` and `Mistral3ForConditionalGeneration` with a `ministral3` or `mistral`
+  text model (Mistral Small 3.1 and 3.2, Magistral 2509) and writes `mistral3`.
+- `provider-local`: Mistral Small 4 (`mistral4`, preset `mistral-small-4-119b-q4_0`, bartowski's
+  two part Q4_0) on the CPU and the GPU engine, with resident, tiered or (on a GPU) host experts. It
+  uses multi-head latent attention (one `kv_lora + rot` row of 320 floats per position and layer,
+  1,280 bytes, the value being a prefix of the key row), fused gate/up experts, an ungated shared
+  expert, `expert_weights_scale` and leading dense blocks. Tensor parallelism rejects it.
+- `provider-local`: the output parser reads Mistral's reasoning markers `[THINK]` and `[/THINK]` and
+  its tool syntax `[TOOL_CALLS]name[ARGS]{json}`, detected from the chat template and the
+  vocabulary (Mistral Small 3.2 and 4, Devstral, Ministral 3). A call has no closing marker and ends
+  at the next opener or at the end of the reply, and `[CALL_ID]id` becomes the call's id. A template
+  that reads `reasoning_effort` (`none` or `high`) is driven by the request's thinking setting.
+- `provider-local`: the checkpoint converter reads Mistral Small 4 (`Mistral3ForConditionalGeneration`
+  with a `mistral4` text model, written in llama.cpp's `mistral4` layout) and `MistralForCausalLM`
+  (as `llama`). `F8_E4M3` weights are dequantized while converting (times their `*_scale_inv`, per
+  tensor or per expert) and written at the chosen precision; block scaled FP8 is refused up front.
+  The `tokenizer.ggml.pre` name follows llama.cpp's probe-text hash table when the engine implements
+  it (`pixtral` for Mistral Small 4).
+- `provider-local`: the `tekken` pre-tokenizer (Mistral Nemo, Pixtral, Mistral Small 3 and 4); the
+  name `pixtral` selects it, with `ignore_merges` and a default BOS. Checkpoints that ship only
+  `tekken.json` (Mistral Small 3.0 to 3.2, Magistral, Devstral Small) convert as llama.cpp's
+  `MistralVocab` path does: the ranked byte vocabulary becomes a `gpt2` vocabulary with the `tekken`
+  pre-tokenizer and rebuilt merges, and the chat template is the one llama.cpp bundles for tokenizer
+  version v11 or v13, or the name `mistral-v7-tekken` for v7. Any other tokenizer version is
+  refused.
+- `provider-local`: `LocalModelConfig::chat_template` replaces the GGUF's chat template (llama.cpp's
+  `--chat-template-file`, vLLM's `--chat-template`); the reasoning markers, tool syntax and end of
+  turn tokens follow it, and a template that does not compile or cannot render a one message
+  conversation fails `LocalModel::load` with `CucaError::Config`. A preset pins one with
+  `ModelPreset::template` (`PresetTemplate { repo, revision, file, sha256 }`, downloaded and verified
+  like a model file): `ministral3-3b-reasoning-q4_0`, `ministral3-3b-instruct-q4_0` and
+  `muse-glimmer-30b-q4_0` pin the `chat_template.jinja` of the model's own repository, and
+  `CUCA_LOCAL_CHAT_TEMPLATE=<path>` sets one in `examples/local_model.rs`. Breaking:
+  `ModelSource::HuggingFace` gains `template: Option<Box<ModelTemplate>>` and `ModelPreset` gains
+  `template`.
+- `provider-local`: llama.cpp's named chat templates `mistral-v7` and `mistral-v7-tekken` (what its
+  converter writes for Mistral Small 3.0 and 3.1 and Devstral Small 2505) expand to Jinja at load,
+  from `tokenizer.chat_template` or `LocalModelConfig::chat_template`, and render as llama.cpp's
+  `llm_chat_apply_template` does (system message in place, no BOS, no generation prompt, tools
+  ignored). Any other bare name is a load error that lists the supported ones.
+- `provider-local`: the model file's sampling defaults apply. The GGUF keys `general.sampling.temp`,
+  `general.sampling.top_k` and `general.sampling.top_p` are read at load, and the converter writes
+  them from `generation_config.json`. Each value resolves from the request, then `SamplingConfig`,
+  then the file, then the built-in default, and `LocalModel::sampling()` reports the result.
+  Breaking: `SamplingConfig::temperature`, `top_k` and `top_p` are `Option` (`None` defers to the
+  file), and the built-in values are the constants `SamplingConfig::DEFAULT_TEMPERATURE` (1.0),
+  `DEFAULT_TOP_K` (64) and `DEFAULT_TOP_P` (0.95).
+- `provider-local`: the Mistral Small 4 EAGLE drafter (`mistralai/Mistral-Small-4-119B-2603-eagle`,
+  architecture `mistral4-eagle`) as `DrafterSource::File` with a checkpoint source
+  (`mistralai/Mistral-Small-4-119B-2603-eagle:<revision>`). The converter turns its Mistral-format
+  files (`params.json`, FP8 `consolidated.safetensors`) into a GGUF at `convert.quant`; the drafter
+  is two latent attention layers over a dense FFN that use the target's embedding and LM head, with
+  a K/V cache of its own. It pairs with a `mistral4` target on the CPU only and serves one sequence
+  at a time.
+- `provider-local`: a DFlash block drafter as `DrafterSource::File`: the preset
+  `muse-glimmer-30b-dflash-q4_0` (llama.cpp's `dflash-Muse-Glimmer-30B-Q4_0.gguf`), another `dflash`
+  GGUF, or a checkpoint such as `meta-models/Muse-Glimmer-30B-assistant` converted at
+  `convert.quant`. It proposes up to 15 tokens per round in one pass from the target's hidden
+  features at five layers, keeps a sliding window K/V ring of its own, and runs on the CPU only with
+  one sequence at a time.
+- `provider-local`: preset `r1-distill-llama-8b-q4_0` (`unsloth/DeepSeek-R1-Distill-Llama-8B-GGUF`,
+  Q4_0, `llama` architecture).
 
 ### Changed
 
-- `provider-local`: checkpoint conversion is 1.3 to 5 times faster on a warm cache with identical output bytes. The `q4_0`, `q8_0` and `f16` encoders run on every core, written out of candle's quantizer (the same `ggml` reference arithmetic, checked bit for bit against it in a test), and the next block of a tensor is read while the current one is encoded and written, so peak memory is two blocks (64 MiB of `f32`) instead of one. Measured on a Ryzen 9 9950X3D2 with the checkpoint in the OS file cache and the output on an NVMe drive: Qwen3 0.6B 1.9 s to 1.4 s (`f16`), 2.6 s to 1.2 s (`q8_0`), 2.0 s to 1.0 s (`q4_0`); a layer-truncated Mistral Small 4 checkpoint (4.8 GB written at `q4_0`) 23.6 s to 4.7 s.
-- `provider-local`: a drafter that keeps a cache of its own (the EAGLE drafter, the DFlash block drafter, the Qwen 3.5 in-trunk head) no longer takes every committed position into it in plain rounds. A round that drafts nothing only hands its hidden rows (features, for DFlash) to the drafter (`Drafter::defer`), which holds them and the range of positions it has not seen (at most 1,024 positions and 16 MiB), and the next round that drafts first takes them in one batched pass (`Drafter::catch_up`, chunks of the trunk's prefill size; a new prompt trims the held rows, a replay at an earlier position replaces the ones it covers, a failed request forgets them). The pass is not charged to the governor's timing of either mode. The CPU kernels are row-exact, so the cache after catching up equals the per-round upkeep's bit for bit (engine tests per drafter with the governor forced plain for 0 to 1,000 rounds, a drafter-level test of chunking, caps, truncation, replay, gaps and reset), and proposals and output are unchanged. Measured per token, plain round against catching up per row: EAGLE on Mistral Small 4 4.4 ms of 86.6 ms against 0.89 ms, DFlash on Muse Glimmer 3.5 ms of 288 ms against 1.2 ms, the Qwen 3.5 0.8B head 0.09 ms of 17.3 ms against 0.05 ms. EAGLE at `draft_tokens` 2, old and new engine back to back twice: a prompt where the governor drafts nothing 0.96x and 0.96x before, 0.98x to 1.00x after (0.99x on the traced runs: 4 of 4 prompts and loads at 0.98x to 1.00x), all three prompts 1.02x and 1.01x before, 0.99x and 1.00x after: with the upkeep gone plain decoding is 5 % faster, the 2 % that drafting still gains on this mixture-of-experts model is below the governor's 1.02 margin, and it drafts less (190 to 220 drafted tokens before, 86 to 90 after). DFlash at `draft_tokens` 3: 1.47x (1.46x before). See the governor section of `docs/content/providers/local/drafting.md`.
-- `provider-local` live suite: `CUCA_LOCAL_ALLOW_MISMATCH=1` makes `tests/provider_local_mtp.rs` report a CPU output that differs from plain decoding (`identical false`) instead of failing, for timing a 67 GB model on a machine whose separate loads sometimes differ by a flipped bit; the default is unchanged.
-- `provider-local-gpu`: dense weights (attention projections, dense FFNs, the LM head) are held in the MoE kernels' own block layout (Q4_0, Q4_1 and Q8_0 as they are, other quantized dtypes requantized to Q8_0, one copy per weight) and multiplied by two CubeCL kernels of this crate instead of burn's quantized matmul: a matrix-vector kernel with f32 accumulation for up to 64 input rows (decode, batched decode, verification, prompt tails; several threads per row for weights with few rows) and a dequantize-to-f32 slice kernel for burn's float matmul on longer prefill chunks. The burn 0.22 Vulkan quantized-matmul workarounds go away: no weight is held as f32 to keep autotune keys of the two schemes apart (`plan_dense` and its f32 holding are deleted), and the single-row shapes that dequantized the whole weight on every token are gone. On a RX 9070 XT, same machine, before -> after: Gemma 4 E2B GPU decode 30.6 -> 48-57 tokens/s and prefill of a 1,108-token prompt 15 s -> 1.3 s; Muse 30B at `gpu_layers = 26` 3.0-3.1 -> 5.4-5.5 tokens/s (CPU only: 3.5), and 8.3-8.4 at 38 layers, the most that fits (weight chunks of 256 MiB instead of 1 GiB: burn's memory pool sizes its pages after the largest allocation, which kept 36 layers from fitting); Mistral Small 4 with host experts 8.0-8.3 -> 8.6-8.8 (CPU only: 11.2), prefill 22.3-23.9 s against 34.4 s on the CPU; Qwen3.6 host 9.3-9.9 -> 10.1-10.2, tiered 11.0-11.2 -> 10.6-10.9 with 12.2-14.4 s prefill against 23.8-24.4 s on the CPU; device memory at the peak 9.9 -> 6.6 GiB (Mistral host), 10.7 -> 5.9 (Qwen host), 14.0 -> 10.6 (Qwen tiered).
-- `provider-local` live suite: the two tool scenarios of a model whose template forces reasoning decode with the model's own sampling defaults (`LocalModel::sampling()`) and the fixed request seed 1 instead of greedily. Greedy decoding of `ministral3-3b-reasoning-q4_0` loops in its reasoning for the whole budget (7,965 tokens at 8,192 context too; HuggingFace f32 the same), while at the model card's temperature 0.7 it calls the tool in 66 to 137 tokens (HuggingFace bf16: 94 to 149); the template, the budget and the parser were ruled out. Both tool scenarios now pass for that preset and its known limit is removed; `muse-glimmer-30b-q4_0` (pinned repository template) passes all eight scenarios too.
-- `provider-local`: the documented thinking behaviour of `LocalModel` and the requests page is corrected: effort levels reach templates that read `reasoning_strength` (Muse Glimmer: `low` to `xhigh`) and the two-mode `reasoning_effort` (`none`/`high`) is driven by the enabled flag.
-- `provider-local`: the pre-tokenizer name `pixtral` now selects the Tekken expression (llama.cpp's mapping, with `ignore_merges` and a default BOS) instead of the Llama 3 expression. No preset used it.
-- `provider-local`: the K/V cache is paged. K/V lives in blocks of 16
-  positions in per-layer-group pools (`model/paged.rs`), a sequence holds one
-  block table per group, and a prefix store names full blocks by a hash chain
-  over their token ids, so a finished request's blocks stay cached (least
-  recently used evicted first) and an unrelated request no longer evicts a
-  prefix. `prompt_cache_usage.read_tokens` is now a multiple of 16 (the
-  trailing partial block, at most 15 tokens, is recomputed). The sliding-window
-  ring buffer and its compaction are gone: a sliding block is released once it
-  leaves the window. The pool holds twice `context_length` positions, so
-  `LocalModel::kv_cache_bytes` grows (Gemma 4 E2B at 8192: 145 MB to 422 MB;
-  full-attention models double). On the CPU attention reads the blocks in
-  place with an online-softmax kernel per (row, head): decode is faster
-  (Gemma 4 E2B 20.9 to 25 tok/s, Qwen3-0.6B 27 to 50 at 1,100 tokens), a row
-  is bit-identical alone or in a batch, and warm equals cold, chunked equals
-  token by token and speculative equals plain bit for bit as before; the
-  rounding differs from candle's matmul attention, so a greedy reply can
-  differ from 0.6.x where two logits are within about 0.1. On a GPU a decode
-  step reads the blocks with a split (flash-decoding) CubeCL kernel
-  (`paged_kernel.rs`) and a prefill gathers the blocks it needs.
-- `provider-local`: continuous batching. The engine is a step scheduler
-  (`engine/scheduler.rs`): up to `LocalModelConfig::batching.max_sequences`
-  requests (default 4) run at once, and every step is one forward pass
-  (`Model::forward_batch`) over a decode row of each running sequence plus
-  chunks of the prompts being prefilled, within `max_step_tokens` rows: the
-  dense layers read each weight once per step, attention, the K/V block
-  writes and a hybrid model's recurrent scan stay per sequence (per-sequence
-  state slots). All sequences share the one K/V block pool
-  (`batching.kv_tokens`, default twice `context_length`, the memory knob:
-  more sequences do not grow it); a request that needs a block when the pool
-  is full preempts the youngest running one, which resumes from the blocks it
-  left in the prefix store, and blocks of a prompt are named as soon as they
-  are filled, so a request with the same prompt as a running one reuses them.
-  A slow consumer stalls only its own request (`try_send`, no blocking send
-  in the engine), and a dropped stream releases its blocks at once.
-  `LocalModel::serving_stats` reports the scheduler (running and waiting
-  requests, free and cached blocks, snapshot bytes, prefix hits, preemptions,
-  rows per step). `BatchingConfig` parses from `seqs=4,kv=16384,step=256,
-  prefix=off` (`CUCA_LOCAL_BATCHING` in the example and the live tests). On
-  the CPU a sequence's output equals what it produces alone, bit for bit;
-  with four sequences decoding 96 tokens each the aggregate rate rose from
-  24.3 to 50.1 tok/s on Gemma 4 E2B Q4_0 (2.07x), 65.5 to 110.8 on
-  Qwen3-0.6B Q8_0 (1.69x) and 53.3 to 95.1 on Qwen3.5-0.8B Q8_0 (1.78x); on
-  Vulkan 11.3 to 21.7 (1.93x) and 27.4 to 43.8 tok/s (1.60x). A lone
-  sequence decodes as fast as before (Qwen3-0.6B 51 tok/s on both). A hybrid
-  model (Qwen 3.5) no longer keeps its last sequence and one checkpoint: the
-  prefix store keeps a recurrent-state snapshot at the block boundary below
-  the last end-of-turn token of every prompt it prefills
-  (`Model::snapshot`/`restore`; `read_tokens` is that boundary at most), and
-  `Model::checkpoint` is gone. An in-trunk drafter serves one sequence at a
-  time and a file drafter speculates only while one request runs alone.
-- `provider-local` (GPU): tensor parallelism. `LocalModelConfig::shards`
-  (and `LocalModelConfig::set_devices("cuda:0+cuda:1")`, the syntax of
-  `CUCA_LOCAL_DEVICE` in the example and the live tests; the example's
-  `loaded on` line lists the devices) splits a model over `1 + shards.len()`
-  GPUs of one backend: attention heads and FFN widths are split evenly (a mixture
-  of experts inside every expert, K/V heads replicated when a model has fewer
-  than there are devices, as Gemma 4 E2B's one), every device holds its slice
-  of the weights and of the K/V pools, and the partial outputs are summed twice
-  per layer, by burn's NCCL `all_reduce` on CUDA (Linux, distinct devices;
-  compile-checked, not run) and host-staged in a fixed order everywhere else,
-  so runs are deterministic. A device may repeat (`vulkan:0+vulkan:0`): the
-  same path on one GPU. Rejected at load with `tensor parallelism: ...`: a
-  drafter, tiered experts, delta-net layers (Qwen 3.5), full-width Q/K norms
-  (OLMo 2, OLMoE) and models whose heads or widths do not divide. On
-  `vulkan:0+vulkan:0` the live matrix of Gemma 4 E2B Q4_0 and Qwen3-0.6B Q8_0
-  gives the single-device replies (15 of 15 each), at about a third of the
-  speed (the host-staged reduction: two readbacks per layer), and continuous
-  batching works on it (8 of 8 concurrent replies equal to the serial ones).
-- `provider-local`: the `olmoe-1b-7b-q4_0` preset now pins
-  `allenai/OLMoE-1B-7B-0125-Instruct-GGUF` (Q4_0, revision `2ac1d273`, 3.93 GB,
-  published by the model's lab) instead of the September 2024
-  `bartowski/OLMoE-1B-7B-0924-Instruct-GGUF`; same architecture and sizes.
+- `provider-local`: the K/V cache is paged. Blocks of 16 positions live in per layer group pools,
+  and a prefix store names full blocks by a hash chain over their token ids, so a finished
+  request's blocks stay cached (least recently used evicted first) and an unrelated request does
+  not evict a prefix. A hybrid model (Qwen 3.5) resumes only from a block boundary that has a
+  recurrent state snapshot, taken below the last end of turn token of each prompt. Breaking:
+  `prompt_cache_usage.read_tokens` is a multiple of 16 (the trailing partial block, at most 15
+  tokens, is recomputed); the pool of a full attention layer group holds twice `context_length`
+  positions, so `LocalModel::kv_cache_bytes` grows (Gemma 4 E2B at 8192: 422 MB); and CPU attention
+  sums in a different order than candle's matmul attention, so a greedy reply can differ from 0.6.2
+  where two logits are close.
+- `provider-local`: continuous batching. The engine is a step scheduler: up to
+  `BatchingConfig::max_sequences` requests (default 4) run at once, every step is one forward pass
+  over a decode row per running sequence plus prompt chunks within `max_step_tokens` rows, and all
+  sequences share one K/V block pool (`kv_tokens`, default twice `context_length`, so more
+  sequences do not grow it). A request that needs a block when the pool is full preempts the
+  youngest running one, which resumes from the prefix store, and a slow consumer stalls only its own
+  request. `BatchingConfig` parses from `seqs=4,kv=16384,step=256,prefix=off`
+  (`CUCA_LOCAL_BATCHING` in `examples/local_model.rs`) and `LocalModel::serving_stats` reports the
+  scheduler; a request speculates only while it runs alone, and an in-trunk, EAGLE or DFlash drafter
+  limits the engine to one sequence. On the CPU a sequence's output equals what it produces alone,
+  bit for bit.
+- `provider-local`: `LocalModelConfig` has the new public fields `chat_template`, `convert`,
+  `batching`, `shards` and `gpu_layers`, and the crate root exports `BatchingConfig`,
+  `ConvertConfig`, `ModelPart`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `ServingStats` and
+  `WeightQuant`. Breaking: code that builds `LocalModelConfig` with a struct literal, without
+  `..Default::default()`, must set the new fields.
+- `provider-local`: `rope.scaling.yarn_log_multiplier` sets the YaRN cos/sin magnitude for every
+  architecture, as llama.cpp does (`get_mscale(f, 1) / get_mscale(f, m)`); a file without the key
+  keeps ggml's `1 + 0.1 ln f` boost. A `llama` file that carries the key (Devstral 2 123B) gets a
+  different magnitude, so its logits change.
+- `provider-local`: the batched CPU quantized matmul (`model/qmm.rs`) serves Q4_0, Q4_1, Q5_0, Q5_1
+  and Q8_0 weights, and a row's result is bit-identical alone or in any batch. Q4_1, Q5_0 and Q5_1
+  run 2 to 4 times faster than candle's per row kernel from 4 rows on (measured on a Ryzen 9
+  9950X3D2). K-quants and every other dtype stay on candle's per row kernel, which is also row
+  independent.
+- `provider-local-gpu`: dense weights (attention projections, dense FFNs, the LM head) are
+  multiplied by two CubeCL kernels of this crate: a matrix-vector kernel with f32 accumulation for
+  up to 64 input rows (decode, batched decode, verification, prompt tails) and a dequantizing slice
+  kernel that feeds burn's float matmul on longer prefill chunks. Q4_0, Q4_1 and Q8_0 weights are
+  held as they are and other quantized dtypes are requantized to Q8_0; burn's quantized matmul is
+  not used. A weight larger than 256 MiB on the device is split into row chunks.
+- `provider-local`: checkpoint conversion encodes `q4_0`, `q8_0` and `f16` tensors on every core and
+  reads the next block while the current one is written, with identical output bytes.
+- `provider-local`: the `olmoe-1b-7b-q4_0` preset pins `allenai/OLMoE-1B-7B-0125-Instruct-GGUF`
+  (Q4_0, revision `2ac1d273`). Breaking: it downloads a different file than 0.6.2's 0924
+  `bartowski` one, so replies can change.
 
 ### Removed
 
 Models first released before 2025 and the engine code only they needed.
 
-- `provider-local` presets `gemma2-2b-q4_0`, `qwen2.5-0.5b-q8_0`,
-  `llama3.2-1b-q4_0`, `phi3.5-mini-q4_0`, `smollm2-360m-q8_0`,
-  `tinyllama-1.1b-q4_0` and `granite3.1-moe-1b-q4_0` (all first released
-  between December 2023 and December 2024). Any GGUF of those models still
-  loads when its architecture is supported (`llama`, `qwen2`, `phi3`).
-- The `gemma2` and `granitemoe` architectures: a GGUF with that
-  `general.architecture` now fails with the unknown-architecture error, and
-  the checkpoint classes `Gemma2ForCausalLM` and `GraniteMoeForCausalLM` fail
-  with the no-converter error, both naming the value. No official model
-  released since January 2025 uses `granitemoe` except a safety classifier,
-  and `gemma2` only TxGemma.
-- Attention logit soft-capping (the `{arch}.attn_logit_softcapping` key and
-  the `softcap` argument of the CPU attention, the paged attention and the GPU
-  decode kernel): only Gemma 2 used it. The final logit soft-cap of Gemma 4
-  stays.
-- The Llama 3 tool-call syntax (`ToolSyntax::LlamaJson`: a bare
-  `{"name": ..., "parameters": ...}` reply and the `<|python_tag|>` body that
-  became a `python` call); only Llama 3.2 used it. A model with such a
-  template now answers in plain text. The tagged-JSON syntax still reads
-  `parameters` as an alias of `arguments`.
-- The pre-tokenizer names `smollm`, `megrez`, `stablelm2`, `phi-2`, `mpt`,
-  `jais`, `jina-es`, `jina-de`, `jina-v2-es`, `jina-v2-de`, `codeshell` and
-  `minerva-7b`, whose families were first released before 2025.
-  `unsupported pre-tokenizer` names them now.
-- The Granite MoE `block_sparse_moe` expert tensors in the checkpoint
-  converter and the `TinySpec::gemma2` and `TinySpec::granitemoe` test
-  fixtures; the SmolLM 2, TinyLlama, Gemma 2 and Granite 3.1 MoE converter
-  oracle checkpoints and the fixtures, goldens, templates and known limits of
-  the removed presets. The converter oracle now covers
-  `unsloth/gemma-3-1b-it` (the ungated mirror of `google/gemma-3-1b-it`, SentencePiece),
-  `allenai/OLMoE-1B-7B-0125-Instruct` and `deepseek-ai/DeepSeek-R1-Distill-Llama-8B` (a 2025 `LlamaForCausalLM`).
+- `provider-local` presets `gemma2-2b-q4_0`, `qwen2.5-0.5b-q8_0`, `llama3.2-1b-q4_0`,
+  `phi3.5-mini-q4_0`, `smollm2-360m-q8_0`, `tinyllama-1.1b-q4_0` and `granite3.1-moe-1b-q4_0` (all
+  first released between December 2023 and December 2024). Any GGUF of those models still loads
+  when its architecture is supported (`llama`, `qwen2`, `phi3`).
+- The `gemma2` and `granitemoe` architectures: a GGUF with that `general.architecture` fails with
+  the unknown architecture error, and the checkpoint classes `Gemma2ForCausalLM` and
+  `GraniteMoeForCausalLM` fail with the no converter error, both naming the value. The Granite MoE
+  `block_sparse_moe` expert tensors leave the converter with them.
+- Attention logit soft-capping (the `{arch}.attn_logit_softcapping` key): only Gemma 2 used it. The
+  final logit soft-cap of Gemma 4 stays.
+- The Llama 3 tool call syntax (`ToolSyntax::LlamaJson`: a bare `{"name": ..., "parameters": ...}`
+  reply and the `<|python_tag|>` body that became a `python` call); only Llama 3.2 used it. A model
+  with such a template answers in plain text. The tagged JSON syntax still reads `parameters` as an
+  alias of `arguments`.
+- The pre-tokenizer names `smollm`, `megrez`, `stablelm2`, `phi-2`, `mpt`, `jais`, `jina-es`,
+  `jina-de`, `jina-v2-es`, `jina-v2-de`, `codeshell` and `minerva-7b`, whose families were first
+  released before 2025. `unsupported pre-tokenizer` names them.
+- The converter's Phi 3 SentencePiece vocabulary reader (a Phi 3 or 3.5 SentencePiece checkpoint
+  fails with `CucaError::Config`; Phi 4 mini, which has a GPT2 tokenizer, converts), its SmolLM
+  `add_bos_token` override and the tokenizer's special token `lstrip` and `rstrip` rule, which only
+  Phi 3 SentencePiece files used.
 
 ### Fixed
 
-- `provider-local`: a speculative round whose accepted draft ends the reply (end of generation, a stop string or the token budget) no longer caches that draft. The accepted drafts are emitted like sampled tokens before the round is cached, so the K/V rows, the cached ids and the published prefix blocks end where plain decoding's do (`a_stop_string_ending_inside_a_round_caches_what_plain_decoding_does` and the strict `last_ids` checks of the drafter engine tests).
-- `provider-local`: file offsets of expert slices and embedding rows are computed in `u64`. The positional read loop (`tier::read_exact_at`) was already correct; it is now split into `read_fully_at`/`read_some_at` and tested with random short reads from eight threads sharing one handle and offsets past 4 GiB.
-- `tests/provider_local_mtp.rs` records the plain outputs, drops the plain model and loads one speculative model per draft length (two copies of a 67 GB target do not fit in memory). On the measurement machine two loads of the 67.7 GB Mistral Small 4 file occasionally differ by one bit in one tensor (5 of 579 tensors over three loads, found by hashing the loaded buffers against an independent re-read; suspected hardware or OS memory, not reproduced by a RAM and file-read probe), which can move first-token logits by 1 % and make a plain-versus-speculative comparison across loads fail: repeat such a failure before believing it.
+- `provider-local`: a speculative round whose accepted draft ends the reply (end of generation, a
+  stop string or the token budget) does not cache that draft. The accepted drafts are emitted like
+  sampled tokens before the round is cached, so the K/V rows, the cached ids and the published
+  prefix blocks end where plain decoding's do.
 
 ## 0.6.2
 
