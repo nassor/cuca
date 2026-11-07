@@ -225,6 +225,11 @@ impl Drafter {
             Model::Gpu(_) => Err(err(
                 "the EAGLE drafter runs on the CPU only: use `LocalDevice::Cpu`",
             )),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(_) => Err(CucaError::Config(
+                "the EAGLE drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
+                    .into(),
+            )),
         }
     }
 
@@ -251,6 +256,11 @@ impl Drafter {
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(_) => Err(err(
                 "the DFlash drafter runs on the CPU only: use `LocalDevice::Cpu`",
+            )),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(_) => Err(CucaError::Config(
+                "the DFlash drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
+                    .into(),
             )),
         }
     }
