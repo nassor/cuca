@@ -134,15 +134,39 @@ pub(crate) fn cached_path(
     Ok(path)
 }
 
-/// `path` with `suffix` appended to its file name.
-fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
+/// `path` with `suffix` appended to its file name (`.partial`, `.lock`).
+pub(crate) fn with_suffix(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
 }
 
-/// Lowercase hex of a SHA-256 digest.
-fn hex(bytes: &[u8]) -> String {
+/// An exclusive `<target>.lock` file, released on drop.
+///
+/// The empty lock file is left in place: deleting it after unlock would race
+/// with a process still blocked on it.
+pub(crate) struct FileLock {
+    _file: File,
+}
+
+/// Take the exclusive `<target>.lock` file (creating `target`'s directory and
+/// the lock file), waiting for another loader that holds it.
+pub(crate) fn lock_file(target: &Path) -> Result<FileLock, CucaError> {
+    let parent = target.parent().ok_or_else(|| {
+        CucaError::Config(format!("`{}` has no parent directory", target.display()))
+    })?;
+    std::fs::create_dir_all(parent)?;
+    let file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(with_suffix(target, ".lock"))?;
+    file.lock()?;
+    Ok(FileLock { _file: file })
+}
+
+/// Lowercase hex of `bytes`.
+pub(crate) fn hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {
@@ -164,12 +188,17 @@ fn hash_file(path: &Path, hasher: &mut Sha256) -> Result<(), CucaError> {
     }
 }
 
-/// Report progress when a callback is installed.
-fn report(progress: Option<&DownloadProgressCallback>, downloaded: u64, total: Option<u64>) {
+/// Report progress when a callback is installed; `total` is a byte count or
+/// `None` while unknown.
+pub(crate) fn report(
+    progress: Option<&DownloadProgressCallback>,
+    downloaded: u64,
+    total: impl Into<Option<u64>>,
+) {
     if let Some(cb) = progress {
         (cb.0)(DownloadProgress {
             downloaded_bytes: downloaded,
-            total_bytes: total,
+            total_bytes: total.into(),
         });
     }
 }
@@ -226,10 +255,19 @@ pub(crate) async fn ensure_downloaded(
     token: Option<&str>,
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<(), CucaError> {
-    ensure_locked_download(
-        client, endpoint, repo, revision, file, sha256, final_path, token, progress,
-    )
-    .await
+    if final_path.exists() {
+        return Ok(());
+    }
+    let _lock = lock_file(final_path)?;
+    // Another loader may have finished while this one waited for the lock.
+    if final_path.exists() {
+        return Ok(());
+    }
+    let url = format!(
+        "{}/{repo}/resolve/{revision}/{file}",
+        endpoint.trim_end_matches('/')
+    );
+    download_locked(client, &url, file, sha256, final_path, token, progress).await
 }
 
 /// Make sure `merged` holds the merge of a split GGUF set: download and verify
@@ -264,7 +302,7 @@ pub(crate) async fn ensure_split_downloaded(
     if merged.exists() {
         return Ok(());
     }
-    let lock = convert::lock_output(merged)?;
+    let lock = lock_file(merged)?;
     // Another loader may have merged while this one waited for the lock.
     if merged.exists() {
         return Ok(());
@@ -314,7 +352,7 @@ pub(crate) async fn ensure_downloaded_optional(
     token: Option<&str>,
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<bool, CucaError> {
-    match ensure_locked_download(
+    match ensure_downloaded(
         client, endpoint, repo, revision, file, sha256, final_path, token, progress,
     )
     .await
@@ -323,52 +361,6 @@ pub(crate) async fn ensure_downloaded_optional(
         Err(CucaError::Http { status: 404, .. }) => Ok(false),
         Err(e) => Err(e),
     }
-}
-
-/// The shared body of both entry points: lock, re-check, download.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "same inputs as ensure_downloaded"
-)]
-async fn ensure_locked_download(
-    client: &reqwest::Client,
-    endpoint: &str,
-    repo: &str,
-    revision: &str,
-    file: &str,
-    sha256: Option<&str>,
-    final_path: &Path,
-    token: Option<&str>,
-    progress: Option<&DownloadProgressCallback>,
-) -> Result<(), CucaError> {
-    if final_path.exists() {
-        return Ok(());
-    }
-    let parent = final_path.parent().ok_or_else(|| {
-        CucaError::Config(format!(
-            "model path `{}` has no parent directory",
-            final_path.display()
-        ))
-    })?;
-    std::fs::create_dir_all(parent)?;
-
-    let lock = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(with_suffix(final_path, ".lock"))?;
-    lock.lock()?;
-    // Another loader may have finished while this one waited for the lock.
-    if final_path.exists() {
-        return Ok(());
-    }
-    let url = format!(
-        "{}/{repo}/resolve/{revision}/{file}",
-        endpoint.trim_end_matches('/')
-    );
-    let result = download_locked(client, &url, file, sha256, final_path, token, progress).await;
-    drop(lock);
-    result
 }
 
 /// The download proper, run while holding the lock file.
@@ -382,7 +374,8 @@ async fn download_locked(
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<(), CucaError> {
     let partial = with_suffix(final_path, ".partial");
-    let mut hasher = sha256.map(|_| Sha256::new());
+    let new_hasher = || sha256.map(|_| Sha256::new());
+    let mut hasher = new_hasher();
     let mut offset = std::fs::metadata(&partial).map_or(0, |m| m.len());
     if offset > 0
         && let Some(h) = hasher.as_mut()
@@ -419,16 +412,11 @@ async fn download_locked(
                 }
                 _ => {}
             },
-            200 if offset > 0 => {
-                // The server ignored the range: its body is the whole file.
-                offset = 0;
-                if sha256.is_some() {
-                    hasher = Some(Sha256::new());
-                }
-                let total = response.content_length();
-                break (response, total);
-            }
             200 => {
+                // Without a range request this is the whole file; with one,
+                // the server ignored it and its body is the whole file too.
+                offset = 0;
+                hasher = new_hasher();
                 let total = response.content_length();
                 break (response, total);
             }
@@ -451,9 +439,7 @@ async fn download_locked(
         }
         restarted = true;
         offset = 0;
-        if sha256.is_some() {
-            hasher = Some(Sha256::new());
-        }
+        hasher = new_hasher();
         match std::fs::remove_file(&partial) {
             Ok(()) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -678,7 +664,11 @@ mod tests {
         }
     }
 
-    async fn spawn_stub(body: Vec<u8>, mode: Mode) -> Stub {
+    /// Serve every connection from `respond(request head)`: the status text,
+    /// extra header lines (each ending in `\r\n`) and the payload.
+    async fn serve(
+        respond: impl Fn(&str) -> (&'static str, String, Vec<u8>) + Send + 'static,
+    ) -> Stub {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind stub");
@@ -686,8 +676,6 @@ mod tests {
             "http://127.0.0.1:{}",
             listener.local_addr().expect("addr").port()
         );
-        let ranges = Arc::new(Mutex::new(Vec::new()));
-        let seen = ranges.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok((mut socket, _)) = listener.accept().await else {
@@ -701,43 +689,58 @@ mod tests {
                         Ok(n) => raw.extend_from_slice(&buf[..n]),
                     }
                 }
-                let head = String::from_utf8_lossy(&raw).to_string();
-                let range = head.lines().find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("range")
-                        .then(|| value.trim().to_string())
-                });
-                seen.lock().expect("lock").push(range.clone());
-                let start = range
-                    .as_deref()
-                    .and_then(|r| r.strip_prefix("bytes="))
-                    .and_then(|r| r.strip_suffix('-'))
-                    .and_then(|r| r.parse::<usize>().ok());
-                let len = body.len();
-                let (status, extra, payload): (&str, String, &[u8]) = match (mode, start) {
-                    (Mode::NotFound, _) => ("404 Not Found", String::new(), b"nope"),
-                    (Mode::Honour, Some(s)) => (
-                        "206 Partial Content",
-                        format!("content-range: bytes {s}-{}/{len}\r\n", len - 1),
-                        &body[s..],
-                    ),
-                    (Mode::Reject416, Some(_)) => (
-                        "416 Range Not Satisfiable",
-                        format!("content-range: bytes */{len}\r\n"),
-                        b"",
-                    ),
-                    _ => ("200 OK", String::new(), &body[..]),
-                };
+                let (status, extra, payload) = respond(&String::from_utf8_lossy(&raw));
                 let response = format!(
                     "HTTP/1.1 {status}\r\n{extra}content-length: {}\r\nconnection: close\r\n\r\n",
                     payload.len()
                 );
                 let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.write_all(payload).await;
+                let _ = socket.write_all(&payload).await;
                 let _ = socket.shutdown().await;
             }
         });
-        Stub { base, ranges, task }
+        Stub {
+            base,
+            ranges: Arc::default(),
+            task,
+        }
+    }
+
+    /// A stub serving `body` as `mode` says, recording every `Range` header.
+    async fn spawn_stub(body: Vec<u8>, mode: Mode) -> Stub {
+        let ranges = Arc::new(Mutex::new(Vec::new()));
+        let seen = ranges.clone();
+        let mut stub = serve(move |head| {
+            let range = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("range")
+                    .then(|| value.trim().to_string())
+            });
+            seen.lock().expect("lock").push(range.clone());
+            let start = range
+                .as_deref()
+                .and_then(|r| r.strip_prefix("bytes="))
+                .and_then(|r| r.strip_suffix('-'))
+                .and_then(|r| r.parse::<usize>().ok());
+            let len = body.len();
+            match (mode, start) {
+                (Mode::NotFound, _) => ("404 Not Found", String::new(), b"nope".to_vec()),
+                (Mode::Honour, Some(s)) => (
+                    "206 Partial Content",
+                    format!("content-range: bytes {s}-{}/{len}\r\n", len - 1),
+                    body[s..].to_vec(),
+                ),
+                (Mode::Reject416, Some(_)) => (
+                    "416 Range Not Satisfiable",
+                    format!("content-range: bytes */{len}\r\n"),
+                    Vec::new(),
+                ),
+                _ => ("200 OK", String::new(), body.clone()),
+            }
+        })
+        .await;
+        stub.ranges = ranges;
+        stub
     }
 
     /// Temp directory removed on drop.
@@ -900,51 +903,21 @@ mod tests {
 
     /// A stub that serves `routes` (`(path suffix, body)`) with plain 200s.
     async fn spawn_routes(routes: Vec<(String, Vec<u8>)>) -> Stub {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind stub");
-        let base = format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().expect("addr").port()
-        );
-        let ranges = Arc::new(Mutex::new(Vec::new()));
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    return;
-                };
-                let mut raw = Vec::new();
-                let mut buf = [0u8; 2048];
-                while !raw.windows(4).any(|w| w == b"\r\n\r\n") {
-                    match socket.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => raw.extend_from_slice(&buf[..n]),
-                    }
-                }
-                let head = String::from_utf8_lossy(&raw).to_string();
-                let path = head
-                    .lines()
-                    .next()
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .unwrap_or("")
-                    .to_string();
-                let found = routes
-                    .iter()
-                    .find(|(suffix, _)| path.ends_with(suffix.as_str()));
-                let (status, payload): (&str, &[u8]) = match found {
-                    Some((_, body)) => ("200 OK", body),
-                    None => ("404 Not Found", b"nope"),
-                };
-                let response = format!(
-                    "HTTP/1.1 {status}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-                    payload.len()
-                );
-                let _ = socket.write_all(response.as_bytes()).await;
-                let _ = socket.write_all(payload).await;
-                let _ = socket.shutdown().await;
+        serve(move |head| {
+            let path = head
+                .lines()
+                .next()
+                .and_then(|l| l.split_whitespace().nth(1))
+                .unwrap_or("");
+            match routes
+                .iter()
+                .find(|(suffix, _)| path.ends_with(suffix.as_str()))
+            {
+                Some((_, body)) => ("200 OK", String::new(), body.clone()),
+                None => ("404 Not Found", String::new(), b"nope".to_vec()),
             }
-        });
-        Stub { base, ranges, task }
+        })
+        .await
     }
 
     /// A tiny model cut into three parts (the first without tensors): the

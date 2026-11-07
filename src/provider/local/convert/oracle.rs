@@ -13,7 +13,7 @@
 
 use std::fs::File;
 use std::io::BufReader;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use candle_core::quantized::gguf_file;
 use serde_json::Value;
@@ -60,15 +60,97 @@ const PINNED: &[(&str, &str)] = &[
     ),
 ];
 
-fn skip(reason: &str) {
-    if std::env::var("CUCA_REQUIRE_LIVE").as_deref() == Ok("1") {
+// Scaffolding shared with `oracle_dflash` and `oracle_local`.
+
+/// A set, non-empty environment variable.
+pub(super) fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+/// Report a skipped live test; with `CUCA_REQUIRE_LIVE=1` it fails instead.
+pub(super) fn skip(reason: &str) {
+    if env("CUCA_REQUIRE_LIVE").as_deref() == Some("1") {
         panic!("{reason}");
     }
     println!("SKIP: {reason}");
 }
 
+/// The config that converts `source` to F16 (the closest to an f32 oracle;
+/// BF16 checkpoints are exact in it).
+pub(super) fn f16_config(source: ModelSource) -> LocalModelConfig {
+    LocalModelConfig {
+        source,
+        convert: ConvertConfig {
+            quant: WeightQuant::F16,
+        },
+        ..Default::default()
+    }
+}
+
+/// The GGUF converted from the checkpoint directory `dir`.
+pub(super) fn convert_dir(dir: PathBuf) -> PathBuf {
+    let config = f16_config(ModelSource::Dir(dir));
+    resolve_model_path(&config, &config.source).expect("conversion")
+}
+
+pub(super) fn read_gguf(path: &Path) -> gguf_file::Content {
+    gguf_file::Content::read(&mut BufReader::new(File::open(path).unwrap())).unwrap()
+}
+
+/// The token ids of a JSON array.
+pub(super) fn token_ids(v: &Value) -> Vec<u32> {
+    v.as_array()
+        .unwrap()
+        .iter()
+        .map(|x| u32::try_from(x.as_u64().unwrap()).unwrap())
+        .collect()
+}
+
+/// The little-endian f32 values of a raw reference file.
+pub(super) fn floats(raw: &[u8]) -> Vec<f32> {
+    raw.as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
+        .collect()
+}
+
+pub(super) fn argmax(v: &[f32]) -> u32 {
+    v.iter()
+        .enumerate()
+        .max_by(|a, b| a.1.total_cmp(b.1))
+        .map_or(0, |(i, _)| i as u32)
+}
+
+/// `n` greedy ids after a prompt of `prompt_len` tokens whose last-position
+/// logits are `logits`.
+pub(super) fn greedy_continuation(
+    model: &mut Transformer,
+    mut logits: Vec<f32>,
+    prompt_len: usize,
+    n: usize,
+) -> Vec<u32> {
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let next = argmax(&logits);
+        out.push(next);
+        logits = model
+            .forward_ext(
+                &[next],
+                prompt_len + out.len() - 1,
+                Want::Last,
+                Hidden::None,
+                true,
+            )
+            .unwrap()
+            .logits
+            .unwrap();
+    }
+    out
+}
+
 /// The oracle dump made from `repo@revision`'s own safetensors.
-fn dump_for(dir: &std::path::Path, repo: &str, revision: &str) -> Option<Value> {
+fn dump_for(dir: &Path, repo: &str, revision: &str) -> Option<Value> {
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         if entry.path().extension().is_none_or(|e| e != "json") {
             continue;
@@ -98,16 +180,6 @@ fn ids(v: &Value) -> Vec<u32> {
         .unwrap_or_default()
 }
 
-fn argmax(v: &[f32]) -> u32 {
-    v.iter()
-        .enumerate()
-        .fold(
-            (0usize, f32::MIN),
-            |a, (i, &x)| if x > a.1 { (i, x) } else { a },
-        )
-        .0 as u32
-}
-
 #[test]
 fn converted_checkpoints_match_the_transformers_oracle() {
     let Some(ref_dir) = std::env::var_os("CUCA_LOCAL_REF_DIR").map(PathBuf::from) else {
@@ -125,16 +197,10 @@ fn converted_checkpoints_match_the_transformers_oracle() {
             ));
             continue;
         };
-        let config = LocalModelConfig {
-            source: ModelSource::Checkpoint {
-                repo: (*repo).to_string(),
-                revision: (*revision).to_string(),
-            },
-            convert: ConvertConfig {
-                quant: WeightQuant::F16,
-            },
-            ..Default::default()
-        };
+        let config = f16_config(ModelSource::Checkpoint {
+            repo: (*repo).to_string(),
+            revision: (*revision).to_string(),
+        });
         let path = match resolve_model_path(&config, &config.source) {
             Ok(p) => p,
             Err(e @ crate::error::CucaError::Transport { .. }) => {
@@ -142,8 +208,7 @@ fn converted_checkpoints_match_the_transformers_oracle() {
             }
             Err(e) => panic!("{repo}: conversion failed: {e}"),
         };
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&path).unwrap())).unwrap();
+        let content = read_gguf(&path);
         let prompts: Vec<&Value> = dump["prompts"].as_array().unwrap().iter().collect();
         let ctx = prompts
             .iter()
@@ -197,23 +262,7 @@ fn converted_checkpoints_match_the_transformers_oracle() {
                 den += f64::from(*want) * f64::from(*want);
             }
             let rel_l2 = (num / den).sqrt();
-            let mut cur = logits.clone();
-            let mut out = Vec::new();
-            for _ in 0..greedy.len() {
-                let next = argmax(&cur);
-                out.push(next);
-                cur = model
-                    .forward_ext(
-                        &[next],
-                        prompt_ids.len() + out.len() - 1,
-                        Want::Last,
-                        Hidden::None,
-                        true,
-                    )
-                    .unwrap()
-                    .logits
-                    .unwrap();
-            }
+            let out = greedy_continuation(&mut model, logits, prompt_ids.len(), greedy.len());
             let matched = out.iter().zip(&greedy).take_while(|(a, b)| a == b).count();
             // Margin of the oracle's top-1 over its runner-up: a flip inside
             // a near-tie is not a conversion error.

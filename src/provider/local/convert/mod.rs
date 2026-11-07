@@ -44,18 +44,27 @@ pub(crate) mod tensors;
 pub(crate) mod vocab;
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use candle_core::quantized::gguf_file::Value;
 use sha2::{Digest, Sha256};
 
 use self::arch::ConvArch;
 use self::gguf_writer::GgufWriter;
 use self::hf::CheckpointDir;
+use self::safetensors::Shards;
+use self::tensors::Plan;
+use super::download::{self, report};
 use super::tokenizer::Tokenizer;
-use super::{DownloadProgress, DownloadProgressCallback, ModelSource, WeightQuant, download};
+use super::{DownloadProgressCallback, ModelSource, WeightQuant};
 use crate::error::CucaError;
+
+/// A [`CucaError::Config`] from a message (shared by every converter module).
+fn cfg_err(msg: impl Into<String>) -> CucaError {
+    CucaError::Config(msg.into())
+}
 
 /// Write buffer of the output file.
 const WRITE_BUFFER: usize = 1 << 20;
@@ -84,15 +93,32 @@ pub(crate) fn output_path(
             .join("converted")
             .join(format!("dir-{}", dir_key(dir)?))
             .join(file)),
-        _ => Err(CucaError::Config(
-            "only a checkpoint source is converted".into(),
-        )),
+        _ => Err(cfg_err("only a checkpoint source is converted")),
     }
 }
 
-/// The first 16 hex digits of SHA-256 over the canonical path of `dir` and,
-/// for `config.json` and every `*.safetensors` file in name order, its name,
-/// byte length and modification time in seconds.
+/// Mix a file's name, byte length and modification time in seconds into a
+/// cache-key hash.
+fn hash_file_stamp(hasher: &mut Sha256, name: &str, meta: &std::fs::Metadata) {
+    let mtime = meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_secs());
+    hasher.update(b"\0");
+    hasher.update(name.as_bytes());
+    hasher.update(meta.len().to_le_bytes());
+    hasher.update(mtime.to_le_bytes());
+}
+
+/// The first 16 hex digits of a finished cache-key hash.
+fn short_digest(hasher: Sha256) -> String {
+    download::hex(&hasher.finalize()[..8])
+}
+
+/// The cache key of a checkpoint directory: SHA-256 over the canonical path of
+/// `dir` and, for `config.json` and every `*.safetensors` file in name order,
+/// its name, byte length and modification time in seconds.
 fn dir_key(dir: &Path) -> Result<String, CucaError> {
     let canonical = dir.canonicalize().map_err(|e| CucaError::Io {
         message: format!(
@@ -114,28 +140,13 @@ fn dir_key(dir: &Path) -> Result<String, CucaError> {
     let mut hasher = Sha256::new();
     hasher.update(canonical.to_string_lossy().as_bytes());
     for file in files {
-        let meta = std::fs::metadata(&file)?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
-        hasher.update(b"\0");
-        hasher.update(
-            file.file_name()
-                .map(|n| n.to_string_lossy())
-                .unwrap_or_default()
-                .as_bytes(),
-        );
-        hasher.update(meta.len().to_le_bytes());
-        hasher.update(mtime.to_le_bytes());
+        let name = file
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        hash_file_stamp(&mut hasher, &name, &std::fs::metadata(&file)?);
     }
-    Ok(hasher
-        .finalize()
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect())
+    Ok(short_digest(hasher))
 }
 
 /// `general.name` for a checkpoint directory: the repository's name for a
@@ -154,23 +165,13 @@ fn model_name(dir: &Path) -> String {
     repo.rsplit("--").next().unwrap_or(repo).to_string()
 }
 
-fn report(progress: Option<&DownloadProgressCallback>, done: u64, total: u64) {
-    if let Some(cb) = progress {
-        (cb.0)(DownloadProgress {
-            downloaded_bytes: done,
-            total_bytes: Some(total),
-        });
-    }
-}
-
 /// Convert `checkpoint` to the GGUF file `out`.
 ///
 /// Writes `<out>.partial` and renames it into place under an exclusive
 /// `<out>.lock` file (the pattern of the model download), so concurrent
 /// loaders convert once and a present `out` is always complete. An existing
 /// `out` is left alone. `progress` receives the tensors converted so far in
-/// [`DownloadProgress::downloaded_bytes`] and the tensor count in
-/// [`DownloadProgress::total_bytes`].
+/// `downloaded_bytes` and the tensor count in `total_bytes`.
 ///
 /// # Errors
 ///
@@ -189,32 +190,6 @@ pub(crate) fn convert(
     })
 }
 
-/// The exclusive `<out>.lock` file of an output, released on drop.
-pub(crate) struct OutputLock {
-    _file: File,
-}
-
-/// Take the exclusive `<out>.lock` file of `out` (creating the directory and
-/// the empty lock file), waiting for another loader that holds it.
-pub(crate) fn lock_output(out: &Path) -> Result<OutputLock, CucaError> {
-    let parent = out.parent().ok_or_else(|| {
-        CucaError::Config(format!(
-            "output `{}` has no parent directory",
-            out.display()
-        ))
-    })?;
-    std::fs::create_dir_all(parent)?;
-    let mut lock_name = out.as_os_str().to_owned();
-    lock_name.push(".lock");
-    let lock = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(PathBuf::from(lock_name))?;
-    lock.lock()?;
-    Ok(OutputLock { _file: lock })
-}
-
 /// Produce the file `out` with `build`, which writes the path it is given.
 ///
 /// Writes `<out>.partial` and renames it into place under an exclusive
@@ -226,13 +201,13 @@ pub(crate) fn write_atomically(
     out: &Path,
     build: impl FnOnce(&Path) -> Result<(), CucaError>,
 ) -> Result<(), CucaError> {
-    let lock = lock_output(out)?;
+    let lock = download::lock_file(out)?;
     build_locked(&lock, out, build)
 }
 
 /// [`write_atomically`] for a caller that already holds `out`'s lock.
 pub(crate) fn build_locked(
-    _lock: &OutputLock,
+    _lock: &download::FileLock,
     out: &Path,
     build: impl FnOnce(&Path) -> Result<(), CucaError>,
 ) -> Result<(), CucaError> {
@@ -240,16 +215,38 @@ pub(crate) fn build_locked(
     if out.exists() {
         return Ok(());
     }
-    let mut partial_name = out.as_os_str().to_owned();
-    partial_name.push(".partial");
-    let partial = PathBuf::from(partial_name);
-    match build(&partial) {
-        Ok(()) => std::fs::rename(&partial, out)?,
-        Err(e) => {
-            let _ = std::fs::remove_file(&partial);
-            return Err(e);
-        }
+    let partial = download::with_suffix(out, ".partial");
+    if let Err(e) = build(&partial) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(e);
     }
+    std::fs::rename(&partial, out)?;
+    Ok(())
+}
+
+/// Stream the GGUF file `partial`: the metadata `kv`, then every plan's
+/// tensor read from `shards` at `quant`. `progress` receives the plans
+/// written so far and their count.
+pub(super) fn write_plans(
+    partial: &Path,
+    kv: &[(String, Value)],
+    plans: &[Plan],
+    shards: &Shards,
+    quant: WeightQuant,
+    progress: Option<&DownloadProgressCallback>,
+) -> Result<(), CucaError> {
+    let specs: Vec<_> = plans.iter().map(|p| p.spec(quant)).collect();
+    let file = File::create(partial)?;
+    let mut writer = GgufWriter::start(BufWriter::with_capacity(WRITE_BUFFER, file), kv, &specs)?;
+    let total = plans.len() as u64;
+    report(progress, 0, total);
+    for (i, (plan, spec)) in plans.iter().zip(&specs).enumerate() {
+        plan.write(shards, spec.dtype, &mut |bytes| writer.write(bytes))?;
+        report(progress, i as u64 + 1, total);
+    }
+    let mut sink = writer.finish()?;
+    sink.flush()?;
+    sink.get_ref().sync_all()?;
     Ok(())
 }
 
@@ -266,7 +263,7 @@ fn convert_locked(
     }
     let arch = ConvArch::from_config(&ck.config)?;
     let hp = config::Hp::new(&ck.config)?.with_defaults(arch);
-    let shards = safetensors::Shards::open(&ck.shards)?;
+    let shards = Shards::open(&ck.shards)?;
     let n_mtp = if arch.is_qwen35() {
         tensors::mtp_blocks(&shards)
     } else {
@@ -298,24 +295,10 @@ fn convert_locked(
     config::check(&kv, &|n| names.contains(n))?;
     if !matches!(arch, ConvArch::Gemma4Assistant | ConvArch::Mistral4Eagle) {
         let md: HashMap<String, _> = kv.iter().cloned().collect();
-        Tokenizer::from_gguf(&md).map_err(|e| {
-            CucaError::Config(format!("the converted tokenizer does not load: {e}"))
-        })?;
+        Tokenizer::from_gguf(&md)
+            .map_err(|e| cfg_err(format!("the converted tokenizer does not load: {e}")))?;
     }
-
-    let specs: Vec<_> = plans.iter().map(|p| p.spec(quant)).collect();
-    let file = File::create(partial)?;
-    let mut writer = GgufWriter::start(BufWriter::with_capacity(WRITE_BUFFER, file), &kv, &specs)?;
-    let total = plans.len() as u64;
-    report(progress, 0, total);
-    for (i, (plan, spec)) in plans.iter().zip(&specs).enumerate() {
-        plan.write(&shards, spec.dtype, &mut |bytes| writer.write(bytes))?;
-        report(progress, i as u64 + 1, total);
-    }
-    let mut sink = writer.finish()?;
-    sink.flush()?;
-    sink.get_ref().sync_all()?;
-    Ok(())
+    write_plans(partial, &kv, &plans, &shards, quant, progress)
 }
 
 #[cfg(test)]

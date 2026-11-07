@@ -19,69 +19,19 @@
 //! `CUCA_LOCAL_REF_TOL` (default `5e-4`) bounds `max |dlogit|` over every
 //! round, and the draft tokens must be equal.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 
-use candle_core::quantized::gguf_file;
 use serde_json::Value;
 
+use super::oracle::{argmax, convert_dir, env, floats, read_gguf, skip, token_ids};
 use crate::provider::local::model::cpu::dflash::DflashNet;
 use crate::provider::local::model::cpu::{Hidden, Transformer};
 use crate::provider::local::model::{Want, prefill_chunk};
-use crate::provider::local::{
-    ConvertConfig, LocalModelConfig, ModelSource, WeightQuant, resolve_model_path,
-};
-
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
-fn convert_dir(dir: PathBuf) -> PathBuf {
-    let config = LocalModelConfig {
-        source: ModelSource::Dir(dir),
-        convert: ConvertConfig {
-            quant: WeightQuant::F16,
-        },
-        ..Default::default()
-    };
-    resolve_model_path(&config, &config.source).expect("conversion")
-}
-
-fn read_gguf(path: &std::path::Path) -> gguf_file::Content {
-    gguf_file::Content::read(&mut BufReader::new(File::open(path).unwrap())).unwrap()
-}
-
-fn ids(v: &Value) -> Vec<u32> {
-    v.as_array()
-        .unwrap()
-        .iter()
-        .map(|x| u32::try_from(x.as_u64().unwrap()).unwrap())
-        .collect()
-}
-
-fn floats(raw: &[u8]) -> Vec<f32> {
-    raw.as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect()
-}
-
-fn argmax(v: &[f32]) -> u32 {
-    v.iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map_or(0, |(i, _)| i as u32)
-}
 
 #[test]
 fn dflash_drafter_matches_the_transformers_reference() {
     let Some(dir) = env("CUCA_LOCAL_DFLASH_REF") else {
-        let msg = "SKIP: set CUCA_LOCAL_DFLASH_REF (see make_tiny_dflash.py)";
-        assert!(env("CUCA_REQUIRE_LIVE").is_none(), "{msg}");
-        println!("{msg}");
-        return;
+        return skip("set CUCA_LOCAL_DFLASH_REF (see make_tiny_dflash.py)");
     };
     let dir = PathBuf::from(dir);
     let tol: f32 = env("CUCA_LOCAL_REF_TOL").map_or(5e-4, |t| t.parse().unwrap());
@@ -115,7 +65,7 @@ fn dflash_drafter_matches_the_transformers_reference() {
     let mut worst = 0f32;
     let mut seen = 0;
     for (r, round) in rounds.iter().enumerate() {
-        let seq = ids(&round["ids"]);
+        let seq = token_ids(&round["ids"]);
         let anchor = u32::try_from(round["anchor"].as_u64().unwrap()).unwrap();
         // The target runs the positions accepted since the last round, in
         // prefill-sized chunks, and hands their features to the drafter.
@@ -157,7 +107,11 @@ fn dflash_drafter_matches_the_transformers_reference() {
             seq.len()
         );
         worst = worst.max(d);
-        assert_eq!(drafts, ids(&round["draft_capped"]), "round {r} drafts");
+        assert_eq!(
+            drafts,
+            token_ids(&round["draft_capped"]),
+            "round {r} drafts"
+        );
     }
     assert!(worst < tol, "max|dlogit| {worst:.3e} exceeds {tol:.1e}");
 }

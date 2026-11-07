@@ -24,7 +24,9 @@ const VERSION: u32 = 3;
 /// Tensor data alignment, the value of `general.alignment`.
 pub(crate) const ALIGNMENT: u64 = 32;
 /// Dimensions a tensor may have in GGUF.
-const MAX_DIMS: usize = 4;
+pub(crate) const MAX_DIMS: usize = 4;
+/// Zero bytes to pad with; padding is always shorter than [`ALIGNMENT`].
+const ZEROS: [u8; ALIGNMENT as usize] = [0; ALIGNMENT as usize];
 
 /// How a tensor's elements are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,13 +90,10 @@ impl TensorSpec {
     }
 }
 
-fn io(e: std::io::Error) -> CucaError {
-    CucaError::from(e)
-}
-
 fn write_str<W: Write>(w: &mut W, s: &str) -> Result<(), CucaError> {
-    w.write_all(&(s.len() as u64).to_le_bytes()).map_err(io)?;
-    w.write_all(s.as_bytes()).map_err(io)
+    w.write_all(&(s.len() as u64).to_le_bytes())?;
+    w.write_all(s.as_bytes())?;
+    Ok(())
 }
 
 /// GGUF value type ids.
@@ -118,18 +117,18 @@ fn value_type(v: &Value) -> u32 {
 
 fn write_value<W: Write>(w: &mut W, v: &Value) -> Result<(), CucaError> {
     match v {
-        Value::U8(x) => w.write_all(&[*x]),
-        Value::I8(x) => w.write_all(&x.to_le_bytes()),
-        Value::U16(x) => w.write_all(&x.to_le_bytes()),
-        Value::I16(x) => w.write_all(&x.to_le_bytes()),
-        Value::U32(x) => w.write_all(&x.to_le_bytes()),
-        Value::I32(x) => w.write_all(&x.to_le_bytes()),
-        Value::U64(x) => w.write_all(&x.to_le_bytes()),
-        Value::I64(x) => w.write_all(&x.to_le_bytes()),
-        Value::F32(x) => w.write_all(&x.to_le_bytes()),
-        Value::F64(x) => w.write_all(&x.to_le_bytes()),
-        Value::Bool(x) => w.write_all(&[u8::from(*x)]),
-        Value::String(s) => return write_str(w, s),
+        Value::U8(x) => w.write_all(&[*x])?,
+        Value::I8(x) => w.write_all(&x.to_le_bytes())?,
+        Value::U16(x) => w.write_all(&x.to_le_bytes())?,
+        Value::I16(x) => w.write_all(&x.to_le_bytes())?,
+        Value::U32(x) => w.write_all(&x.to_le_bytes())?,
+        Value::I32(x) => w.write_all(&x.to_le_bytes())?,
+        Value::U64(x) => w.write_all(&x.to_le_bytes())?,
+        Value::I64(x) => w.write_all(&x.to_le_bytes())?,
+        Value::F32(x) => w.write_all(&x.to_le_bytes())?,
+        Value::F64(x) => w.write_all(&x.to_le_bytes())?,
+        Value::Bool(x) => w.write_all(&[u8::from(*x)])?,
+        Value::String(s) => write_str(w, s)?,
         Value::Array(items) => {
             let ty = items.first().map_or(4, value_type);
             if items.iter().any(|i| value_type(i) != ty) {
@@ -137,16 +136,14 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> Result<(), CucaError> {
                     "GGUF array values must all have one type".into(),
                 ));
             }
-            w.write_all(&ty.to_le_bytes()).map_err(io)?;
-            w.write_all(&(items.len() as u64).to_le_bytes())
-                .map_err(io)?;
+            w.write_all(&ty.to_le_bytes())?;
+            w.write_all(&(items.len() as u64).to_le_bytes())?;
             for item in items {
                 write_value(w, item)?;
             }
-            Ok(())
         }
     }
-    .map_err(io)
+    Ok(())
 }
 
 /// A tensor copied as it is stored in another GGUF file: its dimensions in
@@ -251,7 +248,7 @@ impl<W: Write> GgufWriter<W> {
             offset += pad_to(t.bytes);
         }
         let padding = (pad_to(pos) - pos) as usize;
-        put(&mut out, &mut pos, &vec![0u8; padding])?;
+        put(&mut out, &mut pos, &ZEROS[..padding])?;
 
         let pending: VecDeque<(String, u64)> =
             tensors.iter().map(|t| (t.name.clone(), t.bytes)).collect();
@@ -270,9 +267,7 @@ impl<W: Write> GgufWriter<W> {
     fn advance(&mut self) -> Result<(), CucaError> {
         while self.left == 0 {
             if self.pad > 0 {
-                self.out
-                    .write_all(&vec![0u8; self.pad as usize])
-                    .map_err(io)?;
+                self.out.write_all(&ZEROS[..self.pad as usize])?;
                 self.pos += self.pad;
                 self.pad = 0;
             }
@@ -298,7 +293,7 @@ impl<W: Write> GgufWriter<W> {
             let n = bytes
                 .len()
                 .min(usize::try_from(self.left).unwrap_or(usize::MAX));
-            self.out.write_all(&bytes[..n]).map_err(io)?;
+            self.out.write_all(&bytes[..n])?;
             self.pos += n as u64;
             self.left -= n as u64;
             bytes = &bytes[n..];
@@ -320,20 +315,20 @@ impl<W: Write> GgufWriter<W> {
                 "converter ended before writing the data of `{name}`"
             )));
         }
-        self.out.flush().map_err(io)?;
+        self.out.flush()?;
         Ok(self.out)
     }
 }
 
 /// Write `bytes` and count them.
 fn put<W: Write>(out: &mut W, pos: &mut u64, bytes: &[u8]) -> Result<(), CucaError> {
-    out.write_all(bytes).map_err(io)?;
+    out.write_all(bytes)?;
     *pos += bytes.len() as u64;
     Ok(())
 }
 
 /// `n` rounded up to the alignment.
-fn pad_to(n: u64) -> u64 {
+pub(crate) fn pad_to(n: u64) -> u64 {
     n.div_ceil(ALIGNMENT) * ALIGNMENT
 }
 

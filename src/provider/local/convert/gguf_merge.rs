@@ -30,18 +30,15 @@ use std::path::{Path, PathBuf};
 use candle_core::quantized::gguf_file::Value;
 use sha2::{Digest, Sha256};
 
-use super::gguf_writer::{ALIGNMENT, GgufWriter, RawTensorSpec};
+use super::gguf_writer::{ALIGNMENT, GgufWriter, MAX_DIMS, RawTensorSpec, pad_to};
+use super::{WRITE_BUFFER, hash_file_stamp, report, short_digest};
 use crate::error::CucaError;
-use crate::provider::local::{DownloadProgress, DownloadProgressCallback};
+use crate::provider::local::DownloadProgressCallback;
 
-/// Write buffer of the merged file.
-const WRITE_BUFFER: usize = 1 << 20;
 /// Bytes copied per read.
 const CHUNK: usize = 8 << 20;
 /// Bytes between two progress reports inside a tensor.
 const REPORT_EVERY: u64 = 64 << 20;
-/// Most tensor dimensions GGUF stores.
-const MAX_DIMS: u32 = 4;
 /// Longest key or string value accepted.
 const MAX_STRING: u64 = 1 << 30;
 /// The metadata keys of a split part that the merged file drops.
@@ -137,7 +134,8 @@ pub(crate) fn plan_local(cache_dir: &Path, path: &Path) -> Result<Option<LocalMe
     hasher.update(dir.to_string_lossy().as_bytes());
     let mut parts = Vec::new();
     for no in 1..=split.count {
-        let part = dir.join(split.part_name(no));
+        let name = split.part_name(no);
+        let part = dir.join(&name);
         let meta = std::fs::metadata(&part).map_err(|e| CucaError::Io {
             message: format!(
                 "part {no} of {} of the split GGUF `{}` is missing: `{}`: {e}",
@@ -146,24 +144,13 @@ pub(crate) fn plan_local(cache_dir: &Path, path: &Path) -> Result<Option<LocalMe
                 part.display()
             ),
         })?;
-        let mtime = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_secs());
-        hasher.update(b"\0");
-        hasher.update(split.part_name(no).as_bytes());
-        hasher.update(meta.len().to_le_bytes());
-        hasher.update(mtime.to_le_bytes());
+        hash_file_stamp(&mut hasher, &name, &meta);
         parts.push(part);
     }
-    let key: String = hasher
-        .finalize()
-        .iter()
-        .take(8)
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let merged = cache_dir.join("merged").join(key).join(split.merged_name());
+    let merged = cache_dir
+        .join("merged")
+        .join(short_digest(hasher))
+        .join(split.merged_name());
     Ok(Some(LocalMerge { parts, merged }))
 }
 
@@ -206,6 +193,20 @@ impl PartHeader {
     }
 }
 
+/// An I/O failure on `path`.
+fn io_err(path: &Path, e: impl std::fmt::Display) -> CucaError {
+    CucaError::Io {
+        message: format!("`{}`: {e}", path.display()),
+    }
+}
+
+/// Open `path` for reading.
+fn open(path: &Path) -> Result<File, CucaError> {
+    File::open(path).map_err(|e| CucaError::Io {
+        message: format!("cannot open `{}`: {e}", path.display()),
+    })
+}
+
 /// A bounded little-endian reader over a part file that names the file in
 /// every error.
 struct Reader<'a> {
@@ -222,19 +223,13 @@ impl Reader<'_> {
         ))
     }
 
-    fn bytes(&mut self, n: usize) -> Result<Vec<u8>, CucaError> {
-        let mut buf = vec![0u8; n];
-        self.inner.read_exact(&mut buf).map_err(|e| CucaError::Io {
-            message: format!("`{}`: {e}", self.path.display()),
-        })?;
-        Ok(buf)
+    fn fill(&mut self, buf: &mut [u8]) -> Result<(), CucaError> {
+        self.inner.read_exact(buf).map_err(|e| io_err(self.path, e))
     }
 
     fn array<const N: usize>(&mut self) -> Result<[u8; N], CucaError> {
         let mut buf = [0u8; N];
-        self.inner.read_exact(&mut buf).map_err(|e| CucaError::Io {
-            message: format!("`{}`: {e}", self.path.display()),
-        })?;
+        self.fill(&mut buf)?;
         Ok(buf)
     }
 
@@ -255,7 +250,8 @@ impl Reader<'_> {
         if n > MAX_STRING || n > self.len {
             return Err(self.fail(format!("a string of {n} bytes")));
         }
-        let bytes = self.bytes(n as usize)?;
+        let mut bytes = vec![0u8; n as usize];
+        self.fill(&mut bytes)?;
         String::from_utf8(bytes).map_err(|_| self.fail("a string that is not UTF-8"))
     }
 
@@ -300,15 +296,8 @@ impl Reader<'_> {
 /// Read the header of one part: metadata, tensor infos and where the data
 /// starts.
 fn read_header(path: &Path) -> Result<PartHeader, CucaError> {
-    let file = File::open(path).map_err(|e| CucaError::Io {
-        message: format!("cannot open `{}`: {e}", path.display()),
-    })?;
-    let len = file
-        .metadata()
-        .map_err(|e| CucaError::Io {
-            message: format!("`{}`: {e}", path.display()),
-        })?
-        .len();
+    let file = open(path)?;
+    let len = file.metadata().map_err(|e| io_err(path, e))?.len();
     let mut r = Reader {
         inner: BufReader::with_capacity(1 << 20, file),
         path,
@@ -339,7 +328,7 @@ fn read_header(path: &Path) -> Result<PartHeader, CucaError> {
     for _ in 0..n_tensors {
         let name = r.string()?;
         let n_dims = r.u32()?;
-        if n_dims == 0 || n_dims > MAX_DIMS {
+        if n_dims == 0 || n_dims as usize > MAX_DIMS {
             return Err(r.fail(format!("tensor `{name}` with {n_dims} dimensions")));
         }
         let gguf_dims = (0..n_dims)
@@ -355,9 +344,7 @@ fn read_header(path: &Path) -> Result<PartHeader, CucaError> {
             extent: 0,
         });
     }
-    let header_end = r.inner.stream_position().map_err(|e| CucaError::Io {
-        message: format!("`{}`: {e}", path.display()),
-    })?;
+    let header_end = r.inner.stream_position().map_err(|e| io_err(path, e))?;
     let mut header = PartHeader {
         metadata,
         tensors,
@@ -371,7 +358,7 @@ fn read_header(path: &Path) -> Result<PartHeader, CucaError> {
             path.display()
         )));
     }
-    header.data_start = header_end.div_ceil(ALIGNMENT) * ALIGNMENT;
+    header.data_start = pad_to(header_end);
     if header.data_start > len && !header.tensors.is_empty() {
         return Err(r.fail("the file ends inside the header"));
     }
@@ -440,20 +427,10 @@ fn validate(parts: &[PathBuf], headers: &[PartHeader]) -> Result<(), CucaError> 
     Ok(())
 }
 
-fn report(progress: Option<&DownloadProgressCallback>, done: u64, total: u64) {
-    if let Some(cb) = progress {
-        (cb.0)(DownloadProgress {
-            downloaded_bytes: done,
-            total_bytes: Some(total),
-        });
-    }
-}
-
 /// Merge `parts` (in part order) into the file `out`, atomically.
 ///
-/// `progress` receives the data bytes copied so far in
-/// [`DownloadProgress::downloaded_bytes`] and their total in
-/// [`DownloadProgress::total_bytes`]. An existing `out` is left alone.
+/// `progress` receives the data bytes copied so far in `downloaded_bytes` and
+/// their total in `total_bytes`. An existing `out` is left alone.
 ///
 /// # Errors
 ///
@@ -524,20 +501,15 @@ pub(crate) fn merge_to(
     let mut reported = 0u64;
     let mut buf = vec![0u8; CHUNK];
     for (path, header) in parts.iter().zip(&headers) {
-        let mut file = File::open(path).map_err(|e| CucaError::Io {
-            message: format!("cannot open `{}`: {e}", path.display()),
-        })?;
+        let mut file = open(path)?;
         for t in &header.tensors {
             file.seek(SeekFrom::Start(header.data_start + t.offset))
-                .map_err(|e| CucaError::Io {
-                    message: format!("`{}`: {e}", path.display()),
-                })?;
+                .map_err(|e| io_err(path, e))?;
             let mut left = t.extent;
             while left > 0 {
                 let n = usize::try_from(left).map_or(CHUNK, |l| l.min(CHUNK));
-                file.read_exact(&mut buf[..n]).map_err(|e| CucaError::Io {
-                    message: format!("`{}`: tensor `{}`: {e}", path.display(), t.name),
-                })?;
+                file.read_exact(&mut buf[..n])
+                    .map_err(|e| io_err(path, format!("tensor `{}`: {e}", t.name)))?;
                 writer.write(&buf[..n])?;
                 left -= n as u64;
                 done += n as u64;

@@ -13,37 +13,13 @@
 //! engine's exact dequantized mode, so only float rounding separates the two
 //! sides: `CUCA_LOCAL_REF_TOL` (default `5e-4`) bounds `max |dlogit|`.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::PathBuf;
 
-use candle_core::quantized::gguf_file;
 use serde_json::Value;
 
+use super::oracle::{convert_dir, env, floats, greedy_continuation, read_gguf, skip, token_ids};
 use crate::provider::local::model::cpu::{Hidden, Transformer};
 use crate::provider::local::model::{Want, prefill_chunk};
-use crate::provider::local::{
-    ConvertConfig, LocalModelConfig, ModelSource, WeightQuant, resolve_model_path,
-};
-
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
-fn ids(v: &Value) -> Vec<u32> {
-    v.as_array()
-        .unwrap()
-        .iter()
-        .map(|x| x.as_u64().unwrap() as u32)
-        .collect()
-}
-
-fn argmax(v: &[f32]) -> u32 {
-    v.iter()
-        .enumerate()
-        .max_by(|a, b| a.1.total_cmp(b.1))
-        .map_or(0, |(i, _)| i as u32)
-}
 
 #[test]
 fn local_checkpoint_matches_the_reference() {
@@ -51,45 +27,28 @@ fn local_checkpoint_matches_the_reference() {
         .map(|dir| (true, dir))
         .or_else(|| env("CUCA_LOCAL_REF_GGUF").map(|file| (false, file)));
     let (Some((is_dir, source)), Some(prefix)) = (source, env("CUCA_LOCAL_REF_PREFIX")) else {
-        let msg =
-            "SKIP: set CUCA_LOCAL_REF_CKPT (or CUCA_LOCAL_REF_GGUF) and CUCA_LOCAL_REF_PREFIX";
-        assert!(env("CUCA_REQUIRE_LIVE").is_none(), "{msg}");
-        println!("{msg}");
-        return;
+        return skip("set CUCA_LOCAL_REF_CKPT (or CUCA_LOCAL_REF_GGUF) and CUCA_LOCAL_REF_PREFIX");
     };
     let tol: f32 = env("CUCA_LOCAL_REF_TOL").map_or(5e-4, |t| t.parse().unwrap());
     let meta: Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{prefix}.json")).unwrap()).unwrap();
-    let prompt = ids(&meta["ids"]);
-    let positions: Vec<usize> = ids(&meta["positions"])
+    let prompt = token_ids(&meta["ids"]);
+    let positions: Vec<usize> = token_ids(&meta["positions"])
         .iter()
         .map(|&p| p as usize)
         .collect();
-    let greedy = ids(&meta["greedy"]);
+    let greedy = token_ids(&meta["greedy"]);
     let vocab = meta["vocab"].as_u64().unwrap() as usize;
     let raw = std::fs::read(format!("{prefix}.bin")).unwrap();
     assert_eq!(raw.len(), positions.len() * vocab * 4, "reference size");
-    let reference: Vec<f32> = raw
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|b| f32::from_le_bytes(*b))
-        .collect();
+    let reference = floats(&raw);
 
     let path = if is_dir {
-        let config = LocalModelConfig {
-            source: ModelSource::Dir(PathBuf::from(&source)),
-            convert: ConvertConfig {
-                quant: WeightQuant::F16,
-            },
-            ..Default::default()
-        };
-        resolve_model_path(&config, &config.source).expect("conversion")
+        convert_dir(PathBuf::from(&source))
     } else {
         PathBuf::from(&source)
     };
-    let content =
-        gguf_file::Content::read(&mut BufReader::new(File::open(&path).unwrap())).unwrap();
+    let content = read_gguf(&path);
     let ctx = prompt.len() + greedy.len() + 8;
     let mut model = Transformer::load_dequantized(&content, &path, ctx).unwrap();
 
@@ -134,23 +93,8 @@ fn local_checkpoint_matches_the_reference() {
     assert!(worst < tol, "max|dlogit| {worst:.3e} exceeds {tol:.1e}");
 
     // Greedy continuation (the last prompt position is always compared).
-    let mut cur = per_pos[prompt.len() - 1].clone().unwrap();
-    let mut out = Vec::new();
-    for _ in 0..greedy.len() {
-        let next = argmax(&cur);
-        out.push(next);
-        cur = model
-            .forward_ext(
-                &[next],
-                prompt.len() + out.len() - 1,
-                Want::Last,
-                Hidden::None,
-                true,
-            )
-            .unwrap()
-            .logits
-            .unwrap();
-    }
+    let cur = per_pos[prompt.len() - 1].clone().unwrap();
+    let out = greedy_continuation(&mut model, cur, prompt.len(), greedy.len());
     println!("REF greedy mine {out:?}\nREF greedy ref  {greedy:?}");
     assert_eq!(out, greedy, "greedy ids");
 }
@@ -167,12 +111,7 @@ fn convert_probe() {
     let [dir, out, quant] = parts.as_slice() else {
         panic!("CUCA_CONVERT_PROBE is `<dir>|<out>|<quant>`");
     };
-    let quant = match *quant {
-        "f16" => WeightQuant::F16,
-        "q8_0" => WeightQuant::Q8_0,
-        "q4_0" => WeightQuant::Q4_0,
-        other => panic!("unknown quant `{other}`"),
-    };
+    let quant: crate::provider::local::WeightQuant = quant.parse().unwrap();
     let checkpoint = super::hf::CheckpointDir::open(std::path::Path::new(dir)).unwrap();
     super::convert(&checkpoint, std::path::Path::new(out), quant, None).unwrap();
     println!("PROBE wrote {out}");
