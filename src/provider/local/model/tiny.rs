@@ -7,7 +7,7 @@
 //! RoPE factors, per-layer embeddings). [`write_spec`] builds the others from
 //! a [`TinySpec`]: Llama (NORM RoPE, Llama 3 factors), Ministral 3 (YaRN,
 //! query scaling), Qwen 2 (biases), Qwen 3 (QK-norm, query width different
-//! from the embedding width), Phi 3 (fused QKV and gate-up, LongRoPE, partial
+//! from the embedding width), Phi 4 mini (fused QKV and gate-up, LongRoPE, partial
 //! rotary), SmolLM 3 (NoPE layers), Granite (scales), OLMoE and Qwen 3 MoE
 //! (experts), OLMo 2 (post-norms only), ERNIE 4.5, Gemma 3 (post-norms,
 //! sliding pattern) and Muse Glimmer (attention gate, sandwich norms).
@@ -418,7 +418,7 @@ impl TinySpec {
         s
     }
 
-    /// Phi 3: fused QKV and gate-up, partial rotary (24 of 32 dimensions),
+    /// Phi 4 mini: fused QKV and gate-up, partial rotary (24 of 32 dimensions),
     /// LongRoPE factors (the model's original context is 16 < `CONTEXT`, so
     /// the long list applies) and an attention factor.
     pub(crate) fn phi3() -> Self {

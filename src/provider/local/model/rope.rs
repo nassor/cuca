@@ -30,7 +30,7 @@ pub(crate) enum RopeKind {
     /// (Llama, SmolLM3, Granite).
     Norm,
     /// Half-split pairs `(i, i + n_dims / 2)`: `LLAMA_ROPE_TYPE_NEOX` (Gemma,
-    /// Qwen, Phi 3).
+    /// Qwen, Phi 4 mini).
     Neox,
 }
 

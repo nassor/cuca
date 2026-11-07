@@ -25,7 +25,7 @@ pub(crate) enum Arch {
     Qwen2,
     /// Qwen 3: QK-norm.
     Qwen3,
-    /// Phi 4-mini (and Phi 3.x): fused QKV and gate-up, LongRoPE, partial rotary.
+    /// Phi 4 mini (`phi3`): fused QKV and gate-up, LongRoPE, partial rotary.
     Phi3,
     /// SmolLM 3: Llama-style with NoPE layers.
     Smollm3,

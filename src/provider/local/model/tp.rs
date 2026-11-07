@@ -717,7 +717,7 @@ mod tests {
     /// with the numbers worked out by hand.
     #[test]
     fn fused_and_gated_rows_land_on_the_shards_heads() {
-        // Phi 3 sized: 4 query and 4 KV heads of 32, `[q | k | v]` has 384
+        // Phi 4 mini sized: 4 query and 4 KV heads of 32, `[q | k | v]` has 384
         // rows (q 0..128, k 128..256, v 256..384).
         let heads = tp(2, 1).heads(4, 4);
         assert_eq!(

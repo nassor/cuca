@@ -54,7 +54,7 @@
 //! (each running sequence owns a state slot, [`StateSlot`]):
 //!
 //! - the slot's current end (the live state);
-//! - the **verify record**: after a `Want::All` call over `2..=17` rows
+//! - the verify record: after a `Want::All` call over `2..=17` rows
 //!   ([`cpu::MAX_VERIFY_ROWS`], one drafter verification round: the pending
 //!   token and up to 16 drafts) every position inside the call (`start ..
 //!   start + rows`, the position before its first row included), until the
@@ -70,7 +70,7 @@
 //! any chunking, a token-by-token run and a restore-and-replay produce the
 //! same logits and state bit for bit.
 //!
-//! A **snapshot** ([`Model::snapshot`], [`Model::restore`]) is a copy of one
+//! A snapshot ([`Model::snapshot`], [`Model::restore`]) is a copy of one
 //! slot's state, which the engine's prefix store keeps next to the K/V
 //! blocks of the same prefix. The GPU engine follows the same rules for the
 //! live state and the snapshots (its states are immutable device tensors, so
@@ -139,9 +139,9 @@
 //!   length) never needs a released block. Prefix hits shorten by whole
 //!   blocks until every group still holds the blocks its window needs.
 //! - A hybrid model's recurrent state is independent of the context length:
-//!   `Hparams::recurrent_state_bytes` is 4 bytes times the sum, over
-//!   the delta-net layers, of `(conv_kernel - 1) * conv_dim + n_v_heads *
-//!   head_k_dim * head_v_dim` (Qwen3.5-0.8B: 18 layers of 1.12 MB, 20.2 MB).
+//!   the state is 4 bytes times the sum, over the delta-net layers, of
+//!   `(conv_kernel - 1) * conv_dim + n_v_heads * head_k_dim * head_v_dim`
+//!   (Qwen3.5-0.8B: 18 layers of 1.12 MB, 20.2 MB).
 //!   Every state slot (one per sequence that can run, `max_sequences`) keeps
 //!   that state live and, once a model verifies drafts, the verify record: one
 //!   more copy and `4 * (conv_dim + 2 * n_v_heads)` bytes per verified row per

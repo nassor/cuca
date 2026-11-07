@@ -1,10 +1,10 @@
 //! The DFlash block-diffusion drafter (`dflash` GGUF files; Muse Glimmer's
 //! `Muse-Glimmer-30B-assistant`, Qwen's and others').
 //!
-//! A DFlash drafter proposes a whole block of tokens in **one** forward pass
+//! A DFlash drafter proposes a whole block of tokens in one forward pass
 //! instead of chaining one token per pass. It owns no embedding table and no
 //! output head: it reads the target's, and it never sees the target's K/V
-//! cache. What it reads from the target is its **hidden features**, the
+//! cache. What it reads from the target is its hidden features, the
 //! residual stream after a few chosen decoder layers, of every position the
 //! target has accepted ([`Hidden::Layers`](super::Hidden)).
 //!
@@ -22,11 +22,11 @@
 //! (the scores scale by `1 / sqrt(head_dim)`, nothing else), whose keys and
 //! values are
 //!
-//! - the **context**, one K/V entry per accepted position and layer:
+//! - the context, one K/V entry per accepted position and layer:
 //!   `K = rope(k_norm(k_proj(c)))`, `V = v_proj(c)` for the context row
 //!   `c = RMSNorm_enc(fc(concat(features)))` (`fc` maps the `n_features`
 //!   concatenated `n_embd` feature rows to the drafter width), and
-//! - the **block rows** themselves, projected from the normed block input
+//! - the block rows themselves, projected from the normed block input
 //!   like any attention layer.
 //!
 //! The block rows attend to each other in both directions (bidirectional)
@@ -34,7 +34,7 @@
 //! when it has one: a query at position `q` reads a key at position `p` only
 //! when `|q - p| <= window` (transformers'
 //! `create_bidirectional_sliding_window_mask`; the checkpoint's reference).
-//! After the last layer, the final norm and the **target's** LM head (with
+//! After the last layer, the final norm and the target's LM head (with
 //! its logit multiplier and soft-cap, so the drafter's distribution lives on
 //! the target's scale) turn rows `1..=k` into the logits of the `k` draft
 //! tokens, the token after `first` first: one pass, `k` tokens.

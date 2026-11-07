@@ -5,15 +5,15 @@
 //! built from the same file bytes the resident mode reads, so the output is
 //! the resident mode's (bit for bit on the CPU).
 //!
-//! An **expert** is the triple `(ffn_gate_exps[e], ffn_up_exps[e],
+//! An expert is the triple `(ffn_gate_exps[e], ffn_up_exps[e],
 //! ffn_down_exps[e])` of one layer: three contiguous byte ranges of the three
 //! stacked tensors ([`ExpertSlice`]). The tiers, fastest first:
 //!
-//! - **device** (GPU devices only, owned by the GPU engine): built device
+//! - device (GPU devices only, owned by the GPU engine): built device
 //!   weights, fed from the RAM tier or directly from disk;
-//! - **RAM** ([`ExpertStore`]): built experts (CPU: quantized matmul weights;
+//! - RAM ([`ExpertStore`]): built experts (CPU: quantized matmul weights;
 //!   GPU: packed, upload-ready host bytes);
-//! - **disk**: the GGUF file, read with positional reads ([`read_exact_at`])
+//! - disk: the GGUF file, read with positional reads ([`read_exact_at`])
 //!   by a pool of loader threads, so one file handle serves every thread.
 //!
 //! # Bounds
@@ -31,24 +31,24 @@
 //!
 //! # Policy
 //!
-//! - **Heat**: every routing adds each expert's pick count to its heat
+//! - Heat: every routing adds each expert's pick count to its heat
 //!   (saturating); after every [`HEAT_DECAY_ROWS`] routed rows of a layer all
 //!   its counts halve, so the heat follows the recent traffic.
-//! - **Eviction**: the victim is the resident expert not needed later in the
+//! - Eviction: the victim is the resident expert not needed later in the
 //!   current layer pass with the lowest `(heat, last use)`, ties to the lower
 //!   expert id; if every resident expert is needed later, the one needed
 //!   farthest ahead (the largest id, since a pass computes its experts in
 //!   ascending order), and only when it is needed after the expert being
 //!   fetched. A prefill that scans many cold experts evicts them among
 //!   themselves and keeps the hot ones.
-//! - **Pass** ([`Pass`]): the routing gives the ascending list of experts a
+//! - Pass ([`Pass`]): the routing gives the ascending list of experts a
 //!   layer needs. Missing experts are read in that order while the table plus
 //!   the reads in flight fit the slots (at most twice the loader threads in
 //!   flight; with no RAM tier, at most the loader threads); compute walks the
 //!   list in the same ascending order and waits
 //!   for each expert's read, so the accumulation order, and with it the
 //!   arithmetic, is the resident mode's.
-//! - **Warm start**: heat exported from an earlier session
+//! - Warm start: heat exported from an earlier session
 //!   ([`TierShared::heat`], `LocalModel::expert_heat`) seeds the counters and
 //!   loads the hottest experts of every layer at startup.
 

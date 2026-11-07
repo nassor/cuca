@@ -34,9 +34,9 @@
 //! the recurrence cannot be undone. [`DeltaCell`] holds, next to the live
 //! state, what cache rollback restores from:
 //!
-//! - a **snapshot**: a copy of the state at one chosen position (the
+//! - a snapshot: a copy of the state at one chosen position (the
 //!   engine's prefix store keeps them);
-//! - the **verify record** of the last forward call over several rows: a copy
+//! - the verify record of the last forward call over several rows: a copy
 //!   of the state before the call and the per-row inputs of the recurrence
 //!   (the raw convolution inputs, `beta`, `exp(g)`: `conv_dim + 2 * n_v_heads`
 //!   floats per row, not a state copy per row). The state after any prefix of

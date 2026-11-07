@@ -32,8 +32,8 @@
 //!   ([`dequant_row`]) and uploaded as f32 for burn's float matmul, exactly.
 //!   They cost 4 bytes per element on the device whatever their size in the
 //!   file (an F16 or BF16 weight doubles).
-//! - **Every other quantized dtype** (Q5_0, Q5_1, Q8_1 and the K-quants Q2_K
-//!   to Q6_K) is dequantized on the host row by row and **requantized to Q8_0**
+//! - Every other quantized dtype (Q5_0, Q5_1, Q8_1 and the K-quants Q2_K
+//!   to Q6_K) is dequantized on the host row by row and requantized to Q8_0
 //!   ([`quantize_q8_0`]), then packed like a native Q8_0 weight, so it costs
 //!   about 1.06 bytes per element on the device instead of 4: a 3.8
 //!   B-parameter Q4_K_M file needs about 4 GB rather than 15 GB. The price is
@@ -144,18 +144,18 @@
 //! splits burn's fused elementwise kernels at other places: they agree to
 //! float rounding.
 //!
-//! - **Device tier**: per MoE layer a pool of `device_slots` slots
+//! - Device tier: per MoE layer a pool of `device_slots` slots
 //!   ([`GpuExpertBank::Tiered`]), with `device_slots = min(n_expert,
 //!   device_bytes / per_expert)` where `per_expert` is the size of one
 //!   expert of every MoE layer in the kernels' layout (the file's bytes for
 //!   Q4_0, Q4_1 and Q8_0). A budget below `n_used` experts per layer fails
 //!   the load with `CucaError::Config` naming the minimum. The pool is
 //!   allocated at load.
-//! - **RAM tier** (`ram_bytes > 0`): the packed host copies of experts
+//! - RAM tier (`ram_bytes > 0`): the packed host copies of experts
 //!   ([`PackedExpert`]: the words of one expert, shared with the uploads). They
 //!   are converted on the loader threads, never on the engine thread.
 //!   `ram_bytes == 0` disables the tier.
-//! - **Disk**: a pool of loader threads reads the three matrices of a missing
+//! - Disk: a pool of loader threads reads the three matrices of a missing
 //!   expert with positional reads and converts them.
 //!
 //! Per MoE layer pass the kernels' routing is read back (ids and weights, a
@@ -228,7 +228,7 @@
 //! (delta-net) models, latent attention, a drafter and tiered or host experts
 //! are not supported with shards. What this module does for it:
 //!
-//! - **Weights per shard**: one [`Weights`] per device, built with the
+//! - Weights per shard: one [`Weights`] per device, built with the
 //!   shard's own hyperparameters (its head counts) from sliced reads
 //!   ([`WeightReader::matrix_cut`]: a shard reads only its rows from the
 //!   file and copies its columns' bytes out of whole rows; a column cut that
@@ -239,17 +239,17 @@
 //!   output scales and the RoPE tables are replicated, and so is the
 //!   `attn_output` bias, added once after the reduction. Q/K/V biases are
 //!   cut with their rows.
-//! - **Experts**: every shard holds every expert, each cut to `ff / world`
+//! - Experts: every shard holds every expert, each cut to `ff / world`
 //!   units (gate and up rows, down columns, before [`mk::pack_expert`]
 //!   converts them), and the shared expert is cut the same way. The router
 //!   is replicated, so the kernels keep indexing experts by id, and the
 //!   weighted sum over experts is linear in the down projection, so the
 //!   shards' partial outputs add up exactly.
-//! - **K/V pools**: one set per shard with the shard's own KV heads and the
+//! - K/V pools: one set per shard with the shard's own KV heads and the
 //!   same blocks and block tables ([`GpuTransformer::kv_pool_bytes`] sums
 //!   them: a KV head that is replicated, because the model has fewer KV
 //!   heads than shards, is stored on every shard that serves it).
-//! - **A layer**: every shard runs [`Weights::mixer`] (pre-norm, the
+//! - A layer: every shard runs [`Weights::mixer`] (pre-norm, the
 //!   projections of its heads, RoPE, K/V writes, paged attention and the
 //!   output projection's matmul, no bias), the partial `[t, n_embd]`
 //!   outputs are summed ([`tp::Collective::all_reduce_sum`]), every shard
@@ -261,14 +261,14 @@
 //!   nothing is reduced. The residual stream is replicated: the
 //!   embedding rows go to every shard, and the final norm and the LM head
 //!   run on shard 0's copy.
-//! - **The sum** is host-staged (every part read back, added in f32 in shard
+//! - The sum is host-staged (every part read back, added in f32 in shard
 //!   order, uploaded to every device) except for distinct CUDA devices on
 //!   Linux, which use NCCL through burn's `all_reduce`. Two sharded loads
 //!   agree bit for bit on the host path; a sharded and a single-device run
 //!   agree to float rounding (the reduction order differs). The host path
 //!   costs two device-to-host round trips per layer: it is for correctness
 //!   and for GPUs without a collective, not for speed.
-//! - **Memory**: each device holds about `1 / world` of the attention,
+//! - Memory: each device holds about `1 / world` of the attention,
 //!   FFN and expert weights plus the replicated tensors (and shard 0 the
 //!   LM head), its own K/V pools and, during a forward pass, the whole
 //!   `[t, n_embd]` residual stream. The host reads each shard's tensors in
@@ -282,7 +282,7 @@
 //! on the left returns wrong values, the `vecmat` autotune entry is shared
 //! by every shape of a power-of-two bucket (a candidate tuned for one shape
 //! fails to launch for another), and the autotune key holds the shapes, the
-//! element types and the strides but **not the quantization scheme**, so a
+//! element types and the strides but not the quantization scheme, so a
 //! candidate tuned for a Q8_0 weight is replayed on a Q4_0 one. The own kernels
 //! ([`mk::dense_gemv`], [`mk::dense_dequant`]) have none of these limits.
 //! Only the f32 weights (the float dtypes) go through burn's matmul, and
@@ -4833,13 +4833,13 @@ const DEQUANT_SLICE_BYTES: usize = 64 << 20;
 /// A weight in several row chunks runs one product per chunk and
 /// concatenates the outputs.
 ///
-/// - A **quantized** chunk (Q4_0, Q4_1, Q8_0 in the layout of
+/// - A quantized chunk (Q4_0, Q4_1, Q8_0 in the layout of
 ///   [`mk::DenseLayout`]) with at most [`GEMV_ROWS`] input rows runs the
 ///   matrix-vector kernel of this crate (f32 accumulation straight from the
 ///   blocks, one thread per row and token). More rows dequantize slices of
 ///   the weight to f32 ([`mk::dense_dequant`]) and use burn's float matmul.
 ///   burn's own quantized matmul is not used (see the module docs).
-/// - An **f32** chunk follows burn 0.22's rules on Vulkan: `t > 1` runs
+/// - An f32 chunk follows burn 0.22's rules on Vulkan: `t > 1` runs
 ///   `(w · xᵀ)ᵀ`; `t == 1` runs `x · wᵀ` ([`vecmat_fits`]) or, for other
 ///   shapes, a product of the token duplicated into two rows (the `vecmat`
 ///   autotune entry is shared by every shape of its power-of-two bucket).
@@ -7985,7 +7985,7 @@ mod tests {
         }
     }
 
-    /// What a shard reads of every per-layer matrix of a tiny Phi 3 (fused
+    /// What a shard reads of every per-layer matrix of a tiny Phi 4 mini (fused
     /// QKV and gate-up, several row ranges per cut), Llama (separate
     /// projections) and Gemma 3 (one KV head, replicated) equals the rows
     /// and columns of the whole tensor read the plain way, at world 2 for
