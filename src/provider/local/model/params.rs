@@ -175,6 +175,7 @@ impl DeltaSpec {
 
     /// f32 values of one layer's recurrent state: the convolution history
     /// (`conv_kernel - 1` rows of `conv_dim`) and the `n_v_heads` matrices.
+    #[cfg(test)]
     pub(crate) fn state_floats(&self) -> usize {
         (self.conv_kernel - 1) * self.conv_dim()
             + self.n_v_heads * self.head_k_dim * self.head_v_dim
@@ -378,7 +379,7 @@ impl Hparams {
     /// Bytes of the recurrent state of one sequence: every delta-net layer's
     /// convolution history and state matrices in f32. Independent of the
     /// context length (Qwen 3.5 0.8B: 18 layers, 1.12 MB each).
-    #[allow(dead_code)] // Reported by the memory docs and tests; no runtime consumer.
+    #[cfg(test)]
     pub(crate) fn recurrent_state_bytes(&self) -> usize {
         self.layers
             .iter()

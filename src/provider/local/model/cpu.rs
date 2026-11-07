@@ -44,6 +44,7 @@ mod eagle;
 mod head;
 mod mla;
 pub(super) mod paged_attn;
+mod pairs;
 pub(crate) use eagle::EagleHead;
 pub(crate) use head::NextnHead;
 use paged_attn::{PoolShape, attend_paged_rows, gather, store_rows};
@@ -82,40 +83,38 @@ impl Drop for RowExact {
     }
 }
 
-/// A matmul weight: candle's, or the row-batched kernel's.
-enum Weight {
+/// A matmul weight: candle's, or the row-batched kernel's; [`RowExact`]
+/// applies to its float weights.
+enum QMatMul {
     Candle(CandleMatMul),
     /// A Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0 weight read once for all activation
     /// rows (see [`qmm`]).
     RowBatched(QmmWeight),
 }
 
-/// A matmul weight, applying [`RowExact`] to float weights.
-struct QMatMul(Weight);
-
 impl QMatMul {
     fn tensor(t: Tensor) -> Self {
-        Self(Weight::Candle(CandleMatMul::Tensor(t)))
+        Self::Candle(CandleMatMul::Tensor(t))
     }
 
     fn from_arc(qt: Arc<QTensor>) -> candle_core::Result<Self> {
-        CandleMatMul::from_arc(qt).map(|m| Self(Weight::Candle(m)))
+        CandleMatMul::from_arc(qt).map(Self::Candle)
     }
 
     /// The row-batched kernel over `qt` when it serves its dtype and shape,
     /// else candle's matmul.
     fn from_arc_row_batched(qt: Arc<QTensor>) -> candle_core::Result<Self> {
         match QmmWeight::new(&qt) {
-            Some(w) => Ok(Self(Weight::RowBatched(w))),
+            Some(w) => Ok(Self::RowBatched(w)),
             None => Self::from_arc(qt),
         }
     }
 
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
-        let m = match &self.0 {
-            Weight::Candle(m) => m,
+        let m = match self {
+            Self::Candle(m) => m,
             // Row-independent by construction: no per-row split needed.
-            Weight::RowBatched(w) => return row_batched(w, x, w.n()),
+            Self::RowBatched(w) => return row_batched(w, x, w.n()),
         };
         let float_weight = !matches!(m, CandleMatMul::QTensor(_));
         if float_weight && ROW_EXACT.get() && x.rank() >= 2 && x.dim(D::Minus2)? > 1 {
@@ -132,7 +131,7 @@ impl QMatMul {
     /// `rows` weight rows). The row-batched kernel computes just those; any
     /// other weight computes the whole product and drops the rest.
     fn forward_rows(&self, x: &Tensor, rows: usize) -> candle_core::Result<Tensor> {
-        if let Weight::RowBatched(w) = &self.0 {
+        if let Self::RowBatched(w) = self {
             return row_batched(w, x, rows.min(w.n()));
         }
         let y = self.forward(x)?;
@@ -152,7 +151,7 @@ impl QMatMul {
     /// picks tokens the target verifies, so the half-Q8_0-step rounding it adds
     /// to the logits cannot change the output.
     fn proposal_copy(&self) -> candle_core::Result<Option<Self>> {
-        let Weight::Candle(CandleMatMul::QTensor(qt)) = &self.0 else {
+        let Self::Candle(CandleMatMul::QTensor(qt)) = self else {
             return Ok(None);
         };
         let q = requantize_q8_0(qt)?;
@@ -288,11 +287,54 @@ enum GateUp {
     },
 }
 
-/// One routed expert's three matmul weights.
+/// A gated FFN's three matmul weights: one routed expert, or a shared expert.
 pub(crate) struct CpuExpert {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
+}
+
+impl CpuExpert {
+    /// `down(act(gate x) * up x)` over the rows `x`.
+    fn forward(&self, x: &Tensor, act: Act) -> candle_core::Result<Tensor> {
+        self.down
+            .forward(&(activate(&self.gate.forward(x)?, act)? * self.up.forward(x)?)?)
+    }
+
+    /// Run the expert over the rows of `flat` `(t, n_embd)` that `picks`
+    /// (token row, routing weight) name, and add each weighted output row to
+    /// its token's row of `out` (`t * n_embd` floats).
+    fn add_picks(
+        &self,
+        flat: &Tensor,
+        picks: &[(u32, f32)],
+        act: Act,
+        out: &mut [f32],
+    ) -> candle_core::Result<()> {
+        let n_embd = flat.dim(1)?;
+        let ids = Tensor::from_vec(
+            picks.iter().map(|&(token, _)| token).collect(),
+            picks.len(),
+            flat.device(),
+        )?;
+        let y = self
+            .forward(&flat.index_select(&ids, 0)?, act)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        for (&(token, weight), y) in picks.iter().zip(y.chunks_exact(n_embd)) {
+            let at = token as usize * n_embd;
+            let Some(dst) = out.get_mut(at..at + n_embd) else {
+                candle_core::bail!(
+                    "a routed token ({token}) outside the {t} rows",
+                    t = out.len() / n_embd
+                );
+            };
+            for (o, &y) in dst.iter_mut().zip(y) {
+                *o += y * weight;
+            }
+        }
+        Ok(())
+    }
 }
 
 /// The routed experts of one MoE layer in host RAM, computed on the CPU for a
@@ -361,9 +403,8 @@ impl HostExperts {
         act: Act,
     ) -> Result<Vec<f32>, CucaError> {
         let run = || -> candle_core::Result<Vec<f32>> {
-            let dev = &Device::Cpu;
-            let flat = Tensor::from_slice(rows, (t, n_embd), dev)?;
-            let mut out = Tensor::zeros((t, n_embd), DType::F32, dev)?;
+            let flat = Tensor::from_slice(rows, (t, n_embd), &Device::Cpu)?;
+            let mut out = vec![0f32; t * n_embd];
             for (e, picks) in routing.per_expert.iter().enumerate() {
                 if picks.is_empty() {
                     continue;
@@ -372,17 +413,9 @@ impl HostExperts {
                     .experts
                     .get(e)
                     .ok_or_else(|| candle_core::Error::msg("expert out of range"))?;
-                let (ids, weights): (Vec<u32>, Vec<f32>) = picks.iter().copied().unzip();
-                let m = ids.len();
-                let ids = Tensor::from_vec(ids, m, dev)?;
-                let weights = Tensor::from_vec(weights, (m, 1), dev)?;
-                let picked = flat.index_select(&ids, 0)?;
-                let hidden =
-                    (activate(&x.gate.forward(&picked)?, act)? * x.up.forward(&picked)?)?;
-                let y = x.down.forward(&hidden)?.broadcast_mul(&weights)?;
-                out = out.index_add(&ids, &y, 0)?;
+                x.add_picks(&flat, picks, act, &mut out)?;
             }
-            out.flatten_all()?.to_vec1::<f32>()
+            Ok(out)
         };
         run().map_err(candle_err)
     }
@@ -404,9 +437,7 @@ enum ExpertBank {
 /// scaled per token by `sigmoid(gate_inp . x)` (Qwen 3.5 MoE) or, without a
 /// gate, added as it is (Mistral Small 4).
 struct SharedExpert {
-    gate: QMatMul,
-    up: QMatMul,
-    down: QMatMul,
+    ffn: CpuExpert,
     /// `ffn_gate_inp_shexp`, `n_embd` floats; `None` for an ungated shared
     /// expert.
     gate_inp: Option<Vec<f32>>,
@@ -419,8 +450,7 @@ impl SharedExpert {
     /// value never depends on how many rows share the call.
     fn forward(&self, flat: &Tensor, act: Act) -> candle_core::Result<Tensor> {
         let (t, n_embd) = flat.dims2()?;
-        let hidden = (activate(&self.gate.forward(flat)?, act)? * self.up.forward(flat)?)?;
-        let y = self.down.forward(&hidden)?;
+        let y = self.ffn.forward(flat, act)?;
         let Some(gate_inp) = &self.gate_inp else {
             return Ok(y);
         };
@@ -687,19 +717,8 @@ impl Loader<'_> {
         cols: usize,
     ) -> Result<Vec<QMatMul>, CucaError> {
         let slice = ExpertSlice::read(self.content, tensor_name, n_expert, rows, cols)?;
-        let mut raw = vec![0u8; n_expert * slice.file_bytes];
-        let io = |e: std::io::Error| err(format!("tensor `{tensor_name}`: {e}"));
-        self.reader
-            .seek(SeekFrom::Start(slice.offset(0)))
-            .map_err(io)?;
-        self.reader.read_exact(&mut raw).map_err(io)?;
-        raw.chunks_exact(slice.file_bytes.max(1))
-            .map(|chunk| {
-                let qt = expert_qtensor(&slice, chunk)
-                    .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
-                self.to_matmul(Arc::new(qt), tensor_name)
-            })
-            .collect()
+        let [weights] = self.expert_weights(tensor_name, n_expert, [slice])?;
+        Ok(weights)
     }
 
     /// The fused `[n_expert, 2 * ff, cols]` gate/up expert tensor
@@ -713,25 +732,38 @@ impl Loader<'_> {
         cols: usize,
     ) -> Result<(Vec<QMatMul>, Vec<QMatMul>), CucaError> {
         let (gate, up) = ExpertSlice::read_fused(self.content, tensor_name, n_expert, ff, cols)?;
-        let mut raw = vec![0u8; n_expert * gate.stride];
+        let [gates, ups] = self.expert_weights(tensor_name, n_expert, [gate, up])?;
+        Ok((gates, ups))
+    }
+
+    /// Read the matrices `parts` of the expert tensor `tensor_name` (one
+    /// stride apart per expert, `parts[0]` first in the file) in one pass
+    /// and build one matmul weight per expert for each of them.
+    fn expert_weights<const N: usize>(
+        &mut self,
+        tensor_name: &str,
+        n_expert: usize,
+        parts: [ExpertSlice; N],
+    ) -> Result<[Vec<QMatMul>; N], CucaError> {
+        let mut out: [Vec<QMatMul>; N] = std::array::from_fn(|_| Vec::with_capacity(n_expert));
+        let Some(first) = parts.first() else {
+            return Ok(out);
+        };
         let io = |e: std::io::Error| err(format!("tensor `{tensor_name}`: {e}"));
+        let mut raw = vec![0u8; n_expert * first.stride];
         self.reader
-            .seek(SeekFrom::Start(gate.offset(0)))
+            .seek(SeekFrom::Start(first.offset(0)))
             .map_err(io)?;
         self.reader.read_exact(&mut raw).map_err(io)?;
-        let mut gates = Vec::with_capacity(n_expert);
-        let mut ups = Vec::with_capacity(n_expert);
-        for chunk in raw.chunks_exact(gate.stride.max(1)) {
-            for (slice, bytes, out) in [
-                (&gate, &chunk[..gate.file_bytes], &mut gates),
-                (&up, &chunk[gate.file_bytes..], &mut ups),
-            ] {
-                let qt = expert_qtensor(slice, bytes)
+        for chunk in raw.chunks_exact(first.stride.max(1)) {
+            for (part, weights) in parts.iter().zip(&mut out) {
+                let at = (part.offset(0) - first.offset(0)) as usize;
+                let qt = expert_qtensor(part, &chunk[at..at + part.file_bytes])
                     .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
-                out.push(self.to_matmul(Arc::new(qt), tensor_name)?);
+                weights.push(self.to_matmul(Arc::new(qt), tensor_name)?);
             }
         }
-        Ok((gates, ups))
+        Ok(out)
     }
 
     /// The experts of MoE layer `il` (FFN width `ff`): every expert read and
@@ -1552,11 +1584,7 @@ impl Transformer {
             });
             tokens.extend_from_slice(r.tokens);
         }
-        let embed = self
-            .embed
-            .as_ref()
-            .ok_or_else(|| err("a drafter has no token embedding; use `draft`"))?;
-        let mut embeddings = embed.rows(&tokens, self.hp.embd_scale)?;
+        let mut embeddings = self.embedding_rows(&tokens)?;
         self.hp.norm_embeddings(&mut embeddings);
         let per_layer = match (&mut self.ple, self.hp.ple_dim) {
             (Some(ple), Some(dim)) => Some(ple.table.rows(&tokens, (dim as f32).sqrt())?),
@@ -1668,18 +1696,27 @@ impl Transformer {
         self.hp.arch
     }
 
-    /// The `n_embd`-wide embedding row of `token` (scaled as the first layer
-    /// sees it): a drafter's input half next to the target's hidden state.
+    /// The embedding rows of `ids`, concatenated (scaled as the first layer
+    /// sees them): a drafter's input half next to the target's hidden state.
     ///
     /// # Errors
     ///
     /// [`CucaError::Provider`] for a drafter model, which has no token
     /// embedding.
-    pub(crate) fn embedding_row(&self, token: u32) -> Result<Vec<f32>, CucaError> {
+    pub(crate) fn embedding_rows(&self, ids: &[u32]) -> Result<Vec<f32>, CucaError> {
         self.embed
             .as_ref()
-            .ok_or_else(|| err("a drafter has no token embedding"))?
-            .rows(&[token], self.hp.embd_scale)
+            .ok_or_else(|| err("a drafter has no token embedding; use `draft`"))?
+            .rows(ids, self.hp.embd_scale)
+    }
+
+    /// The `n_embd`-wide embedding row of `token` ([`Transformer::embedding_rows`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Transformer::embedding_rows`].
+    pub(crate) fn embedding_row(&self, token: u32) -> Result<Vec<f32>, CucaError> {
+        self.embedding_rows(&[token])
     }
 
     /// One drafting step. `input` is the drafter's `2 * n_embd_out` floats
@@ -2050,7 +2087,7 @@ impl Transformer {
         let lw = &self.layers[il];
         let t = x.dim(1)?;
         self.block(lw, x, ple.map(|p| (p, il)), t, |h| match &lw.mixer {
-            Mixer::Attention(aw) => self.attention(il, aw, h, segs, ext),
+            Mixer::Attention(aw) => self.attention_in(&self.attn_calls(il, segs, ext)?, aw, h),
             Mixer::Mla(mw) => self.mla_in(&self.attn_calls(il, segs, ext)?, mw, h),
             Mixer::Delta(dw) => dw.forward_segs(h, segs),
         })
@@ -2112,22 +2149,6 @@ impl Transformer {
         }
     }
 
-    /// The attention of layer `il` over the normed input `h` `(1, T, n_embd)`
-    /// of the concatenated rows of the sequences `segs` describe: the
-    /// projections, QK-norm, RoPE and the output gate and projection run over
-    /// all rows, the K/V cache write and the attention itself per sequence.
-    fn attention(
-        &self,
-        il: usize,
-        aw: &AttnWeights,
-        h: &Tensor,
-        segs: &[Seg<'_>],
-        ext: Option<(&ExtKv, usize)>,
-    ) -> candle_core::Result<Tensor> {
-        let calls = self.attn_calls(il, segs, ext)?;
-        self.attention_in(&calls, aw, h)
-    }
-
     /// The attention calls of layer `il`: what each sequence of `segs`
     /// contributes and the K/V storage it reads and writes.
     fn attn_calls<'a>(
@@ -2180,9 +2201,11 @@ impl Transformer {
             .collect()
     }
 
-    /// [`Transformer::attention`] for the calls `calls` describe (all of one
-    /// layer), which also lets the multi-token-prediction head run it over
-    /// its own cache.
+    /// The attention of one layer over the normed input `h` `(1, T, n_embd)`
+    /// of the rows the `calls` describe (all one layer's): the projections,
+    /// QK-norm, RoPE and the output gate and projection run over all rows,
+    /// the K/V cache write and the attention itself per call. The
+    /// multi-token-prediction head runs it over its own cache.
     fn attention_in(
         &self,
         calls: &[AttnCall<'_>],
@@ -2256,17 +2279,17 @@ impl Transformer {
             self.store_kv(calls, aw, k, v)?;
         }
 
-        let mut outs = Vec::with_capacity(calls.len());
-        for call in calls {
-            if let [_] = calls {
-                outs.push(self.attend_call(call, &q)?);
-            } else {
-                outs.push(self.attend_call(call, &q.narrow(2, call.offset, call.t)?)?);
-            }
-        }
-        let attn = match outs.as_mut_slice() {
-            [only] => only.clone(),
-            _ => Tensor::cat(&outs, 1)?,
+        let mut outs = calls
+            .iter()
+            .map(|call| match calls {
+                [_] => self.attend_call(call, &q),
+                _ => self.attend_call(call, &q.narrow(2, call.offset, call.t)?),
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let attn = if outs.len() == 1 {
+            outs.swap_remove(0)
+        } else {
+            Tensor::cat(&outs, 1)?
         };
         let attn = match gate {
             Some(gate) => (attn * sigmoid(&gate)?)?,
@@ -2353,58 +2376,36 @@ impl Transformer {
         })
     }
 
-    /// Rotate the rows `m` `(1, heads, t, d)` of a layer, the first at RoPE
-    /// position `rope_start` (a NoPE layer passes them through).
-    fn rotate_rows(
-        &self,
-        spec: &LayerSpec,
-        m: &Tensor,
-        rope_start: usize,
-        t: usize,
-    ) -> candle_core::Result<Tensor> {
-        match spec.rope {
-            Some(r) => {
-                let (table, rope_spec) = (&self.ropes[r], &self.hp.ropes[r]);
-                apply_rope(
-                    m,
-                    &table.cos.narrow(0, rope_start, t)?,
-                    &table.sin.narrow(0, rope_start, t)?,
-                    rope_spec.kind,
-                    rope_spec.n_dims,
-                )
-            }
-            None => Ok(m.clone()),
-        }
-    }
-
-    /// [`Transformer::rotate_rows`] over the concatenated rows `m` `(1,
-    /// heads, T, d)` of several sequences, each at its own positions.
+    /// Rotate the rows `m` `(1, heads, T, d)` of the concatenated rows of
+    /// several sequences, each at its own RoPE positions (a NoPE layer passes
+    /// them through).
     fn rotate_calls(
         &self,
         spec: &LayerSpec,
         m: &Tensor,
         calls: &[AttnCall<'_>],
     ) -> candle_core::Result<Tensor> {
-        match (spec.rope, calls) {
-            (None, _) => Ok(m.clone()),
-            (Some(_), [only]) => self.rotate_rows(spec, m, only.rope_start, only.t),
-            (Some(r), _) => {
-                let (table, rope_spec) = (&self.ropes[r], &self.hp.ropes[r]);
-                let rows = |t: &Tensor| {
-                    calls
-                        .iter()
-                        .map(|c| t.narrow(0, c.rope_start, c.t))
-                        .collect::<candle_core::Result<Vec<_>>>()
-                };
-                apply_rope(
-                    m,
-                    &Tensor::cat(&rows(&table.cos)?, 0)?,
-                    &Tensor::cat(&rows(&table.sin)?, 0)?,
-                    rope_spec.kind,
-                    rope_spec.n_dims,
-                )
-            }
-        }
+        let Some(r) = spec.rope else {
+            return Ok(m.clone());
+        };
+        let (table, rope_spec) = (&self.ropes[r], &self.hp.ropes[r]);
+        let rows = |t: &Tensor| match calls {
+            [only] => t.narrow(0, only.rope_start, only.t),
+            _ => Tensor::cat(
+                &calls
+                    .iter()
+                    .map(|c| t.narrow(0, c.rope_start, c.t))
+                    .collect::<candle_core::Result<Vec<_>>>()?,
+                0,
+            ),
+        };
+        apply_rope(
+            m,
+            &rows(&table.cos)?,
+            &rows(&table.sin)?,
+            rope_spec.kind,
+            rope_spec.n_dims,
+        )
     }
 
     /// Normalise, rotate and store the key and value projections `k` and `v`
@@ -2535,9 +2536,11 @@ fn load_layer(
             experts: loader.expert_bank(il, spec.n_expert, ff, n_embd, fused, tiers)?,
             shared: match shared_ff {
                 Some(sff) => Some(SharedExpert {
-                    gate: loader.matmul(&blk(name::FFN_GATE_SHEXP), &[sff, n_embd])?,
-                    up: loader.matmul(&blk(name::FFN_UP_SHEXP), &[sff, n_embd])?,
-                    down: loader.matmul(&blk(name::FFN_DOWN_SHEXP), &[n_embd, sff])?,
+                    ffn: CpuExpert {
+                        gate: loader.matmul(&blk(name::FFN_GATE_SHEXP), &[sff, n_embd])?,
+                        up: loader.matmul(&blk(name::FFN_UP_SHEXP), &[sff, n_embd])?,
+                        down: loader.matmul(&blk(name::FFN_DOWN_SHEXP), &[n_embd, sff])?,
+                    },
                     gate_inp: if hp.behavior.shared_expert_ungated {
                         None
                     } else {
@@ -2885,7 +2888,7 @@ impl FfnWeights {
                         Some(store.pass(*il, &needed))
                     }
                 };
-                let mut out = Tensor::zeros((t, n_embd), DType::F32, f.device())?;
+                let mut out = vec![0f32; t * n_embd];
                 for (e, picks) in routing.per_expert.iter().enumerate() {
                     if picks.is_empty() {
                         continue;
@@ -2905,16 +2908,9 @@ impl FfnWeights {
                             return Err(candle_core::Error::msg("tiered experts without a pass"));
                         }
                     };
-                    let (ids, weights): (Vec<u32>, Vec<f32>) = picks.iter().copied().unzip();
-                    let m = ids.len();
-                    let ids = Tensor::from_vec(ids, m, f.device())?;
-                    let weights = Tensor::from_vec(weights, (m, 1), f.device())?;
-                    let rows = flat.index_select(&ids, 0)?;
-                    let hidden =
-                        (activate(&x.gate.forward(&rows)?, act)? * x.up.forward(&rows)?)?;
-                    let y = x.down.forward(&hidden)?.broadcast_mul(&weights)?;
-                    out = out.index_add(&ids, &y, 0)?;
+                    x.add_picks(&flat, picks, act, &mut out)?;
                 }
+                let mut out = Tensor::from_vec(out, (t, n_embd), f.device())?;
                 if let Some(shared) = shared {
                     out = (out + shared.forward(&flat, act)?)?;
                 }
@@ -3674,10 +3670,7 @@ mod tests {
         }
         for token in 0..t {
             let row = flat.narrow(0, token, 1).unwrap();
-            let h = (shared.gate.forward(&row).unwrap().silu().unwrap()
-                * shared.up.forward(&row).unwrap())
-            .unwrap();
-            let y = vec_of(shared.down.forward(&h).unwrap());
+            let y = vec_of(shared.ffn.forward(&row, Act::Silu).unwrap());
             let dot: f64 = values[token * 64..][..64]
                 .iter()
                 .zip(shared.gate_inp.as_ref().unwrap())
@@ -3800,14 +3793,14 @@ mod tests {
         let q6 = Arc::new(QTensor::quantize(&dense, GgmlDType::Q6K).unwrap());
         let weight = QMatMul::from_arc_row_batched(q6).unwrap();
         assert!(
-            matches!(weight.0, Weight::Candle(_)),
+            matches!(weight, QMatMul::Candle(_)),
             "a K-quant stays on candle's kernel"
         );
         let copy = weight
             .proposal_copy()
             .unwrap()
             .expect("a K-quant gets a copy");
-        let Weight::RowBatched(w) = &copy.0 else {
+        let QMatMul::RowBatched(w) = &copy else {
             panic!("the copy is served by the row-batched kernel");
         };
         assert_eq!((w.n(), w.k()), (rows, cols));
@@ -4498,8 +4491,10 @@ mod hybrid_tests {
         let mut pools = KvPools::new(m.kv_layout());
         let mut seq = pools.seq();
         pools.reserve(&mut seq, t).unwrap();
+        let segs = [solo_seg(t, &seq.tables)];
+        let calls = m.attn_calls(3, &segs, None).unwrap();
         let got = m
-            .attention(3, aw, &input, &[solo_seg(t, &seq.tables)], None)
+            .attention_in(&calls, aw, &input)
             .unwrap()
             .flatten_all()
             .unwrap()

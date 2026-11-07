@@ -68,7 +68,7 @@
 //! - [`DflashNet::truncate`]`(shared)` keeps the positions below `shared` (a
 //!   position's row depends only on the tokens up to it, so the first
 //!   `shared` rows stay valid when a new prompt shares `shared` tokens with
-//!   the cached ids), [`DflashNet::reset`] drops everything;
+//!   the cached ids; `truncate(0)` drops everything);
 //! - a draft needs `hi == len`: without the context up to the pending token
 //!   the drafter proposes nothing (the round runs plain).
 //!
@@ -515,14 +515,8 @@ impl DflashNet {
         (self.lo, self.hi, self.k.clone(), self.v.clone())
     }
 
-    /// Forget every position.
-    pub(crate) fn reset(&mut self) {
-        self.lo = 0;
-        self.hi = 0;
-    }
-
     /// Keep the positions below `shared` (they depend on the first `shared`
-    /// tokens only) and forget the rest.
+    /// tokens only) and forget the rest; `truncate(0)` forgets everything.
     pub(crate) fn truncate(&mut self, shared: usize) {
         self.hi = self.hi.min(shared);
         self.lo = self.lo.min(self.hi);
@@ -655,11 +649,7 @@ impl DflashNet {
         let rows = k + 1;
         let mut ids = vec![self.geo.mask_token; rows];
         ids[0] = first;
-        let embeddings = target
-            .embed
-            .as_ref()
-            .ok_or_else(|| err("the DFlash drafter needs a target with a token embedding"))?
-            .rows(&ids, target.hp.embd_scale)?;
+        let embeddings = target.embedding_rows(&ids)?;
         let mut logits = self
             .block_logits(target, embeddings, len, k)
             .map_err(candle_err)?;
@@ -1307,7 +1297,7 @@ mod tests {
             "beyond the context"
         );
         assert_eq!(net.held(), (40, 42));
-        net.reset();
+        net.truncate(0);
         assert_eq!(net.held(), (0, 0));
         assert!(none(&net, 0, 3).is_empty());
     }

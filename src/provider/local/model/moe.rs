@@ -31,9 +31,15 @@ pub(crate) fn route(logits: &[f32], t: usize, spec: &MoeSpec) -> Routing {
         order.clear();
         order.extend(0..n);
         // Largest probability first; the lower expert index wins ties, so the
-        // order is total and an unstable sort gives the stable sort's result.
-        order.sort_unstable_by(|&a, &b| probs[b].total_cmp(&probs[a]).then(a.cmp(&b)));
-        let kept = &order[..spec.n_used];
+        // order is total and the top `n_used` come out the same as from a
+        // full sort: select them, then order just those.
+        let by_prob = |&a: &usize, &b: &usize| probs[b].total_cmp(&probs[a]).then(a.cmp(&b));
+        let k = spec.n_used;
+        if 0 < k && k < n {
+            order.select_nth_unstable_by(k - 1, by_prob);
+        }
+        order[..k].sort_unstable_by(by_prob);
+        let kept = &order[..k];
         let denominator = if spec.norm_weights {
             kept.iter().map(|&e| probs[e]).sum::<f32>()
         } else {

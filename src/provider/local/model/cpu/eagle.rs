@@ -39,7 +39,7 @@
 //! a skipped pair is a position the drafter cannot see, which costs a worse
 //! proposal and never changes output), plus the *tail*, the hidden row of the
 //! last observed position, which still waits for its successor token.
-//! [`EagleHead::truncate`] and [`EagleHead::reset`] keep it consistent with the
+//! [`EagleHead::truncate`] (`truncate(0)` empties it) keeps it consistent with the
 //! trunk, and drafting writes into slots past the committed ones, which the
 //! next observation overwrites.
 //!
@@ -75,6 +75,7 @@ use super::super::layout::{LayerLayout, name};
 use super::super::paged::{BLOCK_SIZE, BlockTable};
 use super::super::params::Hparams;
 use super::super::{candle_err, err, read_hparams};
+use super::pairs::PairLog;
 use super::{
     AttnCall, FfnWeights, KvAccess, KvLayer, LayerWeights, Loader, Mixer, QMatMul, Transformer,
     load_layer, rms,
@@ -98,20 +99,16 @@ pub(crate) struct EagleHead {
     /// The identity block table over the pools: slot `s` is row `s %
     /// BLOCK_SIZE` of block `s / BLOCK_SIZE`.
     table: BlockTable,
-    capacity: usize,
-    /// The pair index `j` (the pair `(h[j], t[j + 1])`) of every committed
-    /// slot, strictly ascending.
-    pairs: Vec<usize>,
-    /// Position and final-norm hidden row of the last observed position,
-    /// awaiting the token that follows it.
-    tail: Option<(usize, Vec<f32>)>,
+    /// The committed pairs and the tail; its capacity is the number of K/V
+    /// slots.
+    log: PairLog,
 }
 
 impl EagleHead {
     /// Number of committed pairs (K/V slots in use).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.pairs.len()
+        self.log.pairs.len()
     }
 
     /// The latent rows of every layer for the committed slots (tests).
@@ -120,32 +117,13 @@ impl EagleHead {
         self.kv
             .iter()
             .zip(&self.hp.layers)
-            .map(|(layer, spec)| layer.lock().k[..self.pairs.len() * spec.head_dim].to_vec())
+            .map(|(layer, spec)| layer.lock().k[..self.log.pairs.len() * spec.head_dim].to_vec())
             .collect()
     }
 
-    /// Forget every pair and the tail.
-    pub(crate) fn reset(&mut self) {
-        self.pairs.clear();
-        self.tail = None;
-    }
-
-    /// The first `shared` tokens of the sequence stay as they were and every
-    /// later one may change: keep the pairs `(h[j], t[j + 1])` with
-    /// `j + 1 < shared` (the tokens and so the hidden rows they depend on are
-    /// unchanged) and the tail when its position is below `shared`.
+    /// See [`PairLog::truncate`].
     pub(crate) fn truncate(&mut self, shared: usize) {
-        let keep = self.pairs.partition_point(|&j| j + 1 < shared);
-        self.pairs.truncate(keep);
-        if self.tail.as_ref().is_some_and(|(at, _)| *at >= shared) {
-            self.tail = None;
-        }
-    }
-
-    /// Drop the pairs with an index of at least `first`.
-    fn drop_from(&mut self, first: usize) {
-        let keep = self.pairs.partition_point(|&j| j < first);
-        self.pairs.truncate(keep);
+        self.log.truncate(shared);
     }
 
     /// The attention call of layer `il`: `t` rows from slot `slot`, the first
@@ -234,9 +212,7 @@ impl Transformer {
             hp,
             kv,
             table: (0..blocks as u32).collect(),
-            capacity,
-            pairs: Vec::new(),
-            tail: None,
+            log: PairLog::new(capacity),
         })
     }
 
@@ -303,7 +279,7 @@ impl Transformer {
             )));
         }
         // Pair `(h[j], t[j + 1])` for `j` from `first`.
-        let (first, rows, ids) = match head.tail.as_ref().filter(|(at, _)| at + 1 == pos) {
+        let (first, rows, ids) = match head.log.tail.as_ref().filter(|(at, _)| at + 1 == pos) {
             Some((_, prev)) => {
                 let mut rows = Vec::with_capacity(n * d);
                 rows.extend_from_slice(prev);
@@ -312,23 +288,23 @@ impl Transformer {
             }
             None => (pos, Cow::Borrowed(&hidden[..(n - 1) * d]), &tokens[1..]),
         };
-        head.drop_from(first);
+        head.log.drop_from(first);
         let m = ids.len();
         if m > 0 {
-            let slot = head.pairs.len();
-            if slot + m > head.capacity {
+            let slot = head.log.pairs.len();
+            if slot + m > head.log.capacity {
                 return Err(err(format!(
                     "the EAGLE cache holds {} positions, {} do not fit",
-                    head.capacity,
+                    head.log.capacity,
                     slot + m
                 )));
             }
             let emb = self.embedding_rows(ids)?;
             self.eagle_store(head, emb, &rows, slot, first)
                 .map_err(candle_err)?;
-            head.pairs.extend(first..first + m);
+            head.log.pairs.extend(first..first + m);
         }
-        head.tail = Some((pos + n - 1, hidden[(n - 1) * d..].to_vec()));
+        head.log.tail = Some((pos + n - 1, hidden[(n - 1) * d..].to_vec()));
         Ok(())
     }
 
@@ -395,11 +371,11 @@ impl Transformer {
                 "EAGLE draft: needs the hidden row of the last position",
             ));
         }
-        let slot = head.pairs.len();
-        if slot + k > head.capacity {
+        let slot = head.log.pairs.len();
+        if slot + k > head.log.capacity {
             return Err(err(format!(
                 "the EAGLE cache holds {} positions, {} do not fit",
-                head.capacity,
+                head.log.capacity,
                 slot + k
             )));
         }
@@ -784,7 +760,7 @@ mod tests {
         assert_eq!(same.len(), n);
 
         // Reset forgets the tail as well.
-        same.reset();
+        same.truncate(0);
         assert_eq!(same.len(), 0);
         m.eagle_observe(&mut same, 3, &tokens[..2], &hidden[..2 * D])
             .unwrap();

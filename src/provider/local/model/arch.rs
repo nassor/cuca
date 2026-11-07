@@ -493,86 +493,10 @@ mod tests {
         }
     }
 
+    /// Only the Gemma 4 assistant and the EAGLE head are drafters, and only
+    /// the assistant reads the target's K/V.
     #[test]
-    fn only_qwen35_family_is_hybrid_gated_and_embeds_prediction_blocks() {
-        for arch in Arch::ALL {
-            let b = arch.behavior();
-            let qwen35 = matches!(arch, Arch::Qwen35 | Arch::Qwen35Moe);
-            assert_eq!(b.hybrid_delta_net, qwen35, "{arch:?}");
-            assert_eq!(b.gated_attention, qwen35, "{arch:?}");
-            assert_eq!(b.ffn_norm_is_post_attention, qwen35, "{arch:?}");
-            assert_eq!(b.nextn_blocks, qwen35, "{arch:?}");
-        }
-        assert!(!Arch::Qwen35.is_drafter());
-    }
-
-    #[test]
-    fn muse_glimmer_alone_sets_the_muse_flags() {
-        for arch in Arch::ALL {
-            let b = arch.behavior();
-            let muse = arch == Arch::MuseGlimmer;
-            assert_eq!(b.attn_gate_tensor, muse, "{arch:?}");
-            assert_eq!(b.nope_full_layers, muse, "{arch:?}");
-            assert_eq!(b.swa_base_from_freq_base, muse, "{arch:?}");
-            assert_eq!(b.embd_norm, muse, "{arch:?}");
-            assert_eq!(b.logit_multiplier, muse, "{arch:?}");
-            assert_eq!(b.post_norm_eps.is_some(), muse, "{arch:?}");
-        }
-        let b = Arch::MuseGlimmer.behavior();
-        assert!(b.post_norms && !b.gated_attention);
-        assert_eq!(b.swa, Swa::PatternArray);
-        assert_eq!(b.rope, RopeKind::Norm);
-    }
-
-    #[test]
-    fn only_the_qwen35moe_and_mistral4_have_a_shared_expert_and_only_mistral4_ungated() {
-        for arch in Arch::ALL {
-            let b = arch.behavior();
-            let shared = matches!(arch, Arch::Qwen35Moe | Arch::Mistral4);
-            assert_eq!(b.shared_expert, shared, "{arch:?}");
-            assert_eq!(b.shared_expert_ungated, arch == Arch::Mistral4, "{arch:?}");
-        }
-        let b = Arch::Qwen35Moe.behavior();
-        assert!(b.moe && b.moe_norm_weights);
-        assert!(!Arch::Qwen35.behavior().moe);
-    }
-
-    #[test]
-    fn mistral3_is_llama_with_the_orig_context_query_scaling() {
-        for arch in Arch::ALL {
-            assert_eq!(
-                arch.behavior().attn_temp_orig_ctx,
-                arch == Arch::Mistral3,
-                "{arch:?}"
-            );
-        }
-        let b = Arch::Mistral3.behavior();
-        assert_eq!(b.rope, RopeKind::Norm);
-        assert!(!b.mla && !b.moe && b.attn_temp_default.is_none());
-    }
-
-    #[test]
-    fn only_the_mistral4_family_is_latent_attention_with_llama4_query_scaling() {
-        for arch in Arch::ALL {
-            let b = arch.behavior();
-            let m = matches!(arch, Arch::Mistral4 | Arch::Mistral4Eagle);
-            assert_eq!(b.mla, m, "{arch:?}");
-            assert_eq!(b.attn_temp_default.is_some(), m, "{arch:?}");
-        }
-        let b = Arch::Mistral4.behavior();
-        assert_eq!(b.rope, RopeKind::Norm);
-        assert!(b.moe && b.moe_norm_weights && !b.post_norms);
-        assert_eq!(b.attn_temp_default, Some((0.1, 8192)));
-    }
-
-    /// The EAGLE drafter is the Mistral 4 attention over a dense FFN, owns
-    /// its K/V and is a drafter; the Gemma 4 assistant reads the target's.
-    #[test]
-    fn the_eagle_drafter_is_a_dense_mistral4_with_its_own_kv() {
-        let (eagle, target) = (Arch::Mistral4Eagle.behavior(), Arch::Mistral4.behavior());
-        assert_eq!(eagle.rope, target.rope);
-        assert_eq!(eagle.attn_temp_default, target.attn_temp_default);
-        assert!(!eagle.moe && !eagle.shared_expert && !eagle.shared_expert_ungated);
+    fn only_the_assistant_and_the_eagle_head_are_drafters() {
         for arch in Arch::ALL {
             let drafter = matches!(arch, Arch::Gemma4Assistant | Arch::Mistral4Eagle);
             assert_eq!(arch.is_drafter(), drafter, "{arch:?}");

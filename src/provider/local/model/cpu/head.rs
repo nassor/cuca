@@ -38,8 +38,8 @@
 //! at `pos - 1`, and makes the last row the new tail; it drops every pair
 //! with an index at or above its first new one, so re-observing replayed
 //! rows replaces what they supersede. [`NextnHead::truncate`] drops the pairs
-//! and the tail that a changed token invalidates (see there); [`NextnHead::reset`]
-//! empties everything. Drafting writes its steps into slots *past* the
+//! and the tail that a changed token invalidates (see there; `truncate(0)`
+//! empties everything). Drafting writes its steps into slots *past* the
 //! committed ones and never commits them: the next `observe` (which the
 //! engine calls after every forward pass, drafted or not) overwrites them.
 //!
@@ -98,6 +98,7 @@ use candle_core::{DType, Device, Tensor};
 use super::super::layout::{LayerLayout, name};
 use super::super::params::LayerSpec;
 use super::super::{candle_err, err};
+use super::pairs::PairLog;
 use super::{
     AttnCall, KvAccess, LayerWeights, Loader, Mixer, QMatMul, Transformer, load_layer, rms,
 };
@@ -121,23 +122,19 @@ pub(crate) struct NextnHead {
     /// K and V `(1, n_kv_head, context_length, head_dim)`: slot `s` holds the
     /// entry of pair `pairs[s]`; slots past `pairs.len()` are scratch.
     kv: (Tensor, Tensor),
-    capacity: usize,
     /// Rows of the LM head the draft steps rank: the first `vocab_rows` token
     /// ids.
     vocab_rows: usize,
-    /// The pair index `j` (the pair `(h[j], t[j + 1])`) of every committed
-    /// slot, strictly ascending.
-    pairs: Vec<usize>,
-    /// Position and final-norm hidden row of the last observed position,
-    /// awaiting the token that follows it.
-    tail: Option<(usize, Vec<f32>)>,
+    /// The committed pairs and the tail; its capacity is the number of K/V
+    /// slots.
+    log: PairLog,
 }
 
 impl NextnHead {
     /// Number of committed pairs (K/V slots in use).
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.pairs.len()
+        self.log.pairs.len()
     }
 
     /// The K and V rows of the committed slots (tests).
@@ -146,7 +143,7 @@ impl NextnHead {
         [&self.kv.0, &self.kv.1]
             .into_iter()
             .map(|t| {
-                t.narrow(2, 0, self.pairs.len())
+                t.narrow(2, 0, self.log.pairs.len())
                     .and_then(|rows| rows.contiguous())
                     .and_then(|rows| rows.flatten_all())
                     .and_then(|rows| rows.to_vec1::<f32>())
@@ -155,28 +152,9 @@ impl NextnHead {
             .collect()
     }
 
-    /// Forget every pair and the tail.
-    pub(crate) fn reset(&mut self) {
-        self.pairs.clear();
-        self.tail = None;
-    }
-
-    /// The first `shared` tokens of the sequence stay as they were and every
-    /// later one may change: keep the pairs `(h[j], t[j + 1])` with
-    /// `j + 1 < shared` (the tokens and so the hidden rows they depend on are
-    /// unchanged) and the tail when its position is below `shared`.
+    /// See [`PairLog::truncate`].
     pub(crate) fn truncate(&mut self, shared: usize) {
-        let keep = self.pairs.partition_point(|&j| j + 1 < shared);
-        self.pairs.truncate(keep);
-        if self.tail.as_ref().is_some_and(|(at, _)| *at >= shared) {
-            self.tail = None;
-        }
-    }
-
-    /// Drop the pairs with an index of at least `first`.
-    fn drop_from(&mut self, first: usize) {
-        let keep = self.pairs.partition_point(|&j| j < first);
-        self.pairs.truncate(keep);
+        self.log.truncate(shared);
     }
 }
 
@@ -250,20 +228,9 @@ impl Transformer {
             block,
             spec: spec.clone(),
             kv: (zeros()?, zeros()?),
-            capacity,
             vocab_rows: self.vocab.min(PROPOSAL_ROWS),
-            pairs: Vec::new(),
-            tail: None,
+            log: PairLog::new(capacity),
         })
-    }
-
-    /// The embedding rows of `ids`, concatenated (scaled as the first trunk
-    /// layer sees them).
-    pub(super) fn embedding_rows(&self, ids: &[u32]) -> Result<Vec<f32>, CucaError> {
-        self.embed
-            .as_ref()
-            .ok_or_else(|| err("this model has no token embedding"))?
-            .rows(ids, self.hp.embd_scale)
     }
 
     /// The head inputs `eh_proj(cat(enorm(emb), hnorm(hidden)))` of `m` pairs:
@@ -315,7 +282,7 @@ impl Transformer {
             )));
         }
         // Pair `(h[j], t[j + 1])` for `j` from `first`.
-        let (first, rows, ids) = match head.tail.as_ref().filter(|(at, _)| at + 1 == pos) {
+        let (first, rows, ids) = match head.log.tail.as_ref().filter(|(at, _)| at + 1 == pos) {
             Some((_, prev)) => {
                 let mut rows = Vec::with_capacity(n * d);
                 rows.extend_from_slice(prev);
@@ -324,23 +291,23 @@ impl Transformer {
             }
             None => (pos, Cow::Borrowed(&hidden[..(n - 1) * d]), &tokens[1..]),
         };
-        head.drop_from(first);
+        head.log.drop_from(first);
         let m = ids.len();
         if m > 0 {
-            let slot = head.pairs.len();
-            if slot + m > head.capacity {
+            let slot = head.log.pairs.len();
+            if slot + m > head.log.capacity {
                 return Err(err(format!(
                     "the head cache holds {} positions, {} do not fit",
-                    head.capacity,
+                    head.log.capacity,
                     slot + m
                 )));
             }
             let emb = self.embedding_rows(ids)?;
             self.head_store(head, emb, &rows, slot, first)
                 .map_err(candle_err)?;
-            head.pairs.extend(first..first + m);
+            head.log.pairs.extend(first..first + m);
         }
-        head.tail = Some((pos + n - 1, hidden[(n - 1) * d..].to_vec()));
+        head.log.tail = Some((pos + n - 1, hidden[(n - 1) * d..].to_vec()));
         Ok(())
     }
 
@@ -400,11 +367,11 @@ impl Transformer {
         if len == 0 || hidden.len() != self.hp.n_embd {
             return Err(err("head draft: needs the hidden row of the last position"));
         }
-        let slot = head.pairs.len();
-        if slot + k > head.capacity {
+        let slot = head.log.pairs.len();
+        if slot + k > head.log.capacity {
             return Err(err(format!(
                 "the head cache holds {} positions, {} do not fit",
-                head.capacity,
+                head.log.capacity,
                 slot + k
             )));
         }
@@ -726,7 +693,7 @@ mod tests {
         assert_eq!(same.len(), n);
 
         // Reset forgets the tail as well.
-        same.reset();
+        same.truncate(0);
         assert_eq!(same.len(), 0);
         m.head_observe(&mut same, 3, &tokens[..2], &hidden[..2 * D])
             .unwrap();

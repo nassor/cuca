@@ -645,21 +645,7 @@ impl Drafter {
     /// cache was emptied), the deferred rows included. A no-op for the file
     /// drafters.
     pub(crate) fn reset(&mut self) {
-        match self {
-            Self::InTrunk(head, lag) => {
-                lag.trim_from(0);
-                head.reset();
-            }
-            Self::Eagle(head, lag) => {
-                lag.trim_from(0);
-                head.reset();
-            }
-            Self::Dflash(net, lag) => {
-                lag.trim_from(0);
-                net.reset();
-            }
-            _ => {}
-        }
+        self.truncate(0);
     }
 
     /// Draft at most `k` tokens after the pending token `first` of the

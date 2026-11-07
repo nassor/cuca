@@ -20,37 +20,11 @@
 //! input and its own cache range, with a fixed reduction order), so a row is
 //! bit-identical alone or in a batch, as for the other attention kernels.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
-
-use candle_core::utils::barrier_pool;
 use candle_core::{Device, Tensor};
 
+use super::super::pool::par_chunks;
 use super::paged_attn::{attend_latent_rows, dot, store_rows};
 use super::{AttnCall, KvAccess, MlaWeights, Transformer, rms};
-
-/// Run `f(job, chunk)` for every `chunk`-sized piece of `out` on candle's
-/// barrier pool; the arithmetic of one piece never depends on the split.
-fn par_chunks(out: &mut [f32], chunk: usize, f: impl Fn(usize, &mut [f32]) + Sync) {
-    let jobs = out.len() / chunk.max(1);
-    let slots: Vec<Mutex<&mut [f32]>> = out.chunks_mut(chunk.max(1)).map(Mutex::new).collect();
-    let next = AtomicUsize::new(0);
-    let run = |_: usize| {
-        loop {
-            let job = next.fetch_add(1, Ordering::Relaxed);
-            if job >= jobs {
-                break;
-            }
-            let mut slot = slots[job].lock().unwrap_or_else(PoisonError::into_inner);
-            f(job, &mut slot);
-        }
-    };
-    if jobs <= 1 {
-        run(0);
-    } else {
-        barrier_pool().execute(run);
-    }
-}
 
 /// `q_abs[row][h][c] = sum_n k_b[h][c][n] * q_nope[row][h][n]`: the nope part
 /// of every query head folded through its key up-projection. `q_nope` is
@@ -696,10 +670,7 @@ mod tests {
         }
         for token in 0..t {
             let row = flat.narrow(0, token, 1).unwrap();
-            let hidden = (shared.gate.forward(&row).unwrap().silu().unwrap()
-                * shared.up.forward(&row).unwrap())
-            .unwrap();
-            let y = vec_of(shared.down.forward(&hidden).unwrap());
+            let y = vec_of(shared.ffn.forward(&row, Act::Silu).unwrap());
             for (o, v) in want[token * N_EMBD..][..N_EMBD].iter_mut().zip(&y) {
                 *o += f64::from(*v);
             }

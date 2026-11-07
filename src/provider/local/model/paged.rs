@@ -26,9 +26,9 @@
 //! thing an allocation evicts when no free block is left. A block without a
 //! hash goes straight back to the free list. [`KvPools::lookup`] finds the
 //! longest block-aligned prefix of a prompt whose blocks are still cached in
-//! every group and takes a reference to each of them. The hash covers the ids
-//! only (a 64-bit chain, no id comparison on a hit), which is as strong as
-//! the hash: a collision would make two different prompts share K/V.
+//! every group and takes a reference to each of them. A block is named by
+//! its chain hash, its parent's hash and its 16 ids ([`BlockKey`]), so a
+//! 64-bit hash collision can never make two different prompts share K/V.
 //!
 //! A block is written only while its single owner is filling it; a shared or
 //! cached block is read-only, because a hit covers whole blocks below the
