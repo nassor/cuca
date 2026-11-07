@@ -3,23 +3,22 @@
 //!
 //! `LocalModelConfig::gpu_layers = Some(n)` puts `n` layers on the GPU:
 //!
-//! - **Which layers**: the *last* `n`, as llama.cpp does: the CPU runs the
-//!   layers `0..n_layer - n` and the GPU the layers `n_layer - n..n_layer`.
-//!   A boundary costs one residual stream per pass wherever it is, and the
-//!   tail is where the head is, so the logits come off the device that
-//!   already holds the last layer.
-//! - **The embeddings** are always on the host: both engines already look a
-//!   token's row up in the file and hand the row on (the GPU engine uploads
-//!   it), so the first layers' input needs no device copy of the table. The
-//!   Gemma 4 per-layer-embedding inputs are computed on the host by the CPU
-//!   half for every layer and the GPU half receives them with the hidden
-//!   state.
-//! - **The head** (final norm, LM head, logit scale and soft-cap) is on the
-//!   GPU with the last layer. With `n = 0` nothing is on the GPU (the model
-//!   loads as a plain CPU model and no device opens), with `n = n_layer` the
-//!   model is a plain GPU model (llama.cpp counts the output layer as one
-//!   more offloadable layer and keeps it on the CPU at `n = n_layer`; here
-//!   the head always follows the last layer).
+//! - Which layers: the last `n`, as llama.cpp does. The CPU runs the layers
+//!   `0..n_layer - n` and the GPU the layers `n_layer - n..n_layer`. A
+//!   boundary costs one residual stream per pass wherever it is, and the tail
+//!   is where the head is, so the logits come off the device that already
+//!   holds the last layer.
+//! - The embeddings are always on the host: both engines look a token's row up
+//!   in the file and hand the row on (the GPU engine uploads it), so the first
+//!   layers' input needs no device copy of the table. The Gemma 4
+//!   per-layer-embedding inputs are computed on the host by the CPU half for
+//!   every layer, and the GPU half receives them with the hidden state.
+//! - The head (final norm, LM head, logit scale and soft-cap) is on the GPU
+//!   with the last layer. With `n = 0` nothing is on the GPU (the model loads
+//!   as a plain CPU model and no device opens); with `n = n_layer` the model is
+//!   a plain GPU model. llama.cpp counts the output layer as one more
+//!   offloadable layer and keeps it on the CPU at `n = n_layer`; here the head
+//!   always follows the last layer.
 //!
 //! # How a pass runs
 //!
@@ -28,7 +27,7 @@
 //! over the rows of every sequence of the batch, then hands the residual
 //! stream `[rows, n_embd]` (and the per-layer inputs) to the GPU half
 //! ([`GpuTransformer`] with a [`Back`]: the last layers and the head). The
-//! hidden state crosses the boundary **once per pass**: one host read of the
+//! hidden state crosses the boundary once per pass: one host read of the
 //! CPU half's output and one upload; nothing else moves between the halves.
 //!
 //! The paged K/V cache is one [`KvLayout`](super::paged::KvLayout): both

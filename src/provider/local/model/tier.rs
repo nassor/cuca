@@ -44,7 +44,8 @@
 //! - **Pass** ([`Pass`]): the routing gives the ascending list of experts a
 //!   layer needs. Missing experts are read in that order while the table plus
 //!   the reads in flight fit the slots (at most twice the loader threads in
-//!   flight); compute walks the list in the same ascending order and waits
+//!   flight; with no RAM tier, at most the loader threads); compute walks the
+//!   list in the same ascending order and waits
 //!   for each expert's read, so the accumulation order, and with it the
 //!   arithmetic, is the resident mode's.
 //! - **Warm start**: heat exported from an earlier session

@@ -13,8 +13,8 @@
 //! row `[c | k_rot]` per position, and the attention-weighted sum of the
 //! values is `V_h (sum_j p_j c_j)`, taken over the first `kv_lora` columns of
 //! the same cached rows. One row of `kv_lora + rot` floats per position and
-//! layer is the whole K/V cache (1,280 bytes for Mistral Small 4, against
-//! 32,768 for the expanded heads).
+//! layer is the whole K/V cache (1,280 bytes for Mistral Small 4), where the
+//! expanded form would cache `n_head * (nope + rot + v_head)` floats.
 //!
 //! Every step is row-independent (a row's result depends only on its own
 //! input and its own cache range, with a fixed reduction order), so a row is
@@ -455,7 +455,7 @@ mod tests {
     /// direct f64 implementation of the transformers (expanded) form on the
     /// same dequantized weights: per-head keys and values built from the
     /// latent, rotary key shared by every head, YaRN inverse frequencies from
-    /// the published formulas, the softmax scale `mscale^2 / sqrt(128)`-style
+    /// the published formulas, the softmax scale `mscale^2 / sqrt(nope + rot)`
     /// and the per-position Llama 4 query scaling.
     #[test]
     fn latent_attention_matches_the_expanded_f64_reference() {

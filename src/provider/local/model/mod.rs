@@ -705,9 +705,8 @@ impl Model {
     }
 
     /// Make `snapshot` (taken by [`Model::snapshot`] on a model of the same
-    /// device) the recurrent state of `slot`, now at
-    /// position `len`; `None` is the zero state at position 0. A no-op for
-    /// attention-only models.
+    /// device) the recurrent state of `slot`, at position `len`; `None` is
+    /// the zero state at position 0. A no-op for attention-only models.
     ///
     /// # Errors
     ///

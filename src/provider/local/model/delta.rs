@@ -539,8 +539,8 @@ impl DeltaCell {
         }
     }
 
-    /// Floats held by the live state, the pre-call copy and the row log (for
-    /// the memory documentation and tests).
+    /// Floats held by the live state, the pre-call copy and the row log
+    /// (tests only).
     #[cfg(test)]
     pub(crate) fn held_floats(&self) -> usize {
         let state = |s: &DeltaState| s.conv.len() + s.s.len();

@@ -36,7 +36,8 @@
 //!
 //! The drafter's F16 weights are held as f32 (about twice the file: 340 MB
 //! for the E2B drafter) and its K/V is the target's cache, shared by
-//! reference. Drafting is available on the CPU device only.
+//! reference. A separate drafter file runs on the CPU or on one GPU device,
+//! not together with `gpu_layers` ([`Drafter::open`]).
 //!
 //! # In-trunk head (`DrafterSource::InTrunk`)
 //!
@@ -53,8 +54,8 @@
 //! of the vocabulary (a draft step ranks a 65,536-id prefix; an index is
 //! still a token id).
 //! The head runs on the CPU only (a hybrid trunk can run on a GPU, but the
-//! head is not implemented there) and only proposes: verification keeps the output equal to plain
-//! decoding whatever the head computes.
+//! head is not implemented there) and only proposes: verification keeps the
+//! output equal to plain decoding whatever the head computes.
 //!
 //! The cache stays consistent with the trunk by one rule: the head holds a
 //! pair `(h[j], t[j + 1])` only while both its hidden row and its token are
@@ -92,9 +93,7 @@
 //! # Lazy upkeep
 //!
 //! The three drafters above take every committed position into a cache of
-//! their own: 4.4 ms of a 90 ms token for the EAGLE drafter on Mistral Small
-//! 4, 3.5 ms of 288 ms for the DFlash drafter on Muse Glimmer, 0.09 ms of
-//! 17.3 ms for the Qwen 3.5 head. A round that drafts needs the cache, a
+//! their own. A round that drafts needs the cache, a
 //! plain round does not, so the engine hands a plain round's rows over with
 //! [`Drafter::defer`] instead of [`Drafter::observe`]: the drafter keeps the
 //! tokens and rows (a [`Lag`], at most [`LAG_ROWS`] positions and
@@ -545,8 +544,8 @@ impl Drafter {
         }
     }
 
-    /// Make [`Drafter::defer`] observe at once, as before lazy upkeep (tests:
-    /// the reference a lazy drafter must propose like).
+    /// Make [`Drafter::defer`] observe at once instead of holding rows
+    /// (tests: the reference a lazy drafter must propose like).
     #[cfg(test)]
     pub(crate) fn set_eager(&mut self, eager: bool) {
         if let Some(lag) = self.lag() {

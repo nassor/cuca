@@ -5,9 +5,7 @@
 //! forward pass costs close to `k + 1` decode steps. [`QmmWeight::forward_rows`]
 //! reads every weight block once and dots it against all `m` activation rows,
 //! so a batch of `m` rows costs about one row of memory traffic plus `m` times
-//! the (much cheaper) integer arithmetic. Measured on a Ryzen 9 9950X3D2, the
-//! kernel is 2-4x faster than candle's for Q4_1, Q5_0 and Q5_1 from `m = 4`
-//! rows on.
+//! the (much cheaper) integer arithmetic.
 //!
 //! # Arithmetic
 //!
@@ -15,7 +13,7 @@
 //! dtype, exactly as candle's vec-dot partners do:
 //!
 //! - Q4_0, Q5_0, Q8_0: Q8_0 (`d = max|x| / 127` rounded to f16,
-//!   `q = round(x / d)`, 32-element blocks);
+//!   `q = round(x * (1 / d))`, 32-element blocks);
 //! - Q4_1, Q5_1: Q8_1, the same quants plus the sum term
 //!   `s = f16(f16(sum q) * d)`, which multiplies the weight block's minimum.
 //!
@@ -41,14 +39,9 @@
 //!
 //! Q2_K to Q6_K weights are not served here: [`QmmWeight::new`] returns `None`
 //! for them and candle's per-row kernel multiplies them (a row's result still
-//! depends on that row alone, whatever the batch). Measured on the same CPU,
-//! candle's K-quant prefill was already at parity with Q4_0's (phi4-mini
-//! `q4_k_m` against `q4_0`, long-prompt perf test; the 3D V-cache L3 keeps the
-//! per-row weight re-reads cheap), and a row-batched safe-Rust K-quant kernel
-//! written for this module was 2-3x slower than candle's at `m = 1` (the Muse
-//! Glimmer FFN shapes: 2-3.2 ms against 0.9-1.6 ms). The dispatch cannot pick
-//! the faster kernel per `m` either: a row's bits must not depend on the batch
-//! size, so one dtype is served by one kernel.
+//! depends on that row alone, whatever the batch). A row's bits must not depend
+//! on the batch size, so the dispatch cannot pick a faster kernel per `m`: one
+//! dtype is served by exactly one kernel.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -481,10 +474,8 @@ fn put<const R: usize, const M: usize>(
 /// `m` (overlapping rows are recomputed identically) or, when `m` is below
 /// [`MIN_TILE`], starting at row 0 over the zero padding.
 ///
-/// Tiles of one and two rows compile to much slower code than three and four
-/// (measured: a 6144x1536 Q4_0 matrix takes 1.9 ms and 3.4 ms on one thread
-/// for one and two rows, 0.7 ms for three), so a lone row is cheaper as a
-/// three-row tile with two dummy rows.
+/// Tiles of one and two rows compile to much slower code than three and four,
+/// so a lone row is computed as a three-row tile with two dummy rows.
 #[inline(always)]
 fn rows_of<L: Legacy, const R: usize>(
     rs: &[&[L::Block]; R],

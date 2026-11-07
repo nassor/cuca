@@ -2,10 +2,12 @@
 //!
 //! The router logits of every token reach the host (`tokens * n_expert`
 //! floats), where [`route`] applies llama.cpp's `LLM_GATING_SOFTMAX` top-k:
-//! softmax over all experts, keep the `n_used` largest, and renormalise the
-//! kept weights to sum to one when the architecture asks for it, and scale
-//! them by `expert_weights_scale`. The result
-//! is grouped by expert so each expert runs once on exactly its own tokens.
+//! softmax over all experts, keep the `n_used` largest, optionally renormalise
+//! the kept weights to sum to one, then multiply them by `expert_weights_scale`.
+//! The result is grouped by expert so each expert runs once on exactly its own
+//! tokens. Routing is a pure function of one token's logits: ties go to the
+//! lower expert index and tokens stay in order within an expert, so a token's
+//! experts and weights do not depend on the batch it travels in.
 
 use super::params::MoeSpec;
 
@@ -30,9 +32,9 @@ pub(crate) fn route(logits: &[f32], t: usize, spec: &MoeSpec) -> Routing {
         let total: f32 = probs.iter().sum();
         order.clear();
         order.extend(0..n);
-        // Largest probability first; the lower expert index wins ties, so the
-        // order is total and the top `n_used` come out the same as from a
-        // full sort: select them, then order just those.
+        // Largest probability first, lower expert index on ties: the order is
+        // total, so selecting the top `n_used` and ordering just those equals a
+        // full sort.
         let by_prob = |&a: &usize, &b: &usize| probs[b].total_cmp(&probs[a]).then(a.cmp(&b));
         let k = spec.n_used;
         if 0 < k && k < n {

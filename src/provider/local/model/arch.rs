@@ -224,10 +224,10 @@ pub(crate) struct Behavior {
     /// [`Behavior::shared_expert`].
     pub(crate) shared_expert_ungated: bool,
     /// Llama 4 per-position query scaling `1 + beta * ln(1 + floor(pos /
-    /// length))` (`beta`, `length`) when the file carries no
-    /// `attention.temperature_scale` / `attention.temperature_length`: the
-    /// checkpoint's own configuration, which llama.cpp's converter did not
-    /// write for Mistral Small 4.
+    /// length))` (`beta`, `length`), used when the file carries no
+    /// `attention.temperature_scale` / `attention.temperature_length`. The
+    /// values are the checkpoint's own configuration; the GGUF does not hold
+    /// them for Mistral Small 4.
     pub(crate) attn_temp_default: Option<(f64, usize)>,
     /// Llama 4 query scaling from `attention.temperature_scale` (absent or 0:
     /// none) whose length is `rope.scaling.original_context_length` (llama.cpp

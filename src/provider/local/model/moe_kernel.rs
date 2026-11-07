@@ -210,7 +210,7 @@ impl SlotLayout {
     }
 }
 
-/// f16 bits of `x`'s block scale read from the GGUF block bytes.
+/// The little-endian f16 bits at the start of `block` (a GGUF block's scale).
 fn le16(block: &[u8]) -> u16 {
     u16::from_le_bytes([block[0], block[1]])
 }
@@ -352,7 +352,7 @@ pub(crate) fn pack_expert(
 
 /// A dense `[rows, cols]` weight (an attention projection, a dense FFN
 /// matrix, the LM head) in the layout of the dense kernels: like a slot's
-/// matrix, but in **block-major** order, so that the threads of a launch, one
+/// matrix, but in block-major order, so that the threads of a launch, one
 /// per row, read consecutive blocks. The block `b` of row `r` is block `b *
 /// rows + r`; the values of all blocks come first (4 words per Q4 block, 8
 /// per Q8 block), then the f16 scales and, for Q4_1, the f16 minimums, two

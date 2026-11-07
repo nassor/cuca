@@ -1369,7 +1369,6 @@ mod tests {
         }
     }
 
-    /// Muse Glimmer metadata: `[sliding x3, full]` twice.
     /// The published Mistral Small 4 119B metadata (bartowski's GGUF header),
     /// with 2 blocks.
     fn mistral4_metadata() -> Metadata {
@@ -1609,6 +1608,7 @@ mod tests {
         );
     }
 
+    /// Muse Glimmer metadata: 8 blocks, `[sliding x3, full]` twice.
     fn muse_metadata() -> Metadata {
         let pattern = (0..8).map(|il| Bool(il % 4 != 3)).collect();
         md(&[

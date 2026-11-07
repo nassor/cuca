@@ -4,8 +4,31 @@
 //! [`Transformer::load_placed`] builds the weights from [`Hparams`] and the
 //! per-layer [`LayerLayout`]; [`Transformer::forward_batch`] runs the layers
 //! over the rows of several sequences against their K/V blocks. The burn GPU
-//! engine mirrors it operation for operation and shares the host-side pieces
+//! engine follows the same operation order and shares the host-side pieces
 //! (hyperparameters, RoPE tables, masks, MoE routing).
+//!
+//! Invariants to preserve:
+//!
+//! - Row independence: every weight kind computes a row from that row alone
+//!   (the row-batched kernel by construction, candle's quantized kernel per
+//!   row, float weights and attention per row under [`RowExact`]). With
+//!   `Batch::exact` a row is bit-equal to the single-token step at its
+//!   position, whatever else is in the batch. Quantized matmuls round their
+//!   activations to Q8_0, so a ~1e-7 float-gemm difference between batch
+//!   shapes would otherwise surface as one-step jumps.
+//! - K/V memory: each K/V-owning layer holds one pool of
+//!   `KvLayout::blocks[group]` blocks of [`BLOCK_SIZE`] positions, allocated
+//!   zeroed at load and never grown. Sequences address it through block
+//!   tables, so a step allocates no K/V.
+//! - Recurrent state: a hybrid model keeps one state slot per sequence and
+//!   records the rows of a `Want::All` call of up to [`MAX_VERIFY_ROWS`]
+//!   rows, so [`Transformer::rewind`] can return to those positions, to the
+//!   slot's end, or to zero.
+//! - Expert tiers: with `ExpertPlacement::Tiered` the experts stay in the
+//!   file behind the RAM tier of the [`ExpertStore`], sized by `ExpertTiers`.
+//! - Drafters: float weights and the LM head of a drafter are held as Q8_0,
+//!   which shifts its logits by at most half a Q8_0 step. It only proposes
+//!   tokens; the target's rows decide the output.
 
 use std::fs::File;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
@@ -160,7 +183,7 @@ impl QMatMul {
 }
 
 /// Rows of a matrix [`requantize_q8_0`] converts at a time: bounds the f32
-/// copy it holds to a few tens of MB.
+/// copy it holds to `REQUANTIZE_ROWS * cols * 4` bytes.
 const REQUANTIZE_ROWS: usize = 4096;
 
 /// The 2-D quantized `qt` as Q8_0, converted `REQUANTIZE_ROWS` rows at a time
@@ -600,11 +623,11 @@ struct Loader<'a> {
     content: &'a gguf_file::Content,
     reader: BufReader<File>,
     /// Hold matmul weights as dequantized f32 instead of quantized (test
-    /// reference only: candle's quantized matmul rounds activations to Q8).
+    /// reference only: candle's quantized matmul rounds activations to Q8_0).
     dequantize: bool,
-    /// Store float matrices as Q8_0 (a drafter's: it only proposes tokens, so
-    /// its rounding cannot change the output, and a quarter of the bytes are
-    /// read per step).
+    /// Store float matrices (columns a multiple of 32) as Q8_0 (a drafter's:
+    /// it only proposes tokens, so its rounding cannot change the output, and
+    /// a quarter of the bytes are read per step).
     requantize: bool,
 }
 
@@ -2336,7 +2359,8 @@ impl Transformer {
                 let data = layer.lock();
                 if t == 1 || ROW_EXACT.get() {
                     // Every query row over exactly the keys a decode step at
-                    // its position reads, straight out of the blocks.
+                    // its position reads (a drafter's `read_len` keys for all
+                    // rows), straight out of the blocks.
                     let rows = q
                         .transpose(1, 2)?
                         .contiguous()?
@@ -3012,8 +3036,8 @@ fn window_lo(spec: &LayerSpec, query: usize, hi: usize) -> usize {
 }
 
 /// The single-sequence calls the unit tests use: one implicit sequence over
-/// the model's own pools ([`Solo`]), so a test reads like the old contiguous
-/// cache. The engine passes its sequences' block tables explicitly.
+/// the model's own pools ([`Solo`]), so a test needs no block tables. The
+/// engine passes its sequences' block tables explicitly.
 #[cfg(test)]
 impl Transformer {
     /// [`Transformer::forward_ext`] logits only, not exact.
@@ -4021,6 +4045,8 @@ mod tests {
             .sum()
     }
 
+    /// Loads `model` with tiered experts under a `ram_bytes` budget (two
+    /// loader threads, 32 positions), preloading the experts `warm_from` ranks.
     pub(super) fn load_tiered(
         model: &super::super::tiny::TinyModel,
         ram_bytes: u64,
@@ -4157,6 +4183,7 @@ mod hybrid_tests {
     use super::tests::{mixed_dense, mixed_moe};
     use super::*;
 
+    /// The parsed GGUF header of `model`.
     pub(super) fn content_of(model: &TinyModel) -> gguf_file::Content {
         gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap())).unwrap()
     }
@@ -4232,6 +4259,7 @@ mod hybrid_tests {
             .sum()
     }
 
+    /// The tensor `name` of `model` dequantized to f64.
     pub(super) fn tensor(model: &TinyModel, name: &str) -> Vec<f64> {
         let content = content_of(model);
         let mut reader = BufReader::new(File::open(&model.path).unwrap());

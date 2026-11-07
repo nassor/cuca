@@ -5,16 +5,20 @@
 //! [`write_tiny_model_with`] builds the Gemma 4 model (shared K/V layers,
 //! sliding and full layers with a window shorter than the prompt, partial
 //! RoPE factors, per-layer embeddings). [`write_spec`] builds the others from
-//! a [`TinySpec`]: Llama (NORM RoPE, Llama 3 factors), Qwen 2 (biases), Qwen 3
-//! (QK-norm, query width different from the embedding width), Phi 3 (fused
-//! QKV and gate-up, LongRoPE, partial rotary), SmolLM 3 (NoPE layers),
-//! Granite (scales), OLMoE and Qwen 3 MoE (experts) and Gemma 3 (post-norms,
-//! sliding pattern).
+//! a [`TinySpec`]: Llama (NORM RoPE, Llama 3 factors), Ministral 3 (YaRN,
+//! query scaling), Qwen 2 (biases), Qwen 3 (QK-norm, query width different
+//! from the embedding width), Phi 3 (fused QKV and gate-up, LongRoPE, partial
+//! rotary), SmolLM 3 (NoPE layers), Granite (scales), OLMoE and Qwen 3 MoE
+//! (experts), OLMo 2 (post-norms only), ERNIE 4.5, Gemma 3 (post-norms,
+//! sliding pattern) and Muse Glimmer (attention gate, sandwich norms).
 //! [`write_qwen35`] builds the hybrid Qwen 3.5 model from a [`TinyQwen35`]:
 //! delta-net, delta-net, delta-net, gated attention, delta-net, then a
 //! trailing multi-token-prediction block with its `nextn.*` tensors, four
 //! value heads over two key heads of different widths so every index of the
-//! recurrence is exercised.
+//! recurrence is exercised. [`write_mistral4`] builds the latent-attention
+//! MoE model, and the drafters ([`write_tiny_drafter`], [`write_tiny_dflash`],
+//! [`write_tiny_eagle`]) pair with the models above.
+//!
 //! Weights are drawn in a fixed order, so two specs that differ only in
 //! storage (fused or split, NORM or NEOX row order) hold the same values.
 
@@ -786,11 +790,10 @@ pub(crate) struct TinyMoe {
 }
 
 /// A tiny `qwen35` model (`qwen35moe` with [`TinyQwen35::moe`] set). The
-/// defaults give five trunk layers (delta-net,
-/// delta-net, delta-net, attention, delta-net) and one trailing
-/// multi-token-prediction block (block 5, with its `nextn.*` tensors); four
-/// value heads share two query/key heads, so the repeat-interleave is
-/// exercised.
+/// defaults give five trunk layers (delta-net, delta-net, delta-net,
+/// attention, delta-net) and one trailing multi-token-prediction block
+/// (block 5, with its `nextn.*` tensors); four value heads share two
+/// query/key heads, so the repeat-interleave is exercised.
 #[derive(Clone)]
 pub(crate) struct TinyQwen35 {
     pub(crate) trunk_layers: usize,

@@ -39,14 +39,12 @@
 //! the target's scale) turn rows `1..=k` into the logits of the `k` draft
 //! tokens, the token after `first` first: one pass, `k` tokens.
 //!
-//! Ranking is the expensive part on a CPU: it reads the whole LM head (1.1 GB
-//! of Q6_K for Muse Glimmer 30B), and candle's per-row kernel, which serves
-//! the K-quants, reads it once per row (24 ms a row measured, 194 ms for a block
-//! of 7 drafts). A K-quant head is therefore ranked through a Q8_0 copy
-//! (`QMatMul::proposal_copy`, 1.4 GB for Muse, built when the drafter opens)
-//! that the row-batched kernel reads once for all rows (65 ms a round with
-//! the five drafter layers, 206 ms for a block of 15). It only changes which
-//! tokens are proposed, never the output: the target verifies every draft.
+//! Ranking is the expensive part on a CPU: it reads the whole LM head, and
+//! candle's per-row kernel, which serves the K-quants, reads it once per row.
+//! A K-quant head is therefore ranked through a Q8_0 copy
+//! (`QMatMul::proposal_copy`, built when the drafter opens) that the
+//! row-batched kernel reads once for all rows. It only changes which tokens
+//! are proposed, never the output: the target verifies every draft.
 //!
 //! # Context cache
 //!
@@ -55,7 +53,7 @@
 //! round only projects the block. Every layer here is a sliding-window layer
 //! (a full-attention layer is supported too), so the cache is a ring of the
 //! last `window` positions per layer: `5 layers x 2 x 8 heads x 128 x 4 bytes
-//! x 2048` = 82 MB for the Muse drafter whatever the context length. A
+//! x 2048` = 84 MB for the Muse drafter whatever the context length. A
 //! position older than the window is overwritten and never read again by a
 //! forward round, since the next block starts at or after the last one.
 //!
@@ -82,12 +80,10 @@
 //! *input* feeds the drafter (the output of layer `i - 1`), so the HF
 //! `target_layer_ids` `[1, 13, 25, 37, 49]` of the Muse checkpoint are stored
 //! as `[2, 14, 26, 38, 50]`. transformers' `target_layer_ids` are *outputs*
-//! of decoder layer `i` (`output_hidden_states=[ids]` returns the hook of
-//! layer `i`; checked against the real `generate(.., speculation_type=
-//! "dflash")` path on a tiny model: the features handed to the assistant
-//! equal `hidden_states[i + 1]` of the full-form output, and differ from
-//! `hidden_states[i]`). The loader subtracts one and requires the layers to
-//! ascend, because the target returns them in ascending order.
+//! of decoder layer `i` (the features transformers hands the assistant equal
+//! `hidden_states[i + 1]` of the full-form output, not `hidden_states[i]`).
+//! The loader subtracts one and requires the layers to ascend, because the
+//! target returns them in ascending order.
 //!
 //! # Cost
 //!
@@ -99,13 +95,10 @@
 //!
 //! The block is `1 + k` rows, not always `block_size`: llama.cpp's `dflash`
 //! graph builds blocks of "anchor + drafted positions" (bounded by the
-//! training block size) too, and the DFlash paper (arXiv 2602.06036, Table
-//! 8: an 8-layer drafter trained on blocks of 16, Math500) measures an
-//! average accepted length of 6.33 at inference blocks of 16 and 5.09 at
-//! blocks of 8. The pass costs `(1 + k) / block_size` of a full block on the
-//! compute-bound CPU. The transformers reference runs the full block; the
-//! oracle test compares both (a reference block of 16 rows and a shorter
-//! one).
+//! training block size) too. The pass costs `(1 + k) / block_size` of a full
+//! block on the compute-bound CPU. The transformers reference runs the full
+//! block; the oracle test compares both (a reference block of 16 rows and a
+//! shorter one).
 
 use std::fs::File;
 use std::io::BufReader;
@@ -464,9 +457,8 @@ impl DflashNet {
             .max(1);
         let ring = geo.n_kv_head * cap * geo.head_dim;
         let n_layer = layers.len();
-        // A K-quant LM head would be read once per block row by candle's
-        // kernel (24 ms a row for Muse Glimmer's 1.1 GB Q6_K head): rank the
-        // block through a Q8_0 copy that is read once for all rows.
+        // A K-quant LM head is read once per block row by candle's kernel:
+        // rank the block through a Q8_0 copy that is read once for all rows.
         let rank = target
             .lm_head()
             .and_then(QMatMul::proposal_copy)

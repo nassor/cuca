@@ -42,10 +42,10 @@
 //!   the block maximum). Q8_0 resolves a block with 255 levels where Q4_K,
 //!   Q5_K and Q6_K resolve theirs with about 15, 31 and 63, so this extra
 //!   error is below the one the file's own quantization already carries.
-//!   Logits still differ from a host-dequantized reference by far more than
-//!   float rounding (about 1e-2 of their magnitude in the tiny-model tests,
-//!   rather than 1e-5), so a K-quant model decodes the CPU engine's tokens
-//!   except where two candidates are that close.
+//!   Logits therefore differ from a host-dequantized reference by far more
+//!   than float rounding (about 1e-2 of their magnitude in the tiny-model
+//!   tests), so a K-quant model decodes the CPU engine's tokens except where
+//!   two candidates are that close.
 //! - Norm vectors, biases and scalars are f32 whatever their stored dtype.
 //!
 //! # Memory
@@ -97,9 +97,9 @@
 //!   holds the embedding rows, the attention masks and, per MoE layer, the
 //!   router logits (`tokens * n_expert` f32).
 //! - Dropping a [`GpuTransformer`] or [`GpuDrafter`] waits for the device
-//!   and returns the freed pages to the driver (`Device::memory_cleanup`):
-//!   burn keeps freed pages in its pools otherwise, and a model loaded after
-//!   a dropped one in the same process ran out of device memory.
+//!   and returns the freed pages to the driver (`Device::memory_cleanup`);
+//!   burn otherwise keeps freed pages in its pools, which starves a model
+//!   loaded later in the same process.
 //!
 //! # Batched steps
 //!
@@ -126,10 +126,10 @@
 //! expert and everything outside the experts stay burn operations.
 //!
 //! The kernels exist because burn's quantized matmuls cannot gather a
-//! data-dependent subset of experts (`q_select` dequantizes) and because the
-//! per-expert matmul triples were host-bound (about 10 us of host time per
-//! queued operation, 8 experts x 3 matmuls x 40 layers). The dense weights
-//! use the same layout and dot-row arithmetic through [`mk::dense_gemv`].
+//! data-dependent subset of experts (`q_select` dequantizes) and because a
+//! per-expert matmul triple is host-bound by the per-operation launch cost.
+//! The dense weights use the same layout and dot-row arithmetic through
+//! [`mk::dense_gemv`].
 //!
 //! # Tiered experts
 //!
@@ -209,10 +209,10 @@
 //! drafter's layers attend to the target's K/V cache, which they reach through
 //! clones of its tensor handles taken for the length of one `draft` call (a
 //! handle held across a target forward would turn its in-place cache writes
-//! into whole-cache copies). The GPU does not keep a batched pass bit-equal
-//! to single-token steps (`exact` is ignored), so a speculative greedy run can
-//! differ from plain greedy where two logits are within float rounding; in
-//! the measured runs the outputs were identical.
+//! into whole-cache copies).
+//! The GPU does not keep a batched pass bit-equal to single-token steps
+//! (`exact` is ignored), so a speculative greedy run can differ from plain
+//! greedy where two logits are within float rounding.
 //!
 //! # Tensor parallelism
 //!
@@ -258,8 +258,7 @@
 //!   reduction, and [`Weights::ffn_tail`] (post-norm, residual add, the
 //!   per-layer-embedding block, the output scale). On one device
 //!   [`Weights::layer`] runs the same functions in the same order and
-//!   nothing is reduced, so a model that is not split computes what it did
-//!   before the split existed. The residual stream is replicated: the
+//!   nothing is reduced. The residual stream is replicated: the
 //!   embedding rows go to every shard, and the final norm and the LM head
 //!   run on shard 0's copy.
 //! - **The sum** is host-staged (every part read back, added in f32 in shard
@@ -284,7 +283,7 @@
 //! by every shape of a power-of-two bucket (a candidate tuned for one shape
 //! fails to launch for another), and the autotune key holds the shapes, the
 //! element types and the strides but **not the quantization scheme**, so a
-//! Q8_0 candidate was replayed on a Q4_0 weight. The own kernels
+//! candidate tuned for a Q8_0 weight is replayed on a Q4_0 one. The own kernels
 //! ([`mk::dense_gemv`], [`mk::dense_dequant`]) have none of these limits.
 //! Only the f32 weights (the float dtypes) go through burn's matmul, and
 //! they follow the workarounds of [`linear`].
@@ -411,16 +410,15 @@ fn require_index(
 
 /// Largest device buffer one part of a weight may occupy. wgpu bounds one
 /// storage buffer by `min(max_storage_buffer_binding_size, max_buffer_size)`
-/// of the adapter, which burn does not expose; the development GPU refused a
-/// 2.46 GB buffer, so a conservative 1 GiB is assumed everywhere.
+/// of the adapter, which burn does not expose, so a conservative 1 GiB is
+/// assumed everywhere.
 const MAX_PART_BYTES: usize = 1 << 30;
 
 /// Device bytes of one row chunk of a dense weight. burn's default memory
 /// pool carves its allocations from pages as large as the largest allocation
 /// it has served, so one 1 GiB weight chunk makes every page 1 GiB and a
-/// nearly full card cannot place the next one (`out of device memory
-/// allocating 1074790400 bytes` with 2.4 GiB free while 36 layers of a 30B
-/// model were resident). Chunks of 256 MiB keep the pages that size.
+/// nearly full card cannot place the next one. Chunks of 256 MiB keep the
+/// pages that size.
 const MAX_WEIGHT_CHUNK_BYTES: usize = 256 << 20;
 
 /// Tokens of a delta-net scan between two waits for the device (see
@@ -1358,8 +1356,8 @@ impl GpuExpertBank {
     /// experts the pool lacks. A host bank reads the layer's normed rows and
     /// routing back in one buffer, queues `shared` while the CPU computes
     /// the experts and uploads their sum in one transfer. (burn submits the
-    /// queued work lazily: forcing a submit with `Device::flush` before the
-    /// CPU experts measured 20% slower decode on Vulkan.)
+    /// queued work lazily, and no `Device::flush` forces a submit before the
+    /// CPU experts: it slows decode on Vulkan.)
     fn run(
         &self,
         f: Tensor<2>,
@@ -1976,9 +1974,9 @@ pub(crate) struct GpuTransformer {
 }
 
 /// Wait for `device`'s queued work, then hand the pages no live tensor uses
-/// back to the driver. burn keeps freed pages in its pools for reuse, so
-/// without this a dropped model's device memory stays reserved by the
-/// process and a model loaded after it can run out of device memory.
+/// back to the driver. burn keeps freed pages in its pools for reuse, so a
+/// dropped model's device memory stays reserved by the process unless it is
+/// returned here.
 fn return_device_memory(device: &Device) {
     // Best effort: a lost device fails the wait, and dropping must not fail.
     let _ = device.sync();
@@ -3067,8 +3065,8 @@ impl GpuTransformer {
 }
 
 /// The single-sequence calls the unit tests use: one implicit sequence over
-/// the model's own pools ([`Solo`]), so a test reads like the old contiguous
-/// cache. The engine passes its sequences' block tables explicitly.
+/// the model's own pools ([`Solo`]). The engine passes its sequences' block
+/// tables explicitly.
 #[cfg(test)]
 impl GpuTransformer {
     /// [`GpuTransformer::forward_ext`] logits only, not exact.
@@ -4669,8 +4667,8 @@ impl DeltaWeights {
     /// over all rows at once (each weight is read once per step); the
     /// convolution and the recurrence run per sequence.
     ///
-    /// Decode is host-bound (every queued operation costs the host about
-    /// 10 us), so a single token runs few, wide operations: the convolution
+    /// Decode is host-bound (every queued operation costs the host time),
+    /// so a single token runs few, wide operations: the convolution
     /// is one product and sum over the window, the key and query heads are
     /// normalised together, and the value heads that share a key head
     /// broadcast it instead of repeating it.
@@ -4780,10 +4778,10 @@ impl DeltaWeights {
             let delta = (vt - kv_mem) * bt;
             s = s + kt * delta;
             rows.push((s.clone() * qt).sum_dim(2).reshape([1, nv, dv]));
-            // Each token queues a few state-sized temporaries (2 MB for
-            // Qwen3.6-35B-A3B): without a drain a 256-token prefill chunk
-            // holds hundreds of MB of them at once. Best effort: a failed
-            // wait surfaces at the next readback.
+            // Each token queues a few state-sized temporaries; without a
+            // periodic drain a long prefill chunk holds hundreds of MB of
+            // them at once. Best effort: a failed wait surfaces at the next
+            // readback.
             if (ti + 1) % SCAN_DRAIN == 0 && ti + 1 < t {
                 let _ = device.sync();
             }
@@ -4826,12 +4824,6 @@ fn vecmat_fits(w: &Tensor<2>) -> bool {
 /// ([`mk::dense_gemv`]): a decode step, the rows of a batched decode step or
 /// of a verification call, the tail of a prompt. More rows (a 256-row
 /// prefill chunk) expand the weight to f32 in slices and use burn's matmul.
-/// Measured on an RX 9070 XT (Vulkan, f32 accumulation, `[16384, 6144]`,
-/// `[6144, 16384]`, `[6144, 1536]` weights): the kernel is 1.2 to 3 times
-/// faster than expanding up to 64 rows for both formats and up to 128 rows
-/// for Q4_0; at 256 rows it is 1.3 to 1.8 times faster than the expansion
-/// for the Q4_0 `[16384, 6144]` and `[6144, 16384]` weights but twice as slow
-/// for Q8_0, and at 512 rows the expansion wins for both.
 const GEMV_ROWS: usize = 64;
 
 /// f32 bytes of one dequantized slice of a quantized weight in a prefill.
@@ -5812,17 +5804,10 @@ mod tests {
     /// resident run never reads the router output back, a tiered run does
     /// at every layer, which splits burn's fused elementwise kernels at
     /// different places, so they agree to float rounding (tiered placements
-    /// among themselves agree bit for bit). Measured over the tiny models the
-    /// relative difference (to `1 + |logit|`) is 1e-6 to 3e-5 at nearly every
-    /// step. The tiny hybrid MoE model has one sensitive step (the second
-    /// step of the greedy run): 4e-5 to 7e-5 with one thread per row in the dense kernel,
-    /// 1.6e-4 to 2.2e-4 with the split-row kernel. Its routing is the same in
-    /// the resident and the hosted run (checked by reading every layer's
-    /// router logits back in both: identical expert ids for all 160 routed
-    /// rows, smallest gap between the last chosen and the first unchosen
-    /// logit 2.7e-3, far above rounding), so the difference is the order of
-    /// float accumulation, amplified at that step. 3e-4 is the tightest round
-    /// bound above the worst measured value.
+    /// among themselves agree bit for bit). The bound is `3e-4` relative to
+    /// `1 + |logit|`: the tiny hybrid MoE model has one sensitive step (the
+    /// second of the greedy run) where the order of float accumulation, not
+    /// the routing, moves the logits by far more than at the other steps.
     fn assert_close_logits(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}");
         for (step, (g, w)) in got.iter().zip(want).enumerate() {
@@ -6344,7 +6329,7 @@ mod tests {
     /// CPU reference as closely as a Q4_0 one: no requantization happens.
     /// A model in Q4_1, Q5_0 or Q5_1, which the engine requantizes to Q8_0,
     /// is within the Q8_0 rounding of it: at most 8% of the largest logit
-    /// (measured up to 4.5%: a random-weight model amplifies the rounding).
+    /// (a random-weight model amplifies the rounding).
     #[test]
     fn gpu_matches_cpu_on_other_weight_dtypes() {
         let Some(device) = test_device() else {
@@ -6388,8 +6373,8 @@ mod tests {
         }
     }
 
-    /// `linear` against a host matmul of the dequantized weight, over the
-    /// shapes that exposed burn 0.22 Vulkan bugs. The order replays cached
+    /// `linear` against a host matmul of the dequantized weight, over shapes
+    /// that stress burn's Vulkan matmul and `vecmat` paths. The order replays cached
     /// autotune entries across shapes of one power-of-two bucket (`out = 96`
     /// then `128`) and mixes one-row inputs with weights the `vecmat` kernel
     /// can launch (`512 x 1024`) and cannot (`96 x 64`), and small odd row
@@ -7185,8 +7170,8 @@ mod tests {
     /// up `[768, 2048]`, Q8_0 down `[2048, 768]`) over a pass whose experts
     /// each get one row, after longer and single-token passes have tuned the
     /// kernels: every row equals the same row's single-token pass. Gathering
-    /// the one row and scaling it by a `[1, 1]` device tensor lost the Vulkan
-    /// device on this sequence (burn 0.22, RX 9070 XT).
+    /// the one row and scaling it by a `[1, 1]` device tensor loses the
+    /// device on this sequence.
     #[test]
     fn gpu_moe_one_row_experts_match_single_tokens() {
         let Some(device) = test_device() else {
@@ -7426,8 +7411,8 @@ mod tests {
     }
 
     /// A column cut that splits a 256-element K-quant block dequantizes the
-    /// rows and cuts the values, as Q8_0; a cut
-    /// on block bounds stays a byte copy. Host only.
+    /// rows and cuts the values, as Q8_0; a cut on block bounds stays a byte
+    /// copy. Host only.
     #[test]
     fn column_cuts_inside_a_k_quant_block_requantize() {
         use candle_core::quantized::QTensor;
@@ -7742,8 +7727,8 @@ mod tests {
     /// `model` split across `devices[0]` and `devices[1]` equals the same
     /// model on `devices[0]` alone (to `tol` of the logits' scale: the
     /// shards sum two half-width partial products where the single device's
-    /// matmul sums the whole inner dimension, so the reduction order, not the
-    /// arithmetic, differs) and two sharded loads agree bit for bit (the host
+    /// matmul sums the whole inner dimension, so only the reduction order
+    /// differs) and two sharded loads agree bit for bit (the host
     /// reduction adds in a fixed shard order). Also: the shards' pools are at
     /// least the single device's, and the split model reports its world.
     fn check_sharded(model: &TinyModel, devices: &[LocalDevice], tol: f32, label: &str) {

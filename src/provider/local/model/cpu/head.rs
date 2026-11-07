@@ -9,9 +9,9 @@
 //!
 //! 1. For a trunk position `j` with its final-norm hidden state `h[j]` (the
 //!    row that feeds the LM head: [`Hidden::PostNorm`](super::Hidden); the
-//!    pre-norm state works much worse, 59 % against 95 % teacher-forced
-//!    top-1 on long prompts) and the token `t[j + 1]` that follows it, the
-//!    head input is `x = eh_proj(cat(enorm(embed(t[j + 1])), hnorm(h[j])))`
+//!    pre-norm state predicts far worse) and the token `t[j + 1]` that
+//!    follows it, the head input is
+//!    `x = eh_proj(cat(enorm(embed(t[j + 1])), hnorm(h[j])))`
 //!    (embedding first; `embed` is the plain `token_embd` row).
 //! 2. `x` runs through the block like a trunk attention layer would (same
 //!    code: [`Transformer::block`]), with RoPE position `j + 1`, attending
@@ -54,24 +54,16 @@
 //! The hidden row a step hands to the next is the head's output *after*
 //! `nextn.shared_head_norm` (the row its own logits come from, which then
 //! goes through `hnorm` like a trunk row does), not the block output before
-//! that norm. Measured on Qwen3.5-0.8B over seven texts (Python, Rust, a
-//! list, prose, facts and two chat prompts, each continued by 128 greedy
-//! tokens: 868 chains of four steps from every position of the
-//! continuation), the conditional acceptance by draft position is 88.7 / 84.5
-//! / 86.2 / 87.0 % with the normed output and 88.7 / 33.1 / 39.2 / 21.0 %
-//! with the output before the norm (3.85 against 2.32 expected tokens per
-//! round at four drafts). Step 1 is the same either way: it reads the
-//! trunk's own final-norm row.
+//! that norm; the pre-norm row collapses acceptance from step 2 on. Step 1
+//! reads the trunk's own final-norm row.
 //!
 //! # Proposal vocabulary
 //!
-//! The head's LM head is the trunk's: 248,320 rows of Q8_0 (270 MB) on the
-//! 0.8B model, so a whole draft step measures 5.4 ms with it. A draft is only a proposal, so a
-//! step ranks just the first [`PROPOSAL_ROWS`] token ids: byte-level BPE
-//! vocabularies number their pieces in merge order, which puts the frequent
-//! ones first (a tokenizer-specific heuristic; it only affects proposal quality). With it a step takes 1.05 ms and, on the same 868 chains, 84.1 /
-//! 82.9 / 86.0 / 86.0 % conditional acceptance (3.14 against 3.28 expected
-//! tokens per round at three drafts). Tokens beyond (rare pieces, the
+//! The head's LM head is the trunk's, a full-vocabulary matmul per step. A
+//! draft is only a proposal, so a step ranks just the first [`PROPOSAL_ROWS`]
+//! token ids: byte-level BPE vocabularies number their pieces in merge order,
+//! which puts the frequent ones first (a tokenizer-specific heuristic that
+//! only affects proposal quality). Tokens beyond (rare pieces, the
 //! end-of-generation and other special tokens) are never proposed. The logits
 //! a step passes to `pick` cover those ids only, so an index is a token id;
 //! drafting from a distribution over a subset keeps speculative sampling
@@ -80,12 +72,10 @@
 //!
 //! # Memory
 //!
-//! The head's weights stay quantized as in the file: 21.7 MB for
-//! Qwen3.5-0.8B Q8_0 (attention 7.8 MB, FFN 11.7 MB, `eh_proj` 2.2 MB); the
-//! token embedding and LM head are the trunk's. The K/V cache is preallocated
-//! for `context_length` slots of `2 * 4 * n_kv_head * head_dim` bytes (4 KB
-//! per position for the 0.8B model: 33.5 MB at 8192 positions) and the
-//! bookkeeping is 8 bytes per slot plus one hidden row (4 KB).
+//! The head's weights stay quantized as in the file; the token embedding and
+//! LM head are the trunk's. The K/V cache is preallocated for
+//! `context_length` slots of `2 * 4 * n_kv_head * head_dim` bytes, and the
+//! bookkeeping is 8 bytes per slot plus one hidden row (`4 * n_embd` bytes).
 
 use std::borrow::Cow;
 use std::fs::File;
@@ -610,6 +600,7 @@ mod tests {
             .map(|j| (f64s(&hidden[j * D..(j + 1) * D]), tokens[j + 1]))
             .collect();
         let (mut h, mut token) = (f64s(last_hidden), first);
+        // f32 head against an f64 reference: relative to the largest logit.
         for (step, got) in logits.iter().enumerate() {
             pairs.push((h, token));
             let (want, normed) = reference(&model, &pairs, 0);

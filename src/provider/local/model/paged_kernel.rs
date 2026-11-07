@@ -17,9 +17,7 @@
 //!   throughout, the score being `q . k * scale`;
 //! - a second pass merges the chunks' partial results of each (row, head) in
 //!   chunk order (the global maximum, every partial rescaled to it), so the
-//!   result does not depend on how the work was scheduled. One serial chunk
-//!   per head took 17 ms per layer for a 1,100-key decode on the RX 9070 XT:
-//!   the split is what makes the kernel fast.
+//!   result does not depend on how the work was scheduled.
 //!
 //! # Latent attention
 //!
@@ -240,9 +238,9 @@ impl PagedKernels for CubeBackend {
         debug_assert!(dv <= v_row);
         debug_assert_eq!(block, BLOCK_SIZE);
         let max_blocks = tables.shape().dims::<2>()[1];
-        // One block per split, so a long context spreads
-        // over many cubes (the unit count of one cube is only the query heads
-        // of a KV head). The count depends on the table width alone.
+        // One block per split spreads a long context over many cubes (one
+        // cube has only the query heads of a KV head as units). The count
+        // depends on the table width alone.
         let splits = max_blocks.clamp(1, MAX_SPLITS);
         let client = q.client.clone();
         let part = empty_device_dtype(

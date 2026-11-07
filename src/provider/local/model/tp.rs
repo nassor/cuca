@@ -15,13 +15,13 @@
 //! The split is Megatron/vLLM style. Every shard holds the whole residual
 //! stream and runs a slice of each layer:
 //!
-//! - **Attention**: shard `s` computes the query heads
+//! - Attention: shard `s` computes the query heads
 //!   `[s * n_head / world, (s + 1) * n_head / world)` (its rows of `attn_q`,
 //!   or of the three parts of a fused `attn_qkv`), the key/value heads they
 //!   read, attention over its own K/V pools, and the output projection over
 //!   its heads' columns of `attn_output`. That product is a partial sum of
 //!   the layer's `[t, n_embd]` output.
-//! - **KV-head replication**: when `n_kv_head < world` (`world % n_kv_head
+//! - KV-head replication: when `n_kv_head < world` (`world % n_kv_head
 //!   == 0`, e.g. Gemma 4 E2B's single KV head on two shards) each shard keeps
 //!   a full copy of the key/value head its query heads share: shard `s`
 //!   serves KV head `s * n_kv_head / world`, and the `n_head / world` query
@@ -30,10 +30,10 @@
 //!   own KV heads only, so the pools of all shards together exceed the
 //!   single-device pool by the replication factor
 //!   (`GpuTransformer::kv_pool_bytes` sums them).
-//! - **Dense FFN**: `ffn_gate` and `ffn_up` rows `[s * ff / world ..)` (a
+//! - Dense FFN: `ffn_gate` and `ffn_up` rows `[s * ff / world ..)` (a
 //!   fused `ffn_up` holds `[gate | up]`: both halves are cut) and the
 //!   matching `ffn_down` columns; the product is a partial sum again.
-//! - **Mixture of experts**: every shard holds all experts, each sliced to
+//! - Mixture of experts: every shard holds all experts, each sliced to
 //!   `ff_exp / world` units (gate and up rows, down columns), and the shared
 //!   expert is sliced the same way. The router is replicated, so every shard
 //!   routes every token to the same experts and the MoE kernels keep indexing
@@ -44,19 +44,18 @@
 //!   agree as long as their devices run the router matmul identically
 //!   (devices of one kind do; a near tie between two experts could otherwise
 //!   route differently on a differently tuned device).
-//! - **Replicated**: norms, the per-head Q/K norms, the router, the shared
+//! - Replicated: norms, the per-head Q/K norms, the router, the shared
 //!   expert's gate vector, the per-layer-embedding block and layer output
 //!   scale of Gemma 4, the RoPE tables, and the bias of `attn_output` (added
 //!   once after the reduction). Q/K/V biases are cut with their rows. Only
 //!   shard 0 holds the LM head; the final norm and the head run on its copy
 //!   of the residual stream.
 //!
-//! A layer runs as: every shard's attention half; **all-reduce**; every
+//! A layer runs as: every shard's attention half; all-reduce; every
 //! shard's `attn_output` bias, post-attention norm and residual add; every
-//! shard's FFN half; **all-reduce**; every shard's post-FFN norm, residual
+//! shard's FFN half; all-reduce; every shard's post-FFN norm, residual
 //! add, per-layer-embedding block and output scale. With one shard the
-//! reductions are the identity and the same operations run in the same order
-//! as before the split existed.
+//! reductions are the identity.
 //!
 //! # Rules
 //!
@@ -94,10 +93,10 @@
 //! outputs of every shard (one tensor per device, in shard order), the sum on
 //! every device.
 //!
-//! - **CUDA** (every device a distinct CUDA device, Linux): burn 0.22's
+//! - CUDA (every device a distinct CUDA device, Linux): burn 0.22's
 //!   `all_reduce` over a `DistributedContext` that the model holds for its
 //!   lifetime (NCCL through CubeCL), in place on each device.
-//! - **Everything else** (Vulkan, Metal, ROCm, a repeated device such as
+//! - Everything else (Vulkan, Metal, ROCm, a repeated device such as
 //!   `vulkan:0+vulkan:0`, mixed backends): host-staged. Every part is read
 //!   back, summed in f32 in shard order `0, 1, .., world - 1` (a fixed order,
 //!   so two runs agree bit for bit) and uploaded to every device. That costs
