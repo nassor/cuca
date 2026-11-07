@@ -1018,6 +1018,39 @@ struct HostPlan {
     dequantize: bool,
 }
 
+/// `CUCA_LOCAL_PROFILE_HOST=1`: time the phases of every host-experts layer
+/// (the device's queued work, the readback, the CPU experts, the upload) and
+/// print their averages to stderr every 288 layer passes.
+fn host_profile() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CUCA_LOCAL_PROFILE_HOST").is_some())
+}
+
+fn host_profile_add(phases: [std::time::Duration; 4]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SUM: [AtomicU64; 4] = [
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+        AtomicU64::new(0),
+    ];
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    for (sum, d) in SUM.iter().zip(phases) {
+        sum.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
+    }
+    let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+    if n.is_multiple_of(288) {
+        let avg = |i: usize| SUM[i].swap(0, Ordering::Relaxed) as f64 / 288.0 / 1000.0;
+        eprintln!(
+            "HOSTPROFILE|per layer pass ms: device wait {:.2} readback {:.2} cpu experts {:.2} upload {:.2}",
+            avg(0),
+            avg(1),
+            avg(2),
+            avg(3)
+        );
+    }
+}
+
 /// Whether the tests load host experts dequantized ([`HostPlan::dequantize`]).
 #[cfg(test)]
 static HOST_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1674,6 +1707,14 @@ impl GpuExpertBank {
                 // One readback: the layer's normed rows and the routing
                 // (ids, then weights) in one buffer; one upload of the sum.
                 let rows = t * n_embd;
+                let profile = host_profile();
+                let mark = std::time::Instant::now();
+                if profile {
+                    // Separate the device's queued work from the transfer.
+                    let _ = device.sync();
+                }
+                let waited = mark.elapsed();
+                let mark = std::time::Instant::now();
                 let host = read_f32(
                     Tensor::cat(vec![f.reshape([rows]), route], 0),
                     "the rows of host experts",
@@ -1685,12 +1726,17 @@ impl GpuExpertBank {
                         picks.push(((pair / k) as u32, route_host[t * k + pair]));
                     }
                 }
+                let read = mark.elapsed();
+                let mark = std::time::Instant::now();
                 let act = if c.act == 0 { Act::Silu } else { Act::Gelu };
                 let out = experts.forward(input, t, n_embd, &Routing { per_expert }, act)?;
-                Ok(Tensor::<2>::from_data(
-                    TensorData::new(out, [t, n_embd]),
-                    device,
-                ))
+                let computed = mark.elapsed();
+                let mark = std::time::Instant::now();
+                let up = Tensor::<2>::from_data(TensorData::new(out, [t, n_embd]), device);
+                if profile {
+                    host_profile_add([waited, read, computed, mark.elapsed()]);
+                }
+                Ok(up)
             }
         }
     }
