@@ -9,7 +9,7 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Nine always-present modules, two gated modules, and 148 re-exported items at the crate root, grouped by the feature that gates them</dd>
+<dd>Nine always-present modules, two gated modules, and 198 re-exported items at the crate root, grouped by the feature that gates them</dd>
 <dt>You need</dt>
 <dd>Nothing; this page mirrors <code>src/lib.rs</code></dd>
 <dt>Read this if</dt>
@@ -63,11 +63,11 @@ Available in every build that compiles. There are 17.
 
 ## Feature-gated re-exports
 
-There are 131, in 21 groups.
+There are 181, in 22 groups.
 
 | Gate | Items |
 |---|---|
-| `provider-local` | `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalModel`, `LocalModelConfig`, `ModelPreset`, `ModelSource`, `SamplingConfig` |
+| `provider-local` | `BatchingConfig`, `ConvertConfig`, `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `ExpertHeat`, `ExpertPlacement`, `ExpertTierStats`, `ExpertTiers`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalModel`, `LocalModelConfig`, `ModelPart`, `ModelPreset`, `ModelSource`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `SamplingConfig`, `ServingStats`, `WeightQuant` |
 | `plugin-cost` | `CostConfig`, `CostEntry`, `CostObserver`, `CostPlugin`, `CostUsage`, `ModelRates`, `PricingResolver`, `PricingTable`, `UnpricedModelPolicy` |
 | `plugin-guardrails` | `JsonGuardrailPlugin` |
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |
@@ -96,6 +96,50 @@ There are 131, in 21 groups.
 |---|---|---|
 | `CUCA_EXPORT_FORMAT` | `&str` | `cuca-export` |
 | `CUCA_EXPORT_VERSION` | `u32` | `1` |
+
+## Request surface
+
+`UnifiedRequest` has public fields `model`, `provider`, `messages`, `temperature`, `max_tokens`, `top_p`, `top_k`, `seed`, `stop`, `stream`, `thinking`, `tools` and `prompt_cache`. `top_p`, `top_k`, `seed`, `stop` and `prompt_cache` carry `#[serde(default)]`.
+
+| Field | Type | Default from `new` |
+|---|---|---|
+| `temperature` | `Option<f32>` | `None` |
+| `max_tokens` | `Option<u32>` | `None` |
+| `top_p` | `Option<f32>` | `None` |
+| `top_k` | `Option<u32>` | `None`; `0` turns the cut off |
+| `seed` | `Option<u64>` | `None` |
+| `stop` | `Vec<String>` | empty |
+| `stream` | `bool` | `true` |
+| `provider` | `ProviderEndpoint` | `Custom("")`; `generate_stream` sets it |
+
+Builder methods, in declaration order: `new`, `add_tool`, `with_prompt_cache`, `add_system_message`, `add_user_message`, `add_message`, `set_temperature`, `set_max_tokens`, `set_top_p`, `set_top_k`, `set_seed`, `add_stop`, `with_stream`, `with_thinking`, `enable_thinking`, `disable_thinking`. `message_count` reads the message list. `add_stop` appends one entry per call.
+
+A backend that cannot honor a set field fails the request with `CucaError::Config`: `top_k` on OpenAI, the DeepSeek native route and any other endpoint on the OpenAI-compatible builder, `seed` on Anthropic and DeepSeek's Anthropic bridge. The messages are in [Error types](@/reference/errors.md#config-messages).
+
+`ProviderEndpoint` (in `cuca::types`) has nine variants: `LlamaCpp`, `Vllm`, `LmStudio`, `OpenAi` (the `Default`), `Anthropic`, `GoogleGemini`, `DeepSeek`, `Local` and `Custom(String)`.
+
+## Local provider surface
+
+Under `provider-local`, the re-exports above are the whole public path: `cuca::provider` is `pub(crate)`.
+
+| Type | Shape |
+|---|---|
+| `ModelSource` | variants `HuggingFace { repo, revision, file, sha256, parts, template }`, `File(PathBuf)`, `Checkpoint { repo, revision }`, `Dir(PathBuf)`; `PRESETS`, `preset`, `default_model`, `hugging_face`, `FromStr` |
+| `ModelPreset` | `name`, `repo`, `revision`, `file`, `size_bytes`, `architecture`, `drafter`, `parts`, `template`; `source` |
+| `ModelPart`, `PresetPart` | a split-GGUF part: `file` and `sha256` (`ModelPart`, digest optional), `file`, `sha256` and `size_bytes` (`PresetPart`) |
+| `ModelTemplate`, `PresetTemplate` | a chat template file: `repo`, `revision`, `file` and `sha256` (optional in `ModelTemplate`) |
+| `DrafterSource` | `File(ModelSource)`, `InTrunk`; `From<ModelSource>` |
+| `ConvertConfig`, `WeightQuant` | `ConvertConfig { quant }`; `WeightQuant` is `F16`, `Q8_0` (default) or `Q4_0`, with `name` and `FromStr` |
+| `BatchingConfig` | `max_sequences` (4), `kv_tokens`, `max_step_tokens`, `prefix_cache` (true); `FromStr` |
+| `ExpertPlacement`, `ExpertTiers` | `Resident` (default), `Tiered(ExpertTiers)`, `Host { layers }`; `FromStr` |
+| `SamplingConfig` | `temperature`, `top_k`, `top_p`, `seed`, all `Option`; `DEFAULT_TEMPERATURE` (1.0), `DEFAULT_TOP_K` (64), `DEFAULT_TOP_P` (0.95) |
+| `LocalDevice`, `GpuAdapter` | `Cpu`, `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`, `Cuda(usize)`, `Rocm(usize)`; `Default`, `Discrete(usize)`, `Integrated(usize)`; `required_feature`, `FromStr` |
+| `LocalModelConfig` | fields `source`, `cache_dir`, `hf_token`, `context_length`, `sampling`, `chat_template`, `device`, `drafter`, `draft_tokens`, `on_download_progress`, `experts`, `convert`, `batching`, `shards`, `gpu_layers`; `set_devices` |
+| `LocalModel` | `load`, `capabilities`, `sampling`, `kv_cache_bytes`, `layer_split`, `draft_stats`, `serving_stats`, `expert_tier_stats`, `expert_heat` |
+| `LocalCapabilities`, `DraftStats`, `ServingStats`, `ExpertTierStats`, `ExpertHeat` | statistics and capability reports; `DraftStats::acceptance_rate` |
+| `DownloadProgress`, `DownloadProgressCallback` | `downloaded_bytes`, `total_bytes`; `DownloadProgressCallback::new` |
+
+The meaning of each configuration field is on [Local configuration](@/providers/local/configuration.md). `tests/public_exports.rs` does not name any of these types.
 
 ## Client surface
 

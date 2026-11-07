@@ -27,23 +27,39 @@ Everything else below is read by `examples/`, `tests/` or unit-test fixtures in 
 | Variable | Read by | Default |
 |---|---|---|
 | `CUCA_BASE_URL` | the examples except `local_model`; `tests/common/mod.rs` | `http://127.0.0.1:1234/v1` |
-| `CUCA_MODEL` | the same | examples: `google/gemma-4-e4b`; tests: first id the server reports |
-| `CUCA_REQUIRE_LIVE` | `tests/common/mod.rs`, the `provider-local` tests, the tokenizer and chat golden unit tests | unset |
+| `CUCA_MODEL` | the examples except `local_model` and `speculative`; `tests/common/mod.rs` | examples: `google/gemma-4-e4b`; tests: first id the server reports |
+| `CUCA_FAST_MODEL` | `examples/speculative.rs` | `google/gemma-4-e4b` |
+| `CUCA_SLOW_MODEL` | `examples/speculative.rs` | `google/gemma-4-12b-qat` |
+| `CUCA_REQUIRE_LIVE` | `tests/common/mod.rs`, `tests/local_env/mod.rs`, the oracle, tokenizer and chat golden unit tests | unset |
 | `CUCA_SEARCH_API_KEY` | `examples/web_search.rs` | none; required |
 | `CUCA_SEARCH_BASE_URL` | `examples/web_search.rs` | `https://api.firecrawl.dev` |
 | `CUCA_CACHE_DIR` | the library (`provider-local`), the tokenizer and chat golden unit tests | the platform cache directory |
 | `HF_TOKEN` | the library (`provider-local`) | none; anonymous access |
-| `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the gemma4 golden unit tests | none |
-| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs` | `gemma4-e2b-q4_0`; `tests/provider_local_tiers.rs` has no default and skips without a model |
-| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs` | unset |
-| `CUCA_LOCAL_DEVICE` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_batch.rs`, `tests/provider_local_mtp.rs`, `tests/provider_local_tiers.rs`, the `gpu_` unit tests | `cpu` |
-| `CUCA_LOCAL_EXPERTS` | `examples/local_model.rs`, `tests/provider_local.rs`, `tests/provider_local_tiers.rs` | `resident` |
+| `LOCALAPPDATA`, `USERPROFILE`, `HOME`, `XDG_CACHE_HOME` | the library (`provider-local`), as the platform cache directory | see below |
+| `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs`, the tokenizer, chat golden and eagle unit tests | none |
+| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs` | `gemma4-e2b-q4_0`; `_tiers.rs` has no default and skips without a model |
+| `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs` | unset |
+| `CUCA_LOCAL_CONVERT_QUANT` | `examples/local_model.rs`, `tests/provider_local.rs`, `_mtp.rs`, `_tiers.rs` | `q8_0` |
+| `CUCA_LOCAL_DEVICE` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs`, the `gpu` unit tests | `cpu` |
+| `CUCA_LOCAL_GPU_LAYERS` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_tiers.rs` | unset |
+| `CUCA_LOCAL_EXPERTS` | `examples/local_model.rs`, `tests/provider_local.rs`, `_tiers.rs` | `resident` |
 | `CUCA_LOCAL_EXPERTS_REF` | `tests/provider_local_tiers.rs` | `resident` |
-| `CUCA_LOCAL_DRAFTER_PATH` | `examples/local_model.rs`, `tests/provider_local_mtp.rs` | none |
+| `CUCA_LOCAL_BATCHING` | `examples/local_model.rs`, `tests/provider_local_batch.rs` | `BatchingConfig::default()` |
+| `CUCA_LOCAL_CHAT_TEMPLATE` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs` | none |
+| `CUCA_LOCAL_DRAFTER_PATH` | `examples/local_model.rs`, `tests/provider_local_mtp.rs`, the eagle unit test | none |
 | `CUCA_LOCAL_DRAFTER` | `examples/local_model.rs`, `tests/provider_local_mtp.rs` | none |
 | `CUCA_LOCAL_DRAFT_TOKENS` | `tests/provider_local_mtp.rs` | `3` |
-| `CUCA_LOCAL_REF_DIR` | `tests/provider_local.rs`, the chat golden unit tests | none |
+| `CUCA_LOCAL_ALLOW_MISMATCH` | `tests/provider_local_mtp.rs` | unset |
+| `CUCA_LOCAL_PERF`, `CUCA_LOCAL_PERF_COLD` | `tests/provider_local.rs` | unset |
+| `CUCA_LOCAL_PRINT_REPLIES` | `tests/provider_local.rs`, `_mtp.rs`, `_tiers.rs` | unset |
+| `CUCA_LOCAL_REF_DIR` | `tests/provider_local.rs`, `tests/provider_local_convert.rs`, the oracle and chat golden unit tests | none |
+| `CUCA_LOCAL_CONVERT_ONLY` | `tests/provider_local_convert.rs`, the oracle unit test | none |
 | `CUCA_LOCAL_CATALOG_DIR` | the tokenizer and chat golden unit tests | `<cache dir>/huggingface` |
+| `CUCA_LOCAL_REF_CKPT`, `CUCA_LOCAL_REF_GGUF`, `CUCA_LOCAL_REF_PREFIX`, `CUCA_LOCAL_REF_TOL` | the `oracle_local` unit test (`CUCA_LOCAL_REF_TOL` also `oracle_dflash`) | none; tolerance `5e-4` |
+| `CUCA_LOCAL_DFLASH_REF` | the `oracle_dflash` unit test | none |
+| `CUCA_CONVERT_PROBE` | the `convert_probe` unit test | none |
+| `CUCA_MISTRAL4_GGUF` | a `mla` unit test | none |
+| `CUCA_TOK_GGUF`, `CUCA_TOK_CASES`, `CUCA_TOK_MAX_DIFF` | the tokenizer corpus unit test | none; `CUCA_TOK_MAX_DIFF` defaults to `0` |
 
 ## Examples and live llama.cpp tests
 
@@ -63,7 +79,7 @@ pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 
 The model id the request carries.
 
-- Examples treat it as a plain override with the literal default `google/gemma-4-e4b`.
+- Examples treat it as a plain override with the literal default `google/gemma-4-e4b`. `examples/speculative.rs` reads `CUCA_FAST_MODEL` and `CUCA_SLOW_MODEL` instead.
 - The test harness treats an unset or empty value as a request to discover the id. It issues `GET {base_url}/models` with a two second timeout and takes the first `data[].id`.
 - With neither the variable nor a reachable server, the harness panics instead of sending a guessed id:
 
@@ -84,7 +100,7 @@ SKIP: llama.cpp not reachable: <reason>
 CUCA_REQUIRE_LIVE=1 but llama.cpp is unreachable: <reason>
 ```
 
-For the `provider-local` tests the skip line is `SKIP: local model not available: ...`. The tokenizer and chat golden unit tests print `SKIP: ...` and, under `CUCA_REQUIRE_LIVE=1`, fail with `required model unavailable: ...`. The how-to is [Run the live integration suite](@/guides/integration-tests.md).
+For the `provider-local` tests the skip line is `SKIP: local model not available: set CUCA_LOCAL_MODEL_PATH, CUCA_LOCAL_MODEL or CUCA_LOCAL_DOWNLOAD=1`. The tokenizer and chat golden unit tests print `SKIP: ...` and, under `CUCA_REQUIRE_LIVE=1`, fail with `required model unavailable: ...`. The how-to is [Run the live integration suite](@/guides/integration-tests.md).
 
 ### `CUCA_SEARCH_API_KEY` and `CUCA_SEARCH_BASE_URL`
 
@@ -112,37 +128,52 @@ With none of them set, `LocalModel::load` fails with `CucaError::Config`. Downlo
 
 ### Model selection
 
-- `CUCA_LOCAL_MODEL_PATH` is the path of an existing GGUF file of any supported architecture. It skips the download and wins over `CUCA_LOCAL_MODEL`.
-- `CUCA_LOCAL_MODEL` names what to download: a preset from `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`; ASCII case-insensitive) or an unverified `repo:revision:file`. It is parsed with `ModelSource::from_str`, and an unknown value fails with the accepted names. Default: `gemma4-e2b-q4_0`.
-- `CUCA_LOCAL_DOWNLOAD=1` downloads the default model (Gemma 4 E2B Q4_0) into the cache for a test run. Setting `CUCA_LOCAL_MODEL` downloads that model without it. The tests compare against the literal `1`.
+- `CUCA_LOCAL_MODEL_PATH` is the path of an existing file or directory. A directory is a Hugging Face checkpoint (`ModelSource::Dir`, converted once to a cached GGUF); anything else is a GGUF file (`ModelSource::File`). It skips the download and wins over `CUCA_LOCAL_MODEL`.
+- `CUCA_LOCAL_MODEL` names what to download, parsed with `ModelSource::from_str`: a preset from `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`; ASCII case-insensitive), an unverified `repo:revision:file` GGUF, or `repo:revision`, a checkpoint that is downloaded and converted. An unknown value fails with the accepted names. Default: `gemma4-e2b-q4_0`.
+- `CUCA_LOCAL_DOWNLOAD=1` selects the default model (Gemma 4 E2B Q4_0) when neither of the two above is set. The tests compare against the literal `1`.
+- `CUCA_LOCAL_CONVERT_QUANT` is the weight precision of a converted checkpoint: `f16`, `q8_0` or `q4_0`. Default: `q8_0`.
+- `CUCA_LOCAL_CHAT_TEMPLATE` is the path of a Jinja template file whose text becomes `LocalModelConfig::chat_template`. An unreadable file fails the example or panics the test.
 
-### Device
+### Device and memory
 
-`CUCA_LOCAL_DEVICE` sets `LocalModelConfig::device`, parsed with `LocalDevice::from_str`. Default: `cpu`. Empty counts as unset in the examples and tests.
-
-- Accepted forms, ASCII case-insensitive: `cpu`, `vulkan`, `vulkan:<n>`, `vulkan:integrated:<n>`, `metal` (same forms), `cuda[:<n>]`, `rocm[:<n>]`.
+- `CUCA_LOCAL_DEVICE` sets `LocalModelConfig::device`, parsed with `LocalDevice::from_str`. Default: `cpu`. Empty counts as unset. Accepted forms, ASCII case-insensitive: `cpu`, `vulkan[:<n>|:integrated:<n>]`, `metal[:<n>|:integrated:<n>]`, `cuda[:<n>]`, `rocm[:<n>]`.
+- A `+`-separated list such as `vulkan:0+vulkan:1` goes through `LocalModelConfig::set_devices` and splits the model over those devices (tensor parallelism, `LocalModelConfig::shards`). The example, `tests/provider_local.rs` and `tests/provider_local_batch.rs` accept a list. `tests/provider_local_mtp.rs` and `tests/provider_local_tiers.rs` parse one device. The `gpu` unit tests read the list and skip when it is unset or starts with `cpu`.
 - A GPU device needs its Cargo feature, for example `provider-local-vulkan`. Without it the load fails with `CucaError::Config`.
-- The library never reads this variable. The `gpu_` unit tests read it and panic on an unparseable value.
+- `CUCA_LOCAL_GPU_LAYERS` is `LocalModelConfig::gpu_layers`, a `usize`: the last `n` layers run on the GPU device, the rest on the CPU.
+- `CUCA_LOCAL_BATCHING` is `LocalModelConfig::batching`, parsed with `BatchingConfig::from_str`: any subset of `seqs=<n>`, `kv=<tokens>`, `step=<tokens>`, `prefix=on|off`, comma separated.
+- The library never reads these variables. The values mean what [Local configuration](@/providers/local/configuration.md) and [GPU](@/providers/local/gpu.md) say.
 
 ### Expert placement
 
-- `CUCA_LOCAL_EXPERTS` sets `LocalModelConfig::experts`, parsed with `ExpertPlacement::from_str`: `resident`, or `tiered:` with `ram=<size>`, `device=<size>` and `threads=<n>`, where `<size>` takes a `k`, `m` or `g` suffix. Empty counts as unset. `tests/provider_local_tiers.rs` needs it and prints `SKIP` without it.
+- `CUCA_LOCAL_EXPERTS` sets `LocalModelConfig::experts`, parsed with `ExpertPlacement::from_str`: `resident`, `host[:layers=<n>]`, or `tiered:` with `ram=<size>`, `device=<size>` and `threads=<n>`, where `<size>` takes a `k`, `m` or `g` suffix. Empty counts as unset. `tests/provider_local_tiers.rs` needs it and prints `SKIP` without it; it panics when the value is not tiered.
 - `CUCA_LOCAL_EXPERTS_REF` is the placement `tests/provider_local_tiers.rs` compares the tiered run against. Default: `resident`.
 - The library never reads these variables. Details are on [Tiered expert placement](@/providers/local/expert-tiers.md).
 
-### Drafter (multi-token prediction)
+### Drafter
 
-- `CUCA_LOCAL_DRAFTER_PATH` is the path of a drafter file. It wins over `CUCA_LOCAL_DRAFTER`.
-- `CUCA_LOCAL_DRAFTER` is a preset name (`gemma4-e2b-mtp-f16`, the drafter of a Gemma 4 target) or `in-trunk`, the head inside the main model's own file (CPU only).
-- Both set `LocalModelConfig::drafter` to `DrafterSource::File` or `DrafterSource::InTrunk`.
+- `CUCA_LOCAL_DRAFTER_PATH` is the path of a drafter file or checkpoint directory. It wins over `CUCA_LOCAL_DRAFTER`.
+- `CUCA_LOCAL_DRAFTER` is a preset name (`gemma4-e2b-mtp-f16`, `muse-glimmer-30b-dflash-q4_0`) or `in-trunk`, the head inside the main model's own file (CPU only). The tests also accept `repo:revision:file`.
+- Both set `LocalModelConfig::drafter`, to a `DrafterSource` from a `ModelSource` or to `DrafterSource::InTrunk`. See [Drafting](@/providers/local/drafting.md).
 - `CUCA_LOCAL_DRAFT_TOKENS` is the `draft_tokens` value of the drafter run in `tests/provider_local_mtp.rs`, or a comma-separated list such as `1,2,3,4` to run one comparison per value. Default: `3`.
+- `CUCA_LOCAL_ALLOW_MISMATCH`, set to any value, makes `tests/provider_local_mtp.rs` report a CPU speculative output that differs from plain decoding instead of failing.
+
+### Test switches
+
+- `CUCA_LOCAL_PERF`, set to any value (even empty), enables the long-prompt speed scenario of `tests/provider_local.rs`. `CUCA_LOCAL_PERF_COLD`, set to any value, changes the first words of every round so no round hits the prefix cache.
+- `CUCA_LOCAL_PRINT_REPLIES`, set to any value, prints each reply as a `REPLY|...` line.
+- `CUCA_LOCAL_CONVERT_ONLY` limits the converted-checkpoint oracle test to repositories whose id contains the text.
 
 ### Reference fixtures
 
-- `CUCA_LOCAL_REF_DIR` is a directory of Hugging Face `transformers` oracle dumps, one `<id>.json` each. When a dump matches the loaded file, the live suite also checks that the prompt token count equals the oracle's. The chat golden unit tests check that the rendered prompt and its ids equal the oracle's.
+- `CUCA_LOCAL_REF_DIR` is a directory of Hugging Face `transformers` oracle dumps, one `<id>.json` each. When a dump matches the loaded file, `tests/provider_local.rs` also checks that the prompt token count equals the oracle's. The chat golden unit tests check that the rendered prompt and its ids equal the oracle's, and the converted-checkpoint oracle test compares last-position logits and the greedy continuation.
 - `CUCA_LOCAL_CATALOG_DIR` is the `huggingface` directory that holds the cached catalog GGUFs. Default: `<cache dir>/huggingface`. A model whose file is absent is skipped.
+- `CUCA_LOCAL_REF_CKPT` (a checkpoint directory) or `CUCA_LOCAL_REF_GGUF` (a GGUF file), with `CUCA_LOCAL_REF_PREFIX` (`<prefix>.json` and `<prefix>.bin` written by the reference script), gate the `oracle_local` parity test. `CUCA_LOCAL_REF_TOL` bounds `max |dlogit|`; default `5e-4`.
+- `CUCA_LOCAL_DFLASH_REF` is the directory the `oracle_dflash` parity test reads (`target/`, `assistant/`, `ref.json`, `ref.bin`), and it uses `CUCA_LOCAL_REF_TOL` as well.
+- `CUCA_CONVERT_PROBE` is `<checkpoint dir>|<output file>|<f16|q8_0|q4_0>`: the `convert_probe` unit test converts the checkpoint to that file. A malformed value panics.
+- `CUCA_MISTRAL4_GGUF` is the path of a published `mistral4` GGUF; one `mla` unit test reads its header. The eagle unit test reads `CUCA_LOCAL_MODEL_PATH` (that GGUF) and `CUCA_LOCAL_DRAFTER_PATH` (the drafter checkpoint directory).
+- `CUCA_TOK_GGUF` is a GGUF whose header supplies the tokenizer and `CUCA_TOK_CASES` a JSON array of `{"text", "ids"}` reference cases. Both are required. `CUCA_TOK_MAX_DIFF` bounds the accepted mismatches; default `0`.
 
-Each of these unit tests prints `SKIP: ... not set` when its variable is absent.
+Except `convert_probe`, each of these unit tests prints `SKIP: ...` when its variables are absent.
 
 ## Setting them
 

@@ -40,15 +40,15 @@ The `provider` field formats through the `Display` of `ProviderEndpoint`: `llama
 
 ### Where each variant is raised
 
-- `Transport`: a `reqwest` failure (connection, TLS, body read), through `From<reqwest::Error>`; also the `provider-local` model download.
+- `Transport`: a `reqwest` failure (connection, TLS, body read), through `From<reqwest::Error>`; also the `provider-local` model download, including a stall of 60 seconds.
 - `Http`: a non-2xx response from any HTTP adapter, with the body captured; the Anthropic OAuth token exchange; the `provider-local` download, where the body is cut to 512 characters.
 - `SseParse`: `SseStreamParser` meets a completed frame whose `data`, `event` or `id` bytes are not valid UTF-8.
 - `Json`: `From<serde_json::Error>`; a malformed provider payload; a `PromptCacheError::Json` mapped by the client.
-- `Provider`: a provider error payload (OpenAI-style `error` body, Anthropic `error` event, Gemini or llama.cpp `error` field); an Anthropic token response with no `access_token`; and every `provider-local` failure on an unsupported or malformed GGUF file, a prompt that does not fit the context, a failed forward pass or a download checksum mismatch.
+- `Provider`: a provider error payload (OpenAI-style `error` body, Anthropic `error` event, Gemini or llama.cpp `error` field); an Anthropic token response with no `access_token`; and every `provider-local` failure on an unsupported or malformed GGUF file or checkpoint, a request the engine cannot take (an `ImageBase64` block, tool arguments that are not a JSON object, a chat template that does not render), a prompt that does not fit the context, a failed forward pass, a drafter that does not match its target, or a download checksum mismatch.
 - `ProviderNotEnabled`: `generate_stream` is called for an endpoint whose feature is not compiled. The payload is the flag, such as `provider-openai`.
 - `Plugin`: an `on_request` hook fails, or a stream hook fails on a block.
 - `Config`: see the next section.
-- `Io`: `From<std::io::Error>`; a `provider-local` model file that is missing or unreadable; the local engine thread cannot start; Anthropic PKCE cannot read system randomness.
+- `Io`: `From<std::io::Error>`; a `provider-local` model file or chat template file that is missing or unreadable; the local engine thread cannot start; Anthropic PKCE cannot read system randomness.
 
 ### `source()`
 
@@ -77,15 +77,31 @@ Anthropic request building:
 - `invalid anthropic-beta header value: {beta}` reports a beta string that cannot be a header.
 - A prompt-cache breakpoint is refused with `prompt-cache breakpoint ...` when its `message_index` or `block_index` is out of range, when it targets a standalone tool message or a non-text system block, or when two breakpoints name the same block.
 
-`provider-local` configuration, raised by `LocalModel::load` and the local dispatch:
+Unsupported sampling fields, raised when the request body is built, before any network call:
+
+| Message | Condition |
+|---|---|
+| `` `top_k` is not supported by OpenAI `` | `UnifiedRequest::top_k` is set on the OpenAI endpoint |
+| `` `top_k` is not supported by DeepSeek `` | `top_k` is set on the DeepSeek native route |
+| `` `top_k` is not supported by this endpoint `` | `top_k` is set on any other endpoint that reaches the OpenAI-compatible builder (for example `Custom`) |
+| `` `seed` is not supported by Anthropic `` | `UnifiedRequest::seed` is set on Anthropic, or on DeepSeek's Anthropic bridge route |
+
+`top_k` is accepted on llama.cpp, vLLM, LM Studio, Anthropic, Gemini and the DeepSeek Anthropic bridge. `seed` is accepted on every other endpoint, and `top_p` and `stop` on all of them.
+
+`provider-local` configuration, raised by `LocalModel::load` and the local dispatch. [Local limits and errors](@/providers/local/limits-and-errors.md#errors) lists the causes:
 
 - `cannot resolve a model cache directory; set LocalModelConfig::cache_dir or CUCA_CACHE_DIR`.
-- `invalid model {label} ...` for a repository, revision or file that is not a relative `/`-separated path of plain segments; `model path ... has no parent directory`.
-- `unknown model ...: expected a preset (...) or repo:revision:file` and `unknown local device ...`.
-- ``device {device:?} requires the `{feature}` cargo feature`` for a GPU device compiled out; `device ... is not available`.
+- ``invalid model {label} `{value}`: it must be a relative `/`-separated path of plain segments``; `` `{path}` has no parent directory``.
+- `` unknown model `{s}`: expected a preset (...), `repo:revision:file` (a GGUF), or `repo:revision` (a checkpoint)`` and `` unknown local device `{s}`; expected cpu, vulkan[:<n>|:integrated:<n>], metal[...], cuda[:<n>] or rocm[:<n>]``; `` unknown batching `{s}`; expected a comma-separated subset of seqs=<n>,kv=<tokens>,step=<tokens>,prefix=on|off``; `empty device list`.
+- ``device {device:?} requires the `{feature}` cargo feature`` for a GPU device compiled out; `device {device:?} is not available`.
 - `context_length must be at least 1`, and `context_length {n} exceeds the model maximum {max}`.
-- `sampling.temperature must be a finite value >= 0`, `sampling.top_p must be a finite value in (0, 1]`, `temperature must be a finite value >= 0` for a request temperature, and `top_p must be a finite value in (0, 1], got P` for a request `top_p`.
-- `DrafterSource::InTrunk runs on the CPU only`, and `draft_tokens must be in 1..=16` when a drafter is set.
+- `sampling.temperature must be a finite value >= 0, got T`, `sampling.top_p must be a finite value in (0, 1], got P`, and for a request `temperature must be a finite value >= 0, got T` and `top_p must be a finite value in (0, 1], got P`.
+- Tensor parallelism: messages starting `tensor parallelism:` for a CPU device or shard, a shard on another GPU backend, a drafter, or tiered or host experts.
+- Layer offload: ``gpu_layers needs a GPU `device`, got cpu``, ``gpu_layers cannot be combined with tensor parallelism (`shards`)`` and ``gpu_layers cannot be combined with a `drafter` ``.
+- `batching.max_sequences must be in 1..=64, got N` and `batching.max_step_tokens must be in max_sequences..=2048 ({max_sequences}..=2048), got N`.
+- `DrafterSource::InTrunk runs on the CPU only, not on {device:?}`, and `draft_tokens must be in 1..=16, got N` when a drafter is set.
+- Expert placement: `experts.loader_threads must be in 1..=64, got N`, `experts.device_bytes must be greater than 0 on {device:?}`, `experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu`, `experts.ram_bytes must be greater than 0 on LocalDevice::Cpu` and `ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does`.
+- Split GGUF parts and templates: `is not named like a split GGUF part (...) but the source lists N parts`, ``the parts of `{file}` must be [...] in order, got [...]`` and ``chat template `{path}` is not UTF-8``.
 
 ## `PluginError`
 

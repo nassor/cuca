@@ -51,7 +51,7 @@ Five features extend `provider-local`. None is a provider.
 
 | Feature | Enables |
 |---|---|
-| `provider-local-gpu` | `provider-local`, `dep:burn` |
+| `provider-local-gpu` | `provider-local`, `dep:burn`, `dep:burn-cubecl`, `dep:cubecl` |
 | `provider-local-vulkan` | `provider-local-gpu`, `burn/vulkan` |
 | `provider-local-metal` | `provider-local-gpu`, `burn/metal` |
 | `provider-local-cuda` | `provider-local-gpu`, `burn/cuda` |
@@ -60,7 +60,7 @@ Five features extend `provider-local`. None is a provider.
 - `provider-local-gpu` is the shared GPU engine. It selects no backend by itself; each backend feature enables it.
 - `provider-local` alone runs the model on the CPU.
 - `LocalDevice` and `GpuAdapter` exist in every `provider-local` build. Selecting a backend whose feature is off makes `LocalModel::load` fail with `CucaError::Config`.
-- `provider-local-cuda` and `provider-local-rocm` download a prebuilt LLVM on the first build. ROCm builds on Linux only.
+- `provider-local-cuda` and `provider-local-rocm` link a prebuilt LLVM that `tracel-llvm-bundler` downloads on the first build, so they need network access once. ROCm builds on Linux only. `provider-local-vulkan` and `provider-local-metal` need no download.
 
 ## Plugin features
 
@@ -146,14 +146,16 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `minijinja` | `2.24` | `loader` | `provider-local` |
 | `minijinja-contrib` | `2.24` | `pycompat` | `provider-local` |
 | `unicode-general-category` | `1` | default | `provider-local` (the byte-level BPE pre-tokenizers) |
-| `burn` | `0.22` | `std`, `fusion`, `autotune`; no defaults | `provider-local-gpu` (backends `burn/vulkan`, `burn/metal`, `burn/cuda`, `burn/rocm`) |
+| `burn` | `0.22` | `std`, `fusion`, `autotune`, `extension`, `cubecl`; no defaults | `provider-local-gpu` (backends `burn/vulkan`, `burn/metal`, `burn/cuda`, `burn/rocm`) |
+| `burn-cubecl` | `0.22` | `std`, `fusion`, `autotune`; no defaults | `provider-local-gpu` |
+| `cubecl` | `0.11` | `stdlib`; no defaults | `provider-local-gpu` |
 
 ### Why some defaults are off
 
 - `reqwest` has no defaults, so TLS arrives only through the `reqwest/rustls` entry that every `provider-*` feature and `plugin-web-search` carries.
 - `jsonschema` has no defaults because guardrails compiles inline schemas only and needs no `$ref` retrieval.
 - `postcard` has no defaults because its default `heapless-cas` feature pulls in `heapless`, which the crate never uses. `use-std` supplies the std buffer and COBS helpers.
-- `burn` has no defaults because they enable the optimizer and autodiff, which inference never uses.
+- `burn`, `burn-cubecl` and `cubecl` have no defaults because `burn`'s defaults enable the optimizer and autodiff, which inference never uses.
 
 ### C compilers and downloads
 
@@ -161,7 +163,18 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 - The Vulkan and Metal backends are Rust (wgpu: SPIR-V, MSL). Every GPU feature still compiles C, because CubeCL's runtime pulls an embedded store (`turso`) that builds C through `cc`.
 - On Windows, a dependency's build script runs the SDK resource compiler (`rc.exe`; `windres` on the GNU target) for the GPU features.
 - `provider-local-cuda` and `provider-local-rocm` pull CubeCL's LLVM backend. Its build script, `tracel-llvm-bundler`, downloads a prebuilt LLVM on the first build (network needed once, then cached) and links it statically.
-- docs.rs builds have no network, so the `[package.metadata.docs.rs]` feature list names every feature except those two.
+- docs.rs builds have no network, so the `[package.metadata.docs.rs]` feature list names every feature except those two: thirty of the thirty-two.
+
+### Dev dependencies
+
+| Crate | Version | Features |
+|---|---|---|
+| `ctor` | `1.0.13` | default |
+| `rmcp` | `3` | `transport-io` |
+| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `net`, `io-util`, `process`, `io-std` |
+| `tokio-stream` | `0.1` | default |
+| `schemars` | `1` | default |
+| `divan` | `0.1` | default |
 
 ## Feature-conditional modules
 
@@ -224,14 +237,16 @@ Examples live in `examples/<name>.rs`.
 
 ## Feature combinations CI verifies
 
-| Job | Feature list |
+| Job | Command |
 |---|---|
-| `clippy`, `test` | `--no-default-features --features provider-openai`, and `--no-default-features --features $ALL_NO_LLVM` |
-| `no_provider` | `--no-default-features`, asserted to fail |
-| `doc` | `--no-default-features --features $ALL_NO_LLVM` |
-| `local_gpu_llvm` | `--all-targets --no-default-features --features provider-local-cuda,provider-local-rocm`, `cargo check` on Ubuntu; the only job that downloads the LLVM bundle |
-| `plugin_solo` | `--no-default-features --features provider-openai,<plugin>`, once per plugin feature (twelve) |
-| `service_solo` | `--no-default-features --features provider-openai,<service>`, once per service feature (seven) |
+| `fmt` | `cargo fmt --all --check` |
+| `clippy` | `cargo clippy --all-targets <features> -- -D warnings`, with `<features>` one of `--no-default-features --features provider-openai` and `--no-default-features --features $ALL_NO_LLVM` |
+| `no_provider` | `cargo check --no-default-features`, asserted to fail |
+| `test` | `cargo test <features>` over the same two legs as `clippy`, with `CARGO_PROFILE_DEV_DEBUG=0` |
+| `doc` | `cargo doc --no-deps --no-default-features --features "$ALL_NO_LLVM"` |
+| `local_gpu_llvm` | `cargo check --all-targets --no-default-features --features provider-local-cuda,provider-local-rocm`; the only job that downloads the LLVM bundle |
+| `plugin_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<plugin>`, once per plugin feature (twelve) |
+| `service_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<service>`, once per service feature (seven) |
 | `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, a `crate::services` path, or a `plugins::` path for `prompt_cache`, `entity_extraction`, `replay` or `rate_limit` |
 
-`ALL_NO_LLVM` is a top-level `env` entry in `.github/workflows/ci.yml`, the same list as the docs.rs feature set: every feature except `provider-local-cuda` and `provider-local-rocm`. The run steps expand it as `$ALL_NO_LLVM`.
+All jobs run on `ubuntu-latest`. `ALL_NO_LLVM` is a top-level `env` entry in `.github/workflows/ci.yml`, the same list as the docs.rs feature set: every feature except `provider-local-cuda` and `provider-local-rocm`. The run steps expand it as `$ALL_NO_LLVM`.
