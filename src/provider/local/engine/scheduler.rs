@@ -1253,23 +1253,38 @@ impl Engine {
             stats.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
         }
 
-        // A draft that ends the reply is not cached: plain decoding samples
-        // that id and stops without forwarding it, so the cached ids and the
-        // published prefix blocks must end before it. The accepted draft
-        // stays the next token (forced, so the sampling distribution is
-        // untouched) and the next round ends the reply with it.
-        if let Some(end) = drafts[..accepted]
-            .iter()
-            .position(|&d| self.format.is_eog(d))
-        {
-            accepted = end;
-            seq.forced = Some(drafts[end]);
+        // Emit the accepted drafts like sampled tokens. A draft that ends the
+        // reply (end of generation, a stop string, the token budget) ends it
+        // here and is not cached: plain decoding samples that id and stops
+        // without forwarding it, so the cached ids, the K/V rows and the
+        // published prefix blocks end before it.
+        let mut cached = accepted;
+        let mut ended = false;
+        for (j, &d) in drafts[..accepted].iter().enumerate() {
+            if self.format.is_eog(d) {
+                ended = true;
+                cached = j;
+                break;
+            }
+            seq.completion += 1;
+            let mut items = Vec::new();
+            let id_rng = &mut self.id_rng;
+            let mut next_call_id = || format!("call_{:016x}", id_rng.next_u64());
+            seq.parser
+                .push(d, &self.tokenizer, &mut next_call_id, &mut items);
+            seq.stopper.push(&mut items, &mut seq.pending);
+            if seq.stopper.stopped || seq.completion == seq.budget {
+                ended = true;
+                cached = j;
+                break;
+            }
         }
 
-        // Cache the pending token and the accepted drafts; the state for the
-        // next round is the verified row after the last of them. The rows of
-        // the rejected drafts leave with their tail blocks.
-        let keep = start + 1 + accepted;
+        // Cache the pending token and the accepted drafts that did not end
+        // the reply; the state for the next round is the verified row after
+        // the last of them. The rows of the rejected drafts leave with their
+        // tail blocks.
+        let keep = start + 1 + cached;
         seq.blocks.len = start + batch.len();
         let slot = StateSlot(seq.slot.unwrap_or(0));
         if self.model.rewind(slot, keep) != keep
@@ -1285,7 +1300,7 @@ impl Engine {
         }
         let seq = &mut self.running[i];
         seq.ids.push(batch[0]);
-        seq.ids.extend_from_slice(&drafts[..accepted]);
+        seq.ids.extend_from_slice(&drafts[..cached]);
         let len = seq.blocks.len;
         let ids = share.then_some(seq.ids.as_slice());
         self.pools.release_window(&mut seq.blocks, len, ids);
@@ -1298,8 +1313,8 @@ impl Engine {
             if let Err(e) = drafter.observe(
                 &self.model,
                 start,
-                &batch[..=accepted],
-                &h[..(accepted + 1) * n],
+                &batch[..=cached],
+                &h[..(cached + 1) * n],
             ) {
                 self.fail(i, e);
                 return;
@@ -1308,12 +1323,12 @@ impl Engine {
         let seq = &mut self.running[i];
         // The verified row after the last kept token seeds the next round:
         // moved to the front of its buffer, not copied into a new one.
-        rows.copy_within(accepted * vocab..(accepted + 1) * vocab, 0);
+        rows.copy_within(cached * vocab..(cached + 1) * vocab, 0);
         rows.truncate(vocab);
         seq.logits = rows;
         seq.hidden = hidden.map(|mut h| {
             let n = h.len() / batch.len();
-            h.copy_within(accepted * n..(accepted + 1) * n, 0);
+            h.copy_within(cached * n..(cached + 1) * n, 0);
             h.truncate(n);
             h
         });
@@ -1338,25 +1353,8 @@ impl Engine {
                 );
             }
         }
-
-        // Emit the accepted drafts like sampled tokens.
-        for &d in &drafts[..accepted] {
-            let seq = &mut self.running[i];
-            if self.format.is_eog(d) {
-                seq.phase = Phase::Ended { failed: false };
-                return;
-            }
-            seq.completion += 1;
-            let mut items = Vec::new();
-            let id_rng = &mut self.id_rng;
-            let mut next_call_id = || format!("call_{:016x}", id_rng.next_u64());
-            seq.parser
-                .push(d, &self.tokenizer, &mut next_call_id, &mut items);
-            seq.stopper.push(&mut items, &mut seq.pending);
-            if seq.stopper.stopped || seq.completion == seq.budget {
-                seq.phase = Phase::Ended { failed: false };
-                return;
-            }
+        if ended {
+            self.running[i].phase = Phase::Ended { failed: false };
         }
     }
 }
