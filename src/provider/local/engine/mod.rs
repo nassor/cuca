@@ -20,21 +20,24 @@
 //!    recurrent state is not positional: the engine keeps a snapshot of it at
 //!    a block boundary of every prompt it prefills (the end of its last
 //!    complete message) and resumes only from prefixes it has one for. An
-//!    in-trunk head or an EAGLE drafter keeps the pairs the shared tokens
-//!    still determine (`Drafter::truncate`) and re-observes the replayed rows;
+//!    in-trunk head, an EAGLE or a DFlash drafter keeps the pairs (positions)
+//!    the shared tokens still determine (`Drafter::truncate`, which also drops
+//!    the rows it holds back) and re-observes the replayed rows;
 //!    it serves one sequence at a time.
 //! 2. **Prefill** in chunks of [`prefill_chunk`] tokens, interleaved with the
 //!    decode rows of the other sequences within the step's row budget; only
-//!    the last chunk computes logits. An in-trunk head or an EAGLE drafter
-//!    takes the final-norm hidden row of every position (`Drafter::observe`).
+//!    the last chunk computes logits. An in-trunk head, an EAGLE or a DFlash
+//!    drafter takes the hidden rows of every position (`Drafter::observe`).
 //! 3. **Decode**: sample, stop on an end-of-generation id, feed the id through
 //!    the [`OutputParser`], cut its text at the first stop string of the job
 //!    (`StopMatcher`; thinking and tool calls pass through, and text a stop
 //!    string might still begin is held back) and queue every resulting block
 //!    for the stream (`try_send`: a slow consumer stalls its own sequence
 //!    only), then run the model one token further (a round: for a lone
-//!    sequence draft, verify one batch, roll back the rejected positions, let
-//!    the in-trunk head or the EAGLE drafter observe the kept rows). Generation stops at the
+//!    sequence draft, verify one batch, roll back the rejected positions, hand
+//!    the kept rows to the in-trunk head, the EAGLE or the DFlash drafter:
+//!    observed at once after a round that drafted, held back (`Drafter::defer`)
+//!    after one that did not, until a round drafts again). Generation stops at the
 //!    end-of-generation id, at a stop string, at `max_tokens`, or when the
 //!    context is full; held text is released at every end but a stop string.
 //! 4. **Usage**: exact prompt and completion token counts are recorded in the
@@ -1800,7 +1803,7 @@ mod tests {
     /// The committed pairs of the in-trunk head of `e`.
     fn head_len(e: &Engine) -> usize {
         match &e.drafter {
-            Some(Drafter::InTrunk(head)) => head.len(),
+            Some(drafter @ Drafter::InTrunk(head, _)) => head.len() + drafter.pending(),
             _ => panic!("the engine has no in-trunk head"),
         }
     }
@@ -2234,7 +2237,7 @@ mod tests {
     /// The committed pairs of the EAGLE drafter of `e`.
     fn eagle_len(e: &Engine) -> usize {
         match &e.drafter {
-            Some(Drafter::Eagle(head)) => head.len(),
+            Some(drafter @ Drafter::Eagle(head, _)) => head.len() + drafter.pending(),
             _ => panic!("the engine has no EAGLE drafter"),
         }
     }
@@ -2345,7 +2348,7 @@ mod tests {
         let mut second = first[..30].to_vec();
         second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
         let kv_of = |e: &Engine| match &e.drafter {
-            Some(Drafter::Eagle(head)) => head.kv_prefix(),
+            Some(Drafter::Eagle(head, _)) => head.kv_prefix(),
             _ => panic!("the engine has no EAGLE drafter"),
         };
         let mut warm = engine_with_eagle(&model, &eagle, 128, 0.0, None, 3);
@@ -2512,7 +2515,10 @@ mod tests {
     /// The positions `lo..hi` the DFlash drafter of `e` holds context for.
     fn dflash_held(e: &Engine) -> (usize, usize) {
         match &e.drafter {
-            Some(Drafter::Dflash(net)) => net.held(),
+            Some(drafter @ Drafter::Dflash(net, _)) => {
+                let (lo, hi) = net.held();
+                (lo, hi + drafter.pending())
+            }
             _ => panic!("the engine has no DFlash drafter"),
         }
     }
@@ -2797,5 +2803,332 @@ mod tests {
             .err()
             .expect("a drafter is not a main model");
         assert!(err.to_string().contains("not a standalone model"), "{err}");
+    }
+
+    // ---- lazy drafter upkeep ------------------------------------------------
+
+    /// The committed pair count and latent K/V rows of the EAGLE drafter of
+    /// `e`: what the drafter has taken into its cache, not what it holds back.
+    fn eagle_cache(e: &Engine) -> (usize, Vec<Vec<f32>>) {
+        match &e.drafter {
+            Some(Drafter::Eagle(head, _)) => (head.len(), head.kv_prefix()),
+            _ => panic!("the engine has no EAGLE drafter"),
+        }
+    }
+
+    /// Rows the drafter of `e` holds back.
+    fn pending(e: &Engine) -> usize {
+        e.drafter.as_ref().expect("a drafter").pending()
+    }
+
+    /// Make the drafter of `e` take the rows it holds back into its cache.
+    fn catch_up(e: &mut Engine) {
+        let drafter = e.drafter.as_mut().expect("a drafter");
+        drafter.catch_up(&e.model).unwrap();
+    }
+
+    /// Rows handed to a drafter round by round (`defer`) and taken in one
+    /// pass (`catch_up`) leave its cache as observing them as they came
+    /// would, bit for bit, whatever the chunking and the cap that forces a
+    /// pass early; the held rows follow truncation, replay and reset.
+    #[test]
+    fn eagle_deferred_rows_catch_up_to_the_eager_cache() {
+        use super::testing::engine_with_eagle;
+        use crate::provider::local::model::tiny::{Lcg, N_EMBD};
+        let (model, eagle) = (mistral4(128), eagle());
+        let n = 40;
+        let tokens: Vec<u32> = (0..n).map(|i| (i * 5 % 13 + 3) as u32).collect();
+        let hidden = Lcg(9).values(n * N_EMBD, 1.0);
+        let rows = |a: usize, b: usize| (&tokens[a..b], &hidden[a * N_EMBD..b * N_EMBD]);
+        let fresh = || engine_with_eagle(&model, &eagle, 128, 0.0, None, 3);
+
+        let mut eager = fresh();
+        let (t, h) = rows(0, n);
+        eager
+            .drafter
+            .as_mut()
+            .unwrap()
+            .observe(&eager.model, 0, t, h)
+            .unwrap();
+        let want = eagle_cache(&eager);
+        assert_eq!(want.0, n - 1);
+
+        // A prompt of four rows, then rounds of one or three rows.
+        for cap in [None, Some(7), Some(1)] {
+            let mut lazy = fresh();
+            let d = lazy.drafter.as_mut().unwrap();
+            if let Some(cap) = cap {
+                d.set_lag_cap(cap);
+            }
+            let (t, h) = rows(0, 4);
+            d.observe(&lazy.model, 0, t, h).unwrap();
+            let mut at = 4;
+            while at < n {
+                let step = (if at % 5 == 0 { 3 } else { 1 }).min(n - at);
+                let (t, h) = rows(at, at + step);
+                d.defer(&lazy.model, at, t, h).unwrap();
+                at += step;
+                assert!(d.pending() <= cap.unwrap_or(1024).max(3), "cap {cap:?}");
+            }
+            if cap.is_none() {
+                assert_eq!(d.pending(), n - 4);
+                assert_eq!(eagle_cache(&lazy).0, 3, "only the prompt was observed");
+            }
+            catch_up(&mut lazy);
+            assert_eq!(pending(&lazy), 0);
+            assert!(eagle_cache(&lazy) == want, "cap {cap:?}");
+            // Nothing is left to take.
+            catch_up(&mut lazy);
+            assert!(eagle_cache(&lazy) == want, "cap {cap:?}");
+        }
+
+        // Truncation drops the held rows the new prompt does not share, and
+        // the replay from an earlier position replaces the ones it covers:
+        // the result is a cold drafter over the final sequence.
+        let mut lazy = fresh();
+        let d = lazy.drafter.as_mut().unwrap();
+        let (t, h) = rows(0, 4);
+        d.observe(&lazy.model, 0, t, h).unwrap();
+        for at in 4..30 {
+            let (t, h) = rows(at, at + 1);
+            d.defer(&lazy.model, at, t, h).unwrap();
+        }
+        assert_eq!(d.pending(), 26);
+        d.truncate(24);
+        assert_eq!(d.pending(), 20, "positions 24 and up are gone");
+        let replay_tokens: Vec<u32> = (16..28).map(|i| (i * 3 % 11 + 2) as u32).collect();
+        let replay_hidden = Lcg(21).values(12 * N_EMBD, 1.0);
+        d.observe(&lazy.model, 16, &replay_tokens, &replay_hidden)
+            .unwrap();
+        assert_eq!(d.pending(), 0, "the replay took everything in one go");
+        let mut cold = fresh();
+        let mut seq_tokens = tokens[..16].to_vec();
+        seq_tokens.extend_from_slice(&replay_tokens);
+        let mut seq_hidden = hidden[..16 * N_EMBD].to_vec();
+        seq_hidden.extend_from_slice(&replay_hidden);
+        cold.drafter
+            .as_mut()
+            .unwrap()
+            .observe(&cold.model, 0, &seq_tokens, &seq_hidden)
+            .unwrap();
+        assert!(eagle_cache(&lazy) == eagle_cache(&cold));
+
+        // A round that does not follow the held rows takes them first.
+        let mut gap = fresh();
+        let d = gap.drafter.as_mut().unwrap();
+        let (t, h) = rows(0, 4);
+        d.observe(&gap.model, 0, t, h).unwrap();
+        let (t, h) = rows(4, 12);
+        d.defer(&gap.model, 4, t, h).unwrap();
+        let (t, h) = rows(30, 31);
+        d.defer(&gap.model, 30, t, h).unwrap();
+        assert_eq!(d.pending(), 1);
+        catch_up(&mut gap);
+        let mut skipped = fresh();
+        let d = skipped.drafter.as_mut().unwrap();
+        let (t, h) = rows(0, 12);
+        d.observe(&skipped.model, 0, t, h).unwrap();
+        let (t, h) = rows(30, 31);
+        d.observe(&skipped.model, 30, t, h).unwrap();
+        assert!(eagle_cache(&gap) == eagle_cache(&skipped));
+
+        // Truncating below the held rows empties them, and a reset forgets
+        // them with everything else.
+        let mut gone = fresh();
+        let d = gone.drafter.as_mut().unwrap();
+        let (t, h) = rows(0, 4);
+        d.observe(&gone.model, 0, t, h).unwrap();
+        let (t, h) = rows(4, 9);
+        d.defer(&gone.model, 4, t, h).unwrap();
+        d.truncate(3);
+        assert_eq!(d.pending(), 0);
+        let (t, h) = rows(4, 9);
+        d.defer(&gone.model, 4, t, h).unwrap();
+        assert_eq!(d.pending(), 5);
+        d.reset();
+        assert_eq!(d.pending(), 0);
+        assert_eq!(eagle_cache(&gone).0, 0);
+    }
+
+    /// The committed pairs and K/V rows of the in-trunk head of `e`.
+    fn head_cache(e: &Engine) -> (usize, Vec<Vec<f32>>) {
+        match &e.drafter {
+            Some(Drafter::InTrunk(head, _)) => (head.len(), head.kv_prefix()),
+            _ => panic!("the engine has no in-trunk head"),
+        }
+    }
+
+    /// The positions the DFlash drafter of `e` holds context for (`hi`) and
+    /// its whole ring: the first held position and every K and V row.
+    fn dflash_cache(e: &Engine) -> (usize, Vec<Vec<f32>>) {
+        match &e.drafter {
+            Some(Drafter::Dflash(net, _)) => {
+                let (lo, hi, mut rows, v) = net.snapshot();
+                rows.extend(v);
+                rows.push(vec![lo as f32]);
+                (hi, rows)
+            }
+            _ => panic!("the engine has no DFlash drafter"),
+        }
+    }
+
+    /// A drafter with a per-token upkeep, as the lazy-upkeep test drives it.
+    struct Upkeep<'a> {
+        name: &'static str,
+        /// An engine over the same target that never drafts.
+        plain: Box<dyn Fn() -> Engine + 'a>,
+        /// An engine that drafts three tokens in every round.
+        spec: Box<dyn Fn() -> Engine + 'a>,
+        /// The positions the drafter has taken into its cache, and the cache.
+        cache: fn(&Engine) -> (usize, Vec<Vec<f32>>),
+        /// How many positions of the cached ids the drafter lacks once it
+        /// has taken everything in: a drafter of pairs holds one fewer, the
+        /// last row waits for its successor token.
+        behind: usize,
+    }
+
+    /// An engine that runs plain rounds for a while and then drafts decodes
+    /// the plain text and leaves the drafter's cache what an engine that
+    /// drafted all along leaves, bit for bit: the plain rounds hand the
+    /// drafter their rows without taking them in (`pending`), and the first
+    /// round that drafts takes them in one pass. A following request that
+    /// replays the cached ids starts from the rows still held.
+    #[test]
+    fn plain_rounds_defer_the_upkeep_and_the_next_draft_catches_up() {
+        use super::testing::{engine_in_trunk, engine_with_dflash, engine_with_eagle};
+        let (mistral, eagle) = (mistral4(128), eagle());
+        let qwen = hybrid(TinyQwen35::default());
+        let (muse, dflash) = (muse_target(128), write_tiny_dflash(&TinyDflash::default()));
+        let cases = [
+            Upkeep {
+                name: "EAGLE",
+                plain: Box::new(|| engine(&mistral, 128, 0.0, None)),
+                spec: Box::new(|| engine_with_eagle(&mistral, &eagle, 128, 0.0, None, 3)),
+                cache: eagle_cache,
+                behind: 1,
+            },
+            Upkeep {
+                name: "in-trunk head",
+                plain: Box::new(|| engine(&qwen, 128, 0.0, None)),
+                spec: Box::new(|| engine_in_trunk(&qwen, 128, 0.0, None, 3)),
+                cache: head_cache,
+                behind: 1,
+            },
+            Upkeep {
+                name: "DFlash",
+                plain: Box::new(|| engine(&muse, 128, 0.0, None)),
+                spec: Box::new(|| engine_with_dflash(&muse, &dflash, 128, 0.0, None, 3)),
+                cache: dflash_cache,
+                behind: 0,
+            },
+        ];
+        for case in &cases {
+            lazy_upkeep_is_exact(case);
+        }
+    }
+
+    fn lazy_upkeep_is_exact(case: &Upkeep<'_>) {
+        let name = case.name;
+        let prompt = long_prompt(20);
+        let mut plain = (case.plain)();
+        let expected = run(&mut plain, &prompt, Some(48));
+
+        let mut eager = (case.spec)();
+        let a = run(&mut eager, &prompt, Some(48));
+        assert_eq!(text(&a), text(&expected), "{name}");
+        assert_eq!(
+            pending(&eager),
+            0,
+            "{name}: a drafting engine observes at once"
+        );
+        let eager_cache = (case.cache)(&eager);
+        assert_eq!(eager_cache.0, eager.last_ids.len() - case.behind, "{name}");
+
+        let mut drafted_after_plain = 0;
+        for forced in [0u32, 1, 3, 10, 30, 1000] {
+            let what = format!("{name}, {forced} plain rounds");
+            let mut lazy = (case.spec)();
+            lazy.governor = Governor {
+                forced,
+                forced_spec: false,
+                ..Governor::always_speculating()
+            };
+            let b = run(&mut lazy, &prompt, Some(48));
+            assert_eq!(text(&b), text(&expected), "{what}");
+            assert_eq!(lazy.last_ids, plain.last_ids, "{what}");
+            assert_eq!(
+                lazy.drafter.as_ref().expect("a drafter").stale_drafts(),
+                0,
+                "{what}: a round drafted before the drafter caught up"
+            );
+            assert_eq!(
+                (case.cache)(&lazy).0 + pending(&lazy),
+                lazy.last_ids.len() - case.behind,
+                "{what}"
+            );
+            if forced >= 48 {
+                // Every round was plain: the drafter saw the prompt only.
+                assert_eq!(lazy.stats.snapshot().drafted, 0, "{what}");
+                assert_eq!(pending(&lazy), lazy.last_ids.len() - prompt.len(), "{what}");
+                assert_eq!((case.cache)(&lazy).0, prompt.len() - case.behind, "{what}");
+            } else {
+                drafted_after_plain += lazy.stats.snapshot().drafted;
+            }
+            catch_up(&mut lazy);
+            assert_eq!(pending(&lazy), 0, "{what}");
+            assert!(
+                (case.cache)(&lazy) == eager_cache,
+                "{what}: the cache differs from the eager one"
+            );
+
+            // The same schedule with the upkeep done round by round: when
+            // the drafter drafts, it holds the cache it would hold, so it
+            // proposes what the lazy one proposes and the rounds are the
+            // same ones.
+            let mut reference = (case.spec)();
+            reference
+                .drafter
+                .as_mut()
+                .expect("a drafter")
+                .set_eager(true);
+            reference.governor = Governor {
+                forced,
+                forced_spec: false,
+                ..Governor::always_speculating()
+            };
+            let r = run(&mut reference, &prompt, Some(48));
+            assert_eq!(text(&r), text(&expected), "{what}");
+            assert_eq!(pending(&reference), 0, "{what}");
+            assert_eq!(
+                reference.stats.snapshot(),
+                lazy.stats.snapshot(),
+                "{what}: the proposals differ from the eager drafter's"
+            );
+        }
+        assert!(
+            drafted_after_plain > 0,
+            "{name}: the rounds after the plain ones draft"
+        );
+
+        // The next request replays the cached ids from the rows still held:
+        // the drafter ends as one that never deferred.
+        let mut lazy = (case.spec)();
+        lazy.governor = Governor {
+            forced: 1000,
+            forced_spec: false,
+            ..Governor::always_speculating()
+        };
+        run(&mut lazy, &prompt, Some(48));
+        assert!(pending(&lazy) > 0, "{name}");
+        lazy.governor = Governor::always_speculating();
+        let mut extended = lazy.last_ids.clone();
+        extended.extend([15, 14, 13]);
+        let c = run(&mut lazy, &extended, Some(20));
+        let expected = run(&mut plain, &extended, Some(20));
+        assert_eq!(text(&c), text(&expected), "{name}");
+        let d = run(&mut eager, &extended, Some(20));
+        assert_eq!(text(&d), text(&expected), "{name}");
+        catch_up(&mut lazy);
+        assert!((case.cache)(&lazy) == (case.cache)(&eager), "{name}");
     }
 }

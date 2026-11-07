@@ -1016,8 +1016,19 @@ impl Engine {
                 0
             };
             if k > 0
-                && let (Some(drafter), Some(h)) = (&self.drafter, seq.hidden.as_deref())
+                && let (Some(drafter), Some(h)) = (&mut self.drafter, seq.hidden.as_deref())
             {
+                // A drafter that skipped the upkeep of plain rounds takes
+                // the rows it missed now, in one batched pass. The time is
+                // a cost of switching, not of either mode: the round the
+                // governor times starts after it.
+                let caught_up = Instant::now();
+                if let Err(e) = drafter.catch_up(&self.model) {
+                    self.fail(i, e);
+                    return None;
+                }
+                let spent = caught_up.elapsed();
+                round.started = round.started.checked_add(spent).unwrap_or(round.started);
                 let greedy_mode = seq.temperature <= 0.0;
                 let (temperature, top_k, top_p) = (seq.temperature, seq.top_k, seq.top_p);
                 let shared_rng = &mut self.rng;
@@ -1308,18 +1319,21 @@ impl Engine {
         let len = seq.blocks.len;
         let ids = share.then_some(seq.ids.as_slice());
         self.pools.release_window(&mut seq.blocks, len, ids);
-        // The in-trunk head takes the hidden rows of the tokens kept (the
-        // pending token and the accepted drafts; rejected drafts' rows are
-        // dropped with them), in plain rounds too, so it never falls behind
-        // the trunk.
+        // The drafter takes the hidden rows of the tokens kept (the pending
+        // token and the accepted drafts; rejected drafts' rows are dropped
+        // with them). A round that drafted nothing only hands them over
+        // (`Drafter::defer`): a drafter with a per-token upkeep takes the
+        // rows it missed in one batched pass when a round drafts again
+        // (`plan_decode`), so plain decoding does not pay for it.
         if observes && let (Some(drafter), Some(h)) = (&mut self.drafter, hidden.as_deref()) {
             let n = h.len() / batch.len();
-            if let Err(e) = drafter.observe(
-                &self.model,
-                start,
-                &batch[..=cached],
-                &h[..(cached + 1) * n],
-            ) {
+            let (tokens, rows) = (&batch[..=cached], &h[..(cached + 1) * n]);
+            let seen = if drafts.is_empty() {
+                drafter.defer(&self.model, start, tokens, rows)
+            } else {
+                drafter.observe(&self.model, start, tokens, rows)
+            };
+            if let Err(e) = seen {
                 self.fail(i, e);
                 return;
             }

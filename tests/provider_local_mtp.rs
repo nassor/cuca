@@ -21,6 +21,11 @@
 //! comma-separated list (`1,2,3,4`) to run one comparison per value (default
 //! 3).
 //!
+//! `CUCA_LOCAL_ALLOW_MISMATCH=1` reports a CPU output that differs from plain
+//! decoding (`identical false`) instead of failing the test: the live timing
+//! of a 67 GB model on a machine whose separate loads sometimes differ by a
+//! flipped bit (`docs/content/providers/local/drafting.md`, machine note).
+//!
 //! With the target or the drafter missing the test prints `SKIP` and passes,
 //! unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build for the host
 //! CPU:
@@ -210,6 +215,7 @@ async fn drafter_output_equals_plain_greedy_decoding() {
     // The engine thread frees the model once its last handle is gone.
     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
+    let allow_mismatch = std::env::var_os("CUCA_LOCAL_ALLOW_MISMATCH").is_some();
     for draft_tokens in draft_token_counts() {
         let speculative = LocalModel::load(LocalModelConfig {
             source: target.clone(),
@@ -233,8 +239,10 @@ async fn drafter_output_equals_plain_greedy_decoding() {
             // On the CPU the engine is row-exact, so output must be identical.
             // A GPU's batched rows differ from single steps by float rounding,
             // which can flip a near-tie: report identity there instead of
-            // asserting it.
-            if exact {
+            // asserting it. `CUCA_LOCAL_ALLOW_MISMATCH=1` reports it on the
+            // CPU too, for timing a machine whose separate loads of one big
+            // model differ by a flipped bit (see the docs' machine note).
+            if exact && !allow_mismatch {
                 assert_eq!(
                     &got, expected,
                     "speculative output must equal plain greedy output for {prompt:?}"

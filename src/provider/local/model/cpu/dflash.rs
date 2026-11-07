@@ -508,6 +508,13 @@ impl DflashNet {
         (self.lo, self.hi)
     }
 
+    /// The held range and the whole ring: `(lo, hi, K per layer, V per
+    /// layer)` (tests).
+    #[cfg(test)]
+    pub(crate) fn snapshot(&self) -> (usize, usize, Vec<Vec<f32>>, Vec<Vec<f32>>) {
+        (self.lo, self.hi, self.k.clone(), self.v.clone())
+    }
+
     /// Forget every position.
     pub(crate) fn reset(&mut self) {
         self.lo = 0;

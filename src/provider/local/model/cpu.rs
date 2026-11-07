@@ -1653,6 +1653,11 @@ impl Transformer {
         self.hp.n_embd
     }
 
+    /// Positions this model's caches hold.
+    pub(crate) fn context_length(&self) -> usize {
+        self.context_length
+    }
+
     /// A drafter's hidden width on the target side (`embedding_length_out`).
     pub(crate) fn n_embd_out(&self) -> usize {
         self.hp.n_embd_out

@@ -140,6 +140,21 @@ impl NextnHead {
         self.pairs.len()
     }
 
+    /// The K and V rows of the committed slots (tests).
+    #[cfg(test)]
+    pub(crate) fn kv_prefix(&self) -> Vec<Vec<f32>> {
+        [&self.kv.0, &self.kv.1]
+            .into_iter()
+            .map(|t| {
+                t.narrow(2, 0, self.pairs.len())
+                    .and_then(|rows| rows.contiguous())
+                    .and_then(|rows| rows.flatten_all())
+                    .and_then(|rows| rows.to_vec1::<f32>())
+                    .expect("the head's K/V rows read back")
+            })
+            .collect()
+    }
+
     /// Forget every pair and the tail.
     pub(crate) fn reset(&mut self) {
         self.pairs.clear();
