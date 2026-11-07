@@ -1176,7 +1176,7 @@ pub(crate) fn build(
             }
             gpt2(ck, hp)?
         }
-        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite => {
+        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite | ConvArch::Mistral3 => {
             let prefix = config_str(ck, "add_prefix_space").and_then(Json::as_bool);
             if ck.tokenizer_model.is_some() {
                 spm_meta(ck, spm_generic(ck, hp)?, prefix)?

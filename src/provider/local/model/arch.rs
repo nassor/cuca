@@ -59,6 +59,11 @@ pub(crate) enum Arch {
     /// sandwich norms (the post norms with their own epsilon), a scale-less
     /// norm on the embeddings and a logit multiplier ahead of the soft-cap.
     MuseGlimmer,
+    /// Ministral 3 and Devstral Small 2 (`mistral3`): the `llama` graph with
+    /// YaRN whose magnitude follows `rope.scaling.yarn_log_multiplier` and the
+    /// Llama 4 per-position query scaling, its length being the YaRN original
+    /// context.
+    Mistral3,
     /// Mistral Small 4 (`mistral4`): DeepSeek-style multi-head latent
     /// attention (low-rank Q, a compressed K/V latent shared by every head
     /// plus one shared rotary key, absorbed into the query so that only the
@@ -217,6 +222,10 @@ pub(crate) struct Behavior {
     /// checkpoint's own configuration, which llama.cpp's converter did not
     /// write for Mistral Small 4.
     pub(crate) attn_temp_default: Option<(f64, usize)>,
+    /// Llama 4 query scaling from `attention.temperature_scale` (absent or 0:
+    /// none) whose length is `rope.scaling.original_context_length` (llama.cpp
+    /// `mistral3`).
+    pub(crate) attn_temp_orig_ctx: bool,
 }
 
 const DEFAULT: Behavior = Behavior {
@@ -247,11 +256,12 @@ const DEFAULT: Behavior = Behavior {
     mla: false,
     shared_expert_ungated: false,
     attn_temp_default: None,
+    attn_temp_orig_ctx: false,
 };
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 17] = [
+    pub(crate) const ALL: [Arch; 18] = [
         Arch::Gemma4,
         Arch::Gemma3,
         Arch::Llama,
@@ -267,6 +277,7 @@ impl Arch {
         Arch::Olmo2,
         Arch::Ernie4_5,
         Arch::MuseGlimmer,
+        Arch::Mistral3,
         Arch::Mistral4,
         Arch::Gemma4Assistant,
     ];
@@ -291,6 +302,7 @@ impl Arch {
             Arch::Ernie4_5 => "ernie4_5",
             Arch::Gemma4Assistant => "gemma4-assistant",
             Arch::MuseGlimmer => "muse-glimmer",
+            Arch::Mistral3 => "mistral3",
             Arch::Mistral4 => "mistral4",
         }
     }
@@ -346,6 +358,10 @@ impl Arch {
                 embd_norm: true,
                 post_norm_eps: Some(1e-8),
                 logit_multiplier: true,
+                ..DEFAULT
+            },
+            Arch::Mistral3 => Behavior {
+                attn_temp_orig_ctx: true,
                 ..DEFAULT
             },
             Arch::Mistral4 => Behavior {
@@ -495,6 +511,20 @@ mod tests {
         let b = Arch::Qwen35Moe.behavior();
         assert!(b.moe && b.moe_norm_weights);
         assert!(!Arch::Qwen35.behavior().moe);
+    }
+
+    #[test]
+    fn mistral3_is_llama_with_the_orig_context_query_scaling() {
+        for arch in Arch::ALL {
+            assert_eq!(
+                arch.behavior().attn_temp_orig_ctx,
+                arch == Arch::Mistral3,
+                "{arch:?}"
+            );
+        }
+        let b = Arch::Mistral3.behavior();
+        assert_eq!(b.rope, RopeKind::Norm);
+        assert!(!b.mla && !b.moe && b.attn_temp_default.is_none());
     }
 
     #[test]

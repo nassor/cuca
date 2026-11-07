@@ -613,6 +613,9 @@ impl Hparams {
             let n_dims = k.usize_opt("rope.dimension_count")?.unwrap_or(head_dim);
             let scaling = k.str_opt("rope.scaling.type").unwrap_or("linear");
             let factor = k.f64_opt("rope.scaling.factor")?.unwrap_or(0.0);
+            let yarn_log_mul = k
+                .f64_opt("rope.scaling.yarn_log_multiplier")?
+                .unwrap_or(0.0);
             let yarn = match scaling {
                 "yarn" => Some(Yarn {
                     ext_factor: 1.0,
@@ -655,6 +658,13 @@ impl Hparams {
                         // scale instead (`mscale` below), twice. Cancel the
                         // table's own `1 + 0.1 ln(factor)`.
                         attn_factor / (1.0 + 0.1 * factor.ln())
+                    } else if yarn.is_some() && factor > 0.0 && yarn_log_mul != 0.0 {
+                        // `yarn_log_multiplier` is `mscale_all_dim` itself
+                        // here: llama.cpp sets the magnitude to
+                        // `get_mscale(factor, 1) / get_mscale(factor, mul)`
+                        // (1 for a multiplier of 1). The table already
+                        // multiplies by `1 + 0.1 ln(factor)`.
+                        attn_factor / (1.0 + 0.1 * yarn_log_mul * factor.ln())
                     } else {
                         attn_factor
                     }
@@ -908,6 +918,22 @@ impl Hparams {
                         "`temperature_scale` and a non-zero `temperature_length` come together",
                     ));
                 }
+            }
+        } else if behavior.attn_temp_orig_ctx {
+            match k.f64_opt("attention.temperature_scale")? {
+                Some(beta) if beta != 0.0 => {
+                    if n_ctx_orig == 0 {
+                        return Err(meta_err(
+                            &format!("{}.rope.scaling.original_context_length", arch.name()),
+                            "the query scaling needs a non-zero original context",
+                        ));
+                    }
+                    Some(AttnTemp {
+                        beta: beta as f32,
+                        length: n_ctx_orig,
+                    })
+                }
+                _ => None,
             }
         } else {
             None
@@ -1355,6 +1381,85 @@ mod tests {
             ("mistral4.expert_group_count", U32(1)),
             ("mistral4.leading_dense_block_count", U32(0)),
         ])
+    }
+
+    /// `llama`-arch metadata with a YaRN block (Devstral 2 123B's GGUF shape).
+    fn yarn_llama_metadata(log_mul: Option<f32>) -> Metadata {
+        let mut m = md(&[
+            ("general.architecture", Str("llama".into())),
+            ("llama.block_count", U32(2)),
+            ("llama.context_length", U32(4096)),
+            ("llama.embedding_length", U32(64)),
+            ("llama.attention.head_count", U32(4)),
+            ("llama.attention.head_count_kv", U32(2)),
+            ("llama.attention.layer_norm_rms_epsilon", F32(1e-5)),
+            ("llama.rope.freq_base", F32(1e6)),
+            ("llama.rope.scaling.type", Str("yarn".into())),
+            ("llama.rope.scaling.factor", F32(64.0)),
+            ("llama.rope.scaling.original_context_length", U32(4096)),
+        ]);
+        if let Some(v) = log_mul {
+            m.insert("llama.rope.scaling.yarn_log_multiplier".into(), F32(v));
+        }
+        m
+    }
+
+    /// The YaRN magnitude of a `llama` file follows `yarn_log_multiplier`
+    /// (llama.cpp: `get_mscale(f, 1) / get_mscale(f, mul)`); without it the
+    /// table keeps ggml's `1 + 0.1 ln f` boost.
+    #[test]
+    fn yarn_log_multiplier_sets_the_rope_magnitude_of_any_architecture() {
+        let boost = 1.0 + 0.1 * 64f64.ln();
+        let mscale = |m: Metadata| {
+            let p = Hparams::from_metadata(&m, &none).unwrap();
+            p.ropes[0].attn_factor * (1.0 + 0.1 * 64f64.ln())
+        };
+        assert!((mscale(yarn_llama_metadata(None)) - boost).abs() < 1e-9);
+        assert!((mscale(yarn_llama_metadata(Some(0.0))) - boost).abs() < 1e-9);
+        // A multiplier of 1 cancels the boost: magnitude 1.
+        assert!((mscale(yarn_llama_metadata(Some(1.0))) - 1.0).abs() < 1e-6);
+        let half = boost / (1.0 + 0.1 * 0.5 * 64f64.ln());
+        assert!((mscale(yarn_llama_metadata(Some(0.5))) - half).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mistral3_scales_queries_past_the_original_context_when_the_file_says_so() {
+        let mut m = yarn_llama_metadata(Some(1.0));
+        m.insert("general.architecture".into(), Str("mistral3".into()));
+        let renamed: Metadata = m
+            .into_iter()
+            .map(|(k, v)| (k.replacen("llama.", "mistral3.", 1), v))
+            .collect();
+        let mut m = renamed.clone();
+        assert!(
+            Hparams::from_metadata(&m, &none)
+                .unwrap()
+                .attn_temp
+                .is_none()
+        );
+        m.insert("mistral3.attention.temperature_scale".into(), F32(0.1));
+        let t = Hparams::from_metadata(&m, &none)
+            .unwrap()
+            .attn_temp
+            .unwrap();
+        assert_eq!((t.beta, t.length), (0.1, 4096));
+        assert_eq!(t.at(4095), 1.0);
+        m.insert("mistral3.attention.temperature_scale".into(), F32(0.0));
+        assert!(
+            Hparams::from_metadata(&m, &none)
+                .unwrap()
+                .attn_temp
+                .is_none()
+        );
+        // Another architecture ignores the key.
+        let mut l = yarn_llama_metadata(None);
+        l.insert("llama.attention.temperature_scale".into(), F32(0.1));
+        assert!(
+            Hparams::from_metadata(&l, &none)
+                .unwrap()
+                .attn_temp
+                .is_none()
+        );
     }
 
     #[test]

@@ -325,6 +325,29 @@ impl TinySpec {
         s
     }
 
+    /// Ministral 3: Llama layers with a tied head, YaRN (factor 2 over an
+    /// original context of 16, `yarn_log_multiplier` 1) and the Llama 4 query
+    /// scaling from position 16, inside the tiny context.
+    pub(crate) fn mistral3() -> Self {
+        let mut s = Self::base("mistral3");
+        s.tied = true;
+        s.meta.push(kv("rope.freq_base", Value::F32(1_000_000.0)));
+        s.meta
+            .push(kv("rope.scaling.type", Value::String("yarn".into())));
+        s.meta.push(kv("rope.scaling.factor", Value::F32(2.0)));
+        s.meta
+            .push(kv("rope.scaling.original_context_length", u(16)));
+        s.meta
+            .push(kv("rope.scaling.yarn_beta_fast", Value::F32(32.0)));
+        s.meta
+            .push(kv("rope.scaling.yarn_beta_slow", Value::F32(1.0)));
+        s.meta
+            .push(kv("rope.scaling.yarn_log_multiplier", Value::F32(1.0)));
+        s.meta
+            .push(kv("attention.temperature_scale", Value::F32(0.3)));
+        s
+    }
+
     /// Qwen 2: NEOX RoPE, Q/K/V biases, tied head.
     pub(crate) fn qwen2() -> Self {
         let mut s = Self::base("qwen2");
@@ -488,6 +511,7 @@ impl TinySpec {
             Self::olmo2(),
             Self::ernie4_5(),
             Self::muse_glimmer(),
+            Self::mistral3(),
         ]
     }
 }

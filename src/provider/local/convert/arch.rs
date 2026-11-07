@@ -48,6 +48,11 @@ pub(crate) enum ConvArch {
     /// `mistral4` model (`Mistral3Model.Mistral4Model` over
     /// `DeepseekV2Model`): multi-head latent attention and stacked experts.
     Mistral4,
+    /// `Ministral3ForCausalLM`, and `Mistral3ForConditionalGeneration` whose
+    /// `text_config` is a `ministral3` model (`Ministral3Model` over
+    /// `LlamaModel`): Llama layers, YaRN with a log multiplier and the Llama 4
+    /// query scaling.
+    Mistral3,
 }
 
 impl ConvArch {
@@ -70,6 +75,7 @@ impl ConvArch {
             "OlmoeForCausalLM" => Self::Olmoe,
             "Ernie4_5ForCausalLM" | "Ernie4_5_ForCausalLM" => Self::Ernie4_5,
             "MuseGlimmerForConditionalGeneration" => Self::MuseGlimmer,
+            "Ministral3ForCausalLM" => Self::Mistral3,
             _ => return None,
         })
     }
@@ -88,8 +94,13 @@ impl ConvArch {
             let text = config.get("text_config").unwrap_or(config);
             return match text.get("model_type").and_then(|t| t.as_str()) {
                 Some("mistral4") => Ok(Self::Mistral4),
+                Some("ministral3") => Ok(Self::Mistral3),
+                // Mistral Small 3.1/3.2 and Magistral 2509 are plain Llama
+                // models in a multimodal wrapper (their published GGUFs say
+                // `llama`).
+                Some("mistral") => Ok(Self::Llama),
                 other => Err(CucaError::Config(format!(
-                    "`Mistral3ForConditionalGeneration` with text model `{}` is not supported (only `mistral4`: llama.cpp converts the others to its `mistral3` architecture, which the engine does not implement)",
+                    "`Mistral3ForConditionalGeneration` with text model `{}` is not supported (only `mistral4`, `ministral3` and `mistral`)",
                     other.unwrap_or("unknown")
                 ))),
             };
@@ -121,6 +132,7 @@ impl ConvArch {
             Self::Ernie4_5 => "ernie4_5",
             Self::MuseGlimmer => "muse-glimmer",
             Self::Mistral4 => "mistral4",
+            Self::Mistral3 => "mistral3",
         }
     }
 
@@ -129,7 +141,7 @@ impl ConvArch {
     pub(crate) fn permutes_qk(self) -> bool {
         matches!(
             self,
-            Self::Llama | Self::Smollm3 | Self::Granite | Self::MuseGlimmer
+            Self::Llama | Self::Smollm3 | Self::Granite | Self::MuseGlimmer | Self::Mistral3
         )
     }
 
@@ -193,6 +205,7 @@ mod tests {
             ConvArch::Ernie4_5,
             ConvArch::MuseGlimmer,
             ConvArch::Mistral4,
+            ConvArch::Mistral3,
         ];
         for conv in all {
             assert!(Arch::from_name(conv.gguf_name()).is_ok(), "{conv:?}");
@@ -214,12 +227,22 @@ mod tests {
             ConvArch::from_config(&class("mistral4")).unwrap(),
             ConvArch::Mistral4
         );
-        let err = ConvArch::from_config(&class("mistral"))
+        assert_eq!(
+            ConvArch::from_config(&class("ministral3")).unwrap(),
+            ConvArch::Mistral3
+        );
+        assert_eq!(
+            ConvArch::from_config(&class("mistral")).unwrap(),
+            ConvArch::Llama
+        );
+        let err = ConvArch::from_config(&class("pixtral"))
             .unwrap_err()
             .to_string();
-        assert!(
-            err.contains("`mistral`") && err.contains("mistral3"),
-            "{err}"
+        assert!(err.contains("`pixtral`"), "{err}");
+        assert_eq!(
+            ConvArch::from_config(&serde_json::json!({"architectures": ["Ministral3ForCausalLM"]}))
+                .unwrap(),
+            ConvArch::Mistral3
         );
         assert_eq!(
             ConvArch::from_config(&serde_json::json!({"architectures": ["MistralForCausalLM"]}))

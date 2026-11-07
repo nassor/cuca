@@ -2021,6 +2021,8 @@ struct Pass {
     /// One entry per [`Hparams::ropes`] entry, the rows of every sequence
     /// one after the other.
     ropes: Vec<RopeRows>,
+    /// Per-row query scale, when a row is past the scaling length.
+    q_scale: Option<Tensor<4>>,
     /// The sequences, in row order.
     seqs: Vec<SeqPass>,
     /// Empty unless every sequence is one query row (and there are several):
@@ -3783,6 +3785,18 @@ impl Weights {
             })
             .collect();
 
+        // The Llama 4 query scaling of each row (`mistral3`), `[1, 1, t, 1]`;
+        // none while every position is below its length.
+        let q_scale = self.hp.attn_temp.and_then(|temp| {
+            let scales: Vec<f32> = seqs
+                .iter()
+                .flat_map(|s| s.start..s.start + s.t)
+                .map(|p| temp.at(p))
+                .collect();
+            scales.iter().any(|&s| s != 1.0).then(|| {
+                Tensor::<4>::from_data(TensorData::new(scales, [1, 1, total, 1]), &self.device)
+            })
+        });
         let stack = seqs.len() > 1
             && seqs
                 .iter()
@@ -3807,6 +3821,7 @@ impl Weights {
             t: total,
             ple,
             ropes,
+            q_scale,
             seqs: passes,
             stacked,
         })
@@ -4031,6 +4046,10 @@ impl Weights {
                     _ => q,
                 };
                 let q = rotate(q.swap_dims(1, 2));
+                let q = match (&pass.q_scale, spec.rope) {
+                    (Some(s), Some(_)) => q * s.clone(),
+                    _ => q,
+                };
                 // Every sequence must have its window's blocks, also on the
                 // layers that only read.
                 for seq in &pass.seqs {

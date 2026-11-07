@@ -19,7 +19,7 @@
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
 //! `llama` (Llama 3.x and compatible), `qwen2`, `qwen3`, `phi3`
 //! (Phi 4-mini and compatible), `smollm3`, `granite`, `qwen3moe`,
-//! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `mistral4`, `qwen35` or `qwen35moe` runs: the loader reads every
+//! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `mistral3`, `mistral4`, `qwen35` or `qwen35moe` runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
 //! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
@@ -322,7 +322,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 22] = [
+const PRESET_TABLE: [ModelPreset; 23] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -508,6 +508,19 @@ const PRESET_TABLE: [ModelPreset; 22] = [
         "95fd818c08f2030a51805548269690e1915fc84088e4322273c5f317e2696999",
         16_265_565_216,
         "muse-glimmer",
+    ),
+    // imatrix Q4_0 (Q4_1 and Q6_K in places) with the earlier chat template of
+    // Ministral 3 Reasoning: identical to the current one except that the
+    // reasoning of earlier assistant turns is not written back into the
+    // history. mistralai publishes no Q4_0 of this model.
+    preset(
+        "ministral3-3b-reasoning-q4_0",
+        "bartowski/mistralai_Ministral-3-3B-Reasoning-2512-GGUF",
+        "36cf98fc920c42a4c89c78880723a8ec4aabe931",
+        "mistralai_Ministral-3-3B-Reasoning-2512-Q4_0.gguf",
+        "72ba5a30221864a7355c92336e639214e122dad4d11345139d2669d7c8bf7c3c",
+        2_046_374_368,
+        "mistral3",
     ),
     // Two parts of `llama-gguf-split`: merged into one cached file at load.
     // imatrix Q4_0 (Q4_1 in the layers' `ffn_down_exps`, Q5_0 in places, Q8_0

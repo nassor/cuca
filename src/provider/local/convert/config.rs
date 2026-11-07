@@ -122,7 +122,7 @@ impl Hp {
             _ => None,
         };
         match arch {
-            ConvArch::Llama => {
+            ConvArch::Llama | ConvArch::Mistral3 => {
                 if let Some(d) = head_dim {
                     set(&mut self.map, "head_dim", Json::from(d));
                 }
@@ -489,6 +489,27 @@ fn mla(arch: ConvArch, hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<(), CucaE
     if let Some(m) = hp.rope_all().get("mscale_all_dim").and_then(Json::as_f64) {
         kv.f32("rope.scaling.yarn_log_multiplier", 0.1 * m);
     }
+    Ok(())
+}
+
+/// `Ministral3Model.set_gguf_parameters`: for a `ministral3` text model the
+/// YaRN `mscale_all_dim` becomes `yarn_log_multiplier` and
+/// `llama_4_scaling_beta` the attention temperature scale.
+fn mistral3_rope(hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
+    if hp.get("model_type").and_then(Json::as_str) != Some("ministral3") {
+        return Ok(());
+    }
+    let p = hp.rope_full();
+    if p.get("rope_type").and_then(Json::as_str) != Some("yarn") {
+        return Err(cfg_err("ministral3 must have a yarn rope_type"));
+    }
+    let get = |key: &str| {
+        p.get(key)
+            .and_then(Json::as_f64)
+            .ok_or_else(|| cfg_err(format!("ministral3 rope_parameters lack `{key}`")))
+    };
+    kv.f32("rope.scaling.yarn_log_multiplier", get("mscale_all_dim")?);
+    kv.f32("attention.temperature_scale", get("llama_4_scaling_beta")?);
     Ok(())
 }
 
@@ -1010,7 +1031,7 @@ pub(crate) fn build(
     let mut extra = Vec::new();
 
     match arch {
-        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite => {
+        ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite | ConvArch::Mistral3 => {
             if arch == ConvArch::Granite {
                 // Granite ignores head_dim: the engine derives the head size
                 // from the embedding width.
@@ -1036,6 +1057,9 @@ pub(crate) fn build(
                 llama_extras(hp, &mut kv)?;
             }
             extra = llama3_freqs(hp)?;
+            if arch == ConvArch::Mistral3 {
+                mistral3_rope(hp, &mut kv)?;
+            }
         }
         ConvArch::Qwen2 | ConvArch::Qwen3 | ConvArch::Ernie4_5 => base(arch, hp, &mut kv, n_block)?,
         ConvArch::Qwen3Moe => {

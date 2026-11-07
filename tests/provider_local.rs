@@ -174,6 +174,13 @@ fn known_limit(model: &str, scenario: &str) -> Option<&'static str> {
              (HuggingFace f32 margin 2.06) and answers; the production path's Q8_0 activation \
              rounding flips it (18.663 against 19.237) and the model calls the tool again",
         ),
+        ("ministral3-3b-reasoning-q4_0", "tool_call_leg") => Some(
+            "the model never reaches the call within the 2,048-token budget: the HuggingFace f32 \
+             model on the original BF16 weights, given the same rendered prompt (`Use the \
+             tool.`), also reasons in circles (\"Alternatively, perhaps ... I'll simulate the \
+             call\") for 2,100 greedy tokens, never closes `[/THINK]` and never writes \
+             `[TOOL_CALLS]`; the engine's replies loop the same way",
+        ),
         _ => None,
     }
 }
@@ -741,23 +748,24 @@ async fn tool_round_trip(live: &Loaded, scenario: &str, tools_on_follow_up: bool
             .set_max_tokens(caps.budget(256, 2048)),
     )
     .await;
-    let (id, name, arguments) = first
-        .blocks
-        .iter()
-        .find_map(|b| match b {
-            MessageContentBlock::ToolCall {
-                id,
-                name,
-                arguments,
-            } => Some((id.clone(), name.clone(), arguments.clone())),
-            _ => None,
-        })
-        .unwrap_or_else(|| {
-            panic!(
-                "[{}] expected a ToolCall, got {:?}",
-                caps.name, first.blocks
-            )
-        });
+    let call = first.blocks.iter().find_map(|b| match b {
+        MessageContentBlock::ToolCall {
+            id,
+            name,
+            arguments,
+        } => Some((id.clone(), name.clone(), arguments.clone())),
+        _ => None,
+    });
+    let Some((id, name, arguments)) = call else {
+        if let Some(evidence) = known_limit(&caps.name, "tool_call_leg") {
+            println!("MATRIX|{scenario}|KNOWN-LIMIT|{evidence}");
+            return;
+        }
+        panic!(
+            "[{}] expected a ToolCall, got {:?}",
+            caps.name, first.blocks
+        );
+    };
     assert_eq!(name, "get_weather", "[{}]", caps.name);
     let city = arguments["city"]
         .as_str()

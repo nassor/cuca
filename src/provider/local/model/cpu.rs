@@ -1826,6 +1826,24 @@ impl Transformer {
         };
         let q = q.transpose(1, 2)?.contiguous()?;
         let q = self.rotate_calls(spec, &q, calls)?;
+        // Llama 4 query scaling (`mistral3`): each row by the factor of its
+        // absolute position, after RoPE; one for the first `length` positions.
+        let q = match hp.attn_temp {
+            Some(temp) if spec.rope.is_some() => {
+                let mut scales = vec![1f32; t];
+                for call in calls {
+                    for i in 0..call.t {
+                        scales[call.offset + i] = temp.at(call.rope_start + i);
+                    }
+                }
+                if scales.iter().all(|&s| s == 1.0) {
+                    q
+                } else {
+                    q.broadcast_mul(&Tensor::from_vec(scales, (1, 1, t, 1), q.device())?)?
+                }
+            }
+            _ => q,
+        };
 
         if let Some((k, v)) = &projected {
             self.store_kv(calls, aw, k, v)?;
@@ -2710,6 +2728,43 @@ mod tests {
     #[test]
     fn gemma4_tiny_model_satisfies_the_invariants() {
         check_invariants(&write_tiny_model(), "gemma4");
+    }
+
+    /// `mistral3`: the query of position `p` is scaled by `1 + beta *
+    /// ln(1 + floor(p / original_context))`, so a prompt inside the original
+    /// context (16 here) is unaffected and a longer one, in any chunking,
+    /// equals itself in one pass.
+    #[test]
+    fn mistral3_scales_queries_by_absolute_position() {
+        use candle_core::quantized::gguf_file::Value;
+        let on = TinySpec::mistral3();
+        let mut off = TinySpec::mistral3();
+        off.meta.retain(|(k, _)| k != "attention.temperature_scale");
+        off.meta
+            .push(("attention.temperature_scale".into(), Value::F32(0.0)));
+        let (on, off) = (write_spec(&on), write_spec(&off));
+        let prompt: Vec<u32> = (0..28u32).map(|i| (i * 5 + 3) % VOCAB as u32).collect();
+        assert_eq!(
+            logits(&mut load(&on, 32), &prompt[..16], 0),
+            logits(&mut load(&off, 32), &prompt[..16], 0)
+        );
+        let whole = logits(&mut load(&on, 32), &prompt, 0);
+        let plain = logits(&mut load(&off, 32), &prompt, 0);
+        assert!(whole.iter().zip(&plain).any(|(a, b)| (a - b).abs() > 1e-3));
+        let mut chunked = load(&on, 32);
+        assert!(
+            chunked
+                .forward(&prompt[..9], 0, Want::None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            chunked
+                .forward(&prompt[9..20], 9, Want::None)
+                .unwrap()
+                .is_none()
+        );
+        assert_close(&whole, &logits(&mut chunked, &prompt[20..], 20));
     }
 
     #[test]
