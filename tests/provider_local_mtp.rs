@@ -22,10 +22,7 @@
 //! 3).
 //!
 //! `CUCA_LOCAL_ALLOW_MISMATCH` (any value) reports a CPU output that differs
-//! from plain decoding (`identical false`) instead of failing the test. It is
-//! for timing a target so large (67 GB) that two loads of it have differed by
-//! one bit on the development machine, which breaks the exactness check
-//! without a speculation fault.
+//! from plain decoding (`identical false`) instead of failing the test.
 //!
 //! With the target or the drafter missing the test prints `SKIP` and passes,
 //! unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build for the host
