@@ -522,20 +522,33 @@ const PRESET_TABLE: [ModelPreset; 24] = [
         20_836_243_072,
         "qwen35moe",
     ),
-    // ggml-org's Q8_0, the one official Muse GGUF at a size the CPU engine
-    // runs: its embedded chat template is byte-identical to the model
-    // repository's current `chat_template.jinja` (meta-models/Muse-Glimmer-30B
-    // at cec94fcf, which rewrites a system prompt's "Reasoning effort" to
-    // "Reasoning strength"); bartowski's Q4_0 embeds the earlier template.
-    preset(
-        "muse-glimmer-30b-q8_0",
-        "ggml-org/Muse-Glimmer-30B-GGUF",
-        "5da9c17514ceb04baf73445648d215272275b114",
-        "Muse-Glimmer-30B-Q8_0.gguf",
-        "2c280b3334b8d980412cf26e1ef62b65cea293e99cce1a8d8b934aa17c2c0bce",
-        29_612_961_088,
-        "muse-glimmer",
-    ),
+    // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers and a Q4_1
+    // `ffn_down` in 6 (those run on candle's kernels, not the row-batched
+    // ones). It embeds the earlier Muse chat template, which renders the same
+    // bytes as the current one except when the caller's system prompt itself
+    // mentions "Reasoning effort": the current template rewrites that to
+    // "Reasoning strength", this one appends a second directive. The preset
+    // pins the repository's current `chat_template.jinja` (meta-models at
+    // cec94fcf) and uses it instead. The only published Q4_0/Q8_0 whose
+    // embedded template equals the current one is ggml-org's Q8_0, twice the
+    // memory and half the CPU speed.
+    ModelPreset {
+        template: Some(PresetTemplate {
+            repo: "meta-models/Muse-Glimmer-30B",
+            revision: "cec94fcfd6512f2cfe708138c32533b346ea4f69",
+            file: "chat_template.jinja",
+            sha256: "cfc67e5f349f37690dfd31ed1f18bc4442a9dd32fe39a648f993cb4eb3cae678",
+        }),
+        ..preset(
+            "muse-glimmer-30b-q4_0",
+            "bartowski/Muse-Glimmer-30B-GGUF",
+            "01e1b7c30e19e1823ee9a73dec51d12f59ec4857",
+            "Muse-Glimmer-30B-Q4_0.gguf",
+            "95fd818c08f2030a51805548269690e1915fc84088e4322273c5f317e2696999",
+            16_265_565_216,
+            "muse-glimmer",
+        )
+    },
     // imatrix Q4_0 (Q4_1 and Q6_K in places; mistralai publishes no Q4_0 of
     // this model). Every published GGUF of Ministral 3 Reasoning (mistralai,
     // ggml-org, lmstudio-community, unsloth, bartowski) embeds the December
@@ -1442,8 +1455,11 @@ pub(crate) struct LocalModelInner {
 ///
 /// # Behavior
 ///
-/// - Thinking is binary: a request with thinking enabled opens the model's
-///   reasoning channel, and its effort level is ignored.
+/// - Thinking is on or off for most templates (`enable_thinking`/`thinking`,
+///   and a two-mode `reasoning_effort` of `none` or `high`): the request's
+///   effort level is ignored. A template that reads `reasoning_strength`
+///   (Muse Glimmer) gets the effort level as `low`, `medium`, `high` or
+///   `xhigh`; a request without an effort leaves the template's default.
 /// - The engine is text-only: image blocks are rejected.
 /// - `UnifiedRequest::model` is not used for routing, since one client holds
 ///   one model. `temperature`, `max_tokens`, `top_p`, `top_k`, `seed` and
