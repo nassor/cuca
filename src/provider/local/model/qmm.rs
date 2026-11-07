@@ -1,12 +1,13 @@
-//! Row-batched quantized matmul for Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the
-//! K-quants Q2_K, Q3_K, Q4_K, Q5_K and Q6_K weights.
+//! Row-batched quantized matmul for Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 weights.
 //!
 //! candle's quantized matmul loops over the activation rows and streams the
 //! whole weight matrix once per row, so verifying `k + 1` drafted tokens in one
 //! forward pass costs close to `k + 1` decode steps. [`QmmWeight::forward_rows`]
 //! reads every weight block once and dots it against all `m` activation rows,
 //! so a batch of `m` rows costs about one row of memory traffic plus `m` times
-//! the (much cheaper) integer arithmetic.
+//! the (much cheaper) integer arithmetic. Measured on a Ryzen 9 9950X3D2, the
+//! kernel is 2-4x faster than candle's for Q4_1, Q5_0 and Q5_1 from `m = 4`
+//! rows on.
 //!
 //! # Arithmetic
 //!
@@ -16,17 +17,10 @@
 //! - Q4_0, Q5_0, Q8_0: Q8_0 (`d = max|x| / 127` rounded to f16,
 //!   `q = round(x / d)`, 32-element blocks);
 //! - Q4_1, Q5_1: Q8_1, the same quants plus the sum term
-//!   `s = f16(f16(sum q) * d)`, which multiplies the weight block's minimum;
-//! - Q2_K to Q6_K: Q8_K (256-element blocks, an f32 scale `1 / iscale` with
-//!   `iscale = -127 / x_max` for the element of largest magnitude, sixteen
-//!   per-16 quant sums).
+//!   `s = f16(f16(sum q) * d)`, which multiplies the weight block's minimum.
 //!
 //! The products are the integer dot of one weight block with one activation
-//! block, scaled by the product of the two block scales. For the K-quants the
-//! sub-block scales are folded into the decoded weights, `scale * quant`
-//! (each fits an `i16`), so a 256-element block is one exact integer dot, and
-//! the sub-block minimums of Q2_K, Q4_K and Q5_K are one more sixteen-term
-//! integer dot against the activation's per-16 sums.
+//! block, scaled by the product of the two block scales.
 //!
 //! The value for activation row `j` and weight row `r` is a fixed function of
 //! that row pair alone: sixteen `f32` lanes, each adding its share of the
@@ -40,7 +34,21 @@
 //!
 //! Work is split in chunks of weight rows over candle's persistent barrier pool
 //! (the one its own quantized matmul uses, so the two never oversubscribe the
-//! cores), with dynamic chunk claiming.
+//! cores), with dynamic chunk claiming; which worker computes a chunk never
+//! changes its bits.
+//!
+//! # K-quants stay on candle
+//!
+//! Q2_K to Q6_K weights are not served here: [`QmmWeight::new`] returns `None`
+//! for them and candle's per-row kernel multiplies them (a row's result still
+//! depends on that row alone, whatever the batch). Measured on the same CPU,
+//! candle's K-quant prefill was already at parity with Q4_0's (phi4-mini
+//! `q4_k_m` against `q4_0`, long-prompt perf test; the 3D V-cache L3 keeps the
+//! per-row weight re-reads cheap), and a row-batched safe-Rust K-quant kernel
+//! written for this module was 2-3x slower than candle's at `m = 1` (the Muse
+//! Glimmer FFN shapes: 2-3.2 ms against 0.9-1.6 ms). The dispatch cannot pick
+//! the faster kernel per `m` either: a row's bits must not depend on the batch
+//! size, so one dtype is served by one kernel.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -49,11 +57,9 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::utils::barrier_pool;
 use half::f16;
 
-/// Elements per quantisation block of the legacy formats (Q4_0, Q4_1, Q5_0,
+/// Elements per quantisation block of the served formats (Q4_0, Q4_1, Q5_0,
 /// Q5_1, Q8_0), and of their Q8_0/Q8_1 activations.
 const QK: usize = 32;
-/// Elements per block of the K-quants and of their Q8_K activations.
-const QK_K: usize = 256;
 /// Lanes: a block's two halves of sixteen elements are summed lane-wise.
 const LANES: usize = QK / 2;
 /// Weight rows decoded together.
@@ -72,45 +78,6 @@ const SERIAL_BELOW: usize = 1 << 17;
 /// the sum of two, so the halves are combined in `i16` without overflow.
 type Halves = [[i16; LANES]; 2];
 
-/// Quantised activations of one call: `m` rows of `blocks()` blocks.
-trait Quantised: Sync {
-    fn rows(&self) -> usize;
-    fn blocks(&self) -> usize;
-}
-
-/// A weight format with the kernel that multiplies it by the activations
-/// quantised the way ggml pairs it (Q8_0 for Q4_0, Q5_0 and Q8_0; Q8_1 for
-/// Q4_1 and Q5_1; Q8_K for the K-quants).
-trait Format {
-    /// The bytes of one block.
-    type Block;
-    type Act: Quantised;
-    /// Decoded weight rows, built once per group of [`NR`] rows and read by
-    /// every activation tile: a worker's scratch. `()` for the formats whose
-    /// tile decodes the blocks itself.
-    type Panel: Default;
-    /// A single activation row (a decode step) runs as a one-row tile instead
-    /// of a [`MIN_TILE`]-row tile over zero padding: faster for the formats
-    /// whose decode is shared across the tile (measured on the K-quants), slower
-    /// for the legacy ones (see [`rows_of`]).
-    const LONE_ROW_TILE: bool;
-    /// The blocks of one row (`row` is a whole number of them).
-    fn blocks(row: &[u8]) -> &[Self::Block];
-    /// `x` is `m` rows of `k` floats, `k` a whole number of blocks.
-    fn quantise(x: &[f32], m: usize, k: usize) -> Self::Act;
-    /// Decode the `R <= 4` weight rows into `panel`.
-    fn load<const R: usize>(rows: &[&[Self::Block]; R], panel: &mut Self::Panel);
-    /// `R <= 4` weight rows (decoded in `panel`) against activation rows
-    /// `j0..j0 + M` (`M <= 4`): `out[i][jj]` is the dot of weight row `i` with
-    /// activation row `j0 + jj`.
-    fn tile<const R: usize, const M: usize>(
-        rows: &[&[Self::Block]; R],
-        panel: &Self::Panel,
-        act: &Self::Act,
-        j0: usize,
-    ) -> [[f32; M]; R];
-}
-
 /// A 32-element weight block: its bytes, f32 scale, optional minimum and quants.
 trait Legacy {
     type Block;
@@ -124,34 +91,6 @@ trait Legacy {
         0.0
     }
     fn halves(block: &Self::Block) -> Halves;
-}
-
-impl<L: Legacy> Format for L {
-    type Block = L::Block;
-    type Act = Acts;
-    type Panel = ();
-    const LONE_ROW_TILE: bool = false;
-
-    #[inline(always)]
-    fn blocks(row: &[u8]) -> &[Self::Block] {
-        L::blocks(row)
-    }
-
-    fn quantise(x: &[f32], m: usize, k: usize) -> Acts {
-        Acts::new(x, m, k, L::HAS_MIN)
-    }
-
-    fn load<const R: usize>(_rows: &[&[Self::Block]; R], _panel: &mut ()) {}
-
-    #[inline(always)]
-    fn tile<const R: usize, const M: usize>(
-        rows: &[&[Self::Block]; R],
-        _panel: &(),
-        act: &Acts,
-        j0: usize,
-    ) -> [[f32; M]; R] {
-        legacy_tile::<L, R, M>(rows, act, j0)
-    }
 }
 
 /// The f16 at byte `at` of a block, widened.
@@ -404,16 +343,6 @@ impl Acts {
     }
 }
 
-impl Quantised for Acts {
-    fn rows(&self) -> usize {
-        self.m
-    }
-
-    fn blocks(&self) -> usize {
-        self.nb
-    }
-}
-
 /// Exact integer dot of one weight block with one activation block, as
 /// sixteen lane sums.
 #[inline(always)]
@@ -461,10 +390,6 @@ macro_rules! unroll4 {
         }
     }};
 }
-
-mod kquant;
-
-use kquant::{Q2K, Q3K, Q4K, Q5K, Q6K};
 
 /// `R <= 4` weight rows against activation rows `j0..j0 + M` (`M <= 4`) of a
 /// 32-element-block format: `out[i][jj]` is the dot of weight row `i` with
@@ -560,28 +485,23 @@ fn put<const R: usize, const M: usize>(
 /// for one and two rows, 0.7 ms for three), so a lone row is cheaper as a
 /// three-row tile with two dummy rows.
 #[inline(always)]
-fn rows_of<F: Format, const R: usize>(
-    rs: &[&[F::Block]; R],
-    panel: &F::Panel,
-    act: &F::Act,
+fn rows_of<L: Legacy, const R: usize>(
+    rs: &[&[L::Block]; R],
+    act: &Acts,
     res: &mut [f32],
     rows: usize,
     r: usize,
 ) {
-    let m = act.rows();
-    if m == 1 && F::LONE_ROW_TILE {
-        put(F::tile::<R, 1>(rs, panel, act, 0), res, m, rows, r, 0);
-        return;
-    }
+    let m = act.m;
     let mut j0 = 0;
     while m - j0 >= MR {
-        put(F::tile::<R, MR>(rs, panel, act, j0), res, m, rows, r, j0);
+        put(legacy_tile::<L, R, MR>(rs, act, j0), res, m, rows, r, j0);
         j0 += MR;
     }
     if j0 < m {
         let j1 = m.saturating_sub(MIN_TILE);
         put(
-            F::tile::<R, MIN_TILE>(rs, panel, act, j1),
+            legacy_tile::<L, R, MIN_TILE>(rs, act, j1),
             res,
             m,
             rows,
@@ -594,22 +514,18 @@ fn rows_of<F: Format, const R: usize>(
 /// Weight rows `w` (a whole number of rows) against every activation row;
 /// `res[j * rows + r]` receives the dot of weight row `r` with activation row
 /// `j`.
-fn chunk<F: Format>(w: &[u8], act: &F::Act, res: &mut [f32]) {
-    let row_bytes = act.blocks() * size_of::<F::Block>();
+fn chunk<L: Legacy>(w: &[u8], act: &Acts, res: &mut [f32]) {
+    let row_bytes = act.nb * size_of::<L::Block>();
     let rows = w.len() / row_bytes;
-    let row = |r: usize| F::blocks(&w[r * row_bytes..(r + 1) * row_bytes]);
-    let mut panel = F::Panel::default();
+    let row = |r: usize| L::blocks(&w[r * row_bytes..(r + 1) * row_bytes]);
     let mut r = 0;
     while r + NR <= rows {
-        let rs: [&[F::Block]; NR] = std::array::from_fn(|i| row(r + i));
-        F::load::<NR>(&rs, &mut panel);
-        rows_of::<F, NR>(&rs, &panel, act, res, rows, r);
+        let rs: [&[L::Block]; NR] = std::array::from_fn(|i| row(r + i));
+        rows_of::<L, NR>(&rs, act, res, rows, r);
         r += NR;
     }
     while r < rows {
-        let rs = [row(r)];
-        F::load::<1>(&rs, &mut panel);
-        rows_of::<F, 1>(&rs, &panel, act, res, rows, r);
+        rows_of::<L, 1>(&[row(r)], act, res, rows, r);
         r += 1;
     }
 }
@@ -622,11 +538,6 @@ enum Kind {
     Q5_0,
     Q5_1,
     Q8_0,
-    Q2K,
-    Q3K,
-    Q4K,
-    Q5K,
-    Q6K,
 }
 
 impl Kind {
@@ -637,26 +548,13 @@ impl Kind {
             GgmlDType::Q5_0 => Self::Q5_0,
             GgmlDType::Q5_1 => Self::Q5_1,
             GgmlDType::Q8_0 => Self::Q8_0,
-            GgmlDType::Q2K => Self::Q2K,
-            GgmlDType::Q3K => Self::Q3K,
-            GgmlDType::Q4K => Self::Q4K,
-            GgmlDType::Q5K => Self::Q5K,
-            GgmlDType::Q6K => Self::Q6K,
             _ => return None,
         })
-    }
-
-    /// Elements per weight block: a row must be a whole number of them.
-    fn block_elems(self) -> usize {
-        match self {
-            Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 => QK,
-            Self::Q2K | Self::Q3K | Self::Q4K | Self::Q5K | Self::Q6K => QK_K,
-        }
     }
 }
 
 /// A quantized `[n, k]` weight (`y = x * w^T`) computed by the row-batched
-/// kernel: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants Q2_K to Q6_K. Holds
+/// kernel: Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0. Holds
 /// the candle tensor and reads its bytes in place.
 pub(crate) struct QmmWeight {
     qt: Arc<QTensor>,
@@ -674,7 +572,7 @@ impl QmmWeight {
         let [n, k] = *qt.shape().dims() else {
             return None;
         };
-        (k % kind.block_elems() == 0 && n > 0).then(|| Self {
+        (k % QK == 0 && n > 0).then(|| Self {
             qt: Arc::clone(qt),
             kind,
             n,
@@ -734,21 +632,16 @@ impl QmmWeight {
             Kind::Q5_0 => run::<Q5_0>(weights, x, m, k, rows, o)?,
             Kind::Q5_1 => run::<Q5_1>(weights, x, m, k, rows, o)?,
             Kind::Q8_0 => run::<Q8_0>(weights, x, m, k, rows, o)?,
-            Kind::Q2K => run::<Q2K>(weights, x, m, k, rows, o)?,
-            Kind::Q3K => run::<Q3K>(weights, x, m, k, rows, o)?,
-            Kind::Q4K => run::<Q4K>(weights, x, m, k, rows, o)?,
-            Kind::Q5K => run::<Q5K>(weights, x, m, k, rows, o)?,
-            Kind::Q6K => run::<Q6K>(weights, x, m, k, rows, o)?,
         }
         Ok(out)
     }
 }
 
-/// Quantise the `m` activation rows for the format `F`, split the `[m, n]`
+/// Quantise the `m` activation rows for the format `L`, split the `[m, n]`
 /// output into `rows_per_chunk`-wide column chunks per activation row and
 /// compute them over the pool; each worker claims chunks dynamically,
 /// computes one into a private scratch and copies it out.
-fn run<F: Format>(
+fn run<L: Legacy>(
     data: &[u8],
     x: &[f32],
     m: usize,
@@ -756,9 +649,9 @@ fn run<F: Format>(
     n: usize,
     out: &mut [f32],
 ) -> candle_core::Result<()> {
-    let act = F::quantise(x, m, k);
+    let act = Acts::new(x, m, k, L::HAS_MIN);
     let act = &act;
-    let row_bytes = act.blocks() * size_of::<F::Block>();
+    let row_bytes = act.nb * size_of::<L::Block>();
     if data.len() != n * row_bytes {
         candle_core::bail!(
             "qmm: weight holds {} bytes, expected {n} rows of {row_bytes}",
@@ -790,7 +683,7 @@ fn run<F: Format>(
             }
             let r0 = c * rows_per_chunk;
             let rows = rows_per_chunk.min(n - r0);
-            chunk::<F>(
+            chunk::<L>(
                 &data[r0 * row_bytes..(r0 + rows) * row_bytes],
                 act,
                 &mut res[..m * rows],
@@ -813,28 +706,18 @@ fn run<F: Format>(
 
 #[cfg(test)]
 mod tests {
-    use super::kquant::ActsK;
     use super::*;
     use candle_core::quantized::QMatMul;
     use candle_core::{Device, Module, Tensor};
 
     /// Every dtype the kernel serves.
-    const DTYPES: [GgmlDType; 10] = [
+    const DTYPES: [GgmlDType; 5] = [
         GgmlDType::Q4_0,
         GgmlDType::Q4_1,
         GgmlDType::Q5_0,
         GgmlDType::Q5_1,
         GgmlDType::Q8_0,
-        GgmlDType::Q2K,
-        GgmlDType::Q3K,
-        GgmlDType::Q4K,
-        GgmlDType::Q5K,
-        GgmlDType::Q6K,
     ];
-
-    fn block_elems(dtype: GgmlDType) -> usize {
-        Kind::of(dtype).map_or(0, Kind::block_elems)
-    }
 
     /// Deterministic pseudo-random floats in `[-1, 1)` scaled by `scale`.
     pub(super) fn noise(len: usize, seed: u64, scale: f32) -> Vec<f32> {
@@ -854,35 +737,22 @@ mod tests {
         Arc::new(QTensor::quantize(&t, dtype).unwrap())
     }
 
-    /// `(n, k, m)` shapes whose rows are whole blocks of `dtype`: tails in both
-    /// tilings, and 600 rows exceeding `SERIAL_BELOW` so the pooled path runs.
-    fn shapes(dtype: GgmlDType) -> [(usize, usize, usize); 4] {
-        let b = block_elems(dtype);
-        [(10, 2 * b, 7), (3, b, 1), (600, 256, 5), (64, 3 * b, 17)]
+    /// `(n, k, m)` shapes whose rows are whole blocks: tails in both tilings,
+    /// and 600 rows exceeding `SERIAL_BELOW` so the pooled path runs.
+    fn shapes() -> [(usize, usize, usize); 4] {
+        [(10, 2 * QK, 7), (3, QK, 1), (600, 256, 5), (64, 3 * QK, 17)]
     }
 
     /// The activations as the kernel sees them: quantised and dequantised.
-    fn rounded_acts(dtype: GgmlDType, x: &[f32], m: usize, k: usize) -> Vec<f64> {
+    fn rounded_acts(x: &[f32], m: usize, k: usize) -> Vec<f64> {
         let mut xd = vec![0f64; m * k];
-        if block_elems(dtype) == QK_K {
-            let act = ActsK::new(x, m, k);
-            for j in 0..m {
-                for b in 0..act.nb {
-                    for e in 0..QK_K {
-                        xd[j * k + b * QK_K + e] = f64::from(act.qs[b * act.stride + j][e])
+        let act = Acts::new(x, m, k, false);
+        for j in 0..m {
+            for b in 0..act.nb {
+                for e in 0..QK {
+                    xd[j * k + b * QK + e] =
+                        f64::from(act.qs[b * act.stride + j][e / LANES][e % LANES])
                             * f64::from(act.scales[b * act.stride + j]);
-                    }
-                }
-            }
-        } else {
-            let act = Acts::new(x, m, k, false);
-            for j in 0..m {
-                for b in 0..act.nb {
-                    for e in 0..QK {
-                        xd[j * k + b * QK + e] =
-                            f64::from(act.qs[b * act.stride + j][e / LANES][e % LANES])
-                                * f64::from(act.scales[b * act.stride + j]);
-                    }
                 }
             }
         }
@@ -906,7 +776,7 @@ mod tests {
             unreachable!()
         };
         let wd = dequantised(w);
-        let xd = rounded_acts(w.dtype(), x, m, k);
+        let xd = rounded_acts(x, m, k);
         let mut out = vec![0f64; m * n];
         for j in 0..m {
             for r in 0..n {
@@ -950,7 +820,7 @@ mod tests {
     #[test]
     fn matches_the_f64_reference_and_candle() {
         for dtype in DTYPES {
-            for (n, k, m) in shapes(dtype) {
+            for (n, k, m) in shapes() {
                 let w = weight(n, k, dtype, 11);
                 let x = noise(m * k, 5, 1.0);
                 let q = QmmWeight::new(&w).unwrap();
@@ -965,7 +835,7 @@ mod tests {
                     );
                 }
                 // candle's Q4_1, Q5_0 and Q5_1 dots assert an even block count.
-                if (k / block_elems(dtype)) % 2 == 1
+                if (k / QK) % 2 == 1
                     && matches!(dtype, GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1)
                 {
                     continue;
@@ -996,7 +866,7 @@ mod tests {
     #[test]
     fn the_error_is_bounded_by_the_activation_rounding() {
         for dtype in DTYPES {
-            let b = block_elems(dtype);
+            let b = QK;
             for (n, k, m) in [(12, 2 * b, 5), (20, 512, 3)] {
                 let w = weight(n, k, dtype, 23);
                 let mut x = noise(m * k, 8, 1.0);
@@ -1039,7 +909,7 @@ mod tests {
     #[test]
     fn a_weight_row_prefix_equals_the_start_of_the_product() {
         for dtype in DTYPES {
-            let b = block_elems(dtype);
+            let b = QK;
             for (n, k, m, rows) in [(10, 2 * b, 3, 7), (600, 256, 2, 450), (64, 3 * b, 5, 1)] {
                 let w = weight(n, k, dtype, 17);
                 let x = noise(m * k, 9, 1.0);
@@ -1092,8 +962,8 @@ mod tests {
         x[QK + 3] = 127.0;
         x[QK + 4] = 0.5;
         x[QK + 5] = -1.5;
-        x[QK_K + 10] = -9.0;
-        x[QK_K + 200] = 9.0;
+        x[2 * QK + 10] = -9.0;
+        x[2 * QK + 20] = 9.0;
         x
     }
 
@@ -1136,36 +1006,26 @@ mod tests {
         }
     }
 
+    /// Row exactness at the weight shapes of a real 100B-class MoE model
+    /// (n not a multiple of the chunk size: the pooled path has tail chunks).
     #[test]
-    fn activations_quantise_like_candles_q8_k() {
-        let (m, k) = (3, 768);
-        let x = awkward_acts(m, k);
-        let t = Tensor::from_vec(x.clone(), (m, k), &Device::Cpu).unwrap();
-        let q = QTensor::quantize(&t, GgmlDType::Q8K).unwrap();
-        let bytes = q.data().unwrap();
-        let act = ActsK::new(&x, m, k);
-        // `d: f32`, 256 quants, 16 sums of `i16`.
-        let size = 4 + QK_K + 2 * (QK_K / 16);
-        for j in 0..m {
-            for b in 0..k / QK_K {
-                let block = &bytes[(j * (k / QK_K) + b) * size..][..size];
-                let i = b * act.stride + j;
-                let d = f32::from_le_bytes([block[0], block[1], block[2], block[3]]);
-                assert_eq!(act.scales[i], d, "scale of row {j} block {b}");
-                for e in 0..QK_K {
-                    assert_eq!(
-                        act.qs[i][e],
-                        i16::from(block[4 + e] as i8),
-                        "quant {e} of row {j} block {b}"
-                    );
-                }
-                if d != 0.0 {
-                    for g in 0..QK_K / 16 {
-                        let at = 4 + QK_K + 2 * g;
+    fn real_shapes_are_row_exact() {
+        for dtype in DTYPES {
+            for (n, k) in [(4104usize, 4096usize), (2056, 2048), (4096, 2048), (1030, 4096)] {
+                assert_eq!(k % QK, 0);
+                let w = weight(n, k, dtype, 3);
+                let q = QmmWeight::new(&w).unwrap();
+                let x = noise(9 * k, 9, 2.0);
+                let alone: Vec<Vec<f32>> = (0..9)
+                    .map(|j| q.forward(&x[j * k..(j + 1) * k], 1).unwrap())
+                    .collect();
+                for m in [2, 3, 4, 5, 6, 7, 8, 9] {
+                    let batch = q.forward(&x[..m * k], m).unwrap();
+                    for j in 0..m {
                         assert_eq!(
-                            act.bsums[i][g],
-                            i32::from(i16::from_le_bytes([block[at], block[at + 1]])),
-                            "sum {g} of row {j} block {b}"
+                            batch[j * n..(j + 1) * n],
+                            alone[j][..],
+                            "{dtype:?} {n}x{k}: row {j} of a batch of {m}"
                         );
                     }
                 }
@@ -1177,7 +1037,7 @@ mod tests {
     #[test]
     fn a_row_is_bit_identical_alone_and_in_any_batch() {
         for dtype in DTYPES {
-            let b = block_elems(dtype);
+            let b = QK;
             for (n, k) in [(10, 2 * b), (512, 512)] {
                 let w = weight(n, k, dtype, 3);
                 let q = QmmWeight::new(&w).unwrap();
@@ -1202,7 +1062,7 @@ mod tests {
     #[test]
     fn zero_activations_give_exact_zeros() {
         for dtype in DTYPES {
-            let b = block_elems(dtype);
+            let b = QK;
             let w = weight(9, 2 * b, dtype, 6);
             let q = QmmWeight::new(&w).unwrap();
             let out = q.forward(&vec![0f32; 4 * 2 * b], 4).unwrap();
@@ -1213,10 +1073,20 @@ mod tests {
     #[test]
     fn other_dtypes_and_shapes_are_left_to_candle() {
         for dtype in DTYPES {
-            let w = weight(4, 2 * block_elems(dtype), dtype, 1);
+            let w = weight(4, 2 * QK, dtype, 1);
             assert!(QmmWeight::new(&w).is_some(), "{dtype:?}");
         }
-        for dtype in [GgmlDType::F16, GgmlDType::F32, GgmlDType::Q8_1] {
+        // The K-quants stay on candle's per-row kernel (see the module docs).
+        for dtype in [
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
+            GgmlDType::Q4K,
+            GgmlDType::Q5K,
+            GgmlDType::Q6K,
+            GgmlDType::F16,
+            GgmlDType::F32,
+            GgmlDType::Q8_1,
+        ] {
             let w = weight(4, 256, dtype, 1);
             assert!(QmmWeight::new(&w).is_none(), "{dtype:?}");
         }

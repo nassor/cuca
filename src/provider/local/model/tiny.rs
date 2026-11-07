@@ -78,10 +78,12 @@ fn quantize(values: Vec<f32>, dims: &[usize], dtype: GgmlDType) -> QTensor {
     QTensor::quantize(&t, dtype).unwrap()
 }
 
-/// Requantise every Q4_0 or Q8_0 `.weight` tensor through a rotation of the
-/// dtypes the row-batched kernel serves: the legacy formats where the rows
-/// are whole 32-element blocks, the K-quants where they are whole 256-element
-/// ones. A model written this way mixes dtypes the way a K-quant GGUF does.
+/// Requantise every Q4_0 or Q8_0 `.weight` tensor through a rotation of
+/// dtypes: the legacy formats (all served by the row-batched kernel) where
+/// the rows are whole 32-element blocks, the K-quants (candle's per-row
+/// kernel) where they are whole 256-element ones. A model written this way
+/// mixes dtypes the way a K-quant GGUF does, so both kernels run in one
+/// forward pass and the engine's invariants are checked across them.
 pub(crate) fn mix_dtypes(tensors: &mut [(String, QTensor)]) {
     const LEGACY: [GgmlDType; 5] = [
         GgmlDType::Q4_0,
