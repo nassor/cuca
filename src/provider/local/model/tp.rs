@@ -71,10 +71,11 @@
 //! - the dense FFN width, the expert FFN width and the shared expert width
 //!   are multiples of `32 * world`;
 //!
-//! and the model has no recurrent (delta-net) layers, no full-width Q/K norm
-//! (OLMo 2, OLMoE: the norm spans all heads, so a shard cannot compute it
-//! alone) and no tiered experts. A drafter is not supported either (the
-//! engine rejects it before the load).
+//! and the model has no recurrent (delta-net) layers, no latent attention
+//! (one shared latent K/V row per position, up-projections not sliced), no
+//! full-width Q/K norm (OLMo 2, OLMoE: the norm spans all heads, so a shard
+//! cannot compute it alone) and no tiered or host experts. A drafter is not
+//! supported either (the engine rejects it before the load).
 //!
 //! # Column cuts of other dtypes
 //!
@@ -115,7 +116,7 @@ use burn::tensor::distributed::{
 use burn::tensor::{Device, Tensor, TensorData};
 use candle_core::quantized::{GgmlDType, gguf_file};
 
-use super::gpu::read_f32;
+use super::gpu::{push_rows, read_f32};
 use super::layout::{Ffn, LayerLayout, Qkv, name};
 use super::params::Hparams;
 use crate::error::CucaError;
@@ -398,10 +399,7 @@ impl Cut {
     ) -> Self {
         let mut merged: Vec<Range<usize>> = Vec::new();
         for r in rows.into_iter().filter(|r| !r.is_empty()) {
-            match merged.last_mut() {
-                Some(last) if last.end == r.start => last.end = r.end,
-                _ => merged.push(r),
-            }
+            push_rows(&mut merged, r);
         }
         Self { rows: merged, cols }
     }

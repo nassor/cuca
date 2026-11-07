@@ -1,9 +1,9 @@
 //! Fused mixture-of-experts kernels for the GPU engine (CubeCL).
 //!
 //! burn's quantized matmuls cannot gather the weights of a data-dependent
-//! subset of experts (`q_select` dequantizes), so a MoE layer ran one
-//! matmul triple per selected expert, and its routing needed a host readback
-//! per layer. These kernels read the experts' weights straight from a
+//! subset of experts (`q_select` dequantizes), and a matmul triple per
+//! selected expert would be host-bound and need the routing on the host.
+//! These kernels read the experts' weights straight from a
 //! per-layer *pool* of expert slots held as one `u32` tensor, indexed by the
 //! router's own output:
 //!
@@ -155,17 +155,8 @@ impl MatrixLayout {
 
     /// Words the matrix occupies.
     pub(crate) fn words(&self) -> usize {
-        self.blocks() * self.format.value_words()
-            + if self.format.has_scale() {
-                self.half_words()
-            } else {
-                0
-            }
-            + if self.format.has_min() {
-                self.half_words()
-            } else {
-                0
-            }
+        let halves = usize::from(self.format.has_scale()) + usize::from(self.format.has_min());
+        self.blocks() * self.format.value_words() + halves * self.half_words()
     }
 }
 
@@ -336,7 +327,6 @@ pub(crate) fn pack_matrix(
             }
         }
     }
-    let _ = mins;
     Ok(())
 }
 
