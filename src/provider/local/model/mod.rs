@@ -139,7 +139,7 @@
 //!   length) never needs a released block. Prefix hits shorten by whole
 //!   blocks until every group still holds the blocks its window needs.
 //! - A hybrid model's recurrent state is independent of the context length:
-//!   [`params::Hparams::recurrent_state_bytes`] is 4 bytes times the sum, over
+//!   `Hparams::recurrent_state_bytes` is 4 bytes times the sum, over
 //!   the delta-net layers, of `(conv_kernel - 1) * conv_dim + n_v_heads *
 //!   head_k_dim * head_v_dim` (Qwen3.5-0.8B: 18 layers of 1.12 MB, 20.2 MB).
 //!   Every state slot (one per sequence that can run, `max_sequences`) keeps
@@ -182,6 +182,7 @@ pub(crate) mod paged;
 #[cfg(feature = "provider-local-gpu")]
 pub(crate) mod paged_kernel;
 pub(crate) mod params;
+mod pool;
 pub(crate) mod qmm;
 pub(crate) mod quant;
 pub(crate) mod rope;

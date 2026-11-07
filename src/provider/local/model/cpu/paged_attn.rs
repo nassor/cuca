@@ -18,12 +18,8 @@
 //! split. [`gather`] copies a key range into one contiguous tensor for the
 //! batched (non-exact) path, which multiplies it with candle's matmul.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, PoisonError};
-
-use candle_core::utils::barrier_pool;
-
 use super::super::paged::{BLOCK_SIZE, NO_BLOCK};
+use super::super::pool::par_chunks;
 
 /// The geometry of one layer's pools.
 #[derive(Clone, Copy)]
@@ -107,8 +103,9 @@ impl Values<'_> {
 }
 
 /// One query head over the keys `lo..hi`: `q` is its `head_dim` query values,
-/// `kvh` the KV head it reads, `out` receives the value width. The ranges were
-/// checked by [`check_range`].
+/// `kvh` the KV head it reads, `acc` is its zeroed output (the value width),
+/// which holds the running weighted sum and ends as the result. The ranges
+/// were checked by [`check_range`].
 #[expect(
     clippy::too_many_arguments,
     reason = "one attention head's inputs; a struct would only rename them"
@@ -123,19 +120,18 @@ fn attend_head(
     values: Values<'_>,
     shape: PoolShape,
     scale: f32,
-    out: &mut [f32],
+    acc: &mut [f32],
 ) {
     let d = shape.head_dim;
-    let vw = values.width(d);
     let mut max = f32::NEG_INFINITY;
     let mut sum = 0f32;
-    let mut acc = vec![0f32; vw];
     let mut scores = [0f32; BLOCK_SIZE];
     let mut pos = lo;
     while pos < hi {
         let end = hi.min((pos / BLOCK_SIZE + 1) * BLOCK_SIZE);
         let n = end - pos;
         let Some(first) = row_offset(table, pos, kvh, shape) else {
+            acc.fill(0.0);
             return;
         };
         let mut block_max = f32::NEG_INFINITY;
@@ -151,7 +147,7 @@ fn attend_head(
             // Rescale what was accumulated under the old maximum.
             let correction = (max - block_max).exp();
             sum *= correction;
-            for a in &mut acc {
+            for a in acc.iter_mut() {
                 *a *= correction;
             }
             max = block_max;
@@ -170,8 +166,8 @@ fn attend_head(
         }
         pos = end;
     }
-    for (o, a) in out.iter_mut().zip(&acc) {
-        *o = a / sum;
+    for a in acc.iter_mut() {
+        *a /= sum;
     }
 }
 
@@ -284,39 +280,22 @@ fn attend_rows(
     let vw = values.width(d);
     let group = n_head / n_kv_head;
     let mut out = vec![0f32; t * n_head * vw];
-    let jobs = t * n_head;
-    {
-        let slots: Vec<Mutex<&mut [f32]>> = out.chunks_mut(vw).map(Mutex::new).collect();
-        let next = AtomicUsize::new(0);
-        let run = |_: usize| {
-            loop {
-                let job = next.fetch_add(1, Ordering::Relaxed);
-                if job >= jobs {
-                    break;
-                }
-                let (row, head) = (job / n_head, job % n_head);
-                let (lo, hi) = range(row);
-                let mut slot = slots[job].lock().unwrap_or_else(PoisonError::into_inner);
-                attend_head(
-                    &q[job * d..(job + 1) * d],
-                    head / group,
-                    table,
-                    lo,
-                    hi,
-                    pool_k,
-                    values,
-                    shape,
-                    scale,
-                    &mut slot,
-                );
-            }
-        };
-        if jobs == 1 {
-            run(0);
-        } else {
-            barrier_pool().execute(run);
-        }
-    }
+    par_chunks(&mut out, vw, |job, slot| {
+        let (row, head) = (job / n_head, job % n_head);
+        let (lo, hi) = range(row);
+        attend_head(
+            &q[job * d..(job + 1) * d],
+            head / group,
+            table,
+            lo,
+            hi,
+            pool_k,
+            values,
+            shape,
+            scale,
+            slot,
+        );
+    });
     Ok(out)
 }
 

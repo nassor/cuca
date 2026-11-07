@@ -50,12 +50,13 @@
 //! the faster kernel per `m` either: a row's bits must not depend on the batch
 //! size, so one dtype is served by one kernel.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::utils::barrier_pool;
 use half::f16;
+
+use super::pool::for_each;
 
 /// Elements per quantisation block of the served formats (Q4_0, Q4_1, Q5_0,
 /// Q5_1, Q8_0), and of their Q8_0/Q8_1 activations.
@@ -658,8 +659,7 @@ fn run<L: Legacy>(
             data.len()
         );
     }
-    let pool = barrier_pool();
-    let threads = pool.n_workers() + 1;
+    let threads = barrier_pool().n_workers() + 1;
     let serial = n * k < SERIAL_BELOW || threads == 1;
     let rows_per_chunk = if serial {
         n
@@ -673,14 +673,11 @@ fn run<L: Legacy>(
         .map(Mutex::new)
         .collect();
 
-    let next = AtomicUsize::new(0);
-    let work = |_: usize| {
-        let mut res = vec![0f32; m * rows_per_chunk];
-        loop {
-            let c = next.fetch_add(1, Ordering::Relaxed);
-            if c >= n_chunks {
-                break;
-            }
+    for_each(
+        n_chunks,
+        !serial,
+        || vec![0f32; m * rows_per_chunk],
+        |res, c| {
             let r0 = c * rows_per_chunk;
             let rows = rows_per_chunk.min(n - r0);
             chunk::<L>(
@@ -694,13 +691,8 @@ fn run<L: Legacy>(
                     .unwrap_or_else(PoisonError::into_inner)
                     .copy_from_slice(&res[j * rows..(j + 1) * rows]);
             }
-        }
-    };
-    if serial {
-        work(0);
-    } else {
-        pool.execute(work);
-    }
+        },
+    );
     Ok(())
 }
 

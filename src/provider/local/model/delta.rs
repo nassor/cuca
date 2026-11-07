@@ -44,12 +44,10 @@
 //!   [`DeltaKernel::scan`] on the first rows, which reproduces the original
 //!   run bit for bit.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use candle_core::utils::barrier_pool;
-
 use super::params::DeltaSpec;
+use super::pool::for_each;
 
 /// The l2 normalisation epsilon of the query and key (the reference
 /// implementation's fixed value, independent of the RMSNorm epsilon).
@@ -261,24 +259,16 @@ impl DeltaKernel {
             .chunks_mut(dk * dv)
             .map(|m| Mutex::new((m, Vec::new())))
             .collect();
-        let next = AtomicUsize::new(0);
-        let work = |_: usize| {
-            let mut scratch = HeadScratch::new(d);
-            loop {
-                let h = next.fetch_add(1, Ordering::Relaxed);
-                let Some(cell) = cells.get(h) else {
-                    break;
-                };
-                let mut guard = cell.lock().unwrap_or_else(PoisonError::into_inner);
+        for_each(
+            cells.len(),
+            pooled,
+            || HeadScratch::new(d),
+            |scratch, h| {
+                let mut guard = cells[h].lock().unwrap_or_else(PoisonError::into_inner);
                 let (matrix, out) = &mut *guard;
-                self.scan_head(h, matrix, &window, rows, z, out, &mut scratch);
-            }
-        };
-        if pooled {
-            barrier_pool().execute(work);
-        } else {
-            work(0);
-        }
+                self.scan_head(h, matrix, &window, rows, z, out, scratch);
+            },
+        );
 
         // The new convolution history is the last rows of `history ++ mixed`.
         let mut next_history = vec![0.0; history_rows * cd];
