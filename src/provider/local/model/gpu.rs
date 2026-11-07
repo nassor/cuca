@@ -18,18 +18,23 @@
 //!
 //! # Weights
 //!
-//! - Q4_0 and Q8_0 matmul weights are repacked once at load into burn's
-//!   block-quantized layout (`Q4S` / `Q8S` values packed into `u32` words, one
-//!   f16 scale per 32-element block, see [`pack_blocks`]) and stay quantized
-//!   on the device: burn's matmul reads them directly and dequantizes inside
-//!   the kernel.
+//! - Q4_0, Q4_1 and Q8_0 matmul weights are repacked once at load into the
+//!   `u32` words of the dense kernels of [`mk`] ([`mk::DenseLayout`]: block
+//!   values then f16 scales, and minimums for Q4_1, in block-major order so
+//!   that the threads of a launch, one per output row, read consecutive
+//!   blocks) and stay quantized on the device, one copy per weight. Up to
+//!   [`GEMV_ROWS`] input rows (decode, batched decode, verification) the
+//!   matrix-vector kernel of [`mk::dense_gemv`] dots the blocks with the
+//!   input in f32; more rows (prefill) dequantize slices of the weight to f32
+//!   ([`mk::dense_dequant`]) and use burn's float matmul. burn's own
+//!   quantized matmul is not used by any weight (see [`linear`]).
 //! - F32, F16 and BF16 matmul weights are dequantized on the host row by row
 //!   ([`dequant_row`]) and uploaded as f32 for burn's float matmul, exactly.
 //!   They cost 4 bytes per element on the device whatever their size in the
 //!   file (an F16 or BF16 weight doubles).
-//! - **Every other dtype** (Q4_1, Q5_0, Q5_1, Q8_1 and the K-quants Q2_K to
-//!   Q6_K) is dequantized on the host row by row and **requantized to Q8_0**
-//!   ([`quantize_q8_0`]), then repacked like a native Q8_0 weight, so it costs
+//! - **Every other quantized dtype** (Q5_0, Q5_1, Q8_1 and the K-quants Q2_K
+//!   to Q6_K) is dequantized on the host row by row and **requantized to Q8_0**
+//!   ([`quantize_q8_0`]), then packed like a native Q8_0 weight, so it costs
 //!   about 1.06 bytes per element on the device instead of 4: a 3.8
 //!   B-parameter Q4_K_M file needs about 4 GB rather than 15 GB. The price is
 //!   a rounding error: each element moves by at most half a Q8_0 step, that
@@ -42,18 +47,16 @@
 //!   rather than 1e-5), so a K-quant model decodes the CPU engine's tokens
 //!   except where two candidates are that close.
 //! - Norm vectors, biases and scalars are f32 whatever their stored dtype.
-//! - **Exception**: a weight that could share an autotune key with a weight of
-//!   the other scheme is held as f32 whatever its dtype (exact), see the
-//!   known bugs below and [`plan_dense`].
 //!
 //! # Memory
 //!
 //! - Device memory holds the matmul weights as above. The token embedding is
 //!   uploaded only when it doubles as the LM head (no `output.weight`), once,
-//!   as the head weight. A weight over 1 GiB on the device is split into row
+//!   as the head weight. A weight over 256 MiB on the device is split into row
 //!   chunks (a large tied head becomes several `[rows_i, n_embd]` weights);
 //!   [`linear`] multiplies by each chunk and concatenates the outputs, which
-//!   is exact, so no single device buffer exceeds [`MAX_PART_BYTES`].
+//!   is exact, so no single weight buffer exceeds [`MAX_WEIGHT_CHUNK_BYTES`]
+//!   (and no buffer at all exceeds [`MAX_PART_BYTES`]).
 //! - Embedding lookups never touch the device copy: the host reads each
 //!   token's row of `token_embd` (and, for Gemma 4, of `per_layer_token_embd`)
 //!   from the GGUF file ([`RowTable`]) and uploads the dequantized rows. The
@@ -125,9 +128,8 @@
 //! The kernels exist because burn's quantized matmuls cannot gather a
 //! data-dependent subset of experts (`q_select` dequantizes) and because the
 //! per-expert matmul triples were host-bound (about 10 us of host time per
-//! queued operation, 8 experts x 3 matmuls x 40 layers); they also do not go
-//! through burn's matmul autotune, so the Q4/Q8 key hazard of [`plan_dense`]
-//! does not apply to experts.
+//! queued operation, 8 experts x 3 matmuls x 40 layers). The dense weights
+//! use the same layout and dot-row arithmetic through [`mk::dense_gemv`].
 //!
 //! # Tiered experts
 //!
@@ -231,8 +233,7 @@
 //!   ([`WeightReader::matrix_cut`]: a shard reads only its rows from the
 //!   file and copies its columns' bytes out of whole rows; a column cut that
 //!   splits a block of the file's dtype, as a K-quant `ffn_down` can, is cut
-//!   from the dequantized rows and held as Q8_0 or f32). [`plan_dense`]
-//!   judges the shapes after the cut ([`shard_shapes`]). Only shard 0 holds
+//!   from the dequantized rows and held as Q8_0). Only shard 0 holds
 //!   the LM head and the final norm; norms, per-head Q/K norms, the router,
 //!   the shared expert's gate, the per-layer-embedding weights, the layer
 //!   output scales and the RoPE tables are replicated, and so is the
@@ -277,46 +278,28 @@
 //!
 //! # Known burn 0.22 Vulkan bugs
 //!
-//! The first three are worked around in [`linear`], whose docs give the details and the tests
-//! that pin them: a quantized weight on the right of a matmul loses the device
-//! in some autotune candidates; a single-row product through a quantized
-//! weight either returns wrong values (weight on the left) or fails to launch
-//! for shapes the `vecmat` kernel does not support once another shape of the
-//! same size bucket tuned it. A single-token (decode) product uses `vecmat`
-//! only for weights it supports and otherwise dequantizes the weight, so such
-//! shapes (an input width that is not a multiple of 64, or an output width
-//! that is not a multiple of 512 for Q4_0, 256 for Q8_0 or 64 for f32, with
-//! the widest plane of 64 lanes assumed) decode several times slower than the
-//! rest.
-//!
-//! The other one lives in the weights, not in `linear`: burn's matmul
-//! autotune key holds the shapes (rounded up to a power of two), the element
-//! types and the strides, but **not the quantization scheme**. A kernel tuned
-//! for a Q8_0 weight (`num_quants` 4) is replayed on a Q4_0 weight (8) of any
-//! shape in the same bucket and fails at launch ("quantized view float vector
-//! size 4 must be a positive multiple of num_quants 8", or "Shared memory
-//! budget exceeded" when the replayed tile needs more than the 32 KiB the
-//! device allows); the other order happens to work, so which model fails
-//! depends on which weight a forward pass tunes first. Files that mix the
-//! schemes (a Q4_0 file with a few Q4_1 layers and a Q6_K head, as the
-//! Llama and Phi families' files are) hit it on the first pass that tunes a Q8 weight before a
-//! Q4 one of the same bucket (any prefill length, or a decode step). The
-//! autotune cache lives per process and device, so the plan covers the
-//! weights of one model and, for a drafter, those of its target. The
-//! loader therefore plans the weights ([`plan_dense`]): where a Q4 and a Q8
-//! weight could share a key (both dimensions within a factor of 2.5) the one
-//! of the scheme with fewer bytes is held as f32 instead, which has its own
-//! key. That is exact (an f32 copy of the file's dequantized values, no
-//! requantization) and costs 4 bytes per element for those few weights; a
-//! head far from every other weight (Gemma 4's 262144-row Q8_0 one) and a
-//! file of one scheme are untouched.
+//! burn's quantized matmul is not used: a quantized weight on the right of a
+//! matmul loses the device in some autotune candidates; a single-row product
+//! through a quantized weight returns wrong values with the weight on the
+//! left; its `vecmat` autotune entry is shared by every shape of a
+//! power-of-two bucket, so a candidate tuned for one shape fails to launch
+//! for another ("could not find supported vector size"), and the shapes it
+//! cannot launch fell back to dequantizing the whole weight on every token;
+//! and its autotune key holds the shapes, the element types and the strides
+//! but **not the quantization scheme**, so a Q8_0 candidate was replayed on
+//! a Q4_0 weight of the same bucket and failed at launch. The loader used to
+//! hold the minority scheme's weights as f32 to keep the keys apart. The
+//! own kernels ([`mk::dense_gemv`], [`mk::dense_dequant`]) have none of these
+//! limits, every shape works, and no weight is held as f32 for this reason.
+//! The f32 weights (the float dtypes) still follow the workarounds of
+//! [`linear`] for the `vecmat` entry.
 
 #[cfg(not(target_endian = "little"))]
 compile_error!(
     "provider-local-gpu copies GGUF little-endian f16 scales into burn's native-endian layout"
 );
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::f64::consts::FRAC_1_SQRT_2;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -324,7 +307,6 @@ use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
-use burn::tensor::quantization::{QuantScheme, QuantStore, QuantValue, ScaleDtype};
 use burn::tensor::{AllocationProperty, Bytes, DType, Device, Int, Tensor, TensorData, activation};
 use candle_core::quantized::{GgmlDType, gguf_file};
 
@@ -350,78 +332,6 @@ use crate::error::CucaError;
 use crate::provider::local::{
     ExpertHeat, ExpertPlacement, ExpertTiers, LocalDevice, device_unavailable,
 };
-
-/// burn's quantization scheme equivalent to a GGUF block dtype, `None` for
-/// every dtype the GPU engine does not keep quantized.
-fn quant_scheme(dtype: GgmlDType) -> Option<QuantScheme> {
-    let value = match dtype {
-        GgmlDType::Q4_0 => QuantValue::Q4S,
-        GgmlDType::Q8_0 => QuantValue::Q8S,
-        _ => return None,
-    };
-    Some(
-        QuantScheme::default()
-            .with_value(value)
-            .per_block([32], ScaleDtype::F16)
-            .with_store(QuantStore::PackedU32(0)),
-    )
-}
-
-/// Repack the GGUF bytes of a `[rows, cols]` Q4_0 or Q8_0 tensor into the
-/// byte layout of a burn quantized tensor with [`quant_scheme`]: every
-/// block's values, packed into little-endian `u32` words, followed by every
-/// block's f16 scale, both in row-major block order.
-///
-/// - Q4_0 element `e = nibble - 8` is stored as its 4-bit two's complement
-///   (`nibble ^ 8`); element `i` of each run of 8 sits at bits `4 * (i % 8)`
-///   of word `i / 8`. GGUF holds elements `0..16` in the low nibbles of a
-///   block's 16 bytes and `16..32` in the high nibbles.
-/// - Q8_0 values are signed bytes already in burn's order (element `i` at
-///   bits `8 * (i % 4)` of word `i / 4`) and are copied verbatim.
-/// - Scales are copied verbatim: GGUF stores them little-endian and burn
-///   native-endian, equal on the little-endian hosts this module builds for.
-fn pack_blocks(
-    dtype: GgmlDType,
-    raw: &[u8],
-    rows: usize,
-    cols: usize,
-) -> Result<Vec<u8>, CucaError> {
-    if quant_scheme(dtype).is_none() {
-        return Err(err(format!("{dtype:?} has no burn block-quantized layout")));
-    }
-    let block_bytes = dtype.type_size();
-    if !cols.is_multiple_of(32) || raw.len() != rows * cols / 32 * block_bytes {
-        return Err(err(format!(
-            "{} bytes do not hold a [{rows}, {cols}] {dtype:?} tensor",
-            raw.len()
-        )));
-    }
-    let blocks = rows * cols / 32;
-    // Values: 16 bytes per Q4 block, 32 per Q8 block; scales: 2 per block.
-    let value_bytes = block_bytes - 2;
-    let mut out = Vec::with_capacity(blocks * block_bytes);
-    for block in raw.chunks_exact(block_bytes) {
-        let q = &block[2..];
-        if dtype == GgmlDType::Q4_0 {
-            for word in 0..4 {
-                let mut packed = 0u32;
-                for i in 0..8 {
-                    let element = 8 * word + i;
-                    let byte = q[element % 16];
-                    let nibble = if element < 16 { byte & 0x0F } else { byte >> 4 };
-                    packed |= u32::from(nibble ^ 8) << (4 * i);
-                }
-                out.extend_from_slice(&packed.to_le_bytes());
-            }
-        } else {
-            out.extend_from_slice(&q[..value_bytes]);
-        }
-    }
-    for block in raw.chunks_exact(block_bytes) {
-        out.extend_from_slice(&block[..2]);
-    }
-    Ok(out)
-}
 
 /// The burn device for `device`, opened now so that a missing adapter or
 /// driver is an error here rather than a panic at the first tensor.
@@ -510,15 +420,50 @@ fn require_index(
 /// 2.46 GB buffer, so a conservative 1 GiB is assumed everywhere.
 const MAX_PART_BYTES: usize = 1 << 30;
 
+/// Device bytes of one row chunk of a dense weight. burn's default memory
+/// pool carves its allocations from pages as large as the largest allocation
+/// it has served, so one 1 GiB weight chunk makes every page 1 GiB and a
+/// nearly full card cannot place the next one (`out of device memory
+/// allocating 1074790400 bytes` with 2.4 GiB free while 36 layers of a 30B
+/// model were resident). Chunks of 256 MiB keep the pages that size.
+const MAX_WEIGHT_CHUNK_BYTES: usize = 256 << 20;
+
 /// Tokens of a delta-net scan between two waits for the device (see
 /// [`DeltaWeights::forward`]).
 const SCAN_DRAIN: usize = 16;
 
 /// A `[rows, cols]` matmul weight on the device as one or more row chunks
-/// (one unless the weight would exceed [`MAX_PART_BYTES`], as a large tied
-/// LM head does); [`linear`] concatenates the chunks' outputs, which is exact.
+/// (one unless the weight would exceed [`MAX_WEIGHT_CHUNK_BYTES`], as a large
+/// tied LM head or FFN matrix does); [`linear`] concatenates the chunks' outputs, which is exact.
 struct Weight {
-    parts: Vec<Tensor<2>>,
+    parts: Vec<Part>,
+}
+
+/// A weight held in the dense kernels' own layout on the device
+/// ([`mk::DenseLayout`]): one `u32` pool.
+#[derive(Clone)]
+struct Packed {
+    pool: Tensor<1, Int>,
+    layout: mk::DenseLayout,
+}
+
+/// One chunk of a [`Weight`].
+#[derive(Clone)]
+enum Part {
+    /// f32, row-major `[rows, cols]` (the float dtypes).
+    Float(Tensor<2>),
+    /// Q4_0, Q4_1 or Q8_0 blocks.
+    Packed(Packed),
+}
+
+impl Part {
+    /// Rows of the chunk.
+    fn rows(&self) -> usize {
+        match self {
+            Part::Float(t) => t.dims()[0],
+            Part::Packed(p) => p.layout.rows,
+        }
+    }
 }
 
 /// Quantize `values` (a whole number of 32-element blocks) to the GGUF Q8_0
@@ -542,7 +487,7 @@ pub(super) fn quantize_q8_0(values: &[f32], out: &mut Vec<u8>) {
 }
 
 /// The `[rows, cols]` weight whose GGUF bytes are `raw`, on the device, with
-/// parts of at most [`MAX_PART_BYTES`]; see [`upload_matrix_with`].
+/// parts of at most [`MAX_WEIGHT_CHUNK_BYTES`]; see [`upload_matrix_with`].
 #[cfg(test)]
 fn upload_matrix(
     tensor_name: &str,
@@ -559,145 +504,20 @@ fn upload_matrix(
         rows,
         cols,
         device,
-        MAX_PART_BYTES,
-        false,
+        MAX_WEIGHT_CHUNK_BYTES,
     )
-}
-
-/// The layout a weight of GGUF dtype `dtype` takes on the device under the
-/// rules of [`upload_matrix_with`]: `None` for f32.
-fn stored_layout(dtype: GgmlDType) -> Option<GgmlDType> {
-    match dtype {
-        GgmlDType::Q4_0 | GgmlDType::Q8_0 => Some(dtype),
-        GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16 => None,
-        _ => Some(GgmlDType::Q8_0),
-    }
-}
-
-/// Device bytes of one `cols`-wide row stored as `stored`.
-fn stored_row_bytes(stored: Option<GgmlDType>, cols: usize) -> usize {
-    match stored {
-        Some(GgmlDType::Q4_0) => cols / 2 + cols / 16,
-        Some(_) => cols + cols / 16,
-        None => cols * 4,
-    }
-    .max(1)
-}
-
-/// The two block-quantization schemes the engine keeps on the device. burn's
-/// matmul autotune key omits the scheme, so a kernel tuned on one
-/// replays on the other for any shape in the same bucket, and a kernel tuned
-/// for Q8 (`num_quants` 4) fails on Q4 (`num_quants` 8): see [`plan_dense`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SchemeClass {
-    Q4,
-    Q8,
-}
-
-/// The scheme a weight of GGUF dtype `dtype` is kept in, `None` for the
-/// float dtypes (held as f32).
-fn scheme_class(dtype: GgmlDType) -> Option<SchemeClass> {
-    match stored_layout(dtype) {
-        Some(GgmlDType::Q4_0) => Some(SchemeClass::Q4),
-        Some(_) => Some(SchemeClass::Q8),
-        None => None,
-    }
-}
-
-/// One quantized matmul weight as [`plan_dense`] sees it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct QuantShape {
-    rows: usize,
-    cols: usize,
-    class: SchemeClass,
-    /// Matrices of this shape the tensor holds: the experts of a stacked
-    /// expert tensor, else 1.
-    copies: usize,
-}
-
-impl QuantShape {
-    /// Rows of the largest chunk the weight is split into.
-    fn part_rows(&self) -> usize {
-        (MAX_PART_BYTES / stored_row_bytes(Some(self.stored()), self.cols))
-            .clamp(1, self.rows.max(1))
-    }
-
-    /// The GGUF layout the weight is kept in on the device.
-    fn stored(&self) -> GgmlDType {
-        match self.class {
-            SchemeClass::Q4 => GgmlDType::Q4_0,
-            SchemeClass::Q8 => GgmlDType::Q8_0,
-        }
-    }
-
-    /// Bytes on the device of one matrix.
-    fn bytes(&self) -> usize {
-        self.rows * stored_row_bytes(Some(self.stored()), self.cols)
-    }
-
-    /// Bytes on the device of every matrix of the tensor.
-    fn total_bytes(&self) -> usize {
-        self.bytes() * self.copies
-    }
-
-    /// Whether burn's matmul autotune may give the two weights one key. The
-    /// key holds the dimensions rounded up to a power of the anchor base
-    /// (2 by default, 2.5 at the coarsest autotune level), so two dimensions
-    /// within a factor of 2.5 may share a bucket and weights whose rows and
-    /// columns both are cannot be told apart. The anchor has no clamp, so
-    /// the bucket of a dimension is decided by its ratio alone.
-    fn may_share_key(&self, other: &QuantShape) -> bool {
-        let close = |x: usize, y: usize| x.max(y) * 2 < x.min(y) * 5;
-        close(self.part_rows(), other.part_rows()) && close(self.cols, other.cols)
-    }
-}
-
-/// The matmul weights of the model in `content` that are held quantized, by
-/// name, in name order: every 2-D tensor and every expert of a 3-D tensor
-/// except the per-layer embedding table (read row by row) and a token
-/// embedding that is not the LM head.
-fn quant_shapes(content: &gguf_file::Content) -> Vec<(String, QuantShape)> {
-    let tied = !content.tensor_infos.contains_key(name::OUTPUT);
-    let mut out: Vec<(String, QuantShape)> = content
-        .tensor_infos
-        .iter()
-        .filter(|(tensor, _)| {
-            tensor.as_str() != name::PER_LAYER_TOKEN_EMBD
-                && !(tensor.as_str() == name::TOKEN_EMBD && !tied)
-        })
-        .filter_map(|(tensor, info)| {
-            let class = scheme_class(info.ggml_dtype)?;
-            // The stacked expert tensors run in the MoE kernels, which read
-            // their own layout: no burn autotune key involves them.
-            let (rows, cols, copies) = match info.shape.dims() {
-                [rows, cols] => (*rows, *cols, 1),
-                _ => return None,
-            };
-            Some((
-                tensor.clone(),
-                QuantShape {
-                    rows,
-                    cols,
-                    class,
-                    copies,
-                },
-            ))
-        })
-        .collect();
-    out.sort_by(|a, b| a.0.cmp(&b.0));
-    out
 }
 
 /// The bytes of the columns `cols` of every row of `raw` (rows `row_len`
 /// wide, GGUF dtype `dtype`) appended to `out` as `held` ([`tp::column_dtype`]
 /// says which): the sub-slice of every row when `held` is `dtype` and the
-/// cut lies on block bounds, else the rows dequantized to f32 and cut, as f32
-/// or quantized to Q8_0.
+/// cut lies on block bounds, else the rows dequantized, cut and quantized to
+/// Q8_0.
 ///
 /// # Errors
 ///
 /// [`CucaError::Provider`] for rows that are not whole blocks of `dtype`, a
-/// cut past the row, a `held` other than `dtype`, Q8_0 or f32, or a Q8_0 cut
+/// cut past the row, a `held` other than `dtype` or Q8_0, or a Q8_0 cut
 /// that is not whole 32-element blocks.
 fn append_columns(
     dtype: GgmlDType,
@@ -718,8 +538,8 @@ fn append_columns(
         || !row_len.is_multiple_of(dtype.block_size())
         || !raw.len().is_multiple_of(row_bytes)
         || cols.end > row_len
-        || !matches!(held, GgmlDType::Q8_0 | GgmlDType::F32)
-        || (held == GgmlDType::Q8_0 && !cols.len().is_multiple_of(32))
+        || held != GgmlDType::Q8_0
+        || !cols.len().is_multiple_of(32)
     {
         return Err(err(format!(
             "{} bytes of {dtype:?} do not hold whole rows of {row_len} cut at columns {cols:?} as {held:?}",
@@ -729,136 +549,56 @@ fn append_columns(
     let mut values = vec![0f32; row_len];
     for row in raw.chunks_exact(row_bytes) {
         dequant_row(dtype, row, 1.0, &mut values)?;
-        let kept = &values[cols.clone()];
-        if held == GgmlDType::Q8_0 {
-            quantize_q8_0(kept, out);
-        } else {
-            out.extend(kept.iter().flat_map(|v| v.to_le_bytes()));
-        }
+        quantize_q8_0(&values[cols.clone()], out);
     }
     Ok(())
 }
 
-/// [`quant_shapes`] as the shard `tp` holds the weights (the rows and columns
-/// its [`Cut`] keeps), so that [`plan_dense`] judges the shapes the autotune
-/// sees. The dense set it yields is the same for every shard: all shards
-/// cut equal shapes.
-///
-/// # Errors
-///
-/// The loader's errors for a layer whose tensors are missing.
-fn shard_shapes(
-    content: &gguf_file::Content,
-    hp: &Hparams,
-    tp: Tp,
-) -> Result<Vec<(String, QuantShape)>, CucaError> {
-    let mut shapes = quant_shapes(content);
-    if !tp.is_split() {
-        return Ok(shapes);
-    }
-    let mut layouts: Vec<LayerLayout> = Vec::with_capacity(hp.n_layer);
-    for (il, spec) in hp.layers.iter().enumerate() {
-        layouts.push(LayerLayout::read(hp, il, spec, content)?);
-    }
-    for (tensor, shape) in &mut shapes {
-        let Some((il, part)) = tp::block_part(tensor) else {
-            continue;
-        };
-        let Some(layout) = layouts.get(il) else {
-            continue;
-        };
-        let cut = tp::part_cut(hp, layout, il, part, (shape.rows, shape.cols), tp);
-        (shape.rows, shape.cols) = (cut.n_rows(), cut.cols.len());
-    }
-    Ok(shapes)
-}
-
-/// The weights of `own` to hold as f32 instead of quantized so that no Q4 and
-/// Q8 weight can share an autotune key (the scheme is not part of it).
-///
-/// For every pair of weights of different schemes that [may share a
-/// key](QuantShape::may_share_key) one is converted: the weight of the
-/// scheme with fewer device bytes among `own` and `peers` (a model's own
-/// weights and the already loaded weights of the model it pairs with), or
-/// the `own` weight when the other belongs to `peers`, which cannot change.
-/// Dense weights are exact (an f32 copy of the dequantized file values), so
-/// the plan costs memory, not accuracy, and a model of one scheme, or whose
-/// schemes differ in shape, converts nothing.
-fn plan_dense(own: &[(String, QuantShape)], peers: &[QuantShape]) -> HashSet<String> {
-    let total = |class| {
-        own.iter()
-            .map(|(_, s)| s)
-            .chain(peers)
-            .filter(|s| s.class == class)
-            .map(QuantShape::total_bytes)
-            .sum::<usize>()
-    };
-    let minority = if total(SchemeClass::Q4) < total(SchemeClass::Q8) {
-        SchemeClass::Q4
-    } else {
-        SchemeClass::Q8
-    };
-    let mut dense = HashSet::new();
-    for (tensor, weight) in own {
-        let collides = |other: &QuantShape, fixed: bool| {
-            other.class != weight.class
-                && weight.may_share_key(other)
-                && (fixed || weight.class == minority)
-        };
-        if peers.iter().any(|p| collides(p, true)) || own.iter().any(|(_, o)| collides(o, false)) {
-            dense.insert(tensor.clone());
-        }
-    }
-    dense
-}
-
 /// One row chunk of a weight, converted on the host to what the device takes.
-#[derive(Clone)]
 enum PackedData {
-    /// burn's block-quantized layout under the scheme ([`pack_blocks`]).
-    Quant(Vec<u8>, QuantScheme),
+    /// The words of the dense kernels ([`mk::pack_dense`]) of a quantized
+    /// chunk.
+    Packed(Vec<u32>, mk::DenseLayout),
     /// f32 values, row-major.
     Float(Vec<f32>),
 }
 
-/// One chunk of `rows` rows of a [`PackedMatrix`].
-#[derive(Clone)]
+/// One chunk of `rows` rows of a weight.
 struct PackedPart {
     rows: usize,
     data: PackedData,
 }
 
 impl PackedPart {
-    /// The chunk as a device tensor `[rows, cols]`.
-    fn upload(self, cols: usize, device: &Device) -> Tensor<2> {
-        let shape = [self.rows, cols];
-        let data = match self.data {
-            PackedData::Quant(bytes, scheme) => {
-                TensorData::from_bytes_vec(bytes, shape, DType::QFloat(scheme))
+    /// The chunk as a device part.
+    fn upload(self, cols: usize, device: &Device) -> Part {
+        match self.data {
+            PackedData::Packed(words, layout) => {
+                let n = words.len();
+                // The words travel as the bits of an i32 tensor.
+                let words: Vec<i32> = words.into_iter().map(|w| w as i32).collect();
+                Part::Packed(Packed {
+                    pool: Tensor::<1, Int>::from_data(TensorData::new(words, [n]), device),
+                    layout,
+                })
             }
-            PackedData::Float(values) => TensorData::new(values, shape),
-        };
-        Tensor::from_data(data, device)
+            PackedData::Float(values) => Part::Float(Tensor::from_data(
+                TensorData::new(values, [self.rows, cols]),
+                device,
+            )),
+        }
     }
 }
 
-/// The layout a `dtype` weight takes on the device: `None` (f32) when
-/// `dense`, else [`stored_layout`].
-fn device_layout(dtype: GgmlDType, dense: bool) -> Option<GgmlDType> {
-    if dense { None } else { stored_layout(dtype) }
-}
-
 /// How a `[rows, cols]` weight of GGUF dtype `dtype` reaches the device: the
-/// layout it takes there and the row chunks it is split into. Shared by
-/// [`upload_matrix_with`] and [`pack_matrix`], so a resident and a tiered
-/// weight are the same device tensors.
+/// layout it takes there and the row chunks it is split into.
 struct PackPlan<'a> {
     tensor_name: &'a str,
     dtype: GgmlDType,
     rows: usize,
     cols: usize,
-    /// The GGUF layout kept on the device, `None` for f32.
-    stored: Option<GgmlDType>,
+    /// Quantized in the kernels' layout; `false` for f32 (the float dtypes).
+    quantized: bool,
     /// File bytes per row.
     row_bytes: usize,
     /// Rows of every chunk but the last, which may be shorter.
@@ -875,7 +615,6 @@ impl<'a> PackPlan<'a> {
         rows: usize,
         cols: usize,
         limit: usize,
-        dense: bool,
     ) -> Result<Self, CucaError> {
         let block = dtype.block_size();
         if !cols.is_multiple_of(block) {
@@ -889,25 +628,27 @@ impl<'a> PackPlan<'a> {
                 "tensor `{tensor_name}`: {raw_len} bytes do not hold a [{rows}, {cols}] {dtype:?} tensor"
             )));
         }
-        // The layout the weight takes on the device, and its bytes per row.
-        let stored = device_layout(dtype, dense);
-        if stored == Some(GgmlDType::Q8_0) && !cols.is_multiple_of(32) {
-            return Err(err(format!(
-                "tensor `{tensor_name}`: row length {cols} is not a multiple of the 32-element Q8_0 block"
-            )));
-        }
-        let mut chunk = (limit / stored_row_bytes(stored, cols)).clamp(1, rows.max(1));
-        if chunk < rows && chunk >= 64 {
-            // Keep chunk widths multiples of the plane width, which the
-            // single-row kernel needs ([`vecmat_fits`]).
-            chunk -= chunk % 64;
-        }
+        let quantized = !matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16);
+        let device_row_bytes = if quantized {
+            if !cols.is_multiple_of(mk::BLOCK) {
+                return Err(err(format!(
+                    "tensor `{tensor_name}`: row length {cols} is not a multiple of the {}-element block",
+                    mk::BLOCK
+                )));
+            }
+            mk::DenseLayout::new(dtype, 1, cols)
+                .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?
+                .bytes()
+        } else {
+            cols * 4
+        };
+        let chunk = (limit / device_row_bytes.max(1)).clamp(1, rows.max(1));
         Ok(Self {
             tensor_name,
             dtype,
             rows,
             cols,
-            stored,
+            quantized,
             row_bytes,
             chunk,
         })
@@ -927,29 +668,21 @@ impl<'a> PackPlan<'a> {
         let (dtype, cols, row_bytes) = (self.dtype, self.cols, self.row_bytes);
         let n = rows.len();
         let src = &raw[rows.start * row_bytes..rows.end * row_bytes];
-        let data = match (self.stored, quant_scheme(self.stored.unwrap_or(dtype))) {
-            (Some(layout), Some(scheme)) if layout == dtype => {
-                PackedData::Quant(pack_blocks(dtype, src, n, cols).map_err(context)?, scheme)
+        let data = if self.quantized {
+            let layout = mk::DenseLayout::new(dtype, n, cols).map_err(context)?;
+            PackedData::Packed(
+                mk::pack_dense(&layout, dtype, src).map_err(context)?,
+                layout,
+            )
+        } else {
+            let mut floats = vec![0f32; n * cols];
+            for (row, dst) in src
+                .chunks_exact(row_bytes.max(1))
+                .zip(floats.chunks_exact_mut(cols.max(1)))
+            {
+                dequant_row(dtype, row, 1.0, dst).map_err(context)?;
             }
-            (Some(layout), Some(scheme)) => {
-                let mut values = vec![0f32; cols];
-                let mut q8 = Vec::with_capacity(n * (cols / 32) * 34);
-                for row in src.chunks_exact(row_bytes.max(1)) {
-                    dequant_row(dtype, row, 1.0, &mut values).map_err(context)?;
-                    quantize_q8_0(&values, &mut q8);
-                }
-                PackedData::Quant(pack_blocks(layout, &q8, n, cols).map_err(context)?, scheme)
-            }
-            _ => {
-                let mut floats = vec![0f32; n * cols];
-                for (row, dst) in src
-                    .chunks_exact(row_bytes.max(1))
-                    .zip(floats.chunks_exact_mut(cols.max(1)))
-                {
-                    dequant_row(dtype, row, 1.0, dst).map_err(context)?;
-                }
-                PackedData::Float(floats)
-            }
+            PackedData::Float(floats)
         };
         Ok(PackedPart { rows: n, data })
     }
@@ -958,24 +691,16 @@ impl<'a> PackPlan<'a> {
 /// The `[rows, cols]` weight whose GGUF bytes are `raw`, on the device, in
 /// row chunks of at most `limit` device bytes:
 ///
-/// - Q4_0 and Q8_0 are repacked and stay quantized ([`pack_blocks`]);
+/// - Q4_0, Q4_1 and Q8_0 are repacked into the dense kernels' block-major
+///   words ([`mk::pack_dense`]) and stay quantized;
 /// - F32, F16 and BF16 are dequantized on the host row by row to f32
 ///   (exact);
-/// - every other dtype (Q4_1, Q5_0, Q5_1, Q8_1, the K-quants) is dequantized
-///   row by row and requantized to Q8_0 ([`quantize_q8_0`]), so it costs
-///   about its file size or less instead of four bytes per element, at the
-///   price of a rounding error of at most half a Q8_0 step per element;
-/// - with `dense`, any dtype is dequantized to f32 (exact), whatever the
-///   rules above say: [`plan_dense`] picks the weights that must not share
-///   an autotune key with a weight of the other quantization scheme.
+/// - every other quantized dtype (Q5_0, Q5_1, Q8_1, the K-quants) is
+///   dequantized row by row and requantized to Q8_0 ([`quantize_q8_0`]), at
+///   a rounding error of at most half a Q8_0 step per element.
 ///
 /// Chunks are converted and uploaded one at a time (the host holds one
-/// converted chunk, not the whole weight); [`pack_matrix`] followed by
-/// [`upload_packed`] yields the same tensors.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "tensor identity, shape, destination and the two upload policies are all independent"
-)]
+/// converted chunk, not the whole weight).
 fn upload_matrix_with(
     tensor_name: &str,
     dtype: GgmlDType,
@@ -984,9 +709,8 @@ fn upload_matrix_with(
     cols: usize,
     device: &Device,
     limit: usize,
-    dense: bool,
 ) -> Result<Weight, CucaError> {
-    let plan = PackPlan::new(tensor_name, dtype, raw.len(), rows, cols, limit, dense)?;
+    let plan = PackPlan::new(tensor_name, dtype, raw.len(), rows, cols, limit)?;
     let parts = plan
         .chunks()
         .map(|range| plan.pack(raw, range).map(|part| part.upload(cols, device)))
@@ -1000,8 +724,6 @@ struct WeightReader<'a> {
     file: File,
     buf: Vec<u8>,
     device: &'a Device,
-    /// Tensors held as f32 whatever their dtype; see [`plan_dense`].
-    dense: HashSet<String>,
     /// `ExpertPlacement::Host`: which layers keep their experts in host RAM.
     host: Option<HostPlan>,
 }
@@ -1094,8 +816,7 @@ impl WeightReader<'_> {
             rows,
             cols,
             self.device,
-            MAX_PART_BYTES,
-            self.dense.contains(tensor_name),
+            MAX_WEIGHT_CHUNK_BYTES,
         )
     }
 
@@ -1143,7 +864,7 @@ impl WeightReader<'_> {
             self.read_at(tensor_name, r.start * row_bytes, r.len() * row_bytes)?;
             return Ok((dtype, std::mem::take(&mut self.buf)));
         }
-        let held = tp::column_dtype(dtype, cols, &cut.cols, self.dense.contains(tensor_name));
+        let held = tp::column_dtype(dtype, cols, &cut.cols);
         let mut out = Vec::new();
         for r in &cut.rows {
             self.read_at(tensor_name, r.start * row_bytes, r.len() * row_bytes)?;
@@ -1174,8 +895,7 @@ impl WeightReader<'_> {
             cut.n_rows(),
             cut.cols.len(),
             self.device,
-            MAX_PART_BYTES,
-            self.dense.contains(tensor_name),
+            MAX_WEIGHT_CHUNK_BYTES,
         )
     }
 
@@ -1302,7 +1022,7 @@ impl WeightReader<'_> {
         // the down matrix once its columns are cut.
         let part = tp.part(ff);
         let whole = part == (0..ff);
-        let down_dtype = tp::column_dtype(layer.down.dtype, ff, &part, false);
+        let down_dtype = tp::column_dtype(layer.down.dtype, ff, &part);
         let dtypes = [layer.gate.dtype, layer.up.dtype, down_dtype];
         let layout = SlotLayout::new(n_embd, part.len(), dtypes)?;
         if n_expert * layout.bytes() > MAX_PART_BYTES {
@@ -2304,8 +2024,6 @@ pub(crate) struct GpuTransformer {
     zero: Vec<Option<DeltaState>>,
     /// The model has delta-net layers.
     hybrid: bool,
-    /// The weights held quantized, for a drafter's [`plan_dense`].
-    peers: Vec<QuantShape>,
     /// Counters and heat of the expert tiers, with `ExpertPlacement::Tiered`.
     tiers: Option<Arc<TierShared>>,
 }
@@ -2797,36 +2515,6 @@ impl GpuTransformer {
 
         // Every shard cuts equal shapes, so one plan serves all.
         let first = back.map_or(0, |b| b.first);
-        let mut shapes = shard_shapes(content, &hp, Tp { world, shard: 0 })?;
-        // The weights of the layers on the CPU never reach the device: they
-        // take no part in the plan of autotune keys.
-        shapes.retain(|(tensor, _)| tp::block_part(tensor).is_none_or(|(il, _)| il >= first));
-        let dense = plan_dense(&shapes, &[]);
-        if std::env::var_os("CUCA_LOCAL_PROFILE_SPLIT").is_some() {
-            let f32_bytes: usize = shapes
-                .iter()
-                .filter(|(tensor, _)| dense.contains(tensor))
-                .map(|(_, shape)| shape.rows * shape.cols * 4 * shape.copies)
-                .sum();
-            let quant_bytes: usize = shapes
-                .iter()
-                .filter(|(tensor, _)| !dense.contains(tensor))
-                .map(|(_, shape)| shape.total_bytes())
-                .sum();
-            eprintln!(
-                "SPLITPROFILE|from layer {first}: {} of {} weights held as f32 ({:.2} GiB as f32, would be {:.2} GiB quantized), {:.2} GiB quantized",
-                dense.len(),
-                shapes.len(),
-                f32_bytes as f64 / (1u64 << 30) as f64,
-                shapes
-                    .iter()
-                    .filter(|(tensor, _)| dense.contains(tensor))
-                    .map(|(_, shape)| shape.total_bytes())
-                    .sum::<usize>() as f64
-                    / (1u64 << 30) as f64,
-                quant_bytes as f64 / (1u64 << 30) as f64
-            );
-        }
         let host = match experts {
             ExpertPlacement::Host { layers } => {
                 if hp.moe.is_none() {
@@ -2879,11 +2567,6 @@ impl GpuTransformer {
             None => None,
         };
 
-        let peers = shapes
-            .iter()
-            .filter(|(tensor, _)| !dense.contains(tensor))
-            .map(|(_, shape)| *shape)
-            .collect();
         let plan = tiers.as_ref().map(|(_, plan)| plan);
         let mut weights: Vec<Weights> = Vec::with_capacity(world);
         for (shard, device) in devices.iter().enumerate() {
@@ -2892,7 +2575,6 @@ impl GpuTransformer {
                 file: File::open(path)?,
                 buf: Vec::new(),
                 device,
-                dense: dense.clone(),
                 host: host.clone(),
             };
             weights.push(Weights::load(
@@ -2965,7 +2647,6 @@ impl GpuTransformer {
             slots,
             zero,
             hybrid,
-            peers,
             tiers: tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
         })
     }
@@ -3533,7 +3214,7 @@ struct GpuExtKv {
 impl Weight {
     /// Rows of the whole weight (the output width of [`linear`]).
     fn rows(&self) -> usize {
-        self.parts.iter().map(|p| p.dims()[0]).sum()
+        self.parts.iter().map(Part::rows).sum()
     }
 }
 
@@ -3624,14 +3305,11 @@ impl GpuDrafter {
             }
         }
         let (n_embd, n_embd_out) = (hp.n_embd, hp.n_embd_out);
-        let shapes = quant_shapes(content);
-        let dense = plan_dense(&shapes, &target.peers);
         let mut reader = WeightReader {
             content,
             file: File::open(path)?,
             buf: Vec::new(),
             device: &target.weights[0].device,
-            dense,
             host: None,
         };
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
@@ -3899,10 +3577,10 @@ fn load_delta(
     let mut beta_alpha = reader.host_floats(&blk(name::SSM_BETA), &[nv, n_embd])?;
     beta_alpha.extend(reader.host_floats(&blk(name::SSM_ALPHA), &[nv, n_embd])?);
     let beta_alpha = Weight {
-        parts: vec![Tensor::from_data(
+        parts: vec![Part::Float(Tensor::from_data(
             TensorData::new(beta_alpha, [2 * nv, n_embd]),
             reader.device,
-        )],
+        ))],
     };
     let mut head_row = |tensor: String| -> Result<Tensor<2>, CucaError> {
         let values = reader.host_vector(&tensor, nv)?;
@@ -5335,44 +5013,46 @@ pub(super) fn read_f32<const D: usize>(
 const MAX_PLANE: usize = 64;
 
 /// Whether burn's `vecmat` kernel can launch `x · wᵀ` for a single row `x`
-/// and the `[out, in]` weight part `w`: it needs `in` to be a multiple of the
-/// plane width and `out` a multiple of the plane width times the values
-/// packed per `u32` word of the weight (8 for Q4_0, 4 for Q8_0, 1 for f32).
-/// The conditions are checked against [`MAX_PLANE`], the worst case.
+/// and the f32 `[out, in]` weight part `w`: it needs `in` to be a multiple of
+/// the plane width and `out` of the plane width, the widest plane
+/// ([`MAX_PLANE`]) assumed.
 fn vecmat_fits(w: &Tensor<2>) -> bool {
     let [out, inn] = w.dims();
-    let per_word = match w.dtype() {
-        DType::QFloat(scheme) if Some(scheme) == quant_scheme(GgmlDType::Q4_0) => 8,
-        DType::QFloat(_) => 4,
-        _ => 1,
-    };
-    out.is_multiple_of(MAX_PLANE * per_word) && inn.is_multiple_of(MAX_PLANE)
+    out.is_multiple_of(MAX_PLANE) && inn.is_multiple_of(MAX_PLANE)
 }
 
-/// `x [t, in]` times the `[out, in]` weight `w`, transposed: `[t, out]`. A
-/// quantized `w` is read by the matmul kernel directly (dequantized in
-/// registers); the transposes only swap strides. A weight in several row
-/// chunks runs one product per chunk and concatenates the outputs.
+/// Input rows up to which a quantized weight runs the matrix-vector kernel
+/// ([`mk::dense_gemv`]): a decode step, the rows of a batched decode step or
+/// of a verification call, the tail of a prompt. More rows (a 256-row
+/// prefill chunk) expand the weight to f32 in slices and use burn's matmul.
+/// Measured on an RX 9070 XT (Vulkan, f32 accumulation, `[16384, 6144]`,
+/// `[6144, 16384]`, `[6144, 1536]` weights): the kernel is 1.2 to 3 times
+/// faster than expanding up to 64 rows for both formats and up to 128 rows
+/// for Q4_0; at 256 rows it is 1.3 to 1.8 times faster than the expansion
+/// for the Q4_0 `[16384, 6144]` and `[6144, 16384]` weights but twice as slow
+/// for Q8_0, and at 512 rows the expansion wins for both.
+const GEMV_ROWS: usize = 64;
+
+/// f32 bytes of one dequantized slice of a quantized weight in a prefill.
+const DEQUANT_SLICE_BYTES: usize = 64 << 20;
+
+/// `x [t, in]` times the `[out, in]` weight `w`, transposed: `[t, out]`.
+/// A weight in several row chunks runs one product per chunk and
+/// concatenates the outputs.
 ///
-/// The operand order depends on `t` and on the shape of each chunk, working
-/// around burn 0.22 kernel bugs seen on Vulkan (RX 9070 XT), all pinned by
-/// `linear_matches_host_across_shapes`, `gpu_matches_cpu_on_every_architecture`
-/// and the live suite:
-///
-/// - `t > 1` (prefill): `(w · xᵀ)ᵀ`, the weight on the left in its stored
-///   layout. With the stride-swapped quantized weight on the right, some
-///   autotune candidates lose the device.
-/// - `t == 1` (decode) and [`vecmat_fits`]: `x · wᵀ`, which selects the
-///   `vecmat` kernel that reads the quantized weight once, in registers.
-///   `(w · xᵀ)ᵀ` with one column selects a matrix-vector kernel that returns
-///   wrong values for a quantized left operand.
-/// - `t == 1` for any other shape: `vecmat`'s autotune entry is shared by
-///   every shape of the same power-of-two bucket, so a candidate tuned for
-///   `out = 96` is replayed for `out = 128` and fails with "could not find
-///   supported vector size". The token is duplicated into two rows, the
-///   product runs as for a prefill, and the second row is dropped. Burn
-///   dequantizes the whole weight to f32 for that product, so such a shape
-///   decodes several times slower than a `vecmat` one.
+/// - A **quantized** chunk (Q4_0, Q4_1, Q8_0 in the layout of
+///   [`mk::DenseLayout`]) with at most [`GEMV_ROWS`] input rows runs the
+///   matrix-vector kernel of this crate (f32 accumulation straight from the
+///   blocks, one thread per row and token). More rows dequantize slices of
+///   the weight to f32 ([`mk::dense_dequant`]) and use burn's float matmul.
+///   burn's own quantized matmul is not used: its autotune keys do not hold
+///   the quantization scheme, its single-row path needs shapes that are
+///   multiples of the plane width, and the shapes it fell back on dequantized
+///   the whole weight on every token.
+/// - An **f32** chunk follows burn 0.22's rules on Vulkan: `t > 1` runs
+///   `(w · xᵀ)ᵀ`; `t == 1` runs `x · wᵀ` ([`vecmat_fits`]) or, for other
+///   shapes, a product of the token duplicated into two rows (the `vecmat`
+///   autotune entry is shared by every shape of its power-of-two bucket).
 fn linear(x: Tensor<2>, w: &Weight) -> Tensor<2> {
     match w.parts.as_slice() {
         [part] => linear_part(x, part),
@@ -5387,17 +5067,47 @@ fn linear(x: Tensor<2>, w: &Weight) -> Tensor<2> {
 }
 
 /// [`linear`] for one chunk of a weight.
-fn linear_part(x: Tensor<2>, w: &Tensor<2>) -> Tensor<2> {
-    if x.dims()[0] > 1 {
-        w.clone().matmul(x.transpose()).transpose()
-    } else if vecmat_fits(w) {
-        x.matmul(w.clone().transpose())
-    } else {
-        let pair = Tensor::cat(vec![x.clone(), x], 0);
-        w.clone()
-            .matmul(pair.transpose())
-            .transpose()
-            .narrow(0, 0, 1)
+fn linear_part(x: Tensor<2>, part: &Part) -> Tensor<2> {
+    let t = x.dims()[0];
+    match part {
+        Part::Float(w) => {
+            if t > 1 {
+                w.clone().matmul(x.transpose()).transpose()
+            } else if vecmat_fits(w) {
+                x.matmul(w.clone().transpose())
+            } else {
+                let pair = Tensor::cat(vec![x.clone(), x], 0);
+                w.clone()
+                    .matmul(pair.transpose())
+                    .transpose()
+                    .narrow(0, 0, 1)
+            }
+        }
+        Part::Packed(p) => {
+            let layout = p.layout;
+            let call = |row0, count| mk::DenseCall {
+                layout,
+                tokens: t,
+                row0,
+                count,
+            };
+            if t <= GEMV_ROWS {
+                return mk::dense_gemv(x, p.pool.clone(), &call(0, 0));
+            }
+            let like = Tensor::<1>::zeros([1], &x.device());
+            let slice = (DEQUANT_SLICE_BYTES / (layout.cols * 4)).clamp(1, layout.rows);
+            let mut outs = Vec::with_capacity(layout.rows.div_ceil(slice));
+            for row0 in (0..layout.rows).step_by(slice) {
+                let count = slice.min(layout.rows - row0);
+                let w = mk::dense_dequant(like.clone(), p.pool.clone(), &call(row0, count));
+                outs.push(w.matmul(x.clone().transpose()).transpose());
+            }
+            if outs.len() == 1 {
+                outs.swap_remove(0)
+            } else {
+                Tensor::cat(outs, 1)
+            }
+        }
     }
 }
 
@@ -5542,94 +5252,6 @@ mod tests {
 
     fn f16_bytes(v: f32) -> [u8; 2] {
         half::f16::from_f32(v).to_bits().to_le_bytes()
-    }
-
-    /// The `index`-th signed element of a packed values region, decoded by
-    /// the documented bit layout: `bits`-wide fields, `32 / bits` per
-    /// little-endian `u32`, lowest field first, two's complement.
-    fn packed_element(values: &[u8], bits: u32, index: usize) -> i32 {
-        let per_word = (32 / bits) as usize;
-        let at = index / per_word * 4;
-        let word = u32::from_le_bytes(values[at..at + 4].try_into().unwrap());
-        let field = (word >> (bits * (index % per_word) as u32)) & ((1 << bits) - 1);
-        // Sign-extend the field.
-        ((field << (32 - bits)) as i32) >> (32 - bits)
-    }
-
-    /// Two Q4_0 blocks (one row of 64) whose nibbles cover 0..16 in both
-    /// halves, so every value -8..=7 appears.
-    fn q4_0_row() -> Vec<u8> {
-        let mut raw = Vec::new();
-        for scale in [0.5f32, -0.25] {
-            raw.extend(f16_bytes(scale));
-            raw.extend((0..16u8).map(|j| j | ((15 - j) << 4)));
-        }
-        raw
-    }
-
-    #[test]
-    fn pack_q4_0_matches_dequant_row() {
-        let raw = q4_0_row();
-        let packed = pack_blocks(GgmlDType::Q4_0, &raw, 1, 64).unwrap();
-        // 64 nibbles in 8 words, then 2 scales.
-        assert_eq!(packed.len(), 32 + 4);
-        let mut expected = [0f32; 64];
-        dequant_row(GgmlDType::Q4_0, &raw, 1.0, &mut expected).unwrap();
-        for (i, &e) in expected.iter().enumerate() {
-            let scale = if i < 32 { 0.5 } else { -0.25 };
-            assert_eq!(
-                packed_element(&packed, 4, i) as f32,
-                e / scale,
-                "element {i}"
-            );
-        }
-        assert_eq!(&packed[32..34], &raw[0..2]);
-        assert_eq!(&packed[34..36], &raw[18..20]);
-    }
-
-    #[test]
-    fn pack_q8_0_matches_dequant_row() {
-        // Two rows of one block each.
-        let mut raw = Vec::new();
-        for (scale, salt) in [(0.25f32, 3i32), (2.0, 11)] {
-            raw.extend(f16_bytes(scale));
-            raw.extend((0..32).map(|j| ((j * 8 + salt) % 256 - 128) as i8 as u8));
-        }
-        let packed = pack_blocks(GgmlDType::Q8_0, &raw, 2, 32).unwrap();
-        assert_eq!(packed.len(), 64 + 4);
-        let mut expected = [0f32; 64];
-        dequant_row(GgmlDType::Q8_0, &raw, 1.0, &mut expected).unwrap();
-        for (i, &e) in expected.iter().enumerate() {
-            let scale = if i < 32 { 0.25 } else { 2.0 };
-            assert_eq!(
-                packed_element(&packed, 8, i) as f32,
-                e / scale,
-                "element {i}"
-            );
-        }
-        assert_eq!(&packed[64..66], &raw[0..2]);
-        assert_eq!(&packed[66..68], &raw[34..36]);
-    }
-
-    #[test]
-    fn only_q4_0_and_q8_0_stay_quantized() {
-        assert!(quant_scheme(GgmlDType::Q4_0).is_some());
-        assert!(quant_scheme(GgmlDType::Q8_0).is_some());
-        for dtype in [
-            GgmlDType::F32,
-            GgmlDType::F16,
-            GgmlDType::BF16,
-            GgmlDType::Q4_1,
-            GgmlDType::Q5_0,
-            GgmlDType::Q5_1,
-            GgmlDType::Q4K,
-            GgmlDType::Q6K,
-        ] {
-            assert!(quant_scheme(dtype).is_none(), "{dtype:?}");
-            assert!(pack_blocks(dtype, &[], 0, 32).is_err(), "{dtype:?}");
-        }
-        // A byte count that is not the tensor's block count.
-        assert!(pack_blocks(GgmlDType::Q4_0, &q4_0_row()[..35], 1, 64).is_err());
     }
 
     /// The GPU devices under test, from `CUCA_LOCAL_DEVICE`: one device or a
@@ -6316,14 +5938,24 @@ mod tests {
     /// resident run never reads the router output back, a tiered run does
     /// at every layer, which splits burn's fused elementwise kernels at
     /// different places, so they agree to float rounding (tiered placements
-    /// among themselves agree bit for bit).
+    /// among themselves agree bit for bit). Measured over the tiny models the
+    /// relative difference (to `1 + |logit|`) is 1e-6 to 3e-5 at nearly every
+    /// step. The tiny hybrid MoE model has one sensitive step (the second
+    /// step of the greedy run): 4e-5 to 7e-5 with one thread per row in the dense kernel,
+    /// 1.6e-4 to 2.2e-4 with the split-row kernel. Its routing is the same in
+    /// the resident and the hosted run (checked by reading every layer's
+    /// router logits back in both: identical expert ids for all 160 routed
+    /// rows, smallest gap between the last chosen and the first unchosen
+    /// logit 2.7e-3, far above rounding), so the difference is the order of
+    /// float accumulation, amplified at that step. 3e-4 is the tightest round
+    /// bound above the worst measured value.
     fn assert_close_logits(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}");
         for (step, (g, w)) in got.iter().zip(want).enumerate() {
             assert_eq!(g.len(), w.len(), "{what}");
             for (i, (a, b)) in g.iter().zip(w).enumerate() {
                 assert!(
-                    (a - b).abs() <= 1e-4 * (1.0 + b.abs()),
+                    (a - b).abs() <= 3e-4 * (1.0 + b.abs()),
                     "{what}: step {step} logit {i}: {a} vs {b}"
                 );
             }
@@ -6949,7 +6581,7 @@ mod tests {
                 for (src, dst) in raw.chunks_exact(row_bytes).zip(host.chunks_exact_mut(inn)) {
                     dequant_row(dtype, src, 1.0, dst).unwrap();
                 }
-                for t in [1usize, 2, 3, 1, 7] {
+                for t in [1usize, 2, 3, 1, 7, 17, 40] {
                     let x: Vec<f32> = (0..t * inn)
                         .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6)
                         .collect();
@@ -7036,7 +6668,7 @@ mod tests {
                 ),
             };
             let w = upload_matrix("w", dtype, &raw, rows, cols, &device).unwrap();
-            assert_eq!(w.parts[0].dtype(), DType::F32, "{dtype:?}");
+            assert!(matches!(w.parts[0], Part::Float(_)), "{dtype:?}");
             let got = read_weight(&w, rows, cols, &device);
             for (i, (g, e)) in got.iter().zip(&expected).enumerate() {
                 assert!((g - e).abs() <= 1e-6, "{dtype:?} element {i}: {g} vs {e}");
@@ -7111,10 +6743,14 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap();
             let w = upload_matrix("k", dtype, &qt.data().unwrap(), rows, cols, &device).unwrap();
-            assert_eq!(
-                w.parts[0].dtype(),
-                DType::QFloat(quant_scheme(GgmlDType::Q8_0).unwrap()),
-                "{dtype:?} is held as Q8_0"
+            let want = if dtype == GgmlDType::Q4_1 {
+                mk::ExpertFormat::Q4_1
+            } else {
+                mk::ExpertFormat::Q8_0
+            };
+            assert!(
+                matches!(&w.parts[0], Part::Packed(p) if p.layout.format == want),
+                "{dtype:?} is held as {want:?}"
             );
             let got = read_weight(&w, rows, cols, &device);
             assert_eq!(got.len(), expected.len(), "{dtype:?}");
@@ -7123,6 +6759,90 @@ mod tests {
                 let bound = amax * (0.5 / 127.0 + 1.0 / 1024.0) + 1e-6;
                 for (x, y) in g.iter().zip(e) {
                     assert!((x - y).abs() <= bound, "{dtype:?} block {b}: {x} vs {y}");
+                }
+            }
+        }
+    }
+
+    /// The dense kernels against a host product of candle's dequantization,
+    /// for every dtype a weight can be stored as (Q4_0, Q4_1, Q8_0 as they
+    /// are, a K-quant requantized to Q8_0) at odd row counts (not a multiple
+    /// of a thread group or of 512), Muse's 256-wide K/V projection, a real
+    /// 6144-wide model dimension and a 320-wide one, with one to forty input
+    /// rows: the matrix-vector kernel up to [`GEMV_ROWS`] and the
+    /// dequantizing prefill path beyond it. The bound is the requantization
+    /// error of a Q8_0 step per element plus f32 accumulation noise.
+    #[test]
+    fn dense_kernels_match_the_host_reference() {
+        use candle_core::quantized::QTensor;
+
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let device = open_device(device).unwrap();
+        let cases: [(GgmlDType, &[(usize, usize)]); 4] = [
+            (
+                GgmlDType::Q4_0,
+                &[(1, 32), (97, 64), (130, 96), (256, 6144), (1030, 320)],
+            ),
+            (
+                GgmlDType::Q4_1,
+                &[(1, 32), (97, 64), (130, 96), (256, 6144), (1030, 320)],
+            ),
+            (
+                GgmlDType::Q8_0,
+                &[(1, 32), (97, 64), (130, 96), (256, 6144), (1030, 320)],
+            ),
+            (GgmlDType::Q6K, &[(97, 256), (600, 512), (256, 6144)]),
+        ];
+        for (dtype, shapes) in cases {
+            for &(rows, cols) in shapes {
+                let source = candle_core::Tensor::from_vec(
+                    test_values(rows, cols),
+                    (rows, cols),
+                    &candle_core::Device::Cpu,
+                )
+                .unwrap();
+                let qt = QTensor::quantize(&source, dtype).unwrap();
+                let host = qt
+                    .dequantize(&candle_core::Device::Cpu)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap();
+                let w =
+                    upload_matrix("w", dtype, &qt.data().unwrap(), rows, cols, &device).unwrap();
+                assert!(matches!(w.parts[0], Part::Packed(_)), "{dtype:?}");
+                for t in [1usize, 2, 16, 17, 40] {
+                    let x: Vec<f32> = (0..t * cols)
+                        .map(|i| ((i * 7 + 3) % 13) as f32 * 0.1 - 0.6)
+                        .collect();
+                    let xt = Tensor::<2>::from_data(TensorData::new(x.clone(), [t, cols]), &device);
+                    let got = read_f32(linear(xt, &w), "linear").unwrap();
+                    assert_eq!(got.len(), t * rows, "{dtype:?} [{rows}, {cols}] t={t}");
+                    for r in 0..t {
+                        for o in 0..rows {
+                            let (mut e, mut bound) = (0f32, 1e-3f32);
+                            for (hw, xv) in host[o * cols..(o + 1) * cols]
+                                .chunks(32)
+                                .zip(x[r * cols..(r + 1) * cols].chunks(32))
+                            {
+                                let amax = hw.iter().fold(0f32, |m, v| m.max(v.abs()));
+                                for (a, c) in hw.iter().zip(xv) {
+                                    e += a * c;
+                                    bound += c.abs() * amax * (0.5 / 127.0 + 1.0 / 1024.0);
+                                }
+                            }
+                            bound += 1e-3 * e.abs();
+                            let g = got[r * rows + o];
+                            assert!(
+                                (g - e).abs() <= bound,
+                                "{dtype:?} [{rows}, {cols}] t={t}: row {r} col {o}: gpu {g} vs host {e} (bound {bound})"
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -7166,9 +6886,8 @@ mod tests {
                 _ => cols + cols / 16,
             };
             let limit = 64 * row_bytes;
-            let split =
-                upload_matrix_with("w", dtype, &raw, rows, cols, &device, limit, false).unwrap();
-            let sizes: Vec<usize> = split.parts.iter().map(|p| p.dims()[0]).collect();
+            let split = upload_matrix_with("w", dtype, &raw, rows, cols, &device, limit).unwrap();
+            let sizes: Vec<usize> = split.parts.iter().map(Part::rows).collect();
             assert_eq!(sizes, [64, 64, 64, 8], "{dtype:?}");
             for t in [1usize, 3] {
                 let x: Vec<f32> = (0..t * cols)
@@ -7185,249 +6904,6 @@ mod tests {
                         (p - q).abs() <= 1e-4 * (1.0 + p.abs()),
                         "{dtype:?} t={t} element {i}: whole {p} vs split {q}"
                     );
-                }
-            }
-        }
-    }
-
-    fn shape(rows: usize, cols: usize, class: SchemeClass) -> QuantShape {
-        QuantShape {
-            rows,
-            cols,
-            class,
-            copies: 1,
-        }
-    }
-
-    fn named(shapes: &[(&str, QuantShape)]) -> Vec<(String, QuantShape)> {
-        shapes.iter().map(|(n, s)| (n.to_string(), *s)).collect()
-    }
-
-    /// After the plan, no Q4 and Q8 weight that remain quantized may share an
-    /// autotune key.
-    fn assert_plan_separates(own: &[(String, QuantShape)], peers: &[QuantShape]) {
-        let dense = plan_dense(own, peers);
-        let kept: Vec<&QuantShape> = own
-            .iter()
-            .filter(|(n, _)| !dense.contains(n))
-            .map(|(_, s)| s)
-            .collect();
-        for a in &kept {
-            for b in kept.iter().copied().chain(peers) {
-                assert!(
-                    a.class == b.class || !a.may_share_key(b),
-                    "{a:?} and {b:?} may share a key"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn plan_dense_converts_only_the_minority_scheme_near_the_other() {
-        use SchemeClass::{Q4, Q8};
-        // One scheme: nothing to do, however similar the shapes.
-        let q4 = named(&[("a", shape(512, 2048, Q4)), ("b", shape(2048, 8192, Q4))]);
-        assert!(plan_dense(&q4, &[]).is_empty());
-        let q8 = named(&[("a", shape(512, 2048, Q8)), ("b", shape(512, 2048, Q8))]);
-        assert!(plan_dense(&q8, &[]).is_empty());
-
-        // Q4 majority: a Q8 weight is converted when a Q4 weight is near (a
-        // Q4_1 attention layer of a Q4_0 file, a Q6_K head of a similar
-        // width) and kept when none is (a narrow projection).
-        let mut mixed = named(&[
-            ("q4.up", shape(16384, 3072, Q4)),
-            ("q4.down", shape(3072, 8192, Q4)),
-            ("q8.layer", shape(3072, 8192, Q8)),
-            ("q8.head", shape(32064, 3072, Q8)),
-            ("q8.far", shape(1024, 3072, Q8)),
-        ]);
-        // The other layers of the Q4_0 file.
-        mixed.extend((0..30).map(|i| (format!("q4.layer{i}"), shape(16384, 3072, Q4))));
-        let dense = plan_dense(&mixed, &[]);
-        let mut names: Vec<&str> = dense.iter().map(String::as_str).collect();
-        names.sort();
-        assert_eq!(names, ["q8.head", "q8.layer"]);
-        assert_plan_separates(&mixed, &[]);
-
-        // Q8 majority: the Q4 weight near a Q8 one is converted instead.
-        let flipped = named(&[
-            ("q8.a", shape(4096, 4096, Q8)),
-            ("q8.b", shape(4096, 4096, Q8)),
-            ("q4.a", shape(4096, 2048, Q4)),
-            ("q4.far", shape(64, 64, Q4)),
-        ]);
-        let dense = plan_dense(&flipped, &[]);
-        assert_eq!(dense.len(), 1);
-        assert!(dense.contains("q4.a"));
-
-        // The factor-2.5 boundary of the anchor bucketing.
-        let edge = |rows| named(&[("q4", shape(1000, 1000, Q4)), ("q8", shape(rows, 1000, Q8))]);
-        assert_eq!(plan_dense(&edge(2400), &[]).len(), 1, "2.4x is near");
-        assert!(plan_dense(&edge(2600), &[]).is_empty(), "2.6x is far");
-
-        // A drafter's own weights give way to the loaded target's whatever
-        // their size.
-        let peers = [shape(2048, 1536, Q8)];
-        let own = named(&[("big", shape(4096, 1536, Q4)), ("far", shape(64, 64, Q4))]);
-        assert_eq!(plan_dense(&own, &peers).len(), 1);
-        assert!(plan_dense(&own, &peers).contains("big"));
-        assert_plan_separates(&own, &peers);
-    }
-
-    /// The tensors the plan sees in a real file layout: a Q4_0 model with a
-    /// Q8_0 output head close to its projections.
-    #[test]
-    fn plan_dense_reads_the_shapes_of_a_gguf_file() {
-        let spec = TinySpec {
-            embd_dtype: GgmlDType::Q8_0,
-            ..TinySpec::llama()
-        };
-        let model = write_spec(&spec);
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
-        let shapes = quant_shapes(&content);
-        let names: Vec<&str> = shapes.iter().map(|(n, _)| n.as_str()).collect();
-        // The token embedding is a lookup table here (the head is a
-        // separate `output.weight`), so it does not count.
-        assert!(!names.contains(&"token_embd.weight"), "{names:?}");
-        assert!(names.contains(&"output.weight"), "{names:?}");
-        assert!(names.contains(&"blk.0.ffn_up.weight"), "{names:?}");
-        // Q8_0 head [16, 64] vs Q4_0 K/V projection [32, 64].
-        let dense = plan_dense(&shapes, &[]);
-        assert_eq!(dense.iter().collect::<Vec<_>>(), ["output.weight"]);
-        assert_plan_separates(&shapes, &[]);
-    }
-
-    /// The bytes of a synthetic `[out, inn]` weight of `dtype`.
-    fn synthetic_weight(dtype: GgmlDType, out: usize, inn: usize) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(out * inn / dtype.block_size() * dtype.type_size());
-        for b in 0..out * inn / 32 {
-            raw.extend(f16_bytes(0.05 + (b % 7) as f32 * 0.01));
-            raw.extend((0..dtype.type_size() - 2).map(|j| ((b * 31 + j * 17 + 5) % 251) as u8));
-        }
-        raw
-    }
-
-    /// burn 0.22's matmul autotune key omits the quantization scheme, so a
-    /// kernel tuned for a Q8_0 weight is replayed on a Q4_0 weight of the same
-    /// shape bucket and fails ("quantized view float vector size 4 must be a
-    /// positive multiple of num_quants 8", or a shared-memory budget). The
-    /// weights below are the shape classes of a wide (`wide`) and a narrow (`narrow`) Llama/Phi-style file
-    /// (Q4_0 with a few Q4_1 layers and a Q6_K head) plus small ones with
-    /// the same residues, uploaded as the loader does (the plan applied),
-    /// Q8 weights first, then multiplied for prefill lengths of every
-    /// residue class and for decode in one process. The autotune cache is
-    /// per process and device, so every test of this module shares it: a
-    /// Q8 weight tuned here can reach a Q4 weight of the same bucket in
-    /// another test, which is why the plan is applied to every family.
-    #[test]
-    fn mixed_scheme_weights_run_in_every_order() {
-        use GgmlDType::{Q4_0, Q8_0};
-
-        let Some(device) = test_device() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
-            return;
-        };
-        let device = open_device(device).unwrap();
-        type Family = (&'static str, Vec<(usize, usize, GgmlDType)>);
-        let families: [Family; 3] = [
-            (
-                "wide",
-                vec![
-                    (3072, 8192, Q8_0),
-                    (32064, 3072, Q8_0),
-                    (9216, 3072, Q4_0),
-                    (3072, 3072, Q4_0),
-                    (16384, 3072, Q4_0),
-                    (3072, 8192, Q4_0),
-                ],
-            ),
-            (
-                "narrow",
-                vec![
-                    (512, 2048, Q8_0),
-                    (2048, 8192, Q8_0),
-                    (2048, 2048, Q4_0),
-                    (512, 2048, Q4_0),
-                    (8192, 2048, Q4_0),
-                    (2048, 8192, Q4_0),
-                ],
-            ),
-            (
-                "small",
-                vec![
-                    (96, 64, Q8_0),
-                    (16, 64, Q8_0),
-                    (64, 128, Q8_0),
-                    (96, 64, Q4_0),
-                    (64, 96, Q4_0),
-                    (32, 64, Q4_0),
-                    (64, 64, Q4_0),
-                    (128, 64, Q4_0),
-                ],
-            ),
-        ];
-        let ts = [1usize, 2, 3, 5, 7, 8, 9, 17, 31, 64, 80, 101, 256, 1];
-        for (family, weights) in &families {
-            let shapes: Vec<(String, QuantShape)> = weights
-                .iter()
-                .enumerate()
-                .map(|(i, &(rows, cols, d))| {
-                    let class = scheme_class(d).unwrap();
-                    (
-                        format!("{family}.{i}"),
-                        QuantShape {
-                            rows,
-                            cols,
-                            class,
-                            copies: 1,
-                        },
-                    )
-                })
-                .collect();
-            let dense = plan_dense(&shapes, &[]);
-            assert!(!dense.is_empty(), "{family}: the plan converts something");
-            let uploaded: Vec<(Weight, Vec<u8>)> = shapes
-                .iter()
-                .zip(weights)
-                .map(|((tensor, _), &(rows, cols, d))| {
-                    let raw = synthetic_weight(d, rows, cols);
-                    let w = upload_matrix_with(
-                        tensor,
-                        d,
-                        &raw,
-                        rows,
-                        cols,
-                        &device,
-                        MAX_PART_BYTES,
-                        dense.contains(tensor),
-                    )
-                    .unwrap();
-                    (w, raw)
-                })
-                .collect();
-            for &t in &ts {
-                for (i, ((w, raw), &(rows, cols, d))) in uploaded.iter().zip(weights).enumerate() {
-                    let x: Vec<f32> = (0..t * cols)
-                        .map(|j| ((j * 7 + 3) % 13) as f32 * 0.1 - 0.6)
-                        .collect();
-                    let xt = Tensor::<2>::from_data(TensorData::new(x.clone(), [t, cols]), &device);
-                    let got = read_f32(linear(xt, w), "linear")
-                        .unwrap_or_else(|e| panic!("{family} weight {i} {rows}x{cols} t={t}: {e}"));
-                    let row_bytes = cols / d.block_size() * d.type_size();
-                    let mut host = vec![0f32; cols];
-                    for o in (0..rows).step_by(rows / 7 + 1) {
-                        dequant_row(d, &raw[o * row_bytes..(o + 1) * row_bytes], 1.0, &mut host)
-                            .unwrap();
-                        for r in 0..t.min(3) {
-                            let e: f32 = (0..cols).map(|j| host[j] * x[r * cols + j]).sum();
-                            let g = got[r * rows + o];
-                            assert!(
-                                (g - e).abs() <= 2e-3 * (1.0 + e.abs()),
-                                "{family} weight {i} {d:?} {rows}x{cols} t={t}: row {r} col {o}: gpu {g} vs host {e}"
-                            );
-                        }
-                    }
                 }
             }
         }
@@ -7994,34 +7470,6 @@ mod tests {
         }
     }
 
-    /// An expert tensor weighs all its experts when `plan_dense` picks the
-    /// minority scheme: a MoE model whose Q8 weights (a big LM head, shared
-    /// experts) outweigh one expert of each Q4 tensor still holds the Q8
-    /// weights that collide with the Q4 experts as f32, never the experts
-    /// (Qwen3.6-35B-A3B: its experts would cost 7x the device memory).
-    #[test]
-    fn plan_dense_weighs_every_expert_of_a_stacked_tensor() {
-        let q4 = |rows, cols, copies| QuantShape {
-            rows,
-            cols,
-            class: SchemeClass::Q4,
-            copies,
-        };
-        let q8 = |rows, cols| QuantShape {
-            rows,
-            cols,
-            class: SchemeClass::Q8,
-            copies: 1,
-        };
-        let own = vec![
-            ("experts".to_string(), q4(512, 2048, 1024)),
-            ("shared".to_string(), q8(512, 2048)),
-            ("head".to_string(), q8(248_320, 2048)),
-        ];
-        let dense = plan_dense(&own, &[]);
-        assert_eq!(dense, HashSet::from(["shared".to_string()]));
-    }
-
     // ------------------------------------------------------------------
     // Tensor parallelism (see `tp`)
     // ------------------------------------------------------------------
@@ -8069,7 +7517,7 @@ mod tests {
         for dtype in [GgmlDType::Q8_0, GgmlDType::F32, GgmlDType::F16] {
             let (raw, whole) = encoded_matrix(dtype, rows, width);
             for cols in [0..128, 0..64, 64..128, 32..96, 96..128, 0..32] {
-                let held = tp::column_dtype(dtype, width, &cols, false);
+                let held = tp::column_dtype(dtype, width, &cols);
                 assert_eq!(held, dtype, "{dtype:?} {cols:?} is a byte copy");
                 let mut out = Vec::new();
                 append_columns(dtype, &raw, width, &cols, held, &mut out).unwrap();
@@ -8083,7 +7531,7 @@ mod tests {
         for dtype in [GgmlDType::F32, GgmlDType::F16] {
             let (raw, whole) = encoded_matrix(dtype, rows, width);
             let cols = 5..77;
-            assert_eq!(tp::column_dtype(dtype, width, &cols, false), dtype);
+            assert_eq!(tp::column_dtype(dtype, width, &cols), dtype);
             let mut out = Vec::new();
             append_columns(dtype, &raw, width, &cols, dtype, &mut out).unwrap();
             assert_eq!(
@@ -8140,7 +7588,7 @@ mod tests {
     }
 
     /// A column cut that splits a 256-element K-quant block dequantizes the
-    /// rows and cuts the values, as Q8_0 (or f32 for a dense weight); a cut
+    /// rows and cuts the values, as Q8_0; a cut
     /// on block bounds stays a byte copy. Host only.
     #[test]
     fn column_cuts_inside_a_k_quant_block_requantize() {
@@ -8159,7 +7607,7 @@ mod tests {
 
         let aligned = 256..512;
         assert_eq!(
-            tp::column_dtype(GgmlDType::Q6K, width, &aligned, false),
+            tp::column_dtype(GgmlDType::Q6K, width, &aligned),
             GgmlDType::Q6K
         );
         let mut copy = Vec::new();
@@ -8179,12 +7627,8 @@ mod tests {
 
         let cols = 32..288;
         assert_eq!(
-            tp::column_dtype(GgmlDType::Q6K, width, &cols, false),
+            tp::column_dtype(GgmlDType::Q6K, width, &cols),
             GgmlDType::Q8_0
-        );
-        assert_eq!(
-            tp::column_dtype(GgmlDType::Q6K, width, &cols, true),
-            GgmlDType::F32
         );
         let kept = host_columns(&whole, width, &cols);
         let mut q8 = Vec::new();
@@ -8192,22 +7636,6 @@ mod tests {
         let mut want = Vec::new();
         quantize_q8_0(&kept, &mut want);
         assert_eq!(q8, want);
-        let mut f32s = Vec::new();
-        append_columns(
-            GgmlDType::Q6K,
-            &raw,
-            width,
-            &cols,
-            GgmlDType::F32,
-            &mut f32s,
-        )
-        .unwrap();
-        assert_eq!(
-            f32s,
-            kept.iter()
-                .flat_map(|v| v.to_le_bytes())
-                .collect::<Vec<u8>>()
-        );
     }
 
     /// The GPU devices under test, as `test_devices` plus a repeat of the
@@ -8794,7 +8222,6 @@ mod tests {
                 file: File::open(&model.path).unwrap(),
                 buf: Vec::new(),
                 device: &device,
-                dense: HashSet::new(),
                 host: None,
             };
             let matrices: Vec<(String, usize, usize)> = content

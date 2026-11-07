@@ -133,18 +133,19 @@ The live matrix (`tests/provider_local.rs`, CPU, release) on converted checkpoin
 
 | Dtype | CPU | GPU |
 |---|---|---|
-| Q4_0, Q8_0 | stays quantized; cuca's batch-invariant quantized matmul kernel | repacked at load into burn's block layout; stays quantized |
+| Q4_0, Q8_0 | stays quantized; cuca's batch-invariant quantized matmul kernel | repacked at load into the kernels' own block-major words; stays quantized |
 | F32, F16, BF16 | held as f32 | uploaded as f32 (4 bytes per element) |
-| Q4_1, Q5_0, Q5_1 | stays quantized; cuca's batch-invariant quantized matmul kernel | dequantized row by row at load, requantized to Q8_0 (stacked expert tensors: Q4_1 is read as Q4_1 by the MoE kernels) |
+| Q4_1 | stays quantized; cuca's batch-invariant quantized matmul kernel | repacked like Q4_0, with the f16 minimum of each block |
+| Q5_0, Q5_1 | stays quantized; cuca's batch-invariant quantized matmul kernel | dequantized row by row at load, requantized to Q8_0 |
 | K-quants (Q2_K to Q6_K) | stays quantized; candle's quantized matmul, one activation row at a time | dequantized row by row at load, requantized to Q8_0 |
 | Q8_1 | stays quantized; candle's quantized matmul (no model ships it; not covered by a test) | dequantized row by row at load, requantized to Q8_0 |
 | IQ family | rejected | rejected |
 
 - Norm vectors, biases and scalars are f32 whatever their stored dtype. Resident weights are about the file size.
 - The CPU reads any dtype candle's quantized matmul reads: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants (Q2_K to Q6_K). An IQ-family tensor makes the load fail with `` `PATH` is not a supported GGUF file: ... ``.
-- A GPU requantizes every dtype other than Q4_0, Q8_0, F32, F16 and BF16 to Q8_0. Each element moves by at most half a Q8_0 step. That is a smaller error than the one a Q4_K, Q5_K or Q6_K file already carries, but GPU logits then differ from the CPU's by more than float rounding.
-- A GPU file that mixes Q4_0 and Q8_0 weights, as the Q4_0 presets with a Q8_0 embedding do, keeps the weights of the scheme with fewer bytes as f32 where the two have similar shapes. That is exact and costs extra device memory.
-- A weight over 1 GiB on the GPU is split into row chunks.
+- A GPU requantizes every quantized dtype other than Q4_0, Q4_1 and Q8_0 to Q8_0. Each element moves by at most half a Q8_0 step. That is a smaller error than the one a Q4_K, Q5_K or Q6_K file already carries, but GPU logits then differ from the CPU's by more than float rounding.
+- A GPU file that mixes Q4_0, Q4_1 and Q8_0 weights, as the Q4_0 presets with a Q8_0 embedding do, keeps every weight in its own format, one copy each: the dense kernels read the format of each weight, so no weight is held as f32 to keep schemes apart.
+- A weight over 256 MiB on the GPU is split into row chunks.
 - Measured on Vulkan with `phi4-mini-q4_k_m` (AMD RX 9070 XT, Windows): the top-1 token equals the CPU's and the relative logit error against the dequantized CPU reference is 1.8e-2.
 - Mixture of experts: by default expert tensors are split once at load into one quantized 2-D weight per expert, so memory is the file size. `LocalModelConfig::experts` can leave them in the file instead; see [Tiered expert placement](@/providers/local/expert-tiers.md).
 

@@ -365,6 +365,7 @@ pub(super) fn part_cut(
 
 /// The layer and part of a per-layer weight's tensor name
 /// (`blk.{layer}.{part}.weight`); `None` for any other name.
+#[cfg(test)]
 pub(super) fn block_part(tensor_name: &str) -> Option<(usize, &str)> {
     let rest = tensor_name.strip_prefix("blk.")?.strip_suffix(".weight")?;
     let (il, part) = rest.split_once('.')?;
@@ -438,18 +439,10 @@ fn on_blocks(dtype: GgmlDType, row_len: usize, cols: &Range<usize>) -> bool {
 /// The dtype the columns `cols` of a `row_len`-wide matrix of `dtype` are
 /// held in: `dtype` itself when the cut is every column or lies on block
 /// boundaries (a byte copy, [`copy_columns`]), else the rows are dequantized
-/// and cut as f32 (`dense`, a weight the loader keeps as f32) or quantized
-/// to Q8_0.
-pub(super) fn column_dtype(
-    dtype: GgmlDType,
-    row_len: usize,
-    cols: &Range<usize>,
-    dense: bool,
-) -> GgmlDType {
+/// and cut, and quantized to Q8_0.
+pub(super) fn column_dtype(dtype: GgmlDType, row_len: usize, cols: &Range<usize>) -> GgmlDType {
     if *cols == (0..row_len) || on_blocks(dtype, row_len, cols) {
         dtype
-    } else if dense {
-        GgmlDType::F32
     } else {
         GgmlDType::Q8_0
     }
