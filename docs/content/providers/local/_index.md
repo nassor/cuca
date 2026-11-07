@@ -13,12 +13,12 @@ kicker = "Reference"
 <dt>In one line</dt>
 <dd>Runs a GGUF language model of a supported architecture (see <a href="@/providers/local/models.md">Local models and formats</a>) on the CPU or a GPU inside your process, with no server and no HTTP endpoint.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature for the CPU, or <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> for a GPU. A GGUF file, or disk for the one-time download (0.29 GB to 17.38 GB across the presets, 2.84 GB for the default). Memory of about the file size plus the K/V cache, or less for a mixture-of-experts model on <a href="@/providers/local/expert-tiers.md">tiered expert placement</a>.</dd>
+<dd>The <code>provider-local</code> feature for the CPU, or <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> for a GPU. A GGUF file, or disk for the one-time download (0.29 GB to 67.71 GB across the main-model presets, 2.84 GB for the default). Memory of about the file size plus the K/V cache, or less for a mixture-of-experts model on <a href="@/providers/local/expert-tiers.md">tiered expert placement</a>.</dd>
 <dt>Read this if</dt>
 <dd>You are routing requests through <code>ProviderEndpoint::Local</code>, or you want a model that needs no external service.</dd>
 </dl>
 
-This is the only provider without an HTTP endpoint. `LocalModel::load` resolves the GGUF file, loads the weights, the tokenizer and the chat template, and starts one engine thread. `CucaClientBuilder::with_local_model` attaches the model to a client built for `ProviderEndpoint::Local`. The engine code is pure Rust: no llama.cpp and no FFI written by cuca.
+`LocalModel::load` resolves the GGUF file, loads the weights, the tokenizer and the chat template, and starts one engine thread. `CucaClientBuilder::with_local_model` attaches the model to a client built for `ProviderEndpoint::Local`. The engine is pure Rust: no llama.cpp and no FFI written by cuca.
 
 ## Endpoint
 
@@ -36,22 +36,23 @@ Each GPU feature enables `provider-local` and `provider-local-gpu`, the shared G
 
 ## Authentication
 
-There is no API key and no auth header. The one credential is the optional Hugging Face token (`hf_token`, else `HF_TOKEN`), sent as a bearer token on the model download. The pinned preset files download anonymously.
+There is no API key and no auth header. The one credential is the optional Hugging Face token (`hf_token`, else `HF_TOKEN`), sent as a bearer token on downloads. The pinned preset files download anonymously.
 
 ## Entry points
 
 - `LocalModel::load(LocalModelConfig)` is async. It resolves or downloads the file, loads it and starts the thread named `cuca-local-engine`. The download, the hashing and the weight parsing run on that thread, so the call never blocks the async runtime.
 - `CucaClientBuilder::with_local_model(LocalModel)` attaches the model. `CucaClient::local_model()` returns `Option<&LocalModel>`.
-- `LocalModel` is cheap to clone. Every clone and every client built from a clone shares the one engine thread, which ends when the last clone is dropped.
-- `LocalModel::kv_cache_bytes()` returns the K/V cache size in bytes. `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`. `LocalModel::draft_stats()` returns the drafter counters. `LocalModel::serving_stats()` returns the scheduler counters (`ServingStats`: running and waiting requests, free and cached blocks, prefix hits, preemptions, rows per step).
-- `LocalModel::expert_tier_stats()` and `LocalModel::expert_heat()` return the expert cache counters and the learned heat, `None` unless `LocalModelConfig::experts` is `ExpertPlacement::Tiered`.
-- `ModelSource::PRESETS`, `ModelSource::preset(name)`, `ModelSource::default_model()` and `ModelSource::hugging_face(repo, revision, file)` describe model sources. `ModelSource` and `LocalDevice` also implement `FromStr`.
+- `LocalModel` is cheap to clone. Every clone, and every client built from a clone, shares the one engine thread, which ends when the last clone is dropped.
+- `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`. `LocalModel::sampling()` returns the resolved sampling defaults.
+- `LocalModel::kv_cache_bytes()` returns the K/V block pool size in bytes. `LocalModel::serving_stats()` returns the scheduler counters (`ServingStats`).
+- `LocalModel::draft_stats()` returns the drafter counters. `LocalModel::expert_tier_stats()` and `LocalModel::expert_heat()` return the expert cache counters and the learned heat, `None` unless `LocalModelConfig::experts` is `ExpertPlacement::Tiered`. `LocalModel::layer_split()` returns `(layers on the GPU, layers in all)` under `gpu_layers`, else `None`.
+- `ModelSource::PRESETS`, `ModelSource::preset(name)`, `ModelSource::default_model()` and `ModelSource::hugging_face(repo, revision, file)` describe model sources. `ModelSource`, `LocalDevice`, `ExpertPlacement`, `BatchingConfig` and `WeightQuant` implement `FromStr`.
 
 <div class="dgm">
 <div class="dgm-scroll">
 <svg viewBox="0 0 660 124" role="img" aria-labelledby="loc-title loc-desc">
   <title id="loc-title">One request through the in-process engine</title>
-  <desc id="loc-desc">Five stages, left to right. CucaClient::generate_stream receives the UnifiedRequest. The chat template and the tokenizer turn it into prompt token ids. The job queue holds up to 16 waiting requests. The engine thread runs up to four requests at once, each step one forward pass over all of them: prefix reuse, prefill chunks and decode rows. A channel of up to 64 blocks carries Text, Thinking and ToolCall blocks back to the stream. Dropping the stream stops generation, and a full queue makes generate_stream wait.</desc>
+  <desc id="loc-desc">Five stages, left to right. CucaClient::generate_stream receives the UnifiedRequest. The chat template and the tokenizer turn it into prompt token ids. The job queue holds up to 16 waiting requests. The engine thread runs up to max_sequences requests at once, 4 by default, each step one forward pass over all of them: prefix reuse, prefill chunks and decode rows. A channel of up to 64 blocks carries Text, Thinking and ToolCall blocks back to the stream. Dropping the stream stops generation, and a full queue makes generate_stream wait.</desc>
   <defs>
     <marker id="loc-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -81,7 +82,7 @@ There is no API key and no auth header. The one credential is the optional Huggi
   <text class="t-ax" x="6" y="114">dropping the stream stops generation; a full queue makes generate_stream wait</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>One thread runs several requests in one forward pass per step.</b> Requests start in arrival order, up to `max_sequences` at once; a slow consumer stalls only its own request, through the bounded channel.</p>
+<p class="dgm-cap"><b>One thread runs several requests in one forward pass per step.</b> Up to <code>max_sequences</code> requests run at once. A slow consumer stalls only its own request, through the bounded channel.</p>
 </div>
 
 ## Example
@@ -129,7 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The reply depends on the model and the sampling seed. `examples/local_model.rs` is the runnable version: it prints download progress on stderr, prints `Thinking` blocks, and prints `loaded on <device>`. It reads the variables listed under [Environment variables](@/providers/local/configuration.md#environment-variables).
+The reply depends on the model and the sampling seed. `examples/local_model.rs` is the runnable version: it prints download progress on stderr, `Thinking` blocks as they arrive, and `loaded on <device>`. It reads the variables listed under [Environment variables](@/providers/local/configuration.md#environment-variables).
 
 candle selects its quantized SIMD kernels when it compiles, so build for the host CPU. A generic build is several times slower.
 
