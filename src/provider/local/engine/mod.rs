@@ -2097,17 +2097,7 @@ mod tests {
                     expected.metadata.token_usage.map(|u| u.completion_tokens),
                     "k {k}, prompt {prompt:?}"
                 );
-                // An accepted draft that ends the reply is cached with its
-                // round; plain decoding stops at it without forwarding it.
-                assert!(
-                    spec.last_ids.starts_with(&plain.last_ids)
-                        && spec.last_ids[plain.last_ids.len()..]
-                            .iter()
-                            .all(|&id| spec.format.is_eog(id)),
-                    "k {k}, prompt {prompt:?}: {:?} vs {:?}",
-                    spec.last_ids,
-                    plain.last_ids
-                );
+                assert_eq!(spec.last_ids, plain.last_ids, "k {k}, prompt {prompt:?}");
                 assert_eq!(
                     eagle_len(&spec),
                     spec.last_ids.len() - 1,
@@ -2395,10 +2385,7 @@ mod tests {
                         expected.metadata.token_usage.map(|u| u.completion_tokens),
                         "{what}"
                     );
-                    // A draft that ends the reply (an end-of-turn id) is
-                    // cached too when accepted; plain decoding never forwards
-                    // it.
-                    assert!(spec.last_ids.starts_with(&plain.last_ids), "{what}");
+                    assert_eq!(spec.last_ids, plain.last_ids, "{what}");
                     assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "{what}");
                     let stats = spec.stats.snapshot();
                     assert!(stats.drafted <= stats.rounds * (block as u64 - 1), "{what}");

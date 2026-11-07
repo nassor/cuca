@@ -1253,6 +1253,19 @@ impl Engine {
             stats.accepted.fetch_add(accepted as u64, Ordering::Relaxed);
         }
 
+        // A draft that ends the reply is not cached: plain decoding samples
+        // that id and stops without forwarding it, so the cached ids and the
+        // published prefix blocks must end before it. The accepted draft
+        // stays the next token (forced, so the sampling distribution is
+        // untouched) and the next round ends the reply with it.
+        if let Some(end) = drafts[..accepted]
+            .iter()
+            .position(|&d| self.format.is_eog(d))
+        {
+            accepted = end;
+            seq.forced = Some(drafts[end]);
+        }
+
         // Cache the pending token and the accepted drafts; the state for the
         // next round is the verified row after the last of them. The rows of
         // the rejected drafts leave with their tail blocks.
