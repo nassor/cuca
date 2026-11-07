@@ -495,8 +495,7 @@ const PRESET_TABLE: [ModelPreset; 24] = [
         "qwen35moe",
     ),
     // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers and a Q4_1
-    // `ffn_down` in 6 (those run on candle's kernels, not the row-batched
-    // ones). It embeds the earlier Muse chat template, which renders the same
+    // `ffn_down` in 6 (all served by the row-batched kernels). It embeds the earlier Muse chat template, which renders the same
     // bytes as the current one except when the caller's system prompt itself
     // mentions "Reasoning effort": the current template rewrites that to
     // "Reasoning strength", this one appends a second directive.

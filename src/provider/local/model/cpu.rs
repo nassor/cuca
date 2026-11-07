@@ -78,7 +78,8 @@ impl Drop for RowExact {
 /// A matmul weight: candle's, or the row-batched kernel's.
 enum Weight {
     Candle(CandleMatMul),
-    /// A Q4_0 or Q8_0 weight read once for all activation rows (see [`qmm`]).
+    /// A Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 or K-quant weight read once for all
+    /// activation rows (see [`qmm`]).
     RowBatched(QmmWeight),
 }
 
@@ -459,9 +460,9 @@ impl Loader<'_> {
                 .and_then(|t| QTensor::quantize(&t, GgmlDType::Q8_0))
                 .and_then(|q| QMatMul::from_arc_row_batched(Arc::new(q)))
         } else {
-            // Q4_0 and Q8_0 go through the row-batched kernel (every row
-            // independent of its batch, each weight read once per pass);
-            // everything else through candle.
+            // Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants go through the
+            // row-batched kernel (every row independent of its batch, each
+            // weight read once per pass); everything else through candle.
             QMatMul::from_arc_row_batched(qt)
         };
         matmul.map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
@@ -3314,6 +3315,99 @@ mod tests {
         );
     }
 
+    /// A dense hybrid model whose FFN down projections are K-quants.
+    pub(super) fn mixed_dense() -> TinyQwen35 {
+        TinyQwen35 {
+            ff: 256,
+            mixed: true,
+            ..TinyQwen35::default()
+        }
+    }
+
+    /// A hybrid MoE model whose experts and shared experts hold K-quant down
+    /// projections (and every other dtype the row-batched kernel serves).
+    pub(super) fn mixed_moe() -> TinyQwen35 {
+        TinyQwen35 {
+            moe: Some(TinyMoe {
+                n_expert: 8,
+                n_used: 2,
+                ff: 256,
+                shared_ff: 256,
+            }),
+            mixed: true,
+            ..TinyQwen35::default()
+        }
+    }
+
+    /// A Llama whose FFN down projections are K-quants.
+    fn mixed_llama() -> TinySpec {
+        TinySpec {
+            ff: 256,
+            mixed: true,
+            ..TinySpec::llama()
+        }
+    }
+
+    /// The dtypes of the weights in a tiny GGUF.
+    fn file_dtypes(model: &super::super::tiny::TinyModel) -> std::collections::BTreeSet<String> {
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        content
+            .tensor_infos
+            .iter()
+            .filter(|(name, _)| name.ends_with(".weight"))
+            .map(|(_, info)| format!("{:?}", info.ggml_dtype))
+            .collect()
+    }
+
+    /// The mixed models really mix: every dtype the row-batched kernel serves
+    /// is in one of them, and every one loads and runs a pass.
+    #[test]
+    fn mixed_dtype_models_hold_every_kernel_dtype() {
+        let mut seen = std::collections::BTreeSet::new();
+        for model in [
+            write_spec(&mixed_llama()),
+            write_qwen35(&mixed_dense()),
+            write_qwen35(&mixed_moe()),
+        ] {
+            seen.extend(file_dtypes(&model));
+            // Loads, and a pass runs.
+            let mut m = load(&model, 32);
+            let f = m.forward_ext(&PROMPT, 0, Want::Last, Hidden::None, true);
+            assert!(f.unwrap().logits.unwrap().iter().all(|v| v.is_finite()));
+        }
+        for dtype in [
+            "Q4_0", "Q4_1", "Q5_0", "Q5_1", "Q8_0", "Q2K", "Q3K", "Q4K", "Q5K", "Q6K",
+        ] {
+            assert!(seen.contains(dtype), "{dtype} missing from {seen:?}");
+        }
+    }
+
+    /// Batched rows equal solo rows bit for bit on models mixing every dtype.
+    #[test]
+    fn mixed_dtype_models_batch_like_solo() {
+        check_batched(&write_spec(&mixed_llama()), "mixed llama");
+        check_batched(&write_qwen35(&mixed_dense()), "mixed qwen35");
+        check_batched(&write_qwen35(&mixed_moe()), "mixed qwen35moe");
+    }
+
+    /// Tiered placement of K-quant experts computes the resident logits bit
+    /// for bit.
+    #[test]
+    fn mixed_dtype_tiered_experts_match_resident_bit_for_bit() {
+        let model = write_qwen35(&mixed_moe());
+        let per_index = expert_bytes(&model);
+        let want = greedy_run(&mut load(&model, 32));
+        for experts in [2u64, 5] {
+            let budget = experts * per_index;
+            let mut tiered = load_tiered(&model, budget, None).unwrap();
+            assert_eq!(greedy_run(&mut tiered), want, "{experts} experts");
+            let stats = tiered.expert_tiers().unwrap().stats();
+            assert!(stats.disk_reads > 0, "{stats:?}");
+        }
+    }
+
     #[test]
     fn kv_pool_bytes_follow_the_layout() {
         // At 32 positions every group holds 4 blocks (twice the context in
@@ -3609,6 +3703,7 @@ mod hybrid_tests {
         CONTEXT, Lcg, N_EMBD, PROMPT, Q35_DK, Q35_DV, Q35_HEAD, Q35_N_HEAD, Q35_N_KV,
         Q35_ROPE_DIMS, TinyModel, TinyQwen35, TinySpec, VOCAB, load, write_qwen35, write_spec,
     };
+    use super::tests::{mixed_dense, mixed_moe};
     use super::*;
 
     pub(super) fn content_of(model: &TinyModel) -> gguf_file::Content {
@@ -3947,8 +4042,13 @@ mod hybrid_tests {
     /// bit for bit.
     #[test]
     fn prefill_in_any_chunking_equals_token_by_token_bit_for_bit() {
-        let model = write_qwen35(&TinyQwen35::default());
-        let mut stepped = load(&model, CONTEXT);
+        for spec in [TinyQwen35::default(), mixed_dense(), mixed_moe()] {
+            chunking_equals_token_by_token(&write_qwen35(&spec));
+        }
+    }
+
+    fn chunking_equals_token_by_token(model: &super::super::tiny::TinyModel) {
+        let mut stepped = load(model, CONTEXT);
         let mut rows: Vec<Vec<f32>> = Vec::new();
         let mut hidden: Vec<Vec<f32>> = Vec::new();
         for (i, t) in PROMPT.iter().enumerate() {
@@ -3967,7 +4067,7 @@ mod hybrid_tests {
             vec![10, 1],
             vec![3, 3, 3, 2],
         ] {
-            let mut m = load(&model, CONTEXT);
+            let mut m = load(model, CONTEXT);
             let (mut at, mut got, mut got_hidden) = (0, Vec::new(), Vec::new());
             for n in &chunks {
                 let f = m
@@ -3983,7 +4083,7 @@ mod hybrid_tests {
         }
 
         // Only the last row requested (what prefill does).
-        let mut last = load(&model, CONTEXT);
+        let mut last = load(model, CONTEXT);
         feed(&mut last, &PROMPT[..6], 0);
         assert_eq!(step(&mut last, &PROMPT[6..], 6, Want::Last), rows[10]);
     }

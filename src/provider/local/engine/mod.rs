@@ -1472,10 +1472,25 @@ mod tests {
 
     /// A tiny hybrid model that loads with a context of 128.
     fn hybrid_model() -> crate::provider::local::model::tiny::TinyModel {
+        hybrid(TinyQwen35::default())
+    }
+
+    /// `base` with a context of 128.
+    fn hybrid(base: TinyQwen35) -> crate::provider::local::model::tiny::TinyModel {
         write_qwen35(&TinyQwen35 {
             meta: vec![("context_length".into(), gguf_file::Value::U32(128))],
-            ..TinyQwen35::default()
+            ..base
         })
+    }
+
+    /// A hybrid model mixing every weight dtype of the row-batched kernel,
+    /// K-quant FFN down projections (trunk and head) included.
+    fn mixed_qwen35() -> TinyQwen35 {
+        TinyQwen35 {
+            ff: 256,
+            mixed: true,
+            ..TinyQwen35::default()
+        }
     }
 
     #[test]
@@ -1596,7 +1611,18 @@ mod tests {
     /// trunk rejects; and the head stays one pair behind the trunk's cache.
     #[test]
     fn in_trunk_head_leaves_greedy_output_unchanged() {
-        let model = write_qwen35(&TinyQwen35::default());
+        in_trunk_head_is_exact(&write_qwen35(&TinyQwen35::default()), true);
+        // The mixed-dtype model's head is random noise that never agrees with
+        // the trunk: every draft is verified in a batched pass and rolled
+        // back, and the output is still the plain output.
+        in_trunk_head_is_exact(&write_qwen35(&mixed_qwen35()), false);
+    }
+
+    /// `accepts`: some drafts must be accepted and rolled forward.
+    fn in_trunk_head_is_exact(
+        model: &crate::provider::local::model::tiny::TinyModel,
+        accepts: bool,
+    ) {
         let prompts: [&[u32]; 5] = [
             &PROMPT,
             &[2, 9, 9, 9, 10],
@@ -1607,8 +1633,8 @@ mod tests {
         let (mut drafted, mut accepted) = (0, 0);
         for k in [1usize, 2, 4, 8] {
             for prompt in prompts {
-                let mut plain = engine(&model, 32, 0.0, None);
-                let mut spec = engine_in_trunk(&model, 32, 0.0, None, k);
+                let mut plain = engine(model, 32, 0.0, None);
+                let mut spec = engine_in_trunk(model, 32, 0.0, None, k);
                 let expected = run(&mut plain, prompt, None);
                 let got = run(&mut spec, prompt, None);
                 assert_eq!(text(&got), text(&expected), "k {k}, prompt {prompt:?}");
@@ -1634,7 +1660,9 @@ mod tests {
             }
         }
         assert!(drafted > 0, "the head proposed tokens");
-        assert!(accepted > 0, "some drafts were accepted and rolled forward");
+        if accepts {
+            assert!(accepted > 0, "some drafts were accepted and rolled forward");
+        }
     }
 
     #[test]
@@ -1689,12 +1717,19 @@ mod tests {
     /// replayed rows.
     #[test]
     fn in_trunk_head_warm_prefix_reuse_equals_cold() {
-        let model = hybrid_model();
+        for base in [TinyQwen35::default(), mixed_qwen35()] {
+            in_trunk_head_warm_prefix_reuse_is_exact(&hybrid(base));
+        }
+    }
+
+    fn in_trunk_head_warm_prefix_reuse_is_exact(
+        model: &crate::provider::local::model::tiny::TinyModel,
+    ) {
         let mut first = long_prompt(40);
         first[19] = 3;
         let mut second = first[..30].to_vec();
         second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
-        let mut warm = engine_in_trunk(&model, 128, 0.0, None, 3);
+        let mut warm = engine_in_trunk(model, 128, 0.0, None, 3);
         let a = run(&mut warm, &first, Some(6));
         assert_eq!(usage(&a), (0, 40));
         assert_eq!(head_len(&warm), warm.last_ids.len() - 1);
@@ -1703,11 +1738,11 @@ mod tests {
         let b = run(&mut warm, &second, Some(6));
         assert_eq!(usage(&b), (16, 24));
         let cold = run(
-            &mut engine_in_trunk(&model, 128, 0.0, None, 3),
+            &mut engine_in_trunk(model, 128, 0.0, None, 3),
             &second,
             Some(6),
         );
-        let plain = run(&mut engine(&model, 128, 0.0, None), &second, Some(6));
+        let plain = run(&mut engine(model, 128, 0.0, None), &second, Some(6));
         assert_eq!(text(&b), text(&cold));
         assert_eq!(text(&b), text(&plain));
         assert_eq!(head_len(&warm), warm.last_ids.len() - 1);
@@ -1725,7 +1760,7 @@ mod tests {
         extended.extend([15, 14]);
         let d = run(&mut warm, &extended, Some(4));
         assert_eq!(usage(&d), (16, u32::try_from(extended.len() - 16).unwrap()));
-        let expected = run(&mut engine(&model, 128, 0.0, None), &extended, Some(4));
+        let expected = run(&mut engine(model, 128, 0.0, None), &extended, Some(4));
         assert_eq!(text(&d), text(&expected));
         assert_eq!(head_len(&warm), warm.last_ids.len() - 1);
 
@@ -1734,7 +1769,7 @@ mod tests {
         diverging.extend([15, 14, 13, 12, 11, 10, 9, 15, 14, 13, 12, 11]);
         let e = run(&mut warm, &diverging, Some(5));
         assert_eq!(usage(&e), (16, 14));
-        let expected = run(&mut engine(&model, 128, 0.0, None), &diverging, Some(5));
+        let expected = run(&mut engine(model, 128, 0.0, None), &diverging, Some(5));
         assert_eq!(text(&e), text(&expected));
         assert_eq!(head_len(&warm), warm.last_ids.len() - 1);
     }

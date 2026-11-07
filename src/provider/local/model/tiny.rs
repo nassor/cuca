@@ -75,6 +75,43 @@ fn quantize(values: Vec<f32>, dims: &[usize], dtype: GgmlDType) -> QTensor {
     QTensor::quantize(&t, dtype).unwrap()
 }
 
+/// Requantise every Q4_0 or Q8_0 `.weight` tensor through a rotation of the
+/// dtypes the row-batched kernel serves: the legacy formats where the rows
+/// are whole 32-element blocks, the K-quants where they are whole 256-element
+/// ones. A model written this way mixes dtypes the way a K-quant GGUF does.
+pub(crate) fn mix_dtypes(tensors: &mut [(String, QTensor)]) {
+    const LEGACY: [GgmlDType; 5] = [
+        GgmlDType::Q4_0,
+        GgmlDType::Q4_1,
+        GgmlDType::Q5_0,
+        GgmlDType::Q5_1,
+        GgmlDType::Q8_0,
+    ];
+    const KQUANT: [GgmlDType; 5] = [
+        GgmlDType::Q2K,
+        GgmlDType::Q3K,
+        GgmlDType::Q4K,
+        GgmlDType::Q5K,
+        GgmlDType::Q6K,
+    ];
+    let (mut legacy, mut kquant) = (0, 0);
+    for (name, qt) in tensors.iter_mut() {
+        if !name.ends_with(".weight") || !matches!(qt.dtype(), GgmlDType::Q4_0 | GgmlDType::Q8_0) {
+            continue;
+        }
+        let inner = qt.shape().dims().last().copied().unwrap_or(0);
+        let (table, n) = if inner % 256 == 0 {
+            (&KQUANT, &mut kquant)
+        } else {
+            (&LEGACY, &mut legacy)
+        };
+        let dtype = table[*n % table.len()];
+        *n += 1;
+        let values = qt.dequantize(&Device::Cpu).unwrap();
+        *qt = QTensor::quantize(&values, dtype).unwrap();
+    }
+}
+
 fn quantized(rng: &mut Lcg, dims: &[usize], dtype: GgmlDType, scale: f32) -> QTensor {
     quantize(rng.values(dims.iter().product(), scale), dims, dtype)
 }
@@ -282,6 +319,9 @@ pub(crate) struct TinySpec {
     pub(crate) rope_long_short: Option<(Vec<f32>, Vec<f32>)>,
     /// `context_length` metadata: the most positions the model loads with.
     pub(crate) context: usize,
+    /// Mix the weight dtypes ([`mix_dtypes`]); give `ff` a multiple of 256 so
+    /// the FFN down projections are K-quants.
+    pub(crate) mixed: bool,
 }
 
 impl TinySpec {
@@ -310,6 +350,7 @@ impl TinySpec {
             rope_freqs: None,
             rope_long_short: None,
             context: CONTEXT,
+            mixed: false,
         }
     }
 
@@ -673,6 +714,9 @@ pub(crate) fn write_spec(s: &TinySpec) -> TinyModel {
     for (key, value) in &s.meta {
         meta.push(kv(&format!("{p}.{key}"), value.clone()));
     }
+    if s.mixed {
+        mix_dtypes(&mut tensors);
+    }
     write(&path, &meta, &tensors);
     TinyModel { path }
 }
@@ -757,6 +801,11 @@ pub(crate) struct TinyQwen35 {
     /// `Some`: the FFN of every block is a mixture of experts plus a shared
     /// expert, and the architecture is `qwen35moe`.
     pub(crate) moe: Option<TinyMoe>,
+    /// Width of the dense FFN ([`Q35_FF`] by default).
+    pub(crate) ff: usize,
+    /// Mix the weight dtypes ([`mix_dtypes`]); give the experts a width that
+    /// is a multiple of 256 so the down projections are K-quants.
+    pub(crate) mixed: bool,
 }
 
 impl Default for TinyQwen35 {
@@ -771,6 +820,8 @@ impl Default for TinyQwen35 {
             dtype: GgmlDType::Q8_0,
             meta: Vec::new(),
             moe: None,
+            ff: Q35_FF,
+            mixed: false,
         }
     }
 }
@@ -903,15 +954,9 @@ pub(crate) fn write_qwen35(s: &TinyQwen35) -> TinyModel {
                 quantized(&mut rng, &[N_EMBD], GgmlDType::F32, 0.8),
             );
         } else {
-            add(
-                b("ffn_gate"),
-                quantized(&mut rng, &[Q35_FF, N_EMBD], dt, 0.3),
-            );
-            add(b("ffn_up"), quantized(&mut rng, &[Q35_FF, N_EMBD], dt, 0.3));
-            add(
-                b("ffn_down"),
-                quantized(&mut rng, &[N_EMBD, Q35_FF], dt, 0.3),
-            );
+            add(b("ffn_gate"), quantized(&mut rng, &[s.ff, N_EMBD], dt, 0.3));
+            add(b("ffn_up"), quantized(&mut rng, &[s.ff, N_EMBD], dt, 0.3));
+            add(b("ffn_down"), quantized(&mut rng, &[N_EMBD, s.ff], dt, 0.3));
         }
         if il >= s.trunk_layers {
             add(
@@ -932,7 +977,7 @@ pub(crate) fn write_qwen35(s: &TinyQwen35) -> TinyModel {
         ),
         kv(&format!("{p}.context_length"), u(CONTEXT)),
         kv(&format!("{p}.embedding_length"), u(N_EMBD)),
-        kv(&format!("{p}.feed_forward_length"), u(Q35_FF)),
+        kv(&format!("{p}.feed_forward_length"), u(s.ff)),
         kv(&format!("{p}.attention.head_count"), u(Q35_N_HEAD)),
         kv(&format!("{p}.attention.head_count_kv"), u(Q35_N_KV)),
         kv(&format!("{p}.attention.key_length"), u(Q35_HEAD)),
@@ -970,6 +1015,9 @@ pub(crate) fn write_qwen35(s: &TinyQwen35) -> TinyModel {
             Some(entry) => entry.1 = value.clone(),
             None => meta.push((full, value.clone())),
         }
+    }
+    if s.mixed {
+        mix_dtypes(&mut tensors);
     }
     write(&path, &meta, &tensors);
     TinyModel { path }
