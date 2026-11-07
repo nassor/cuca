@@ -9,7 +9,7 @@
 //! [`arch`](super::arch) table runs through it: separate or fused
 //! `attn_qkv`, Q/K/V/O biases, QK-norm, post-norms, sliding windows,
 //! adjacent-pair (`NORM`) and half-split (`NEOX`) RoPE with partial rotary
-//! dimensions and NoPE layers, a score scale and optional tanh soft-cap,
+//! dimensions and NoPE layers, a score scale,
 //! dense gated FFNs (fused or separate gate/up, SiLU or GELU) and top-k
 //! mixtures of experts, embedding / residual / logit scales, a final logit
 //! soft-cap, tied or separate output head, and the Gemma 4 extras (shared
