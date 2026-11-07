@@ -5118,7 +5118,7 @@ mod tests {
     use super::super::paged::{KvPools, SeqBlocks};
     use super::super::split::SplitModel;
     use super::super::tiny::{
-        PROMPT, TinyMistral4, TinyModel, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB,
+        Lcg, PROMPT, TinyMistral4, TinyModel, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB,
         write_mistral4, write_qwen35, write_spec, write_tiny_model_with,
     };
     use super::super::{SeqRows, StateSlot};
@@ -6082,17 +6082,6 @@ mod tests {
         compare(&mut cpu, &mut gpu, &tokens[..40], 0, Want::Last, "refilled");
     }
 
-    /// A reproducible stream of values in `[-1, 1)`.
-    fn lcg(seed: u64) -> impl FnMut() -> f32 {
-        let mut state = seed;
-        move || {
-            state = state
-                .wrapping_mul(6_364_136_223_846_793_005)
-                .wrapping_add(1_442_695_040_888_963_407);
-            (state >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
-        }
-    }
-
     /// One decode-kernel call: the query row `q` (`n_head * d` values) over
     /// the positions `lo..hi` of the sequence whose block table is `table`,
     /// launched the way a pass launches it (the table from the first block
@@ -6130,14 +6119,14 @@ mod tests {
             return;
         };
         let device = open_device(device).unwrap();
-        let mut rand = lcg(7);
+        let mut rand = Lcg(7);
         let n_blocks = 12;
         // Blocks of the sequence, in no particular order.
         let scrambled: [u32; 6] = [7, 2, 11, 0, 9, 4];
         for (nh, nkv, d) in [(4usize, 2usize, 16usize), (6, 2, 8), (2, 2, 32)] {
             let pool_len = n_blocks * nkv * BLOCK_SIZE * d;
-            let host_k: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
-            let host_v: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+            let host_k = rand.values(pool_len, 1.0);
+            let host_v = rand.values(pool_len, 1.0);
             let shape = [n_blocks, nkv, BLOCK_SIZE, d];
             let pool_k = Tensor::<4>::from_data(TensorData::new(host_k.clone(), shape), &device);
             let pool_v = Tensor::<4>::from_data(TensorData::new(host_v.clone(), shape), &device);
@@ -6154,7 +6143,7 @@ mod tests {
                     // Blocks before the range may be released.
                     let mut table = scrambled.to_vec();
                     table[..lo / BLOCK_SIZE].fill(NO_BLOCK);
-                    let q: Vec<f32> = (0..nh * d).map(|_| 4.0 * rand()).collect();
+                    let q = rand.values(nh * d, 4.0);
                     let want = attend_paged_row(
                         &q,
                         &table,
@@ -6209,12 +6198,12 @@ mod tests {
             return;
         };
         let device = open_device(device).unwrap();
-        let mut rand = lcg(13);
+        let mut rand = Lcg(13);
         let n_blocks = 12;
         let scrambled: [u32; 6] = [7, 2, 11, 0, 9, 4];
         for (nh, width, v_width) in [(4usize, 24usize, 16usize), (32, 320, 256)] {
             let pool_len = n_blocks * BLOCK_SIZE * width;
-            let host: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+            let host = rand.values(pool_len, 1.0);
             let shape = [n_blocks, 1, BLOCK_SIZE, width];
             let pool = Tensor::<4>::from_data(TensorData::new(host.clone(), shape), &device);
             let scale = 1.0 / (width as f32).sqrt();
@@ -6226,7 +6215,7 @@ mod tests {
                 for lo in los {
                     let mut table = scrambled.to_vec();
                     table[..lo / BLOCK_SIZE].fill(NO_BLOCK);
-                    let q: Vec<f32> = (0..nh * width).map(|_| 4.0 * rand()).collect();
+                    let q = rand.values(nh * width, 4.0);
                     let want = attend_latent_rows(
                         &q,
                         1,
@@ -6277,12 +6266,12 @@ mod tests {
             return;
         };
         let device = open_device(device).unwrap();
-        let mut rand = lcg(11);
+        let mut rand = Lcg(11);
         let (nh, nkv, d, n_blocks) = (4usize, 2usize, 16usize, 12usize);
         let pool_len = n_blocks * nkv * BLOCK_SIZE * d;
         let shape = [n_blocks, nkv, BLOCK_SIZE, d];
-        let host_k: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
-        let host_v: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+        let host_k = rand.values(pool_len, 1.0);
+        let host_v = rand.values(pool_len, 1.0);
         let pool_k = Tensor::<4>::from_data(TensorData::new(host_k, shape), &device);
         let pool_v = Tensor::<4>::from_data(TensorData::new(host_v, shape), &device);
         let table: Vec<u32> = vec![7, 2, 11, 0, 9, 4];
@@ -6290,7 +6279,7 @@ mod tests {
         // Twenty rows from the middle of the second block into the third.
         let (start, t) = (21usize, 20usize);
         let hi = start + t;
-        let q: Vec<f32> = (0..nh * t * d).map(|_| 4.0 * rand()).collect();
+        let q = rand.values(nh * t * d, 4.0);
         for window in [None, Some(8usize)] {
             let lo = window.map_or(0, |w| start.saturating_sub(w - 1));
             let rows = BlockRows {
