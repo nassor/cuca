@@ -85,8 +85,8 @@ impl Drop for RowExact {
 /// A matmul weight: candle's, or the row-batched kernel's.
 enum Weight {
     Candle(CandleMatMul),
-    /// A Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 or K-quant weight read once for all
-    /// activation rows (see [`qmm`]).
+    /// A Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0 weight read once for all activation
+    /// rows (see [`qmm`]).
     RowBatched(QmmWeight),
 }
 
@@ -467,6 +467,11 @@ struct RopeTable {
 /// prediction head's own (see [`head`]); the trunk's is paged.
 type KvPair = (Tensor, Tensor);
 
+/// What [`Transformer::trunk`] returns: the residual stream after the last
+/// layer, Gemma 4's per-layer inputs, and per sequence the rows
+/// [`Hidden::Layers`] captured.
+type TrunkOut = (Tensor, Option<Tensor>, Vec<Vec<Vec<f32>>>);
+
 /// The K and V data of one K/V-owning layer: `[n_blocks][n_kv_head]
 /// [BLOCK_SIZE][head_dim]` floats each, indexed by the block ids of the
 /// layer's group.
@@ -560,9 +565,10 @@ impl Loader<'_> {
                 .and_then(|t| QTensor::quantize(&t, GgmlDType::Q8_0))
                 .and_then(|q| QMatMul::from_arc_row_batched(Arc::new(q)))
         } else {
-            // Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants go through the
-            // row-batched kernel (every row independent of its batch, each
-            // weight read once per pass); everything else through candle.
+            // Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 go through the row-batched
+            // kernel (every row independent of its batch, each weight read
+            // once per pass); everything else, the K-quants included,
+            // through candle's per-row kernel (also row independent).
             QMatMul::from_arc_row_batched(qt)
         };
         matmul.map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
@@ -1404,7 +1410,7 @@ impl Transformer {
     #[cfg(feature = "provider-local-gpu")]
     pub(crate) fn forward_front(&mut self, batch: &Batch<'_>) -> Result<FrontOut, CucaError> {
         self.run_batch(batch, |m, embeddings, per_layer, segs| {
-            let (x, ple) = m.trunk(embeddings, per_layer, segs)?;
+            let (x, ple, _) = m.trunk(embeddings, per_layer, segs)?;
             // The rows the pass just cached for the layers on the GPU that
             // read the K/V of a layer here.
             let mut kv = Vec::with_capacity(m.export.len());
@@ -1797,13 +1803,15 @@ impl Transformer {
 
     /// The concatenated rows `embeddings` of the sequences `segs` describe
     /// through every layer this model holds: the residual stream `(1, t,
-    /// n_embd)` after them and Gemma 4's per-layer inputs.
+    /// n_embd)` after them, Gemma 4's per-layer inputs and, per sequence, the
+    /// rows [`Hidden::Layers`] asked for (one `t * n_embd` vector per
+    /// captured layer).
     fn trunk(
         &self,
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
         segs: &[Seg<'_>],
-    ) -> candle_core::Result<(Tensor, Option<Tensor>)> {
+    ) -> candle_core::Result<TrunkOut> {
         let hp = &self.hp;
         let dev = &Device::Cpu;
         let eps = hp.eps as f32;
@@ -1844,7 +1852,7 @@ impl Transformer {
                 }
             }
         }
-        Ok((x, ple))
+        Ok((x, ple, captured))
     }
 
     /// The layers over the concatenated rows `embeddings` of the sequences
@@ -1858,7 +1866,7 @@ impl Transformer {
     ) -> candle_core::Result<Vec<Forward>> {
         let hp = &self.hp;
         let eps = hp.eps as f32;
-        let (x, _) = self.trunk(embeddings, per_layer, segs)?;
+        let (x, _, captured) = self.trunk(embeddings, per_layer, segs)?;
 
         // The final norm runs over every row of a sequence that wants all
         // logits or every position's hidden row, else over its last row
@@ -3671,7 +3679,8 @@ mod tests {
         );
     }
 
-    /// A dense hybrid model whose FFN down projections are K-quants.
+    /// A dense hybrid model whose FFN down projections are K-quants (served
+    /// by candle's per-row kernel next to the row-batched legacy dtypes).
     pub(super) fn mixed_dense() -> TinyQwen35 {
         TinyQwen35 {
             ff: 256,
@@ -3681,7 +3690,8 @@ mod tests {
     }
 
     /// A hybrid MoE model whose experts and shared experts hold K-quant down
-    /// projections (and every other dtype the row-batched kernel serves).
+    /// projections (candle's kernel) and every dtype the row-batched kernel
+    /// serves.
     pub(super) fn mixed_moe() -> TinyQwen35 {
         TinyQwen35 {
             moe: Some(TinyMoe {
@@ -3718,7 +3728,8 @@ mod tests {
     }
 
     /// The mixed models really mix: every dtype the row-batched kernel serves
-    /// is in one of them, and every one loads and runs a pass.
+    /// and every K-quant (candle's kernel) is in one of them, and every one
+    /// loads and runs a pass.
     #[test]
     fn mixed_dtype_models_hold_every_kernel_dtype() {
         let mut seen = std::collections::BTreeSet::new();
@@ -3748,8 +3759,8 @@ mod tests {
         check_batched(&write_qwen35(&mixed_moe()), "mixed qwen35moe");
     }
 
-    /// Tiered placement of K-quant experts computes the resident logits bit
-    /// for bit.
+    /// Tiered placement of experts of every dtype, K-quants included,
+    /// computes the resident logits bit for bit.
     #[test]
     fn mixed_dtype_tiered_experts_match_resident_bit_for_bit() {
         let model = write_qwen35(&mixed_moe());

@@ -1011,7 +1011,12 @@ mod tests {
     #[test]
     fn real_shapes_are_row_exact() {
         for dtype in DTYPES {
-            for (n, k) in [(4104usize, 4096usize), (2056, 2048), (4096, 2048), (1030, 4096)] {
+            for (n, k) in [
+                (4104usize, 4096usize),
+                (2056, 2048),
+                (4096, 2048),
+                (1030, 4096),
+            ] {
                 assert_eq!(k % QK, 0);
                 let w = weight(n, k, dtype, 3);
                 let q = QmmWeight::new(&w).unwrap();
