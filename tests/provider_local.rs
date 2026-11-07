@@ -1068,10 +1068,19 @@ async fn perf_long_prompt() {
     }
     live_model!(live, _turn);
     let model = &live.model;
-    let mut prompt = String::from("The secret code word is PELICAN. ");
-    prompt.push_str(&"This sentence is filler text. ".repeat(180));
-    prompt.push_str("Now write a numbered list of one hundred different animals.");
+    // `CUCA_LOCAL_PERF_COLD=1` changes the first words of every round's
+    // prompt, so no round hits the prefix cache: `first` is then a real
+    // prefill of the whole prompt (round 0 still includes kernel compilation).
+    let cold = std::env::var_os("CUCA_LOCAL_PERF_COLD").is_some();
     for round in 0..3 {
+        let word = if cold {
+            ["PELICAN", "HERON", "OSPREY"][round]
+        } else {
+            "PELICAN"
+        };
+        let mut prompt = format!("The secret code word is {word}. ");
+        prompt.push_str(&"This sentence is filler text. ".repeat(180));
+        prompt.push_str("Now write a numbered list of one hundred different animals.");
         let client = CucaClient::builder()
             .with_provider(ProviderEndpoint::Local)
             .with_local_model(model.clone())

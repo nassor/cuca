@@ -238,6 +238,32 @@ mod model {
         ))
     }
 
+    /// `CUCA_LOCAL_PROFILE_SPLIT=1`: time the CPU half and the GPU half of
+    /// every single-row (decode) step and print the averages to stderr every
+    /// 32 steps.
+    fn split_profile() -> bool {
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ON.get_or_init(|| std::env::var_os("CUCA_LOCAL_PROFILE_SPLIT").is_some())
+    }
+
+    fn split_profile_add(front: std::time::Duration, back: std::time::Duration, bytes: usize) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SUM: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        SUM[0].fetch_add(front.as_micros() as u64, Ordering::Relaxed);
+        SUM[1].fetch_add(back.as_micros() as u64, Ordering::Relaxed);
+        let n = COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if n.is_multiple_of(32) {
+            let avg = |i: usize| SUM[i].swap(0, Ordering::Relaxed) as f64 / 32.0 / 1000.0;
+            eprintln!(
+                "SPLITPROFILE|per decode step ms: cpu half {:.1} gpu half (upload {} B, layers, head, readback) {:.1}",
+                avg(0),
+                bytes,
+                avg(1)
+            );
+        }
+    }
+
     impl SplitModel {
         /// Load the first `first` layers on the CPU and the rest on `device`.
         ///
@@ -346,19 +372,24 @@ mod model {
             &mut self,
             batch: &Batch<'_>,
         ) -> Result<Vec<Forward>, CucaError> {
+            let started = std::time::Instant::now();
             let out = self.front.forward_front(batch)?;
-            match self
+            let front_done = started.elapsed();
+            let hidden_bytes = out.hidden.len() * 4;
+            let mark = std::time::Instant::now();
+            let result = self
                 .back
-                .forward_back(batch, out.hidden, out.per_layer, &out.kv)
-            {
-                Ok(outs) => Ok(outs),
-                Err(e) => {
-                    for row in &batch.rows {
-                        self.front.reset_slot(row.state.0);
-                    }
-                    Err(e)
+                .forward_back(batch, out.hidden, out.per_layer, &out.kv);
+            if let Err(e) = &result {
+                let _ = e;
+                for row in &batch.rows {
+                    self.front.reset_slot(row.state.0);
                 }
             }
+            if split_profile() && batch.rows.iter().all(|r| r.tokens.len() == 1) {
+                split_profile_add(front_done, mark.elapsed(), hidden_bytes);
+            }
+            result
         }
 
         /// The architecture.

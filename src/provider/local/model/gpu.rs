@@ -1019,21 +1019,16 @@ struct HostPlan {
 }
 
 /// `CUCA_LOCAL_PROFILE_HOST=1`: time the phases of every host-experts layer
-/// (the device's queued work, the readback, the CPU experts, the upload) and
+/// (the readback with the device's queued work, the CPU experts, the upload) and
 /// print their averages to stderr every 288 layer passes.
 fn host_profile() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CUCA_LOCAL_PROFILE_HOST").is_some())
 }
 
-fn host_profile_add(phases: [std::time::Duration; 4]) {
+fn host_profile_add(phases: [std::time::Duration; 3]) {
     use std::sync::atomic::{AtomicU64, Ordering};
-    static SUM: [AtomicU64; 4] = [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-    ];
+    static SUM: [AtomicU64; 3] = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     static COUNT: AtomicU64 = AtomicU64::new(0);
     for (sum, d) in SUM.iter().zip(phases) {
         sum.fetch_add(d.as_micros() as u64, Ordering::Relaxed);
@@ -1042,18 +1037,13 @@ fn host_profile_add(phases: [std::time::Duration; 4]) {
     if n.is_multiple_of(288) {
         let avg = |i: usize| SUM[i].swap(0, Ordering::Relaxed) as f64 / 288.0 / 1000.0;
         eprintln!(
-            "HOSTPROFILE|per layer pass ms: device wait {:.2} readback {:.2} cpu experts {:.2} upload {:.2}",
+            "HOSTPROFILE|per layer pass ms: readback (with the device's queued work) {:.2} cpu experts {:.2} upload {:.2}",
             avg(0),
             avg(1),
-            avg(2),
-            avg(3)
+            avg(2)
         );
     }
 }
-
-/// Whether the tests load host experts dequantized ([`HostPlan::dequantize`]).
-#[cfg(test)]
-static HOST_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl WeightReader<'_> {
     /// Read `len` bytes at `offset` bytes into the data of `tensor_name` into
@@ -1606,6 +1596,18 @@ fn locked<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
+/// What the CPU needs to compute a host-experts layer: the normed rows and the
+/// routing, read back from the device.
+struct HostInput {
+    rows: Vec<f32>,
+    routing: Routing,
+    t: usize,
+    n_embd: usize,
+    act: Act,
+    /// Time the readback took (the device's queued work included).
+    read: std::time::Duration,
+}
+
 /// The experts of one MoE layer, as slots of one `u32` tensor (the *pool*)
 /// that the MoE kernels index.
 enum GpuExpertBank {
@@ -1703,42 +1705,69 @@ impl GpuExpertBank {
                 Ok(mk::sum(scratch, &c))
             }
             Self::Tiered(bank) => bank.run(f, route, call, device),
-            Self::Host { experts, .. } => {
-                // One readback: the layer's normed rows and the routing
-                // (ids, then weights) in one buffer; one upload of the sum.
-                let rows = t * n_embd;
-                let profile = host_profile();
-                let mark = std::time::Instant::now();
-                if profile {
-                    // Separate the device's queued work from the transfer.
-                    let _ = device.sync();
-                }
-                let waited = mark.elapsed();
-                let mark = std::time::Instant::now();
-                let host = read_f32(
-                    Tensor::cat(vec![f.reshape([rows]), route], 0),
-                    "the rows of host experts",
-                )?;
-                let (input, route_host) = host.split_at(rows);
-                let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); c.n_expert];
-                for pair in 0..t * k {
-                    if let Some(picks) = per_expert.get_mut(route_host[pair] as usize) {
-                        picks.push(((pair / k) as u32, route_host[t * k + pair]));
-                    }
-                }
-                let read = mark.elapsed();
-                let mark = std::time::Instant::now();
-                let act = if c.act == 0 { Act::Silu } else { Act::Gelu };
-                let out = experts.forward(input, t, n_embd, &Routing { per_expert }, act)?;
-                let computed = mark.elapsed();
-                let mark = std::time::Instant::now();
-                let up = Tensor::<2>::from_data(TensorData::new(out, [t, n_embd]), device);
-                if profile {
-                    host_profile_add([waited, read, computed, mark.elapsed()]);
-                }
-                Ok(up)
+            Self::Host { .. } => {
+                let input = self.host_fetch(f, route, &call(0, false))?;
+                self.host_finish(input, device)
             }
         }
+    }
+
+    /// Host experts, first half: one readback of the layer's normed rows and
+    /// its routing (ids, then weights) in one buffer. It returns once the
+    /// device has produced them; work queued after this call runs on the
+    /// device while the CPU computes the experts ([`GpuExpertBank::host_finish`]).
+    fn host_fetch(
+        &self,
+        f: Tensor<2>,
+        route: Tensor<1>,
+        c: &MoeCall,
+    ) -> Result<HostInput, CucaError> {
+        let (t, k, n_embd) = (c.tokens, c.n_used, c.slot.down.rows);
+        let rows = t * n_embd;
+        let mark = std::time::Instant::now();
+        let mut host = read_f32(
+            Tensor::cat(vec![f.reshape([rows]), route], 0),
+            "the rows of host experts",
+        )?;
+        let read = mark.elapsed();
+        let route_host = host.split_off(rows);
+        let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); c.n_expert];
+        for pair in 0..t * k {
+            if let Some(picks) = per_expert.get_mut(route_host[pair] as usize) {
+                picks.push(((pair / k) as u32, route_host[t * k + pair]));
+            }
+        }
+        Ok(HostInput {
+            rows: host,
+            routing: Routing { per_expert },
+            t,
+            n_embd,
+            act: if c.act == 0 { Act::Silu } else { Act::Gelu },
+            read,
+        })
+    }
+
+    /// Host experts, second half: the CPU computes the routed experts of
+    /// `input` and the sum goes up in one upload.
+    fn host_finish(&self, input: HostInput, device: &Device) -> Result<Tensor<2>, CucaError> {
+        let Self::Host { experts, .. } = self else {
+            return Err(err("not a host expert bank"));
+        };
+        let mark = std::time::Instant::now();
+        let out = experts.forward(
+            &input.rows,
+            input.t,
+            input.n_embd,
+            &input.routing,
+            input.act,
+        )?;
+        let computed = mark.elapsed();
+        let mark = std::time::Instant::now();
+        let up = Tensor::<2>::from_data(TensorData::new(out, [input.t, input.n_embd]), device);
+        if host_profile() {
+            host_profile_add([input.read, computed, mark.elapsed()]);
+        }
+        Ok(up)
     }
 
     /// Fill the pool of a tiered bank with the hottest experts of `heat`
@@ -2672,6 +2701,7 @@ impl GpuTransformer {
             experts,
             sizing,
             None,
+            false,
         )
     }
 
@@ -2702,6 +2732,32 @@ impl GpuTransformer {
             experts,
             sizing,
             Some(back),
+            false,
+        )
+    }
+
+    /// [`GpuTransformer::load_placed`] with the hosted experts held as f32
+    /// (tests): candle's quantized matmul rounds activations to Q8_0, which
+    /// the device kernels do not, so the exact reference of the host path.
+    #[cfg(test)]
+    pub(crate) fn load_host_exact(
+        content: &gguf_file::Content,
+        path: &Path,
+        context_length: usize,
+        device: LocalDevice,
+        experts: &ExpertPlacement,
+        sizing: &Sizing,
+    ) -> Result<Self, CucaError> {
+        Self::load_part(
+            content,
+            path,
+            context_length,
+            device,
+            &[],
+            experts,
+            sizing,
+            None,
+            true,
         )
     }
 
@@ -2718,6 +2774,7 @@ impl GpuTransformer {
         experts: &ExpertPlacement,
         sizing: &Sizing,
         back: Option<&Back>,
+        host_exact: bool,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         if hp.arch.is_drafter() {
@@ -2745,6 +2802,31 @@ impl GpuTransformer {
         // take no part in the plan of autotune keys.
         shapes.retain(|(tensor, _)| tp::block_part(tensor).is_none_or(|(il, _)| il >= first));
         let dense = plan_dense(&shapes, &[]);
+        if std::env::var_os("CUCA_LOCAL_PROFILE_SPLIT").is_some() {
+            let f32_bytes: usize = shapes
+                .iter()
+                .filter(|(tensor, _)| dense.contains(tensor))
+                .map(|(_, shape)| shape.rows * shape.cols * 4 * shape.copies)
+                .sum();
+            let quant_bytes: usize = shapes
+                .iter()
+                .filter(|(tensor, _)| !dense.contains(tensor))
+                .map(|(_, shape)| shape.total_bytes())
+                .sum();
+            eprintln!(
+                "SPLITPROFILE|from layer {first}: {} of {} weights held as f32 ({:.2} GiB as f32, would be {:.2} GiB quantized), {:.2} GiB quantized",
+                dense.len(),
+                shapes.len(),
+                f32_bytes as f64 / (1u64 << 30) as f64,
+                shapes
+                    .iter()
+                    .filter(|(tensor, _)| dense.contains(tensor))
+                    .map(|(_, shape)| shape.total_bytes())
+                    .sum::<usize>() as f64
+                    / (1u64 << 30) as f64,
+                quant_bytes as f64 / (1u64 << 30) as f64
+            );
+        }
         let host = match experts {
             ExpertPlacement::Host { layers } => {
                 if hp.moe.is_none() {
@@ -2753,16 +2835,12 @@ impl GpuTransformer {
                         hp.arch.name()
                     )));
                 }
-                #[cfg(test)]
-                let dequantize = HOST_EXACT.load(std::sync::atomic::Ordering::Relaxed);
-                #[cfg(not(test))]
-                let dequantize = false;
                 Some(HostPlan {
                     lead: hp.leading_dense,
                     n: layers.unwrap_or(usize::MAX),
                     path: path.to_path_buf(),
                     hp: hp.clone(),
-                    dequantize,
+                    dequantize: host_exact,
                 })
             }
             _ => None,
@@ -5036,22 +5114,37 @@ impl FfnWeights {
                 };
                 let logits = linear(f.clone(), router);
                 let route = mk::route(logits, &call(t * spec.n_used, false), spec.norm_weights);
-                let mut out = experts.run(f.clone(), route, &call, device)?;
-                if let Some(sh) = shared {
-                    // The shared expert, scaled per token by
-                    // `sigmoid(gate_inp . x)`: the dot product is an
-                    // elementwise product and a row sum, not a matmul.
+                // The shared expert, scaled per token by
+                // `sigmoid(gate_inp . x)`: the dot product is an
+                // elementwise product and a row sum, not a matmul.
+                let shared_out = |sh: &GpuShared, f: Tensor<2>| {
                     let hidden =
                         activate(linear(f.clone(), &sh.gate), act) * linear(f.clone(), &sh.up);
                     let y = linear(hidden, &sh.down);
-                    out = out
-                        + match &sh.gate_inp {
-                            Some(gate_inp) => {
-                                y * activation::sigmoid((f * gate_inp.clone()).sum_dim(1))
-                            }
-                            // Ungated: every token takes the whole output.
-                            None => y,
-                        };
+                    match &sh.gate_inp {
+                        Some(gate_inp) => {
+                            y * activation::sigmoid((f * gate_inp.clone()).sum_dim(1))
+                        }
+                        // Ungated: every token takes the whole output.
+                        None => y,
+                    }
+                };
+                if let GpuExpertBank::Host { .. } = experts {
+                    // Host experts: the readback waits for the router only and
+                    // the shared expert is queued right after it. burn submits
+                    // it lazily: forcing a submit with `Device::flush` before
+                    // the CPU experts measured 20% slower decode on Vulkan.
+                    let input = experts.host_fetch(f.clone(), route, &call(0, false))?;
+                    let shared_part = shared.as_ref().map(|sh| shared_out(sh, f));
+                    let routed = experts.host_finish(input, device)?;
+                    return Ok(match shared_part {
+                        Some(part) => routed + part,
+                        None => routed,
+                    });
+                }
+                let mut out = experts.run(f.clone(), route, &call, device)?;
+                if let Some(sh) = shared {
+                    out = out + shared_out(sh, f);
                 }
                 Ok(out)
             }
@@ -6381,21 +6474,29 @@ mod tests {
         for (label, spec) in mistral4_variants() {
             models.push((label.to_string(), write_mistral4(&spec)));
         }
-        // The reference holds the hosted experts as f32: candle's quantized
-        // matmul rounds activations to Q8_0, which the device kernels do not.
-        HOST_EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
+        // The CPU half holds the hosted experts as f32 (see
+        // [`GpuTransformer::load_host_exact`]).
         for (label, model) in &models {
             let want = greedy_run(
                 &mut load_placed_gpu(model, device, &ExpertPlacement::Resident).unwrap(),
             );
+            let content =
+                gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                    .unwrap();
             for layers in [None, Some(1)] {
-                let mut host =
-                    load_placed_gpu(model, device, &ExpertPlacement::Host { layers }).unwrap();
+                let mut host = GpuTransformer::load_host_exact(
+                    &content,
+                    &model.path,
+                    32,
+                    device,
+                    &ExpertPlacement::Host { layers },
+                    &Sizing::single(32),
+                )
+                .unwrap();
                 let got = greedy_run(&mut host);
                 assert_close_logits(&got, &want, &format!("{label} host {layers:?}"));
             }
         }
-        HOST_EXACT.store(false, std::sync::atomic::Ordering::Relaxed);
         let dense = write_spec(&TinySpec::llama());
         let e = load_placed_gpu(&dense, device, &ExpertPlacement::Host { layers: None })
             .err()
