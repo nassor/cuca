@@ -639,14 +639,13 @@ fn added_tokens(ck: &CheckpointDir) -> Vec<(usize, String, bool)> {
 }
 
 /// The checkpoint's `tokenizer.json`. A repository that ships its vocabulary
-/// only as `tekken.json` is named: llama.cpp reads that through
-/// `mistral_common` and a bundled chat template (`_set_vocab_mistral`),
-/// neither of which is ported.
+/// only as `tekken.json` is converted by `tekken.rs` for the Llama family
+/// (llama.cpp's `_set_vocab_mistral`); another architecture is named.
 fn tokenizer_json(ck: &CheckpointDir) -> Result<&Json, CucaError> {
     ck.tokenizer_json.as_ref().ok_or_else(|| {
         if ck.dir.join("tekken.json").is_file() {
             cfg_err(
-                "checkpoint ships its vocabulary only as tekken.json; the converter reads tokenizer.json (add the repository's tokenizer.json, or convert with llama.cpp)",
+                "checkpoint ships its vocabulary only as tekken.json, which the converter reads for the Llama family only (llama.cpp's `_set_vocab_mistral`); this architecture needs the repository's tokenizer.json",
             )
         } else {
             cfg_err("checkpoint has no tokenizer.json")
@@ -1177,6 +1176,11 @@ pub(crate) fn build(
             gpt2(ck, hp)?
         }
         ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite | ConvArch::Mistral3 => {
+            // `LlamaModel.set_vocab`: a directory with `tekken.json` and no
+            // `tokenizer.json` goes through `_set_vocab_mistral`.
+            if ck.tokenizer_json.is_none() && ck.dir.join("tekken.json").is_file() {
+                return Ok(Some(super::tekken::build(&ck.dir, arch.gguf_name())?));
+            }
             let prefix = config_str(ck, "add_prefix_space").and_then(Json::as_bool);
             if ck.tokenizer_model.is_some() {
                 spm_meta(ck, spm_generic(ck, hp)?, prefix)?

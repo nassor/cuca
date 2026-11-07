@@ -12,8 +12,9 @@ use crate::provider::local::DownloadProgressCallback;
 use crate::provider::local::download;
 
 /// Optional files of a checkpoint, fetched when the repository has them.
-const OPTIONAL_FILES: [&str; 7] = [
+const OPTIONAL_FILES: [&str; 8] = [
     "generation_config.json",
+    "tekken.json",
     "tokenizer.json",
     "tokenizer_config.json",
     "tokenizer.model",

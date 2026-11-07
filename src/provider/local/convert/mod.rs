@@ -35,6 +35,7 @@ mod oracle;
 mod oracle_local;
 pub(crate) mod safetensors;
 pub(crate) mod spm;
+pub(crate) mod tekken;
 pub(crate) mod tensors;
 pub(crate) mod vocab;
 
@@ -274,7 +275,14 @@ fn convert_locked(
     let mut kv = meta.kv;
     kv.extend(config::sampling_defaults(ck.generation_config.as_ref()));
     if let Some(v) = vocab {
-        kv.extend(v.kv);
+        // A later write of a key replaces an earlier one (the tekken path
+        // rewrites `<arch>.vocab_size`).
+        for (k, value) in v.kv {
+            match kv.iter_mut().find(|(have, _)| *have == k) {
+                Some(slot) => slot.1 = value,
+                None => kv.push((k, value)),
+            }
+        }
     }
     let names: HashSet<&str> = plans.iter().map(|p| p.name.as_str()).collect();
     // The engine's own reader validates the metadata it will read.
