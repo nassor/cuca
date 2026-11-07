@@ -20,6 +20,9 @@ use crate::provider::local::model::tier::read_exact_at;
 /// Largest header accepted (the format's own convention is 100 MB).
 const MAX_HEADER: u64 = 100_000_000;
 
+/// Bytes read from a shard and decoded at a time (at least one row).
+const READ_PIECE: usize = 1 << 20;
+
 /// A stored element type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StDtype {
@@ -282,6 +285,21 @@ impl Shards {
         n_rows: usize,
         out: &mut Vec<f32>,
     ) -> Result<(), CucaError> {
+        out.clear();
+        self.append_rows(name, first, n_rows, out)
+    }
+
+    /// [`Shards::read_rows`] appending to `out` instead of replacing it.
+    ///
+    /// The file is read and decoded in pieces of about [`READ_PIECE`] bytes,
+    /// so the raw bytes never take more than that, whatever the row count.
+    pub(crate) fn append_rows(
+        &self,
+        name: &str,
+        first: usize,
+        n_rows: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), CucaError> {
         let meta = self.require(name)?;
         let Some(size) = meta.dtype.size() else {
             return Err(CucaError::Config(format!(
@@ -297,45 +315,56 @@ impl Shards {
             )));
         }
         let row_len = meta.row_len();
-        let n = n_rows * row_len;
-        let mut bytes = vec![0u8; n * size];
-        let offset = meta.start + (first * row_len * size) as u64;
-        read_exact_at(&self.files[meta.shard], offset, &mut bytes)
-            .map_err(|e| bad(&self.paths[meta.shard], format!("reading `{name}`: {e}")))?;
-        out.clear();
-        out.reserve(n);
-        match meta.dtype {
-            StDtype::F32 => out.extend(
-                bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|b| f32::from_le_bytes(*b)),
-            ),
-            StDtype::F16 => out.extend(
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| half::f16::from_le_bytes(*b).to_f32()),
-            ),
-            StDtype::Bf16 => out.extend(
-                bytes
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| half::bf16::from_le_bytes(*b).to_f32()),
-            ),
-            StDtype::F8E4m3 => {
-                let scales = self.fp8_scales(name, meta)?;
-                // Rows covered by one scale entry.
-                let per_scale = meta.rows() / scales.len();
-                for (i, row) in bytes.chunks_exact(row_len).enumerate() {
-                    let scale = scales[(first + i) / per_scale];
-                    out.extend(row.iter().map(|b| E4M3[usize::from(*b)] * scale));
+        if n_rows == 0 || row_len == 0 {
+            return Ok(());
+        }
+        let row_bytes = row_len * size;
+        let piece_rows = (READ_PIECE / row_bytes).clamp(1, n_rows);
+        let scales = if meta.dtype == StDtype::F8E4m3 {
+            Some(self.fp8_scales(name, meta)?)
+        } else {
+            None
+        };
+        // Rows covered by one scale entry.
+        let per_scale = scales.as_ref().map_or(1, |s| meta.rows() / s.len());
+        let mut raw = vec![0u8; piece_rows * row_bytes];
+        let mut offset = meta.start + (first * row_bytes) as u64;
+        out.reserve(n_rows * row_len);
+        for row0 in (0..n_rows).step_by(piece_rows) {
+            let rows = piece_rows.min(n_rows - row0);
+            let raw = &mut raw[..rows * row_bytes];
+            read_exact_at(&self.files[meta.shard], offset, raw)
+                .map_err(|e| bad(&self.paths[meta.shard], format!("reading `{name}`: {e}")))?;
+            offset += raw.len() as u64;
+            match (meta.dtype, &scales) {
+                (StDtype::F32, _) => {
+                    out.extend(
+                        raw.as_chunks::<4>()
+                            .0
+                            .iter()
+                            .map(|b| f32::from_le_bytes(*b)),
+                    );
                 }
+                (StDtype::F16, _) => out.extend(
+                    raw.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| half::f16::from_le_bytes(*b).to_f32()),
+                ),
+                (StDtype::Bf16, _) => out.extend(
+                    raw.as_chunks::<2>()
+                        .0
+                        .iter()
+                        .map(|b| half::bf16::from_le_bytes(*b).to_f32()),
+                ),
+                (StDtype::F8E4m3, Some(scales)) => {
+                    for (i, row) in raw.chunks_exact(row_len).enumerate() {
+                        let scale = scales[(first + row0 + i) / per_scale];
+                        out.extend(row.iter().map(|b| E4M3[usize::from(*b)] * scale));
+                    }
+                }
+                _ => {}
             }
-            StDtype::Other(_) => {}
         }
         Ok(())
     }

@@ -15,9 +15,9 @@
 //! is ever transposed.
 
 use std::collections::HashSet;
-
-use candle_core::quantized::{GgmlDType, QTensor};
-use candle_core::{Device, Tensor};
+use std::num::NonZero;
+use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Mutex, PoisonError};
 
 use super::arch::ConvArch;
 use super::cfg_err;
@@ -31,6 +31,10 @@ use crate::provider::local::model::layout::name as gguf;
 /// Elements read and converted at once when a tensor needs no whole-tensor
 /// transform (32 MiB of `f32`).
 const BLOCK_ELEMS: usize = 8 << 20;
+
+/// Elements one encoding thread takes at a time (a multiple of every block
+/// size).
+const ENCODE_CHUNK: usize = 1 << 16;
 
 /// A transform of a tensor viewed as `[rows, cols]`.
 #[derive(Debug, Clone, PartialEq)]
@@ -146,59 +150,122 @@ impl Plan {
         dtype: Dtype,
         sink: &mut dyn FnMut(&[u8]) -> Result<(), CucaError>,
     ) -> Result<(), CucaError> {
-        let cols = self.dims.last().copied().unwrap_or(1);
         let mut bytes = Vec::new();
+        // Reused by every block: the values, and the rearranging ops' output.
+        let mut buf = Vec::new();
+        let mut tmp = Vec::new();
         match &self.body {
             Body::Generated(values) => {
-                encode(dtype, values.clone(), cols, &mut bytes)?;
+                encode(dtype, values, &mut bytes)?;
                 sink(&bytes)
             }
             Body::Slices(slices) if self.ops.iter().all(Op::elementwise) => {
-                let mut buf = Vec::new();
-                for s in slices {
-                    let row_len = shards
-                        .tensor(&s.tensor)
-                        .map(|m| m.row_len())
-                        .ok_or_else(|| cfg_err(format!("checkpoint has no tensor `{}`", s.tensor)))?
-                        .max(1);
-                    let block = (BLOCK_ELEMS / row_len).max(1);
-                    let mut done = 0;
-                    while done < s.rows {
-                        let n = block.min(s.rows - done);
-                        shards.read_rows(&s.tensor, s.row_start + done, n, &mut buf)?;
-                        for op in &self.ops {
-                            apply(op, &mut buf, n, row_len)?;
-                        }
-                        encode(dtype, std::mem::take(&mut buf), cols, &mut bytes)?;
-                        sink(&bytes)?;
-                        done += n;
-                    }
+                // A reader thread fills one buffer while this thread encodes
+                // and writes the other.
+                let (full_tx, full_rx) = mpsc::sync_channel(1);
+                let (free_tx, free_rx) = mpsc::channel();
+                for _ in 0..2 {
+                    let _ = free_tx.send(Vec::new());
                 }
-                Ok(())
+                std::thread::scope(|scope| {
+                    let result: Result<(), CucaError> = (|| {
+                        std::thread::Builder::new().spawn_scoped(scope, move || {
+                            read_blocks(shards, slices, &free_rx, &full_tx);
+                        })?;
+                        for block in &full_rx {
+                            let Block {
+                                mut values,
+                                rows,
+                                row_len,
+                            } = block?;
+                            for op in &self.ops {
+                                apply(op, &mut values, &mut tmp, rows, row_len)?;
+                            }
+                            encode(dtype, &values, &mut bytes)?;
+                            sink(&bytes)?;
+                            let _ = free_tx.send(values);
+                        }
+                        Ok(())
+                    })();
+                    // Closing both ends frees a reader still waiting for a
+                    // buffer or for room to hand over a block.
+                    drop(full_rx);
+                    drop(free_tx);
+                    result
+                })
             }
             Body::Slices(slices) => {
-                let mut all: Vec<f32> = Vec::new();
-                let mut part = Vec::new();
                 let mut rows = 0;
                 let mut row_len = 0;
                 for s in slices {
-                    shards.read_rows(&s.tensor, s.row_start, s.rows, &mut part)?;
-                    all.extend_from_slice(&part);
+                    shards.append_rows(&s.tensor, s.row_start, s.rows, &mut buf)?;
                     rows += s.rows;
                     row_len = shards.tensor(&s.tensor).map_or(0, |m| m.row_len());
                 }
                 for op in &self.ops {
-                    apply(op, &mut all, rows, row_len)?;
+                    apply(op, &mut buf, &mut tmp, rows, row_len)?;
                 }
-                encode(dtype, all, cols, &mut bytes)?;
+                encode(dtype, &buf, &mut bytes)?;
                 sink(&bytes)
             }
         }
     }
 }
 
-/// Apply `op` to `data` viewed as `[rows, cols]`.
-fn apply(op: &Op, data: &mut Vec<f32>, rows: usize, cols: usize) -> Result<(), CucaError> {
+/// A block of whole rows read from the checkpoint.
+struct Block {
+    values: Vec<f32>,
+    rows: usize,
+    row_len: usize,
+}
+
+/// Read `slices` in blocks of about [`BLOCK_ELEMS`] elements into the buffers
+/// that arrive on `free`, handing each filled block (or the first error) to
+/// `full`; returns when everything is read or either channel is closed.
+fn read_blocks(
+    shards: &Shards,
+    slices: &[Slice],
+    free: &Receiver<Vec<f32>>,
+    full: &SyncSender<Result<Block, CucaError>>,
+) {
+    for s in slices {
+        let Some(meta) = shards.tensor(&s.tensor) else {
+            let _ = full.send(Err(cfg_err(format!(
+                "checkpoint has no tensor `{}`",
+                s.tensor
+            ))));
+            return;
+        };
+        let row_len = meta.row_len().max(1);
+        let block_rows = (BLOCK_ELEMS / row_len).max(1);
+        let mut done = 0;
+        while done < s.rows {
+            let rows = block_rows.min(s.rows - done);
+            let Ok(mut values) = free.recv() else { return };
+            let read = shards.read_rows(&s.tensor, s.row_start + done, rows, &mut values);
+            let failed = read.is_err();
+            let block = read.map(|()| Block {
+                values,
+                rows,
+                row_len,
+            });
+            if full.send(block).is_err() || failed {
+                return;
+            }
+            done += rows;
+        }
+    }
+}
+
+/// Apply `op` to `data` viewed as `[rows, cols]`; the ops that rearrange
+/// build the result in `scratch` and swap it in.
+fn apply(
+    op: &Op,
+    data: &mut Vec<f32>,
+    scratch: &mut Vec<f32>,
+    rows: usize,
+    cols: usize,
+) -> Result<(), CucaError> {
     match *op {
         Op::Add(c) => data.iter_mut().for_each(|x| *x += c),
         Op::NegExp => data.iter_mut().for_each(|x| *x = -x.exp()),
@@ -210,18 +277,19 @@ fn apply(op: &Op, data: &mut Vec<f32>, rows: usize, cols: usize) -> Result<(), C
             }
             let per_head = rows / n_head;
             let half = per_head / 2;
-            let mut out = vec![0.0f32; data.len()];
+            scratch.clear();
+            scratch.resize(data.len(), 0.0);
             for h in 0..n_head {
                 for i in 0..half {
                     for j in 0..2 {
                         let from = h * per_head + j * half + i;
                         let to = h * per_head + i * 2 + j;
-                        out[to * cols..(to + 1) * cols]
+                        scratch[to * cols..(to + 1) * cols]
                             .copy_from_slice(&data[from * cols..(from + 1) * cols]);
                     }
                 }
             }
-            *data = out;
+            std::mem::swap(data, scratch);
         }
         Op::ReorderV {
             cols: on_cols,
@@ -231,7 +299,8 @@ fn apply(op: &Op, data: &mut Vec<f32>, rows: usize, cols: usize) -> Result<(), C
             hd,
         } => {
             let span = nk * nvk * hd;
-            let mut out = data.clone();
+            scratch.clear();
+            scratch.extend_from_slice(data);
             if on_cols {
                 if cols != span {
                     return Err(cfg_err(format!(
@@ -240,7 +309,7 @@ fn apply(op: &Op, data: &mut Vec<f32>, rows: usize, cols: usize) -> Result<(), C
                 }
                 for r in 0..rows {
                     let row = &data[r * cols..(r + 1) * cols];
-                    let dst = &mut out[r * cols..(r + 1) * cols];
+                    let dst = &mut scratch[r * cols..(r + 1) * cols];
                     reorder(row, dst, nk, nvk, hd);
                 }
             } else {
@@ -251,13 +320,13 @@ fn apply(op: &Op, data: &mut Vec<f32>, rows: usize, cols: usize) -> Result<(), C
                 }
                 reorder(
                     &data[offset * cols..],
-                    &mut out[offset * cols..],
+                    &mut scratch[offset * cols..],
                     nk,
                     nvk,
                     hd * cols,
                 );
             }
-            *data = out;
+            std::mem::swap(data, scratch);
         }
         Op::TransposeBatches { batch } => {
             if batch == 0 || !rows.is_multiple_of(batch) {
@@ -266,17 +335,18 @@ fn apply(op: &Op, data: &mut Vec<f32>, rows: usize, cols: usize) -> Result<(), C
                 )));
             }
             let r = rows / batch;
-            let mut out = vec![0.0f32; data.len()];
+            scratch.clear();
+            scratch.resize(data.len(), 0.0);
             for b in 0..batch {
                 let src = &data[b * r * cols..(b + 1) * r * cols];
-                let dst = &mut out[b * r * cols..(b + 1) * r * cols];
+                let dst = &mut scratch[b * r * cols..(b + 1) * r * cols];
                 for i in 0..r {
                     for j in 0..cols {
                         dst[j * r + i] = src[i * cols + j];
                     }
                 }
             }
-            *data = out;
+            std::mem::swap(data, scratch);
         }
     }
     Ok(())
@@ -293,29 +363,103 @@ fn reorder(src: &[f32], dst: &mut [f32], nk: usize, nvk: usize, unit: usize) {
     }
 }
 
-/// Encode whole rows of `data` as `dtype` into `out` (cleared first).
-fn encode(dtype: Dtype, data: Vec<f32>, cols: usize, out: &mut Vec<u8>) -> Result<(), CucaError> {
+/// Encode `data` as `dtype` into `out` (cleared first).
+///
+/// Every storage block depends on its own elements only, so the data is cut
+/// into [`ENCODE_CHUNK`]-element pieces that the calling thread and, for a
+/// large tensor, one helper thread per spare core encode in parallel: the
+/// bytes are those of a single-threaded pass.
+fn encode(dtype: Dtype, data: &[f32], out: &mut Vec<u8>) -> Result<(), CucaError> {
+    let block = dtype.block_size();
+    if !data.len().is_multiple_of(block) {
+        return Err(cfg_err(format!(
+            "{} values do not fill whole blocks of {block}",
+            data.len()
+        )));
+    }
     out.clear();
+    out.resize(data.len() / block * dtype.type_size(), 0);
+    let piece = ENCODE_CHUNK / block * dtype.type_size();
+    let work = Mutex::new(data.chunks(ENCODE_CHUNK).zip(out.chunks_mut(piece)));
+    let drain = || {
+        loop {
+            let next = work.lock().unwrap_or_else(PoisonError::into_inner).next();
+            let Some((src, dst)) = next else { return };
+            encode_piece(dtype, src, dst);
+        }
+    };
+    let helpers = if data.len() < 4 * ENCODE_CHUNK {
+        0
+    } else {
+        std::thread::available_parallelism().map_or(1, NonZero::get) - 1
+    };
+    std::thread::scope(|scope| {
+        for _ in 0..helpers {
+            if std::thread::Builder::new()
+                .spawn_scoped(scope, drain)
+                .is_err()
+            {
+                break;
+            }
+        }
+        drain();
+    });
+    Ok(())
+}
+
+/// Encode whole blocks of `src` into `dst`, which holds exactly their bytes.
+///
+/// The quantizers are llama.cpp's `quantize_row_q4_0` / `quantize_row_q8_0`
+/// reference code (candle's `from_float` for the two types), operation for
+/// operation, so the bytes are those of `ggml`.
+fn encode_piece(dtype: Dtype, src: &[f32], dst: &mut [u8]) {
     match dtype {
-        Dtype::F32 => out.extend(data.iter().flat_map(|x| x.to_le_bytes())),
-        Dtype::F16 => out.extend(
-            data.iter()
-                .flat_map(|x| half::f16::from_f32(*x).to_le_bytes()),
-        ),
-        Dtype::Q8_0 | Dtype::Q4_0 => {
-            let rows = data.len() / cols.max(1);
-            let g = if dtype == Dtype::Q8_0 {
-                GgmlDType::Q8_0
-            } else {
-                GgmlDType::Q4_0
-            };
-            let t = Tensor::from_vec(data, (rows, cols), &Device::Cpu)
-                .map_err(|e| cfg_err(e.to_string()))?;
-            let q = QTensor::quantize(&t, g).map_err(|e| cfg_err(e.to_string()))?;
-            out.extend_from_slice(&q.data().map_err(|e| cfg_err(e.to_string()))?);
+        Dtype::F32 => {
+            for (d, x) in dst.as_chunks_mut::<4>().0.iter_mut().zip(src) {
+                *d = x.to_le_bytes();
+            }
+        }
+        Dtype::F16 => {
+            for (d, x) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                *d = half::f16::from_f32(*x).to_le_bytes();
+            }
+        }
+        Dtype::Q8_0 => {
+            let blocks = dst.as_chunks_mut::<34>().0.iter_mut();
+            for (d, xs) in blocks.zip(src.as_chunks::<32>().0) {
+                let amax = xs.iter().fold(0f32, |m, x| m.max(x.abs()));
+                let scale = amax / 127.0;
+                let inv = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                let (head, qs) = d.split_at_mut(2);
+                head.copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                for (q, x) in qs.iter_mut().zip(xs) {
+                    *q = f32::round(x * inv) as i8 as u8;
+                }
+            }
+        }
+        Dtype::Q4_0 => {
+            let blocks = dst.as_chunks_mut::<18>().0.iter_mut();
+            for (d, xs) in blocks.zip(src.as_chunks::<32>().0) {
+                let (mut amax, mut max) = (0f32, 0f32);
+                for &x in xs {
+                    if amax < x.abs() {
+                        amax = x.abs();
+                        max = x;
+                    }
+                }
+                let scale = max / -8.0;
+                let inv = if scale != 0.0 { 1.0 / scale } else { 0.0 };
+                let (head, qs) = d.split_at_mut(2);
+                head.copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
+                let (lo, hi) = xs.split_at(16);
+                for ((q, a), b) in qs.iter_mut().zip(lo).zip(hi) {
+                    let qa = u8::min(15, (a * inv + 8.5) as u8);
+                    let qb = u8::min(15, (b * inv + 8.5) as u8);
+                    *q = qa | (qb << 4);
+                }
+            }
         }
     }
-    Ok(())
 }
 
 /// Whether the engine knows a GGUF tensor name (`layout::name`).
@@ -1707,9 +1851,46 @@ mod tests {
         );
         let all: Vec<f32> = (0..rows * cols).map(|i| i as f32).collect();
         let mut want = Vec::new();
-        encode(Dtype::Q8_0, all, cols, &mut want).unwrap();
+        encode(Dtype::Q8_0, &all, &mut want).unwrap();
         assert_eq!(got, want);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The encoders (threaded, written without candle tensors) produce the
+    /// bytes of candle's quantizers, which are `ggml`'s, on values that
+    /// exercise ties, zero blocks, large and non-finite inputs.
+    #[test]
+    fn encoders_match_candle() {
+        use candle_core::quantized::{GgmlDType, QTensor};
+        use candle_core::{Device, Tensor};
+
+        // Past the threading threshold, with a ragged last piece.
+        let n = 6 * ENCODE_CHUNK + 96;
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut data: Vec<f32> = (0..n)
+            .map(|_| {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((state >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * 3.0
+            })
+            .collect();
+        data[..32].fill(0.0);
+        data[32..64].fill(-2.5);
+        data[64] = 1e30;
+        data[100] = -f32::MAX;
+        data[200] = f32::NAN;
+        for (dtype, ggml) in [
+            (Dtype::Q8_0, GgmlDType::Q8_0),
+            (Dtype::Q4_0, GgmlDType::Q4_0),
+        ] {
+            let mut got = Vec::new();
+            encode(dtype, &data, &mut got).unwrap();
+            let t = Tensor::from_vec(data.clone(), (1, n), &Device::Cpu).unwrap();
+            let q = QTensor::quantize(&t, ggml).unwrap();
+            let want = q.data().unwrap();
+            assert!(got == want.as_ref(), "{dtype:?} differs from candle");
+        }
     }
 
     #[test]

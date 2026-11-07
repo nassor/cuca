@@ -57,7 +57,7 @@ impl Dtype {
     }
 
     /// Bytes per storage block.
-    fn type_size(self) -> usize {
+    pub(crate) fn type_size(self) -> usize {
         match self {
             Self::F32 => 4,
             Self::F16 => 2,

@@ -17,9 +17,10 @@
 //! - [`gguf_writer`]: the streaming GGUF v3 writer.
 //!
 //! The header (metadata plus every tensor's name, shape and type) is known
-//! before any weight is read, so the writer streams: peak memory is one
-//! block of one tensor (at most 32 MiB of `f32`) plus its quantized form,
-//! whatever the model's size. The result is checked before it is renamed into
+//! before any weight is read, so the writer streams: peak memory is two
+//! blocks of one tensor (at most 32 MiB of `f32` each: one is read ahead
+//! while the other is encoded) plus its quantized form, whatever the model's
+//! size. The result is checked before it is renamed into
 //! place: the metadata must load through the engine's own `Hparams` and
 //! tokenizer readers.
 
