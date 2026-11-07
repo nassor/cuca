@@ -60,7 +60,7 @@ use candle_core::quantized::gguf_file;
 use tokio::sync::mpsc;
 
 use self::scheduler::{Sequence, SnapshotStore};
-use super::chat::{ChatFormat, ChatTemplate};
+use super::chat::{ChatFormat, ChatTemplate, expand_template_name};
 use super::model::mtp::Drafter;
 use super::model::paged::{KvPools, Sizing};
 use super::model::{Model, prefill_chunk};
@@ -577,9 +577,11 @@ impl Engine {
         let eos = tokenizer.eos_token().to_string();
         let (format, template) = match chat_template {
             Some(source) => {
+                let source = expand_template_name(source)
+                    .map_err(|e| CucaError::Config(format!("chat_template override: {e}")))?;
                 let template = ChatTemplate::checked(source.to_string(), bos, eos)?;
                 (
-                    ChatFormat::detect(&content.metadata, &tokenizer, source)?,
+                    ChatFormat::detect(&content.metadata, &tokenizer, &source)?,
                     template,
                 )
             }
@@ -591,6 +593,10 @@ impl Engine {
                     .to_string()
                     .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
                     .clone();
+                // llama.cpp's converter can write a template *name*.
+                let source = expand_template_name(&source)
+                    .map_err(|e| local_err(format!("GGUF metadata `{TEMPLATE_KEY}`: {e}")))?
+                    .into_owned();
                 let format = ChatFormat::detect(&content.metadata, &tokenizer, &source)?;
                 (format, ChatTemplate::new(source, bos, eos)?)
             }

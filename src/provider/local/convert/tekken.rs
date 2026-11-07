@@ -20,10 +20,12 @@
 //!   `add_bos_token` true, `add_eos_token` false;
 //! - the chat template is the community template llama.cpp bundles for the
 //!   file's `version` (`MistralModel.get_community_chat_template`): v11 the Mistral
-//!   Small 3.2 one, v13 the Devstral Small 2507 one. For v1, v3 and v7 llama.cpp
-//!   writes the *name* of a template built into its C++ code
-//!   (`mistral-v7-tekken`), which this engine cannot render, and any other
-//!   version it refuses; both are an error here.
+//!   Small 3.2 one, v13 the Devstral Small 2507 one, and for v7 (Mistral Small
+//!   3.0/3.1, Devstral Small 2505) the *name* `mistral-v7-tekken`, which
+//!   llama.cpp renders in C++ and the engine expands to Jinja at load
+//!   (`chat/builtin.rs`). For v1 and v3 (pre-2025 models) llama.cpp writes names
+//!   this engine does not port, and any other version it refuses; both are an
+//!   error here.
 //!
 //! The newer `tekken-num3` pre-tokenizer (right-aligned digit groups of three,
 //! which no model this crate supports uses) is refused by name.
@@ -51,6 +53,31 @@ const TEMPLATE_V11: &str = include_str!("templates/Mistral-Small-3.2-24B-Instruc
 /// ... and for v13 (Devstral Small 2507),
 /// `models/templates/unsloth-mistral-Devstral-Small-2507.jinja`.
 const TEMPLATE_V13: &str = include_str!("templates/unsloth-mistral-Devstral-Small-2507.jinja");
+
+/// `Tekkenizer.DEPRECATED_SPECIAL_TOKENS` of mistral_common, the special
+/// tokens of a tekken.json (v7 or older) that lists none, by rank.
+const DEPRECATED_SPECIAL_TOKENS: [&str; 20] = [
+    "<unk>",
+    "<s>",
+    "</s>",
+    "[INST]",
+    "[/INST]",
+    "[AVAILABLE_TOOLS]",
+    "[/AVAILABLE_TOOLS]",
+    "[TOOL_RESULTS]",
+    "[/TOOL_RESULTS]",
+    "[TOOL_CALLS]",
+    "[IMG]",
+    "<pad>",
+    "[IMG_BREAK]",
+    "[IMG_END]",
+    "[PREFIX]",
+    "[MIDDLE]",
+    "[SUFFIX]",
+    "[SYSTEM_PROMPT]",
+    "[/SYSTEM_PROMPT]",
+    "[TOOL_CONTENT]",
+];
 
 /// Decode standard base64 (with padding), the encoding of `token_bytes`.
 fn base64(text: &str) -> Option<Vec<u8>> {
@@ -104,13 +131,18 @@ fn show(bytes: &[u8], table: &[char; 256]) -> String {
     bytes.iter().map(|b| table[usize::from(*b)]).collect()
 }
 
-/// The text of the bundled community chat template for `version`.
+/// llama.cpp's built-in template name for tokenizer version v7 (tekken).
+const TEMPLATE_V7: &str = "mistral-v7-tekken";
+
+/// The chat template for `version`: the bundled community template's text, or
+/// the built-in name llama.cpp writes.
 fn community_template(version: &str) -> Result<&'static str, CucaError> {
     match version {
         "v11" => Ok(TEMPLATE_V11),
         "v13" => Ok(TEMPLATE_V13),
-        "v1" | "v3" | "v7" => Err(cfg_err(format!(
-            "tekken.json version {version}: llama.cpp names a template built into its C++ code for it, which this engine cannot render; \
+        "v7" => Ok(TEMPLATE_V7),
+        "v1" | "v3" => Err(cfg_err(format!(
+            "tekken.json version {version}: llama.cpp names a template built into its C++ code for it (a pre-2025 format), which this engine does not render; \
              convert a checkpoint that ships a tokenizer.json and a chat template instead"
         ))),
         other => Err(cfg_err(format!(
@@ -186,12 +218,22 @@ pub(crate) fn build(dir: &Path, arch_name: &str) -> Result<VocabMeta, CucaError>
         ));
     }
 
-    // Special tokens: the file's list (v11 and later must have one), then
+    // Special tokens: the file's list (later than v7 must have one; v7 files
+    // may omit it and get mistral_common's `DEPRECATED_SPECIAL_TOKENS`), then
     // `<SPECIAL_{i}>` fillers up to `default_num_special_tokens`.
-    let listed = json
-        .get("special_tokens")
-        .and_then(Json::as_array)
-        .ok_or_else(|| cfg_err("tekken.json has no `special_tokens`"))?;
+    let deprecated: Vec<Json>;
+    let listed = match json.get("special_tokens").and_then(Json::as_array) {
+        Some(list) => list,
+        None if version == "v7" => {
+            deprecated = DEPRECATED_SPECIAL_TOKENS
+                .iter()
+                .enumerate()
+                .map(|(rank, token_str)| serde_json::json!({"rank": rank, "token_str": token_str}))
+                .collect();
+            &deprecated
+        }
+        None => return Err(cfg_err("tekken.json has no `special_tokens`")),
+    };
     let mut special: Vec<String> = Vec::with_capacity(n_special);
     for (i, t) in listed.iter().enumerate() {
         let rank = t.get("rank").and_then(Json::as_u64);
@@ -487,7 +529,8 @@ mod tests {
     fn templates_follow_the_version() {
         assert!(community_template("v11").unwrap().contains("[TOOL_CALLS]"));
         assert!(community_template("v13").unwrap().contains("[ARGS]"));
-        for v in ["v1", "v3", "v7"] {
+        assert_eq!(community_template("v7").unwrap(), "mistral-v7-tekken");
+        for v in ["v1", "v3"] {
             let e = community_template(v).unwrap_err().to_string();
             assert!(e.contains("built into"), "{e}");
         }

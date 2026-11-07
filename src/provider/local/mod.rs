@@ -576,18 +576,28 @@ const PRESET_TABLE: [ModelPreset; 24] = [
             "mistral3",
         )
     },
-    // imatrix Q4_0 of Ministral 3 Instruct. Its embedded chat template is the
-    // earlier one: the same except for the wording of the default system
-    // prompt (the current template adds a tool-calling paragraph there).
-    preset(
-        "ministral3-3b-instruct-q4_0",
-        "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
-        "0a9035302dea19872c96076896304552890a73c2",
-        "mistralai_Ministral-3-3B-Instruct-2512-Q4_0.gguf",
-        "c2993f4b86ddcae94031b2e384169889ceecd51b148ceda30c0f826fcce721c8",
-        2_046_375_904,
-        "mistral3",
-    ),
+    // imatrix Q4_0 of Ministral 3 Instruct. Every published GGUF of this
+    // model embeds the December 2025 chat template (an earlier default system
+    // prompt, without the tool-calling paragraph); the preset pins the
+    // repository's current `chat_template.jinja` ("update to match
+    // mistral-common", 2026-07-15) and uses it instead.
+    ModelPreset {
+        template: Some(PresetTemplate {
+            repo: "mistralai/Ministral-3-3B-Instruct-2512",
+            revision: "b35d4dfe56c142746f54dbd64f579faab2744308",
+            file: "chat_template.jinja",
+            sha256: "0701cfbdc2b7d44fdbad104dff604faee4b0543e8247624568777fe465746f9b",
+        }),
+        ..preset(
+            "ministral3-3b-instruct-q4_0",
+            "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
+            "0a9035302dea19872c96076896304552890a73c2",
+            "mistralai_Ministral-3-3B-Instruct-2512-Q4_0.gguf",
+            "c2993f4b86ddcae94031b2e384169889ceecd51b148ceda30c0f826fcce721c8",
+            2_046_375_904,
+            "mistral3",
+        )
+    },
     // Two parts of `llama-gguf-split`: merged into one cached file at load.
     // imatrix Q4_0 (Q4_1 in the layers' `ffn_down_exps`, Q5_0 in places, Q8_0
     // for the shared experts and the latent projection, Q6_K `output`).
