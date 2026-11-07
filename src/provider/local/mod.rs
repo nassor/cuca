@@ -19,7 +19,8 @@
 //! Any GGUF whose `general.architecture` is one of `gemma4`, `gemma3`,
 //! `llama` (Llama 3.x and compatible), `qwen2`, `qwen3`, `phi3`
 //! (Phi 4-mini and compatible), `smollm3`, `granite`, `qwen3moe`,
-//! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `mistral3`, `mistral4`, `qwen35` or `qwen35moe` runs: the loader reads every
+//! `olmoe`, `olmo2`, `ernie4_5`, `muse-glimmer`, `mistral3`, `mistral4`,
+//! `qwen35` or `qwen35moe` runs: the loader reads every
 //! dimension (layers, widths, per-layer head counts and head dimensions,
 //! FFN widths or experts, vocabulary, RoPE variants) from the file's
 //! metadata and tensor shapes, handles biases, QK-norm, fused QKV and
@@ -75,7 +76,6 @@
 //! `LocalModelConfig::on_download_progress` as bytes copied.
 //!
 //! # Bounds
-//!
 //!
 //! - Continuous batching ([`BatchingConfig`]): up to `max_sequences` requests
 //!   (4 by default) run at once, each decode step one forward pass over a row
@@ -235,7 +235,7 @@ mod tokenizer;
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -396,7 +396,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 25] = [
+const PRESET_TABLE: &[ModelPreset] = &[
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -782,9 +782,9 @@ pub struct ModelTemplate {
 impl ModelSource {
     /// Every verified preset: the models this crate's live suite runs, each
     /// pinned to a repository commit and a SHA-256, plus the multi-token
-    /// prediction drafter. Sorted by family; the first entry is the default
+    /// prediction drafters. Sorted by family; the first entry is the default
     /// ([`ModelSource::default_model`]).
-    pub const PRESETS: &'static [ModelPreset] = &PRESET_TABLE;
+    pub const PRESETS: &'static [ModelPreset] = PRESET_TABLE;
 
     /// The preset called `name` (ASCII case-insensitive), if any.
     pub fn preset(name: &str) -> Option<&'static ModelPreset> {
@@ -950,23 +950,28 @@ pub enum LocalDevice {
 impl LocalDevice {
     /// The cargo feature this device needs, `None` for [`LocalDevice::Cpu`].
     pub fn required_feature(self) -> Option<&'static str> {
-        match self {
-            LocalDevice::Cpu => None,
-            LocalDevice::Vulkan(_) => Some("provider-local-vulkan"),
-            LocalDevice::Metal(_) => Some("provider-local-metal"),
-            LocalDevice::Cuda(_) => Some("provider-local-cuda"),
-            LocalDevice::Rocm(_) => Some("provider-local-rocm"),
-        }
+        self.backend().map(|(feature, _)| feature)
     }
 
-    /// Whether this build includes the backend the device needs.
-    fn is_compiled(self) -> bool {
+    /// The cargo feature of the device's backend and whether this build
+    /// includes it; `None` for the CPU.
+    fn backend(self) -> Option<(&'static str, bool)> {
         match self {
-            LocalDevice::Cpu => true,
-            LocalDevice::Vulkan(_) => cfg!(feature = "provider-local-vulkan"),
-            LocalDevice::Metal(_) => cfg!(feature = "provider-local-metal"),
-            LocalDevice::Cuda(_) => cfg!(feature = "provider-local-cuda"),
-            LocalDevice::Rocm(_) => cfg!(feature = "provider-local-rocm"),
+            LocalDevice::Cpu => None,
+            LocalDevice::Vulkan(_) => Some((
+                "provider-local-vulkan",
+                cfg!(feature = "provider-local-vulkan"),
+            )),
+            LocalDevice::Metal(_) => Some((
+                "provider-local-metal",
+                cfg!(feature = "provider-local-metal"),
+            )),
+            LocalDevice::Cuda(_) => {
+                Some(("provider-local-cuda", cfg!(feature = "provider-local-cuda")))
+            }
+            LocalDevice::Rocm(_) => {
+                Some(("provider-local-rocm", cfg!(feature = "provider-local-rocm")))
+            }
         }
     }
 }
@@ -974,12 +979,12 @@ impl LocalDevice {
 /// The [`CucaError::Config`] for a device whose backend is compiled out, or
 /// `None` when the device is available in this build.
 pub(crate) fn device_unavailable(device: LocalDevice) -> Option<CucaError> {
-    match device.required_feature() {
-        Some(feature) if !device.is_compiled() => Some(CucaError::Config(format!(
+    let (feature, compiled) = device.backend()?;
+    (!compiled).then(|| {
+        CucaError::Config(format!(
             "device {device:?} requires the `{feature}` cargo feature"
-        ))),
-        _ => None,
-    }
+        ))
+    })
 }
 
 /// Parses `cpu`, `vulkan[:<n>|:integrated:<n>]`, `metal[:<n>|:integrated:<n>]`,
@@ -998,14 +1003,17 @@ impl std::str::FromStr for LocalDevice {
             ["integrated", n] => index(n).map(GpuAdapter::Integrated),
             _ => None,
         };
+        let ordinal = |rest: &[&str]| match rest {
+            [] => Some(0),
+            [n] => index(n),
+            _ => None,
+        };
         let device = match parts.split_first() {
             Some((&"cpu", [])) => Some(LocalDevice::Cpu),
             Some((&"vulkan", rest)) => adapter(rest).map(LocalDevice::Vulkan),
             Some((&"metal", rest)) => adapter(rest).map(LocalDevice::Metal),
-            Some((&"cuda", [])) => Some(LocalDevice::Cuda(0)),
-            Some((&"cuda", [n])) => index(n).map(LocalDevice::Cuda),
-            Some((&"rocm", [])) => Some(LocalDevice::Rocm(0)),
-            Some((&"rocm", [n])) => index(n).map(LocalDevice::Rocm),
+            Some((&"cuda", rest)) => ordinal(rest).map(LocalDevice::Cuda),
+            Some((&"rocm", rest)) => ordinal(rest).map(LocalDevice::Rocm),
             _ => None,
         };
         device.ok_or_else(|| {
@@ -1241,64 +1249,87 @@ impl Default for ExpertTiers {
     }
 }
 
-/// Parses `resident` or `tiered:<key>=<value>,...`; see [`ExpertPlacement`].
+/// The entries of a comma-separated `key=value` list, each key at most once.
+/// `apply` takes each entry in order and returns `None` to reject it; the
+/// result is `None` when an entry has no `=`, repeats a key or is rejected.
+fn parse_pairs(list: &str, mut apply: impl FnMut(&str, &str) -> Option<()>) -> Option<()> {
+    let mut seen = Vec::new();
+    for part in list.split(',') {
+        let (key, value) = part.split_once('=')?;
+        if seen.contains(&key) {
+            return None;
+        }
+        seen.push(key);
+        apply(key, value)?;
+    }
+    Some(())
+}
+
+/// A byte count with an optional `k`, `m` or `g` suffix (powers of 1024).
+fn parse_size(text: &str) -> Option<u64> {
+    let (digits, shift) = match text.as_bytes().last()? {
+        b'k' => (&text[..text.len() - 1], 10),
+        b'm' => (&text[..text.len() - 1], 20),
+        b'g' => (&text[..text.len() - 1], 30),
+        _ => (text, 0),
+    };
+    digits.parse::<u64>().ok()?.checked_mul(1u64 << shift)
+}
+
+impl ExpertPlacement {
+    /// `text` (lowercase) as a placement; `None` when it is not one.
+    fn parse(text: &str) -> Option<Self> {
+        let Some((kind, list)) = text.split_once(':') else {
+            return match text {
+                "resident" => Some(Self::Resident),
+                "host" => Some(Self::Host { layers: None }),
+                _ => None,
+            };
+        };
+        match kind {
+            "host" => {
+                let mut layers = None;
+                parse_pairs(list, |key, value| match key {
+                    "layers" => {
+                        layers = Some(value.parse().ok()?);
+                        Some(())
+                    }
+                    _ => None,
+                })?;
+                Some(Self::Host { layers })
+            }
+            "tiered" => {
+                let mut tiers = ExpertTiers::default();
+                let mut sized = false;
+                parse_pairs(list, |key, value| {
+                    match key {
+                        "ram" => tiers.ram_bytes = parse_size(value)?,
+                        "device" => tiers.device_bytes = parse_size(value)?,
+                        "threads" => tiers.loader_threads = value.parse().ok()?,
+                        _ => return None,
+                    }
+                    sized |= key != "threads";
+                    Some(())
+                })?;
+                sized.then_some(Self::Tiered(tiers))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Parses `resident`, `host[:layers=<n>]` or `tiered:<key>=<value>,...`; see
+/// [`ExpertPlacement`].
 impl std::str::FromStr for ExpertPlacement {
     type Err = CucaError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-        let bad = || {
+        Self::parse(&s.to_ascii_lowercase()).ok_or_else(|| {
             CucaError::Config(format!(
                 "unknown expert placement `{s}`; expected resident, host[:layers=<n>] or tiered:ram=<size>[,device=<size>][,threads=<n>]"
             ))
-        };
-        let lower = s.to_ascii_lowercase();
-        if lower == "resident" {
-            return Ok(Self::Resident);
-        }
-        if lower == "host" {
-            return Ok(Self::Host { layers: None });
-        }
-        if let Some(n) = lower.strip_prefix("host:layers=") {
-            let layers = n.parse::<usize>().map_err(|_| bad())?;
-            return Ok(Self::Host {
-                layers: Some(layers),
-            });
-        }
-        let rest = lower.strip_prefix("tiered:").ok_or_else(bad)?;
-        let size = |v: &str| -> Option<u64> {
-            let (digits, shift) = match v.as_bytes().last()? {
-                b'k' => (&v[..v.len() - 1], 10),
-                b'm' => (&v[..v.len() - 1], 20),
-                b'g' => (&v[..v.len() - 1], 30),
-                _ => (v, 0),
-            };
-            digits.parse::<u64>().ok()?.checked_mul(1u64 << shift)
-        };
-        let mut tiers = ExpertTiers::default();
-        let (mut ram, mut device, mut threads) = (false, false, false);
-        for part in rest.split(',') {
-            let (key, value) = part.split_once('=').ok_or_else(bad)?;
-            match key {
-                "ram" if !ram => {
-                    ram = true;
-                    tiers.ram_bytes = size(value).ok_or_else(bad)?;
-                }
-                "device" if !device => {
-                    device = true;
-                    tiers.device_bytes = size(value).ok_or_else(bad)?;
-                }
-                "threads" if !threads => {
-                    threads = true;
-                    tiers.loader_threads = value.parse().map_err(|_| bad())?;
-                }
-                _ => return Err(bad()),
-            }
-        }
-        if !(ram || device) {
-            return Err(bad());
-        }
-        Ok(Self::Tiered(tiers))
+        })
     }
 }
 
@@ -1490,23 +1521,20 @@ impl fmt::Debug for LocalModelConfig {
 
 /// What a loaded engine hands back to `load`: the pieces the request path
 /// needs without touching the engine thread.
-type Ready = Result<
-    (
-        Arc<Tokenizer>,
-        ChatTemplate,
-        ChatFormat,
-        usize,
-        u64,
-        Option<Arc<model::tier::TierShared>>,
-        Arc<engine::ServingCounters>,
-        SamplingConfig,
-        Option<(usize, usize)>,
-    ),
-    CucaError,
->;
+struct Loaded {
+    tokenizer: Arc<Tokenizer>,
+    template: ChatTemplate,
+    format: ChatFormat,
+    context_length: usize,
+    kv_cache_bytes: u64,
+    tiers: Option<Arc<model::tier::TierShared>>,
+    serving: Arc<engine::ServingCounters>,
+    sampling: SamplingConfig,
+    layer_split: Option<(usize, usize)>,
+}
 
 /// State shared by every clone of a [`LocalModel`].
-pub(crate) struct LocalModelInner {
+struct LocalModelInner {
     /// Queue into the engine thread; dropping the last sender ends it.
     jobs: mpsc::Sender<engine::Job>,
     tokenizer: Arc<Tokenizer>,
@@ -1750,28 +1778,23 @@ impl std::str::FromStr for BatchingConfig {
         if lower.is_empty() {
             return Ok(config);
         }
-        let mut seen = Vec::new();
-        for part in lower.split(',') {
-            let (key, value) = part.split_once('=').ok_or_else(bad)?;
-            if seen.contains(&key) {
-                return Err(bad());
-            }
-            seen.push(key);
-            let number = || value.parse::<usize>().map_err(|_| bad());
+        parse_pairs(&lower, |key, value| {
             match key {
-                "seqs" => config.max_sequences = number()?,
-                "kv" => config.kv_tokens = Some(number()?),
-                "step" => config.max_step_tokens = Some(number()?),
+                "seqs" => config.max_sequences = value.parse().ok()?,
+                "kv" => config.kv_tokens = Some(value.parse().ok()?),
+                "step" => config.max_step_tokens = Some(value.parse().ok()?),
                 "prefix" => {
                     config.prefix_cache = match value {
                         "on" | "true" | "1" => true,
                         "off" | "false" | "0" => false,
-                        _ => return Err(bad()),
+                        _ => return None,
                     }
                 }
-                _ => return Err(bad()),
+                _ => return None,
             }
-        }
+            Some(())
+        })
+        .ok_or_else(bad)?;
         Ok(config)
     }
 }
@@ -1907,7 +1930,7 @@ impl LocalModel {
             + 'static,
     {
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<engine::Job>(JOB_QUEUE);
-        let (ready_tx, ready_rx) = oneshot::channel::<Ready>();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<Loaded, CucaError>>();
         std::thread::Builder::new()
             .name("cuca-local-engine".to_string())
             .spawn(move || {
@@ -1930,20 +1953,18 @@ impl LocalModel {
                 };
                 let mut engine = match opened {
                     Ok((engine, tokenizer, template, format)) => {
-                        if ready_tx
-                            .send(Ok((
-                                tokenizer,
-                                template,
-                                format,
-                                engine.context_length(),
-                                engine.kv_cache_bytes(),
-                                engine.expert_tiers(),
-                                engine.serving_counters(),
-                                engine.sampling().config(),
-                                engine.layer_split(),
-                            )))
-                            .is_err()
-                        {
+                        let loaded = Loaded {
+                            context_length: engine.context_length(),
+                            kv_cache_bytes: engine.kv_cache_bytes(),
+                            tiers: engine.expert_tiers(),
+                            serving: engine.serving_counters(),
+                            sampling: engine.sampling().config(),
+                            layer_split: engine.layer_split(),
+                            tokenizer,
+                            template,
+                            format,
+                        };
+                        if ready_tx.send(Ok(loaded)).is_err() {
                             return;
                         }
                         engine
@@ -1960,29 +1981,19 @@ impl LocalModel {
             })?;
 
         match ready_rx.await {
-            Ok(Ok((
-                tokenizer,
-                template,
-                format,
-                context_length,
-                kv_cache_bytes,
-                tiers,
-                serving,
-                sampling,
-                layer_split,
-            ))) => Ok(LocalModel {
+            Ok(Ok(loaded)) => Ok(LocalModel {
                 inner: Arc::new(LocalModelInner {
                     jobs: jobs_tx,
-                    tokenizer,
-                    template,
-                    format,
-                    context_length,
-                    kv_cache_bytes,
-                    sampling,
+                    tokenizer: loaded.tokenizer,
+                    template: loaded.template,
+                    format: loaded.format,
+                    context_length: loaded.context_length,
+                    kv_cache_bytes: loaded.kv_cache_bytes,
+                    sampling: loaded.sampling,
                     draft_stats,
-                    serving,
-                    tiers,
-                    layer_split,
+                    serving: loaded.serving,
+                    tiers: loaded.tiers,
+                    layer_split: loaded.layer_split,
                 }),
             }),
             Ok(Err(e)) => Err(e),
@@ -1994,62 +2005,112 @@ impl LocalModel {
     }
 }
 
+/// A [`CucaError::Config`] with `message`.
+fn invalid(message: impl Into<String>) -> CucaError {
+    CucaError::Config(message.into())
+}
+
+/// Reject a temperature that is not a finite value >= 0; `name` is the
+/// setting it came from.
+fn check_temperature(name: &str, temperature: f32) -> Result<(), CucaError> {
+    if temperature.is_finite() && temperature >= 0.0 {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "{name} must be a finite value >= 0, got {temperature}"
+    )))
+}
+
+/// Reject a `top_p` outside `(0, 1]` (NaN included); `name` is the setting it
+/// came from.
+fn check_top_p(name: &str, top_p: f32) -> Result<(), CucaError> {
+    if top_p > 0.0 && top_p <= 1.0 {
+        return Ok(());
+    }
+    Err(invalid(format!(
+        "{name} must be a finite value in (0, 1], got {top_p}"
+    )))
+}
+
 /// Reject configurations the engine cannot honor, before any thread starts.
 fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
     if config.context_length == Some(0) {
-        return Err(CucaError::Config(
-            "context_length must be at least 1".into(),
+        return Err(invalid("context_length must be at least 1"));
+    }
+    validate_shards(config)?;
+    validate_gpu_layers(config)?;
+    validate_batching(&config.batching)?;
+    if let Some(temperature) = config.sampling.temperature {
+        check_temperature("sampling.temperature", temperature)?;
+    }
+    if let Some(top_p) = config.sampling.top_p {
+        check_top_p("sampling.top_p", top_p)?;
+    }
+    if let Some(e) = device_unavailable(config.device) {
+        return Err(e);
+    }
+    validate_drafter(config)?;
+    validate_experts(config)
+}
+
+/// Tensor parallelism: every device a GPU of one backend, no drafter, resident
+/// experts.
+fn validate_shards(config: &LocalModelConfig) -> Result<(), CucaError> {
+    if config.shards.is_empty() {
+        return Ok(());
+    }
+    let devices = std::iter::once(config.device).chain(config.shards.iter().copied());
+    if devices.clone().any(|d| d == LocalDevice::Cpu) {
+        return Err(invalid(
+            "tensor parallelism: `device` and every shard must be a GPU device, got cpu",
         ));
     }
+    for device in devices {
+        if let Some(e) = device_unavailable(device) {
+            return Err(e);
+        }
+        if std::mem::discriminant(&device) != std::mem::discriminant(&config.device) {
+            return Err(invalid(format!(
+                "tensor parallelism: every shard must use the same GPU backend as `device` ({:?}), got {device:?}",
+                config.device
+            )));
+        }
+    }
+    if config.drafter.is_some() {
+        return Err(invalid(
+            "tensor parallelism: a drafter is not supported with `shards`",
+        ));
+    }
+    if config.experts != ExpertPlacement::Resident {
+        return Err(invalid(
+            "tensor parallelism: tiered experts and host experts are not supported with `shards`",
+        ));
+    }
+    Ok(())
+}
+
+/// Layer offload: a GPU `device`, no shards, no drafter.
+fn validate_gpu_layers(config: &LocalModelConfig) -> Result<(), CucaError> {
+    if config.gpu_layers.is_none() {
+        return Ok(());
+    }
+    if config.device == LocalDevice::Cpu {
+        return Err(invalid("gpu_layers needs a GPU `device`, got cpu"));
+    }
     if !config.shards.is_empty() {
-        let devices = std::iter::once(config.device).chain(config.shards.iter().copied());
-        if devices.clone().any(|d| d == LocalDevice::Cpu) {
-            return Err(CucaError::Config(
-                "tensor parallelism: `device` and every shard must be a GPU device, got cpu".into(),
-            ));
-        }
-        for device in devices {
-            if let Some(e) = device_unavailable(device) {
-                return Err(e);
-            }
-            if std::mem::discriminant(&device) != std::mem::discriminant(&config.device) {
-                return Err(CucaError::Config(format!(
-                    "tensor parallelism: every shard must use the same GPU backend as `device` ({:?}), got {device:?}",
-                    config.device
-                )));
-            }
-        }
-        if config.drafter.is_some() {
-            return Err(CucaError::Config(
-                "tensor parallelism: a drafter is not supported with `shards`".into(),
-            ));
-        }
-        if config.experts != ExpertPlacement::Resident {
-            return Err(CucaError::Config(
-                "tensor parallelism: tiered experts are not supported with `shards`".into(),
-            ));
-        }
+        return Err(invalid(
+            "gpu_layers cannot be combined with tensor parallelism (`shards`)",
+        ));
     }
-    if config.gpu_layers.is_some() {
-        if config.device == LocalDevice::Cpu {
-            return Err(CucaError::Config(
-                "gpu_layers needs a GPU `device`, got cpu".into(),
-            ));
-        }
-        if !config.shards.is_empty() {
-            return Err(CucaError::Config(
-                "gpu_layers cannot be combined with tensor parallelism (`shards`)".into(),
-            ));
-        }
-        if config.drafter.is_some() {
-            return Err(CucaError::Config(
-                "gpu_layers cannot be combined with a `drafter`".into(),
-            ));
-        }
+    if config.drafter.is_some() {
+        return Err(invalid("gpu_layers cannot be combined with a `drafter`"));
     }
-    let batching = &config.batching;
+    Ok(())
+}
+
+fn validate_batching(batching: &BatchingConfig) -> Result<(), CucaError> {
     if !(1..=64).contains(&batching.max_sequences) {
-        return Err(CucaError::Config(format!(
+        return Err(invalid(format!(
             "batching.max_sequences must be in 1..=64, got {}",
             batching.max_sequences
         )));
@@ -2057,78 +2118,118 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
     if let Some(step) = batching.max_step_tokens
         && !(batching.max_sequences..=2048).contains(&step)
     {
-        return Err(CucaError::Config(format!(
+        return Err(invalid(format!(
             "batching.max_step_tokens must be in max_sequences..=2048 ({}..=2048), got {step}",
             batching.max_sequences
         )));
     }
-    if let Some(temperature) = config.sampling.temperature
-        && (!temperature.is_finite() || temperature < 0.0)
-    {
-        return Err(CucaError::Config(format!(
-            "sampling.temperature must be a finite value >= 0, got {temperature}"
-        )));
-    }
-    if let Some(top_p) = config.sampling.top_p
-        && !(top_p > 0.0 && top_p <= 1.0)
-    {
-        return Err(CucaError::Config(format!(
-            "sampling.top_p must be in (0, 1], got {top_p}"
-        )));
-    }
-    if let Some(e) = device_unavailable(config.device) {
-        return Err(e);
-    }
+    Ok(())
+}
+
+/// The in-trunk head runs on the CPU; a drafter proposes `1..=MAX_DRAFT_TOKENS`.
+fn validate_drafter(config: &LocalModelConfig) -> Result<(), CucaError> {
     if config.drafter == Some(DrafterSource::InTrunk) && config.device != LocalDevice::Cpu {
-        return Err(CucaError::Config(format!(
+        return Err(invalid(format!(
             "DrafterSource::InTrunk runs on the CPU only, not on {:?}",
             config.device
         )));
     }
     if config.drafter.is_some() && !(1..=MAX_DRAFT_TOKENS).contains(&config.draft_tokens) {
-        return Err(CucaError::Config(format!(
+        return Err(invalid(format!(
             "draft_tokens must be in 1..={MAX_DRAFT_TOKENS}, got {}",
             config.draft_tokens
         )));
     }
-    if matches!(config.experts, ExpertPlacement::Host { .. }) && config.device == LocalDevice::Cpu {
-        return Err(CucaError::Config(
-            "ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does".into(),
-        ));
-    }
-    if let ExpertPlacement::Tiered(t) = &config.experts {
-        if !(1..=MAX_LOADER_THREADS).contains(&t.loader_threads) {
-            return Err(CucaError::Config(format!(
-                "experts.loader_threads must be in 1..={MAX_LOADER_THREADS}, got {}",
-                t.loader_threads
-            )));
-        }
-        if config.device == LocalDevice::Cpu {
-            if t.device_bytes != 0 {
-                return Err(CucaError::Config(
-                    "experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu"
-                        .into(),
-                ));
-            }
-            if t.ram_bytes == 0 {
-                return Err(CucaError::Config(
-                    "experts.ram_bytes must be greater than 0 on LocalDevice::Cpu".into(),
-                ));
-            }
-        } else if t.device_bytes == 0 {
-            return Err(CucaError::Config(format!(
-                "experts.device_bytes must be greater than 0 on {:?}",
-                config.device
-            )));
-        }
-    }
     Ok(())
 }
 
-/// The GGUF path for `config.source`, downloading (and, for a checkpoint,
+/// Host experts need a GPU device; tiered budgets follow the device.
+fn validate_experts(config: &LocalModelConfig) -> Result<(), CucaError> {
+    let cpu = config.device == LocalDevice::Cpu;
+    match &config.experts {
+        ExpertPlacement::Resident => Ok(()),
+        ExpertPlacement::Host { .. } if cpu => Err(invalid(
+            "ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does",
+        )),
+        ExpertPlacement::Host { .. } => Ok(()),
+        ExpertPlacement::Tiered(t) => {
+            if !(1..=MAX_LOADER_THREADS).contains(&t.loader_threads) {
+                return Err(invalid(format!(
+                    "experts.loader_threads must be in 1..={MAX_LOADER_THREADS}, got {}",
+                    t.loader_threads
+                )));
+            }
+            if !cpu && t.device_bytes == 0 {
+                return Err(invalid(format!(
+                    "experts.device_bytes must be greater than 0 on {:?}",
+                    config.device
+                )));
+            }
+            if cpu && t.device_bytes != 0 {
+                return Err(invalid(
+                    "experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu",
+                ));
+            }
+            if cpu && t.ram_bytes == 0 {
+                return Err(invalid(
+                    "experts.ram_bytes must be greater than 0 on LocalDevice::Cpu",
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// The cache directory: [`LocalModelConfig::cache_dir`], else
+/// `CUCA_CACHE_DIR`, else the platform's.
+fn cache_root(config: &LocalModelConfig) -> Result<PathBuf, CucaError> {
+    download::resolve_cache_dir(config.cache_dir.as_deref(), &|key| std::env::var_os(key))
+}
+
+/// A private current-thread runtime and HTTP client for one download. Drop
+/// both before returning to the engine loop, which blocks on a channel and
+/// must not do so inside a runtime.
+fn download_runtime() -> Result<(tokio::runtime::Runtime, reqwest::Client), CucaError> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let client = reqwest::Client::builder()
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()?;
+    Ok((runtime, client))
+}
+
+/// Make sure `path` holds the verified `file` of `repo` at `revision`,
+/// downloading it when absent.
+fn ensure_file(
+    config: &LocalModelConfig,
+    repo: &str,
+    revision: &str,
+    file: &str,
+    sha256: Option<&str>,
+    path: &Path,
+) -> Result<(), CucaError> {
+    if path.exists() {
+        return Ok(());
+    }
+    let (runtime, client) = download_runtime()?;
+    runtime.block_on(download::ensure_downloaded(
+        &client,
+        download::HF_ENDPOINT,
+        repo,
+        revision,
+        file,
+        sha256,
+        path,
+        hf_token(config).as_deref(),
+        config.on_download_progress.as_ref(),
+    ))
+}
+
+/// The GGUF path for `source`, downloading (and, for a checkpoint,
 /// converting) it first when needed.
 ///
-/// Runs on the engine thread. The download uses a private current-thread
+/// Runs on the engine thread. A download uses a private current-thread
 /// runtime and HTTP client (never the `CucaClient` one), both dropped before
 /// returning: the engine loop later blocks on a channel, which must not happen
 /// inside a runtime. A checkpoint ([`ModelSource::Checkpoint`],
@@ -2139,124 +2240,21 @@ fn resolve_model_path(
     config: &LocalModelConfig,
     source: &ModelSource,
 ) -> Result<PathBuf, CucaError> {
-    let cache_dir =
-        || download::resolve_cache_dir(config.cache_dir.as_deref(), &|key| std::env::var_os(key));
     match source {
-        ModelSource::File(path) => {
-            if !path.is_file() {
-                return Err(CucaError::Io {
-                    message: format!("model file `{}` does not exist", path.display()),
-                });
-            }
-            let is_part = path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .and_then(convert::gguf_merge::SplitName::parse)
-                .is_some();
-            if !is_part {
-                return Ok(path.clone());
-            }
-            let cache_dir = cache_dir()?;
-            let Some(plan) = convert::gguf_merge::plan_local(&cache_dir, path)? else {
-                return Ok(path.clone());
-            };
-            convert::gguf_merge::merge(
-                &plan.parts,
-                &plan.merged,
-                config.on_download_progress.as_ref(),
-            )?;
-            Ok(plan.merged)
-        }
+        ModelSource::File(path) => resolve_file(config, path),
         ModelSource::HuggingFace {
             repo,
             revision,
             file,
             sha256,
             parts,
-            template: _,
-        } => {
-            let cache_dir = cache_dir()?;
-            let split = convert::gguf_merge::repo_parts(file);
-            if split.is_none() && !parts.is_empty() {
-                return Err(CucaError::Config(format!(
-                    "`{file}` is not named like a split GGUF part (`<base>-00001-of-0000N.gguf`) but the source lists {} parts",
-                    parts.len()
-                )));
-            }
-            let runtime = || -> Result<_, CucaError> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                let client = reqwest::Client::builder()
-                    .connect_timeout(CONNECT_TIMEOUT)
-                    .build()?;
-                Ok((runtime, client))
-            };
-            if let Some((names, merged_file)) = split {
-                let wanted: Vec<(String, Option<String>)> = if parts.is_empty() {
-                    names
-                        .iter()
-                        .enumerate()
-                        .map(|(i, n)| (n.clone(), if i == 0 { sha256.clone() } else { None }))
-                        .collect()
-                } else {
-                    let listed: Vec<&str> = parts.iter().map(|p| p.file.as_str()).collect();
-                    if listed != names.iter().map(String::as_str).collect::<Vec<_>>() {
-                        return Err(CucaError::Config(format!(
-                            "the parts of `{file}` must be {names:?} in order, got {listed:?}"
-                        )));
-                    }
-                    parts
-                        .iter()
-                        .map(|p| (p.file.clone(), p.sha256.clone()))
-                        .collect()
-                };
-                let merged = download::cached_path(&cache_dir, repo, revision, &merged_file)?;
-                if !merged.exists() {
-                    let (runtime, client) = runtime()?;
-                    runtime.block_on(download::ensure_split_downloaded(
-                        &client,
-                        download::HF_ENDPOINT,
-                        &cache_dir,
-                        repo,
-                        revision,
-                        &wanted,
-                        &merged,
-                        hf_token(config).as_deref(),
-                        config.on_download_progress.as_ref(),
-                    ))?;
-                }
-                return Ok(merged);
-            }
-            let final_path = download::cached_path(&cache_dir, repo, revision, file)?;
-            if !final_path.exists() {
-                let (runtime, client) = runtime()?;
-                runtime.block_on(download::ensure_downloaded(
-                    &client,
-                    download::HF_ENDPOINT,
-                    repo,
-                    revision,
-                    file,
-                    sha256.as_deref(),
-                    &final_path,
-                    hf_token(config).as_deref(),
-                    config.on_download_progress.as_ref(),
-                ))?;
-            }
-            Ok(final_path)
-        }
+            ..
+        } => resolve_hugging_face(config, repo, revision, file, sha256.as_deref(), parts),
         ModelSource::Checkpoint { repo, revision } => {
-            let cache_dir = cache_dir()?;
-            let quant = config.convert.quant;
-            let out = convert::output_path(&cache_dir, source, quant)?;
-            if !out.exists() {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                let client = reqwest::Client::builder()
-                    .connect_timeout(CONNECT_TIMEOUT)
-                    .build()?;
-                let checkpoint = runtime.block_on(convert::hf::fetch(
+            let cache_dir = cache_root(config)?;
+            convert_cached(config, source, &cache_dir, || {
+                let (runtime, client) = download_runtime()?;
+                runtime.block_on(convert::hf::fetch(
                     &client,
                     download::HF_ENDPOINT,
                     repo,
@@ -2264,16 +2262,8 @@ fn resolve_model_path(
                     &cache_dir,
                     hf_token(config).as_deref(),
                     config.on_download_progress.as_ref(),
-                ))?;
-                drop(runtime);
-                convert::convert(
-                    &checkpoint,
-                    &out,
-                    quant,
-                    config.on_download_progress.as_ref(),
-                )?;
-            }
-            Ok(out)
+                ))
+            })
         }
         ModelSource::Dir(dir) => {
             if !dir.is_dir() {
@@ -2281,20 +2271,135 @@ fn resolve_model_path(
                     message: format!("checkpoint directory `{}` does not exist", dir.display()),
                 });
             }
-            let quant = config.convert.quant;
-            let out = convert::output_path(&cache_dir()?, source, quant)?;
-            if !out.exists() {
-                let checkpoint = convert::hf::CheckpointDir::open(dir)?;
-                convert::convert(
-                    &checkpoint,
-                    &out,
-                    quant,
-                    config.on_download_progress.as_ref(),
-                )?;
-            }
-            Ok(out)
+            let cache_dir = cache_root(config)?;
+            convert_cached(config, source, &cache_dir, || {
+                convert::hf::CheckpointDir::open(dir)
+            })
         }
     }
+}
+
+/// A GGUF on disk; a split part is merged with its siblings first.
+fn resolve_file(config: &LocalModelConfig, path: &Path) -> Result<PathBuf, CucaError> {
+    if !path.is_file() {
+        return Err(CucaError::Io {
+            message: format!("model file `{}` does not exist", path.display()),
+        });
+    }
+    let is_part = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .and_then(convert::gguf_merge::SplitName::parse)
+        .is_some();
+    if !is_part {
+        return Ok(path.to_path_buf());
+    }
+    let Some(plan) = convert::gguf_merge::plan_local(&cache_root(config)?, path)? else {
+        return Ok(path.to_path_buf());
+    };
+    convert::gguf_merge::merge(
+        &plan.parts,
+        &plan.merged,
+        config.on_download_progress.as_ref(),
+    )?;
+    Ok(plan.merged)
+}
+
+/// A file of a Hugging Face repository, downloaded and verified into the
+/// cache; a split GGUF downloads every part and merges them.
+fn resolve_hugging_face(
+    config: &LocalModelConfig,
+    repo: &str,
+    revision: &str,
+    file: &str,
+    sha256: Option<&str>,
+    parts: &[ModelPart],
+) -> Result<PathBuf, CucaError> {
+    let cache_dir = cache_root(config)?;
+    let Some((names, merged_file)) = convert::gguf_merge::repo_parts(file) else {
+        if !parts.is_empty() {
+            return Err(invalid(format!(
+                "`{file}` is not named like a split GGUF part (`<base>-00001-of-0000N.gguf`) but the source lists {} parts",
+                parts.len()
+            )));
+        }
+        let path = download::cached_path(&cache_dir, repo, revision, file)?;
+        ensure_file(config, repo, revision, file, sha256, &path)?;
+        return Ok(path);
+    };
+    let wanted = split_parts(file, &names, sha256, parts)?;
+    let merged = download::cached_path(&cache_dir, repo, revision, &merged_file)?;
+    if !merged.exists() {
+        let (runtime, client) = download_runtime()?;
+        runtime.block_on(download::ensure_split_downloaded(
+            &client,
+            download::HF_ENDPOINT,
+            &cache_dir,
+            repo,
+            revision,
+            &wanted,
+            &merged,
+            hf_token(config).as_deref(),
+            config.on_download_progress.as_ref(),
+        ))?;
+    }
+    Ok(merged)
+}
+
+/// The `(file, sha256)` of every part of the split GGUF `file` (`names`, in
+/// order): the listed `parts`, which must be exactly `names`, or `names` with
+/// only the first part verified (by `first_sha256`) when none are listed.
+fn split_parts(
+    file: &str,
+    names: &[String],
+    first_sha256: Option<&str>,
+    parts: &[ModelPart],
+) -> Result<Vec<(String, Option<String>)>, CucaError> {
+    if parts.is_empty() {
+        return Ok(names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| {
+                (
+                    name.clone(),
+                    first_sha256.filter(|_| i == 0).map(String::from),
+                )
+            })
+            .collect());
+    }
+    let listed = || parts.iter().map(|p| p.file.as_str());
+    if !listed().eq(names.iter().map(String::as_str)) {
+        return Err(invalid(format!(
+            "the parts of `{file}` must be {names:?} in order, got {:?}",
+            listed().collect::<Vec<_>>()
+        )));
+    }
+    Ok(parts
+        .iter()
+        .map(|p| (p.file.clone(), p.sha256.clone()))
+        .collect())
+}
+
+/// The converted GGUF of a checkpoint `source` under `cache_dir`; `open`
+/// supplies the checkpoint, only when it is not converted yet.
+fn convert_cached(
+    config: &LocalModelConfig,
+    source: &ModelSource,
+    cache_dir: &Path,
+    open: impl FnOnce() -> Result<convert::hf::CheckpointDir, CucaError>,
+) -> Result<PathBuf, CucaError> {
+    let quant = config.convert.quant;
+    let out = convert::output_path(cache_dir, source, quant)?;
+    if !out.exists() {
+        let checkpoint = open()?;
+        convert::convert(
+            &checkpoint,
+            &out,
+            quant,
+            config.on_download_progress.as_ref(),
+        )?;
+    }
+    Ok(out)
 }
 
 /// The chat template that replaces the GGUF's, if any:
@@ -2313,34 +2418,21 @@ fn resolve_chat_template(config: &LocalModelConfig) -> Result<Option<String>, Cu
     else {
         return Ok(None);
     };
-    let cache_dir =
-        download::resolve_cache_dir(config.cache_dir.as_deref(), &|key| std::env::var_os(key))?;
-    let path = download::cached_path(&cache_dir, &t.repo, &t.revision, &t.file)?;
-    if !path.exists() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()?;
-        let client = reqwest::Client::builder()
-            .connect_timeout(CONNECT_TIMEOUT)
-            .build()?;
-        runtime.block_on(download::ensure_downloaded(
-            &client,
-            download::HF_ENDPOINT,
-            &t.repo,
-            &t.revision,
-            &t.file,
-            t.sha256.as_deref(),
-            &path,
-            hf_token(config).as_deref(),
-            config.on_download_progress.as_ref(),
-        ))?;
-    }
+    let path = download::cached_path(&cache_root(config)?, &t.repo, &t.revision, &t.file)?;
+    ensure_file(
+        config,
+        &t.repo,
+        &t.revision,
+        &t.file,
+        t.sha256.as_deref(),
+        &path,
+    )?;
     let bytes = std::fs::read(&path).map_err(|e| CucaError::Io {
         message: format!("reading chat template `{}`: {e}", path.display()),
     })?;
     String::from_utf8(bytes)
         .map(Some)
-        .map_err(|_| CucaError::Config(format!("chat template `{}` is not UTF-8", path.display())))
+        .map_err(|_| invalid(format!("chat template `{}` is not UTF-8", path.display())))
 }
 
 /// The Hugging Face token: the configured one, else `HF_TOKEN`.
@@ -2388,19 +2480,11 @@ impl CucaClient {
             .local_model()
             .ok_or_else(|| CucaError::Config(MODEL_REQUIRED.into()))?;
         let inner = &model.inner;
-        if let Some(t) = req.temperature
-            && (!t.is_finite() || t < 0.0)
-        {
-            return Err(CucaError::Config(format!(
-                "temperature must be a finite value >= 0, got {t}"
-            )));
+        if let Some(temperature) = req.temperature {
+            check_temperature("temperature", temperature)?;
         }
-        if let Some(p) = req.top_p
-            && (!p.is_finite() || p <= 0.0 || p > 1.0)
-        {
-            return Err(CucaError::Config(format!(
-                "top_p must be a finite value in (0, 1], got {p}"
-            )));
+        if let Some(top_p) = req.top_p {
+            check_top_p("top_p", top_p)?;
         }
 
         let prompt = chat_prompt(&req)?;
@@ -2480,6 +2564,32 @@ mod tests {
             .with_local_model(model)
             .build()
             .expect("client builds")
+    }
+
+    /// The default configuration with `edit` applied.
+    fn config_with(edit: impl FnOnce(&mut LocalModelConfig)) -> LocalModelConfig {
+        let mut config = LocalModelConfig::default();
+        edit(&mut config);
+        config
+    }
+
+    /// `ExpertPlacement::Tiered` with these budgets and no warm start.
+    fn tiers(ram_bytes: u64, device_bytes: u64, loader_threads: usize) -> ExpertPlacement {
+        ExpertPlacement::Tiered(ExpertTiers {
+            ram_bytes,
+            device_bytes,
+            loader_threads,
+            warm_from: None,
+        })
+    }
+
+    /// `validate` rejects `config` with a configuration error naming `needle`.
+    fn assert_rejected(config: &LocalModelConfig, needle: &str) {
+        let err = validate(config).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains(needle)),
+            "{needle}: {err}"
+        );
     }
 
     #[test]
@@ -2776,107 +2886,142 @@ mod tests {
         assert!(text.contains("DownloadProgressCallback(..)"), "{text}");
     }
 
-    #[tokio::test]
-    async fn load_rejects_invalid_configuration() {
-        for (config, needle) in [
+    #[test]
+    fn validate_rejects_invalid_values() {
+        let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
+        let cases = [
             (
-                LocalModelConfig {
-                    context_length: Some(0),
-                    ..Default::default()
-                },
-                "context_length",
+                config_with(|c| c.context_length = Some(0)),
+                "context_length must be at least 1",
             ),
             (
-                LocalModelConfig {
-                    sampling: SamplingConfig {
-                        temperature: Some(f32::NAN),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                "temperature",
+                config_with(|c| c.sampling.temperature = Some(f32::NAN)),
+                "sampling.temperature",
             ),
             (
-                LocalModelConfig {
-                    sampling: SamplingConfig {
-                        temperature: Some(-0.5),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                "temperature",
+                config_with(|c| c.sampling.temperature = Some(-0.5)),
+                "sampling.temperature",
             ),
             (
-                LocalModelConfig {
-                    sampling: SamplingConfig {
-                        top_p: Some(0.0),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                "top_p",
+                config_with(|c| c.sampling.top_p = Some(0.0)),
+                "sampling.top_p",
             ),
             (
-                LocalModelConfig {
-                    sampling: SamplingConfig {
-                        top_p: Some(1.5),
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                },
-                "top_p",
+                config_with(|c| c.sampling.top_p = Some(1.5)),
+                "sampling.top_p",
             ),
             (
-                LocalModelConfig {
-                    experts: ExpertPlacement::Tiered(ExpertTiers {
-                        ram_bytes: 1 << 30,
-                        loader_threads: 0,
-                        ..ExpertTiers::default()
-                    }),
-                    ..Default::default()
-                },
+                config_with(|c| c.sampling.top_p = Some(f32::NAN)),
+                "sampling.top_p",
+            ),
+            (
+                config_with(|c| c.batching.max_sequences = 0),
+                "batching.max_sequences",
+            ),
+            (
+                config_with(|c| c.batching.max_sequences = 65),
+                "batching.max_sequences",
+            ),
+            (
+                config_with(|c| c.batching.max_step_tokens = Some(3)),
+                "batching.max_step_tokens",
+            ),
+            (
+                config_with(|c| c.batching.max_step_tokens = Some(2049)),
+                "batching.max_step_tokens",
+            ),
+            (
+                config_with(|c| {
+                    c.drafter = Some(DrafterSource::InTrunk);
+                    c.draft_tokens = 0;
+                }),
+                "draft_tokens must be in 1..=16",
+            ),
+            (
+                config_with(|c| {
+                    c.drafter = Some(DrafterSource::InTrunk);
+                    c.draft_tokens = MAX_DRAFT_TOKENS + 1;
+                }),
+                "draft_tokens must be in 1..=16",
+            ),
+            (
+                config_with(|c| c.experts = tiers(1 << 30, 0, 0)),
                 "experts.loader_threads must be in 1..=64, got 0",
             ),
             (
-                LocalModelConfig {
-                    experts: ExpertPlacement::Tiered(ExpertTiers {
-                        ram_bytes: 1 << 30,
-                        device_bytes: 1 << 30,
-                        ..ExpertTiers::default()
-                    }),
-                    ..Default::default()
-                },
+                config_with(|c| c.experts = tiers(1 << 30, 1 << 30, 4)),
                 "experts.device_bytes is for GPU devices",
             ),
             (
-                LocalModelConfig {
-                    experts: ExpertPlacement::Tiered(ExpertTiers::default()),
-                    ..Default::default()
-                },
+                config_with(|c| c.experts = tiers(0, 0, 4)),
                 "experts.ram_bytes must be greater than 0",
             ),
-        ] {
-            let err = LocalModel::load(config).await.unwrap_err();
-            assert!(
-                matches!(&err, CucaError::Config(m) if m.contains(needle)),
-                "{err}"
-            );
+            (
+                config_with(|c| c.experts = ExpertPlacement::Host { layers: None }),
+                "ExpertPlacement::Host",
+            ),
+            (
+                config_with(|c| c.gpu_layers = Some(4)),
+                "gpu_layers needs a GPU `device`",
+            ),
+            // The CPU cannot be a shard or the first device of a split model.
+            (
+                config_with(|c| c.shards = vec![vulkan]),
+                "tensor parallelism",
+            ),
+            (
+                config_with(|c| {
+                    c.device = vulkan;
+                    c.shards = vec![LocalDevice::Cpu];
+                }),
+                "tensor parallelism",
+            ),
+        ];
+        for (config, needle) in &cases {
+            assert_rejected(config, needle);
         }
     }
 
     #[test]
+    fn validate_accepts_the_boundaries() {
+        assert!(validate(&LocalModelConfig::default()).is_ok());
+        for text in ["seqs=1", "seqs=64,step=64", "step=2048", "kv=1"] {
+            let config = config_with(|c| c.batching = text.parse().unwrap());
+            assert!(validate(&config).is_ok(), "{text}");
+        }
+        // The in-trunk head runs on the CPU.
+        for draft_tokens in [1, MAX_DRAFT_TOKENS] {
+            let config = config_with(|c| {
+                c.drafter = Some(DrafterSource::InTrunk);
+                c.draft_tokens = draft_tokens;
+            });
+            assert!(validate(&config).is_ok(), "{draft_tokens}");
+        }
+        // Without a drafter `draft_tokens` is ignored.
+        assert!(validate(&config_with(|c| c.draft_tokens = 0)).is_ok());
+        assert!(validate(&config_with(|c| c.experts = tiers(1 << 20, 0, 64))).is_ok());
+    }
+
+    #[tokio::test]
+    async fn load_rejects_an_invalid_configuration_before_starting_the_engine() {
+        let config = config_with(|c| c.context_length = Some(0));
+        let err = LocalModel::load(config).await.unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("context_length")),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn expert_placement_parses_every_form() {
-        let tiers = |ram_bytes, device_bytes, loader_threads| {
-            ExpertPlacement::Tiered(ExpertTiers {
-                ram_bytes,
-                device_bytes,
-                loader_threads,
-                warm_from: None,
-            })
-        };
         for (text, placement) in [
             ("resident", ExpertPlacement::Resident),
             (" Resident ", ExpertPlacement::Resident),
+            ("host", ExpertPlacement::Host { layers: None }),
+            (
+                " HOST:layers=20 ",
+                ExpertPlacement::Host { layers: Some(20) },
+            ),
             ("tiered:ram=4g", tiers(4 << 30, 0, 4)),
             ("tiered:ram=1100M", tiers(1100 << 20, 0, 4)),
             ("tiered:ram=512k,threads=8", tiers(512 << 10, 0, 8)),
@@ -2904,6 +3049,13 @@ mod tests {
             "tiered:ram=1g,threads=x",
             "tiered:ram=99999999999g",
             "resident:ram=1g",
+            "host:",
+            "host:layers=",
+            "host:layers=x",
+            "host:layers=-1",
+            "host:layers=1,layers=2",
+            "host:ram=1g",
+            "hosted",
         ] {
             let err = bad.parse::<ExpertPlacement>().unwrap_err();
             assert!(
@@ -2914,42 +3066,26 @@ mod tests {
     }
 
     #[test]
-    fn batching_parses_every_subset_and_validates_its_bounds() {
-        let default = BatchingConfig::default();
-        assert_eq!(
-            (
-                default.max_sequences,
-                default.kv_tokens,
-                default.max_step_tokens
-            ),
-            (4, None, None)
-        );
-        assert!(default.prefix_cache);
-        for (text, seqs, kv, step, prefix) in [
-            ("", 4, None, None, true),
-            ("seqs=8", 8, None, None, true),
-            (" SEQS=2, kv=16384 ", 2, Some(16384), None, true),
+    fn batching_parses_every_subset() {
+        let batching = |max_sequences, kv_tokens, max_step_tokens, prefix_cache| BatchingConfig {
+            max_sequences,
+            kv_tokens,
+            max_step_tokens,
+            prefix_cache,
+        };
+        assert_eq!(BatchingConfig::default(), batching(4, None, None, true));
+        for (text, expected) in [
+            ("", BatchingConfig::default()),
+            ("seqs=8", batching(8, None, None, true)),
+            (" SEQS=2,kv=16384 ", batching(2, Some(16384), None, true)),
             (
                 "seqs=4,kv=8192,step=128,prefix=off",
-                4,
-                Some(8192),
-                Some(128),
-                false,
+                batching(4, Some(8192), Some(128), false),
             ),
-            ("prefix=on,step=64", 4, None, Some(64), true),
-            ("prefix=false", 4, None, None, false),
+            ("prefix=on,step=64", batching(4, None, Some(64), true)),
+            ("prefix=false", batching(4, None, None, false)),
         ] {
-            let parsed = text.replace(' ', "").parse::<BatchingConfig>().unwrap();
-            assert_eq!(
-                (
-                    parsed.max_sequences,
-                    parsed.kv_tokens,
-                    parsed.max_step_tokens,
-                    parsed.prefix_cache
-                ),
-                (seqs, kv, step, prefix),
-                "{text}"
-            );
+            assert_eq!(text.parse::<BatchingConfig>().unwrap(), expected, "{text}");
         }
         for bad in [
             "seqs",
@@ -2965,24 +3101,6 @@ mod tests {
                 matches!(&err, CucaError::Config(m) if m.contains("unknown batching")),
                 "{bad}: {err}"
             );
-        }
-        let with = |batching: BatchingConfig| LocalModelConfig {
-            batching,
-            ..LocalModelConfig::default()
-        };
-        let rejected = |text: &str| {
-            let err = validate(&with(text.parse().unwrap())).unwrap_err();
-            assert!(
-                matches!(&err, CucaError::Config(m) if m.contains("batching")),
-                "{text}: {err}"
-            );
-        };
-        rejected("seqs=0");
-        rejected("seqs=65");
-        rejected("seqs=4,step=3");
-        rejected("step=2049");
-        for ok in ["seqs=1", "seqs=64,step=64", "step=2048", "kv=1"] {
-            assert!(validate(&with(ok.parse().unwrap())).is_ok(), "{ok}");
         }
     }
 
@@ -3024,42 +3142,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(feature = "provider-local-vulkan"))]
-    #[tokio::test]
-    async fn validate_rejects_a_compiled_out_device() {
-        let config = LocalModelConfig {
-            device: LocalDevice::Vulkan(GpuAdapter::Default),
-            ..Default::default()
-        };
-        let err = LocalModel::load(config).await.unwrap_err();
-        assert!(
-            matches!(&err, CucaError::Config(m) if m.contains("`provider-local-vulkan`")),
-            "{err}"
-        );
-    }
-
-    /// The in-trunk head runs on the CPU only: a GPU device is a
-    /// configuration error, naming the missing backend feature when it is
-    /// compiled out and the CPU restriction otherwise; the CPU is accepted.
-    #[tokio::test]
-    async fn validate_rejects_the_in_trunk_head_on_a_gpu() {
-        let config = LocalModelConfig {
-            device: LocalDevice::Vulkan(GpuAdapter::Default),
-            drafter: Some(DrafterSource::InTrunk),
-            ..Default::default()
-        };
-        let err = LocalModel::load(config).await.unwrap_err();
-        assert!(
-            matches!(&err, CucaError::Config(m) if m.contains("`provider-local-vulkan`") || m.contains("CPU only")),
-            "{err}"
-        );
-        let cpu = LocalModelConfig {
-            drafter: Some(DrafterSource::InTrunk),
-            ..Default::default()
-        };
-        assert!(validate(&cpu).is_ok());
-    }
-
     #[test]
     fn devices_parse_from_a_plus_separated_list() {
         let mut config = LocalModelConfig::default();
@@ -3093,139 +3175,117 @@ mod tests {
         }
     }
 
+    /// The rules that need a GPU device. With the Vulkan backend compiled
+    /// out, every one of them reports the missing feature instead.
     #[test]
-    fn validate_enforces_the_tensor_parallel_rules() {
-        let config = |device, shards: &[LocalDevice]| LocalModelConfig {
-            device,
-            shards: shards.to_vec(),
-            ..LocalModelConfig::default()
-        };
+    fn validate_enforces_the_gpu_rules() {
         let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
-        let rejects = |config: LocalModelConfig, what: &str| {
-            let err = validate(&config).unwrap_err();
-            assert!(
-                matches!(&err, CucaError::Config(m) if m.contains(what)),
-                "{what}: {err}"
-            );
-        };
-        // No shards: the single-device rules only.
-        assert!(validate(&config(LocalDevice::Cpu, &[])).is_ok());
-        // The CPU cannot be a shard or a first device of a split model.
-        rejects(config(vulkan, &[LocalDevice::Cpu]), "tensor parallelism");
-        rejects(config(LocalDevice::Cpu, &[vulkan]), "tensor parallelism");
-        // A backend that is compiled out names its feature.
         #[cfg(not(feature = "provider-local-vulkan"))]
-        rejects(config(vulkan, &[vulkan]), "`provider-local-vulkan`");
+        {
+            let feature = "`provider-local-vulkan`";
+            assert_rejected(&config_with(|c| c.device = vulkan), feature);
+            assert_rejected(
+                &config_with(|c| {
+                    c.device = vulkan;
+                    c.drafter = Some(DrafterSource::InTrunk);
+                }),
+                feature,
+            );
+            assert_rejected(
+                &config_with(|c| {
+                    c.device = vulkan;
+                    c.shards = vec![vulkan];
+                }),
+                feature,
+            );
+            assert_rejected(
+                &config_with(|c| {
+                    c.device = vulkan;
+                    c.gpu_layers = Some(4);
+                }),
+                feature,
+            );
+        }
         #[cfg(feature = "provider-local-vulkan")]
         {
-            assert!(
-                validate(&config(vulkan, &[vulkan])).is_ok(),
-                "a device may repeat"
-            );
-            let two = config(
-                vulkan,
-                &[vulkan, LocalDevice::Vulkan(GpuAdapter::Discrete(1))],
-            );
+            // Tensor parallelism: a device may repeat.
+            fn split(edit: impl FnOnce(&mut LocalModelConfig)) -> LocalModelConfig {
+                let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
+                config_with(|c| {
+                    c.device = vulkan;
+                    c.shards = vec![vulkan];
+                    edit(c);
+                })
+            }
+            assert!(validate(&split(|_| {})).is_ok());
+            let two = config_with(|c| {
+                c.device = vulkan;
+                c.shards = vec![vulkan, LocalDevice::Vulkan(GpuAdapter::Discrete(1))];
+            });
             assert!(validate(&two).is_ok());
-            let mut drafted = config(vulkan, &[vulkan]);
-            drafted.drafter = Some(DrafterSource::InTrunk);
-            rejects(drafted, "drafter");
-            let mut tiered = config(vulkan, &[vulkan]);
-            tiered.experts = "tiered:device=1g".parse().unwrap();
-            rejects(tiered, "tiered experts");
+            assert_rejected(
+                &split(|c| c.drafter = Some(DrafterSource::InTrunk)),
+                "drafter",
+            );
+            assert_rejected(
+                &split(|c| c.experts = tiers(0, 1 << 30, 4)),
+                "tiered experts",
+            );
+            assert_rejected(
+                &split(|c| c.experts = ExpertPlacement::Host { layers: None }),
+                "host experts",
+            );
+            // The in-trunk head runs on the CPU only.
+            assert_rejected(
+                &config_with(|c| {
+                    c.device = vulkan;
+                    c.drafter = Some(DrafterSource::InTrunk);
+                }),
+                "CPU only",
+            );
+            // Layer offload.
+            fn offload(edit: impl FnOnce(&mut LocalModelConfig)) -> LocalModelConfig {
+                config_with(|c| {
+                    c.device = LocalDevice::Vulkan(GpuAdapter::Default);
+                    c.gpu_layers = Some(4);
+                    edit(c);
+                })
+            }
+            assert!(validate(&offload(|_| {})).is_ok());
+            assert!(validate(&offload(|c| c.gpu_layers = Some(0))).is_ok());
+            assert_rejected(
+                &offload(|c| c.shards = vec![vulkan]),
+                "gpu_layers cannot be combined with tensor parallelism",
+            );
+            assert_rejected(
+                &offload(|c| {
+                    c.drafter = Some(DrafterSource::File(ModelSource::File("d.gguf".into())));
+                }),
+                "gpu_layers cannot be combined with a `drafter`",
+            );
+            // Host experts need a GPU; tiered ones a device budget.
+            let experts = |experts| {
+                config_with(|c| {
+                    c.device = vulkan;
+                    c.experts = experts;
+                })
+            };
+            assert!(validate(&experts(ExpertPlacement::Host { layers: None })).is_ok());
+            assert!(validate(&experts(tiers(0, 1 << 30, 4))).is_ok());
+            assert_rejected(
+                &experts(tiers(0, 0, 4)),
+                "experts.device_bytes must be greater than 0",
+            );
         }
         // Different backends do not mix (when both are compiled in).
         #[cfg(all(feature = "provider-local-vulkan", feature = "provider-local-metal"))]
-        rejects(
-            config(vulkan, &[LocalDevice::Metal(GpuAdapter::Default)]),
+        assert_rejected(
+            &config_with(|c| {
+                c.device = vulkan;
+                c.shards = vec![LocalDevice::Metal(GpuAdapter::Default)];
+            }),
             "same GPU backend",
         );
-    }
-
-    #[test]
-    fn host_expert_placement_parses_and_is_validated() {
-        let host = |s: &str| s.parse::<ExpertPlacement>();
-        assert_eq!(
-            host("host").unwrap(),
-            ExpertPlacement::Host { layers: None }
-        );
-        assert_eq!(
-            host(" HOST:layers=20 ").unwrap(),
-            ExpertPlacement::Host { layers: Some(20) }
-        );
-        for bad in [
-            "host:",
-            "host:layers=",
-            "host:layers=x",
-            "host:layers=-1",
-            "host:ram=1g",
-            "hosted",
-        ] {
-            assert!(host(bad).is_err(), "{bad}");
-        }
-        // The CPU already computes its experts from RAM.
-        let cpu = LocalModelConfig {
-            experts: ExpertPlacement::Host { layers: None },
-            ..LocalModelConfig::default()
-        };
-        let err = validate(&cpu).unwrap_err();
-        assert!(
-            matches!(&err, CucaError::Config(m) if m.contains("ExpertPlacement::Host")),
-            "{err}"
-        );
-        // Tensor parallelism keeps experts resident.
-        #[cfg(feature = "provider-local-vulkan")]
-        {
-            let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
-            let mut config = LocalModelConfig {
-                device: vulkan,
-                experts: ExpertPlacement::Host { layers: None },
-                ..LocalModelConfig::default()
-            };
-            assert!(validate(&config).is_ok());
-            config.shards = vec![vulkan];
-            assert!(validate(&config).is_err());
-        }
-    }
-
-    #[test]
-    fn validate_enforces_the_layer_offload_rules() {
-        let config = |device, gpu_layers| LocalModelConfig {
-            device,
-            gpu_layers,
-            ..LocalModelConfig::default()
-        };
-        let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
-        let rejects = |config: LocalModelConfig, what: &str| {
-            let err = validate(&config).unwrap_err();
-            assert!(
-                matches!(&err, CucaError::Config(m) if m.contains(what)),
-                "{what}: {err}"
-            );
-        };
-        // Offload needs a GPU to offload to.
-        rejects(
-            config(LocalDevice::Cpu, Some(4)),
-            "gpu_layers needs a GPU `device`",
-        );
-        assert!(validate(&config(LocalDevice::Cpu, None)).is_ok());
-        // A backend that is compiled out names its feature.
-        #[cfg(not(feature = "provider-local-vulkan"))]
-        rejects(config(vulkan, Some(4)), "`provider-local-vulkan`");
-        #[cfg(feature = "provider-local-vulkan")]
-        {
-            assert!(validate(&config(vulkan, Some(4))).is_ok());
-            assert!(validate(&config(vulkan, Some(0))).is_ok());
-            let mut shards = config(vulkan, Some(4));
-            shards.shards = vec![vulkan];
-            rejects(
-                shards,
-                "gpu_layers cannot be combined with tensor parallelism",
-            );
-            let mut drafted = config(vulkan, Some(4));
-            drafted.drafter = Some(DrafterSource::File(ModelSource::File("d.gguf".into())));
-            rejects(drafted, "gpu_layers cannot be combined with a `drafter`");
-        }
     }
 
     #[test]
@@ -3277,10 +3337,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn dispatch_without_a_model_is_a_config_error() {
-        // `build` refuses `Local` without a model, so build for another
-        // provider and re-select `Local` is impossible; assert the build check.
+    #[test]
+    fn a_local_client_without_a_model_does_not_build() {
+        // `build` refuses `Local` without a model; `dispatch_local` repeats
+        // the check with the same message.
         let err = CucaClient::builder()
             .with_provider(ProviderEndpoint::Local)
             .build()
@@ -3434,15 +3494,5 @@ mod tests {
         while let Some(item) = stream.next().await {
             let _ = item;
         }
-    }
-
-    #[tokio::test]
-    async fn debug_prints_the_context_length() {
-        let file = write_tiny_model();
-        let model = tiny_model(&file, 32).await;
-        assert_eq!(
-            format!("{model:?}"),
-            "LocalModel { context_length: 32, .. }"
-        );
     }
 }

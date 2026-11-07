@@ -236,7 +236,7 @@ At load, once the file is open, `LocalModel::load` also fails with `CucaError::C
 - `warm_from` of another shape: `experts.warm_from is heat for AxB experts; this model has CxD`, with layers by experts.
 - A model without experts: ``expert tiers need a mixture-of-experts model; `llama` has no experts``.
 
-`str::parse` on an unknown placement returns ``CucaError::Config("unknown expert placement `...`; expected resident or tiered:ram=<size>[,device=<size>][,threads=<n>]")``.
+`str::parse` on an unknown placement returns ``CucaError::Config("unknown expert placement `...`; expected resident, host[:layers=<n>] or tiered:ram=<size>[,device=<size>][,threads=<n>]")``.
 
 An expert read that fails while generating (a truncated file, for example) fails the request with a `CucaError::Provider` item in the stream.
 
