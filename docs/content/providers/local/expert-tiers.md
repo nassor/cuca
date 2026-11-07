@@ -200,7 +200,7 @@ CPU: Ryzen 9 9950X3D2 with 125 GB of RAM, release build with `RUSTFLAGS="-C targ
 | `qwen3-30b-a3b-q4_0` | resident, 17.4 GB of RAM | 12.3 | not applicable |
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=4g`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.641 cold, 0.686 warm |
 | `qwen3-30b-a3b-q4_0` | `tiered:ram=1100m`, 9 of 128 experts per layer | 6.2 cold, 5.3 warm | 0.381 cold, 0.383 warm |
-| `qwen3.6-35b-a3b-q4_0` | resident, 18.9 GiB peak resident set | 14.7 and 14.9 | not applicable |
+| `qwen3.6-35b-a3b-q4_0` | resident, 18.9 GiB peak resident set in this test | 14.7 and 14.9 | not applicable |
 | `qwen3.6-35b-a3b-q4_0` | `tiered:ram=4g`, 60 of 256 experts per layer | 7.4 cold, 7.1 warm | 0.661 cold, 0.708 warm |
 | `qwen3.6-35b-a3b-q4_0` | `tiered:ram=600m`, 8 of 256 experts per layer | 6.3 cold, 6.2 warm | 0.307 cold, 0.308 warm |
 | `mistral-small-4-119b-q4_0` | resident, 67.7 GB of RAM | 8.7 | not applicable |
@@ -208,7 +208,7 @@ CPU: Ryzen 9 9950X3D2 with 125 GB of RAM, release build with `RUSTFLAGS="-C targ
 | `mistral-small-4-119b-q4_0` | `tiered:ram=8g`, 16 of 128 experts per layer | 1.1 cold, 1.8 warm | 0.310 cold, 0.337 warm |
 
 - Mistral Small 4 is 67.7 GB next to 125 GB of RAM, so only part of the file stayed in the page cache. One expert of all 36 layers is 511.7 MB. The cold run at `ram=48g` read 4,618 experts (65.7 GB) out of 26,205 lookups, and the cold run at `ram=8g` read 18,081 (257 GB).
-- Qwen3.6-35B-A3B: the cold runs read 18,861 experts (33.6 GB) at `ram=4g` and 38,510 (68.5 GB) at `ram=600m`, out of 55,597 lookups, from a file that was in the OS page cache. A 1,024-token reply (`examples/local_model.rs`) peaked at 18.8 GiB of resident set with resident experts, 5.95 GiB at `ram=4g` and 2.43 GiB at `ram=600m`. The model loaded in 8.3 s resident against 0.8 s tiered.
+- Qwen3.6-35B-A3B: the cold runs read 18,861 experts (33.6 GB) at `ram=4g` and 38,510 (68.5 GB) at `ram=600m`, out of 55,597 lookups, from a file that was in the OS page cache. In a separate run of one 1,024-token reply (`examples/local_model.rs`) the peak resident set was 18.8 GiB with resident experts, 5.95 GiB at `ram=4g` and 2.43 GiB at `ram=600m`. The model loaded in 8.3 s resident against 0.8 s tiered.
 
 Vulkan: RX 9070 XT with 15.9 GiB, Windows, release build. The rates include the kernel tuning that each new matrix shape pays on first use, which a short run does not amortize.
 
