@@ -22,9 +22,10 @@
 //! 3).
 //!
 //! `CUCA_LOCAL_ALLOW_MISMATCH=1` reports a CPU output that differs from plain
-//! decoding (`identical false`) instead of failing the test: the live timing
-//! of a 67 GB model on a machine whose separate loads sometimes differ by a
-//! flipped bit (`docs/content/providers/local/drafting.md`, machine note).
+//! decoding (`identical false`) instead of failing the test. It is for timing
+//! a target so large (67 GB) that two loads of it on one machine can differ
+//! by a flipped bit, which breaks the exactness check without a speculation
+//! fault.
 //!
 //! With the target or the drafter missing the test prints `SKIP` and passes,
 //! unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build for the host
@@ -136,8 +137,8 @@ async fn drafter_output_equals_plain_greedy_decoding() {
             // A GPU's batched rows differ from single steps by float rounding,
             // which can flip a near-tie: report identity there instead of
             // asserting it. `CUCA_LOCAL_ALLOW_MISMATCH=1` reports it on the
-            // CPU too, for timing a machine whose separate loads of one big
-            // model differ by a flipped bit (see the docs' machine note).
+            // CPU too, for timing a target so large that separate loads of it
+            // can differ by a flipped bit.
             if exact && !allow_mismatch {
                 assert_eq!(
                     &got, expected,

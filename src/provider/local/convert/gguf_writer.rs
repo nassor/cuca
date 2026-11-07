@@ -2,10 +2,10 @@
 //!
 //! The converter knows every tensor's name, shape and storage type before it
 //! reads any weight (from the safetensors headers and the name mapping), so
-//! the whole header - magic, counts, the key/value section and the tensor
-//! infos - is written first by [`GgufWriter::start`], and the tensor data
-//! follows one tensor at a time through [`GgufWriter::write`]: peak memory is
-//! one chunk of one tensor, never the model. Data is aligned to
+//! the whole header (magic, counts, the key/value section and the tensor
+//! infos) is written first by [`GgufWriter::start`], and the tensor data
+//! follows one tensor at a time through [`GgufWriter::write`]: the writer
+//! itself holds no tensor data, so the model is never resident. Data is aligned to
 //! `general.alignment` (32) between tensors and before the first one, exactly
 //! as `candle_core::quantized::gguf_file::write` lays a file out, so
 //! `gguf_file::Content::read` loads either.

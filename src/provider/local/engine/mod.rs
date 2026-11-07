@@ -355,8 +355,9 @@ fn take_block_draft(a_j: f64, e_prev: f64, t_j: f64, t_next: f64, f: f64) -> boo
 
 /// Decides, round by round, whether to draft: speculation runs only while its
 /// measured throughput (tokens per second of a draft-plus-verify round,
-/// acceptance and device costs included) is at least that of plain decoding,
-/// so the worst case is plain decoding plus the cost of occasional probes.
+/// acceptance and device costs included) is at least `MARGIN` (2 %) above
+/// that of plain decoding, so the worst case is plain decoding plus the cost
+/// of occasional probes.
 ///
 /// It measures plain decoding first (two rounds after a discarded warm-up),
 /// then speculation. While plain decoding is faster it re-probes with two

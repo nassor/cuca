@@ -1,6 +1,15 @@
 //! CUCA: Compact Universal Client for Agents.
-//! Unified, zero-default async LLM client: a pipeline-plugin tier and an
-//! explicit-call service tier over one provider abstraction.
+//!
+//! A zero-default async LLM client: no provider, plugin or service is
+//! compiled in until its cargo feature is enabled, and a build without any
+//! `provider-*` feature fails with a `compile_error!`. Requests are built as a
+//! [`UnifiedRequest`], sent through [`CucaClient`], and answered as a stream of
+//! content blocks.
+//!
+//! Two tiers sit on top of the provider layer. Plugins (`plugin-*`, module
+//! [`plugins`]) run as pipeline hooks on every request. Services (`service-*`,
+//! module [`services`]) are driven by direct method calls and never implement
+//! [`CucaPlugin`](plugin::CucaPlugin).
 
 #![forbid(unsafe_code)]
 #[cfg(not(any(

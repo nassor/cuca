@@ -3,8 +3,8 @@
 //! Routes `provider-vllm` requests through the shared
 //! [`openai_compat`](crate::provider::openai_compat) adapter: vLLM exposes the
 //! same `/v1/chat/completions` `data:`-SSE contract as OpenAI. It differs only
-//! in the default base URL (`http://127.0.0.1:8000`) and that the API key is
-//! an optional header rather than a required bearer token.
+//! in the default base URL (`http://127.0.0.1:8000/v1`) and in that the API
+//! key is optional: a bearer token is sent only when one is configured.
 //!
 //! vLLM emits `reasoning_content` for reasoning models; that field flows
 //! through the shared translator's `Thinking` mapping at no extra cost.

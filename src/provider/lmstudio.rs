@@ -3,8 +3,9 @@
 //! Routes `provider-lmstudio` requests through the shared
 //! [`openai_compat`](crate::provider::openai_compat) adapter: LM Studio serves
 //! the OpenAI-compatible `/v1/chat/completions` `data:`-SSE contract. It
-//! differs only in the default base URL (`http://127.0.0.1:1234`) and that the
-//! API key is an optional header rather than a required bearer token.
+//! differs only in the default base URL (`http://127.0.0.1:1234/v1`) and in
+//! that the API key is optional: a bearer token is sent only when one is
+//! configured.
 //!
 //! LM Studio can emit `reasoning_content` for reasoning models; that field
 //! flows through the shared translator's `Thinking` mapping at no extra cost.

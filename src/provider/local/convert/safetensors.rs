@@ -5,8 +5,8 @@
 //! mapped is undefined behaviour). [`Shards`] parses each shard's header (an
 //! 8-byte little-endian length and a JSON object of `dtype`, `shape` and
 //! `data_offsets` per tensor) and reads tensor bytes on demand with
-//! `read_exact_at`, in row blocks: converting a tensor never holds more than
-//! one block of it in memory.
+//! `read_exact_at`, in row blocks ([`Shards::append_rows`] reads any row
+//! range, so a caller that must see a whole tensor reads it whole).
 
 use std::collections::HashMap;
 use std::fs::File;

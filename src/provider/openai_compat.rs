@@ -3,9 +3,9 @@
 //! OpenAI, DeepSeek-native, vLLM, LM Studio, and llama.cpp all expose the same
 //! `/v1/chat/completions` contract: identical request JSON, SSE frames shaped
 //! as `choices[0].delta.{content,reasoning_content,tool_calls}` and terminated
-//! by `data: [DONE]`. They differ only in default base URL and auth header, so
-//! one adapter serves all of them; each provider adds a thin `dispatch_*`
-//! method that builds an [`OpenAiCompatConfig`].
+//! by `data: [DONE]`. They differ only in default base URL and in whether an
+//! API key is sent, so one adapter serves all of them; each provider adds a
+//! thin `dispatch_*` method that builds an [`OpenAiCompatConfig`].
 //!
 //! # Tool-call accumulation design
 //!

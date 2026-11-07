@@ -7,8 +7,8 @@
 //!
 //! - [`hf`]: the checkpoint's files (`config.json`, tokenizer files, shards),
 //!   and their download;
-//! - [`safetensors`]: shard headers and positional reads, one row block at a
-//!   time (the crate forbids `unsafe`, so nothing is memory-mapped);
+//! - [`safetensors`]: shard headers and positional reads, in row blocks (the
+//!   crate forbids `unsafe`, so nothing is memory-mapped);
 //! - [`config`]: the `{arch}.*` metadata and generated tensors
 //!   (`set_gguf_parameters`, `generate_extra_tensors`);
 //! - [`tensors`]: tensor names and values (`modify_tensors`), planned from the
@@ -17,12 +17,14 @@
 //! - [`gguf_writer`]: the streaming GGUF v3 writer.
 //!
 //! The header (metadata plus every tensor's name, shape and type) is known
-//! before any weight is read, so the writer streams: peak memory is two
-//! blocks of one tensor (at most 32 MiB of `f32` each: one is read ahead
-//! while the other is encoded) plus its quantized form, whatever the model's
-//! size. The result is checked before it is renamed into
-//! place: the metadata must load through the engine's own `Hparams` and
-//! tokenizer readers.
+//! before any weight is read, so the writer streams. A tensor that needs no
+//! rearranging is read in blocks of at most 32 MiB of `f32`, two buffers in
+//! flight (one is read ahead while the other is encoded), plus its quantized
+//! form. A tensor that is rearranged (the Q/K permutation, the value-head
+//! reorder, a transpose) or generated is held whole as `f32`. Peak memory is
+//! therefore one tensor at most, never the model. The result is checked
+//! before it is renamed into place: the metadata must load through the
+//! engine's own `Hparams` and tokenizer readers.
 
 pub(crate) mod arch;
 pub(crate) mod chktxt;

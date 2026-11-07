@@ -58,8 +58,9 @@
 //! (compared with its output tensor by tensor, see the local-provider docs). [`WeightQuant`]
 //! (`LocalModelConfig::convert`, `f16`, `q8_0` by default, or `q4_0`) sets
 //! the matrix precision; each precision is converted once and cached.
-//! Conversion streams tensor by tensor (peak memory is one block of one
-//! tensor), and reports its progress through
+//! Conversion streams tensor by tensor (peak memory is one whole tensor in
+//! `f32` when it is rearranged, as the Q/K permutation is, otherwise two
+//! 32 MiB blocks of one tensor), and reports its progress through
 //! `LocalModelConfig::on_download_progress` as tensors converted out of the
 //! tensor count.
 //!
@@ -78,11 +79,12 @@
 //! # Bounds
 //!
 //! - Continuous batching ([`BatchingConfig`]): up to `max_sequences` requests
-//!   (4 by default) run at once, each decode step one forward pass over a row
-//!   of every running sequence, prompts prefilled in chunks next to them; at
-//!   most 16 more queue behind (further callers wait), 64 output blocks are
-//!   buffered per request, and a consumer that does not keep up stalls only
-//!   its own request.
+//!   (`1..=64`, 4 by default; [`CucaError::Config`] outside that range) run at
+//!   once, each decode step one forward pass over a row of every running
+//!   sequence, prompts prefilled in chunks next to them; at most 16 more queue
+//!   behind (further callers wait), 64 output blocks are buffered per
+//!   request, and a consumer that does not keep up stalls only its own
+//!   request.
 //! - K/V cache memory: blocks of 16 positions, `2 * 4 * 16 * n_kv_head *
 //!   head_dim` bytes per block and layer that owns K/V ([`LocalModel::kv_cache_bytes`]),
 //!   in RAM or device memory. The pool is shared by every running sequence and
@@ -132,10 +134,10 @@
 //! prefill throughput. A request that reuses a cached prefix therefore
 //! generates what a cold request generates. (Quantized matmuls round
 //! activations to Q8_0, which otherwise amplifies the batch-shape rounding of
-//! a float matmul into visible logit jumps.) The attention itself is an
-//! online-softmax kernel over the K/V blocks, whose float rounding differs
-//! from candle's matmul attention in 0.6.x: where two logits are within about
-//! 0.1 of each other a greedy reply can differ from 0.6.x's.
+//! a float matmul into visible logit jumps.) Attention is an online-softmax
+//! kernel over the K/V blocks; its float rounding differs from a dense
+//! matmul attention, so where two logits are within about 0.1 of each other
+//! a greedy reply can differ from another runtime's.
 //!
 //! # Speculative decoding (opt-in)
 //!
@@ -570,14 +572,14 @@ const PRESET_TABLE: &[ModelPreset] = &[
     ),
     // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers (candle's
     // kernel: K-quants are not served by the row-batched one) and a Q4_1
-    // `ffn_down` in 6 (row-batched). It embeds the earlier Muse chat template, which renders the same
-    // bytes as the current one except when the caller's system prompt itself
-    // mentions "Reasoning effort": the current template rewrites that to
-    // "Reasoning strength", this one appends a second directive. The preset
-    // pins the repository's current `chat_template.jinja` (meta-models at
-    // cec94fcf) and uses it instead. The only published Q4_0/Q8_0 whose
-    // embedded template equals the current one is ggml-org's Q8_0, twice the
-    // memory and half the CPU speed.
+    // `ffn_down` in 6 (row-batched). Its embedded Muse chat template renders
+    // the same bytes as the repository's current one except when the caller's
+    // system prompt itself mentions "Reasoning effort": the current template
+    // rewrites that to "Reasoning strength", the embedded one appends a second
+    // directive. The preset pins the repository's `chat_template.jinja`
+    // (meta-models at cec94fcf) and uses it instead. The only published
+    // Q4_0/Q8_0 whose embedded template equals it is ggml-org's Q8_0, twice
+    // the memory and half the CPU speed.
     ModelPreset {
         template: Some(PresetTemplate {
             repo: "meta-models/Muse-Glimmer-30B",
@@ -598,11 +600,11 @@ const PRESET_TABLE: &[ModelPreset] = &[
     // imatrix Q4_0 (Q4_1 and Q6_K in places; mistralai publishes no Q4_0 of
     // this model). Every published GGUF of Ministral 3 Reasoning (mistralai,
     // ggml-org, lmstudio-community, unsloth, bartowski) embeds the December
-    // 2025 chat template, a different and shorter one than the repository's
-    // current `chat_template.jinja` ("update to match mistral-common",
-    // 2026-07-15: it merges consecutive messages, writes `reasoning` back as
-    // `[THINK]` blocks and accepts system content lists). The preset pins
-    // that file and uses it instead of the embedded one.
+    // 2025 chat template, which is shorter than the repository's
+    // `chat_template.jinja` at the pinned revision: that one merges
+    // consecutive messages, writes `reasoning` back as `[THINK]` blocks and
+    // accepts system content lists. The preset pins that file and uses it
+    // instead of the embedded one.
     ModelPreset {
         template: Some(PresetTemplate {
             repo: "mistralai/Ministral-3-3B-Reasoning-2512",
@@ -621,10 +623,10 @@ const PRESET_TABLE: &[ModelPreset] = &[
         )
     },
     // imatrix Q4_0 of Ministral 3 Instruct. Every published GGUF of this
-    // model embeds the December 2025 chat template (an earlier default system
-    // prompt, without the tool-calling paragraph); the preset pins the
-    // repository's current `chat_template.jinja` ("update to match
-    // mistral-common", 2026-07-15) and uses it instead.
+    // model embeds the December 2025 chat template (a different default
+    // system prompt, without the tool-calling paragraph); the preset pins the
+    // repository's `chat_template.jinja` at the revision below and uses it
+    // instead.
     ModelPreset {
         template: Some(PresetTemplate {
             repo: "mistralai/Ministral-3-3B-Instruct-2512",
@@ -2471,7 +2473,7 @@ impl CucaClient {
     /// [`CucaError::Config`] when no model is attached or the request's
     /// `temperature` or `top_p` is invalid; [`CucaError::Provider`] when the
     /// request cannot be rendered (for example an image block), the prompt
-    /// does not fit the context, or the engine has shut down.
+    /// has `context_length` or more tokens, or the engine has shut down.
     pub(crate) async fn dispatch_local(
         &self,
         req: UnifiedRequest,

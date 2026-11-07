@@ -13,8 +13,9 @@
 //! The drafter is two DeepSeek-style latent-attention layers over a *dense*
 //! gated FFN (`moe` is `null`), a `2 * dim -> dim` fusion projection
 //! (`eagle_linear`) and a final norm; its embedding and LM head are the
-//! target's. Its GGUF layout is described in [`crate::provider::local`]
-//! (`mistral4-eagle`).
+//! target's. The GGUF it converts to (architecture `mistral4-eagle`) keeps
+//! the tensor names the engine reads (`model::layout`, `nextn.eh_proj.weight`
+//! for the fusion projection); `plan_eagle` in `tensors.rs` maps them.
 
 use serde_json::{Map, Value, json};
 
@@ -248,7 +249,7 @@ mod tests {
         (content, out)
     }
 
-    /// The GGUF layout `mistral4-eagle` documents: metadata, tensor names,
+    /// The GGUF layout of `mistral4-eagle`: metadata, tensor names,
     /// shapes and dtypes at each precision (the norms are `f32`; the per-head
     /// up-projections, whose rows are narrower than a quantization block,
     /// stay `f32` under a block format and are `f16` under `f16`).
