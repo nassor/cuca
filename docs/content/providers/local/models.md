@@ -104,16 +104,16 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 
 ## Presets
 
-`ModelSource::PRESETS` has 25 entries: 23 models and 2 drafters. Each is pinned to a repository commit and a SHA-256; the entry points are on [Model sources](@/providers/local/model-sources.md#presets). Sizes are the file in decimal units. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller): the block pools, which hold twice `context_length` positions. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
+`ModelSource::PRESETS` has 25 entries: 23 models and 2 drafters. Each is pinned to a repository commit and a SHA-256; the entry points are on [Model sources](@/providers/local/model-sources.md#presets). Sizes are the file in decimal units. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller) with the default batching (4 sequences, steps of 256 rows): the block pools, which hold twice `context_length` positions. Each value is computed from the GGUF header of the pinned file with the pool layout code (`KvLayout::pool_bytes`), without loading the model. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
 
 | Preset | Architecture | Repository | Size | K/V |
 |---|---|---|---|---|
-| `gemma4-e2b-q4_0` (default) | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 2.84 GB | 422 MB |
-| `gemma4-e2b-q8_0` | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 4.97 GB | 422 MB |
-| `gemma4-e4b-q4_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 4.59 GB | 1.27 GB |
-| `gemma4-e4b-q8_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 8.03 GB | 1.27 GB |
-| `gemma3-270m-q8_0` | `gemma3` | `ggml-org/gemma-3-270m-it-GGUF` | 0.29 GB | 377 MB |
-| `gemma3-1b-q4_0` | `gemma3` | `unsloth/gemma-3-1b-it-GGUF` | 0.72 GB | 539 MB |
+| `gemma4-e2b-q4_0` (default) | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 2.84 GB | 481 MB |
+| `gemma4-e2b-q8_0` | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 4.97 GB | 481 MB |
+| `gemma4-e4b-q4_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 4.59 GB | 1.47 GB |
+| `gemma4-e4b-q8_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 8.03 GB | 1.47 GB |
+| `gemma3-270m-q8_0` | `gemma3` | `ggml-org/gemma-3-270m-it-GGUF` | 0.29 GB | 451 MB |
+| `gemma3-1b-q4_0` | `gemma3` | `unsloth/gemma-3-1b-it-GGUF` | 0.72 GB | 647 MB |
 | `qwen3-0.6b-q8_0` | `qwen3` | `Qwen/Qwen3-0.6B-GGUF` | 0.64 GB | 3.76 GB |
 | `qwen3-1.7b-q8_0` | `qwen3` | `Qwen/Qwen3-1.7B-GGUF` | 1.83 GB | 3.76 GB |
 | `r1-distill-qwen-1.5b-q4_0` | `qwen2` | `bartowski/DeepSeek-R1-Distill-Qwen-1.5B-GGUF` | 1.07 GB | 940 MB |
@@ -134,7 +134,7 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 | `gemma4-e2b-mtp-f16` | `gemma4-assistant` | `unsloth/gemma-4-E2B-it-GGUF` | 0.17 GB | none: a drafter, reads the target's cache |
 | `muse-glimmer-30b-dflash-q4_0` | `dflash` | `ggml-org/Muse-Glimmer-30B-GGUF` | 1.45 GB | none from the pool: a drafter with its own 2,048-position K/V ring |
 
-- The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position. Qwen 3 0.6B needs 3.76 GB of cache at 8,192 positions for a 0.64 GB file. A sliding-window group (the Gemma presets) holds `ceil((window - 1 + rows) / 16) + 2` blocks of 16 positions per running sequence plus cached prefixes. Lower `context_length` to shrink the cache; the pool rules are on [Local limits and errors](@/providers/local/limits-and-errors.md#limits).
+- The K/V cost depends on the model more than on its size: a model with many K/V heads pays far more per position. Qwen 3 0.6B needs 3.76 GB of cache at 8,192 positions for a 0.64 GB file. A sliding-window group (the Gemma presets) holds `ceil((window - 1 + rows) / 16) + 2` blocks of 16 positions per running sequence plus cached prefixes. The recurrent-state sizes of the two hybrid presets (20.2 MB and 65.9 MB per sequence) are recorded figures, not recomputed from the header. Lower `context_length` to shrink the cache; the pool rules are on [Local limits and errors](@/providers/local/limits-and-errors.md#limits).
 - A model trained on fewer positions loads at its maximum by default (OLMo 2 and OLMoE: 4,096). An explicit larger value fails with `context_length N exceeds the model maximum M`.
 - `gemma4-e2b-mtp-f16` and `muse-glimmer-30b-dflash-q4_0` have `drafter: true`: they load only through `LocalModelConfig::drafter`. The first pairs with the Gemma 4 E2B presets, the second with `muse-glimmer-30b-q4_0` on the CPU and proposes a block of up to 15 tokens per pass.
 - `qwen3.5-0.8b-q8_0` carries the in-trunk prediction head, so `DrafterSource::InTrunk` works with it.

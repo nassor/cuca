@@ -27,7 +27,7 @@ Three kinds of evidence back the claims on the local pages, from strongest to we
 ## Architectures
 
 - Verified in the live suite on the CPU: `gemma4`, `gemma3`, `qwen2` (R1 distill), `qwen3`, `qwen35`, `qwen35moe`, `phi3` (Phi 4 mini), `smollm3`, `granite`, `qwen3moe`, `olmoe`, `olmo2`, `muse-glimmer`, `mistral3`, `mistral4`. `llama` runs live through `r1-distill-llama-8b-q4_0` and is also covered by tiny-model tests and by the converter oracle on the same model's checkpoint.
-- Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` (Qwen3-30B-A3B with tiered experts), `qwen35moe` (with tiered experts). `mistral3` has run on a GPU in the tiny-model tests only. The device matrix is on [Run on a GPU](@/providers/local/gpu.md#verified-and-compile-checked).
+- Also verified in the live suite on Vulkan (AMD RX 9070 XT, Windows): `gemma4` (E2B Q4_0), `gemma3` (1B Q4_0), `phi3` (Phi 4 mini Q4_K_M), `olmo2`, `granite` (Granite 3.3 2B), `qwen3moe` and `qwen35moe` (with tiered experts), `muse-glimmer` (with `gpu_layers` of 34, 36 and 38 of 52) and `mistral4` (with host experts). `mistral3` has run on a GPU in the tiny-model tests only. The device matrix, including tensor parallelism, is on [Run on a GPU](@/providers/local/gpu.md#verified-and-compile-checked).
 - `ernie4_5`: tiny-model tests and a recorded oracle run only. It has no preset and has not run in the live suite.
 - `gemma4-assistant`: `tests/provider_local_mtp.rs` as a drafter, and tiny-model tests on the CPU and the GPU (the GPU ones only when `CUCA_LOCAL_DEVICE` names a GPU). The other drafters are on [Speculative decoding](@/providers/local/drafting.md#verified).
 - Compile-checked only: every GPU backend other than Vulkan.
@@ -55,10 +55,10 @@ The suite ran each preset that has a model of its own on the CPU, in a release b
 | `ministral3-3b-instruct-q4_0` | no | yes, `[TOOL_CALLS]name[ARGS]json` | all pass on the CPU with the pinned template; the thinking scenarios skip, the template has no reasoning |
 | `ministral3-3b-reasoning-q4_0` | always (`[THINK]`) | yes, `[TOOL_CALLS]name[ARGS]json` | all pass on the CPU; thinking-off skips, and the two tool scenarios decode with the model's sampling defaults and a fixed seed |
 | `mistral-small-4-119b-q4_0` | on and off (`reasoning_effort`) | yes, `[TOOL_CALLS]name[ARGS]json` | all pass on the CPU, resident and with `tiered:ram=48g`; the oracle-prompt count skips (no dump) |
-| `muse-glimmer-30b-q4_0` | always (`reasoning_strength`) | yes, channel protocol | all pass on the CPU with the pinned template; the two tool scenarios decode with the model's sampling defaults and a fixed seed, and thinking-off skips because the model cannot switch reasoning off |
+| `muse-glimmer-30b-q4_0` | always (`reasoning_strength`) | yes, channel protocol | all pass on the CPU with the pinned template, and on Vulkan with `gpu_layers` 34, 36 and 38; the two tool scenarios decode with the model's sampling defaults and a fixed seed, and thinking-off skips because the model cannot switch reasoning off |
 | `granite3.3-2b-q4_0` | switched on by the request | yes | all pass except long-context retrieval, a known limit |
 
-The Vulkan engine ran the same suite for `gemma4-e2b-q4_0`, `olmo2-1b-q4_0` and `granite3.3-2b-q4_0` with the same results as on the CPU.
+The Vulkan engine ran the same suite for `gemma4-e2b-q4_0`, `gemma3-1b-q4_0`, `phi4-mini-q4_k_m`, `olmo2-1b-q4_0` and `granite3.3-2b-q4_0`, with the same results as on the CPU, and for `mistral-small-4-119b-q4_0` with host experts.
 
 ## Known limits
 
