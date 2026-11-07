@@ -52,10 +52,11 @@
 //!
 //! - Device memory holds the matmul weights as above. The token embedding is
 //!   uploaded only when it doubles as the LM head (no `output.weight`), once,
-//!   as the head weight. A weight over 1 GiB on the device is split into row
+//!   as the head weight. A weight over 256 MiB on the device is split into row
 //!   chunks (a large tied head becomes several `[rows_i, n_embd]` weights);
 //!   [`linear`] multiplies by each chunk and concatenates the outputs, which
-//!   is exact, so no single device buffer exceeds [`MAX_PART_BYTES`].
+//!   is exact, so no single weight buffer exceeds [`MAX_WEIGHT_CHUNK_BYTES`]
+//!   (and no buffer at all exceeds [`MAX_PART_BYTES`]).
 //! - Embedding lookups never touch the device copy: the host reads each
 //!   token's row of `token_embd` (and, for Gemma 4, of `per_layer_token_embd`)
 //!   from the GGUF file ([`RowTable`]) and uploads the dequantized rows. The
@@ -419,13 +420,21 @@ fn require_index(
 /// 2.46 GB buffer, so a conservative 1 GiB is assumed everywhere.
 const MAX_PART_BYTES: usize = 1 << 30;
 
+/// Device bytes of one row chunk of a dense weight. burn's default memory
+/// pool carves its allocations from pages as large as the largest allocation
+/// it has served, so one 1 GiB weight chunk makes every page 1 GiB and a
+/// nearly full card cannot place the next one (`out of device memory
+/// allocating 1074790400 bytes` with 2.4 GiB free while 36 layers of a 30B
+/// model were resident). Chunks of 256 MiB keep the pages that size.
+const MAX_WEIGHT_CHUNK_BYTES: usize = 256 << 20;
+
 /// Tokens of a delta-net scan between two waits for the device (see
 /// [`DeltaWeights::forward`]).
 const SCAN_DRAIN: usize = 16;
 
 /// A `[rows, cols]` matmul weight on the device as one or more row chunks
-/// (one unless the weight would exceed [`MAX_PART_BYTES`], as a large tied
-/// LM head does); [`linear`] concatenates the chunks' outputs, which is exact.
+/// (one unless the weight would exceed [`MAX_WEIGHT_CHUNK_BYTES`], as a large
+/// tied LM head or FFN matrix does); [`linear`] concatenates the chunks' outputs, which is exact.
 struct Weight {
     parts: Vec<Part>,
 }
@@ -478,7 +487,7 @@ pub(super) fn quantize_q8_0(values: &[f32], out: &mut Vec<u8>) {
 }
 
 /// The `[rows, cols]` weight whose GGUF bytes are `raw`, on the device, with
-/// parts of at most [`MAX_PART_BYTES`]; see [`upload_matrix_with`].
+/// parts of at most [`MAX_WEIGHT_CHUNK_BYTES`]; see [`upload_matrix_with`].
 #[cfg(test)]
 fn upload_matrix(
     tensor_name: &str,
@@ -488,7 +497,15 @@ fn upload_matrix(
     cols: usize,
     device: &Device,
 ) -> Result<Weight, CucaError> {
-    upload_matrix_with(tensor_name, dtype, raw, rows, cols, device, MAX_PART_BYTES)
+    upload_matrix_with(
+        tensor_name,
+        dtype,
+        raw,
+        rows,
+        cols,
+        device,
+        MAX_WEIGHT_CHUNK_BYTES,
+    )
 }
 
 /// The bytes of the columns `cols` of every row of `raw` (rows `row_len`
@@ -799,7 +816,7 @@ impl WeightReader<'_> {
             rows,
             cols,
             self.device,
-            MAX_PART_BYTES,
+            MAX_WEIGHT_CHUNK_BYTES,
         )
     }
 
@@ -878,7 +895,7 @@ impl WeightReader<'_> {
             cut.n_rows(),
             cut.cols.len(),
             self.device,
-            MAX_PART_BYTES,
+            MAX_WEIGHT_CHUNK_BYTES,
         )
     }
 
@@ -5922,15 +5939,23 @@ mod tests {
     /// at every layer, which splits burn's fused elementwise kernels at
     /// different places, so they agree to float rounding (tiered placements
     /// among themselves agree bit for bit). Measured over the tiny models the
-    /// relative difference is 1e-6 to 3e-5 at nearly every step; the hybrid
-    /// MoE model reaches 2e-4 at one step, so the bound is 5e-4.
+    /// relative difference (to `1 + |logit|`) is 1e-6 to 3e-5 at nearly every
+    /// step. The tiny hybrid MoE model has one sensitive step (the second
+    /// step of the greedy run): 4e-5 to 7e-5 with one thread per row in the dense kernel,
+    /// 1.6e-4 to 2.2e-4 with the split-row kernel. Its routing is the same in
+    /// the resident and the hosted run (checked by reading every layer's
+    /// router logits back in both: identical expert ids for all 160 routed
+    /// rows, smallest gap between the last chosen and the first unchosen
+    /// logit 2.7e-3, far above rounding), so the difference is the order of
+    /// float accumulation, amplified at that step. 3e-4 is the tightest round
+    /// bound above the worst measured value.
     fn assert_close_logits(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
         assert_eq!(got.len(), want.len(), "{what}");
         for (step, (g, w)) in got.iter().zip(want).enumerate() {
             assert_eq!(g.len(), w.len(), "{what}");
             for (i, (a, b)) in g.iter().zip(w).enumerate() {
                 assert!(
-                    (a - b).abs() <= 5e-4 * (1.0 + b.abs()),
+                    (a - b).abs() <= 3e-4 * (1.0 + b.abs()),
                     "{what}: step {step} logit {i}: {a} vs {b}"
                 );
             }
