@@ -94,11 +94,11 @@ impl ConvArch {
             let text = config.get("text_config").unwrap_or(config);
             return match text.get("model_type").and_then(|t| t.as_str()) {
                 Some("mistral4") => Ok(Self::Mistral4),
-                Some("ministral3") => Ok(Self::Mistral3),
-                // Mistral Small 3.1/3.2 and Magistral 2509 are plain Llama
-                // models in a multimodal wrapper (their published GGUFs say
-                // `llama`).
-                Some("mistral") => Ok(Self::Llama),
+                // Mistral Small 3.1/3.2 and Magistral 2509: llama.cpp's
+                // converter writes `mistral3` for them too (the published
+                // GGUFs, converted in Mistral format, say `llama`; the engine
+                // runs both identically).
+                Some("ministral3" | "mistral") => Ok(Self::Mistral3),
                 other => Err(CucaError::Config(format!(
                     "`Mistral3ForConditionalGeneration` with text model `{}` is not supported (only `mistral4`, `ministral3` and `mistral`)",
                     other.unwrap_or("unknown")
@@ -233,7 +233,7 @@ mod tests {
         );
         assert_eq!(
             ConvArch::from_config(&class("mistral")).unwrap(),
-            ConvArch::Llama
+            ConvArch::Mistral3
         );
         let err = ConvArch::from_config(&class("pixtral"))
             .unwrap_err()

@@ -12,13 +12,14 @@ use crate::provider::local::DownloadProgressCallback;
 use crate::provider::local::download;
 
 /// Optional files of a checkpoint, fetched when the repository has them.
-const OPTIONAL_FILES: [&str; 6] = [
+const OPTIONAL_FILES: [&str; 7] = [
     "generation_config.json",
     "tokenizer.json",
     "tokenizer_config.json",
     "tokenizer.model",
     "added_tokens.json",
     "chat_template.jinja",
+    "chat_template.json",
 ];
 /// The shard index of a sharded checkpoint.
 const INDEX_FILE: &str = "model.safetensors.index.json";
@@ -121,10 +122,15 @@ impl CheckpointDir {
             tokenizer_config: read_json_opt(&dir.join("tokenizer_config.json"))?,
             tokenizer_model: model.is_file().then_some(model),
             added_tokens: read_json_opt(&dir.join("added_tokens.json"))?,
-            chat_template_file: template
-                .is_file()
-                .then(|| std::fs::read_to_string(&template))
-                .transpose()?,
+            chat_template_file: if template.is_file() {
+                Some(std::fs::read_to_string(&template)?)
+            } else {
+                // Older checkpoints keep it as `{"chat_template": "..."}`.
+                read_json_opt(&dir.join("chat_template.json"))?.and_then(|j| {
+                    j.get("chat_template")
+                        .and_then(|t| t.as_str().map(String::from))
+                })
+            },
             shards,
         })
     }

@@ -322,7 +322,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 23] = [
+const PRESET_TABLE: [ModelPreset; 24] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -520,6 +520,18 @@ const PRESET_TABLE: [ModelPreset; 23] = [
         "mistralai_Ministral-3-3B-Reasoning-2512-Q4_0.gguf",
         "72ba5a30221864a7355c92336e639214e122dad4d11345139d2669d7c8bf7c3c",
         2_046_374_368,
+        "mistral3",
+    ),
+    // imatrix Q4_0 of Ministral 3 Instruct. Its embedded chat template is the
+    // earlier one: the same except for the wording of the default system
+    // prompt (the current template adds a tool-calling paragraph there).
+    preset(
+        "ministral3-3b-instruct-q4_0",
+        "bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF",
+        "0a9035302dea19872c96076896304552890a73c2",
+        "mistralai_Ministral-3-3B-Instruct-2512-Q4_0.gguf",
+        "c2993f4b86ddcae94031b2e384169889ceecd51b148ceda30c0f826fcce721c8",
+        2_046_375_904,
         "mistral3",
     ),
     // Two parts of `llama-gguf-split`: merged into one cached file at load.
