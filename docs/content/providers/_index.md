@@ -50,6 +50,26 @@ The seven HTTP adapters speak four wire formats and share two translation module
 - `src/provider/anthropic.rs` holds the Anthropic translation, documented on the [Anthropic](@/providers/anthropic.md) page.
 - Gemini and the llama.cpp native route each have their own translator.
 
+## Sampling fields
+
+`top_p`, `top_k`, `seed` and `stop` are optional on `UnifiedRequest`. Each adapter sends a set field under the wire name below, or rejects it with `CucaError::Config` before any request goes out. A field left unset is not sent.
+
+| Adapter | `top_p` | `top_k` | `seed` | `stop` |
+|---|---|---|---|---|
+| OpenAI | `top_p` | rejected | `seed` | `stop` |
+| Anthropic | `top_p` | `top_k` | rejected | `stop_sequences` |
+| Gemini | `generationConfig.topP` | `generationConfig.topK` | `generationConfig.seed` | `generationConfig.stopSequences` |
+| DeepSeek native | `top_p` | rejected | `seed` | `stop` |
+| DeepSeek bridge | `top_p` | `top_k` | rejected | `stop_sequences` |
+| llama.cpp chat and `/completion` | `top_p` | `top_k` | `seed` | `stop` |
+| vLLM | `top_p` | `top_k` | `seed` | `stop` |
+| LM Studio | `top_p` | `top_k` | `seed` | `stop` |
+| Local | per request override | per request override | per request override | per request override |
+
+- `stop` is sent only when non-empty.
+- The rejection messages are ``"`top_k` is not supported by OpenAI"``, ``"`top_k` is not supported by DeepSeek"`` and ``"`seed` is not supported by Anthropic"``. A `top_k` on any other endpoint that reaches the OpenAI-compatible builder reads ``"`top_k` is not supported by this endpoint"``.
+- `provider-local` accepts all four and checks `top_p` in `(0, 1]`; see [Local requests](@/providers/local/requests.md).
+
 ## The in-process adapter
 
 `provider-local` runs a GGUF language model inside your process and exposes no HTTP endpoint. It has no base URL, auth header or route.
@@ -89,10 +109,10 @@ configuration error: custom endpoints require a registered adapter
 
 None of the seven HTTP adapters reads an environment variable. Base URLs, API keys and bearer tokens reach them only through `CucaClientBuilder`. The `CUCA_*` variables that belong to the examples and the test harness are listed in [Environment variables](@/reference/environment.md).
 
-`provider-local` reads two variables as fallbacks:
+`provider-local` reads these as fallbacks:
 
-- `CUCA_CACHE_DIR`, then the platform's cache variables, when `LocalModelConfig::cache_dir` is `None`.
-- `HF_TOKEN` when `LocalModelConfig::hf_token` is `None`.
+- `HF_TOKEN` when `LocalModelConfig::hf_token` is `None`. An empty value counts as unset.
+- `CUCA_CACHE_DIR` when `LocalModelConfig::cache_dir` is `None`. Without it the cache is `%LOCALAPPDATA%\cuca` (then `%USERPROFILE%\AppData\Local\cuca`) on Windows, `$HOME/Library/Caches/cuca` on macOS, and `$XDG_CACHE_HOME/cuca` (then `$HOME/.cache/cuca`) elsewhere. With none resolvable, loading fails with `CucaError::Config`.
 
 Setting the config fields keeps it from reading either.
 

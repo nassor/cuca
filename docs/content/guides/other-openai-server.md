@@ -94,6 +94,8 @@ let client = CucaClient::builder()
 
 If the server wants a key, add `.with_api_key("...")`. It becomes an `Authorization: Bearer` header. With no key the header is not sent, so an unauthenticated local server needs no placeholder.
 
+`top_k` is sent by `provider-vllm`, `provider-lmstudio` and `provider-llamacpp`. With `provider-openai` or the DeepSeek native route it fails with `CucaError::Config`, so a gateway that does accept `top_k` still needs one of the other three features to receive it. `top_p`, `seed` and `stop` go out on all five.
+
 `with_provider` is required. Without it `build()` fails:
 
 ```text,name=CucaError::Config when with_provider was never called

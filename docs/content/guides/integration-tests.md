@@ -81,7 +81,7 @@ The reason comes from a probe of `GET {base_url}/models` with a two second timeo
 
 Two files never call the probe: `tests/service_prompt_cache.rs` drives in-process mock SSE servers on ephemeral loopback ports, and `tests/public_exports.rs` constructs types and never dispatches. Every other llama.cpp file has more tests than live gates, so a subset of each runs with no server up.
 
-`tests/provider_local.rs` and `tests/provider_local_mtp.rs` need no server. They print `SKIP: local model not available: ...` until you select a model; see [Environment variables](@/reference/environment.md). `tests/provider_local_tiers.rs` needs no server either and prints a `SKIP:` line until you select a model and set `CUCA_LOCAL_EXPERTS`.
+`tests/provider_local.rs`, `tests/provider_local_batch.rs` and `tests/provider_local_mtp.rs` need no server. They print `SKIP: local model not available: ...` until you select a model. `tests/provider_local_tiers.rs` prints a `SKIP:` line until you select a model and set `CUCA_LOCAL_EXPERTS`, and `tests/provider_local_convert.rs` prints `SKIP: set CUCA_LOCAL_REF_DIR to the oracle dumps` until you set that directory. All five run under `--features provider-local`; the variables are in [Environment variables](@/reference/environment.md).
 
 Result: you can tell which tests skipped and why.
 
@@ -127,19 +127,27 @@ A shorter list does not fail. It compiles fewer submodules and reports success f
 
 Result: the run lists only that file's tests.
 
-## If the model id is wrong
+## The live suite variables
 
-With `CUCA_MODEL` unset or empty, the harness probes the server and uses the first model id it reports. Set `CUCA_MODEL` to override. With neither available the test panics:
+The llama.cpp suite reads three variables, all in `tests/common/mod.rs`:
+
+| Variable | Effect | Default |
+|---|---|---|
+| `CUCA_BASE_URL` | the server base URL, with `/v1` | `http://127.0.0.1:1234/v1` |
+| `CUCA_MODEL` | the model id under test; empty counts as unset | the first id `GET {base_url}/models` reports |
+| `CUCA_REQUIRE_LIVE` | `1` turns an unreachable server into a panic | unset |
+
+With neither `CUCA_MODEL` nor a server answering, the test panics:
 
 ```text,name=The panic when no model id can be resolved
 no model id: set CUCA_MODEL or start llama-server at http://127.0.0.1:1234/v1
 ```
 
-Defaults for all three variables are in [Environment variables](@/reference/environment.md).
+The `provider-local` variables are in [Environment variables](@/reference/environment.md).
 
 ## If you are checking one feature builds alone
 
-CI's `plugin_solo` and `service_solo` jobs do this, and they need no server. One leg runs per plugin feature (12) and per service feature (6):
+CI's `plugin_solo` and `service_solo` jobs do this, and they need no server. One leg runs per plugin feature (12) and per service feature (7):
 
 ```bash,name=Runs the same on all three platforms
 cargo check --all-targets --no-default-features --features provider-openai,plugin-hitl

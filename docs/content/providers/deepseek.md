@@ -90,7 +90,8 @@ The provider name in a stream error comes from the shared translator: `OpenAi` o
 - The SSE parser keeps one reusable buffer that starts at 8192 bytes. Its high-water mark is the largest single frame plus one partial line.
 - Native route: in-flight tool calls hold their argument fragments until each call completes. Bridge route: one thinking text, signature or tool call input is buffered at a time.
 - The bridge sends `max_tokens` 1024 when the request leaves it unset. The native route sends none.
-- The native route sends `top_p`, `seed` and `stop`, and rejects `top_k` with `CucaError::Config`. The bridge sends `top_p`, `top_k` and `stop_sequences`, and rejects `seed`.
+- Native route: `top_p`, `seed` and `stop` go out under those names. `top_k` fails with `CucaError::Config` and the message ``"`top_k` is not supported by DeepSeek"``.
+- Bridge route: `top_p`, `top_k` and `stop_sequences` go out. `seed` fails with `CucaError::Config` and the message ``"`seed` is not supported by Anthropic"``, because the bridge builds the body with the Anthropic builder.
 
 ## Example
 

@@ -60,14 +60,14 @@ The default route, `Chat`, runs the code on the [OpenAI](@/providers/openai.md) 
 
 ## Request translation
 
-Chat route: the body is the one described under [OpenAI request translation](@/providers/openai.md#request-translation). The model is `LlamaCppConfig::model` when non-empty, otherwise the request's model. The three `llama-server` parameters are not sent.
+Chat route: the body is the one described under [OpenAI request translation](@/providers/openai.md#request-translation). The model is `LlamaCppConfig::model` when non-empty, otherwise the request's model. The three `llama-server` parameters are not sent. `top_p`, `top_k`, `seed` and `stop` go out under those names, and no sampling field is rejected.
 
 Completion route: the body is a JSON object with these keys:
 
 - `prompt` is assembled from the conversation. `System` message text comes first as bare context. `User` and `Assistant` messages are marked with `### User:` and `### Assistant:` prefixes.
 - Only `Text` blocks contribute. Images, thinking and tool blocks are dropped, and `Tool`-role messages are skipped.
 - `stream` is always `true`.
-- `temperature`, `top_p`, `top_k` and `seed` are included only when set, and `stop` only when non-empty.
+- `temperature`, `top_p`, `top_k` and `seed` are included only when set, and `stop` only when non-empty. No sampling field is rejected.
 - `n_predict` carries `max_tokens`, or 128 when the request leaves it unset.
 - `n_threads` and `n_gpu_layers` are included only when configured, and `flash_attn` only when `true`.
 - `model` is `LlamaCppConfig::model`, or the request's model when that is empty. `llama-server` ignores it.

@@ -41,7 +41,7 @@ The default base URL carries `/v1`. Any base URL you set is used as given, so it
 
 ## Request translation
 
-Same as [OpenAI request translation](@/providers/openai.md#request-translation). The model is the request's model.
+Same as [OpenAI request translation](@/providers/openai.md#request-translation). The model is the request's model. `top_p`, `top_k`, `seed` and `stop` go out under those names, and no sampling field is rejected.
 
 ## Response stream
 

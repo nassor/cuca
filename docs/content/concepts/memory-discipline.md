@@ -59,6 +59,24 @@ Refusing is the less convenient policy. The design chooses it where eviction wou
 
 Memory reports usage on every request. A `ContextUsageObserver` receives a `ContextUsage` reading, and `MemoryConfig::warn_fraction` injects a one-shot near-limit warning, idempotent through a marker scan. Alerting and export belong on the caller-supplied OpenTelemetry meter of `plugin-telemetry`. No plugin installs a global provider.
 
+## The local engine
+
+`provider-local` preallocates its K/V memory and bounds its queues. Each cap below has a policy at the bound and a usage reading; [Limits and errors](@/providers/local/limits-and-errors.md) holds the full table.
+
+| Structure | Bound | At the cap | Usage reading |
+|---|---|---|---|
+| K/V block pool | `BatchingConfig::kv_tokens` positions per full-attention group, default twice `context_length`, blocks of 16 | the least recently used unreferenced block is evicted; a running request that needs a block preempts the youngest one | `LocalModel::kv_cache_bytes()`, `serving_stats()` |
+| Prefix store | the unreferenced full 16-position blocks of the same pool, an LRU | evict the least recently used block, first when an allocation finds no free block | `ServingStats` (free and cached blocks, prefix hits) |
+| Recurrent snapshots (hybrid models) | `max_sequences + 4` | evict the least recently used snapshot | `ServingStats` |
+| Running sequences | `BatchingConfig::max_sequences`, 1 to 64, default 4 | later requests wait | `ServingStats` |
+| Waiting jobs | 16 behind the running ones | `generate_stream` waits for a slot | `ServingStats` |
+| Output channel | 64 blocks per request | that request is skipped until its consumer reads | none |
+| Step rows | `BatchingConfig::max_step_tokens`, at most 2048, default the prefill chunk | decode rows come first, prompts prefill in the rest | none |
+| Tiered experts, RAM | `ExpertTiers::ram_bytes` | evict the coolest expert the pass no longer needs | `LocalModel::expert_tier_stats()` |
+| Tiered experts, device | `ExpertTiers::device_bytes`, GPU only | same policy | `LocalModel::expert_tier_stats()` |
+
+The K/V pool never grows. Only the oldest request alone in a pool smaller than it needs fails, with a `CucaError::Provider`. The queues apply backpressure and refuse nothing, which suits a single in-process caller that can wait. See [Local configuration](@/providers/local/configuration.md) and [Expert tiers](@/providers/local/expert-tiers.md).
+
 ## Per-call limits need no usage reading
 
 `plugin-sandbox` has four limits, all per call:
