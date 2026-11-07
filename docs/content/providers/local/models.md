@@ -52,7 +52,7 @@ Nothing here is specific to one model family. The loader reads every dimension f
 | `ernie4_5` | ERNIE 4.5 (dense) | CPU, GPU |
 | `muse-glimmer` | Muse Glimmer 30B | CPU; GPU on tiny models only (the 30B model does not fit a 16 GB card) |
 | `mistral3` | Ministral 3 (3B, 8B, 14B), Devstral Small 2 | CPU, GPU (tiny-model tests only on the GPU) |
-| `mistral4` | Mistral Small 4 (119B, 128 experts) | CPU only; the GPU engine rejects it |
+| `mistral4` | Mistral Small 4 (119B, 128 experts) | CPU and GPU (not tensor parallel) |
 | `gemma4-assistant` | the Gemma 4 multi-token-prediction drafter | only through `LocalModelConfig::drafter` |
 
 What each architecture adds to the common forward pass:
@@ -121,7 +121,7 @@ A safetensors checkpoint of any architecture in the table above loads through `M
 | `Ernie4_5ForCausalLM` | `ernie4_5` |
 | `Ministral3ForCausalLM`, `Mistral3ForConditionalGeneration` whose `text_config.model_type` is `ministral3` or `mistral` (Ministral 3, Devstral Small 2, Mistral Small 3.1/3.2, Magistral 2509; text tower, FP8 weights dequantized) | `mistral3` (YaRN log multiplier and attention temperature written as llama.cpp does) |
 | `MuseGlimmerForConditionalGeneration` (text tower; the vision tensors are skipped) | `muse-glimmer` |
-| `Mistral3ForConditionalGeneration` whose `text_config.model_type` is `mistral4` (Mistral Small 4; text tower, FP8 weights dequantized) | `mistral4` (written as llama.cpp does; the engine runs it on the CPU) |
+| `Mistral3ForConditionalGeneration` whose `text_config.model_type` is `mistral4` (Mistral Small 4; text tower, FP8 weights dequantized) | `mistral4` (written as llama.cpp does) |
 
 Any other architecture fails with `` architecture `X` has no checkpoint converter; convert it to GGUF with llama.cpp ``. The weights, the metadata, the tokenizer (including `tokenizer.ggml.pre`, found from `tokenizer.json` and fingerprinted with llama.cpp's probe-text hash table) and the chat template are those llama.cpp's `convert_hf_to_gguf.py` writes: that script (commit `67107ac34f62882d8b53ea41ad68010ea635b9be`) was run on the same checkpoints and its GGUF files compared key by key and tensor by tensor with the converter's, with no difference but the float-rounding ones listed under [Checkpoints](@/providers/local/model-sources.md#checkpoints). Converted `f16` checkpoints also match the transformers oracle (top-1 equal, top-10 overlap at least 9 of 10, logits within 2 % relative L2) in `src/provider/local/convert/oracle.rs`, and answer the oracle's chat turn in `tests/provider_local_convert.rs`. All eight pinned repositories (OLMo 2, Granite 3.3, ERNIE 4.5, SmolLM 3, Gemma 3 1B through the ungated `unsloth/gemma-3-1b-it` mirror, OLMoE-1B-7B-0125-Instruct, DeepSeek-R1-Distill-Llama-8B as the 2025 `LlamaForCausalLM`, Qwen 3.5) passed: top-1 equal, top-10 overlap 10 of 10, greedy ids equal for all 24 (8 or 4 on the long prompts) steps, and every checkpoint answers the oracle's chat turn.
 

@@ -173,6 +173,32 @@
 //! each layer's device tier at load and waits for the device after every
 //! layer, so at most one layer's uploads are queued at a time.
 //!
+//! # Host experts
+//!
+//! With `ExpertPlacement::Host` the experts of the hosted MoE layers are read
+//! into RAM at load ([`cpu::HostExperts`](super::cpu::HostExperts), the CPU
+//! engine's resident experts) and [`GpuExpertBank::Host`] runs them: the
+//! router and [`mk::route`] run on the device, one readback brings the layer's
+//! normed rows and the routing to the host, the CPU computes every selected
+//! expert over its own tokens and sums them in ascending expert order, and one
+//! upload returns `[t, n_embd]`. Resident layers beyond `layers` keep their
+//! experts on the device.
+//!
+//! # Latent attention
+//!
+//! A `mistral4` layer ([`Weights::mla`]) caches one `[latent | rotary key]`
+//! row per position in a pool `[blocks, 1, 16, kv_lora + rot]` with no value
+//! pool, absorbs `k_b` into the query with one batched matmul, runs the paged
+//! decode kernel (key width 320, value width 256, the pool passed as both) or
+//! the gather path, and applies `v_b` to the attended latent.
+//!
+//! # Layer offload
+//!
+//! [`GpuTransformer::load_back`] loads the last layers and the head
+//! ([`Back`]); [`GpuTransformer::forward_back`] takes the residual stream the
+//! CPU layers produced and the rows of the K/V sources it holds
+//! ([`MirrorRows`](super::split::MirrorRows)); see [`split`](super::split).
+//!
 //! # Speculative drafting
 //!
 //! [`GpuTransformer::forward_ext`] returns the final-norm hidden rows next to
@@ -303,7 +329,7 @@ use burn::tensor::{AllocationProperty, Bytes, DType, Device, Int, Tensor, Tensor
 use candle_core::quantized::{GgmlDType, gguf_file};
 
 use super::arch::{Act, Arch};
-use super::cpu::{Forward, Hidden};
+use super::cpu::{Forward, Hidden, HostExperts};
 use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
 use super::moe::Routing;
 use super::moe_kernel::{self as mk, MoeCall, SlotLayout};
@@ -976,7 +1002,25 @@ struct WeightReader<'a> {
     device: &'a Device,
     /// Tensors held as f32 whatever their dtype; see [`plan_dense`].
     dense: HashSet<String>,
+    /// `ExpertPlacement::Host`: which layers keep their experts in host RAM.
+    host: Option<HostPlan>,
 }
+
+/// The MoE layers `lead..lead + n` keep their experts in host RAM
+/// (`ExpertPlacement::Host`; `n` is unbounded for all of them).
+#[derive(Clone)]
+struct HostPlan {
+    lead: usize,
+    n: usize,
+    path: std::path::PathBuf,
+    hp: Hparams,
+    /// Hold the hosted experts as f32 (the exact reference of the tests).
+    dequantize: bool,
+}
+
+/// Whether the tests load host experts dequantized ([`HostPlan::dequantize`]).
+#[cfg(test)]
+static HOST_EXACT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 impl WeightReader<'_> {
     /// Read `len` bytes at `offset` bytes into the data of `tensor_name` into
@@ -1201,6 +1245,15 @@ impl WeightReader<'_> {
         tp: Tp,
     ) -> Result<GpuExpertBank, CucaError> {
         let (layer, layout) = layer_experts(self.content, il, n_expert, ff, n_embd, fused)?;
+        if let Some(h) = &self.host
+            && il >= h.lead
+            && il - h.lead < h.n
+        {
+            return Ok(GpuExpertBank::Host {
+                experts: HostExperts::load(self.content, &h.path, &h.hp, il, h.dequantize)?,
+                layout,
+            });
+        }
         let no_list = Tensor::<1, Int>::zeros([2], self.device);
         if let Some(plan) = tiers {
             // One buffer holds at most MAX_PART_BYTES.
@@ -1534,6 +1587,12 @@ enum GpuExpertBank {
     /// The experts stay in the file; the pool holds at most `device_slots`
     /// of them, the rest come through the `store`'s tiers.
     Tiered(TieredBank),
+    /// The experts are in host RAM and the CPU computes them
+    /// (`ExpertPlacement::Host`); `layout` only sizes the kernels' calls.
+    Host {
+        experts: HostExperts,
+        layout: SlotLayout,
+    },
 }
 
 struct TieredBank {
@@ -1581,7 +1640,7 @@ impl TierPlan {
 impl GpuExpertBank {
     fn layout(&self) -> &SlotLayout {
         match self {
-            Self::Resident { layout, .. } => layout,
+            Self::Resident { layout, .. } | Self::Host { layout, .. } => layout,
             Self::Tiered(bank) => &bank.layout,
         }
     }
@@ -1611,6 +1670,28 @@ impl GpuExpertBank {
                 Ok(mk::sum(scratch, &c))
             }
             Self::Tiered(bank) => bank.run(f, route, call, device),
+            Self::Host { experts, .. } => {
+                // One readback: the layer's normed rows and the routing
+                // (ids, then weights) in one buffer; one upload of the sum.
+                let rows = t * n_embd;
+                let host = read_f32(
+                    Tensor::cat(vec![f.reshape([rows]), route], 0),
+                    "the rows of host experts",
+                )?;
+                let (input, route_host) = host.split_at(rows);
+                let mut per_expert: Vec<Vec<(u32, f32)>> = vec![Vec::new(); c.n_expert];
+                for pair in 0..t * k {
+                    if let Some(picks) = per_expert.get_mut(route_host[pair] as usize) {
+                        picks.push(((pair / k) as u32, route_host[t * k + pair]));
+                    }
+                }
+                let act = if c.act == 0 { Act::Silu } else { Act::Gelu };
+                let out = experts.forward(input, t, n_embd, &Routing { per_expert }, act)?;
+                Ok(Tensor::<2>::from_data(
+                    TensorData::new(out, [t, n_embd]),
+                    device,
+                ))
+            }
         }
     }
 
@@ -2618,8 +2699,30 @@ impl GpuTransformer {
         // take no part in the plan of autotune keys.
         shapes.retain(|(tensor, _)| tp::block_part(tensor).is_none_or(|(il, _)| il >= first));
         let dense = plan_dense(&shapes, &[]);
+        let host = match experts {
+            ExpertPlacement::Host { layers } => {
+                if hp.moe.is_none() {
+                    return Err(CucaError::Config(format!(
+                        "host experts need a mixture-of-experts model; `{}` has no experts",
+                        hp.arch.name()
+                    )));
+                }
+                #[cfg(test)]
+                let dequantize = HOST_EXACT.load(std::sync::atomic::Ordering::Relaxed);
+                #[cfg(not(test))]
+                let dequantize = false;
+                Some(HostPlan {
+                    lead: hp.leading_dense,
+                    n: layers.unwrap_or(usize::MAX),
+                    path: path.to_path_buf(),
+                    hp: hp.clone(),
+                    dequantize,
+                })
+            }
+            _ => None,
+        };
         let tiers = match experts {
-            ExpertPlacement::Resident => None,
+            ExpertPlacement::Resident | ExpertPlacement::Host { .. } => None,
             ExpertPlacement::Tiered(t) => Some((
                 t,
                 open_tiers(
@@ -2666,6 +2769,7 @@ impl GpuTransformer {
                 buf: Vec::new(),
                 device,
                 dense: dense.clone(),
+                host: host.clone(),
             };
             weights.push(Weights::load(
                 &mut reader,
@@ -3404,6 +3508,7 @@ impl GpuDrafter {
             buf: Vec::new(),
             device: &target.weights[0].device,
             dense,
+            host: None,
         };
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
@@ -3928,6 +4033,9 @@ impl Weights {
         kv: &mut KvLayers,
         mirror: &[MirrorRows],
     ) -> Result<(), CucaError> {
+        // Everything that can fail is checked before any pool is taken out of
+        // `kv`, so that a rejected call leaves every pool in place.
+        let mut plan = Vec::with_capacity(mirror.len());
         for m in mirror {
             let spec = self
                 .hp
@@ -3943,11 +4051,10 @@ impl Weights {
                     pass.seqs.len()
                 )));
             }
-            let mut pool = kv
-                .get_mut(m.layer)
-                .and_then(Option::take)
-                .ok_or_else(|| err(format!("layer {} has no mirrored K/V pool", m.layer)))?;
-            let mut value_pool = pool.v.take();
+            if kv.get(m.layer).is_none_or(Option::is_none) {
+                return Err(err(format!("layer {} has no mirrored K/V pool", m.layer)));
+            }
+            let mut writes = Vec::with_capacity(pass.seqs.len());
             for (seq, (k, v)) in pass.seqs.iter().zip(&m.seqs) {
                 let want = nkv * seq.t * d;
                 if k.len() != want || v.len() != want {
@@ -3958,6 +4065,16 @@ impl Weights {
                         v.len()
                     )));
                 }
+                writes.push(&seq.visible(m.layer, spec.window)?.1.writes);
+            }
+            plan.push((m, nkv, d, writes));
+        }
+        for (m, nkv, d, writes) in plan {
+            let Some(mut pool) = kv[m.layer].take() else {
+                return Err(err(format!("layer {} has no mirrored K/V pool", m.layer)));
+            };
+            let mut value_pool = pool.v.take();
+            for ((seq, (k, v)), writes) in pass.seqs.iter().zip(&m.seqs).zip(writes) {
                 let upload = |rows: &[f32]| {
                     Tensor::<4>::from_data(
                         TensorData::new(rows.to_vec(), [1, nkv, seq.t, d]),
@@ -3965,8 +4082,7 @@ impl Weights {
                     )
                 };
                 let (kt, vt) = (upload(k), upload(v));
-                let (_, blocks) = seq.visible(m.layer, spec.window)?;
-                for w in &blocks.writes {
+                for w in writes {
                     let at = [w.block..w.block + 1, 0..nkv, w.r0..w.r1, 0..d];
                     let rows = w.r1 - w.r0;
                     pool.k = pool
@@ -5410,22 +5526,12 @@ mod tests {
         )
     }
 
-    thread_local! {
-        /// The absolute and relative tolerance of [`assert_matches_cpu`] on
-        /// this thread.
-        static TOLERANCE: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((1e-3, 1e-2)) };
-    }
+    /// The absolute and relative tolerance of the GPU-versus-CPU compares
+    /// on engines that agree to float rounding plus the Q8_0 requantization
+    /// some weight types go through.
+    const LOOSE: (f32, f32) = (1e-3, 1e-2);
 
-    /// Run `f` with the GPU-versus-CPU tolerance `(absolute, relative)`.
-    fn with_tolerance<T>(tolerance: (f32, f32), f: impl FnOnce() -> T) -> T {
-        let before = TOLERANCE.replace(tolerance);
-        let out = f();
-        TOLERANCE.set(before);
-        out
-    }
-
-    fn assert_matches_cpu(cpu: &[f32], gpu: &[f32], what: &str) {
-        let (abs, rel) = TOLERANCE.get();
+    fn assert_matches_cpu(cpu: &[f32], gpu: &[f32], (abs, rel): (f32, f32), what: &str) {
         assert_eq!(cpu.len(), gpu.len(), "{what}");
         for (i, (c, g)) in cpu.iter().zip(gpu).enumerate() {
             assert!(
@@ -5445,9 +5551,22 @@ mod tests {
         want: Want,
         what: &str,
     ) {
+        compare_within(cpu, gpu, tokens, start, want, LOOSE, what);
+    }
+
+    /// [`compare`] to the tolerance `tol` (absolute, relative).
+    fn compare_within(
+        cpu: &mut Transformer,
+        gpu: &mut GpuTransformer,
+        tokens: &[u32],
+        start: usize,
+        want: Want,
+        tol: (f32, f32),
+        what: &str,
+    ) {
         let c = cpu.forward(tokens, start, want).unwrap().unwrap();
         let g = gpu.forward(tokens, start, want).unwrap().unwrap();
-        assert_matches_cpu(&c, &g, what);
+        assert_matches_cpu(&c, &g, tol, what);
     }
 
     /// The GPU engine must reproduce the CPU engine on one tiny model:
@@ -5457,24 +5576,31 @@ mod tests {
     /// GPU kernels (f32 activations) do not, and over several random-weight
     /// layers that alone moves logits by several percent.
     fn check_model(model: &TinyModel, device: LocalDevice, label: &str) {
+        check_model_within(model, device, label, LOOSE);
+    }
+
+    /// [`check_model`] to the tolerance `tol` (absolute, relative).
+    fn check_model_within(model: &TinyModel, device: LocalDevice, label: &str, tol: (f32, f32)) {
         let n = PROMPT.len();
 
         // (a) single-shot prefill, then (c) one decode step.
         let (mut cpu, mut gpu) = load_both(model, device);
-        compare(
+        compare_within(
             &mut cpu,
             &mut gpu,
             &PROMPT,
             0,
             Want::Last,
+            tol,
             &format!("{label} prefill"),
         );
-        compare(
+        compare_within(
             &mut cpu,
             &mut gpu,
             &[7],
             n,
             Want::Last,
+            tol,
             &format!("{label} decode"),
         );
 
@@ -5482,12 +5608,13 @@ mod tests {
         let (mut cpu, mut gpu) = load_both(model, device);
         assert!(gpu.forward(&PROMPT[..4], 0, Want::None).unwrap().is_none());
         assert!(cpu.forward(&PROMPT[..4], 0, Want::None).unwrap().is_none());
-        compare(
+        compare_within(
             &mut cpu,
             &mut gpu,
             &PROMPT[4..],
             4,
             Want::All,
+            tol,
             &format!("{label} all"),
         );
 
@@ -5500,12 +5627,13 @@ mod tests {
             cpu.forward(chunk, start, Want::None).unwrap();
             start += 3;
         }
-        compare(
+        compare_within(
             &mut cpu,
             &mut gpu,
             &PROMPT[start..],
             start,
             Want::Last,
+            tol,
             &format!("{label} chunked"),
         );
         assert_eq!(gpu.cache_len(), n);
@@ -5517,12 +5645,13 @@ mod tests {
             gpu.forward(&PROMPT[6..], 6, Want::Last).is_err(),
             "{label}: gap after truncate"
         );
-        compare(
+        compare_within(
             &mut cpu,
             &mut gpu,
             &[11, 13, 15, 14, 13, 12],
             5,
             Want::Last,
+            tol,
             &format!("{label} replay"),
         );
     }
@@ -5560,11 +5689,9 @@ mod tests {
         // Latent attention (and fused gate/up experts, an ungated shared
         // expert, a routing scale, YaRN and per-position query scaling)
         // against the dequantized CPU reference at 1e-4.
-        with_tolerance((1e-4, 1e-4), || {
-            for (label, spec) in mistral4_variants() {
-                check_model(&write_mistral4(&spec), device, label);
-            }
-        });
+        for (label, spec) in mistral4_variants() {
+            check_model_within(&write_mistral4(&spec), device, label, (1e-4, 1e-4));
+        }
         for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
             check_hybrid_model(&write_qwen35(&spec), device, label);
         }
@@ -5641,7 +5768,7 @@ mod tests {
         assert!(gpu.snapshot(1).is_none(), "{label}: one slot");
         let continued = gpu.forward(&PROMPT[6..], 6, Want::Last).unwrap().unwrap();
         let reference = cpu.forward(&PROMPT[6..], 6, Want::Last).unwrap().unwrap();
-        assert_matches_cpu(&reference, &continued, &format!("{label} chunked"));
+        assert_matches_cpu(&reference, &continued, LOOSE, &format!("{label} chunked"));
         assert_eq!(gpu.cache_len(), n);
 
         // The K/V blocks go back to position 6 (nothing there is named) and
@@ -6181,6 +6308,58 @@ mod tests {
         );
     }
 
+    /// Host experts (`ExpertPlacement::Host`: the CPU computes the routed
+    /// experts from RAM, the GPU everything else) give the resident GPU
+    /// logits to 1e-4 for every MoE architecture, hosting every MoE layer or
+    /// only the first one (the others stay on the device), and a model
+    /// without experts is rejected.
+    #[test]
+    fn gpu_host_experts_match_gpu_resident() {
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let mut models: Vec<(String, TinyModel)> = [TinySpec::qwen3moe(), TinySpec::olmoe()]
+            .into_iter()
+            .map(|spec| {
+                let arch = spec.arch.to_string();
+                let model = write_spec(&TinySpec {
+                    moe: Some((8, 2)),
+                    n_layer: 4,
+                    ..spec
+                });
+                (arch, model)
+            })
+            .collect();
+        models.push(("qwen35moe".into(), write_qwen35(&tiny_qwen35moe())));
+        for (label, spec) in mistral4_variants() {
+            models.push((label.to_string(), write_mistral4(&spec)));
+        }
+        // The reference holds the hosted experts as f32: candle's quantized
+        // matmul rounds activations to Q8_0, which the device kernels do not.
+        HOST_EXACT.store(true, std::sync::atomic::Ordering::Relaxed);
+        for (label, model) in &models {
+            let want = greedy_run(
+                &mut load_placed_gpu(model, device, &ExpertPlacement::Resident).unwrap(),
+            );
+            for layers in [None, Some(1)] {
+                let mut host =
+                    load_placed_gpu(model, device, &ExpertPlacement::Host { layers }).unwrap();
+                let got = greedy_run(&mut host);
+                assert_close_logits(&got, &want, &format!("{label} host {layers:?}"));
+            }
+        }
+        HOST_EXACT.store(false, std::sync::atomic::Ordering::Relaxed);
+        let dense = write_spec(&TinySpec::llama());
+        let e = load_placed_gpu(&dense, device, &ExpertPlacement::Host { layers: None })
+            .err()
+            .unwrap();
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("host experts need a mixture-of-experts model")),
+            "{e:?}"
+        );
+    }
+
     /// Past a sliding window (the tiny Gemma 3 at 1400 positions, window 4,
     /// whose blocks behind the window are released) the blocks it holds, the
     /// gathered reads and the decode kernel agree with the CPU engine's, also
@@ -6571,7 +6750,7 @@ mod tests {
                     println!("{dtype:?} {what}: max error {worst:.4} of the largest logit");
                     assert!(worst <= 0.08, "{dtype:?} {what}: {worst}");
                 } else {
-                    assert_matches_cpu(&c, &g, &format!("{dtype:?} {what}"));
+                    assert_matches_cpu(&c, &g, LOOSE, &format!("{dtype:?} {what}"));
                 }
             }
         }
@@ -7190,7 +7369,7 @@ mod tests {
                 let n = all.len();
                 Tensor::<1, Int>::from_data(TensorData::new(all, [n]), &device)
             };
-            for norm in [true, false] {
+            for (norm, scale) in [(true, 1.0f32), (false, 1.0), (true, 1.5), (false, 1.5)] {
                 for t in [1usize, 3, 5] {
                     let logits: Vec<f32> = (0..t * n_expert).map(|_| rand() * 6.0).collect();
                     let x: Vec<f32> = (0..t * n_embd).map(|_| rand()).collect();
@@ -7198,7 +7377,7 @@ mod tests {
                         n_expert,
                         n_used,
                         norm_weights: norm,
-                        scale: 1.0,
+                        scale,
                     };
                     let routing: Routing = host_route(&logits, t, &spec);
                     // Host reference.
@@ -7353,8 +7532,8 @@ mod tests {
                 .unwrap();
             let (ch, gh) = (c.hidden.unwrap(), g.hidden.unwrap());
             assert_eq!(gh.len(), rows * n);
-            assert_matches_cpu(&ch, &gh, "hidden rows");
-            assert_matches_cpu(&c.logits.unwrap(), &g.logits.unwrap(), "logits");
+            assert_matches_cpu(&ch, &gh, LOOSE, "hidden rows");
+            assert_matches_cpu(&c.logits.unwrap(), &g.logits.unwrap(), LOOSE, "logits");
         }
         let none = gpu
             .forward_ext(&[7], PROMPT.len(), Want::None, Hidden::PostNorm, false)
@@ -8080,6 +8259,89 @@ mod tests {
         }
     }
 
+    /// A mirror write the GPU half rejects (rows of the wrong size) fails the
+    /// call and leaves every pool in place: the next call, with the right
+    /// rows, serves and equals the single-device logits.
+    #[test]
+    fn gpu_offload_serves_again_after_a_rejected_mirror_write() {
+        use super::super::cpu::Front;
+        use super::super::split::mirrored;
+
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        const CTX: usize = 32;
+        let model = write_tiny_model_with(TinyOptions::default());
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
+                .unwrap();
+        let hp = read_hparams(&content).unwrap();
+        let first = (1..hp.n_layer)
+            .find(|&f| !mirrored(&hp, f).is_empty())
+            .expect("a split crossing a shared cache");
+        let mirror = mirrored(&hp, first);
+        let sizing = Sizing::single(CTX);
+        let mut front = Transformer::load_front(
+            &content,
+            &model.path,
+            CTX,
+            &ExpertPlacement::Resident,
+            &sizing,
+            &Front {
+                layers: first,
+                shared: None,
+                export: mirror.clone(),
+            },
+            true,
+        )
+        .unwrap();
+        let mut back = GpuTransformer::load_back(
+            &content,
+            &model.path,
+            CTX,
+            device,
+            &ExpertPlacement::Resident,
+            &sizing,
+            &Back {
+                first,
+                shared: None,
+                mirror,
+            },
+        )
+        .unwrap();
+        let mut reference = GpuTransformer::load(&content, &model.path, CTX, device).unwrap();
+        let want = reference
+            .forward(&PROMPT[..6], 0, Want::Last)
+            .unwrap()
+            .unwrap();
+
+        let mut pools = KvPools::new(back.kv_layout());
+        let mut seq = pools.seq();
+        pools.reserve(&mut seq, 6).unwrap();
+        let batch = Batch {
+            rows: vec![SeqRows {
+                tokens: &PROMPT[..6],
+                start_pos: 0,
+                tables: &seq.tables,
+                state: StateSlot(0),
+                want: Want::Last,
+                hidden: Hidden::None,
+            }],
+            exact: false,
+        };
+        let mut out = front.forward_front(&batch).unwrap();
+        out.kv[0].seqs[0].0.pop();
+        let failed = back.forward_back(&batch, out.hidden, out.per_layer, &out.kv);
+        assert!(failed.is_err(), "rows of the wrong size are rejected");
+        let out = front.forward_front(&batch).unwrap();
+        let mut served = back
+            .forward_back(&batch, out.hidden, out.per_layer, &out.kv)
+            .unwrap();
+        let got = served.swap_remove(0).logits.unwrap();
+        assert_rows_within(&got, &want, 1e-4, "after a rejected mirror write");
+    }
+
     /// `model` split across `devices[0]` and `devices[1]` equals the same
     /// model on `devices[0]` alone (to `tol` of the logits' scale: the
     /// shards sum two half-width partial products where the single device's
@@ -8386,6 +8648,7 @@ mod tests {
                 buf: Vec::new(),
                 device: &device,
                 dense: HashSet::new(),
+                host: None,
             };
             let matrices: Vec<(String, usize, usize)> = content
                 .tensor_infos

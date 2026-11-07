@@ -177,6 +177,12 @@ pub(super) fn validate(
             format!("architecture {}", hp.arch.name()),
         ));
     }
+    if matches!(experts, ExpertPlacement::Host { .. }) {
+        return Err(rule(
+            "host experts cannot be split across shards",
+            "ExpertPlacement::Host",
+        ));
+    }
     if matches!(experts, ExpertPlacement::Tiered(_)) {
         return Err(rule(
             "tiered experts cannot be split across shards",

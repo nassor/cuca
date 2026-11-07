@@ -428,7 +428,8 @@ pub(crate) fn read_hparams(content: &gguf_file::Content) -> Result<Hparams, Cuca
 /// a GPU device: the same tiers without the device tier.
 fn cpu_experts(experts: &ExpertPlacement) -> ExpertPlacement {
     match experts {
-        ExpertPlacement::Resident => ExpertPlacement::Resident,
+        // The CPU keeps every expert in RAM already.
+        ExpertPlacement::Resident | ExpertPlacement::Host { .. } => ExpertPlacement::Resident,
         ExpertPlacement::Tiered(tiers) => ExpertPlacement::Tiered(ExpertTiers {
             device_bytes: 0,
             ..tiers.clone()

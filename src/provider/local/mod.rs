@@ -105,6 +105,11 @@
 //!   [`ExpertPlacement::Tiered`] keeps the experts in the file instead and
 //!   streams them through RAM (and, on a GPU, device-memory) caches of a
 //!   configured byte size, with the same output.
+//! - [`LocalModelConfig::gpu_layers`] runs only the last `n` layers (and the
+//!   head) on the GPU and the first layers on the CPU (llama.cpp's `-ngl`),
+//!   and [`ExpertPlacement::Host`] keeps the routed experts in RAM and
+//!   computes them on the CPU while the GPU runs the rest (`--cpu-moe`); both
+//!   are for models that do not fit the device and compose with batching.
 //! - [`LocalModelConfig::shards`] splits a model over several GPUs (tensor
 //!   parallelism): attention heads and FFN widths are split evenly, each
 //!   device holds its slice of the weights and of the K/V pools, and the
@@ -1083,7 +1088,8 @@ pub struct ConvertConfig {
 /// `resident`, or `tiered:` followed by comma-separated `ram=<size>`,
 /// `device=<size>` and `threads=<n>` in any order (each at most once), where
 /// `<size>` is a byte count with an optional `k`, `m` or `g` suffix (powers
-/// of 1024): `tiered:ram=4g`, `tiered:device=6g,ram=12g,threads=8`.
+/// of 1024): `tiered:ram=4g`, `tiered:device=6g,ram=12g,threads=8`; or
+/// `host` / `host:layers=<n>` ([`ExpertPlacement::Host`]).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ExpertPlacement {
     /// Every expert is loaded at startup and stays in RAM (CPU) or device
@@ -1093,6 +1099,24 @@ pub enum ExpertPlacement {
     /// The experts stay in the GGUF file and are loaded on demand through
     /// bounded caches; mixture-of-experts models only.
     Tiered(ExpertTiers),
+    /// llama.cpp's `--cpu-moe` / `--n-cpu-moe` for a GPU device: the routed
+    /// experts of the MoE layers stay in host RAM and the CPU computes them,
+    /// while attention, the router, the shared expert, the norms and the head
+    /// run on the GPU. Per MoE layer the GPU computes the router and the
+    /// layer's normed rows are read back once; the CPU runs the routed
+    /// experts of every token and sums them, and the sum is uploaded once and
+    /// added. `layers: None` hosts every MoE layer, `Some(n)` the first `n`
+    /// (the other MoE layers keep their experts resident on the device).
+    /// Every hosted expert is read into RAM at load (the file's size, as
+    /// [`ExpertPlacement::Resident`] on the CPU). GPU devices and
+    /// mixture-of-experts models only; it cannot be combined with
+    /// [`ExpertTiers`] or with `shards`. It composes with
+    /// [`LocalModelConfig::gpu_layers`]: the CPU layers then use their
+    /// experts as a CPU model does, the GPU layers host theirs.
+    Host {
+        /// The first this many MoE layers, `None` for all of them.
+        layers: Option<usize>,
+    },
 }
 
 /// The caches of [`ExpertPlacement::Tiered`].
@@ -1169,12 +1193,21 @@ impl std::str::FromStr for ExpertPlacement {
         let s = s.trim();
         let bad = || {
             CucaError::Config(format!(
-                "unknown expert placement `{s}`; expected resident or tiered:ram=<size>[,device=<size>][,threads=<n>]"
+                "unknown expert placement `{s}`; expected resident, host[:layers=<n>] or tiered:ram=<size>[,device=<size>][,threads=<n>]"
             ))
         };
         let lower = s.to_ascii_lowercase();
         if lower == "resident" {
             return Ok(Self::Resident);
+        }
+        if lower == "host" {
+            return Ok(Self::Host { layers: None });
+        }
+        if let Some(n) = lower.strip_prefix("host:layers=") {
+            let layers = n.parse::<usize>().map_err(|_| bad())?;
+            return Ok(Self::Host {
+                layers: Some(layers),
+            });
         }
         let rest = lower.strip_prefix("tiered:").ok_or_else(bad)?;
         let size = |v: &str| -> Option<u64> {
@@ -1998,6 +2031,11 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
             "draft_tokens must be in 1..={MAX_DRAFT_TOKENS}, got {}",
             config.draft_tokens
         )));
+    }
+    if matches!(config.experts, ExpertPlacement::Host { .. }) && config.device == LocalDevice::Cpu {
+        return Err(CucaError::Config(
+            "ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does".into(),
+        ));
     }
     if let ExpertPlacement::Tiered(t) = &config.experts {
         if !(1..=MAX_LOADER_THREADS).contains(&t.loader_threads) {
@@ -3042,6 +3080,52 @@ mod tests {
             config(vulkan, &[LocalDevice::Metal(GpuAdapter::Default)]),
             "same GPU backend",
         );
+    }
+
+    #[test]
+    fn host_expert_placement_parses_and_is_validated() {
+        let host = |s: &str| s.parse::<ExpertPlacement>();
+        assert_eq!(
+            host("host").unwrap(),
+            ExpertPlacement::Host { layers: None }
+        );
+        assert_eq!(
+            host(" HOST:layers=20 ").unwrap(),
+            ExpertPlacement::Host { layers: Some(20) }
+        );
+        for bad in [
+            "host:",
+            "host:layers=",
+            "host:layers=x",
+            "host:layers=-1",
+            "host:ram=1g",
+            "hosted",
+        ] {
+            assert!(host(bad).is_err(), "{bad}");
+        }
+        // The CPU already computes its experts from RAM.
+        let cpu = LocalModelConfig {
+            experts: ExpertPlacement::Host { layers: None },
+            ..LocalModelConfig::default()
+        };
+        let err = validate(&cpu).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("ExpertPlacement::Host")),
+            "{err}"
+        );
+        // Tensor parallelism keeps experts resident.
+        #[cfg(feature = "provider-local-vulkan")]
+        {
+            let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
+            let mut config = LocalModelConfig {
+                device: vulkan,
+                experts: ExpertPlacement::Host { layers: None },
+                ..LocalModelConfig::default()
+            };
+            assert!(validate(&config).is_ok());
+            config.shards = vec![vulkan];
+            assert!(validate(&config).is_err());
+        }
     }
 
     #[test]

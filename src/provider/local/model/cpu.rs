@@ -20,6 +20,8 @@ use candle_nn::rotary_emb::{rope, rope_i};
 use super::arch::Act;
 use super::delta::{DeltaCell, DeltaKernel, DeltaState, Rows};
 use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
+#[cfg(feature = "provider-local-gpu")]
+use super::moe::Routing;
 use super::moe::route;
 #[cfg(test)]
 use super::paged::Solo;
@@ -237,6 +239,99 @@ pub(crate) struct CpuExpert {
     gate: QMatMul,
     up: QMatMul,
     down: QMatMul,
+}
+
+/// The routed experts of one MoE layer in host RAM, computed on the CPU for a
+/// GPU model (`ExpertPlacement::Host`): the CPU's resident experts, run with
+/// the CPU engine's own expert code.
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) struct HostExperts {
+    experts: Vec<CpuExpert>,
+}
+
+#[cfg(feature = "provider-local-gpu")]
+impl HostExperts {
+    /// Read every expert of MoE layer `il` from the file at `path` (index
+    /// `content`) into RAM; `dequantize` holds the matmul weights as f32
+    /// (the exact reference of the tests: candle's quantized matmul rounds
+    /// the activations to Q8_0).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] for a model without experts;
+    /// [`CucaError::Provider`] / [`CucaError::Io`] for missing or unreadable
+    /// expert tensors.
+    pub(crate) fn load(
+        content: &gguf_file::Content,
+        path: &Path,
+        hp: &Hparams,
+        il: usize,
+        dequantize: bool,
+    ) -> Result<Self, CucaError> {
+        let spec = hp.moe.ok_or_else(|| {
+            CucaError::Config(format!(
+                "host experts need a mixture-of-experts model; `{}` has no experts",
+                hp.arch.name()
+            ))
+        })?;
+        let Ffn::Moe { ff, fused, .. } = LayerLayout::read(hp, il, &hp.layers[il], content)?.ffn
+        else {
+            return Err(err(format!("layer {il} has no experts")));
+        };
+        let mut loader = Loader {
+            content,
+            reader: BufReader::new(File::open(path)?),
+            dequantize,
+            requantize: false,
+        };
+        match loader.expert_bank(il, spec.n_expert, ff, hp.n_embd, fused, None)? {
+            ExpertBank::Resident(experts) => Ok(Self { experts }),
+            ExpertBank::Tiered { .. } => Err(err("host experts are resident")),
+        }
+    }
+
+    /// The routed experts' output `[t, n_embd]` (row-major) for the normed
+    /// input `rows` and the `routing` of its tokens: every expert runs once
+    /// over its own tokens, in ascending expert order, and the weighted
+    /// outputs are summed per token, as the CPU engine's MoE layer does.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a failed matmul.
+    pub(crate) fn forward(
+        &self,
+        rows: &[f32],
+        t: usize,
+        n_embd: usize,
+        routing: &Routing,
+        act: Act,
+    ) -> Result<Vec<f32>, CucaError> {
+        let run = || -> candle_core::Result<Vec<f32>> {
+            let dev = &Device::Cpu;
+            let flat = Tensor::from_slice(rows, (t, n_embd), dev)?;
+            let mut out = Tensor::zeros((t, n_embd), DType::F32, dev)?;
+            for (e, picks) in routing.per_expert.iter().enumerate() {
+                if picks.is_empty() {
+                    continue;
+                }
+                let x = self
+                    .experts
+                    .get(e)
+                    .ok_or_else(|| candle_core::Error::msg("expert out of range"))?;
+                let (ids, weights): (Vec<u32>, Vec<f32>) = picks.iter().copied().unzip();
+                let m = ids.len();
+                let ids = Tensor::from_vec(ids, m, dev)?;
+                let weights = Tensor::from_vec(weights, (m, 1), dev)?;
+                let picked = flat.index_select(&ids, 0)?;
+                let hidden =
+                    (activate(&x.gate.forward(&picked)?, act)? * x.up.forward(&picked)?)?;
+                let y = x.down.forward(&hidden)?.broadcast_mul(&weights)?;
+                out = out.index_add(&ids, &y, 0)?;
+            }
+            out.flatten_all()?.to_vec1::<f32>()
+        };
+        run().map_err(candle_err)
+    }
 }
 
 /// The experts of one MoE layer.
@@ -1077,6 +1172,11 @@ impl Transformer {
         let upto = front.map_or(hp.n_layer, |f| f.layers);
         let store = match experts {
             ExpertPlacement::Resident => None,
+            ExpertPlacement::Host { .. } => {
+                return Err(CucaError::Config(
+                    "ExpertPlacement::Host is for a GPU device: the CPU keeps every expert in RAM already".into(),
+                ));
+            }
             ExpertPlacement::Tiered(_) if dequantize || drafter => {
                 return Err(CucaError::Config(
                     "expert tiers apply to a quantized main model only".into(),

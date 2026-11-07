@@ -188,6 +188,11 @@ mod model {
         experts: &ExpertPlacement,
         first: usize,
     ) -> Result<(ExpertPlacement, ExpertPlacement, Option<Arc<TierShared>>), CucaError> {
+        // Host experts belong to the GPU half's MoE layers; the CPU half
+        // already keeps its experts in RAM.
+        if let ExpertPlacement::Host { .. } = experts {
+            return Ok((ExpertPlacement::Resident, experts.clone(), None));
+        }
         let ExpertPlacement::Tiered(tiers) = experts else {
             return Ok((ExpertPlacement::Resident, ExpertPlacement::Resident, None));
         };
