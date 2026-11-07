@@ -7,39 +7,18 @@
 
 use crate::error::CucaError;
 
-/// `SentencePiece.Type`; also the values of `tokenizer.ggml.token_type` for a
+/// `SentencePiece.Type` values: `NORMAL`, `UNKNOWN`, `CONTROL`, `USER_DEFINED`,
+/// `UNUSED`, `BYTE`; also the values of `tokenizer.ggml.token_type` for a
 /// `llama` vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub(crate) enum PieceType {
-    Normal = 1,
-    Unknown = 2,
-    Control = 3,
-    UserDefined = 4,
-    Unused = 5,
-    Byte = 6,
-}
-
-impl PieceType {
-    fn from_i32(v: i32) -> Option<Self> {
-        Some(match v {
-            1 => Self::Normal,
-            2 => Self::Unknown,
-            3 => Self::Control,
-            4 => Self::UserDefined,
-            5 => Self::Unused,
-            6 => Self::Byte,
-            _ => return None,
-        })
-    }
-}
+const PIECE_TYPES: std::ops::RangeInclusive<i32> = 1..=6;
 
 /// One vocabulary entry of the model.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Piece {
     pub(crate) text: String,
     pub(crate) score: f32,
-    pub(crate) kind: PieceType,
+    /// The `SentencePiece.Type`.
+    pub(crate) kind: i32,
 }
 
 fn bad(why: &str) -> CucaError {
@@ -99,7 +78,7 @@ fn parse_piece(bytes: &[u8]) -> Result<Piece, CucaError> {
     let mut piece = Piece {
         text: String::new(),
         score: 0.0,
-        kind: PieceType::Normal,
+        kind: 1,
     };
     while !r.0.is_empty() {
         let tag = r.varint()?;
@@ -115,7 +94,10 @@ fn parse_piece(bytes: &[u8]) -> Result<Piece, CucaError> {
             }
             (3, 0) => {
                 let v = r.varint()? as i32;
-                piece.kind = PieceType::from_i32(v).ok_or_else(|| bad("unknown piece type"))?;
+                if !PIECE_TYPES.contains(&v) {
+                    return Err(bad("unknown piece type"));
+                }
+                piece.kind = v;
             }
             (_, wire) => r.skip(wire)?,
         }
@@ -141,7 +123,7 @@ pub(crate) fn parse_pieces(model: &[u8]) -> Result<Vec<Piece>, CucaError> {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
 
     fn varint(mut v: u64, out: &mut Vec<u8>) {
@@ -165,7 +147,7 @@ pub(crate) mod tests {
     }
 
     /// A hand-built `ModelProto`: `pieces` plus fields the reader must skip.
-    pub(crate) fn model(pieces: &[(&str, f32, Option<i32>)]) -> Vec<u8> {
+    fn model(pieces: &[(&str, f32, Option<i32>)]) -> Vec<u8> {
         let mut out = Vec::new();
         // trainer_spec (field 2) comes first in real files.
         field(2, 2, &[0x08, 0x01, 0x12, 0x03, b'a', b'b', b'c'], &mut out);
@@ -198,19 +180,19 @@ pub(crate) mod tests {
         ]);
         let pieces = parse_pieces(&bytes).unwrap();
         assert_eq!(pieces.len(), 6);
-        assert_eq!(pieces[0].kind, PieceType::Unknown);
-        assert_eq!(pieces[1].kind, PieceType::Control);
+        assert_eq!(pieces[0].kind, 2);
+        assert_eq!(pieces[1].kind, 3);
         assert_eq!(
             pieces[2],
             Piece {
                 text: "\u{2581}the".into(),
                 score: -3.5,
-                kind: PieceType::Normal
+                kind: 1
             }
         );
-        assert_eq!(pieces[3].kind, PieceType::Byte);
-        assert_eq!(pieces[4].kind, PieceType::UserDefined);
-        assert_eq!(pieces[5].kind, PieceType::Unused);
+        assert_eq!(pieces[3].kind, 6);
+        assert_eq!(pieces[4].kind, 4);
+        assert_eq!(pieces[5].kind, 5);
     }
 
     #[test]

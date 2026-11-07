@@ -11,17 +11,14 @@ use candle_core::quantized::gguf_file::Value;
 use serde_json::{Map, Value as Json};
 
 use super::arch::ConvArch;
+use super::cfg_err;
 use crate::error::CucaError;
 use crate::provider::local::WeightQuant;
 use crate::provider::local::model::params::Hparams;
 
-fn cfg_err(msg: impl Into<String>) -> CucaError {
-    CucaError::Config(msg.into())
-}
-
 /// The merged hyperparameters of a checkpoint, as the converter's
 /// `self.hparams` and `self.rope_parameters`.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Hp {
     map: Map<String, Json>,
     /// `rope_parameters` (or `rope_scaling`) with the converter's mirrored
@@ -72,10 +69,7 @@ impl Hp {
                 "rope_local_base_freq",
             ])
             .cloned();
-        let partial = hp
-            .find(&["partial_rotary_factor", "rope_pct", "rope_percent"])
-            .cloned();
-        let orig = hp.find(&["original_max_position_embeddings"]).cloned();
+        let rope_type = rope.get("type").filter(|t| !t.is_null()).cloned();
         if !rope.contains_key("full_attention") && !rope.contains_key("sliding_attention") {
             if let Some(t) = local_theta {
                 rope.insert(
@@ -83,25 +77,23 @@ impl Hp {
                     serde_json::json!({ "rope_theta": t }),
                 );
             }
-            if !rope.contains_key("rope_theta")
-                && let Some(t) = rope_theta
-            {
-                rope.insert("rope_theta".into(), t);
-            }
-            if !rope.contains_key("rope_type")
-                && let Some(t) = rope.get("type").filter(|t| !t.is_null()).cloned()
-            {
-                rope.insert("rope_type".into(), t);
-            }
-            if !rope.contains_key("partial_rotary_factor")
-                && let Some(p) = partial
-            {
-                rope.insert("partial_rotary_factor".into(), p);
-            }
-            if !rope.contains_key("original_max_position_embeddings")
-                && let Some(o) = orig
-            {
-                rope.insert("original_max_position_embeddings".into(), o);
+            let mirrored = [
+                ("rope_theta", rope_theta),
+                ("rope_type", rope_type),
+                (
+                    "partial_rotary_factor",
+                    hp.find(&["partial_rotary_factor", "rope_pct", "rope_percent"])
+                        .cloned(),
+                ),
+                (
+                    "original_max_position_embeddings",
+                    hp.find(&["original_max_position_embeddings"]).cloned(),
+                ),
+            ];
+            for (key, value) in mirrored {
+                if let Some(v) = value {
+                    rope.entry(key).or_insert(v);
+                }
             }
         }
         hp.rope = rope;
@@ -112,34 +104,31 @@ impl Hp {
     /// therefore sees (it loads `AutoConfig(...).to_dict()`): the head width
     /// of Llama-family and Qwen 3 configs and the RMSNorm epsilon.
     pub(crate) fn with_defaults(mut self, arch: ConvArch) -> Self {
-        let set = |map: &mut Map<String, Json>, key: &str, value: Json| {
-            if map.get(key).is_none_or(Json::is_null) {
-                map.insert(key.to_string(), value);
+        let (head_dim, eps) = match arch {
+            ConvArch::Llama | ConvArch::Mistral3 => (
+                match (self.n_embd(), self.n_head()) {
+                    (Ok(e), Ok(h)) if h > 0 => Some(e / h),
+                    _ => None,
+                },
+                1e-6,
+            ),
+            ConvArch::Qwen3 | ConvArch::Qwen3Moe => (Some(128), 1e-6),
+            ConvArch::Smollm3 | ConvArch::Qwen2 | ConvArch::Granite | ConvArch::Mistral4 => {
+                (None, 1e-6)
             }
+            ConvArch::Phi3 | ConvArch::Olmo2 | ConvArch::Olmoe | ConvArch::Ernie4_5 => (None, 1e-5),
+            _ => return self,
         };
-        let head_dim = match (self.n_embd(), self.n_head()) {
-            (Ok(e), Ok(h)) if h > 0 => Some(e / h),
-            _ => None,
-        };
-        match arch {
-            ConvArch::Llama | ConvArch::Mistral3 => {
-                if let Some(d) = head_dim {
-                    set(&mut self.map, "head_dim", Json::from(d));
+        for (key, value) in [
+            ("head_dim", head_dim.map(Json::from)),
+            ("rms_norm_eps", Some(Json::from(eps))),
+        ] {
+            if let Some(value) = value {
+                let slot = self.map.entry(key).or_insert(Json::Null);
+                if slot.is_null() {
+                    *slot = value;
                 }
-                set(&mut self.map, "rms_norm_eps", Json::from(1e-6));
             }
-            ConvArch::Smollm3 => set(&mut self.map, "rms_norm_eps", Json::from(1e-6)),
-            ConvArch::Qwen3 | ConvArch::Qwen3Moe => {
-                set(&mut self.map, "head_dim", Json::from(128));
-                set(&mut self.map, "rms_norm_eps", Json::from(1e-6));
-            }
-            ConvArch::Qwen2 | ConvArch::Granite | ConvArch::Mistral4 => {
-                set(&mut self.map, "rms_norm_eps", Json::from(1e-6));
-            }
-            ConvArch::Phi3 | ConvArch::Olmo2 | ConvArch::Olmoe | ConvArch::Ernie4_5 => {
-                set(&mut self.map, "rms_norm_eps", Json::from(1e-5));
-            }
-            _ => {}
         }
         self
     }
@@ -154,6 +143,10 @@ impl Hp {
 
     pub(crate) fn get(&self, key: &str) -> Option<&Json> {
         self.map.get(key).filter(|v| !v.is_null())
+    }
+
+    fn flag(&self, key: &str) -> Option<bool> {
+        self.get(key).and_then(Json::as_bool)
     }
 
     pub(crate) fn uint(&self, keys: &[&str]) -> Option<usize> {
@@ -180,6 +173,11 @@ impl Hp {
             Some(Json::Object(m)) => m,
             _ => &self.rope,
         }
+    }
+
+    /// `rope_parameters["full_attention"]["rope_theta"]`.
+    fn rope_theta(&self) -> Option<f64> {
+        self.rope_full().get("rope_theta").and_then(Json::as_f64)
     }
 
     /// `rope_parameters` itself (the converter's `self.rope_parameters`).
@@ -227,9 +225,9 @@ fn as_usize(v: &Json) -> Option<usize> {
 }
 
 /// Ordered GGUF key/value pairs under one architecture prefix.
-pub(crate) struct Kv {
+struct Kv {
     prefix: &'static str,
-    pub(crate) items: Vec<(String, Value)>,
+    items: Vec<(String, Value)>,
 }
 
 impl Kv {
@@ -242,7 +240,7 @@ impl Kv {
 
     /// Set a full key, replacing an earlier value (the converter's later
     /// override of an earlier write).
-    pub(crate) fn raw(&mut self, key: &str, value: Value) {
+    fn raw(&mut self, key: &str, value: Value) {
         match self.items.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = value,
             None => self.items.push((key.to_string(), value)),
@@ -260,8 +258,20 @@ impl Kv {
         Ok(())
     }
 
+    /// [`Kv::u32`] of a value the config may not have.
+    fn u32_opt(&mut self, key: &str, v: Option<usize>) -> Result<(), CucaError> {
+        v.map_or(Ok(()), |v| self.u32(key, v))
+    }
+
     fn f32(&mut self, key: &str, v: f64) {
         self.arch_key(key, Value::F32(v as f32));
+    }
+
+    /// [`Kv::f32`] of a value the config may not have.
+    fn f32_opt(&mut self, key: &str, v: Option<f64>) {
+        if let Some(v) = v {
+            self.f32(key, v);
+        }
     }
 
     fn bool(&mut self, key: &str, v: bool) {
@@ -298,7 +308,7 @@ pub(crate) struct ModelMeta {
 }
 
 /// `LlamaFileType` of a weight precision.
-fn file_type(q: WeightQuant) -> u32 {
+pub(crate) fn file_type(q: WeightQuant) -> u32 {
     match q {
         WeightQuant::F16 => 1,
         WeightQuant::Q4_0 => 2,
@@ -312,16 +322,16 @@ fn rope_scaling(arch: ConvArch, hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
     let Some(kind) = p.get("rope_type").and_then(Json::as_str) else {
         return Ok(());
     };
-    let factor = p.get("factor").and_then(Json::as_f64);
-    match kind {
-        "default" | "" => {}
-        "linear" if factor.is_some() => {
+    let num = |key: &str| p.get(key).and_then(Json::as_f64);
+    match (kind, num("factor")) {
+        ("default" | "" | "llama3", _) => {}
+        ("linear", Some(factor)) => {
             kv.arch_key("rope.scaling.type", Value::String("linear".into()));
-            kv.f32("rope.scaling.factor", factor.unwrap_or(1.0));
+            kv.f32("rope.scaling.factor", factor);
         }
-        "yarn" if factor.is_some() => {
+        ("yarn", Some(factor)) => {
             kv.arch_key("rope.scaling.type", Value::String("yarn".into()));
-            kv.f32("rope.scaling.factor", factor.unwrap_or(1.0));
+            kv.f32("rope.scaling.factor", factor);
             let orig = p
                 .get("original_max_position_embeddings")
                 .and_then(as_usize)
@@ -332,30 +342,20 @@ fn rope_scaling(arch: ConvArch, hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
             if let Some(t) = p.get("truncate").and_then(Json::as_bool) {
                 kv.bool("rope.scaling.yarn_truncate", t);
             }
-            if let Some(e) = p.get("extrapolation_factor").and_then(Json::as_f64) {
-                kv.f32("rope.scaling.yarn_ext_factor", e);
-            }
-            if p.get("attention_factor")
-                .or_else(|| p.get("attn_factor"))
-                .is_some()
-            {
+            kv.f32_opt("rope.scaling.yarn_ext_factor", num("extrapolation_factor"));
+            if p.contains_key("attention_factor") || p.contains_key("attn_factor") {
                 return Err(cfg_err(
                     "an explicit YaRN attention_factor is not supported by the engine",
                 ));
             }
-            if let Some(b) = p.get("beta_fast").and_then(Json::as_f64) {
-                kv.f32("rope.scaling.yarn_beta_fast", b);
-            }
-            if let Some(b) = p.get("beta_slow").and_then(Json::as_f64) {
-                kv.f32("rope.scaling.yarn_beta_slow", b);
-            }
+            kv.f32_opt("rope.scaling.yarn_beta_fast", num("beta_fast"));
+            kv.f32_opt("rope.scaling.yarn_beta_slow", num("beta_slow"));
         }
-        "su" | "longrope" => {
+        ("su" | "longrope", _) => {
             kv.arch_key("rope.scaling.type", Value::String("longrope".into()));
         }
-        "llama3" => {}
-        "proportional" if arch == ConvArch::Gemma4 || arch == ConvArch::Gemma4Assistant => {}
-        other => {
+        ("proportional", _) if arch == ConvArch::Gemma4 || arch == ConvArch::Gemma4Assistant => {}
+        (other, _) => {
             return Err(cfg_err(format!(
                 "rope scaling type `{other}` is not supported"
             )));
@@ -367,34 +367,39 @@ fn rope_scaling(arch: ConvArch, hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
 /// The generic `TextModel.set_gguf_parameters`.
 fn base(arch: ConvArch, hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<(), CucaError> {
     kv.u32("block_count", n_block)?;
-    if let Some(n) = hp.uint(&[
-        "max_position_embeddings",
-        "n_ctx",
-        "n_positions",
-        "max_length",
-        "max_sequence_length",
-        "model_max_length",
-    ]) {
-        kv.u32("context_length", n)?;
-    }
-    if let Some(n) = hp.uint(&["hidden_size", "n_embd", "dim"]) {
-        kv.u32("embedding_length", n)?;
-    }
-    if let Some(n) = hp.uint(&[
-        "prefix_dense_intermediate_size",
-        "dense_intermediate_size",
-        "intermediate_size",
-        "n_inner",
-        "hidden_dim",
-    ]) {
-        kv.u32("feed_forward_length", n)?;
-    }
-    if let Some(n) = hp.uint(&["num_attention_heads", "n_head", "n_heads"]) {
-        kv.u32("attention.head_count", n)?;
-    }
-    if let Some(n) = hp.uint(&["num_key_value_heads", "n_kv_heads"]) {
-        kv.u32("attention.head_count_kv", n)?;
-    }
+    kv.u32_opt(
+        "context_length",
+        hp.uint(&[
+            "max_position_embeddings",
+            "n_ctx",
+            "n_positions",
+            "max_length",
+            "max_sequence_length",
+            "model_max_length",
+        ]),
+    )?;
+    kv.u32_opt(
+        "embedding_length",
+        hp.uint(&["hidden_size", "n_embd", "dim"]),
+    )?;
+    kv.u32_opt(
+        "feed_forward_length",
+        hp.uint(&[
+            "prefix_dense_intermediate_size",
+            "dense_intermediate_size",
+            "intermediate_size",
+            "n_inner",
+            "hidden_dim",
+        ]),
+    )?;
+    kv.u32_opt(
+        "attention.head_count",
+        hp.uint(&["num_attention_heads", "n_head", "n_heads"]),
+    )?;
+    kv.u32_opt(
+        "attention.head_count_kv",
+        hp.uint(&["num_key_value_heads", "n_kv_heads"]),
+    )?;
     rope_scaling(arch, hp, kv)?;
     if let Some(Json::Array(sections)) = hp.rope_all().get("mrope_section") {
         let mut s: Vec<i64> = sections.iter().filter_map(Json::as_i64).collect();
@@ -403,34 +408,30 @@ fn base(arch: ConvArch, hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<(), Cuca
         }
         kv.i32s("rope.dimension_sections", &s[..4]);
     }
-    if let Some(t) = hp.rope_full().get("rope_theta").and_then(Json::as_f64) {
-        kv.f32("rope.freq_base", t);
-    }
-    if let Some(t) = hp.rope_sliding_theta() {
-        kv.f32("rope.freq_base_swa", t);
-    }
-    if let Some(e) = hp.float(&["rms_norm_eps", "norm_eps"]) {
-        kv.f32("attention.layer_norm_rms_epsilon", e);
-    }
-    if let Some(e) = hp.float(&["layer_norm_eps", "layer_norm_epsilon", "norm_epsilon"]) {
-        kv.f32("attention.layer_norm_epsilon", e);
-    }
-    if let Some(n) = hp.uint(&["num_local_experts", "num_experts", "n_routed_experts"]) {
-        kv.u32("expert_count", n)?;
-    }
-    if let Some(n) = hp.uint(&[
-        "num_experts_per_tok",
-        "num_experts_per_token",
-        "top_k_experts",
-    ]) {
-        kv.u32("expert_used_count", n)?;
-    }
-    if let Some(n) = hp.uint(&["n_group"]) {
-        kv.u32("expert_group_count", n)?;
-    }
-    if let Some(n) = hp.uint(&["topk_group"]) {
-        kv.u32("expert_group_used_count", n)?;
-    }
+    kv.f32_opt("rope.freq_base", hp.rope_theta());
+    kv.f32_opt("rope.freq_base_swa", hp.rope_sliding_theta());
+    kv.f32_opt(
+        "attention.layer_norm_rms_epsilon",
+        hp.float(&["rms_norm_eps", "norm_eps"]),
+    );
+    kv.f32_opt(
+        "attention.layer_norm_epsilon",
+        hp.float(&["layer_norm_eps", "layer_norm_epsilon", "norm_epsilon"]),
+    );
+    kv.u32_opt(
+        "expert_count",
+        hp.uint(&["num_local_experts", "num_experts", "n_routed_experts"]),
+    )?;
+    kv.u32_opt(
+        "expert_used_count",
+        hp.uint(&[
+            "num_experts_per_tok",
+            "num_experts_per_token",
+            "top_k_experts",
+        ]),
+    )?;
+    kv.u32_opt("expert_group_count", hp.uint(&["n_group"]))?;
+    kv.u32_opt("expert_group_used_count", hp.uint(&["topk_group"]))?;
     if let Some(d) = hp.uint(&["head_dim"]) {
         kv.u32("attention.key_length", d)?;
         kv.u32("attention.value_length", d)?;
@@ -455,9 +456,7 @@ fn mla(arch: ConvArch, hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<(), CucaE
     };
     kv.u32("leading_dense_block_count", dense)?;
     kv.u32("vocab_size", hp.req_uint(&["vocab_size"])?)?;
-    if let Some(r) = hp.uint(&["q_lora_rank"]) {
-        kv.u32("attention.q_lora_rank", r)?;
-    }
+    kv.u32_opt("attention.q_lora_rank", hp.uint(&["q_lora_rank"]))?;
     let lora = hp.uint(&["kv_lora_rank"]).unwrap_or(512);
     let nope = hp.req_uint(&["qk_nope_head_dim"])?;
     let rope = hp.req_uint(&["qk_rope_head_dim"])?;
@@ -470,17 +469,13 @@ fn mla(arch: ConvArch, hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<(), CucaE
         "expert_feed_forward_length",
         hp.req_uint(&["moe_intermediate_size", "intermediate_size"])?,
     )?;
-    if let Some(n) = hp.uint(&["n_routed_experts"]) {
-        kv.u32("expert_count", n)?;
-    }
+    kv.u32_opt("expert_count", hp.uint(&["n_routed_experts"]))?;
     kv.u32(
         "expert_shared_count",
         hp.uint(&["n_shared_experts"]).unwrap_or(0),
     )?;
-    if let Some(f) = hp.float(&["routed_scaling_factor"]) {
-        kv.f32("expert_weights_scale", f);
-    }
-    if hp.get("norm_topk_prob").and_then(Json::as_bool) == Some(true) {
+    kv.f32_opt("expert_weights_scale", hp.float(&["routed_scaling_factor"]));
+    if hp.flag("norm_topk_prob") == Some(true) {
         kv.bool("expert_weights_norm", true);
     }
     kv.u32("rope.dimension_count", rope)?;
@@ -561,14 +556,16 @@ fn llama3_freqs(hp: &Hp) -> Result<Vec<ExtraTensor>, CucaError> {
     }])
 }
 
-fn gemma_softcaps(hp: &Hp, kv: &mut Kv) {
-    if let Some(c) = hp.truthy_f("final_logit_softcapping") {
-        kv.f32("final_logit_softcapping", c);
-    }
+/// `final_logit_softcapping`, when set and non-zero.
+fn final_softcap(hp: &Hp, kv: &mut Kv) {
+    kv.f32_opt(
+        "final_logit_softcapping",
+        hp.truthy_f("final_logit_softcapping"),
+    );
 }
 
-/// `per_layer_config[i]` of the layers of `kind`, first hit of `key`.
-fn first_layer_value(hp: &Hp, kind: &str, key: &str) -> Option<Json> {
+/// `per_layer_config[i][key]` of the first layer of `kind`, as an integer.
+fn first_layer_uint(hp: &Hp, kind: &str, key: &str) -> Option<usize> {
     let layer_types = hp.get("layer_types")?.as_array()?;
     let Json::Object(cfg) = hp.get("per_layer_config")? else {
         return None;
@@ -578,7 +575,7 @@ fn first_layer_value(hp: &Hp, kind: &str, key: &str) -> Option<Json> {
         if layer_types.get(i).and_then(Json::as_str) == Some(kind)
             && let Some(v) = layer.get(key)
         {
-            return Some(v.clone());
+            return as_usize(v);
         }
     }
     None
@@ -592,10 +589,7 @@ fn gemma4(
     kv: &mut Kv,
     n_block: usize,
 ) -> Result<Vec<ExtraTensor>, CucaError> {
-    if hp
-        .get("enable_moe_block")
-        .and_then(Json::as_bool)
-        .unwrap_or(false)
+    if hp.flag("enable_moe_block").unwrap_or(false)
         || hp.uint(&["num_experts"]).is_some_and(|n| n > 0)
     {
         return Err(cfg_err(
@@ -611,40 +605,31 @@ fn gemma4(
         "embedding_length_per_layer_input",
         hp.uint(&["hidden_size_per_layer_input"]).unwrap_or(0),
     )?;
-    let layer_types: Vec<&str> = hp
+    let swa: Vec<bool> = hp
         .get("layer_types")
         .and_then(Json::as_array)
         .ok_or_else(|| cfg_err("config.json has no `layer_types`"))?
         .iter()
         .filter_map(Json::as_str)
-        .collect();
-    let swa: Vec<bool> = layer_types
-        .iter()
-        .map(|t| *t == "sliding_attention")
+        .map(|t| t == "sliding_attention")
         .collect();
     kv.bools("attention.sliding_window_pattern", &swa);
 
-    let head_dim_full = match hp.uint(&["global_head_dim"]) {
-        Some(d) => d,
-        None => first_layer_value(hp, "full_attention", "head_dim")
-            .as_ref()
-            .and_then(as_usize)
-            .ok_or_else(|| cfg_err("cannot find the full-attention head dimension"))?,
-    };
+    let head_dim_full = hp
+        .uint(&["global_head_dim"])
+        .or_else(|| first_layer_uint(hp, "full_attention", "head_dim"))
+        .ok_or_else(|| cfg_err("cannot find the full-attention head dimension"))?;
     let head_dim_swa = hp.req_uint(&["head_dim"])?;
     kv.u32("attention.key_length", head_dim_full)?;
     kv.u32("attention.value_length", head_dim_full)?;
     kv.u32("attention.key_length_swa", head_dim_swa)?;
     kv.u32("attention.value_length_swa", head_dim_swa)?;
 
-    if let Some(n) = hp.uint(&["expert_intermediate_size", "moe_intermediate_size"]) {
-        kv.u32("expert_feed_forward_length", n)?;
-    }
-    if hp
-        .get("use_double_wide_mlp")
-        .and_then(Json::as_bool)
-        .unwrap_or(false)
-    {
+    kv.u32_opt(
+        "expert_feed_forward_length",
+        hp.uint(&["expert_intermediate_size", "moe_intermediate_size"]),
+    )?;
+    if hp.flag("use_double_wide_mlp").unwrap_or(false) {
         let n_ff = hp.req_uint(&["intermediate_size"])?;
         let first_shared = n_block - shared;
         let arr: Vec<i64> = (0..n_block)
@@ -658,12 +643,9 @@ fn gemma4(
             .collect();
         kv.i32s("feed_forward_length", &arr);
     }
-    let kv_full = match hp.uint(&["num_global_key_value_heads"]) {
-        Some(n) => Some(n),
-        None => first_layer_value(hp, "full_attention", "num_key_value_heads")
-            .as_ref()
-            .and_then(as_usize),
-    };
+    let kv_full = hp
+        .uint(&["num_global_key_value_heads"])
+        .or_else(|| first_layer_uint(hp, "full_attention", "num_key_value_heads"));
     if let (Some(full), Some(swa_heads)) = (kv_full, hp.uint(&["num_key_value_heads"])) {
         let arr: Vec<i64> = swa
             .iter()
@@ -725,19 +707,13 @@ fn gemma3_overrides(hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
     let head_dim = hp.uint(&["head_dim"]).unwrap_or(256);
     kv.u32("attention.key_length", head_dim)?;
     kv.u32("attention.value_length", head_dim)?;
-    kv.f32(
-        "rope.freq_base",
-        hp.rope_full()
-            .get("rope_theta")
-            .and_then(Json::as_f64)
-            .unwrap_or(1_000_000.0),
-    );
+    kv.f32("rope.freq_base", hp.rope_theta().unwrap_or(1_000_000.0));
     if hp.get("attn_logit_softcapping").is_some() {
         return Err(cfg_err(
             "Gemma 3 checkpoints have no attn_logit_softcapping",
         ));
     }
-    gemma_softcaps(hp, kv);
+    final_softcap(hp, kv);
     if hp.uint(&["sliding_window_pattern"]) != Some(1) {
         kv.u32(
             "attention.sliding_window",
@@ -784,8 +760,7 @@ fn phi3(hp: &Hp, kv: &mut Kv, n_block: usize) -> Result<Vec<ExtraTensor>, CucaEr
     kv.u32("rope.dimension_count", rope_dims)?;
     kv.f32(
         "rope.freq_base",
-        rope.get("rope_theta")
-            .and_then(Json::as_f64)
+        hp.rope_theta()
             .ok_or_else(|| cfg_err("Phi 3 rope parameters lack rope_theta"))?,
     );
     kv.u32(
@@ -871,7 +846,7 @@ fn muse_glimmer(hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
         ));
     }
     // The engine rotates exactly the sliding layers, with the global base.
-    let theta = hp.rope_full().get("rope_theta").and_then(Json::as_f64);
+    let theta = hp.rope_theta();
     if let Some(Json::Array(thetas)) = hp.get("layer_rope_theta") {
         let ok = thetas.len() == n_layer
             && thetas.iter().zip(&sliding).all(|(t, s)| {
@@ -895,7 +870,7 @@ fn muse_glimmer(hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
     {
         return Err(cfg_err("Muse Glimmer activations other than silu"));
     }
-    if hp.get("attention_bias").and_then(Json::as_bool) == Some(true) {
+    if hp.flag("attention_bias") == Some(true) {
         return Err(cfg_err("Muse Glimmer attention biases are not supported"));
     }
     if hp.float(&["post_norm_eps"]).is_some_and(|e| e != 1e-8) {
@@ -903,9 +878,7 @@ fn muse_glimmer(hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
             "Muse Glimmer post_norm_eps other than 1e-8 is not supported: the engine fixes it",
         ));
     }
-    if let Some(c) = hp.truthy_f("final_logit_softcapping") {
-        kv.f32("final_logit_softcapping", c);
-    }
+    final_softcap(hp, kv);
     kv.f32(
         "logit_scale",
         hp.float(&["output_multiplier"])
@@ -919,7 +892,7 @@ fn muse_glimmer(hp: &Hp, kv: &mut Kv) -> Result<(), CucaError> {
 /// Refuse features the engine's architecture does not implement, so a
 /// converted file never silently computes something else.
 fn guard(arch: ConvArch, hp: &Hp) -> Result<(), CucaError> {
-    let sliding_layers = |hp: &Hp| {
+    let sliding_layers = || {
         hp.get("layer_types")
             .and_then(Json::as_array)
             .is_some_and(|l| l.iter().any(|t| t.as_str() == Some("sliding_attention")))
@@ -936,13 +909,13 @@ fn guard(arch: ConvArch, hp: &Hp) -> Result<(), CucaError> {
         ));
     }
     match arch {
-        ConvArch::Olmo2 if sliding_layers(hp) => {
+        ConvArch::Olmo2 if sliding_layers() => {
             return Err(cfg_err(
                 "OLMo 3 sliding-window layers are not supported by the engine",
             ));
         }
         ConvArch::Qwen3Moe => {
-            if hp.get("norm_topk_prob").and_then(Json::as_bool) != Some(true) {
+            if hp.flag("norm_topk_prob") != Some(true) {
                 return Err(cfg_err(
                     "Qwen3 MoE with norm_topk_prob = false is not supported: the engine renormalises the selected experts",
                 ));
@@ -965,7 +938,7 @@ fn guard(arch: ConvArch, hp: &Hp) -> Result<(), CucaError> {
                 return Err(cfg_err("Qwen3 MoE decoder_sparse_step must be 1"));
             }
         }
-        ConvArch::Olmoe if hp.get("norm_topk_prob").and_then(Json::as_bool) == Some(true) => {
+        ConvArch::Olmoe if hp.flag("norm_topk_prob") == Some(true) => {
             return Err(cfg_err(
                 "OLMoE with norm_topk_prob = true is not supported: the engine keeps the raw softmax weights",
             ));
@@ -1032,29 +1005,25 @@ pub(crate) fn build(
 
     match arch {
         ConvArch::Llama | ConvArch::Smollm3 | ConvArch::Granite | ConvArch::Mistral3 => {
+            // Granite ignores head_dim: the engine derives the head size
+            // from the embedding width.
+            let granite = (arch == ConvArch::Granite).then(|| {
+                let mut g = hp.clone();
+                g.map.remove("head_dim");
+                g
+            });
+            let llama_hp = granite.as_ref().unwrap_or(hp);
+            base(arch, llama_hp, &mut kv, n_block)?;
+            llama_extras(llama_hp, &mut kv)?;
             if arch == ConvArch::Granite {
-                // Granite ignores head_dim: the engine derives the head size
-                // from the embedding width.
-                let mut granite = Hp {
-                    map: hp.map.clone(),
-                    rope: hp.rope.clone(),
-                };
-                granite.map.remove("head_dim");
-                base(arch, &granite, &mut kv, n_block)?;
-                llama_extras(&granite, &mut kv)?;
                 for (src, key) in [
                     ("attention_multiplier", "attention.scale"),
                     ("embedding_multiplier", "embedding_scale"),
                     ("residual_multiplier", "residual_scale"),
                     ("logits_scaling", "logit_scale"),
                 ] {
-                    if let Some(v) = granite.truthy_f(src) {
-                        kv.f32(key, v);
-                    }
+                    kv.f32_opt(key, llama_hp.truthy_f(src));
                 }
-            } else {
-                base(arch, hp, &mut kv, n_block)?;
-                llama_extras(hp, &mut kv)?;
             }
             extra = llama3_freqs(hp)?;
             if arch == ConvArch::Mistral3 {
@@ -1064,18 +1033,21 @@ pub(crate) fn build(
         ConvArch::Qwen2 | ConvArch::Qwen3 | ConvArch::Ernie4_5 => base(arch, hp, &mut kv, n_block)?,
         ConvArch::Qwen3Moe => {
             base(arch, hp, &mut kv, n_block)?;
-            if let Some(n) = hp.uint(&["moe_intermediate_size"]) {
-                kv.u32("expert_feed_forward_length", n)?;
-            }
+            kv.u32_opt(
+                "expert_feed_forward_length",
+                hp.uint(&["moe_intermediate_size"]),
+            )?;
         }
         ConvArch::Qwen35 | ConvArch::Qwen35Moe => {
             base(arch, hp, &mut kv, n_block)?;
-            if let Some(n) = hp.uint(&["moe_intermediate_size"]) {
-                kv.u32("expert_feed_forward_length", n)?;
-            }
-            if let Some(n) = hp.uint(&["shared_expert_intermediate_size"]) {
-                kv.u32("expert_shared_feed_forward_length", n)?;
-            }
+            kv.u32_opt(
+                "expert_feed_forward_length",
+                hp.uint(&["moe_intermediate_size"]),
+            )?;
+            kv.u32_opt(
+                "expert_shared_feed_forward_length",
+                hp.uint(&["shared_expert_intermediate_size"]),
+            )?;
             if n_mtp > 0 {
                 kv.u32("nextn_predict_layers", n_mtp)?;
             }
@@ -1151,9 +1123,7 @@ pub(crate) fn build(
         }
         ConvArch::Olmo2 => {
             base(arch, hp, &mut kv, n_block)?;
-            if let Some(w) = hp.uint(&["sliding_window"]) {
-                kv.u32("attention.sliding_window", w)?;
-            }
+            kv.u32_opt("attention.sliding_window", hp.uint(&["sliding_window"]))?;
         }
         ConvArch::Olmoe => {
             base(arch, hp, &mut kv, n_block)?;

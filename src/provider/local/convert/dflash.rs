@@ -36,25 +36,19 @@
 //! the drafter, which is the output of layer `i - 1` (transformers' ids are
 //! outputs: `[1, 13, 25, 37, 49]` becomes `[2, 14, 26, 38, 50]`).
 
-use std::fs::File;
-use std::io::{BufWriter, Write};
 use std::path::Path;
 
 use candle_core::quantized::gguf_file::Value;
 use serde_json::Value as Json;
 
-use super::config::Hp;
-use super::gguf_writer::GgufWriter;
+use super::cfg_err;
+use super::config::{Hp, file_type};
 use super::hf::CheckpointDir;
 use super::safetensors::Shards;
 use super::tensors::{Body, Plan, Slice};
 use crate::error::CucaError;
 use crate::provider::local::model::cpu::dflash::{ARCH, check_metadata};
 use crate::provider::local::{DownloadProgressCallback, WeightQuant};
-
-fn cfg_err(msg: impl Into<String>) -> CucaError {
-    CucaError::Config(msg.into())
-}
 
 /// The class of the checkpoints this converter reads.
 const CLASS: &str = "MuseGlimmerAssistantModel";
@@ -85,38 +79,6 @@ pub(crate) fn check_architecture(config: &Json) -> Result<(), CucaError> {
     }
 }
 
-/// The GGUF name of the checkpoint tensor `hf` and its shape: `None` for a
-/// tensor this layout does not hold.
-fn gguf_name(hf: &str) -> Option<String> {
-    let global = match hf {
-        "encoder.fc.weight" => Some("fc.weight"),
-        "encoder.output_norm_enc.weight" => Some("enc.output_norm.weight"),
-        "norm.weight" => Some("output_norm.weight"),
-        _ => None,
-    };
-    if let Some(name) = global {
-        return Some(name.to_string());
-    }
-    let rest = hf.strip_prefix("layers.")?;
-    let (il, part) = rest.split_once('.')?;
-    il.parse::<usize>().ok()?;
-    let part = match part {
-        "input_layernorm.weight" => "attn_norm",
-        "self_attn.q_proj.weight" => "attn_q",
-        "self_attn.k_proj.weight" => "attn_k",
-        "self_attn.v_proj.weight" => "attn_v",
-        "self_attn.o_proj.weight" => "attn_output",
-        "self_attn.q_norm.weight" => "attn_q_norm",
-        "self_attn.k_norm.weight" => "attn_k_norm",
-        "post_attention_layernorm.weight" => "ffn_norm",
-        "mlp.gate_proj.weight" => "ffn_gate",
-        "mlp.up_proj.weight" => "ffn_up",
-        "mlp.down_proj.weight" => "ffn_down",
-        _ => return None,
-    };
-    Some(format!("blk.{il}.{part}.weight"))
-}
-
 /// What `config.json` says (transformers' `MuseGlimmerAssistantConfig`
 /// defaults filled in).
 struct Config {
@@ -133,7 +95,7 @@ struct Config {
     mask_token: usize,
     /// transformers' `target_layer_ids`.
     target_ids: Vec<usize>,
-    /// The sliding window of every layer.
+    /// Whether each layer is a sliding-window layer.
     sliding: Vec<bool>,
     window: Option<usize>,
 }
@@ -270,41 +232,49 @@ impl Config {
         kv.push(("general.quantization_version".to_string(), Value::U32(2)));
         kv.push((
             "general.file_type".to_string(),
-            Value::U32(match quant {
-                WeightQuant::F16 => 1,
-                WeightQuant::Q4_0 => 2,
-                WeightQuant::Q8_0 => 7,
-            }),
+            Value::U32(file_type(quant)),
         ));
         Ok(kv)
     }
 
-    /// Every tensor of the checkpoint with the shape it must have.
-    fn expected(&self) -> Vec<(String, Vec<usize>)> {
+    /// Every tensor of the checkpoint as `(checkpoint name, GGUF name, shape)`.
+    fn expected(&self) -> Vec<(String, String, Vec<usize>)> {
         let (n, d) = (self.n_embd, self.head_dim);
         let (qd, kd) = (self.n_head * d, self.n_kv_head * d);
+        let t = |hf: &str, gguf: &str, shape: Vec<usize>| (hf.to_string(), gguf.to_string(), shape);
         let mut tensors = vec![
-            (
-                "encoder.fc.weight".to_string(),
+            t(
+                "encoder.fc.weight",
+                "fc.weight",
                 vec![n, self.target_ids.len() * n],
             ),
-            ("encoder.output_norm_enc.weight".to_string(), vec![n]),
-            ("norm.weight".to_string(), vec![n]),
+            t(
+                "encoder.output_norm_enc.weight",
+                "enc.output_norm.weight",
+                vec![n],
+            ),
+            t("norm.weight", "output_norm.weight", vec![n]),
         ];
         for il in 0..self.n_layer {
-            let l = |part: &str| format!("layers.{il}.{part}.weight");
+            let l = |hf: &str, gguf: &str, shape: Vec<usize>| {
+                t(
+                    &format!("layers.{il}.{hf}.weight"),
+                    &format!("blk.{il}.{gguf}.weight"),
+                    shape,
+                )
+            };
             tensors.extend([
-                (l("input_layernorm"), vec![n]),
-                (l("self_attn.q_proj"), vec![qd, n]),
-                (l("self_attn.k_proj"), vec![kd, n]),
-                (l("self_attn.v_proj"), vec![kd, n]),
-                (l("self_attn.o_proj"), vec![n, qd]),
-                (l("self_attn.q_norm"), vec![d]),
-                (l("self_attn.k_norm"), vec![d]),
-                (l("post_attention_layernorm"), vec![n]),
-                (l("mlp.gate_proj"), vec![self.n_ff, n]),
-                (l("mlp.up_proj"), vec![self.n_ff, n]),
-                (l("mlp.down_proj"), vec![n, self.n_ff]),
+                l("input_layernorm", "attn_norm", vec![n]),
+                l("self_attn.q_proj", "attn_q", vec![qd, n]),
+                l("self_attn.k_proj", "attn_k", vec![kd, n]),
+                l("self_attn.v_proj", "attn_v", vec![kd, n]),
+                l("self_attn.o_proj", "attn_output", vec![n, qd]),
+                l("self_attn.q_norm", "attn_q_norm", vec![d]),
+                l("self_attn.k_norm", "attn_k_norm", vec![d]),
+                l("post_attention_layernorm", "ffn_norm", vec![n]),
+                l("mlp.gate_proj", "ffn_gate", vec![self.n_ff, n]),
+                l("mlp.up_proj", "ffn_up", vec![self.n_ff, n]),
+                l("mlp.down_proj", "ffn_down", vec![n, self.n_ff]),
             ]);
         }
         tensors
@@ -317,14 +287,14 @@ impl Config {
 fn plan(cfg: &Config, shards: &Shards) -> Result<Vec<Plan>, CucaError> {
     let expected = cfg.expected();
     for name in shards.names() {
-        if !expected.iter().any(|(hf, _)| hf == name) {
+        if !expected.iter().any(|(hf, ..)| hf == name) {
             return Err(cfg_err(format!(
                 "tensor `{name}` of the DFlash drafter has no GGUF name (the drafter holds no embedding table or head: it reads the target's)"
             )));
         }
     }
     let mut plans = Vec::with_capacity(expected.len());
-    for (hf, shape) in expected {
+    for (hf, name, shape) in expected {
         let meta = shards
             .tensor(&hf)
             .ok_or_else(|| cfg_err(format!("the DFlash drafter has no tensor `{hf}`")))?;
@@ -334,8 +304,6 @@ fn plan(cfg: &Config, shards: &Shards) -> Result<Vec<Plan>, CucaError> {
                 meta.shape
             )));
         }
-        let name =
-            gguf_name(&hf).ok_or_else(|| cfg_err(format!("internal: no name for `{hf}`")))?;
         plans.push(Plan {
             name,
             dims: shape,
@@ -372,27 +340,12 @@ pub(crate) fn convert(
     check_metadata(&md)
         .map_err(|e| cfg_err(format!("the converted metadata does not load: {e}")))?;
 
-    let specs: Vec<_> = plans.iter().map(|p| p.spec(quant)).collect();
-    let file = File::create(partial)?;
-    let mut writer = GgufWriter::start(
-        BufWriter::with_capacity(super::WRITE_BUFFER, file),
-        &kv,
-        &specs,
-    )?;
-    let total = plans.len() as u64;
-    super::report(progress, 0, total);
-    for (i, (plan, spec)) in plans.iter().zip(&specs).enumerate() {
-        plan.write(&shards, spec.dtype, &mut |bytes| writer.write(bytes))?;
-        super::report(progress, i as u64 + 1, total);
-    }
-    let mut sink = writer.finish()?;
-    sink.flush()?;
-    sink.get_ref().sync_all()?;
-    Ok(())
+    super::write_plans(partial, &kv, &plans, &shards, quant, progress)
 }
 
 #[cfg(test)]
 mod tests {
+    use std::fs::File;
     use std::io::BufReader;
     use std::path::PathBuf;
 

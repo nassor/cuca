@@ -36,16 +36,10 @@ use std::path::Path;
 use candle_core::quantized::gguf_file::Value;
 use serde_json::Value as Json;
 
-use super::vocab::VocabMeta;
+use super::super::tokenizer::byte_to_char;
+use super::cfg_err;
+use super::vocab::{CONTROL, NORMAL, VocabMeta, string, strings, token_types};
 use crate::error::CucaError;
-
-fn cfg_err(msg: impl Into<String>) -> CucaError {
-    CucaError::Config(msg.into())
-}
-
-/// `gguf.TokenType.NORMAL` and `CONTROL`.
-const NORMAL: i32 = 1;
-const CONTROL: i32 = 3;
 
 /// llama.cpp's community template for tokenizer version v11 (Mistral Small
 /// 3.2), `models/templates/Mistral-Small-3.2-24B-Instruct-2506.jinja`.
@@ -104,31 +98,10 @@ fn base64(text: &str) -> Option<Vec<u8>> {
     Some(out)
 }
 
-/// GPT-2's `bytes_to_unicode`: printable bytes map to themselves, the rest to
-/// `U+0100` upward in byte order.
-fn byte_encoder() -> [char; 256] {
-    let printable = |b: u32| {
-        (u32::from(b'!')..=u32::from(b'~')).contains(&b)
-            || (0xA1..=0xAC).contains(&b)
-            || (0xAE..=0xFF).contains(&b)
-    };
-    let mut table = ['\0'; 256];
-    let mut n = 0;
-    for b in 0..256u32 {
-        let c = if printable(b) {
-            b
-        } else {
-            n += 1;
-            255 + n
-        };
-        table[b as usize] = char::from_u32(c).unwrap_or('\u{fffd}');
-    }
-    table
-}
-
-/// `MistralVocab.token_bytes_to_string`.
-fn show(bytes: &[u8], table: &[char; 256]) -> String {
-    bytes.iter().map(|b| table[usize::from(*b)]).collect()
+/// `MistralVocab.token_bytes_to_string`: the bytes in GPT-2's byte-to-unicode
+/// alphabet.
+fn show(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| byte_to_char(*b)).collect()
 }
 
 /// llama.cpp's built-in template name for tokenizer version v7 (tekken).
@@ -153,11 +126,7 @@ fn community_template(version: &str) -> Result<&'static str, CucaError> {
 
 /// The merges of `MistralVocab.extract_vocab_merges_from_model`, as the
 /// `left right` strings gguf stores.
-fn merges(
-    ranks: &HashMap<Vec<u8>, usize>,
-    by_rank: &[&[u8]],
-    table: &[char; 256],
-) -> Result<Vec<String>, CucaError> {
+fn merges(ranks: &HashMap<&[u8], usize>, by_rank: &[Vec<u8>]) -> Result<Vec<String>, CucaError> {
     let mut out = Vec::with_capacity(by_rank.len());
     for (rank, token) in by_rank.iter().enumerate().skip(256) {
         let mut local: Vec<(&[u8], &[u8])> = (1..token.len())
@@ -176,7 +145,7 @@ fn merges(
         out.extend(
             local
                 .into_iter()
-                .map(|(l, r)| format!("{} {}", show(l, table), show(r, table))),
+                .map(|(l, r)| format!("{} {}", show(l), show(r))),
         );
     }
     Ok(out)
@@ -291,17 +260,15 @@ pub(crate) fn build(dir: &Path, arch_name: &str) -> Result<VocabMeta, CucaError>
         }
         bytes.push(decoded);
     }
-    let mut ranks: HashMap<Vec<u8>, usize> = HashMap::with_capacity(inner);
+    let mut ranks: HashMap<&[u8], usize> = HashMap::with_capacity(inner);
     for (i, b) in bytes.iter().enumerate() {
-        ranks.insert(b.clone(), i);
+        ranks.insert(b, i);
     }
     if ranks.len() != inner {
         return Err(cfg_err("tekken.json ranked tokens are not unique"));
     }
 
-    let table = byte_encoder();
-    let by_rank: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
-    let merges = merges(&ranks, &by_rank, &table)?;
+    let merges = merges(&ranks, &bytes)?;
 
     let id = |name: &str| -> Result<u32, CucaError> {
         special
@@ -310,49 +277,33 @@ pub(crate) fn build(dir: &Path, arch_name: &str) -> Result<VocabMeta, CucaError>
             .and_then(|i| u32::try_from(i).ok())
             .ok_or_else(|| cfg_err(format!("tekken.json has no `{name}` special token")))
     };
+    let (bos, eos, unk, pad) = (id("<s>")?, id("</s>")?, id("<unk>")?, id("<pad>")?);
     let tokens: Vec<String> = special
-        .iter()
-        .cloned()
-        .chain(bytes.iter().map(|b| show(b, &table)))
+        .into_iter()
+        .chain(bytes.iter().map(|b| show(b)))
         .collect();
     let mut types = vec![CONTROL; n_special];
     types.resize(vocab_size, NORMAL);
-    let strings = |v: Vec<String>| Value::Array(v.into_iter().map(Value::String).collect());
     let kv = vec![
-        (
-            "tokenizer.ggml.model".to_string(),
-            Value::String("gpt2".into()),
-        ),
-        (
-            "tokenizer.ggml.pre".to_string(),
-            Value::String("tekken".into()),
-        ),
+        ("tokenizer.ggml.model".to_string(), string("gpt2")),
+        ("tokenizer.ggml.pre".to_string(), string("tekken")),
         ("tokenizer.ggml.merges".to_string(), strings(merges)),
-        (
-            "tokenizer.ggml.bos_token_id".to_string(),
-            Value::U32(id("<s>")?),
-        ),
-        (
-            "tokenizer.ggml.eos_token_id".to_string(),
-            Value::U32(id("</s>")?),
-        ),
+        ("tokenizer.ggml.bos_token_id".to_string(), Value::U32(bos)),
+        ("tokenizer.ggml.eos_token_id".to_string(), Value::U32(eos)),
         (
             "tokenizer.ggml.unknown_token_id".to_string(),
-            Value::U32(id("<unk>")?),
+            Value::U32(unk),
         ),
         (
             "tokenizer.ggml.padding_token_id".to_string(),
-            Value::U32(id("<pad>")?),
+            Value::U32(pad),
         ),
         ("tokenizer.ggml.tokens".to_string(), strings(tokens)),
         (
             "tokenizer.ggml.scores".to_string(),
             Value::Array(vec![Value::F32(0.0); vocab_size]),
         ),
-        (
-            "tokenizer.ggml.token_type".to_string(),
-            Value::Array(types.into_iter().map(Value::I32).collect()),
-        ),
+        ("tokenizer.ggml.token_type".to_string(), token_types(&types)),
         (
             format!("{arch_name}.vocab_size"),
             Value::U32(u32::try_from(vocab_size).map_err(|_| cfg_err("vocabulary too large"))?),
@@ -365,10 +316,7 @@ pub(crate) fn build(dir: &Path, arch_name: &str) -> Result<VocabMeta, CucaError>
             "tokenizer.ggml.add_eos_token".to_string(),
             Value::Bool(false),
         ),
-        (
-            "tokenizer.chat_template".to_string(),
-            Value::String(template.to_string()),
-        ),
+        ("tokenizer.chat_template".to_string(), string(template)),
     ];
     Ok(VocabMeta {
         kv,
@@ -392,47 +340,37 @@ mod tests {
 
     #[test]
     fn the_byte_alphabet_is_gpt2s() {
-        let t = byte_encoder();
-        assert_eq!(t[b'a' as usize], 'a');
-        assert_eq!(t[b' ' as usize], '\u{120}');
-        assert_eq!(t[b'\n' as usize], '\u{10a}');
-        assert_eq!(t[0], '\u{100}');
-        assert_eq!(t[0xA1], '\u{a1}');
-        assert_eq!(t[0xAD], '\u{143}');
-        assert_eq!(show("é".as_bytes(), &t), "Ã©");
+        assert_eq!(show(b"a"), "a");
+        assert_eq!(show(b" "), "\u{120}");
+        assert_eq!(show(b"\n"), "\u{10a}");
+        assert_eq!(show(&[0]), "\u{100}");
+        assert_eq!(show(&[0xA1]), "\u{a1}");
+        assert_eq!(show(&[0xAD]), "\u{143}");
+        assert_eq!(show("é".as_bytes()), "Ã©");
     }
 
     /// Every split into two ranked halves is a merge, ordered by the halves'
     /// ranks and then by the merged token's rank.
     #[test]
     fn merges_follow_the_ranks() {
+        let ranked = |bytes: &[Vec<u8>]| -> Result<Vec<String>, CucaError> {
+            let ranks: HashMap<&[u8], usize> = bytes
+                .iter()
+                .enumerate()
+                .map(|(i, b)| (b.as_slice(), i))
+                .collect();
+            merges(&ranks, bytes)
+        };
         let mut bytes: Vec<Vec<u8>> = (0..=255u8).map(|b| vec![b]).collect();
         bytes.push(b"ab".to_vec()); // 256
         bytes.push(b"bc".to_vec()); // 257
         bytes.push(b"abc".to_vec()); // 258: a+bc and ab+c
-        let ranks: HashMap<Vec<u8>, usize> = bytes
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, b)| (b, i))
-            .collect();
-        let by_rank: Vec<&[u8]> = bytes.iter().map(Vec::as_slice).collect();
-        let m = merges(&ranks, &by_rank, &byte_encoder()).unwrap();
         // a+bc has ranks (97, 257), ab+c has (256, 99): the byte half sorts first.
-        assert_eq!(m, ["a b", "b c", "a bc", "ab c"]);
-        // A token with no ranked split is an error.
-        let mut broken = bytes.clone();
-        broken.push(b"xyz!".to_vec());
-        let ranks: HashMap<Vec<u8>, usize> = broken
-            .iter()
-            .cloned()
-            .enumerate()
-            .map(|(i, b)| (b, i))
-            .collect();
-        let by_rank: Vec<&[u8]> = broken.iter().map(Vec::as_slice).collect();
-        // "x" + "yz!" has no ranked right half but "xy"? none: x|yz!, xy|z!, xyz|!
-        // only x, y, z, ! exist, so no split has both halves ranked.
-        assert!(merges(&ranks, &by_rank, &byte_encoder()).is_err());
+        assert_eq!(ranked(&bytes).unwrap(), ["a b", "b c", "a bc", "ab c"]);
+        // A token with no ranked split is an error: x|yz!, xy|z!, xyz|! each
+        // have an unranked half.
+        bytes.push(b"xyz!".to_vec());
+        assert!(ranked(&bytes).is_err());
     }
 
     /// A synthetic `tekken.json` (256 bytes, three merges, 12 special tokens)

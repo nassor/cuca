@@ -48,7 +48,8 @@ use std::ops::Range;
 
 use candle_core::quantized::gguf_file::{self, Value};
 
-use self::bpe::{Merges, Scratch, Unknown, byte_to_char, char_to_byte};
+pub(super) use self::bpe::byte_to_char;
+use self::bpe::{Merges, Scratch, Unknown, char_to_byte};
 use self::pretok::{Pre, Pretokenizer};
 use self::spm::Spm;
 use self::vocab::{

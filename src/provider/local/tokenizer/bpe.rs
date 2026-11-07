@@ -282,7 +282,7 @@ const REMAPPED_BYTES: [u8; REMAPPED] = {
 };
 
 /// The GPT-2 alphabet character of `byte`.
-pub(super) fn byte_to_char(byte: u8) -> char {
+pub(in crate::provider::local) fn byte_to_char(byte: u8) -> char {
     BYTE_TO_CHAR[byte as usize]
 }
 

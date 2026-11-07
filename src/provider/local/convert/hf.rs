@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::eagle;
+use super::{cfg_err, eagle};
 use crate::error::CucaError;
 use crate::provider::local::DownloadProgressCallback;
 use crate::provider::local::download;
@@ -50,7 +50,7 @@ fn read_json(path: &Path) -> Result<Value, CucaError> {
     let text = std::fs::read_to_string(path).map_err(|e| CucaError::Io {
         message: format!("cannot read `{}`: {e}", path.display()),
     })?;
-    serde_json::from_str(&text).map_err(|e| CucaError::Config(format!("`{}`: {e}", path.display())))
+    serde_json::from_str(&text).map_err(|e| cfg_err(format!("`{}`: {e}", path.display())))
 }
 
 fn read_json_opt(path: &Path) -> Result<Option<Value>, CucaError> {
@@ -74,16 +74,16 @@ fn index_shards(dir: &Path, index: &Value) -> Result<Vec<PathBuf>, CucaError> {
     let map = index
         .get("weight_map")
         .and_then(Value::as_object)
-        .ok_or_else(|| CucaError::Config(format!("`{INDEX_FILE}` has no `weight_map`")))?;
+        .ok_or_else(|| cfg_err(format!("`{INDEX_FILE}` has no `weight_map`")))?;
     let names: BTreeSet<&str> = map.values().filter_map(Value::as_str).collect();
     if names.is_empty() {
-        return Err(CucaError::Config(format!("`{INDEX_FILE}` lists no shard")));
+        return Err(cfg_err(format!("`{INDEX_FILE}` lists no shard")));
     }
     names
         .into_iter()
         .map(|n| {
             if n.contains(['/', '\\']) || n.starts_with('.') {
-                Err(CucaError::Config(format!(
+                Err(cfg_err(format!(
                     "`{INDEX_FILE}` names the shard `{n}`; expected a plain file name"
                 )))
             } else {
@@ -113,7 +113,7 @@ impl CheckpointDir {
             found
         };
         if shards.is_empty() {
-            return Err(CucaError::Config(format!(
+            return Err(cfg_err(format!(
                 "checkpoint `{}` has no {SINGLE_FILE} or {INDEX_FILE}",
                 dir.display()
             )));
@@ -149,11 +149,58 @@ impl CheckpointDir {
     }
 }
 
-/// Download the files of `repo` at `revision` into `dir` (the cache location
-/// of the checkpoint) and open them.
+/// A repository revision being downloaded into its cache directory.
+struct Source<'a> {
+    client: &'a reqwest::Client,
+    endpoint: &'a str,
+    repo: &'a str,
+    revision: &'a str,
+    cache_dir: &'a Path,
+    token: Option<&'a str>,
+    progress: Option<&'a DownloadProgressCallback>,
+}
+
+impl Source<'_> {
+    /// Download `file` (no checksum); `Ok(false)` when the repository has no
+    /// such file.
+    async fn optional(&self, file: &str) -> Result<bool, CucaError> {
+        download::ensure_downloaded_optional(
+            self.client,
+            self.endpoint,
+            self.repo,
+            self.revision,
+            file,
+            None,
+            &download::cached_path(self.cache_dir, self.repo, self.revision, file)?,
+            self.token,
+            self.progress,
+        )
+        .await
+    }
+
+    /// Download `file` (no checksum); a missing file is an error.
+    async fn required(&self, file: &str) -> Result<(), CucaError> {
+        download::ensure_downloaded(
+            self.client,
+            self.endpoint,
+            self.repo,
+            self.revision,
+            file,
+            None,
+            &download::cached_path(self.cache_dir, self.repo, self.revision, file)?,
+            self.token,
+            self.progress,
+        )
+        .await
+    }
+}
+
+/// Download the files of `repo` at `revision` into the cache directory of the
+/// checkpoint and open them.
 ///
 /// `config.json` comes first: an architecture without a converter fails
-/// before any weight is downloaded. Missing optional files are skipped.
+/// before any weight is downloaded (the Mistral-format EAGLE drafter has
+/// `params.json` in its place). Missing optional files are skipped.
 pub(crate) async fn fetch(
     client: &reqwest::Client,
     endpoint: &str,
@@ -163,61 +210,30 @@ pub(crate) async fn fetch(
     token: Option<&str>,
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<CheckpointDir, CucaError> {
-    let path = |file: &str| download::cached_path(cache_dir, repo, revision, file);
-    let dir = path("config.json")?
-        .parent()
-        .map(Path::to_path_buf)
-        .ok_or_else(|| CucaError::Config("checkpoint path has no parent".into()))?;
-    // `config.json` comes first: an architecture without a converter fails
-    // before any weight is downloaded. The Mistral-format EAGLE drafter has
-    // `params.json` in its place.
-    let has_config = download::ensure_downloaded_optional(
+    let source = Source {
         client,
         endpoint,
         repo,
         revision,
-        "config.json",
-        None,
-        &path("config.json")?,
+        cache_dir,
         token,
         progress,
-    )
-    .await?;
-    if !has_config {
-        let has_params = download::ensure_downloaded_optional(
-            client,
-            endpoint,
-            repo,
-            revision,
-            eagle::PARAMS_FILE,
-            None,
-            &path(eagle::PARAMS_FILE)?,
-            token,
-            progress,
-        )
-        .await?;
-        if !has_params {
-            return Err(CucaError::Config(format!(
-                "checkpoint `{repo}` at `{revision}` has neither config.json nor {}",
-                eagle::PARAMS_FILE
-            )));
-        }
+    };
+    let dir = download::cached_path(cache_dir, repo, revision, "config.json")?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| cfg_err("checkpoint path has no parent"))?;
+    let has_config = source.optional("config.json").await?;
+    if !has_config && !source.optional(eagle::PARAMS_FILE).await? {
+        return Err(cfg_err(format!(
+            "checkpoint `{repo}` at `{revision}` has neither config.json nor {}",
+            eagle::PARAMS_FILE
+        )));
     }
     super::dflash::check_architecture(&read_config(&dir)?)?;
 
     for file in OPTIONAL_FILES.iter().chain(&[INDEX_FILE]) {
-        download::ensure_downloaded_optional(
-            client,
-            endpoint,
-            repo,
-            revision,
-            file,
-            None,
-            &path(file)?,
-            token,
-            progress,
-        )
-        .await?;
+        source.optional(file).await?;
     }
     let shards: Vec<String> = match read_json_opt(&dir.join(INDEX_FILE))? {
         Some(index) => index_shards(&dir, &index)?
@@ -228,18 +244,7 @@ pub(crate) async fn fetch(
         None => vec![eagle::WEIGHTS_FILE.to_string()],
     };
     for shard in &shards {
-        download::ensure_downloaded(
-            client,
-            endpoint,
-            repo,
-            revision,
-            shard,
-            None,
-            &path(shard)?,
-            token,
-            progress,
-        )
-        .await?;
+        source.required(shard).await?;
     }
     CheckpointDir::open(&dir)
 }

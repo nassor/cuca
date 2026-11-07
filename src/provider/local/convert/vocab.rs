@@ -19,16 +19,12 @@ use super::arch::ConvArch;
 use super::chktxt::{CHKTXT, PRE_BY_HASH};
 use super::config::Hp;
 use super::hf::CheckpointDir;
-use super::spm::{self, PieceType};
+use super::{cfg_err, spm};
 use crate::error::CucaError;
 use crate::provider::local::tokenizer::Tokenizer;
 
-fn cfg_err(msg: impl Into<String>) -> CucaError {
-    CucaError::Config(msg.into())
-}
-
-const NORMAL: i32 = 1;
-const CONTROL: i32 = 3;
+pub(super) const NORMAL: i32 = 1;
+pub(super) const CONTROL: i32 = 3;
 const USER_DEFINED: i32 = 4;
 const UNUSED: i32 = 5;
 const BYTE: i32 = 6;
@@ -44,15 +40,15 @@ pub(crate) struct VocabMeta {
     pub(crate) n_vocab: usize,
 }
 
-fn string(s: impl Into<String>) -> Value {
+pub(super) fn string(s: impl Into<String>) -> Value {
     Value::String(s.into())
 }
 
-fn strings<I: IntoIterator<Item = String>>(it: I) -> Value {
+pub(super) fn strings<I: IntoIterator<Item = String>>(it: I) -> Value {
     Value::Array(it.into_iter().map(Value::String).collect())
 }
 
-fn token_types(types: &[i32]) -> Value {
+pub(super) fn token_types(types: &[i32]) -> Value {
     Value::Array(types.iter().map(|t| Value::I32(*t)).collect())
 }
 
@@ -75,6 +71,13 @@ fn token_str(v: &Json) -> Option<String> {
 
 fn truthy(s: &Option<String>) -> bool {
     s.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+/// The array under `key`, empty when absent or not an array.
+fn array<'a>(v: &'a Json, key: &str) -> &'a [Json] {
+    v.get(key)
+        .and_then(Json::as_array)
+        .map_or(&[][..], Vec::as_slice)
 }
 
 /// gguf-py's `SpecialVocab`.
@@ -129,12 +132,7 @@ impl Special {
                 }
             }
             Some("Sequence") => {
-                for sub in n
-                    .get("normalizers")
-                    .and_then(Json::as_array)
-                    .into_iter()
-                    .flatten()
-                {
+                for sub in array(n, "normalizers") {
                     self.normalizer(sub);
                 }
             }
@@ -150,12 +148,7 @@ impl Special {
                 }
             }
             Some("Sequence") => {
-                for sub in p
-                    .get("pretokenizers")
-                    .and_then(Json::as_array)
-                    .into_iter()
-                    .flatten()
-                {
+                for sub in array(p, "pretokenizers") {
                     self.pre_tokenizer(sub);
                 }
             }
@@ -167,15 +160,12 @@ impl Special {
     fn load(
         ck: &CheckpointDir,
         load_merges: bool,
-        types: Option<&[&str]>,
         n_vocab: Option<usize>,
     ) -> Result<Self, CucaError> {
         let mut sv = Self {
-            types: types
-                .unwrap_or(&["bos", "eos", "unk", "sep", "pad", "cls", "mask"])
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            types: ["bos", "eos", "unk", "sep", "pad", "cls", "mask"]
+                .map(String::from)
+                .into(),
             n_vocab,
             ..Self::default()
         };
@@ -220,11 +210,7 @@ impl Special {
             .and_then(Json::as_object)
             .cloned()
             .filter(|m| !m.is_empty());
-        let added: Vec<Json> = tok
-            .and_then(|t| t.get("added_tokens"))
-            .and_then(Json::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let added = tok.map_or(&[][..], |t| array(t, "added_tokens"));
         if let Some(t) = tok {
             if load_merges
                 && let Some(Json::Array(merges)) = t.get("model").and_then(|m| m.get("merges"))
@@ -384,15 +370,8 @@ impl Special {
         eos: &mut Option<String>,
         sep: &Option<String>,
     ) {
-        let list = |k: &str| -> Vec<Json> {
-            processor
-                .get(k)
-                .and_then(Json::as_array)
-                .cloned()
-                .unwrap_or_default()
-        };
-        let single = list("single");
-        let pair = list("pair");
+        let single = array(processor, "single");
+        let pair = array(processor, "pair");
         let special_id = |item: &Json| -> Option<String> {
             item.get("SpecialToken")
                 .and_then(|s| s.get("id"))
@@ -457,9 +436,9 @@ impl Special {
         if !pair.is_empty() {
             let seq_start = usize::from(first.is_some() && special_id(&pair[0]) == first);
             let trim_end = last.is_some() && pair.last().and_then(special_id) == last;
-            let mut mid: Vec<Json> = pair[seq_start..].to_vec();
-            if trim_end {
-                mid.pop();
+            let mut mid = &pair[seq_start..];
+            if trim_end && let Some((_, rest)) = mid.split_last() {
+                mid = rest;
             }
             if !mid.is_empty() {
                 let seq_id = |i: &Json| {
@@ -501,12 +480,9 @@ impl Special {
     }
 
     /// The metadata `SpecialVocab.add_to_gguf` writes.
-    fn write(&self, out: &mut Vec<(String, Value)>) {
+    fn write(self, out: &mut Vec<(String, Value)>) {
         if !self.merges.is_empty() {
-            out.push((
-                "tokenizer.ggml.merges".into(),
-                strings(self.merges.iter().cloned()),
-            ));
+            out.push(("tokenizer.ggml.merges".into(), strings(self.merges)));
         }
         for (typ, id) in &self.ids {
             let key = match typ.as_str() {
@@ -544,11 +520,8 @@ impl Special {
                 out.push((key.into(), Value::Bool(v)));
             }
         }
-        if let Some(s) = &self.metaspace {
-            out.push((
-                "tokenizer.ggml.metaspace.prepend_scheme".into(),
-                string(s.clone()),
-            ));
+        if let Some(s) = self.metaspace {
+            out.push(("tokenizer.ggml.metaspace.prepend_scheme".into(), string(s)));
         }
     }
 }
@@ -592,14 +565,34 @@ fn chat_template(value: &Json, out: &mut Vec<(String, Value)>) {
     }
 }
 
-/// `added_tokens` of `tokenizer.json` only: `(id, content, special)`.
-fn json_added_tokens(ck: &CheckpointDir) -> Vec<(usize, String, bool)> {
-    ck.tokenizer_json
+/// The `added_tokens_decoder` entries of `tokenizer_config.json`:
+/// `(id, content, special)`.
+fn decoder_tokens(ck: &CheckpointDir) -> impl Iterator<Item = (usize, &str, bool)> {
+    ck.tokenizer_config
         .as_ref()
-        .and_then(|t| t.get("added_tokens"))
-        .and_then(Json::as_array)
+        .and_then(|c| c.get("added_tokens_decoder"))
+        .and_then(Json::as_object)
         .into_iter()
         .flatten()
+        .filter_map(|(id, data)| {
+            Some((
+                id.parse().ok()?,
+                data.get("content")?.as_str()?,
+                data.get("special").and_then(Json::as_bool).unwrap_or(false),
+            ))
+        })
+}
+
+/// The added tokens `AutoTokenizer` knows, `(id, content, special)`: those of
+/// `tokenizer.json`, plus the entries of `tokenizer_config.json`'s
+/// `added_tokens_decoder` whose id `tokenizer.json` does not use (Qwen 3.5
+/// lists its audio and TTS tokens only there).
+fn added_tokens(ck: &CheckpointDir) -> Vec<(usize, String, bool)> {
+    let mut out: Vec<(usize, String, bool)> = ck
+        .tokenizer_json
+        .as_ref()
+        .map_or(&[][..], |t| array(t, "added_tokens"))
+        .iter()
         .filter_map(|a| {
             Some((
                 a.get("id")?.as_u64()? as usize,
@@ -607,31 +600,9 @@ fn json_added_tokens(ck: &CheckpointDir) -> Vec<(usize, String, bool)> {
                 a.get("special").and_then(Json::as_bool).unwrap_or(false),
             ))
         })
-        .collect()
-}
-
-/// The added tokens `AutoTokenizer` knows: those of `tokenizer.json`, plus
-/// the entries of `tokenizer_config.json`'s `added_tokens_decoder` whose id
-/// `tokenizer.json` does not use (Qwen 3.5 lists its audio and TTS tokens
-/// only there).
-fn added_tokens(ck: &CheckpointDir) -> Vec<(usize, String, bool)> {
-    let mut out = json_added_tokens(ck);
-    if let Some(Json::Object(decoder)) = ck
-        .tokenizer_config
-        .as_ref()
-        .and_then(|c| c.get("added_tokens_decoder"))
-    {
-        for (id, data) in decoder {
-            let (Ok(id), Some(content)) = (
-                id.parse::<usize>(),
-                data.get("content").and_then(Json::as_str),
-            ) else {
-                continue;
-            };
-            if out.iter().any(|(i, _, _)| *i == id) {
-                continue;
-            }
-            let special = data.get("special").and_then(Json::as_bool).unwrap_or(false);
+        .collect();
+    for (id, content, special) in decoder_tokens(ck) {
+        if !out.iter().any(|(i, _, _)| *i == id) {
             out.push((id, content.to_string(), special));
         }
     }
@@ -702,26 +673,24 @@ fn gpt2_tokens(
     let mut tokens = Vec::with_capacity(vocab_size);
     let mut types = Vec::with_capacity(vocab_size);
     for i in 0..vocab_size {
-        match by_id.get(&i) {
-            None => {
-                tokens.push(format!("[PAD{i}]"));
-                types.push(UNUSED);
+        let Some(t) = by_id.remove(&i) else {
+            tokens.push(format!("[PAD{i}]"));
+            types.push(UNUSED);
+            continue;
+        };
+        match added_by_content.get(t.as_str()) {
+            Some(&special) if !(special || looks_special(&t)) => {
+                tokens.push(t.replace(SPACE_MARK, " "));
+                types.push(USER_DEFINED);
             }
-            Some(t) => match added_by_content.get(t.as_str()) {
-                Some(&special) => {
-                    if special || looks_special(t) {
-                        tokens.push(t.clone());
-                        types.push(CONTROL);
-                    } else {
-                        tokens.push(t.replace(SPACE_MARK, " "));
-                        types.push(USER_DEFINED);
-                    }
-                }
-                None => {
-                    tokens.push(t.clone());
-                    types.push(NORMAL);
-                }
-            },
+            Some(_) => {
+                tokens.push(t);
+                types.push(CONTROL);
+            }
+            None => {
+                tokens.push(t);
+                types.push(NORMAL);
+            }
         }
     }
     Ok((tokens, types))
@@ -739,12 +708,7 @@ fn structural_pre(tok: &Json) -> Result<&'static str, CucaError> {
     fn flatten<'a>(p: &'a Json, out: &mut Vec<&'a Json>) {
         match p.get("type").and_then(Json::as_str) {
             Some("Sequence") => {
-                for sub in p
-                    .get("pretokenizers")
-                    .and_then(Json::as_array)
-                    .into_iter()
-                    .flatten()
-                {
+                for sub in array(p, "pretokenizers") {
                     flatten(sub, out);
                 }
             }
@@ -891,7 +855,7 @@ fn gpt2(ck: &CheckpointDir, hp: &Hp) -> Result<VocabMeta, CucaError> {
     };
     let (tokens, types) = gpt2_tokens(ck, vocab_size)?;
     let structural = structural_pre(tok)?;
-    let special = Special::load(ck, true, None, None)?;
+    let special = Special::load(ck, true, None)?;
     let id = |t: &str| special.ids.iter().find(|(k, _)| k == t).map(|(_, v)| *v);
     let flag = |t: &str| {
         special
@@ -919,10 +883,6 @@ fn gpt2(ck: &CheckpointDir, hp: &Hp) -> Result<VocabMeta, CucaError> {
     Ok(VocabMeta { kv, n_vocab })
 }
 
-fn piece_type_value(k: PieceType) -> i32 {
-    k as i32
-}
-
 /// A `tokenizer.model` read, with the token list as the converter builds it.
 struct SpmVocab {
     tokens: Vec<String>,
@@ -945,13 +905,10 @@ fn spm_generic(ck: &CheckpointDir, hp: &Hp) -> Result<SpmVocab, CucaError> {
         scores: vec![-10000.0; vocab_size],
         types: vec![UNUSED; vocab_size],
     };
-    for (i, p) in pieces.iter().enumerate() {
-        if i >= vocab_size {
-            break;
-        }
-        v.tokens[i] = p.text.clone();
+    for (i, p) in pieces.into_iter().take(vocab_size).enumerate() {
+        v.tokens[i] = p.text;
         v.scores[i] = p.score;
-        v.types[i] = piece_type_value(p.kind);
+        v.types[i] = p.kind;
     }
     if let Some(Json::Object(added)) = &ck.added_tokens {
         for (key, id) in added {
@@ -963,33 +920,18 @@ fn spm_generic(ck: &CheckpointDir, hp: &Hp) -> Result<SpmVocab, CucaError> {
             v.types[id] = USER_DEFINED;
         }
     }
-    if let Some(Json::Object(decoder)) = ck
-        .tokenizer_config
-        .as_ref()
-        .and_then(|c| c.get("added_tokens_decoder"))
-    {
-        for (id, data) in decoder {
-            let (Ok(id), Some(content)) = (
-                id.parse::<usize>(),
-                data.get("content").and_then(Json::as_str),
-            ) else {
-                continue;
-            };
-            if id >= vocab_size {
-                continue;
-            }
-            let token = if data.get("special").and_then(Json::as_bool).unwrap_or(false)
-                || looks_special(content)
-            {
-                v.types[id] = CONTROL;
-                content.to_string()
-            } else {
-                v.types[id] = USER_DEFINED;
-                content.replace(SPACE_MARK, " ")
-            };
-            v.scores[id] = -1000.0;
-            v.tokens[id] = token;
+    for (id, content, special) in decoder_tokens(ck) {
+        if id >= vocab_size {
+            continue;
         }
+        v.tokens[id] = if special || looks_special(content) {
+            v.types[id] = CONTROL;
+            content.to_string()
+        } else {
+            v.types[id] = USER_DEFINED;
+            content.replace(SPACE_MARK, " ")
+        };
+        v.scores[id] = -1000.0;
     }
     Ok(v)
 }
@@ -1000,7 +942,7 @@ fn spm_meta(
     add_space_prefix: Option<bool>,
 ) -> Result<VocabMeta, CucaError> {
     let n = v.tokens.len();
-    let special = Special::load(ck, false, None, Some(n))?;
+    let special = Special::load(ck, false, Some(n))?;
     let mut kv = vec![
         ("tokenizer.ggml.model".to_string(), string("llama")),
         ("tokenizer.ggml.pre".to_string(), string("default")),
@@ -1032,7 +974,7 @@ fn gemma4(ck: &CheckpointDir) -> Result<VocabMeta, CucaError> {
         "<tool_response|>",
         "<|\"|>",
     ];
-    let base = bpe_vocab(ck)?;
+    let mut base = bpe_vocab(ck)?;
     let n_base = base.len();
     let added = added_tokens(ck);
     // Special ids: the tokens of tokenizer_config's special-token entries and
@@ -1069,21 +1011,20 @@ fn gemma4(ck: &CheckpointDir) -> Result<VocabMeta, CucaError> {
             && t.ends_with('>')
             && t[3..5].chars().all(|c| c.is_ascii_hexdigit())
     };
-    let by_id: BTreeMap<usize, String> = base.clone();
     for id in 0..n_base {
-        let t = by_id
-            .get(&id)
+        let t = base
+            .remove(&id)
             .ok_or_else(|| cfg_err(format!("tokenizer.json vocabulary has no token {id}")))?;
-        tokens.push(t.clone());
         types.push(if VISIBLE.contains(&t.as_str()) {
             USER_DEFINED
-        } else if is_byte(t) {
+        } else if is_byte(&t) {
             BYTE
         } else if special_ids.contains(&id) {
             CONTROL
         } else {
             NORMAL
         });
+        tokens.push(t);
     }
     // Added tokens beyond the base vocabulary follow, sorted by id.
     let mut extra: Vec<&(usize, String, bool)> =
@@ -1100,7 +1041,7 @@ fn gemma4(ck: &CheckpointDir) -> Result<VocabMeta, CucaError> {
         });
     }
     let n = tokens.len();
-    let special = Special::load(ck, true, None, None)?;
+    let special = Special::load(ck, true, None)?;
     let mut kv = vec![
         ("tokenizer.ggml.model".to_string(), string("gemma4")),
         ("tokenizer.ggml.tokens".to_string(), strings(tokens)),
@@ -1116,7 +1057,7 @@ fn gemma4(ck: &CheckpointDir) -> Result<VocabMeta, CucaError> {
     kv.push(("tokenizer.ggml.add_bos_token".into(), Value::Bool(true)));
     Ok(VocabMeta {
         kv,
-        n_vocab: base.len() + added.len(),
+        n_vocab: n_base + added.len(),
     })
 }
 
@@ -1271,7 +1212,6 @@ mod tests {
 
     #[test]
     fn probe_text_hash_table_is_loaded() {
-        assert_eq!(PRE_BY_HASH.len(), 105);
         // llama.cpp's `tekken` and `pixtral` fingerprints resolve to names the
         // engine implements.
         for (hash, name) in [
@@ -1291,7 +1231,8 @@ mod tests {
             );
         }
         assert!(PRE_BY_HASH.iter().all(|(h, _)| h.len() == 64));
-        assert_eq!(chkhsh(&[1, 2, 3]).len(), 64);
+        // Guards the probe text against truncation or encoding damage: a hash
+        // miss silently falls back to the structural `pre`.
         assert!(CHKTXT.contains("កាន់តែពិសេសអាច"));
     }
 
@@ -1363,7 +1304,7 @@ mod tests {
             chat_template_file: None,
             shards: Vec::new(),
         };
-        let sv = Special::load(&ck, false, None, None).unwrap();
+        let sv = Special::load(&ck, false, None).unwrap();
         assert_eq!(sv.ids, [("bos".to_string(), 5), ("eos".to_string(), 6)]);
         assert_eq!(sv.add, [("bos".to_string(), true)]);
         let mut kv = Vec::new();

@@ -20,16 +20,13 @@ use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
 
 use super::arch::ConvArch;
+use super::cfg_err;
 use super::config::{ExtraTensor, Hp};
 use super::gguf_writer::{Dtype, TensorSpec};
-use super::safetensors::{Shards, StDtype};
+use super::safetensors::{Shards, StDtype, TensorMeta};
 use crate::error::CucaError;
 use crate::provider::local::WeightQuant;
 use crate::provider::local::model::layout::name as gguf;
-
-fn cfg_err(msg: impl Into<String>) -> CucaError {
-    CucaError::Config(msg.into())
-}
 
 /// Elements read and converted at once when a tensor needs no whole-tensor
 /// transform (32 MiB of `f32`).
@@ -322,7 +319,7 @@ fn encode(dtype: Dtype, data: Vec<f32>, cols: usize, out: &mut Vec<u8>) -> Resul
 }
 
 /// Whether the engine knows a GGUF tensor name (`layout::name`).
-pub(crate) fn is_known(name: &str) -> bool {
+fn is_known(name: &str) -> bool {
     const GLOBAL: [&str; 12] = [
         gguf::TOKEN_EMBD,
         gguf::OUTPUT,
@@ -512,28 +509,40 @@ fn layer_of(name: &str) -> Option<(usize, &str)> {
 }
 
 impl Planner<'_> {
-    fn shape(&self, hf: &str) -> Result<Vec<usize>, CucaError> {
+    fn meta(&self, hf: &str) -> Result<&TensorMeta, CucaError> {
         self.shards
             .tensor(hf)
-            .map(|m| m.shape.clone())
             .ok_or_else(|| cfg_err(format!("checkpoint has no tensor `{hf}`")))
+    }
+
+    fn shape(&self, hf: &str) -> Result<Vec<usize>, CucaError> {
+        Ok(self.meta(hf)?.shape.clone())
     }
 
     fn rows_of(&self, hf: &str) -> Result<usize, CucaError> {
-        self.shards
-            .tensor(hf)
-            .map(|m| m.rows())
-            .ok_or_else(|| cfg_err(format!("checkpoint has no tensor `{hf}`")))
+        Ok(self.meta(hf)?.rows())
     }
 
-    fn check(&self, name: &str) -> Result<(), CucaError> {
-        if is_known(name) {
-            Ok(())
-        } else {
-            Err(cfg_err(format!(
+    /// Add a plan, which must carry a name the engine reads.
+    fn push(
+        &mut self,
+        name: String,
+        dims: Vec<usize>,
+        body: Body,
+        ops: Vec<Op>,
+    ) -> Result<(), CucaError> {
+        if !is_known(&name) {
+            return Err(cfg_err(format!(
                 "internal: `{name}` is not a tensor name the engine reads"
-            )))
+            )));
         }
+        self.plans.push(Plan {
+            name,
+            dims,
+            body,
+            ops,
+        });
+        Ok(())
     }
 
     /// The whole tensor `hf` as GGUF tensor `name`.
@@ -549,19 +558,13 @@ impl Planner<'_> {
         dims: Vec<usize>,
         ops: Vec<Op>,
     ) -> Result<(), CucaError> {
-        self.check(&name)?;
         let rows = self.rows_of(hf)?;
-        self.plans.push(Plan {
-            name,
-            dims,
-            body: Body::Slices(vec![Slice {
-                tensor: hf.to_string(),
-                row_start: 0,
-                rows,
-            }]),
-            ops,
-        });
-        Ok(())
+        let slice = Slice {
+            tensor: hf.to_string(),
+            row_start: 0,
+            rows,
+        };
+        self.push(name, dims, Body::Slices(vec![slice]), ops)
     }
 
     /// Rows `start..start + len` of `hf` as GGUF tensor `name`.
@@ -573,9 +576,9 @@ impl Planner<'_> {
         name: String,
         ops: Vec<Op>,
     ) -> Result<(), CucaError> {
-        self.check(&name)?;
-        let mut dims = self.shape(hf)?;
-        let have = self.rows_of(hf)?;
+        let meta = self.meta(hf)?;
+        let have = meta.rows();
+        let mut dims = meta.shape.clone();
         if start + len > have || dims.len() != 2 {
             return Err(cfg_err(format!(
                 "tensor `{hf}` of shape {dims:?} has {have} rows, need {}",
@@ -583,46 +586,29 @@ impl Planner<'_> {
             )));
         }
         dims[0] = len;
-        self.plans.push(Plan {
-            name,
-            dims,
-            body: Body::Slices(vec![Slice {
-                tensor: hf.to_string(),
-                row_start: start,
-                rows: len,
-            }]),
-            ops,
-        });
-        Ok(())
+        let slice = Slice {
+            tensor: hf.to_string(),
+            row_start: start,
+            rows: len,
+        };
+        self.push(name, dims, Body::Slices(vec![slice]), ops)
     }
 
     /// One slice per expert, stacked into `[E, rows, cols]`.
     fn stack(&mut self, slices: Vec<Slice>, name: String) -> Result<(), CucaError> {
-        self.check(&name)?;
         let first = slices
             .first()
             .ok_or_else(|| cfg_err("experts without tensors"))?;
-        let shape = self.shape(&first.tensor)?;
         let mut dims = vec![slices.len(), first.rows];
-        dims.extend_from_slice(&shape[1..]);
-        self.plans.push(Plan {
-            name,
-            dims,
-            body: Body::Slices(slices),
-            ops: Vec::new(),
-        });
-        Ok(())
-    }
-
-    fn n_head(&self) -> Result<usize, CucaError> {
-        self.hp.n_head()
+        dims.extend(self.meta(&first.tensor)?.shape.iter().skip(1));
+        self.push(name, dims, Body::Slices(slices), Vec::new())
     }
 
     fn n_kv_head(&self) -> Result<usize, CucaError> {
         Ok(self
             .hp
             .uint(&["n_kv_heads", "num_key_value_heads"])
-            .unwrap_or(self.n_head()?))
+            .unwrap_or(self.hp.n_head()?))
     }
 
     /// The norm shift of a tensor: `norm_shift` of Gemma 3, and
@@ -661,10 +647,7 @@ impl Planner<'_> {
         // Multi-token-prediction head tensors of Qwen 3.5 (`mtp.*`) take the
         // names of blocks after the trunk.
         let canon = if arch.is_qwen35() {
-            match mtp_name(&canon, self.n_layer) {
-                Some(n) => n,
-                None => canon,
-            }
+            mtp_name(&canon, self.n_layer).unwrap_or(canon)
         } else {
             canon
         };
@@ -776,11 +759,11 @@ impl Planner<'_> {
             let permute = |n_head: usize| vec![Op::PermuteQk { n_head }];
             match rest {
                 "self_attn.q_proj.weight" => {
-                    let ops = permute(self.n_head()?);
+                    let ops = permute(self.hp.n_head()?);
                     return self.direct(hf, blk(gguf::ATTN_Q), ops);
                 }
                 "self_attn.q_proj.bias" => {
-                    let ops = permute(self.n_head()?);
+                    let ops = permute(self.hp.n_head()?);
                     return self.direct(hf, bias(gguf::ATTN_Q), ops);
                 }
                 "self_attn.k_proj.weight" => {
@@ -800,7 +783,7 @@ impl Planner<'_> {
         {
             return self.plan_delta(hf, il, sub);
         }
-        if arch == ConvArch::Qwen35 || arch == ConvArch::Qwen35Moe {
+        if arch.is_qwen35() {
             // MTP head tensors renamed by `mtp_name`.
             let nextn = match rest {
                 "eh_proj.weight" => Some(gguf::NEXTN_EH_PROJ),
@@ -813,10 +796,8 @@ impl Planner<'_> {
                 return self.direct(hf, blk(part), norm);
             }
         }
-        if arch.is_moe()
-            && let Some(done) = self.plan_moe(hf, il, rest)?
-        {
-            return Ok(done);
+        if arch.is_moe() && self.plan_moe(hf, il, rest)? {
+            return Ok(());
         }
 
         // Fused projections kept fused (Phi 3) or split (Ernie 4.5).
@@ -829,7 +810,7 @@ impl Planner<'_> {
             }
             (ConvArch::Ernie4_5, "self_attn.qkv_proj.weight") => {
                 let hd = self.hp.head_dim()?;
-                let (q, k) = (self.n_head()? * hd, self.n_kv_head()? * hd);
+                let (q, k) = (self.hp.n_head()? * hd, self.n_kv_head()? * hd);
                 self.rows(hf, 0, q, blk(gguf::ATTN_Q), Vec::new())?;
                 self.rows(hf, q, k, blk(gguf::ATTN_K), Vec::new())?;
                 return self.rows(hf, q + k, k, blk(gguf::ATTN_V), Vec::new());
@@ -907,14 +888,8 @@ impl Planner<'_> {
                 .float(&["qk_scale_factor"])
                 .ok_or_else(|| cfg_err("config.json has no qk_scale_factor"))? as f32;
         for (part, value) in [(gguf::ATTN_Q_NORM, scale), (gguf::ATTN_K_NORM, 1.0)] {
-            let name = gguf::blk(il, part);
-            self.check(&name)?;
-            self.plans.push(Plan {
-                name,
-                dims: vec![head_dim],
-                body: Body::Generated(vec![value; head_dim]),
-                ops: Vec::new(),
-            });
+            let body = Body::Generated(vec![value; head_dim]);
+            self.push(gguf::blk(il, part), vec![head_dim], body, Vec::new())?;
         }
         Ok(())
     }
@@ -979,17 +954,17 @@ impl Planner<'_> {
                 })
                 .collect()
         };
-        self.check(&gguf::blk(il, gguf::ATTN_K_B))?;
-        self.plans.push(Plan {
-            name: gguf::blk(il, gguf::ATTN_K_B),
-            dims: vec![heads, lora, nope],
-            body: Body::Slices(head_rows(0, nope)),
-            ops: vec![Op::TransposeBatches { batch: heads }],
-        });
-        self.stack_with_dims(
-            head_rows(nope, v),
+        self.push(
+            gguf::blk(il, gguf::ATTN_K_B),
+            vec![heads, lora, nope],
+            Body::Slices(head_rows(0, nope)),
+            vec![Op::TransposeBatches { batch: heads }],
+        )?;
+        self.push(
             gguf::blk(il, gguf::ATTN_V_B),
             vec![heads, v, lora],
+            Body::Slices(head_rows(nope, v)),
+            Vec::new(),
         )
     }
 
@@ -1008,76 +983,52 @@ impl Planner<'_> {
         }
         let nvk = nv / nk;
         let tiled = nk != nv;
-        let rows = |offset: usize, hd: usize| {
-            tiled.then_some(Op::ReorderV {
-                cols: false,
-                offset,
-                nk,
-                nvk,
-                hd,
-            })
+        let reorder = |cols: bool, offset: usize, hd: usize| -> Vec<Op> {
+            tiled
+                .then_some(Op::ReorderV {
+                    cols,
+                    offset,
+                    nk,
+                    nvk,
+                    hd,
+                })
+                .into_iter()
+                .collect()
         };
+        let rows = |offset: usize, hd: usize| reorder(false, offset, hd);
         let blk = |part: &str| gguf::blk(il, part);
         match sub {
             "A_log" => {
-                let mut ops: Vec<Op> = rows(0, 1).into_iter().collect();
+                let mut ops = rows(0, 1);
                 ops.push(Op::NegExp);
                 self.direct(hf, gguf::blk_bare(il, gguf::SSM_A), ops)
             }
-            "dt_bias" => {
-                let ops = rows(0, 1).into_iter().collect();
-                self.direct(hf, gguf::blk_bias(il, gguf::SSM_DT), ops)
-            }
+            "dt_bias" => self.direct(hf, gguf::blk_bias(il, gguf::SSM_DT), rows(0, 1)),
             "conv1d.weight" => {
                 let shape = self.shape(hf)?;
                 let dims = vec![shape[0], shape[1..].iter().product()];
-                let ops = rows(2 * hk * nk, hv).into_iter().collect();
-                self.direct_dims(hf, blk(gguf::SSM_CONV1D), dims, ops)
+                self.direct_dims(hf, blk(gguf::SSM_CONV1D), dims, rows(2 * hk * nk, hv))
             }
-            "in_proj_qkv.weight" => {
-                let ops = rows(2 * hk * nk, hv).into_iter().collect();
-                self.direct(hf, blk(gguf::ATTN_QKV), ops)
-            }
-            "in_proj_z.weight" => {
-                let ops = rows(0, hv).into_iter().collect();
-                self.direct(hf, blk(gguf::ATTN_GATE), ops)
-            }
-            "in_proj_a.weight" => {
-                let ops = rows(0, 1).into_iter().collect();
-                self.direct(hf, blk(gguf::SSM_ALPHA), ops)
-            }
-            "in_proj_b.weight" => {
-                let ops = rows(0, 1).into_iter().collect();
-                self.direct(hf, blk(gguf::SSM_BETA), ops)
-            }
-            "out_proj.weight" => {
-                let ops = tiled
-                    .then_some(Op::ReorderV {
-                        cols: true,
-                        offset: 0,
-                        nk,
-                        nvk,
-                        hd: hv,
-                    })
-                    .into_iter()
-                    .collect();
-                self.direct(hf, blk(gguf::SSM_OUT), ops)
-            }
+            "in_proj_qkv.weight" => self.direct(hf, blk(gguf::ATTN_QKV), rows(2 * hk * nk, hv)),
+            "in_proj_z.weight" => self.direct(hf, blk(gguf::ATTN_GATE), rows(0, hv)),
+            "in_proj_a.weight" => self.direct(hf, blk(gguf::SSM_ALPHA), rows(0, 1)),
+            "in_proj_b.weight" => self.direct(hf, blk(gguf::SSM_BETA), rows(0, 1)),
+            "out_proj.weight" => self.direct(hf, blk(gguf::SSM_OUT), reorder(true, 0, hv)),
             "norm.weight" => self.direct(hf, blk(gguf::SSM_NORM), Vec::new()),
             _ => Err(self.unmapped(hf)),
         }
     }
 
-    /// Router, experts and shared expert of an MoE layer; `Some(())` when the
-    /// tensor was one of them.
-    fn plan_moe(&mut self, hf: &str, il: usize, rest: &str) -> Result<Option<()>, CucaError> {
+    /// Router, experts and shared expert of an MoE layer; whether the tensor
+    /// was one of them.
+    fn plan_moe(&mut self, hf: &str, il: usize, rest: &str) -> Result<bool, CucaError> {
         let arch = self.arch;
         let n_expert =
             self.hp
                 .req_uint(&["num_local_experts", "num_experts", "n_routed_experts"])?;
         if rest == "mlp.gate.weight" {
             self.direct(hf, gguf::blk(il, gguf::FFN_GATE_INP), Vec::new())?;
-            return Ok(Some(()));
+            return Ok(true);
         }
         if arch == ConvArch::Qwen35Moe {
             let shared = match rest {
@@ -1089,7 +1040,7 @@ impl Planner<'_> {
             };
             if let Some(part) = shared {
                 self.direct(hf, gguf::blk(il, part), Vec::new())?;
-                return Ok(Some(()));
+                return Ok(true);
             }
         }
         // Fused expert tensors: [E, 2 * ff, hidden] and [E, hidden, ff].
@@ -1112,13 +1063,15 @@ impl Planner<'_> {
                         rows: ff,
                     })
                     .collect();
-                self.stack_with_dims(slices, gguf::blk(il, part), vec![n_expert, ff, shape[2]])?;
+                let name = gguf::blk(il, part);
+                let dims = vec![n_expert, ff, shape[2]];
+                self.push(name, dims, Body::Slices(slices), Vec::new())?;
             }
-            return Ok(Some(()));
+            return Ok(true);
         }
         if down(rest) {
             self.direct(hf, gguf::blk(il, gguf::FFN_DOWN_EXPS), Vec::new())?;
-            return Ok(Some(()));
+            return Ok(true);
         }
         // Per-expert tensors: `mlp.experts.{e}.{gate,up,down}_proj.weight`.
         if let Some(tail) = rest.strip_prefix("mlp.experts.")
@@ -1130,7 +1083,7 @@ impl Planner<'_> {
             )
         {
             if !self.stacked.insert(il) {
-                return Ok(Some(()));
+                return Ok(true);
             }
             let prefix = hf
                 .rsplit_once("mlp.experts.")
@@ -1153,25 +1106,9 @@ impl Planner<'_> {
                 }
                 self.stack(slices, gguf::blk(il, part))?;
             }
-            return Ok(Some(()));
+            return Ok(true);
         }
-        Ok(None)
-    }
-
-    fn stack_with_dims(
-        &mut self,
-        slices: Vec<Slice>,
-        name: String,
-        dims: Vec<usize>,
-    ) -> Result<(), CucaError> {
-        self.check(&name)?;
-        self.plans.push(Plan {
-            name,
-            dims,
-            body: Body::Slices(slices),
-            ops: Vec::new(),
-        });
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -1239,13 +1176,13 @@ pub(crate) fn plan(
             .unwrap_or(false),
     };
     for e in extra {
-        planner.check(e.name)?;
-        planner.plans.push(Plan {
-            name: e.name.to_string(),
-            dims: vec![e.data.len()],
-            body: Body::Generated(e.data),
-            ops: Vec::new(),
-        });
+        let dims = vec![e.data.len()];
+        planner.push(
+            e.name.to_string(),
+            dims,
+            Body::Generated(e.data),
+            Vec::new(),
+        )?;
     }
     for hf in shards.names() {
         if skipped(hf) || is_fp8_scale(hf, shards) {

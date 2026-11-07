@@ -6,6 +6,7 @@
 //! `67107ac34f62882d8b53ea41ad68010ea635b9be`) that handles the same HF
 //! class.
 
+use super::cfg_err;
 use crate::error::CucaError;
 
 /// A checkpoint family the converter handles; one per engine architecture.
@@ -62,7 +63,7 @@ pub(crate) enum ConvArch {
 
 impl ConvArch {
     /// The converter for an HF `architectures[0]` string.
-    pub(crate) fn from_architecture(name: &str) -> Option<Self> {
+    fn from_architecture(name: &str) -> Option<Self> {
         Some(match name {
             "LlamaForCausalLM" | "MistralForCausalLM" => Self::Llama,
             "SmolLM3ForCausalLM" => Self::Smollm3,
@@ -93,7 +94,7 @@ impl ConvArch {
             .get("architectures")
             .and_then(|a| a.get(0))
             .and_then(|a| a.as_str())
-            .ok_or_else(|| CucaError::Config("config.json has no `architectures` entry".into()))?;
+            .ok_or_else(|| cfg_err("config.json has no `architectures` entry"))?;
         if name == "Mistral3ForConditionalGeneration" {
             // One class for several text models: the converter dispatches on
             // the text config's `model_type`.
@@ -105,14 +106,14 @@ impl ConvArch {
                 // GGUFs, converted in Mistral format, say `llama`; the engine
                 // runs both identically).
                 Some("ministral3" | "mistral") => Ok(Self::Mistral3),
-                other => Err(CucaError::Config(format!(
+                other => Err(cfg_err(format!(
                     "`Mistral3ForConditionalGeneration` with text model `{}` is not supported (only `mistral4`, `ministral3` and `mistral`)",
                     other.unwrap_or("unknown")
                 ))),
             };
         }
         Self::from_architecture(name).ok_or_else(|| {
-            CucaError::Config(format!(
+            cfg_err(format!(
                 "architecture `{name}` has no checkpoint converter; convert it to GGUF with llama.cpp"
             ))
         })
@@ -159,8 +160,8 @@ impl ConvArch {
         self == Self::MuseGlimmer
     }
 
-    /// The Gemma family, whose HF checkpoints keep `norm.weight` as an offset
-    /// from 1 for Gemma 3 (see [`ConvArch::norm_shift`]).
+    /// The Gemma family (Gemma 3's `norm.weight` offset is
+    /// [`ConvArch::norm_shift`]).
     pub(crate) fn is_gemma(self) -> bool {
         matches!(self, Self::Gemma3 | Self::Gemma4 | Self::Gemma4Assistant)
     }
