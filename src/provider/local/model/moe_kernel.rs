@@ -364,6 +364,9 @@ pub(crate) struct MoeCall {
     pub(crate) use_list: bool,
     /// 0 silu, 1 gelu.
     pub(crate) act: u32,
+    /// Multiplier on the routing weights after the softmax and the optional
+    /// renormalisation (`expert_weights_scale`, 1 when the file has none).
+    pub(crate) scale: f32,
     pub(crate) slot: SlotLayout,
 }
 
@@ -471,6 +474,7 @@ fn route_kernel(
     out: &mut Tensor<f32>,
     tokens: u32,
     norm: u32,
+    scale: f32,
     #[comptime] n_expert: usize,
     #[comptime] n_used: usize,
     #[comptime] dim: usize,
@@ -555,7 +559,7 @@ fn route_kernel(
     if tid == 0usize {
         let denom = if norm != 0u32 { kept } else { total };
         for i in 0..n_used {
-            out[weights_at + tok * n_used + i] = out[weights_at + tok * n_used + i] / denom;
+            out[weights_at + tok * n_used + i] = out[weights_at + tok * n_used + i] / denom * scale;
         }
     }
 }
@@ -768,6 +772,7 @@ impl MoeKernels for CubeBackend {
             out.clone().into_tensor_arg(),
             call.tokens as u32,
             u32::from(norm),
+            call.scale,
             call.n_expert,
             call.n_used,
             dim,

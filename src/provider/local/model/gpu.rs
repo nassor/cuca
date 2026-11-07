@@ -311,7 +311,7 @@ use super::moe_kernel::{self as mk, MoeCall, SlotLayout};
 use super::paged::Solo;
 use super::paged::{BLOCK_SIZE, BlockTable, KvLayout, NO_BLOCK, Sizing};
 use super::paged_kernel::{self, PagedCall};
-use super::params::{DeltaSpec, Hparams, LayerSpec, MoeSpec};
+use super::params::{DeltaSpec, Hparams, LayerSpec, MlaSpec, MoeSpec};
 use super::quant::{RowTable, dequant_row};
 use super::rope::{RopeKind, RopeSpec};
 use super::tier::{
@@ -1169,29 +1169,37 @@ impl WeightReader<'_> {
         rows: &Range<usize>,
     ) -> Result<Vec<u8>, CucaError> {
         let row_bytes = slice.cols / slice.dtype.block_size() * slice.dtype.type_size();
+        // The up half of a fused gate/up tensor starts inside the expert's
+        // record, which `slice` knows as an absolute file offset.
+        let tensor_start =
+            self.content.tensor_data_offset + tensor_info(self.content, tensor_name)?.offset;
+        let within = (slice.offset(e) - tensor_start) as usize;
         self.read_at(
             tensor_name,
-            e * slice.file_bytes + rows.start * row_bytes,
+            within + rows.start * row_bytes,
             rows.len() * row_bytes,
         )?;
         Ok(std::mem::take(&mut self.buf))
     }
 
-    /// The experts of MoE layer `il` (FFN width `ff`): every expert read,
+    /// The experts of MoE layer `il` (FFN width `ff`; `fused` when gate and
+    /// up share one `ffn_gate_up_exps` tensor): every expert read,
     /// converted and uploaded now, or, with `tiers`, left in the file for
     /// the tiers to load into an empty pool. Shard `tp` of a split model
     /// holds every expert cut to its `ff / world` units (gate and up rows,
     /// down columns).
+    #[allow(clippy::too_many_arguments)]
     fn expert_bank(
         &mut self,
         il: usize,
         n_expert: usize,
         ff: usize,
         n_embd: usize,
+        fused: bool,
         tiers: Option<&TierPlan>,
         tp: Tp,
     ) -> Result<GpuExpertBank, CucaError> {
-        let (layer, layout) = layer_experts(self.content, il, n_expert, ff, n_embd)?;
+        let (layer, layout) = layer_experts(self.content, il, n_expert, ff, n_embd, fused)?;
         let no_list = Tensor::<1, Int>::zeros([2], self.device);
         if let Some(plan) = tiers {
             // One buffer holds at most MAX_PART_BYTES.
@@ -1229,10 +1237,15 @@ impl WeightReader<'_> {
         // The same conversion the tiers apply to an expert they load, so a
         // resident and a tiered expert are the same words.
         let blk = |tensor: &str| name::blk(il, tensor);
+        let (gate_name, up_name) = if fused {
+            (blk(name::FFN_GATE_UP_EXPS), blk(name::FFN_GATE_UP_EXPS))
+        } else {
+            (blk(name::FFN_GATE_EXPS), blk(name::FFN_UP_EXPS))
+        };
         let mut words: Vec<i32> = Vec::with_capacity(n_expert * layout.words);
         for e in 0..n_expert {
-            let gate = self.expert_rows(&blk(name::FFN_GATE_EXPS), &layer.gate, e, &part)?;
-            let up = self.expert_rows(&blk(name::FFN_UP_EXPS), &layer.up, e, &part)?;
+            let gate = self.expert_rows(&gate_name, &layer.gate, e, &part)?;
+            let up = self.expert_rows(&up_name, &layer.up, e, &part)?;
             let down = self.expert_rows(&blk(name::FFN_DOWN_EXPS), &layer.down, e, &(0..n_embd))?;
             let down = if whole {
                 down
@@ -1383,8 +1396,9 @@ struct GpuShared {
     gate: Weight,
     up: Weight,
     down: Weight,
-    /// `ffn_gate_inp_shexp` as `[1, n_embd]`.
-    gate_inp: Tensor<2>,
+    /// `ffn_gate_inp_shexp` as `[1, n_embd]`; `None` for an ungated shared
+    /// expert (Mistral Small 4), whose output is added as it is.
+    gate_inp: Option<Tensor<2>>,
 }
 
 /// Gated delta-net weights of one layer (see [`super::delta`] for the
@@ -1442,12 +1456,32 @@ impl DeltaState {
     }
 }
 
+/// Multi-head latent attention weights of one layer (Mistral Small 4, see
+/// [`Weights::mla`]). The per-head up-projections are f32 on the device,
+/// already transposed into the right operands of the two batched products
+/// the layer runs around the attention.
+struct MlaWeights {
+    q_a: Weight,
+    q_a_norm: Tensor<1>,
+    q_b: Weight,
+    kv_a: Weight,
+    kv_a_norm: Tensor<1>,
+    /// `attn_k_b` as `[n_head, nope, kv_lora]`: `q_nope [n_head, t, nope] .
+    /// k_b` is the query absorbed into the latent space.
+    k_b: Tensor<3>,
+    /// `attn_v_b` as `[n_head, kv_lora, v_head]`: the attended latent
+    /// `[n_head, t, kv_lora] . v_b` is the head's value.
+    v_b: Tensor<3>,
+    wo: Proj,
+}
+
 /// What mixes the tokens of one layer.
 // One value per layer, built at load and only read afterwards.
 #[allow(clippy::large_enum_variant)]
 enum Mixer {
     Attention(AttnWeights),
     Delta(Box<DeltaWeights>),
+    Mla(Box<MlaWeights>),
 }
 
 /// One routed expert converted on the host to the words of the MoE kernels
@@ -1788,7 +1822,9 @@ struct RopeTable {
 /// the sequences' tables that name it (see [`paged`](super::paged)).
 struct KvPool {
     k: Tensor<4>,
-    v: Tensor<4>,
+    /// `None` for a latent-attention layer, whose value is the leading
+    /// columns of its key row: the pool holds one row per position.
+    v: Option<Tensor<4>>,
 }
 
 /// The pool of every layer (`None` for layers that share another layer's
@@ -2269,7 +2305,7 @@ fn alloc_pools(hp: &Hparams, layout: &KvLayout, device: &Device) -> Result<KvLay
         let shape = [blocks, spec.n_kv_head, BLOCK_SIZE, spec.head_dim];
         kv.push(Some(KvPool {
             k: Tensor::zeros(shape, device),
-            v: Tensor::zeros(shape, device),
+            v: spec.mla.is_none().then(|| Tensor::zeros(shape, device)),
         }));
     }
     Ok(kv)
@@ -2288,16 +2324,18 @@ fn tier_layout(
 ) -> Result<Vec<LayerExperts>, CucaError> {
     let mut layers = Vec::new();
     for (il, layer_spec) in hp.layers.iter().enumerate() {
-        let Ffn::Moe { ff, .. } = LayerLayout::read(hp, il, layer_spec, content)?.ffn else {
+        let Ffn::Moe { ff, fused, .. } = LayerLayout::read(hp, il, layer_spec, content)?.ffn else {
             continue;
         };
-        layers.push(layer_experts(content, il, spec.n_expert, ff, hp.n_embd)?.0);
+        layers.push(layer_experts(content, il, spec.n_expert, ff, hp.n_embd, fused)?.0);
     }
     Ok(layers)
 }
 
 /// Where the `n_expert` experts of MoE layer `il` (FFN width `ff`, `n_embd`
-/// inputs) live in the file, and the slot layout of one on the device.
+/// inputs) live in the file, and the slot layout of one on the device;
+/// `fused` when the gate and up matrices share one `ffn_gate_up_exps` tensor
+/// (per expert, the gate rows then the up rows).
 ///
 /// # Errors
 ///
@@ -2309,12 +2347,25 @@ fn layer_experts(
     n_expert: usize,
     ff: usize,
     n_embd: usize,
+    fused: bool,
 ) -> Result<(LayerExperts, SlotLayout), CucaError> {
     let slice = |part: &str, rows, cols| {
         ExpertSlice::read(content, &name::blk(il, part), n_expert, rows, cols)
     };
-    let gate = slice(name::FFN_GATE_EXPS, ff, n_embd)?;
-    let up = slice(name::FFN_UP_EXPS, ff, n_embd)?;
+    let (gate, up) = if fused {
+        ExpertSlice::read_fused(
+            content,
+            &name::blk(il, name::FFN_GATE_UP_EXPS),
+            n_expert,
+            ff,
+            n_embd,
+        )?
+    } else {
+        (
+            slice(name::FFN_GATE_EXPS, ff, n_embd)?,
+            slice(name::FFN_UP_EXPS, ff, n_embd)?,
+        )
+    };
     let down = slice(name::FFN_DOWN_EXPS, n_embd, ff)?;
     let layout = SlotLayout::new(n_embd, ff, [gate.dtype, up.dtype, down.dtype])?;
     let layer = LayerExperts {
@@ -2456,17 +2507,6 @@ impl GpuTransformer {
                 "`{}` is a multi-token-prediction drafter, not a standalone model: pass it as the `drafter` of a Gemma 4 model",
                 hp.arch.name()
             )));
-        }
-        if hp.behavior.mla {
-            return Err(CucaError::Config(format!(
-                "`{}` uses multi-head latent attention (a low-rank query and one shared latent K/V row per position, absorbed into the query), which the GPU engine does not implement: run it on the CPU (`LocalDevice::Cpu`)",
-                hp.arch.name()
-            )));
-        }
-        if hp.moe.is_some_and(|m| m.scale != 1.0) {
-            return Err(CucaError::Config(
-                "`expert_weights_scale` other than 1 is not implemented by the GPU engine's expert kernels: run the model on the CPU (`LocalDevice::Cpu`)".into(),
-            ));
         }
         let hybrid = hp.behavior.hybrid_delta_net;
         check_context(&hp, context_length)?;
@@ -2867,7 +2907,9 @@ impl GpuTransformer {
                 .ok_or_else(|| err("the sequence has no block table for the drafter's layer"))?;
             Ok(ExtGroup {
                 k: pool.k.clone(),
-                v: pool.v.clone(),
+                v: pool.v.clone().ok_or_else(|| {
+                    err("the drafter reads a target with a latent K/V cache, which has no value pool")
+                })?,
                 table: table.clone(),
             })
         };
@@ -3356,6 +3398,59 @@ fn load_attention(
     })
 }
 
+/// Transpose each of the `heads` row-major `[rows, cols]` matrices of
+/// `values` to `[cols, rows]`.
+fn transpose_heads(values: &[f32], heads: usize, rows: usize, cols: usize) -> Vec<f32> {
+    let mut out = vec![0f32; values.len()];
+    for h in 0..heads {
+        for r in 0..rows {
+            for c in 0..cols {
+                out[(h * cols + c) * rows + r] = values[(h * rows + r) * cols + c];
+            }
+        }
+    }
+    out
+}
+
+/// Read the latent-attention weights of layer `il`: the low-rank query, the
+/// latent projection and the per-head up-projections (dequantized on the
+/// host, held as f32: two small batched products use them).
+fn load_mla(
+    reader: &mut WeightReader<'_>,
+    hp: &Hparams,
+    il: usize,
+    spec: &LayerSpec,
+    mla: &MlaSpec,
+) -> Result<MlaWeights, CucaError> {
+    let n_embd = hp.n_embd;
+    let nh = spec.n_head;
+    let blk = |part: &str| name::blk(il, part);
+    // Stored `[n_head, kv_lora, nope]` and `[n_head, v_head, kv_lora]`.
+    let k_b = reader.host_floats(&blk(name::ATTN_K_B), &[nh, mla.kv_lora, mla.nope])?;
+    let v_b = reader.host_floats(&blk(name::ATTN_V_B), &[nh, mla.v_head, mla.kv_lora])?;
+    let k_b = transpose_heads(&k_b, nh, mla.kv_lora, mla.nope);
+    let v_b = transpose_heads(&v_b, nh, mla.v_head, mla.kv_lora);
+    Ok(MlaWeights {
+        q_a: reader.matrix(&blk(name::ATTN_Q_A), mla.q_lora, n_embd)?,
+        q_a_norm: reader.vector(&blk(name::ATTN_Q_A_NORM), mla.q_lora)?,
+        q_b: reader.matrix(&blk(name::ATTN_Q_B), nh * mla.q_head(), mla.q_lora)?,
+        kv_a: reader.matrix(&blk(name::ATTN_KV_A_MQA), mla.latent_width(), n_embd)?,
+        kv_a_norm: reader.vector(&blk(name::ATTN_KV_A_NORM), mla.kv_lora)?,
+        k_b: Tensor::from_data(
+            TensorData::new(k_b, [nh, mla.nope, mla.kv_lora]),
+            reader.device,
+        ),
+        v_b: Tensor::from_data(
+            TensorData::new(v_b, [nh, mla.kv_lora, mla.v_head]),
+            reader.device,
+        ),
+        wo: Proj {
+            w: reader.matrix(&blk(name::ATTN_OUTPUT), n_embd, nh * mla.v_head)?,
+            bias: None,
+        },
+    })
+}
+
 /// Read the gated delta-net weights of layer `il`.
 fn load_delta(
     reader: &mut WeightReader<'_>,
@@ -3424,9 +3519,10 @@ fn load_layer(
         reader.matrix_cut(&blk(part), (rows, cols), &cut)
     };
 
-    let mixer = match spec.delta() {
-        Some(delta) => Mixer::Delta(Box::new(load_delta(reader, hp, il, delta)?)),
-        None => Mixer::Attention(load_attention(reader, hp, tp, il, spec, layout)?),
+    let mixer = match (spec.delta(), spec.mla) {
+        (Some(delta), _) => Mixer::Delta(Box::new(load_delta(reader, hp, il, delta)?)),
+        (None, Some(mla)) => Mixer::Mla(Box::new(load_mla(reader, hp, il, spec, &mla)?)),
+        (None, None) => Mixer::Attention(load_attention(reader, hp, tp, il, spec, layout)?),
     };
 
     let ffn = match (layout.ffn, hp.moe) {
@@ -3444,27 +3540,33 @@ fn load_layer(
             },
             down: matrix(reader, name::FFN_DOWN, n_embd, ff)?,
         },
-        (Ffn::Moe { fused: true, .. }, _) => {
-            return Err(CucaError::Config(
-                "a fused `ffn_gate_up_exps` expert tensor is not implemented by the GPU engine"
-                    .into(),
-            ));
-        }
-        (Ffn::Moe { ff, shared_ff, .. }, Some(spec)) => FfnWeights::Moe {
+        (
+            Ffn::Moe {
+                ff,
+                shared_ff,
+                fused,
+            },
+            Some(spec),
+        ) => FfnWeights::Moe {
             spec,
             router: reader.matrix(&blk(name::FFN_GATE_INP), spec.n_expert, n_embd)?,
-            experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, tiers, tp)?,
+            experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, fused, tiers, tp)?,
             shared: match shared_ff {
                 Some(sff) => {
-                    let gate_inp = reader.host_vector(&blk(name::FFN_GATE_INP_SHEXP), n_embd)?;
+                    let gate_inp = if hp.behavior.shared_expert_ungated {
+                        None
+                    } else {
+                        let values = reader.host_vector(&blk(name::FFN_GATE_INP_SHEXP), n_embd)?;
+                        Some(Tensor::from_data(
+                            TensorData::new(values, [1, n_embd]),
+                            reader.device,
+                        ))
+                    };
                     Some(GpuShared {
                         gate: matrix(reader, name::FFN_GATE_SHEXP, sff, n_embd)?,
                         up: matrix(reader, name::FFN_UP_SHEXP, sff, n_embd)?,
                         down: matrix(reader, name::FFN_DOWN_SHEXP, n_embd, sff)?,
-                        gate_inp: Tensor::from_data(
-                            TensorData::new(gate_inp, [1, n_embd]),
-                            reader.device,
-                        ),
+                        gate_inp,
                     })
                 }
                 None => None,
@@ -3997,6 +4099,7 @@ impl Weights {
             None => x.clone(),
         };
         let attn = match &lw.mixer {
+            Mixer::Mla(mw) => self.mla(il, h, mw, pass, kv)?,
             Mixer::Delta(dw) => {
                 let mut states = Vec::with_capacity(pass.seqs.len());
                 for seq in &pass.seqs {
@@ -4085,7 +4188,10 @@ impl Weights {
                             pool.k = pool
                                 .k
                                 .slice_assign(at.clone(), k.clone().narrow(2, from, rows));
-                            pool.v = pool.v.slice_assign(at, v.clone().narrow(2, from, rows));
+                            pool.v = pool
+                                .v
+                                .take()
+                                .map(|pv| pv.slice_assign(at, v.clone().narrow(2, from, rows)));
                         }
                     }
                     kv[il] = Some(pool);
@@ -4110,10 +4216,18 @@ impl Weights {
                         .get(src)
                         .and_then(Option::as_ref)
                         .ok_or_else(|| err(format!("layer {src} owns no K/V cache")))?;
-                    (&pool.k, &pool.v)
+                    let v = pool.v.as_ref().ok_or_else(|| {
+                        err(format!(
+                            "layer {src} has a latent K/V cache, which holds no value pool"
+                        ))
+                    })?;
+                    (&pool.k, v)
                 };
 
-                let call = PagedCall { scale: spec.scale };
+                let call = PagedCall {
+                    scale: spec.scale,
+                    v_width: None,
+                };
                 let attn = if let Some(st) = pass.stacked.iter().find(|s| s.window == spec.window) {
                     // A decode step: every sequence's one row in one launch.
                     paged_kernel::decode(
@@ -4178,6 +4292,158 @@ impl Weights {
             }
         };
         Ok(attn)
+    }
+
+    /// The latent attention of layer `il` (Mistral Small 4) over the normed
+    /// rows `h [t, n_embd]` of the pass, up to and including the output
+    /// projection, as the CPU `mla_in` computes it.
+    ///
+    /// The query is low rank (`q_b(norm(q_a(h)))`, `n_head` heads of `nope +
+    /// rot` values). `kv_a(h)` yields a latent `c` (`kv_lora` values, normed)
+    /// and a rotary key `k_rot` (`rot` values, rotated), both shared by every
+    /// head, and the layer's cache is the single row `[c | k_rot]` per
+    /// position in the paged pool `[n_blocks, 1, 16, kv_lora + rot]` (written
+    /// block by block as a normal layer's keys are). The key up-projection
+    /// is absorbed into the query, `q_abs = q_nope . k_b` (one batched
+    /// product), so the score of head `h` is `[q_abs | q_rot] . [c | k_rot]`
+    /// against the shared row, and the attended latent, the softmax-weighted
+    /// sum of the rows' first `kv_lora` columns, goes through `v_b` per head
+    /// afterwards: no per-head key or value exists. A single query row
+    /// reads the pool in place ([`paged_kernel::decode`] with the pool as
+    /// both keys and values, values being the row's prefix); several rows
+    /// gather the visible rows and use [`attend`]. Each query row is scaled
+    /// by the Llama 4 factor of its position ([`Pass::q_scale`]).
+    fn mla(
+        &self,
+        il: usize,
+        h: Tensor<2>,
+        mw: &MlaWeights,
+        pass: &Pass,
+        kv: &mut KvLayers,
+    ) -> Result<Tensor<2>, CucaError> {
+        let hp = &self.hp;
+        let spec = &hp.layers[il];
+        let mla = spec
+            .mla
+            .ok_or_else(|| err(format!("layer {il} is not a latent attention layer")))?;
+        let rope_at = spec.rope.ok_or_else(|| {
+            err(format!(
+                "layer {il}: latent attention needs rotary embeddings"
+            ))
+        })?;
+        let eps = hp.eps;
+        let t = pass.t;
+        let (nh, nope, rot, kvl) = (spec.n_head, mla.nope, mla.rot, mla.kv_lora);
+        let width = mla.latent_width();
+        let rotate = |m: Tensor<4>| rope(m, &pass.ropes[rope_at], &hp.ropes[rope_at]);
+
+        // The query rows `[nope | rot]` per head: the nope part absorbed
+        // through `k_b`, the rot part rotated, scaled by position.
+        let cq = rms(linear(h.clone(), &mw.q_a), Some(&mw.q_a_norm), eps);
+        let q = linear(cq, &mw.q_b).reshape([t, nh, mla.q_head()]);
+        let q_nope = q.clone().narrow(2, 0, nope).swap_dims(0, 1);
+        let q_rot = rotate(
+            q.narrow(2, nope, rot)
+                .reshape([1, t, nh, rot])
+                .swap_dims(1, 2),
+        );
+        let q_abs = q_nope.matmul(mw.k_b.clone()).reshape([1, nh, t, kvl]);
+        let q_full = Tensor::cat(vec![q_abs, q_rot], 3);
+        let q_full = match &pass.q_scale {
+            Some(s) => q_full * s.clone(),
+            None => q_full,
+        };
+
+        // The cached row `[c | k_rot]` of every new position.
+        let latent = linear(h, &mw.kv_a);
+        let c = rms(latent.clone().narrow(1, 0, kvl), Some(&mw.kv_a_norm), eps);
+        let k_rot = rotate(latent.narrow(1, kvl, rot).reshape([1, 1, t, rot]));
+        let row = Tensor::cat(vec![c.reshape([1, 1, t, kvl]), k_rot], 3);
+        // Take the pool out so the assignments own the only handle and
+        // write in place.
+        let mut pool = kv
+            .get_mut(il)
+            .and_then(Option::take)
+            .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
+        for seq in &pass.seqs {
+            let (_, blocks) = seq.visible(il, spec.window)?;
+            for w in &blocks.writes {
+                let at = [w.block..w.block + 1, 0..1, w.r0..w.r1, 0..width];
+                let rows = row.clone().narrow(2, seq.off + w.off, w.r1 - w.r0);
+                pool.k = pool.k.slice_assign(at, rows);
+            }
+        }
+        kv[il] = Some(pool);
+        let pool_k = kv
+            .get(il)
+            .and_then(Option::as_ref)
+            .map(|p| &p.k)
+            .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))?;
+
+        // The attended latent `[n_head, t, kv_lora]`.
+        let call = PagedCall {
+            scale: spec.scale,
+            v_width: Some(kvl),
+        };
+        let attended = if let Some(st) = pass.stacked.iter().find(|s| s.window == spec.window) {
+            paged_kernel::decode(
+                q_full.swap_dims(1, 2).reshape([t, nh, width]),
+                pool_k.clone(),
+                pool_k.clone(),
+                st.table.clone(),
+                st.range.clone(),
+                &call,
+            )
+            .swap_dims(0, 1)
+        } else {
+            let mut outs = Vec::with_capacity(pass.seqs.len());
+            for seq in &pass.seqs {
+                let (visible, blocks) = seq.visible(il, spec.window)?;
+                let qs = if pass.seqs.len() == 1 {
+                    q_full.clone()
+                } else {
+                    q_full.clone().narrow(2, seq.off, seq.t)
+                };
+                let out = match &blocks.read {
+                    BlockRead::Decode { table, range } => paged_kernel::decode(
+                        qs.reshape([1, nh, width]),
+                        pool_k.clone(),
+                        pool_k.clone(),
+                        Tensor::clone(table),
+                        Tensor::clone(range),
+                        &call,
+                    )
+                    .swap_dims(0, 1),
+                    BlockRead::Gather { idx, skip, len } => {
+                        let keys = gather_view(pool_k, idx, *skip, *len);
+                        attend(
+                            qs,
+                            keys.clone(),
+                            keys.narrow(3, 0, kvl),
+                            visible.mask.clone(),
+                            spec.scale,
+                        )
+                        .reshape([nh, seq.t, kvl])
+                    }
+                    BlockRead::Rows { .. } => {
+                        return Err(err(format!(
+                            "layer {il}: the step's blocks were stacked for one launch"
+                        )));
+                    }
+                };
+                outs.push(out);
+            }
+            if outs.len() == 1 {
+                outs.swap_remove(0)
+            } else {
+                Tensor::cat(outs, 1)
+            }
+        };
+        let out = attended
+            .matmul(mw.v_b.clone())
+            .swap_dims(0, 1)
+            .reshape([t, nh * mla.v_head]);
+        Ok(linear(out, &mw.wo.w))
     }
 
     /// `branch` scaled by the residual scale (the branch itself when 1).
@@ -4313,6 +4579,7 @@ impl FfnWeights {
                     pairs,
                     use_list,
                     act: act_code,
+                    scale: spec.scale,
                     slot: layout,
                 };
                 let logits = linear(f.clone(), router);
@@ -4325,8 +4592,14 @@ impl FfnWeights {
                     let hidden =
                         activate(linear(f.clone(), &sh.gate), act) * linear(f.clone(), &sh.up);
                     let y = linear(hidden, &sh.down);
-                    let gate = activation::sigmoid((f * sh.gate_inp.clone()).sum_dim(1));
-                    out = out + y * gate;
+                    out = out
+                        + match &sh.gate_inp {
+                            Some(gate_inp) => {
+                                y * activation::sigmoid((f * gate_inp.clone()).sum_dim(1))
+                            }
+                            // Ungated: every token takes the whole output.
+                            None => y,
+                        };
                 }
                 Ok(out)
             }
@@ -4693,6 +4966,7 @@ fn attend(
 ) -> Tensor<4> {
     let [_, n_head, t, d] = q.dims();
     let [_, n_kv, l, _] = k.dims();
+    let [_, _, _, dv] = v.dims();
     let rows = n_head / n_kv * t;
     let mut scores = q.reshape([1, n_kv, rows, d]).matmul(k.transpose());
     if scale != 1.0 {
@@ -4704,7 +4978,7 @@ fn attend(
     };
     activation::softmax(scores, 3)
         .matmul(v)
-        .reshape([1, n_head, t, d])
+        .reshape([1, n_head, t, dv])
 }
 
 #[cfg(test)]
@@ -4714,8 +4988,8 @@ mod tests {
     use super::super::cpu::Transformer;
     use super::super::paged::{KvPools, SeqBlocks};
     use super::super::tiny::{
-        PROMPT, TinyModel, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB, write_qwen35,
-        write_spec, write_tiny_model_with,
+        PROMPT, TinyMistral4, TinyModel, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB,
+        write_mistral4, write_qwen35, write_spec, write_tiny_model_with,
     };
     use super::super::{SeqRows, StateSlot};
     use super::*;
@@ -4845,11 +5119,26 @@ mod tests {
         )
     }
 
+    thread_local! {
+        /// The absolute and relative tolerance of [`assert_matches_cpu`] on
+        /// this thread.
+        static TOLERANCE: std::cell::Cell<(f32, f32)> = const { std::cell::Cell::new((1e-3, 1e-2)) };
+    }
+
+    /// Run `f` with the GPU-versus-CPU tolerance `(absolute, relative)`.
+    fn with_tolerance<T>(tolerance: (f32, f32), f: impl FnOnce() -> T) -> T {
+        let before = TOLERANCE.replace(tolerance);
+        let out = f();
+        TOLERANCE.set(before);
+        out
+    }
+
     fn assert_matches_cpu(cpu: &[f32], gpu: &[f32], what: &str) {
+        let (abs, rel) = TOLERANCE.get();
         assert_eq!(cpu.len(), gpu.len(), "{what}");
         for (i, (c, g)) in cpu.iter().zip(gpu).enumerate() {
             assert!(
-                (g - c).abs() <= 1e-3 + 1e-2 * c.abs(),
+                (g - c).abs() <= abs + rel * c.abs(),
                 "{what}: logit {i}: gpu {g} vs cpu {c}"
             );
         }
@@ -4977,9 +5266,46 @@ mod tests {
         for spec in TinySpec::all() {
             check_model(&write_spec(&spec), device, spec.arch);
         }
+        // Latent attention (and fused gate/up experts, an ungated shared
+        // expert, a routing scale, YaRN and per-position query scaling)
+        // against the dequantized CPU reference at 1e-4.
+        with_tolerance((1e-4, 1e-4), || {
+            for (label, spec) in mistral4_variants() {
+                check_model(&write_mistral4(&spec), device, label);
+            }
+        });
         for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
             check_hybrid_model(&write_qwen35(&spec), device, label);
         }
+    }
+
+    /// The tiny `mistral4` models of the GPU tests: fused and split gate/up
+    /// experts, a dense leading layer, float dense weights.
+    fn mistral4_variants() -> Vec<(&'static str, TinyMistral4)> {
+        vec![
+            ("mistral4 fused", TinyMistral4::default()),
+            (
+                "mistral4 split",
+                TinyMistral4 {
+                    fused: false,
+                    ..TinyMistral4::default()
+                },
+            ),
+            (
+                "mistral4 dense first layer",
+                TinyMistral4 {
+                    dense_layers: 1,
+                    ..TinyMistral4::default()
+                },
+            ),
+            (
+                "mistral4 F32",
+                TinyMistral4 {
+                    dtype: GgmlDType::F32,
+                    ..TinyMistral4::default()
+                },
+            ),
+        ]
     }
 
     fn tiny_qwen35() -> TinyQwen35 {
@@ -5373,6 +5699,9 @@ mod tests {
         for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
             check_batched(&write_qwen35(&spec), device, label);
         }
+        for (label, spec) in mistral4_variants() {
+            check_batched(&write_mistral4(&spec), device, label);
+        }
     }
 
     /// Device bytes of one expert summed over the MoE layers of `model`, as
@@ -5476,7 +5805,24 @@ mod tests {
                 });
                 (arch, model)
             })
-            .chain([("qwen35moe", qwen35moe)])
+            .chain([
+                ("qwen35moe", qwen35moe),
+                (
+                    "mistral4",
+                    write_mistral4(&TinyMistral4 {
+                        layers: 4,
+                        ..TinyMistral4::default()
+                    }),
+                ),
+                (
+                    "mistral4 dense first layer",
+                    write_mistral4(&TinyMistral4 {
+                        layers: 4,
+                        dense_layers: 1,
+                        ..TinyMistral4::default()
+                    }),
+                ),
+            ])
             .collect();
         for (arch, model) in &models {
             let min = 2 * expert_device_bytes(model) as u64;
@@ -5708,7 +6054,10 @@ mod tests {
                         scale,
                     )
                     .unwrap();
-                    let call = PagedCall { scale };
+                    let call = PagedCall {
+                        scale,
+                        v_width: None,
+                    };
                     let got = decode_row(
                         &device,
                         (&pool_k, &pool_v),
@@ -5723,6 +6072,80 @@ mod tests {
                         assert!(
                             (g - w).abs() <= 1e-4,
                             "heads {nh}/{nkv} d {d} {lo}..{hi}: value {i}: gpu {g} vs cpu {w}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The latent decode kernel (one shared `[latent | rotary]` row per
+    /// position, the value its first `kv_lora` columns, every query head
+    /// reading it) equals the CPU's latent attention over scrambled blocks,
+    /// at lengths around block boundaries, with and without a range floor,
+    /// for the key/value widths of the tiny model and of Mistral Small 4
+    /// (320 and 256 with 32 heads).
+    #[test]
+    fn gpu_paged_latent_decode_kernel_matches_cpu() {
+        use super::super::cpu::paged_attn::{PoolShape, attend_latent_rows};
+
+        let Some(device) = test_device() else {
+            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            return;
+        };
+        let device = open_device(device).unwrap();
+        let mut rand = lcg(13);
+        let n_blocks = 12;
+        let scrambled: [u32; 6] = [7, 2, 11, 0, 9, 4];
+        for (nh, width, v_width) in [(4usize, 24usize, 16usize), (32, 320, 256)] {
+            let pool_len = n_blocks * BLOCK_SIZE * width;
+            let host: Vec<f32> = (0..pool_len).map(|_| rand()).collect();
+            let shape = [n_blocks, 1, BLOCK_SIZE, width];
+            let pool = Tensor::<4>::from_data(TensorData::new(host.clone(), shape), &device);
+            let scale = 1.0 / (width as f32).sqrt();
+            for hi in [1usize, 2, 15, 16, 17, 33, 70] {
+                let mut los = vec![0];
+                if hi > BLOCK_SIZE + 1 {
+                    los.push(BLOCK_SIZE);
+                }
+                for lo in los {
+                    let mut table = scrambled.to_vec();
+                    table[..lo / BLOCK_SIZE].fill(NO_BLOCK);
+                    let q: Vec<f32> = (0..nh * width).map(|_| 4.0 * rand()).collect();
+                    let want = attend_latent_rows(
+                        &q,
+                        1,
+                        |_| (lo, hi),
+                        &table,
+                        &host,
+                        PoolShape {
+                            n_head: nh,
+                            n_kv_head: 1,
+                            head_dim: width,
+                        },
+                        v_width,
+                        scale,
+                    )
+                    .unwrap();
+                    let call = PagedCall {
+                        scale,
+                        v_width: Some(v_width),
+                    };
+                    let got = decode_row(
+                        &device,
+                        (&pool, &pool),
+                        &table,
+                        (lo, hi),
+                        &q,
+                        (nh, width),
+                        &call,
+                    );
+                    assert_eq!(got.len(), nh * v_width);
+                    assert_eq!(want.len(), nh * v_width);
+                    for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (g - w).abs() <= 1e-4,
+                            "heads {nh} width {width}/{v_width} {lo}..{hi}: value {i}: gpu {g} vs cpu {w}"
                         );
                     }
                 }
@@ -5782,7 +6205,10 @@ mod tests {
                 scale,
             );
             let gathered = read_f32(out, "gathered attention").unwrap();
-            let call = PagedCall { scale };
+            let call = PagedCall {
+                scale,
+                v_width: None,
+            };
             for r in 0..t {
                 let pos = start + r;
                 let row_lo = window.map_or(0, |w| lo.max((pos + 1).saturating_sub(w)));
@@ -6518,6 +6944,7 @@ mod tests {
                         pairs,
                         use_list,
                         act: 0,
+                        scale: spec.scale,
                         slot: layout,
                     };
                     let xt =
@@ -7407,39 +7834,6 @@ mod tests {
         }
     }
 
-    /// Latent attention (and a fused gate/up expert tensor, and a routing
-    /// scale) are CPU only: the GPU load fails with a `CucaError::Config`
-    /// naming the missing piece, before any device is opened.
-    #[test]
-    fn gpu_rejects_latent_attention_loudly() {
-        use crate::provider::local::GpuAdapter;
-        use crate::provider::local::model::tiny::{TinyMistral4, write_mistral4};
-
-        let model = write_mistral4(&TinyMistral4::default());
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
-        let device = test_device().unwrap_or(LocalDevice::Vulkan(GpuAdapter::Default));
-        let e = GpuTransformer::load_placed(
-            &content,
-            &model.path,
-            32,
-            device,
-            &[],
-            &ExpertPlacement::Resident,
-            &Sizing::single(32),
-        )
-        .err()
-        .expect("the GPU engine cannot run mistral4");
-        match &e {
-            CucaError::Config(m) => assert!(
-                m.contains("`mistral4`") && m.contains("multi-head latent attention"),
-                "{m}"
-            ),
-            other => panic!("expected a Config error, got {other:?}"),
-        }
-    }
-
     /// Each rule of the split fails the load with a `CucaError::Config` that
     /// names it (and the numbers it failed on).
     #[test]
@@ -7491,6 +7885,13 @@ mod tests {
         );
         // Recurrent layers.
         assert_split_rejected(&write_qwen35(&tiny_qwen35()), 1, &resident, "delta-net");
+        // Latent attention.
+        assert_split_rejected(
+            &write_mistral4(&TinyMistral4::default()),
+            1,
+            &resident,
+            "multi-head latent attention",
+        );
         // Tiered experts.
         let tiered = ExpertPlacement::Tiered(ExpertTiers {
             ram_bytes: 0,
