@@ -361,7 +361,7 @@ const fn preset(
     }
 }
 
-const PRESET_TABLE: [ModelPreset; 24] = [
+const PRESET_TABLE: [ModelPreset; 25] = [
     preset(
         "gemma4-e2b-q4_0",
         "ggml-org/gemma-4-E2B-it-GGUF",
@@ -608,6 +608,18 @@ const PRESET_TABLE: [ModelPreset; 24] = [
             "cf045574920f9889cebd21db2e5019535d01155947ae00f9e498714954c0fd74",
             170_193_984,
             "gemma4-assistant",
+        )
+    },
+    ModelPreset {
+        drafter: true,
+        ..preset(
+            "muse-glimmer-30b-dflash-q4_0",
+            "ggml-org/Muse-Glimmer-30B-GGUF",
+            "5da9c17514ceb04baf73445648d215272275b114",
+            "dflash-Muse-Glimmer-30B-Q4_0.gguf",
+            "048242c69254627fc11226c9f68dc34fbc82eac1c026ef148c9dbd2f90686db2",
+            1_451_096_896,
+            "dflash",
         )
     },
 ];
@@ -2252,10 +2264,11 @@ mod tests {
         // The default stays Gemma 4 E2B Q4_0 and sits first in the table.
         assert_eq!(ModelSource::PRESETS[0].name, "gemma4-e2b-q4_0");
         assert_eq!(ModelSource::PRESETS[0].size_bytes, 2_841_481_184);
-        // Exactly one drafter preset; every other preset is a main model.
+        // Two drafter presets (Gemma 4's MTP assistant, Muse's DFlash); every other preset is a main model.
         let drafters: Vec<_> = ModelSource::PRESETS.iter().filter(|p| p.drafter).collect();
-        assert_eq!(drafters.len(), 1);
+        assert_eq!(drafters.len(), 2);
         assert_eq!(drafters[0].architecture, "gemma4-assistant");
+        assert_eq!(drafters[1].architecture, "dflash");
         for name in ["qwen3-0.6b-q8_0", "phi4-mini-q4_0", "olmoe-1b-7b-q4_0"] {
             assert!(ModelSource::preset(name).is_some(), "{name}");
         }
