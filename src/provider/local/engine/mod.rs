@@ -310,6 +310,15 @@ fn take_draft(a_j: f64, e_prev: f64, j: usize, t_j: f64, t_next: f64, d: f64) ->
     a_j * (t_j + (j - 1) as f64 * d) > e_prev * (t_next - t_j + d)
 }
 
+/// [`take_draft`] for a block drafter, whose forward pass costs `f` seconds
+/// per round however many drafts the round keeps: the expected-tokens-per-
+/// second comparison `(e_prev + a_j) / (t_next + f) > e_prev / (t_j + f)`
+/// reduces to `a_j (t_j + f) > e_prev (t_next - t_j)`. Adding a draft then
+/// costs only the extra verified row.
+fn take_block_draft(a_j: f64, e_prev: f64, t_j: f64, t_next: f64, f: f64) -> bool {
+    a_j * (t_j + f) > e_prev * (t_next - t_j)
+}
+
 /// Decides, round by round, whether to draft: speculation runs only while its
 /// measured throughput (tokens per second of a draft-plus-verify round,
 /// acceptance and device costs included) is at least that of plain decoding,
@@ -535,21 +544,24 @@ impl Engine {
 
         let hp = super::model::read_hparams(&content)?;
         let context_length = super::resolve_context_length(config.context_length, hp.n_ctx_train);
-        // A file drafter's header is read before the model loads: an EAGLE
-        // drafter observes every position of its one sequence (like the
-        // in-trunk head, which sets the batching) and runs on the CPU only.
+        // A separate drafter file is indexed before the model loads: its
+        // architecture says whether it observes every position of its one
+        // sequence like an in-trunk head does (`file_drafter_observes`), and
+        // an EAGLE drafter runs on the CPU only.
         let file_drafter = match drafter {
             Some(ResolvedDrafter::File(dp)) => Some(read_drafter_header(dp)?),
             _ => None,
         };
-        let eagle = file_drafter.as_ref().is_some_and(is_eagle);
-        if eagle && config.device != LocalDevice::Cpu {
+        if file_drafter.as_ref().is_some_and(is_eagle) && config.device != LocalDevice::Cpu {
             return Err(CucaError::Config(format!(
                 "the EAGLE drafter runs on the CPU only, not on {:?}",
                 config.device
             )));
         }
-        let observing = eagle || matches!(drafter, Some(ResolvedDrafter::InTrunk));
+        let observing = matches!(drafter, Some(ResolvedDrafter::InTrunk))
+            || file_drafter
+                .as_ref()
+                .is_some_and(|dc| file_drafter_observes(architecture_of(dc)));
         let (batching, sizing) = resolve_batching(config, context_length, observing)?;
         let model = Model::load(
             &content,
@@ -560,18 +572,24 @@ impl Engine {
             &config.experts,
             &sizing,
         )?;
-        let drafter = match (drafter, file_drafter) {
-            (Some(ResolvedDrafter::File(dp)), Some(dc)) if eagle => {
-                Some(Drafter::open_eagle(&dc, dp, &model)?)
-            }
-            (Some(ResolvedDrafter::File(dp)), Some(dc)) => {
-                Some(Drafter::open(&dc, dp, &model, context_length)?)
-            }
-            (Some(ResolvedDrafter::InTrunk), _) => {
-                Some(Drafter::open_in_trunk(&content, path, &model)?)
-            }
-            _ => None,
-        };
+        let drafter = drafter
+            .map(|source| -> Result<Drafter, CucaError> {
+                match (source, &file_drafter) {
+                    (ResolvedDrafter::File(dp), Some(dc)) => match architecture_of(dc) {
+                        super::model::cpu::dflash::ARCH => {
+                            Drafter::open_dflash(dc, dp, &model, context_length)
+                        }
+                        a if a == Arch::Mistral4Eagle.name() => Drafter::open_eagle(dc, dp, &model),
+                        _ => Drafter::open(dc, dp, &model, context_length),
+                    },
+                    (ResolvedDrafter::File(dp), None) => Err(local_err(format!(
+                        "the drafter file `{}` was not indexed",
+                        dp.display()
+                    ))),
+                    (ResolvedDrafter::InTrunk, _) => Drafter::open_in_trunk(&content, path, &model),
+                }
+            })
+            .transpose()?;
         let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
 
         const TEMPLATE_KEY: &str = "tokenizer.chat_template";
@@ -702,7 +720,7 @@ fn is_eagle(content: &gguf_file::Content) -> bool {
 fn resolve_batching(
     config: &LocalModelConfig,
     context_length: usize,
-    in_trunk: bool,
+    observing: bool,
 ) -> Result<(Batching, Sizing), CucaError> {
     use super::model::paged::BLOCK_SIZE;
     let b = &config.batching;
@@ -716,9 +734,9 @@ fn resolve_batching(
             )));
         }
     };
-    // The in-trunk head and the EAGLE drafter observe every position in
-    // order: one sequence.
-    let max_sequences = if in_trunk { 1 } else { b.max_sequences };
+    // A drafter that observes every position in order (the in-trunk head, a
+    // DFlash drafter) serves one sequence.
+    let max_sequences = if observing { 1 } else { b.max_sequences };
     let max_step_tokens = b
         .max_step_tokens
         .unwrap_or_else(|| prefill_chunk(context_length).max(max_sequences));
@@ -735,6 +753,22 @@ fn resolve_batching(
         prefix_cache: b.prefix_cache,
     };
     Ok((batching, sizing))
+}
+
+/// The `general.architecture` of a GGUF file (empty when absent).
+fn architecture_of(content: &gguf_file::Content) -> &str {
+    content
+        .metadata
+        .get("general.architecture")
+        .and_then(|v| v.to_string().ok())
+        .map_or("", String::as_str)
+}
+
+/// Whether a drafter file of architecture `arch` takes the trunk's rows of
+/// every position ([`Drafter::observes`]), so that the engine serves one
+/// sequence at a time.
+fn file_drafter_observes(arch: &str) -> bool {
+    matches!(arch, super::model::cpu::dflash::ARCH)
 }
 
 fn saturating_u32(n: usize) -> u32 {
@@ -920,12 +954,36 @@ pub(crate) mod testing {
         e.cost = CostModel::always_drafting();
         e
     }
+
+    /// [`engine`] drafting with a DFlash block drafter, `draft_tokens` per
+    /// round, and a governor and cost model that always draft the full cap
+    /// (the tiny drafter's confidence would end most chains early).
+    pub(crate) fn engine_with_dflash(
+        model: &TinyModel,
+        drafter: &TinyModel,
+        context_length: usize,
+        temperature: f32,
+        seed: Option<u64>,
+        draft_tokens: usize,
+    ) -> Engine {
+        let mut e = engine(model, context_length, temperature, seed);
+        let content =
+            gguf_file::Content::read(&mut BufReader::new(File::open(&drafter.path).unwrap()))
+                .unwrap();
+        e.drafter =
+            Some(Drafter::open_dflash(&content, &drafter.path, &e.model, context_length).unwrap());
+        e.draft_tokens = draft_tokens;
+        e.governor = Governor::always_speculating();
+        e.cost = CostModel::always_drafting();
+        e
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::testing::{engine, engine_in_trunk, engine_with_drafter};
+    use super::testing::{engine, engine_in_trunk, engine_with_dflash, engine_with_drafter};
     use super::*;
+    use crate::provider::local::model::tiny::{TinyDflash, write_tiny_dflash};
     use crate::provider::local::model::tiny::{TinyQwen35, TinySpec, write_qwen35, write_spec};
     use crate::provider::local::model::tiny::{write_tiny_drafter, write_tiny_model};
     use crate::request::PromptCacheUsage;
@@ -2275,5 +2333,307 @@ mod tests {
             matches!(&e, CucaError::Config(m) if m.contains("EAGLE drafter runs on the CPU only")),
             "{e}"
         );
+    }
+
+    // ---- DFlash block drafter ----------------------------------------------
+
+    /// A tiny `muse-glimmer` target that loads with `context` positions.
+    fn muse_target(context: usize) -> crate::provider::local::model::tiny::TinyModel {
+        write_spec(&TinySpec {
+            context,
+            ..TinySpec::muse_glimmer()
+        })
+    }
+
+    /// The positions `lo..hi` the DFlash drafter of `e` holds context for.
+    fn dflash_held(e: &Engine) -> (usize, usize) {
+        match &e.drafter {
+            Some(Drafter::Dflash(net)) => net.held(),
+            _ => panic!("the engine has no DFlash drafter"),
+        }
+    }
+
+    /// Drafting with a DFlash block drafter must not change greedy output:
+    /// the same tokens, the same usage and the same cache bookkeeping as
+    /// plain decoding, whatever the block length, the draft cap and however
+    /// many drafts the target rejects; and the drafter's context ends where
+    /// the trunk's cache does.
+    #[test]
+    fn dflash_drafter_leaves_greedy_output_unchanged() {
+        let model = muse_target(32);
+        let prompts: [&[u32]; 5] = [
+            &PROMPT,
+            &[2, 9, 9, 9, 10],
+            &[2, 13, 12, 11, 10, 9, 13],
+            &[2, 11],
+            &[2, 12, 10, 14, 13, 11, 9, 15, 10, 12, 14, 11],
+        ];
+        let (mut drafted, mut accepted) = (0, 0);
+        for (block, window) in [
+            (2usize, Some(6usize)),
+            (5, Some(6)),
+            (8, Some(4)),
+            (8, None),
+            (16, Some(6)),
+        ] {
+            let drafter = write_tiny_dflash(&TinyDflash {
+                block,
+                window,
+                ..TinyDflash::default()
+            });
+            for k in [1usize, 2, 4, 15] {
+                for prompt in prompts {
+                    let mut plain = engine(&model, 32, 0.0, None);
+                    let mut spec = engine_with_dflash(&model, &drafter, 32, 0.0, None, k);
+                    let expected = run(&mut plain, prompt, None);
+                    let got = run(&mut spec, prompt, None);
+                    let what = format!("block {block} window {window:?} k {k} prompt {prompt:?}");
+                    assert_eq!(text(&got), text(&expected), "{what}");
+                    assert_eq!(got.items.len(), expected.items.len(), "{what}");
+                    assert_eq!(
+                        got.metadata.token_usage.map(|u| u.completion_tokens),
+                        expected.metadata.token_usage.map(|u| u.completion_tokens),
+                        "{what}"
+                    );
+                    // A draft that ends the reply (an end-of-turn id) is
+                    // cached too when accepted; plain decoding never forwards
+                    // it.
+                    assert!(spec.last_ids.starts_with(&plain.last_ids), "{what}");
+                    assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "{what}");
+                    let stats = spec.stats.snapshot();
+                    assert!(stats.drafted <= stats.rounds * (block as u64 - 1), "{what}");
+                    drafted += stats.drafted;
+                    accepted += stats.accepted;
+                }
+            }
+        }
+        assert!(drafted > 0, "the drafter proposed tokens");
+        assert!(accepted > 0, "some drafts were accepted and rolled forward");
+    }
+
+    #[test]
+    fn dflash_drafter_respects_max_tokens_and_the_context_limit() {
+        let model = muse_target(32);
+        let drafter = write_tiny_dflash(&TinyDflash::default());
+        for max in [1u32, 2, 3, 7] {
+            let mut plain = engine(&model, 32, 0.0, None);
+            let mut spec = engine_with_dflash(&model, &drafter, 32, 0.0, None, 4);
+            let a = run(&mut plain, &PROMPT, Some(max));
+            let b = run(&mut spec, &PROMPT, Some(max));
+            assert_eq!(text(&a), text(&b), "max {max}");
+            assert_eq!(
+                a.metadata.token_usage.map(|u| u.completion_tokens),
+                b.metadata.token_usage.map(|u| u.completion_tokens),
+                "max {max}"
+            );
+            assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "max {max}");
+        }
+        // A context that fills up mid-round, for several sizes and prompts.
+        let mut filled = 0;
+        for ctx in [7usize, 8, 9, 10, 12, 16] {
+            let model = muse_target(ctx.max(8));
+            for prompt in [
+                &PROMPT[..],
+                &[2u32, 9, 9, 9, 10][..],
+                &[2u32, 11][..],
+                &[2u32, 12, 10, 14][..],
+                &[2u32, 13, 12, 11, 10][..],
+            ] {
+                let mut plain = engine(&model, ctx, 0.0, None);
+                let mut spec = engine_with_dflash(&model, &drafter, ctx, 0.0, None, 8);
+                let a = run(&mut plain, prompt, None);
+                let b = run(&mut spec, prompt, None);
+                assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
+                assert!(
+                    spec.last_ids.starts_with(&plain.last_ids),
+                    "ctx {ctx}, prompt {prompt:?}"
+                );
+                assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "ctx {ctx}");
+                let tokens = b.metadata.token_usage.map(|u| u.completion_tokens);
+                filled += usize::from(tokens == u32::try_from(ctx - prompt.len()).ok());
+            }
+        }
+        assert!(filled > 0, "some run stopped at the context limit");
+    }
+
+    /// Warm prefix reuse with the drafter equals a cold run: the trunk
+    /// resumes from the shared blocks, the drafter keeps the positions the
+    /// shared tokens still determine and observes the replayed rows.
+    #[test]
+    fn dflash_warm_prefix_reuse_equals_cold() {
+        let model = muse_target(128);
+        let drafter = write_tiny_dflash(&TinyDflash::default());
+        let first = long_prompt(40);
+        let mut second = first[..30].to_vec();
+        second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
+        let mut warm = engine_with_dflash(&model, &drafter, 128, 0.0, None, 3);
+        let a = run(&mut warm, &first, Some(6));
+        assert_eq!(usage(&a), (0, 40));
+        assert_eq!(dflash_held(&warm).1, warm.last_ids.len());
+
+        // The first 30 tokens are shared: one whole block is reused.
+        let b = run(&mut warm, &second, Some(6));
+        assert_eq!(usage(&b), (16, 24));
+        let cold = run(
+            &mut engine_with_dflash(&model, &drafter, 128, 0.0, None, 3),
+            &second,
+            Some(6),
+        );
+        let plain = run(&mut engine(&model, 128, 0.0, None), &second, Some(6));
+        assert_eq!(text(&b), text(&cold));
+        assert_eq!(text(&b), text(&plain));
+        assert_eq!(dflash_held(&warm).1, warm.last_ids.len());
+
+        // The same prompt again reuses its two whole blocks.
+        let c = run(&mut warm, &second, Some(6));
+        assert_eq!(usage(&c), (32, 8));
+        assert_eq!(text(&c), text(&plain));
+        assert_eq!(dflash_held(&warm).1, warm.last_ids.len());
+
+        // The cached ids plus more tokens.
+        let mut extended = warm.last_ids.clone();
+        extended.extend([15, 14]);
+        let d = run(&mut warm, &extended, Some(4));
+        let expected = run(&mut engine(&model, 128, 0.0, None), &extended, Some(4));
+        assert_eq!(text(&d), text(&expected));
+        assert_eq!(dflash_held(&warm).1, warm.last_ids.len());
+
+        // A prompt that diverges inside the second block keeps the first.
+        let mut diverging = first[..18].to_vec();
+        diverging.extend([15, 14, 13, 12, 11, 10, 9, 15, 14, 13, 12, 11]);
+        let e = run(&mut warm, &diverging, Some(5));
+        assert_eq!(usage(&e), (16, 14));
+        let expected = run(&mut engine(&model, 128, 0.0, None), &diverging, Some(5));
+        assert_eq!(text(&e), text(&expected));
+        assert_eq!(dflash_held(&warm).1, warm.last_ids.len());
+    }
+
+    /// A failed request resets the drafter with the trunk, and the engine
+    /// keeps serving.
+    #[test]
+    fn dflash_drafter_recovers_from_a_failed_request() {
+        let model = muse_target(32);
+        let drafter = write_tiny_dflash(&TinyDflash::default());
+        let mut e = engine_with_dflash(&model, &drafter, 32, 0.0, None, 3);
+        let prompt = [2u32, 9, 10, 3, 11, 12, 13];
+        let before = run(&mut e, &prompt, Some(4));
+        let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
+        assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
+        assert!(e.last_ids.is_empty());
+        assert_eq!(dflash_held(&e), (0, 0));
+        let after = run(&mut e, &prompt, Some(4));
+        assert_eq!(usage(&after), (0, 7));
+        assert_eq!(text(&after), text(&before));
+        assert_eq!(dflash_held(&e).1, e.last_ids.len());
+    }
+
+    #[test]
+    fn dflash_drafter_with_sampling_is_reproducible_for_a_seed() {
+        let model = muse_target(32);
+        let drafter = write_tiny_dflash(&TinyDflash::default());
+        let run_once = || {
+            let mut e = engine_with_dflash(&model, &drafter, 32, 1.0, Some(5), 3);
+            let out = run(&mut e, &PROMPT, None);
+            (
+                text(&out),
+                out.metadata.token_usage.map(|u| u.completion_tokens),
+                e.stats.snapshot(),
+            )
+        };
+        let (a, n, stats_a) = run_once();
+        let (b, m, stats_b) = run_once();
+        assert_eq!((a, n, stats_a), (b, m, stats_b));
+        assert!(n.is_some());
+        assert!(stats_a.drafted > 0, "a seeded run always drafts");
+    }
+
+    /// The measured cost model and governor (no test freeze) price a block
+    /// drafter per round: the output is still plain greedy's, and the
+    /// drafter's cost is recorded once per round, not once per draft.
+    #[test]
+    fn dflash_drafter_with_the_measured_cost_model_matches_plain() {
+        let model = muse_target(128);
+        let drafter = write_tiny_dflash(&TinyDflash::default());
+        let prompt = long_prompt(20);
+        let mut plain = engine(&model, 128, 0.0, None);
+        let mut spec = engine_with_dflash(&model, &drafter, 128, 0.0, None, 7);
+        spec.governor = Governor::default();
+        spec.cost = CostModel::default();
+        for _ in 0..6 {
+            let a = run(&mut plain, &prompt, Some(24));
+            let b = run(&mut spec, &prompt, Some(24));
+            assert_eq!(text(&a), text(&b));
+        }
+        // Drafted rounds were measured: one pass each (not one per draft).
+        assert!(spec.cost.draft.n > 0, "the cost model measured drafting");
+        assert!(spec.stats.snapshot().drafted > 0);
+    }
+
+    /// A block drafter's drafts are free once the pass is paid for: the
+    /// marginal rule keeps a draft while its acceptance beats the extra
+    /// verified row, and the flat pass cost only weighs the whole round.
+    #[test]
+    fn a_block_draft_is_priced_per_round() {
+        // Free rows: every draft with any chance of acceptance is kept.
+        assert!(take_block_draft(0.01, 1.0, 1.0, 1.0, 0.0));
+        assert!(!take_block_draft(0.0, 1.0, 1.0, 1.0, 0.0));
+        // A row costing as much as the whole round: keep it only when its
+        // acceptance is above the expected tokens of the round so far.
+        assert!(!take_block_draft(0.5, 1.0, 1.0, 2.0, 0.0));
+        assert!(take_block_draft(1.1, 1.0, 1.0, 2.0, 0.0));
+        // A pass that dominates the round makes extra rows cheap in
+        // relative terms: the same draft flips to kept.
+        assert!(take_block_draft(0.5, 1.0, 1.0, 2.0, 10.0));
+        // The chained rule with the same numbers charges the pass per draft.
+        assert!(!take_draft(0.5, 1.0, 2, 1.0, 2.0, 10.0));
+    }
+
+    /// A `dflash` file observes every position of one sequence, so the
+    /// engine serves one at a time whatever batch size is configured;
+    /// `Engine::open` dispatches a drafter file on its architecture, and a
+    /// `dflash` file is refused as a main model. (The tiny GGUFs carry no
+    /// tokenizer, so what is checked is everything `open` does before it.)
+    #[test]
+    fn a_dflash_file_is_dispatched_by_its_architecture() {
+        assert!(file_drafter_observes("dflash"));
+        assert!(!file_drafter_observes("gemma4-assistant"));
+        let config = LocalModelConfig {
+            context_length: Some(32),
+            batching: "seqs=4".parse().unwrap(),
+            draft_tokens: 4,
+            ..LocalModelConfig::default()
+        };
+        let (batching, sizing) =
+            resolve_batching(&config, 32, file_drafter_observes("dflash")).unwrap();
+        assert_eq!((batching.max_sequences, sizing.max_sequences), (1, 1));
+
+        let model = muse_target(32);
+        let open = |drafter: &crate::provider::local::model::tiny::TinyModel| {
+            Engine::open(
+                &model.path,
+                Some(&ResolvedDrafter::File(drafter.path.clone())),
+                Arc::default(),
+                &config,
+            )
+            .err()
+            .expect("the tiny model has no tokenizer")
+            .to_string()
+        };
+        // A fitting drafter loads: `open` gets as far as the tokenizer.
+        let e = open(&write_tiny_dflash(&TinyDflash::default()));
+        assert!(e.contains("tokenizer.ggml.model"), "{e}");
+        // A drafter that reads a layer the target lacks fails while loading.
+        let e = open(&write_tiny_dflash(&TinyDflash {
+            target_ids: vec![0, 9],
+            ..TinyDflash::default()
+        }));
+        assert!(e.contains("layer 9"), "{e}");
+
+        // The file is a drafter, not a model.
+        let drafter = write_tiny_dflash(&TinyDflash::default());
+        let err = Engine::open(&drafter.path, None, Arc::default(), &config)
+            .err()
+            .expect("a drafter is not a main model");
+        assert!(err.to_string().contains("not a standalone model"), "{err}");
     }
 }

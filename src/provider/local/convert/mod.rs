@@ -26,12 +26,15 @@
 pub(crate) mod arch;
 pub(crate) mod chktxt;
 pub(crate) mod config;
+pub(crate) mod dflash;
 pub(crate) mod eagle;
 pub(crate) mod gguf_merge;
 pub(crate) mod gguf_writer;
 pub(crate) mod hf;
 #[cfg(test)]
 mod oracle;
+#[cfg(test)]
+mod oracle_dflash;
 #[cfg(test)]
 mod oracle_local;
 pub(crate) mod safetensors;
@@ -255,6 +258,11 @@ fn convert_locked(
     quant: WeightQuant,
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<(), CucaError> {
+    // A DFlash drafter checkpoint has its own tensor set, no tokenizer and no
+    // `ConvArch`: it converts on its own path.
+    if dflash::is_dflash(&ck.config) {
+        return dflash::convert(ck, partial, quant, progress);
+    }
     let arch = ConvArch::from_config(&ck.config)?;
     let hp = config::Hp::new(&ck.config)?.with_defaults(arch);
     let shards = safetensors::Shards::open(&ck.shards)?;

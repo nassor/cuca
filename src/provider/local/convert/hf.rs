@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 
 use serde_json::Value;
 
-use super::arch::ConvArch;
 use super::eagle;
 use crate::error::CucaError;
 use crate::provider::local::DownloadProgressCallback;
@@ -203,7 +202,7 @@ pub(crate) async fn fetch(
             )));
         }
     }
-    ConvArch::from_config(&read_config(&dir)?)?;
+    super::dflash::check_architecture(&read_config(&dir)?)?;
 
     for file in OPTIONAL_FILES.iter().chain(&[INDEX_FILE]) {
         download::ensure_downloaded_optional(
@@ -246,6 +245,7 @@ pub(crate) async fn fetch(
 
 #[cfg(test)]
 mod tests {
+    use super::super::arch::ConvArch;
     use super::*;
     use crate::provider::local::convert::safetensors::tests::temp_dir;
 

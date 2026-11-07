@@ -75,13 +75,26 @@
 //! See [`super::cpu::EagleHead`] for the semantics (embedding first, then the
 //! hidden row; RoPE position of the hidden row), the cost of committing a
 //! pair, and the memory.
+//!
+//! # DFlash block drafter (`dflash` file)
+//!
+//! A DFlash drafter ([`super::cpu::DflashNet`]) proposes a whole block of
+//! tokens in one pass from the target's per-layer hidden features instead of
+//! chaining one step per token. It observes every position like the in-trunk
+//! head, but the rows it takes are the residual streams after chosen target
+//! layers ([`Drafter::feature_rows`], `Hidden::Layers`), not the final-norm
+//! row, and one [`Drafter::draft`] call costs one block pass whatever the
+//! number of drafts kept ([`Drafter::block`]: the engine's cost model prices
+//! it per round). CPU only; the same truncate, reset and observe rules keep
+//! its context cache consistent with the trunk's.
 
 use std::path::Path;
 
 use candle_core::quantized::gguf_file;
 
 use super::arch::Arch;
-use super::cpu::{EagleHead, NextnHead, Transformer};
+use super::cpu::dflash::DflashNet;
+use super::cpu::{EagleHead, Hidden, NextnHead, Transformer};
 #[cfg(feature = "provider-local-gpu")]
 use super::gpu::GpuDrafter;
 use super::paged::BlockTable;
@@ -103,6 +116,9 @@ pub(crate) enum Drafter {
     /// The EAGLE drafter of a Mistral Small 4 model, a separate file with a
     /// K/V cache of its own (CPU only).
     Eagle(EagleHead),
+    /// A DFlash block drafter in its own file, driven by the target's
+    /// per-layer features (CPU only).
+    Dflash(DflashNet),
 }
 
 impl Drafter {
@@ -204,10 +220,37 @@ impl Drafter {
         }
     }
 
+    /// The DFlash block drafter at `path` (index `content`) for `target`.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when `target` runs on a GPU or the file is not
+    /// a plain DFlash drafter this target can feed (see
+    /// [`DflashNet::open`](super::cpu::DflashNet)).
+    pub(crate) fn open_dflash(
+        content: &gguf_file::Content,
+        path: &Path,
+        target: &Model,
+        context_length: usize,
+    ) -> Result<Self, CucaError> {
+        match target {
+            Model::Cpu(target) => Ok(Self::Dflash(DflashNet::open(
+                content,
+                path,
+                target,
+                context_length,
+            )?)),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(_) => Err(err(
+                "the DFlash drafter runs on the CPU only: use `LocalDevice::Cpu`",
+            )),
+        }
+    }
+
     /// Whether the drafter needs the trunk's hidden row of every position
     /// ([`Drafter::observe`]), not just the last one.
     pub(crate) fn observes(&self) -> bool {
-        matches!(self, Self::InTrunk(_) | Self::Eagle(_))
+        matches!(self, Self::InTrunk(_) | Self::Eagle(_) | Self::Dflash(_))
     }
 
     /// Tell the drafter the trunk ran the tokens `tokens[i]` at positions
@@ -233,14 +276,41 @@ impl Drafter {
             (Self::Eagle(head), Model::Cpu(target)) => {
                 target.eagle_observe(head, pos, tokens, hidden)
             }
-            #[cfg(feature = "provider-local-gpu")]
-            (Self::InTrunk(_), _) => {
-                Err(err("the drafter and its target run on different devices"))
+            (Self::Dflash(net), Model::Cpu(_)) => {
+                if hidden.len() != tokens.len() * net.feature_width() {
+                    return Err(err(format!(
+                        "DFlash observe: {} tokens with {} feature floats, expected {} each",
+                        tokens.len(),
+                        hidden.len(),
+                        net.feature_width()
+                    )));
+                }
+                net.observe(pos, hidden)
             }
             #[cfg(feature = "provider-local-gpu")]
-            (Self::Eagle(_), _) => Err(err("the drafter and its target run on different devices")),
+            (Self::InTrunk(_) | Self::Dflash(_) | Self::Eagle(_), _) => {
+                Err(err("the drafter and its target run on different devices"))
+            }
             _ => Ok(()),
         }
+    }
+
+    /// The per-layer feature rows a block drafter reads from the trunk
+    /// instead of the final-norm hidden row (`None` for the others): ask the
+    /// trunk's forward passes for exactly this ([`Hidden::Layers`]), then
+    /// hand the rows to [`Drafter::observe`] as `hidden`.
+    pub(crate) fn feature_rows(&self) -> Option<Hidden> {
+        match self {
+            Self::Dflash(net) => Some(Hidden::Layers(net.features())),
+            _ => None,
+        }
+    }
+
+    /// Whether one [`Drafter::draft`] call costs one pass whatever the
+    /// number of drafts it returns (a block drafter), not one pass per
+    /// draft: the cost model prices such a drafter per round.
+    pub(crate) fn block(&self) -> bool {
+        matches!(self, Self::Dflash(_))
     }
 
     /// The first `shared` tokens of the trunk's sequence stay and any later
@@ -251,6 +321,7 @@ impl Drafter {
         match self {
             Self::InTrunk(head) => head.truncate(shared),
             Self::Eagle(head) => head.truncate(shared),
+            Self::Dflash(net) => net.truncate(shared),
             _ => {}
         }
     }
@@ -261,6 +332,7 @@ impl Drafter {
         match self {
             Self::InTrunk(head) => head.reset(),
             Self::Eagle(head) => head.reset(),
+            Self::Dflash(net) => net.reset(),
             _ => {}
         }
     }
@@ -316,6 +388,7 @@ impl Drafter {
             (Self::Eagle(head), Model::Cpu(target)) => {
                 target.eagle_draft(head, hidden, first, len, k, pick)
             }
+            (Self::Dflash(net), Model::Cpu(target)) => net.draft(target, first, len, k, pick),
             #[cfg(feature = "provider-local-gpu")]
             (Self::Gpu(drafter), Model::Gpu(target)) => {
                 drafter.draft(target, tables, hidden, first, len, k, pick)
