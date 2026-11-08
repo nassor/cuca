@@ -33,6 +33,7 @@ weight = 4
 | `client` | `pub` | none | the builder, the client and the plugin-instrumented stream |
 | `export` | `pub` | `plugin-memory` or `service-prompt-cache` | the versioned `cuca-export` envelope |
 | `cost_otel` | `pub` | `plugin-cost` and `plugin-telemetry` | the cost ledger to OpenTelemetry bridge |
+| `server` | `pub` | `server` | the `cuca serve`, `cuca balance` and `cuca tui` implementations; see [Server](@/server/_index.md) |
 | `provider` | `pub(crate)` | none | the provider adapters; not part of the public surface |
 | `canonical` | `pub(crate)` | `plugin-session-log` or `service-prompt-cache` | canonical JSON encoding for storage records and digest input |
 | `tokenize` | `pub(crate)` | `plugin-memory` or `plugin-cost` | tiktoken encoder resolution |
@@ -63,11 +64,11 @@ Available in every build that compiles. There are 17.
 
 ## Feature-gated re-exports
 
-There are 181, in 22 groups.
+There are 183, in 22 groups.
 
 | Gate | Items |
 |---|---|
-| `provider-local` | `BatchingConfig`, `ConvertConfig`, `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `ExpertHeat`, `ExpertPlacement`, `ExpertTierStats`, `ExpertTiers`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalModel`, `LocalModelConfig`, `ModelPart`, `ModelPreset`, `ModelSource`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `SamplingConfig`, `ServingStats`, `WeightQuant` |
+| `provider-local` | `BatchingConfig`, `ConvertConfig`, `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `ExpertHeat`, `ExpertPlacement`, `ExpertTierStats`, `ExpertTiers`, `GenerationReport`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalGeneration`, `LocalModel`, `LocalModelConfig`, `ModelPart`, `ModelPreset`, `ModelSource`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `SamplingConfig`, `ServingStats`, `WeightQuant` |
 | `plugin-cost` | `CostConfig`, `CostEntry`, `CostObserver`, `CostPlugin`, `CostUsage`, `ModelRates`, `PricingResolver`, `PricingTable`, `UnpricedModelPolicy` |
 | `plugin-guardrails` | `JsonGuardrailPlugin` |
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |
@@ -135,7 +136,8 @@ Under `provider-local`, the re-exports above are the whole public path: `cuca::p
 | `SamplingConfig` | `temperature`, `top_k`, `top_p`, `seed`, all `Option`; `DEFAULT_TEMPERATURE` (1.0), `DEFAULT_TOP_K` (64), `DEFAULT_TOP_P` (0.95) |
 | `LocalDevice`, `GpuAdapter` | `Cpu`, `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`, `Cuda(usize)`, `Rocm(usize)`; `Default`, `Discrete(usize)`, `Integrated(usize)`; `required_feature`, `FromStr` |
 | `LocalModelConfig` | fields `source`, `cache_dir`, `hf_token`, `context_length`, `sampling`, `chat_template`, `device`, `drafter`, `draft_tokens`, `on_download_progress`, `experts`, `convert`, `batching`, `shards`, `gpu_layers`; `set_devices` |
-| `LocalModel` | `load`, `capabilities`, `sampling`, `kv_cache_bytes`, `layer_split`, `draft_stats`, `serving_stats`, `expert_tier_stats`, `expert_heat` |
+| `LocalModel` | `load`, `generate`, `capabilities`, `sampling`, `context_length`, `kv_cache_bytes`, `weights_file_bytes`, `layer_split`, `draft_stats`, `serving_stats`, `expert_tier_stats`, `expert_heat` |
+| `LocalGeneration`, `GenerationReport` | the stream of one `LocalModel::generate` request, with no client and no plugin hooks, and its `report()`: `usage`, `prompt_cache`, `finish_reason` (`stop` or `length`), `queue_secs` |
 | `LocalCapabilities`, `DraftStats`, `ServingStats`, `ExpertTierStats`, `ExpertHeat` | statistics and capability reports; `DraftStats::acceptance_rate` |
 | `DownloadProgress`, `DownloadProgressCallback` | `downloaded_bytes`, `total_bytes`; `DownloadProgressCallback::new` |
 

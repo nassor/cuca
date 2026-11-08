@@ -9,7 +9,7 @@ weight = 3
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>The library reads the environment only in <code>provider-local</code>, as a fallback; the examples, the integration tests and the local unit-test fixtures read the rest</dd>
+<dd>The library reads the environment only in <code>provider-local</code>, as a fallback; the <code>cuca</code> binary reads two API keys and <code>RUST_LOG</code>; the examples, the integration tests and the local unit-test fixtures read the rest</dd>
 <dt>You need</dt>
 <dd>Nothing; every variable has a default or a documented fallback</dd>
 <dt>Read this if</dt>
@@ -36,6 +36,9 @@ Everything else below is read by `examples/`, `tests/` or unit-test fixtures in 
 | `CUCA_CACHE_DIR` | the library (`provider-local`), the tokenizer and chat golden unit tests | the platform cache directory |
 | `HF_TOKEN` | the library (`provider-local`) | none; anonymous access |
 | `LOCALAPPDATA`, `USERPROFILE`, `HOME`, `XDG_CACHE_HOME` | the library (`provider-local`), as the platform cache directory | see below |
+| `CUCA_API_KEY` | the `cuca` binary: `serve --api-key`, `balance --api-key`, `tui --api-key` | none |
+| `CUCA_UPSTREAM_API_KEY` | the `cuca` binary: `balance --upstream-api-key` | none |
+| `RUST_LOG` | the `cuca` binary, as the log filter when `--log-level` is absent | `info` |
 | `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs`, the tokenizer, chat golden and eagle unit tests | none |
 | `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs` | `gemma4-e2b-q4_0`; `_tiers.rs` has no default and skips without a model |
 | `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs` | unset |

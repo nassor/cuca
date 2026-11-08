@@ -201,6 +201,24 @@ title = "Scheduler"
 path = "@/services/scheduler.md"
 
 [[extra.nav]]
+label = "Server"
+[[extra.nav.items]]
+title = "Overview"
+path = "@/server/_index.md"
+[[extra.nav.items]]
+title = "Model server"
+path = "@/server/model-server.md"
+[[extra.nav.items]]
+title = "Balancer"
+path = "@/server/balancer.md"
+[[extra.nav.items]]
+title = "Stats API and metrics"
+path = "@/server/stats-and-metrics.md"
+[[extra.nav.items]]
+title = "Terminal UI"
+path = "@/server/tui.md"
+
+[[extra.nav]]
 label = "How-to guides"
 [[extra.nav.items]]
 title = "Point the client at another OpenAI-compatible server"
@@ -208,6 +226,9 @@ path = "@/guides/other-openai-server.md"
 [[extra.nav.items]]
 title = "Write a custom plugin"
 path = "@/guides/custom-plugin.md"
+[[extra.nav.items]]
+title = "Serve a model over HTTP"
+path = "@/guides/serve-a-model.md"
 [[extra.nav.items]]
 title = "Run the live integration suite"
 path = "@/guides/integration-tests.md"

@@ -143,6 +143,16 @@ let client = CucaClient::builder()
 
 A Hugging Face safetensors checkpoint needs no GGUF: `"Qwen/Qwen3-0.6B:<commit>".parse::<ModelSource>()?`, or `ModelSource::Dir` for a local directory, is converted once to a cached GGUF in pure Rust and loaded like any other file. See [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/#checkpoints).
 
+### Serve a model over HTTP
+
+The `cuca` binary turns the local engine into an OpenAI-compatible server (vLLM and llama.cpp style), with a load balancer for several servers, Prometheus metrics, a stats API and a terminal UI. This command runs the same on Linux, macOS and Windows (PowerShell):
+
+```
+cargo run --release --no-default-features --features server-tui --bin cuca -- serve --model qwen3-0.6b-q8_0 --stats-api
+```
+
+Then `POST /v1/chat/completions` on `http://127.0.0.1:8000`. The [Server pages](https://nassor.github.io/cuca/server/) cover `serve`, `balance`, `tui`, the metrics and the stats API.
+
 ### Run the live tests
 
 With a chat model on `http://127.0.0.1:1234` (a llama.cpp server works), run this on Linux, macOS and Windows (PowerShell):

@@ -107,6 +107,8 @@ pub(crate) struct Job {
     pub(crate) events: mpsc::Sender<Result<MessageContentBlock, CucaError>>,
     /// Receives the prompt-cache and token usage of this job.
     pub(crate) metadata: ResponseMetadataHandle,
+    /// When the request was dispatched: its wait for admission starts here.
+    pub(crate) queued_at: std::time::Instant,
 }
 
 /// The resolved [`BatchingConfig`](super::BatchingConfig): what the scheduler
@@ -164,6 +166,9 @@ pub(crate) struct Engine {
     cost: CostModel,
     /// Scratch the scheduler refills every step.
     bufs: StepBufs,
+    /// Size in bytes of the GGUF file the model was read from (`0` for an
+    /// engine not built by [`Engine::open`]).
+    file_bytes: u64,
     /// The ids the last sequence that ended held (empty after a failure).
     #[cfg(test)]
     last_ids: Vec<u32>,
@@ -504,11 +509,21 @@ pub(crate) struct ServingCounters {
     waiting: AtomicUsize,
     free_blocks: AtomicUsize,
     cached_blocks: AtomicUsize,
+    used_blocks: AtomicUsize,
+    total_blocks: AtomicUsize,
+    max_sequences: AtomicUsize,
     snapshot_bytes: AtomicU64,
     prefix_hit_tokens: AtomicU64,
     preemptions: AtomicU64,
     steps: AtomicU64,
     batched_rows: AtomicU64,
+    prefill_rows: AtomicU64,
+    generated_tokens: AtomicU64,
+    admissions: AtomicU64,
+    queue_wait_ns: AtomicU64,
+    step_ns: AtomicU64,
+    last_step_ns: AtomicU64,
+    last_step_rows: AtomicUsize,
 }
 
 impl ServingCounters {
@@ -516,13 +531,23 @@ impl ServingCounters {
         super::ServingStats {
             running: self.running.load(Ordering::Relaxed),
             waiting: self.waiting.load(Ordering::Relaxed),
+            max_sequences: self.max_sequences.load(Ordering::Relaxed),
             free_blocks: self.free_blocks.load(Ordering::Relaxed),
             cached_blocks: self.cached_blocks.load(Ordering::Relaxed),
+            used_blocks: self.used_blocks.load(Ordering::Relaxed),
+            total_blocks: self.total_blocks.load(Ordering::Relaxed),
             snapshot_bytes: self.snapshot_bytes.load(Ordering::Relaxed),
             prefix_hit_tokens: self.prefix_hit_tokens.load(Ordering::Relaxed),
             preemptions: self.preemptions.load(Ordering::Relaxed),
             steps: self.steps.load(Ordering::Relaxed),
             batched_rows: self.batched_rows.load(Ordering::Relaxed),
+            prefill_rows: self.prefill_rows.load(Ordering::Relaxed),
+            generated_tokens: self.generated_tokens.load(Ordering::Relaxed),
+            admissions: self.admissions.load(Ordering::Relaxed),
+            queue_wait_ns: self.queue_wait_ns.load(Ordering::Relaxed),
+            step_ns: self.step_ns.load(Ordering::Relaxed),
+            last_step_ns: self.last_step_ns.load(Ordering::Relaxed),
+            last_step_rows: self.last_step_rows.load(Ordering::Relaxed),
         }
     }
 }
@@ -629,7 +654,7 @@ impl Engine {
         let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
         let (format, template) = load_chat(&content, &tokenizer, chat_template)?;
 
-        let engine = Self::new(
+        let mut engine = Self::new(
             model,
             Arc::clone(&tokenizer),
             format.clone(),
@@ -643,6 +668,7 @@ impl Engine {
             config.draft_tokens,
             stats,
         );
+        engine.file_bytes = std::fs::metadata(path).map_or(0, |m| m.len());
         Ok((engine, tokenizer, template, format))
     }
 
@@ -663,7 +689,11 @@ impl Engine {
         stats: Arc<DraftCounters>,
     ) -> Self {
         let pools = KvPools::new(model.kv_layout());
-        Self {
+        let serving = Arc::<ServingCounters>::default();
+        serving
+            .max_sequences
+            .store(batching.max_sequences, Ordering::Relaxed);
+        let engine = Self {
             model,
             tokenizer,
             format,
@@ -682,13 +712,17 @@ impl Engine {
             drafter,
             draft_tokens,
             bufs: StepBufs::default(),
+            file_bytes: 0,
             stats,
-            serving: Arc::default(),
+            serving,
             governor: Governor::default(),
             cost: CostModel::default(),
             #[cfg(test)]
             last_ids: Vec::new(),
-        }
+        };
+        // The pool sizes are known before the first request.
+        engine.publish_gauges();
+        engine
     }
 
     /// The scheduler counters `LocalModel::serving_stats` reads.
@@ -706,6 +740,11 @@ impl Engine {
     /// default resolved against the model.
     pub(crate) fn context_length(&self) -> usize {
         self.context_length
+    }
+
+    /// Size in bytes of the GGUF file the model was read from.
+    pub(crate) fn file_bytes(&self) -> u64 {
+        self.file_bytes
     }
 
     /// K/V cache bytes of the loaded model at its context length.
@@ -838,6 +877,10 @@ fn file_drafter_observes(arch: &str) -> bool {
 
 fn saturating_u32(n: usize) -> u32 {
     u32::try_from(n).unwrap_or(u32::MAX)
+}
+
+fn saturating_u64(n: u128) -> u64 {
+    u64::try_from(n).unwrap_or(u64::MAX)
 }
 
 /// Fixtures shared by the engine tests and the `LocalModel` tests.
@@ -1062,6 +1105,7 @@ pub(crate) mod testing {
             stop: Vec::new(),
             events,
             metadata,
+            queued_at: std::time::Instant::now(),
         }
     }
 }

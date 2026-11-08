@@ -80,7 +80,7 @@ The fields are `Option` so "set" and "default" can be told apart: `top_k: Some(6
 - `max_step_tokens` is at least `max_sequences` and at most 2,048. `None` is the prefill chunk of the context length, `clamp(2,097,152 / context_length, 16, 256)`, so 256 at 8,192 positions.
 - `prefix_cache: false` registers nothing in the prefix store, so every prompt prefills in full.
 - A drafter that reads every position of its sequence (the in-trunk head, the EAGLE and the DFlash drafters) forces `max_sequences` to 1. A Gemma 4 assistant drafts only while one request runs alone.
-- `LocalModel::serving_stats()` returns `ServingStats`: `running`, `waiting`, `free_blocks`, `cached_blocks`, `snapshot_bytes`, `prefix_hit_tokens`, `preemptions`, `steps` and `batched_rows`. `batched_rows > steps` means steps carried several rows.
+- `LocalModel::serving_stats()` returns `ServingStats`. Gauges: `running`, `waiting`, `max_sequences`, `free_blocks`, `cached_blocks`, `used_blocks`, `total_blocks` and `snapshot_bytes`. Totals since load: `prefix_hit_tokens`, `preemptions`, `steps`, `batched_rows`, `prefill_rows` (the part of `batched_rows` that are prompt rows), `generated_tokens`, `admissions`, `queue_wait_ns` (the wait between dispatch and first admission, summed), `step_ns` (forward pass time, summed) and, for the last pass, `last_step_ns` and `last_step_rows`. `batched_rows > steps` means steps carried several rows. The counters are atomics the engine thread updates, so reading them never waits for a step.
 
 ## Environment variables
 

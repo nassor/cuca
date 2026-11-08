@@ -11,7 +11,7 @@ concurrency:
 # list is the docs.rs feature set in Cargo.toml. Matrix values reference it as
 # $ALL_NO_LLVM, which the run step's shell expands.
 env:
-  ALL_NO_LLVM: "provider-openai,provider-anthropic,provider-gemini,provider-deepseek,provider-llamacpp,provider-vllm,provider-lmstudio,provider-local,provider-local-gpu,provider-local-vulkan,provider-local-metal,plugin-mcp,plugin-sandbox,plugin-memory,plugin-guardrails,plugin-subagent,plugin-hitl,plugin-web-search,plugin-skills,plugin-telemetry,plugin-session-log,plugin-redaction,plugin-cost,service-entity-extraction,service-prompt-cache,service-rate-limit,service-replay,service-scheduler,service-speculative,service-vector-store"
+  ALL_NO_LLVM: "provider-openai,provider-anthropic,provider-gemini,provider-deepseek,provider-llamacpp,provider-vllm,provider-lmstudio,provider-local,provider-local-gpu,provider-local-vulkan,provider-local-metal,plugin-mcp,plugin-sandbox,plugin-memory,plugin-guardrails,plugin-subagent,plugin-hitl,plugin-web-search,plugin-skills,plugin-telemetry,plugin-session-log,plugin-redaction,plugin-cost,service-entity-extraction,service-prompt-cache,service-rate-limit,service-replay,service-scheduler,service-speculative,service-vector-store,server,server-tui"
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -109,6 +109,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --all-targets --no-default-features --features provider-openai,${{ matrix.service }}
+  server_solo:
+    # The `cuca` binary and the server module alone: `server` enables
+    # provider-local itself, so no other provider is named.
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        feature:
+          - server
+          - server-tui
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --all-targets --no-default-features --features ${{ matrix.feature }}
   plugin_layering:
     runs-on: ubuntu-latest
     steps:

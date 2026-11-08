@@ -77,6 +77,20 @@ Memory reports usage on every request. A `ContextUsageObserver` receives a `Cont
 
 The K/V pool never grows. Only the oldest request alone in a pool smaller than it needs fails, with a `CucaError::Provider`. The queues apply backpressure and refuse nothing, which suits a single in-process caller that can wait. See [Local configuration](@/providers/local/configuration.md) and [Expert tiers](@/providers/local/expert-tiers.md).
 
+## The server
+
+`cuca serve` and `cuca balance` keep every traffic-driven structure fixed in size. The tables are on [Stats API and metrics](@/server/stats-and-metrics.md#bounds) and [Balancer](@/server/balancer.md#bounds).
+
+| Structure | Bound | At the cap | Usage reading |
+|---|---|---|---|
+| Latency window | 60 s and 4,096 records (balancer: 1,024 per upstream) | the oldest record drops | `latency` in the stats snapshot |
+| Sample rings | 300 one-second samples per model and for the machine | the oldest sample drops | `StatsSnapshot` rates |
+| Metrics | fixed atomics; labels are the model, status code, upstream and GPU | no series is added at run time | `/metrics` |
+| Request body | 32 MiB | 413 `request_too_large` | none |
+| Chat stream buffer | 32 events per request | the producer waits for the client | `cuca_response_stall_seconds_total` |
+| Stats streams | 64 open | 429 `too_many_streams` | none |
+| Models, upstreams | 16 per server, 256 per balancer | startup fails | `models`, `upstreams` |
+
 ## Per-call limits need no usage reading
 
 `plugin-sandbox` has four limits, all per call:

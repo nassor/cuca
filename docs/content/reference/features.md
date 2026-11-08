@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Thirty-two opt-in features: eight providers, five <code>provider-local</code> GPU features, twelve plugins, seven services</dd>
+<dd>Thirty-four opt-in features: eight providers, five <code>provider-local</code> GPU features, twelve plugins, seven services, two server features</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -97,6 +97,15 @@ Seven features. A service is driven by direct method calls and never implements 
 | `service-vector-store` | `plugin-memory`, `dep:wide` |
 | `service-scheduler` | `dep:tokio`, `dep:tracing` |
 
+## Server features
+
+Two features, described under [Server](@/server/_index.md). Neither is a provider; `server` enables `provider-local`, so it satisfies the provider gate.
+
+| Feature | Enables |
+|---|---|
+| `server` | `provider-local`, `dep:axum`, `dep:clap`, `dep:tracing`, `dep:tracing-subscriber`, `dep:sysinfo`, `dep:nvml-wrapper`, `dep:wmi`, `dep:winreg`, `dep:toml`, `dep:getrandom`, `dep:tokio-stream`, `tokio/net`, `tokio/rt-multi-thread`, `tokio/signal`, `tokio/io-util` |
+| `server-tui` | `server`, `dep:ratatui`, `dep:crossterm` |
+
 ## Feature edges
 
 Three hard edges, all service to plugin:
@@ -126,10 +135,10 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | Crate | Version | Declared features | Owned by |
 |---|---|---|---|
 | `reqwest` | `0.13` | `json`, `stream`, `form`; no defaults | the eight `provider-*`, `plugin-web-search` |
-| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; no defaults | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit`, `service-scheduler` |
-| `tokio-stream` | `0.1` | default | the seven HTTP `provider-*`, `service-speculative` |
+| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; no defaults (`server` adds `net`, `rt-multi-thread`, `signal`, `io-util`) | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit`, `service-scheduler` |
+| `tokio-stream` | `0.1` | default | the seven HTTP `provider-*`, `service-speculative`, `server` |
 | `sha2` | `0.11` | default | `provider-anthropic`, `provider-local`, `service-prompt-cache` |
-| `getrandom` | `0.4` | default | `provider-anthropic` |
+| `getrandom` | `0.4` | default | `provider-anthropic`, `server` (request ids) |
 | `base64` | `0.23` | none | `provider-anthropic`, `plugin-sandbox` |
 | `rmcp` | `3` | `client`, `transport-child-process`, `transport-streamable-http-client-reqwest` | `plugin-mcp` |
 | `wasmtime` | `48` | default, plus `wat` | `plugin-sandbox` |
@@ -137,7 +146,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `jsonschema` | `0.52` | no defaults | `plugin-guardrails` |
 | `opentelemetry` | `0.32` | default | `plugin-telemetry` |
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
-| `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction`, `service-scheduler` |
+| `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction`, `service-scheduler`, `server` |
 | `postcard` | `1` | `use-std`; no defaults | `plugin-session-log`, `service-prompt-cache` |
 | `wide` | `1.7` | default | `service-vector-store` |
 | `candle-core` | `0.11.0` | no defaults | `provider-local` |
@@ -149,6 +158,16 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `burn` | `0.22` | `std`, `fusion`, `autotune`, `extension`, `cubecl`; no defaults | `provider-local-gpu` (backends `burn/vulkan`, `burn/metal`, `burn/cuda`, `burn/rocm`) |
 | `burn-cubecl` | `0.22` | `std`, `fusion`, `autotune`; no defaults | `provider-local-gpu` |
 | `cubecl` | `0.11` | `stdlib`; no defaults | `provider-local-gpu` |
+| `axum` | `0.8` | `tokio`, `http1`, `json`, `query`, `matched-path`; no defaults | `server` |
+| `clap` | `4` | `derive`, `env` | `server` |
+| `tracing-subscriber` | `0.3` | `env-filter`, `json` | `server` |
+| `sysinfo` | `0.40` | `system`, `disk`; no defaults | `server` |
+| `nvml-wrapper` | `0.13` | default | `server` (NVIDIA, loaded at run time) |
+| `wmi` | `0.18` | no defaults | `server`, Windows only (GPU counters) |
+| `winreg` | `0.56` | default | `server`, Windows only (adapter table) |
+| `toml` | `1` | default | `server` (`--config`) |
+| `ratatui` | `0.30` | default | `server-tui` |
+| `crossterm` | `0.29` | default | `server-tui` |
 
 ### Why some defaults are off
 
@@ -163,7 +182,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 - The Vulkan and Metal backends are Rust (wgpu: SPIR-V, MSL). Every GPU feature still compiles C, because CubeCL's runtime pulls an embedded store (`turso`) that builds C through `cc`.
 - On Windows, a dependency's build script runs the SDK resource compiler (`rc.exe`; `windres` on the GNU target) for the GPU features.
 - `provider-local-cuda` and `provider-local-rocm` pull CubeCL's LLVM backend. Its build script, `tracel-llvm-bundler`, downloads a prebuilt LLVM on the first build (network needed once, then cached) and links it statically.
-- docs.rs builds have no network, so the `[package.metadata.docs.rs]` feature list names every feature except those two: thirty of the thirty-two.
+- docs.rs builds have no network, so the `[package.metadata.docs.rs]` feature list names every feature except those two: thirty-two of the thirty-four.
 
 ### Dev dependencies
 
@@ -196,7 +215,7 @@ Every other public module compiles unconditionally: `types`, `error`, `request`,
 | Pinned toolchain | `1.98.0`, from `rust-toolchain.toml` |
 | License | `Apache-2.0` |
 | `[lib] doctest` | `false` |
-| Binary targets | none |
+| Binary targets | `cuca` (`src/bin/cuca.rs`, requires `server`) |
 
 `doctest = false` because the doctest pass does a plain library build that the provider gate rejects, and the crate has no doctests.
 
@@ -247,6 +266,7 @@ Examples live in `examples/<name>.rs`.
 | `local_gpu_llvm` | `cargo check --all-targets --no-default-features --features provider-local-cuda,provider-local-rocm`; the only job that downloads the LLVM bundle |
 | `plugin_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<plugin>`, once per plugin feature (twelve) |
 | `service_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<service>`, once per service feature (seven) |
+| `server_solo` | `cargo check --all-targets --no-default-features --features <feature>`, once for `server` and once for `server-tui`; neither names another provider |
 | `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, a `crate::services` path, or a `plugins::` path for `prompt_cache`, `entity_extraction`, `replay` or `rate_limit` |
 
 All jobs run on `ubuntu-latest`. `ALL_NO_LLVM` is a top-level `env` entry in `.github/workflows/ci.yml`, the same list as the docs.rs feature set: every feature except `provider-local-cuda` and `provider-local-rocm`. The run steps expand it as `$ALL_NO_LLVM`.

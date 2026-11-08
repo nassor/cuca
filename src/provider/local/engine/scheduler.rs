@@ -47,7 +47,7 @@ use std::time::Instant;
 
 use tokio::sync::mpsc::{self, error::TrySendError};
 
-use super::{Engine, Job, local_err, saturating_u32, take_block_draft, take_draft};
+use super::{Engine, Job, local_err, saturating_u32, saturating_u64, take_block_draft, take_draft};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
 use crate::provider::local::model::cpu::{Forward, Hidden};
@@ -159,6 +159,8 @@ pub(super) struct Sequence {
     /// Whether the prompt-cache usage was reported (once, at the first
     /// admission).
     usage_reported: bool,
+    /// When the request was dispatched; the first admission measures its wait.
+    enqueued: Instant,
     temperature: f32,
     top_k: usize,
     top_p: f32,
@@ -197,6 +199,7 @@ impl Sequence {
             stop,
             events,
             metadata,
+            queued_at,
         } = job;
         let prompt_len = prompt_ids.len();
         let sampling = &engine.sampling;
@@ -214,6 +217,7 @@ impl Sequence {
             slot: None,
             snapshot_at: None,
             usage_reported: false,
+            enqueued: queued_at,
             temperature: temperature.unwrap_or(sampling.temperature),
             top_k: top_k.map_or(sampling.top_k, |k| k as usize),
             top_p: top_p.unwrap_or(sampling.top_p),
@@ -497,13 +501,16 @@ impl Engine {
         }
     }
 
-    fn publish_gauges(&self) {
+    pub(super) fn publish_gauges(&self) {
         let s = &self.serving;
         let pool = self.pools.full_stats();
         s.running.store(self.running.len(), Ordering::Relaxed);
         s.waiting.store(self.waiting.len(), Ordering::Relaxed);
         s.free_blocks.store(pool.free, Ordering::Relaxed);
         s.cached_blocks.store(pool.cached, Ordering::Relaxed);
+        s.used_blocks.store(pool.used, Ordering::Relaxed);
+        s.total_blocks
+            .store(pool.free + pool.cached + pool.used, Ordering::Relaxed);
         s.snapshot_bytes
             .store(self.snapshots.bytes() as u64, Ordering::Relaxed);
     }
@@ -699,6 +706,12 @@ impl Engine {
                 .fetch_add(reuse as u64, Ordering::Relaxed);
             if !seq.usage_reported {
                 seq.usage_reported = true;
+                let waited = seq.enqueued.elapsed();
+                self.serving.admissions.fetch_add(1, Ordering::Relaxed);
+                self.serving
+                    .queue_wait_ns
+                    .fetch_add(saturating_u64(waited.as_nanos()), Ordering::Relaxed);
+                seq.metadata.set_queue_secs(waited.as_secs_f64());
                 seq.metadata.set_prompt_cache_usage(PromptCacheUsage {
                     read_tokens: saturating_u32(reuse),
                     write_tokens: saturating_u32(prompt_len - reuse),
@@ -747,6 +760,11 @@ impl Engine {
             completion_tokens: saturating_u32(seq.completion),
             reasoning_tokens: seq.enable_thinking.then(|| seq.parser.reasoning_tokens()),
         });
+        // A stop string, or the end-of-generation token, is a natural stop;
+        // running out of the token budget (`max_tokens` or the context) is not.
+        let length = !seq.stopper.stopped && seq.completion >= seq.budget;
+        seq.metadata
+            .set_finish_reason(if length { "length" } else { "stop" });
     }
 
     /// Move the sequences that ended this step from `running` to
@@ -953,11 +971,21 @@ impl Engine {
                 return;
             }
         };
+        let step_ns = saturating_u64(started.elapsed().as_nanos());
         let rows: usize = plans.iter().map(|p| p.tokens.len()).sum();
-        self.serving.steps.fetch_add(1, Ordering::Relaxed);
-        self.serving
-            .batched_rows
-            .fetch_add(rows as u64, Ordering::Relaxed);
+        let prefill_rows: usize = plans
+            .iter()
+            .filter(|p| matches!(p.kind, Kind::Prefill { .. }))
+            .map(|p| p.tokens.len())
+            .sum();
+        let s = &self.serving;
+        s.steps.fetch_add(1, Ordering::Relaxed);
+        s.batched_rows.fetch_add(rows as u64, Ordering::Relaxed);
+        s.prefill_rows
+            .fetch_add(prefill_rows as u64, Ordering::Relaxed);
+        s.step_ns.fetch_add(step_ns, Ordering::Relaxed);
+        s.last_step_ns.store(step_ns, Ordering::Relaxed);
+        s.last_step_rows.store(rows, Ordering::Relaxed);
 
         for (plan, out) in plans.drain(..).zip(outs) {
             let Plan {
@@ -1042,6 +1070,9 @@ impl Engine {
             return None;
         }
         seq.emit(id, &self.tokenizer, &mut self.id_rng, &mut self.bufs.items);
+        self.serving
+            .generated_tokens
+            .fetch_add(1, Ordering::Relaxed);
         if seq.stopper.stopped || seq.completion == seq.budget || seq.ids.len() == ctx {
             seq.phase = Phase::Ended { failed: false };
             return None;
@@ -1358,6 +1389,9 @@ impl Engine {
                 break;
             }
             seq.emit(d, &self.tokenizer, &mut self.id_rng, &mut self.bufs.items);
+            self.serving
+                .generated_tokens
+                .fetch_add(1, Ordering::Relaxed);
             if seq.stopper.stopped || seq.completion == seq.budget {
                 ended = true;
                 cached = j;

@@ -251,7 +251,7 @@ pub use self::model::tier::{ExpertHeat, ExpertTierStats};
 use self::tokenizer::Tokenizer;
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
-use crate::request::UnifiedRequest;
+use crate::request::{AgentResponseStream, PromptCacheUsage, TokenUsage, UnifiedRequest};
 use crate::types::{MessageContentBlock, ProviderEndpoint};
 
 /// Message shared by `CucaClientBuilder::build` and `dispatch_local` when the
@@ -1529,6 +1529,7 @@ struct Loaded {
     format: ChatFormat,
     context_length: usize,
     kv_cache_bytes: u64,
+    file_bytes: u64,
     tiers: Option<Arc<model::tier::TierShared>>,
     serving: Arc<engine::ServingCounters>,
     sampling: SamplingConfig,
@@ -1555,6 +1556,8 @@ struct LocalModelInner {
     /// Layers on the GPU and in all when the model runs split over the CPU
     /// and the GPU ([`LocalModelConfig::gpu_layers`]).
     layer_split: Option<(usize, usize)>,
+    /// Size of the GGUF file, see [`LocalModel::weights_file_bytes`].
+    file_bytes: u64,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -1694,7 +1697,9 @@ impl DraftStats {
 }
 
 /// A snapshot of the engine's scheduler and K/V pools, see
-/// [`LocalModel::serving_stats`].
+/// [`LocalModel::serving_stats`]. Fields named `*_ns`, `*_rows`, `*_tokens` and
+/// the counts of steps, admissions and preemptions are totals since load:
+/// subtract two snapshots to get a rate over the time between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub struct ServingStats {
@@ -1703,11 +1708,21 @@ pub struct ServingStats {
     /// Requests admitted to the engine but waiting for a slot or for K/V
     /// blocks (including a request preempted and put back in the queue).
     pub waiting: usize,
+    /// [`BatchingConfig::max_sequences`] of this model: the most requests
+    /// that run at once. `waiting > 0` with `running == max_sequences` means
+    /// requests queue for a slot.
+    pub max_sequences: usize,
     /// Free blocks in the full-attention pool (or the first pool of a model
     /// without one).
     pub free_blocks: usize,
     /// Unreferenced blocks the prefix store keeps in that pool.
     pub cached_blocks: usize,
+    /// Blocks in that pool some running sequence references.
+    pub used_blocks: usize,
+    /// All blocks of that pool (`free + cached + used`), fixed at load. A
+    /// cached block is evictable, so the pool's pressure is
+    /// `used_blocks / total_blocks`.
+    pub total_blocks: usize,
     /// Bytes of recurrent-state snapshots the prefix store keeps (hybrid
     /// models; zero for the others).
     pub snapshot_bytes: u64,
@@ -1721,6 +1736,23 @@ pub struct ServingStats {
     /// Rows (tokens) those steps processed since load; `batched_rows > steps`
     /// means steps carried several rows.
     pub batched_rows: u64,
+    /// The part of `batched_rows` that were prompt rows (prefill chunks); the
+    /// rest are decode and speculative-verification rows.
+    pub prefill_rows: u64,
+    /// Tokens generated since load (reasoning tokens included), one per
+    /// emitted token whatever the number of rows that computed them.
+    pub generated_tokens: u64,
+    /// Requests admitted to the engine for the first time since load.
+    pub admissions: u64,
+    /// Total nanoseconds those requests waited between dispatch and their
+    /// first admission; divide by `admissions` for the mean wait.
+    pub queue_wait_ns: u64,
+    /// Total nanoseconds the forward passes of all steps took.
+    pub step_ns: u64,
+    /// Nanoseconds the last forward pass took (`0` before the first).
+    pub last_step_ns: u64,
+    /// Rows of the last forward pass.
+    pub last_step_rows: usize,
 }
 
 /// How the engine serves concurrent requests: a step scheduler that runs the
@@ -1818,6 +1850,23 @@ impl LocalModel {
     /// one per cached snapshot, none of it counted here.
     pub fn kv_cache_bytes(&self) -> u64 {
         self.inner.kv_cache_bytes
+    }
+
+    /// Size in bytes of the GGUF file the model was loaded from (the
+    /// converted or merged one for a checkpoint or split source): the
+    /// footprint of the weights, up to what the engine leaves out (Gemma 4's
+    /// per-layer embeddings stay on disk) and what a GPU re-encodes
+    /// (requantized dtypes, `f32` upload of 16-bit weights). `0` when the
+    /// file could not be sized.
+    pub fn weights_file_bytes(&self) -> u64 {
+        self.inner.file_bytes
+    }
+
+    /// The context length the model runs with: the most tokens of prompt plus
+    /// completion one request may use ([`LocalModelConfig::context_length`],
+    /// resolved against the model's own maximum).
+    pub fn context_length(&self) -> usize {
+        self.inner.context_length
     }
 
     /// The sampling parameters a request that sets none runs with, every field
@@ -1958,6 +2007,7 @@ impl LocalModel {
                         let loaded = Loaded {
                             context_length: engine.context_length(),
                             kv_cache_bytes: engine.kv_cache_bytes(),
+                            file_bytes: engine.file_bytes(),
                             tiers: engine.expert_tiers(),
                             serving: engine.serving_counters(),
                             sampling: engine.sampling().config(),
@@ -1991,6 +2041,7 @@ impl LocalModel {
                     format: loaded.format,
                     context_length: loaded.context_length,
                     kv_cache_bytes: loaded.kv_cache_bytes,
+                    file_bytes: loaded.file_bytes,
                     sampling: loaded.sampling,
                     draft_stats,
                     serving: loaded.serving,
@@ -2460,6 +2511,58 @@ impl Stream for LocalStream {
     }
 }
 
+/// One request running on a [`LocalModel`], from [`LocalModel::generate`]: a
+/// stream of content blocks. Dropping it stops the request.
+pub struct LocalGeneration {
+    stream: AgentResponseStream,
+    metadata: ResponseMetadataHandle,
+}
+
+impl Stream for LocalGeneration {
+    type Item = Result<MessageContentBlock, CucaError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.stream.as_mut().poll_next(cx)
+    }
+}
+
+impl LocalGeneration {
+    /// What the engine reported for this request: token usage, prefix reuse,
+    /// the finish reason and the wait for admission. The usage and the finish
+    /// reason are set when the stream ends, so read it after the stream
+    /// yielded `None`; the call takes the values, a second call reports
+    /// nothing.
+    pub fn report(&self) -> GenerationReport {
+        let metadata = self.metadata.take();
+        GenerationReport {
+            usage: metadata.token_usage,
+            prompt_cache: metadata.prompt_cache_usage,
+            finish_reason: metadata.finish_reason,
+            queue_secs: metadata.queue_secs,
+        }
+    }
+}
+
+/// What the engine reported about one finished request, see
+/// [`LocalGeneration::report`]. A field is `None` when the request never got
+/// that far (it failed or was dropped while queued).
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[non_exhaustive]
+pub struct GenerationReport {
+    /// Exact prompt and completion token counts.
+    pub usage: Option<TokenUsage>,
+    /// `read_tokens` prompt tokens came from the prefix store (a multiple of
+    /// 16), `write_tokens` were prefilled.
+    pub prompt_cache: Option<PromptCacheUsage>,
+    /// `"stop"` (end-of-generation token or a stop string) or `"length"` (the
+    /// token budget, `max_tokens` or the context, ran out).
+    pub finish_reason: Option<&'static str>,
+    /// Seconds from dispatch to the first admission to the engine: the wait
+    /// for a free sequence slot and for K/V blocks, plus the engine thread's
+    /// own queue. Time spent preempted afterwards is not included.
+    pub queue_secs: Option<f64>,
+}
+
 impl CucaClient {
     /// Dispatch a unified request to the in-process engine.
     ///
@@ -2481,7 +2584,37 @@ impl CucaClient {
         let model = self
             .local_model()
             .ok_or_else(|| CucaError::Config(MODEL_REQUIRED.into()))?;
-        let inner = &model.inner;
+        model.dispatch(req).await
+    }
+}
+
+impl LocalModel {
+    /// Run one request on the engine without a [`CucaClient`]: the stream of
+    /// content blocks, plus a [`GenerationReport`] once it ends. This is the
+    /// path for a caller that serves many requests and needs per-request
+    /// timings and the finish reason (`CucaClient` reports neither); it runs
+    /// no plugin hooks and keeps no copy of the blocks.
+    ///
+    /// Dropping the returned [`LocalGeneration`] stops the request: the
+    /// engine ends it at its next step and keeps its work in the prefix
+    /// store.
+    ///
+    /// # Errors
+    ///
+    /// The errors of `CucaClient::generate_stream` for the local provider:
+    /// [`CucaError::Config`] for an invalid `temperature` or `top_p`,
+    /// [`CucaError::Provider`] when the request cannot be rendered (an image
+    /// block), the prompt has `context_length` or more tokens, or the engine
+    /// has shut down. `req.model` is not used.
+    pub async fn generate(&self, req: UnifiedRequest) -> Result<LocalGeneration, CucaError> {
+        let ProviderDispatch { stream, metadata } = self.dispatch(req).await?;
+        Ok(LocalGeneration { stream, metadata })
+    }
+
+    /// The shared body of [`LocalModel::generate`] and
+    /// `CucaClient::dispatch_local`.
+    async fn dispatch(&self, req: UnifiedRequest) -> Result<ProviderDispatch, CucaError> {
+        let inner = &self.inner;
         if let Some(temperature) = req.temperature {
             check_temperature("temperature", temperature)?;
         }
@@ -2517,6 +2650,7 @@ impl CucaClient {
             stop: req.stop,
             events,
             metadata: metadata.clone(),
+            queued_at: std::time::Instant::now(),
         };
         inner.jobs.send(job).await.map_err(|_| {
             CucaError::provider(ProviderEndpoint::Local, "local engine has shut down")

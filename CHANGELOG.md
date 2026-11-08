@@ -2,6 +2,56 @@
 
 ## Unreleased
 
+### Added
+
+- `server` feature and the `cuca` binary (`src/bin/cuca.rs`, `required-features = ["server"]`) with
+  `cuca serve`: an OpenAI-compatible HTTP server over `provider-local`, as vLLM and llama.cpp's
+  server speak it. It loads one or more models concurrently (`--model [name=]source`, a preset, a
+  GGUF path or Hugging Face file, a checkpoint, `--config` TOML `[[model]]` tables, global
+  `--device`, `--context-length`, `--batching`, `--experts`, `--gpu-layers`, `--cache-dir`) and serves
+  `GET /health` (503 until every model is ready), `/version`, `/v1/models` (with `max_model_len`),
+  `POST /v1/chat/completions` (text, reasoning, tools, SSE with `include_usage`, exact usage with
+  cached prompt tokens, `finish_reason` `stop`, `length` or `tool_calls`) and `/metrics`.
+  Parameters the engine cannot honour (`n` above 1, `logprobs`, penalties, `logit_bias`,
+  `response_format`, image parts) are a 400 naming the field; `/v1/completions` is not served.
+  `--api-key` (or `CUCA_API_KEY`) requires a bearer key on every route but `/health`. Every request has an
+  `x-request-id`, a tracing span and an access log line (`--log-format pretty|json`, `--log-level`).
+  A client disconnect stops the generation. Library entry points are in `cuca::server`
+  (`serve`, `ServerConfig`, `ModelSpec`, `ServerError`).
+- `cuca balance`: a load balancer over several `cuca serve` instances. Routing policies are
+  `prefix-affinity` (default: rendezvous hashing of the model and the prompt prefix, with a fall back
+  to the least-loaded upstream above `2 * min_score + 2`), `least-loaded` and `round-robin`. Upstreams
+  are polled for `/health`, `/v1/models` and the stats API; a connect error or a 5xx before the first
+  byte ejects an upstream at once; requests retry at most twice on a connect error or a 503 before any
+  body byte. Responses stream through unchanged, a client disconnect reaches the upstream, and the
+  balancer serves `/health`, `/v1/models` (union), `/metrics` and its own stats API.
+- `cuca tui` (`server-tui` feature, `ratatui` and `crossterm`): a live terminal view of a server or a
+  balancer with resources, latency percentiles, the ranked reasons for the latency and a model or
+  upstream list; Enter drills into an upstream's own view.
+- Stats API (`--stats-api`): `GET /cuca/v1/stats` and `GET /cuca/v1/stats/stream` (SSE, one snapshot per
+  second, `?interval_ms=` 250 to 10000) serve a `StatsSnapshot` (`cuca::server::stats`, serde
+  types shared by the balancer and the TUI): node identity, per-model engine state, K/V pool, rates,
+  memory, windowed latency percentiles, requests, the machine, ranked `Diagnosis` entries with
+  evidence, and for a balancer the upstreams with their nested snapshots. Diagnosis causes cover
+  queue saturation, K/V pressure, preemptions, prefill, batching, step time growth, CPU, memory
+  paging, VRAM, GPU, disk reads and slow clients, and for a balancer no healthy upstream, a down,
+  saturated or slow upstream and load imbalance.
+- `GET /metrics`: hand-written Prometheus text with per-model request counters by status, TTFT,
+  inter-token, end to end and queue histograms, token counters, engine gauges and counters, and the
+  machine's CPU, memory, swap and paging, disk and GPU series; the balancer exports its own
+  `cuca_balancer_*` series.
+- System sampler (`cuca::server::sysmon`): one thread samples CPU, RAM, swap and paging rates, disks,
+  this process and GPUs every second (`sysinfo`; WMI and the registry on Windows; `sysfs`, `fdinfo`
+  and NVML on Linux; `ioreg` on macOS). Only the Windows sampler has run; the Linux and macOS
+  samplers are compile-checked.
+- `provider-local`: `LocalModel::generate` runs one request without a `CucaClient` and returns a
+  `LocalGeneration` stream whose `report()` is a `GenerationReport` (exact `usage`, `prompt_cache`,
+  `finish_reason` `stop` or `length`, `queue_secs`). `LocalModel::context_length` and
+  `weights_file_bytes` are new accessors.
+- `ServingStats` gains `max_sequences`, `used_blocks`, `total_blocks`, `prefill_rows`,
+  `generated_tokens`, `admissions`, `queue_wait_ns`, `step_ns`, `last_step_ns` and `last_step_rows`,
+  all atomics on the engine thread.
+
 ## 0.7.0 - 2026-11-07
 
 ### Added

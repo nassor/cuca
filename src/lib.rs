@@ -10,6 +10,11 @@
 //! [`plugins`]) run as pipeline hooks on every request. Services (`service-*`,
 //! module [`services`]) are driven by direct method calls and never implement
 //! [`CucaPlugin`](plugin::CucaPlugin).
+//!
+//! With the `server` feature, the `server` module and the `cuca` binary serve
+//! the in-process local engine over an OpenAI-compatible HTTP API (`cuca
+//! serve`), balance several such servers (`cuca balance`) and, with
+//! `server-tui`, show either live in a terminal (`cuca tui`).
 
 #![forbid(unsafe_code)]
 #[cfg(not(any(
@@ -49,6 +54,9 @@ pub mod client;
 
 /// Provider adapter layer: per-provider dispatch implementations.
 pub(crate) mod provider;
+
+#[cfg(feature = "server")]
+pub mod server;
 
 /// Canonical JSON encoding for `serde_json::Value` leaves carried inside
 /// postcard-encoded storage records, digest input, and the `cuca-export`
@@ -126,10 +134,10 @@ pub use crate::plugins::web_search::{
 #[cfg(feature = "provider-local")]
 pub use crate::provider::local::{
     BatchingConfig, ConvertConfig, DownloadProgress, DownloadProgressCallback, DraftStats,
-    DrafterSource, ExpertHeat, ExpertPlacement, ExpertTierStats, ExpertTiers, GpuAdapter,
-    LocalCapabilities, LocalDevice, LocalModel, LocalModelConfig, ModelPart, ModelPreset,
-    ModelSource, ModelTemplate, PresetPart, PresetTemplate, SamplingConfig, ServingStats,
-    WeightQuant,
+    DrafterSource, ExpertHeat, ExpertPlacement, ExpertTierStats, ExpertTiers, GenerationReport,
+    GpuAdapter, LocalCapabilities, LocalDevice, LocalGeneration, LocalModel, LocalModelConfig,
+    ModelPart, ModelPreset, ModelSource, ModelTemplate, PresetPart, PresetTemplate, SamplingConfig,
+    ServingStats, WeightQuant,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,

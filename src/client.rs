@@ -91,6 +91,12 @@ pub(crate) struct ResponseMetadata {
     pub(crate) prompt_cache_usage: Option<PromptCacheUsage>,
     /// Provider token usage.
     pub(crate) token_usage: Option<TokenUsage>,
+    /// Why generation ended, `"stop"` or `"length"` (`provider-local` only).
+    #[cfg(feature = "provider-local")]
+    pub(crate) finish_reason: Option<&'static str>,
+    /// Seconds the request waited for admission (`provider-local` only).
+    #[cfg(feature = "provider-local")]
+    pub(crate) queue_secs: Option<f64>,
 }
 
 impl ResponseMetadataHandle {
@@ -165,6 +171,24 @@ impl ResponseMetadataHandle {
             .lock()
             .map(|mut guard| std::mem::take(&mut *guard))
             .unwrap_or_default()
+    }
+
+    /// Record why generation ended (`"stop"` or `"length"`); read by
+    /// `LocalGeneration::report`, so only the `provider-local` engine calls it.
+    #[cfg(feature = "provider-local")]
+    pub(crate) fn set_finish_reason(&self, reason: &'static str) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.finish_reason = Some(reason);
+        }
+    }
+
+    /// Record the seconds the request waited for admission to the engine;
+    /// read by `LocalGeneration::report`.
+    #[cfg(feature = "provider-local")]
+    pub(crate) fn set_queue_secs(&self, secs: f64) {
+        if let Ok(mut guard) = self.0.lock() {
+            guard.queue_secs = Some(secs);
+        }
     }
 }
 

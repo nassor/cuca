@@ -46,6 +46,8 @@ features = [
     "service-scheduler",
     "service-speculative",
     "service-vector-store",
+    "server",
+    "server-tui",
 ]
 
 # The provider gate in lib.rs fails the plain lib build cargo performs for the
@@ -176,6 +178,18 @@ service-speculative = ["dep:tokio", "dep:tokio-stream"]
 # src/plugins/memory/mod.rs, so plugin-memory is a hard dependency; wide is the
 # feature-owned SIMD kernel dependency for the retrieval scan.
 service-vector-store = ["plugin-memory", "dep:wide"]
+# server: the `cuca` binary's model server (src/server/): an OpenAI-compatible HTTP API
+# (axum), the stats API, Prometheus metrics and system sampling over the in-process
+# local engine. `sysinfo` (CPU/RAM/disk/process), `nvml-wrapper` (NVIDIA, loaded at run
+# time, absent driver is a soft failure) and `wmi` (Windows GPU counters) feed
+# `server::sysmon`. getrandom makes request ids; toml reads `--config`.
+server = [
+    "provider-local", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber",
+    "dep:sysinfo", "dep:nvml-wrapper", "dep:wmi", "dep:winreg", "dep:toml", "dep:getrandom", "dep:tokio-stream",
+    "tokio/net", "tokio/rt-multi-thread", "tokio/signal", "tokio/io-util",
+]
+# server-tui: the real-time terminal UI over the stats API (built after the server).
+server-tui = ["server", "dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 bytes = "1"
@@ -224,6 +238,19 @@ unicode-general-category = { version = "1", optional = true }
 burn = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune", "extension", "cubecl"] }
 cubecl = { version = "0.11", optional = true, default-features = false, features = ["stdlib"] }
 burn-cubecl = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune"] }
+# server: HTTP framework, CLI, logging and system sampling (see the `server` feature).
+axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1", "json", "query", "matched-path"] }
+clap = { version = "4", optional = true, features = ["derive", "env"] }
+tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "json"] }
+sysinfo = { version = "0.40", optional = true, default-features = false, features = ["system", "disk"] }
+nvml-wrapper = { version = "0.13", optional = true }
+toml = { version = "1", optional = true }
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", optional = true }
+
+[target.'cfg(windows)'.dependencies]
+wmi = { version = "0.18", optional = true, default-features = false }
+winreg = { version = "0.56", optional = true }
 
 # Test-only deps for the integration suite: `ctor` runs the `--mcp-echo-server`
 # interceptor in tests/plugin_mcp.rs before libtest's main (that test binary
@@ -429,3 +456,9 @@ required-features = ["provider-llamacpp", "plugin-web-search"]
 name = "vector_store"
 harness = false
 required-features = ["provider-openai", "service-vector-store"]
+
+# The `cuca` binary: the model server (`cuca serve`).
+[[bin]]
+name = "cuca"
+path = "src/bin/cuca.rs"
+required-features = ["server"]

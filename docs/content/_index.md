@@ -87,6 +87,7 @@ No backend and no dependency is implicit. `reqwest`, `tokio`, `wasmtime`, `rmcp`
 - [Plugins](@/plugins/_index.md): twelve pipeline capabilities, each with its feature flag, entry type, hooks, config defaults and caps.
 - [Services](@/services/_index.md): seven explicit-call capabilities, driven by direct method calls instead of hooks.
 - [How-to guides](@/guides/other-openai-server.md): point the client at another server, write a plugin, run the live suite.
+- [Server](@/server/_index.md): `cuca serve`, `cuca balance` and `cuca tui`, an OpenAI-compatible endpoint over the in-process engine with metrics and a live terminal view.
 - [Reference](@/reference/features.md): the feature matrix, error types, environment variables and the public API surface.
 - Rustdoc holds signatures, field docs and generic bounds for each item.
 
