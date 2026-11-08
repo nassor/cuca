@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.7.0 - 2026-11-07
+
 ### Added
 
 - `UnifiedRequest` has the per request fields `top_p`, `top_k`, `seed` and `stop` (`set_top_p`,
