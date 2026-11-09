@@ -26,7 +26,7 @@ The model runs on the CPU unless `LocalModelConfig::device` selects a GPU. A GPU
 | `provider-local-vulkan` | Vulkan through wgpu, SPIR-V shaders | C compiler; `rc.exe` on Windows |
 | `provider-local-metal` | Metal through wgpu, MSL shaders | C compiler; `rc.exe` on Windows; runs on Apple only |
 | `provider-local-cuda` | CUDA | prebuilt LLVM, downloaded on the first build |
-| `provider-local-rocm` | ROCm (HIP) | the same LLVM download; Linux only |
+| `provider-local-rocm` | ROCm (HIP) | the same LLVM download; Linux and Windows |
 
 The GPU drivers are system libraries loaded at runtime, the Vulkan loader for example. `Cargo.toml` leaves `provider-local-cuda` and `provider-local-rocm` out of the docs.rs feature list because docs.rs builds have no network for the LLVM download.
 
@@ -172,6 +172,26 @@ loaded on Vulkan(Default): 17 of 35 layers on the GPU (layers 18 to 34), layers 
 - It composes with batching and with `gpu_layers`: the GPU layers host their experts and the CPU layers already compute theirs from RAM.
 - It fails with `CucaError::Config` on a CPU device, with `shards`, and on a model without experts.
 
+## ROCm on Windows
+
+`provider-local-rocm` builds on Windows and runs on the RX 9070 XT (gfx1201) with the HIP runtime of an AMD driver, but only part of what the engine does is verified on it. CubeCL loads `amdhip64.dll` and `hiprtc.dll` by those names at run time, and compiles kernels with its own LLVM, which needs the AMD device libraries (`ocml.bc`). The Adrenalin driver (32.0.32015.12012) ships `amdhip64_7.dll` in `System32` and no `hiprtc`; the HIP SDK installer needs administrator rights. The run below used the `rocm_sdk_core` wheel (7.14.0a20260612, from `https://rocm.nightlies.amd.com/v2/gfx120X-all/`) unpacked into a folder, with `amdhip64_7.dll` copied to `amdhip64.dll` and `hiprtc0714.dll` to `hiprtc.dll`.
+
+```powershell,name=Windows (PowerShell): run on ROCm
+$sdk = "C:\rocm\_rocm_sdk_core"
+$env:PATH = "$sdk\bin;" + $env:PATH
+$env:HIP_PATH = "$sdk\bin"
+$env:HIP_DEVICE_LIB_PATH = "$sdk\lib\llvm\amdgcn\bitcode"
+$env:CUCA_LOCAL_DEVICE = "rocm:1"
+cargo run --release --no-default-features --features provider-local-rocm --example local_model
+```
+
+- The bin directory must be on `PATH`, because `amdhip64.dll` imports `rocm_kpack.dll` from its own folder and the loader does not search there. Without it, or without the libraries, the load fails with `device Rocm(1): 0 such device(s) found`, whose message now names the three variables.
+- HIP numbers the Ryzen's integrated GPU 0 (gfx1036) and the RX 9070 XT 1, so the device is `rocm:1`.
+- Kernels allocate their outputs contiguously. HIP pads the rows of an ordinary tensor to the device's pitch, which the kernels' linear indexing ignores; before the fix 21 of the 37 `model::gpu` tests failed with wrong values.
+- `CUCA_LOCAL_DEVICE=rocm:1 cargo test --release --no-default-features --features provider-local-rocm --lib model::gpu -- --test-threads=1`: 36 pass and `gpu_moe_one_row_experts_match_single_tokens` fails (row 3: -0.00609 against -0.00267). The first run takes 20 minutes because every kernel compiles.
+- `qwen3-0.6b-q8_0`, thinking off, 23 tokens: the reply is byte for byte the Vulkan reply. First block after 16.5 s (8.4 s on Vulkan), 27.1 tokens/s after it (24.3 on Vulkan). The first process to run it took 247 s to the first block.
+- `deepseek41`, host-tiered `tiered:ram=85g,threads=32`: the 16-token oracle check passes (quantizers off: top-1 equal at 15 of 16 positions, KL 5.6e-8; on: 13 of 16, KL 8.6e-8), but generation is wrong. `What is 9 * 8?` with thinking on produced unrelated text after 475.6 s to the first block (3.48 tokens/s after it, 11.0 GiB of device memory), and the 21-token `Paris` prompt produced unrelated characters. The cause is not found, so `deepseek41` on ROCm is not usable.
+
 ## Measured speed
 
 Machine: Ryzen 9 9950X3D2, RX 9070 XT with 15.9 GiB, Windows, release build with native CPU flags. Test: `perf_long_prompt` in `tests/provider_local.rs`, a prompt of about 1,100 tokens (1,108 for Gemma 4, 1,102 for Phi 4 mini) and 96 generated tokens, with the prefix cache bypassed so each round prefills the whole prompt. 14.6 GiB of the card was free before each run. Prefill is the time to the first token in rounds 1 and 2; round 0 compiles kernels. Decode is tokens per second after the first token. Ranges are the spread over the measured rounds. Adapter memory is the peak of the run.
@@ -233,7 +253,7 @@ Unit tests on tiny random models:
 Compile-checked only:
 
 - Metal: compiled in the CI jobs on Linux that use the `ALL_NO_LLVM` feature list. No run on Apple hardware.
-- CUDA and ROCm: the CI job `local_gpu_llvm` runs `cargo check` for both. The NCCL all-reduce of tensor parallelism has never run.
+- CUDA and ROCm: the CI job `local_gpu_llvm` runs `cargo check` for both. ROCm also ran on Windows, see [ROCm on Windows](#rocm-on-windows). The NCCL all-reduce of tensor parallelism has never run.
 
 Not run:
 

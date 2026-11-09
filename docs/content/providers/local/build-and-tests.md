@@ -22,7 +22,7 @@ weight = 13
 
 - `provider-local` needs a C compiler. `candle-core` 0.11 depends on `tokenizers[onig]`, so the dependency tree compiles the C crate `onig_sys`. cuca names `tokenizers` itself only for the Engram token-map normalizers of the DeepSeek-V4.1 converter; the engine's tokenizer, the chat templates and the engine are Rust. `sysinfo` answers the converter's free-space check of its output volume, since the crate forbids `unsafe` and the standard library has no such call.
 - Every GPU feature needs a C compiler as well, because CubeCL's runtime pulls an embedded store (`turso`) that builds C (`simsimd`, `aegis`). On Windows a dependency's build script runs the SDK resource compiler, `rc.exe` (`windres` on the GNU target).
-- `provider-local-cuda` and `provider-local-rocm` download and link a prebuilt LLVM on the first build, which needs the network once. ROCm builds on Linux only. docs.rs and the CI all-features jobs leave both out; one CI job, `local_gpu_llvm`, checks them alone.
+- `provider-local-cuda` and `provider-local-rocm` download and link a prebuilt LLVM on the first build, which needs the network once. ROCm builds on Linux and on Windows. docs.rs and the CI all-features jobs leave both out; one CI job, `local_gpu_llvm`, checks them alone.
 - The crate has no default provider, so every `cargo` command that builds the engine names its feature.
 - candle selects its quantized SIMD kernels when it compiles: a generic build, without `-C target-cpu=native`, is several times slower.
 

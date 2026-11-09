@@ -60,7 +60,7 @@ Five features extend `provider-local`. None is a provider.
 - `provider-local-gpu` is the shared GPU engine. It selects no backend by itself; each backend feature enables it.
 - `provider-local` alone runs the model on the CPU.
 - `LocalDevice` and `GpuAdapter` exist in every `provider-local` build. Selecting a backend whose feature is off makes `LocalModel::load` fail with `CucaError::Config`.
-- `provider-local-cuda` and `provider-local-rocm` link a prebuilt LLVM that `tracel-llvm-bundler` downloads on the first build, so they need network access once. ROCm builds on Linux only. `provider-local-vulkan` and `provider-local-metal` need no download.
+- `provider-local-cuda` and `provider-local-rocm` link a prebuilt LLVM that `tracel-llvm-bundler` downloads on the first build, so they need network access once. ROCm builds on Linux and on Windows. `provider-local-vulkan` and `provider-local-metal` need no download.
 
 ## Plugin features
 

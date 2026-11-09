@@ -48,7 +48,7 @@ use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn::tensor::DType;
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_dtype;
+use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
 /// `1 / 448` rounded to `f32`: the FP8 scale divides `amax` by the largest
@@ -280,7 +280,12 @@ impl QdqKernels for CubeBackend {
         // The kernels index the buffer linearly.
         let x = into_contiguous(x);
         let total = x.shape().num_elements();
-        let out = empty_device_dtype(x.client.clone(), x.device.clone(), x.shape(), DType::F32);
+        let out = empty_device_contiguous_dtype(
+            x.client.clone(),
+            x.device.clone(),
+            x.shape(),
+            DType::F32,
+        );
         let blocks = total / call.block;
         if blocks == 0 {
             return out;

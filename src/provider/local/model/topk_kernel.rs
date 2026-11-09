@@ -69,7 +69,7 @@ use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn::tensor::{DType, Int, Shape, Tensor};
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_dtype;
+use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
 use self::kernels::{block_scores_kernel, index_scores_kernel, select_kernel};
@@ -688,7 +688,7 @@ impl TopkKernels for CubeBackend {
         let cand = into_contiguous(cand);
         let max_blocks = tables.shape().dims::<2>()[1];
         let client = iq.client.clone();
-        let out = empty_device_dtype(
+        let out = empty_device_contiguous_dtype(
             client.clone(),
             iq.device.clone(),
             Shape::new([call.rows, call.width]),
@@ -742,7 +742,7 @@ impl TopkKernels for CubeBackend {
         let scores = into_contiguous(scores);
         let row_pos = into_contiguous(row_pos);
         let client = scores.client.clone();
-        let out = empty_device_dtype(
+        let out = empty_device_contiguous_dtype(
             client.clone(),
             scores.device.clone(),
             Shape::new([call.rows, call.blocks]),
@@ -770,7 +770,7 @@ impl TopkKernels for CubeBackend {
     fn index_select(scores: CubeTensor, call: SelectCall) -> CubeTensor {
         let scores = into_contiguous(scores);
         let client = scores.client.clone();
-        let out = empty_device_dtype(
+        let out = empty_device_contiguous_dtype(
             client.clone(),
             scores.device.clone(),
             Shape::new([call.rows, call.k]),

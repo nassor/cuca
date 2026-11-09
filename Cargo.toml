@@ -112,7 +112,7 @@ provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja
 # compiler (rc.exe; windres on GNU) in a build script.
 # cuda/rocm link a prebuilt LLVM that tracel-llvm-bundler downloads on first build
 # (network required; excluded from docs.rs and from the CI all-features jobs; rocm
-# runs on Linux only).
+# also builds and runs on Windows, see docs/content/providers/local/gpu.md).
 provider-local-gpu = ["provider-local", "dep:burn", "dep:burn-cubecl", "dep:cubecl"]
 provider-local-vulkan = ["provider-local-gpu", "burn/vulkan"]
 provider-local-metal = ["provider-local-gpu", "burn/metal"]

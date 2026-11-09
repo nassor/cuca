@@ -403,8 +403,13 @@ fn require_index(
 ) -> Result<(), CucaError> {
     let found = Device::enumerate(kind).into_vec().len();
     if index >= found {
+        let hint = if cfg!(feature = "provider-local-rocm") && device == LocalDevice::Rocm(index) {
+            "; ROCm loads amdhip64 and hiprtc at run time (ROCM_PATH or HIP_PATH, and the HIP bin directory on PATH on Windows) and needs the device libraries (HIP_DEVICE_LIB_PATH, the directory with ocml.bc)"
+        } else {
+            ""
+        };
         return Err(err(format!(
-            "device {device:?}: {found} such device(s) found (missing driver or GPU?)"
+            "device {device:?}: {found} such device(s) found (missing driver or GPU?){hint}"
         )));
     }
     Ok(())

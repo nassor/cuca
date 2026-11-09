@@ -951,8 +951,8 @@ pub enum LocalDevice {
     Metal(GpuAdapter),
     /// burn's CUDA backend on the GPU with this index (`provider-local-cuda`).
     Cuda(usize),
-    /// burn's ROCm (HIP) backend on the GPU with this index, Linux only
-    /// (`provider-local-rocm`).
+    /// burn's ROCm (HIP) backend on the GPU with this index, on Linux and
+    /// Windows (`provider-local-rocm`).
     Rocm(usize),
 }
 
@@ -1834,7 +1834,7 @@ struct LocalModelInner {
 /// feature compiles C through CubeCL's dependencies (as `provider-local`
 /// already does for candle) and, on Windows, runs the SDK resource compiler;
 /// `provider-local-cuda` and `provider-local-rocm` also download and link a
-/// prebuilt LLVM on the first build (ROCm on Linux only). The first forward
+/// prebuilt LLVM on the first build (ROCm on Linux and Windows). The first forward
 /// pass of each new input shape on a GPU is slow while CubeCL autotunes and
 /// compiles its kernels.
 #[derive(Clone)]

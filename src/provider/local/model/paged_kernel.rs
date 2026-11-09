@@ -51,7 +51,7 @@ use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn::tensor::{DType, Shape};
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_dtype;
+use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
 use super::paged::BLOCK_SIZE;
@@ -243,13 +243,13 @@ impl PagedKernels for CubeBackend {
         // depends on the table width alone.
         let splits = max_blocks.clamp(1, MAX_SPLITS);
         let client = q.client.clone();
-        let part = empty_device_dtype(
+        let part = empty_device_contiguous_dtype(
             client.clone(),
             q.device.clone(),
             Shape::new([rows * n_head * splits * (dv + 2)]),
             DType::F32,
         );
-        let out = empty_device_dtype(
+        let out = empty_device_contiguous_dtype(
             client.clone(),
             q.device.clone(),
             Shape::new([rows, n_head, dv]),

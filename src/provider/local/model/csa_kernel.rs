@@ -82,7 +82,7 @@ use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn::tensor::{DType, Shape};
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_dtype;
+use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
 use super::paged::BLOCK_SIZE;
@@ -896,7 +896,7 @@ impl CsaKernels for CubeBackend {
         let [rows, row_len] = x.shape().dims::<2>();
         let total = rows * row_len;
         let client = x.client.clone();
-        let out = empty_device_dtype(
+        let out = empty_device_contiguous_dtype(
             client.clone(),
             x.device.clone(),
             Shape::new([rows, row_len]),
@@ -960,7 +960,7 @@ impl CsaKernels for CubeBackend {
         let right = into_contiguous(right);
         let total = call.rows * call.width;
         let client = kv.client.clone();
-        let out = empty_device_dtype(
+        let out = empty_device_contiguous_dtype(
             client.clone(),
             kv.device.clone(),
             Shape::new([call.rows, call.width]),
@@ -1013,7 +1013,7 @@ impl CsaKernels for CubeBackend {
         let cmp_blocks = cmp_tables.shape().dims::<2>()[1];
         let cmp_width = cmp.shape().dims::<2>()[1];
         let client = q.client.clone();
-        let out = empty_device_dtype(
+        let out = empty_device_contiguous_dtype(
             client.clone(),
             q.device.clone(),
             Shape::new([rows, n_head * hd]),
@@ -1021,7 +1021,7 @@ impl CsaKernels for CubeBackend {
         );
         let dim = CubeDim::new_1d(LANES as u32);
         if call.split {
-            let part = empty_device_dtype(
+            let part = empty_device_contiguous_dtype(
                 client.clone(),
                 q.device.clone(),
                 Shape::new([rows * n_head * n_chunks * (hd + 2)]),

@@ -124,6 +124,14 @@
   of up to 4 per matrix (layers that store their experts expert after expert; the bytes, counters and
   budgets are the single reads'). Cold expert reads from the SSD rise from 3.41 to 3.50 GB/s.
 
+### Fixed
+
+- `provider-local-*`: the GPU kernels allocate their outputs contiguously (`empty_device_contiguous_dtype`).
+  A HIP tensor pads its rows to the device's pitch, which the kernels' linear indexing ignored;
+  on ROCm (Windows, RX 9070 XT) 21 of 37 `model::gpu` tests failed before and 1 fails after.
+  `provider-local-rocm` builds and runs on Windows (docs: `ROCm on Windows`); a missing HIP runtime
+  now names `ROCM_PATH`/`HIP_PATH` and `HIP_DEVICE_LIB_PATH` in its error.
+
 ## 0.7.0 - 2026-11-07
 
 ### Added

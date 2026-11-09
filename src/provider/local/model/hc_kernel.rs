@@ -64,7 +64,7 @@ use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
 use burn::tensor::{DType, Shape};
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_dtype;
+use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
 use super::hc::coeff_len;
@@ -567,7 +567,7 @@ pub trait HcKernels: burn::backend::Backend {
 }
 
 fn f32_tensor(like: &CubeTensor, shape: Shape) -> CubeTensor {
-    empty_device_dtype(like.client.clone(), like.device.clone(), shape, DType::F32)
+    empty_device_contiguous_dtype(like.client.clone(), like.device.clone(), shape, DType::F32)
 }
 
 /// Cubes of a per-token reduction kernel: one per token.

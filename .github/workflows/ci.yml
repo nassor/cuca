@@ -63,7 +63,7 @@ jobs:
   local_gpu_llvm:
     # The only job that builds the CUDA and ROCm backends: their build scripts
     # download a prebuilt LLVM (tracel-llvm-bundler) and ROCm's HIP bindings
-    # build on Linux only.
+    # load the HIP runtime at run time, so they build on Windows too.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
