@@ -174,7 +174,25 @@ loaded on Vulkan(Default): 17 of 35 layers on the GPU (layers 18 to 34), layers 
 
 ## ROCm on Windows
 
-`provider-local-rocm` builds on Windows and runs on the RX 9070 XT (gfx1201) with the HIP runtime of an AMD driver, but only part of what the engine does is verified on it. CubeCL loads `amdhip64.dll` and `hiprtc.dll` by those names at run time, and compiles kernels with its own LLVM, which needs the AMD device libraries (`ocml.bc`). The Adrenalin driver (32.0.32015.12012) ships `amdhip64_7.dll` in `System32` and no `hiprtc`; the HIP SDK installer needs administrator rights. The run below used the `rocm_sdk_core` wheel (7.14.0a20260612, from `https://rocm.nightlies.amd.com/v2/gfx120X-all/`) unpacked into a folder, with `amdhip64_7.dll` copied to `amdhip64.dll` and `hiprtc0714.dll` to `hiprtc.dll`.
+`provider-local-rocm` builds on Windows and runs on the RX 9070 XT (gfx1201) with the HIP runtime of an AMD driver, but only part of what the engine does is verified on it. CubeCL loads `amdhip64.dll` and `hiprtc.dll` by those names at run time, and compiles kernels with its own LLVM, which needs the AMD device libraries (`ocml.bc`). The Adrenalin driver (32.0.32015.12012) ships `amdhip64_7.dll` in `System32` and no `hiprtc`, so the runtime has to come from somewhere else.
+
+The HIP SDK installer (AMD's download page, an `-install` command line) provides the same files under `C:\Program Files\AMD\ROCm\<version>\bin`, but it needs administrator rights and bundles a display driver, and it was not tried. The run below used the `rocm_sdk_core` wheel instead: a 710 MB zip that needs no administrator rights and no Python. Its file names carry the version (`amdhip64_7.dll`, `hiprtc0714.dll`), so two copies under the names CubeCL asks for are made.
+
+```powershell,name=Windows (PowerShell): install the HIP runtime without administrator rights
+$root = "C:\rocm"
+$wheel = "rocm_sdk_core-7.14.0a20260612-py3-none-win_amd64.whl"
+New-Item -ItemType Directory -Force $root | Out-Null
+curl.exe -L -o "$root\$wheel" "https://rocm.nightlies.amd.com/v2/gfx120X-all/$wheel"
+tar -xf "$root\$wheel" -C $root
+$sdk = "$root\_rocm_sdk_core"
+Copy-Item "$sdk\bin\amdhip64_7.dll" "$sdk\bin\amdhip64.dll"
+Copy-Item "$sdk\bin\hiprtc0714.dll" "$sdk\bin\hiprtc.dll"
+$env:PATH = "$sdk\bin;" + $env:PATH
+hipInfo.exe | Select-String "^device#|^Name|gcnArchName"
+Test-Path "$sdk\lib\llvm\amdgcn\bitcode\ocml.bc"
+```
+
+Expected output on the test machine: `device# 0` is `AMD Radeon(TM) Graphics` (`gfx1036`), `device# 1` is `AMD Radeon RX 9070 XT` (`gfx1201`), and `Test-Path` prints `True`. The download, unpacking and these checks took 14 s. The wheel comes from the `gfx120X-all` nightly index of the ROCm project for RDNA4 cards; nightlies are replaced over time, so keep the file, and pick the version that matches the HIP bindings in `cubecl-hip-sys` (7.14.60850 here). An index listing is at `https://rocm.nightlies.amd.com/v2/gfx120X-all/rocm-sdk-core/`; other GPU families have their own index.
 
 ```powershell,name=Windows (PowerShell): run on ROCm
 $sdk = "C:\rocm\_rocm_sdk_core"
@@ -182,8 +200,14 @@ $env:PATH = "$sdk\bin;" + $env:PATH
 $env:HIP_PATH = "$sdk\bin"
 $env:HIP_DEVICE_LIB_PATH = "$sdk\lib\llvm\amdgcn\bitcode"
 $env:CUCA_LOCAL_DEVICE = "rocm:1"
+$env:CUCA_LOCAL_MODEL = "qwen3-0.6b-q8_0"
+$env:CUCA_LOCAL_PROMPT = "Explain in two sentences what a mixture of experts model is."
+$env:CUCA_LOCAL_THINKING = "off"
+$env:RUSTFLAGS = "-C target-cpu=native"
 cargo run --release --no-default-features --features provider-local-rocm --example local_model
 ```
+
+The run prints `loaded on Rocm(1)` and then the reply, which on the test machine equals the Vulkan reply. The first process to run it took 247 s to the first block while CubeCL compiled its kernels; later processes took 16.5 s. The variables are per shell: set them again in a new one.
 
 - The bin directory must be on `PATH`, because `amdhip64.dll` imports `rocm_kpack.dll` from its own folder and the loader does not search there. Without it, or without the libraries, the load fails with `device Rocm(1): 0 such device(s) found`, whose message now names the three variables.
 - HIP numbers the Ryzen's integrated GPU 0 (gfx1036) and the RX 9070 XT 1, so the device is `rocm:1`.
