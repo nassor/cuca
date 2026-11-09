@@ -46,7 +46,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
 
-use candle_core::quantized::gguf_file::{self, Value};
+use crate::provider::local::gguf::{self, Value};
 
 pub(super) use self::bpe::byte_to_char;
 use self::bpe::{Merges, Scratch, Unknown, char_to_byte};
@@ -265,7 +265,7 @@ impl Tokenizer {
     /// for the llama3-family pres; `gemma4`: BOS forced) and
     /// `tokenizer.ggml.add_{bos,eos}_token` override them. SPM falls back to
     /// llama.cpp's default ids (BOS 1, EOS 2) when the id keys are absent.
-    pub(crate) fn from_gguf(md: &HashMap<String, gguf_file::Value>) -> Result<Self, CucaError> {
+    pub(crate) fn from_gguf(md: &HashMap<String, gguf::Value>) -> Result<Self, CucaError> {
         /// Which scheme the metadata selects.
         enum Kind {
             Spm,

@@ -40,7 +40,7 @@ Everything else below is read by `examples/`, `tests/` or unit-test fixtures in 
 | `CUCA_UPSTREAM_API_KEY` | the `cuca` binary: `balance --upstream-api-key` | none |
 | `RUST_LOG` | the `cuca` binary, as the log filter when `--log-level` is absent | `info` |
 | `CUCA_LOCAL_MODEL_PATH` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs`, the tokenizer, chat golden and eagle unit tests | none |
-| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs` | `gemma4-e2b-q4_0`; `_tiers.rs` has no default and skips without a model |
+| `CUCA_LOCAL_MODEL` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs` (the tests also accept a checkpoint alias such as `deepseek-v41-flash-1017`) | `gemma4-e2b-q4_0`; `_tiers.rs` has no default and skips without a model |
 | `CUCA_LOCAL_DOWNLOAD` | `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs` | unset |
 | `CUCA_LOCAL_CONVERT_QUANT` | `examples/local_model.rs`, `tests/provider_local.rs`, `_mtp.rs`, `_tiers.rs` | `q8_0` |
 | `CUCA_LOCAL_DEVICE` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_mtp.rs`, `_tiers.rs`, the `gpu` unit tests | `cpu` |
@@ -48,6 +48,8 @@ Everything else below is read by `examples/`, `tests/` or unit-test fixtures in 
 | `CUCA_LOCAL_EXPERTS` | `examples/local_model.rs`, `tests/provider_local.rs`, `_tiers.rs` | `resident` |
 | `CUCA_LOCAL_EXPERTS_REF` | `tests/provider_local_tiers.rs` | `resident` |
 | `CUCA_LOCAL_BATCHING` | `examples/local_model.rs`, `tests/provider_local_batch.rs` | `BatchingConfig::default()` |
+| `CUCA_LOCAL_ENGRAM` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs`, `_tiers.rs` (through `tests/local_env/mod.rs`) | `EngramCache::default()` |
+| `CUCA_LOCAL_PROMPT`, `CUCA_LOCAL_THINKING`, `CUCA_LOCAL_MAX_TOKENS`, `CUCA_LOCAL_TEMPERATURE` | `examples/local_model.rs` | `Explain CUCA in one sentence.`; thinking on; `1024`; the model's own temperature |
 | `CUCA_LOCAL_CHAT_TEMPLATE` | `examples/local_model.rs`, `tests/provider_local.rs`, `_batch.rs` | none |
 | `CUCA_LOCAL_DRAFTER_PATH` | `examples/local_model.rs`, `tests/provider_local_mtp.rs`, the eagle unit test | none |
 | `CUCA_LOCAL_DRAFTER` | `examples/local_model.rs`, `tests/provider_local_mtp.rs` | none |
@@ -60,6 +62,9 @@ Everything else below is read by `examples/`, `tests/` or unit-test fixtures in 
 | `CUCA_LOCAL_CATALOG_DIR` | the tokenizer and chat golden unit tests | `<cache dir>/huggingface` |
 | `CUCA_LOCAL_REF_CKPT`, `CUCA_LOCAL_REF_GGUF`, `CUCA_LOCAL_REF_PREFIX`, `CUCA_LOCAL_REF_TOL` | the `oracle_local` unit test (`CUCA_LOCAL_REF_TOL` also `oracle_dflash`) | none; tolerance `5e-4` |
 | `CUCA_LOCAL_DFLASH_REF` | the `oracle_dflash` unit test | none |
+| `CUCA_LOCAL_DS41_REF` | `tests/local_env/mod.rs` (`ds41_ref`, no test calls it), the DeepSeek-V4.1 oracle, hyper-connection and DSpark unit tests | none |
+| `CUCA_LOCAL_DS41_REAL`, `CUCA_LOCAL_DS41_REAL_RAM`, `CUCA_LOCAL_DS41_REAL_GPU_LAYERS`, `CUCA_LOCAL_DS41_REAL_SPEED`, `CUCA_LOCAL_DS41_REAL_DUMP` | the `real_tests` unit test of the CPU engine and the `real_model_on_the_gpu_*` tests of the GPU engine | none; RAM `90` GiB on the CPU, `85` on a GPU; the others unset |
+| `CUCA_DS41_REF_DIR`, `CUCA_DS41_TOKENIZER_JSON` | the DeepSeek-V4.1 tokenizer conversion, Engram token map and tokenizer golden unit tests | the reference copy under `.omp/local-models/ref/deepseek-v41/` |
 | `CUCA_CONVERT_PROBE` | the `convert_probe` unit test | none |
 | `CUCA_MISTRAL4_GGUF` | a `mla` unit test | none |
 | `CUCA_TOK_GGUF`, `CUCA_TOK_CASES`, `CUCA_TOK_MAX_DIFF` | the tokenizer corpus unit test | none; `CUCA_TOK_MAX_DIFF` defaults to `0` |
@@ -136,6 +141,7 @@ With none of them set, `LocalModel::load` fails with `CucaError::Config`. Downlo
 - `CUCA_LOCAL_DOWNLOAD=1` selects the default model (Gemma 4 E2B Q4_0) when neither of the two above is set. The tests compare against the literal `1`.
 - `CUCA_LOCAL_CONVERT_QUANT` is the weight precision of a converted checkpoint: `f16`, `q8_0` or `q4_0`. Default: `q8_0`.
 - `CUCA_LOCAL_CHAT_TEMPLATE` is the path of a Jinja template file whose text becomes `LocalModelConfig::chat_template`. An unreadable file fails the example or panics the test.
+- `CUCA_LOCAL_MODEL` also takes, in the tests, a checkpoint alias of `local_env::CHECKPOINT_PRESETS` that is no library preset, such as `deepseek-v41-flash-1017` (`deepseek-ai/DeepSeek-V4.1-Flash-1017`, converted once to a cached split GGUF set).
 
 ### Device and memory
 
@@ -152,6 +158,11 @@ With none of them set, `LocalModel::load` fails with `CucaError::Config`. Downlo
 - `CUCA_LOCAL_EXPERTS_REF` is the placement `tests/provider_local_tiers.rs` compares the tiered run against. Default: `resident`.
 - The library never reads these variables. Details are on [Tiered expert placement](@/providers/local/expert-tiers.md).
 
+### Engram cache
+
+- `CUCA_LOCAL_ENGRAM` sets `LocalModelConfig::engram`, parsed with `EngramCache::from_str`: any subset of `ram=<size>` (default `4g`, 1 MiB to 1 TiB) and `threads=<n>` (default `16`, 1 to 64), comma separated, for example `ram=8g,threads=32`. A model without Engram tables ignores it.
+- The library never reads this variable. Details are on [Local configuration](@/providers/local/configuration.md).
+
 ### Drafter
 
 - `CUCA_LOCAL_DRAFTER_PATH` is the path of a drafter file or checkpoint directory. It wins over `CUCA_LOCAL_DRAFTER`.
@@ -165,6 +176,7 @@ With none of them set, `LocalModel::load` fails with `CucaError::Config`. Downlo
 - `CUCA_LOCAL_PERF`, set to any value (even empty), enables the long-prompt speed scenario of `tests/provider_local.rs`. `CUCA_LOCAL_PERF_COLD`, set to any value, changes the first words of every round so no round hits the prefix cache.
 - `CUCA_LOCAL_PRINT_REPLIES`, set to any value, prints each reply as a `REPLY|...` line.
 - `CUCA_LOCAL_CONVERT_ONLY` limits the converted-checkpoint oracle test to repositories whose id contains the text.
+- `CUCA_LOCAL_PROMPT` is the request text of `examples/local_model.rs`, `CUCA_LOCAL_THINKING=off` (any case) turns reasoning off in that request, `CUCA_LOCAL_MAX_TOKENS` is its token limit and `CUCA_LOCAL_TEMPERATURE` its temperature (a number; `0` is greedy).
 
 ### Reference fixtures
 
@@ -172,6 +184,9 @@ With none of them set, `LocalModel::load` fails with `CucaError::Config`. Downlo
 - `CUCA_LOCAL_CATALOG_DIR` is the `huggingface` directory that holds the cached catalog GGUFs. Default: `<cache dir>/huggingface`. A model whose file is absent is skipped.
 - `CUCA_LOCAL_REF_CKPT` (a checkpoint directory) or `CUCA_LOCAL_REF_GGUF` (a GGUF file), with `CUCA_LOCAL_REF_PREFIX` (`<prefix>.json` and `<prefix>.bin` written by the reference script), gate the `oracle_local` parity test. `CUCA_LOCAL_REF_TOL` bounds `max |dlogit|`; default `5e-4`.
 - `CUCA_LOCAL_DFLASH_REF` is the directory the `oracle_dflash` parity test reads (`target/`, `assistant/`, `ref.json`, `ref.bin`), and it uses `CUCA_LOCAL_REF_TOL` as well.
+- `CUCA_LOCAL_DS41_REF` is the directory of the DeepSeek-V4.1 oracle dump: a tiny release-format checkpoint (`target/`), the exact float tensors and metadata (`expected/`) and the torch port's logits. The converter, hyper-connection and DSpark unit tests compare against it and print `SKIP:` without it.
+- `CUCA_LOCAL_DS41_REAL` is the directory of the real-weights streaming oracle; with `CUCA_CACHE_DIR` naming the cache that holds the converted DeepSeek-V4.1-Flash-1017 set, it gates the `real_tests` unit test of the CPU engine and the `real_model_on_the_gpu_*` tests (which also need a GPU `CUCA_LOCAL_DEVICE`). `CUCA_LOCAL_DS41_REAL_RAM` is the tiered expert RAM in GiB, default `90` on the CPU and `85` on a GPU. `CUCA_LOCAL_DS41_REAL_GPU_LAYERS=<n>` runs the last `n` layers on the GPU with a 3 GiB device tier. `CUCA_LOCAL_DS41_REAL_SPEED`, set to any value, enables the speed probes, and `CUCA_LOCAL_DS41_REAL_DUMP=<dir>` writes every position's logits.
+- `CUCA_DS41_REF_DIR` is the directory of the DeepSeek-V4.1 tokenizer files, and `CUCA_DS41_TOKENIZER_JSON` the path of its `tokenizer.json`. Both default to the reference copy under `.omp/local-models/ref/deepseek-v41/`.
 - `CUCA_CONVERT_PROBE` is `<checkpoint dir>|<output file>|<f16|q8_0|q4_0>`: the `convert_probe` unit test converts the checkpoint to that file. A malformed value panics.
 - `CUCA_MISTRAL4_GGUF` is the path of a published `mistral4` GGUF; one `mla` unit test reads its header. The eagle unit test reads `CUCA_LOCAL_MODEL_PATH` (that GGUF) and `CUCA_LOCAL_DRAFTER_PATH` (the drafter checkpoint directory).
 - `CUCA_TOK_GGUF` is a GGUF whose header supplies the tokenizer and `CUCA_TOK_CASES` a JSON array of `{"text", "ids"}` reference cases. Both are required. `CUCA_TOK_MAX_DIFF` bounds the accepted mismatches; default `0`.

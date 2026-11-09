@@ -1,0 +1,247 @@
+{#- DeepSeek-V4.1 chat template: a port of encoding/encoding.py of
+    deepseek-ai/DeepSeek-V4.1-Flash-1017 (`encode_messages` with
+    drop_thinking=True, add_default_bos_token=True and no `context`). The
+    checkpoint ships no Jinja; this text reproduces the reference prompts byte
+    for byte (the official test pairs, hand cases and fuzzed conversations).
+
+    Variables read:
+      messages          OpenAI-shaped; roles system / user / assistant / tool /
+                        latest_reminder. Assistant `tool_calls[].function.arguments`
+                        MUST be an object (not a JSON string), and the maps MUST
+                        keep their key order (it is the order of the DSML
+                        parameters).
+      tools             optional OpenAI tool list; rendered into the first system
+                        message (a leading empty system message is added when the
+                        conversation does not start with one). A `tools` list on a
+                        system message is rendered there instead (encoding.py).
+      enable_thinking   true -> thinking mode, otherwise chat mode.
+      reasoning_budget  optional: integer 1..100 or "low" / "high" / "max"
+                        (50 / 75 / 100); default "high". Only rendered in thinking mode.
+      bos_token, eos_token
+    Per-message extras honoured: tools, response_format, task, wo_eos, reasoning_content.
+    Unsupported (raises): developer role, images, tool namespaces.
+-#}
+{%- set dsml = '｜DSML｜' -%}
+{%- set tool_head = "## Tools\n\nYou have access to a set of tools to help answer the user's question. You can invoke tools by writing a \"<｜DSML｜ calls>\" block like the following:\n\n<｜DSML｜ calls>\n<｜DSML｜ invoke name=\"$TOOL_NAME\">\n<｜DSML｜ parameter name=\"$PARAMETER_NAME\" string=\"true|false\">$PARAMETER_VALUE</｜DSML｜ parameter>\n...\n</｜DSML｜ invoke>\n<｜DSML｜ invoke name=\"$TOOL_NAME2\">\n...\n</｜DSML｜ invoke>\n</｜DSML｜ calls>\n\nString parameters should be specified as is and set `string=\"true\"`. For all other types (numbers, booleans, arrays, objects), pass the value in JSON format and set `string=\"false\"`.\n\nIf thinking_mode is enabled (triggered by <think>), you MUST output your complete reasoning inside <think>...</think> BEFORE any tool calls or final response.\n\nOtherwise, output directly after </think> with tool calls or final response.\n\n### Available Tool Schemas\n\n" -%}
+{%- set tool_tail = "\n\nYou MUST strictly follow the above defined tool name and parameter schemas to invoke tool calls.\n" -%}
+{%- set task_tokens = {'action': '<｜action｜>', 'query': '<｜query｜>', 'authority': '<｜authority｜>', 'domain': '<｜domain｜>', 'title': '<｜title｜>', 'read_url': '<｜read_url｜>'} -%}
+
+{#- Text of a message content: a string, or a list of text parts joined by a blank line. The image
+    placeholder token cannot be written: this engine has no vision tower (encoding.py rejects it too). -#}
+{%- macro text_of(content) -%}
+    {%- if content is none or content is undefined -%}
+    {%- elif content is string -%}
+        {%- if '<｜deepseek_image｜>' in content -%}
+            {{- raise_exception('deepseek_v41: the image placeholder <｜deepseek_image｜> cannot appear in text (text-only engine)') -}}
+        {%- endif -%}
+        {{- content -}}
+    {%- else -%}
+        {%- for part in content -%}
+            {%- if part.type is defined and part.type != 'text' -%}
+                {{- raise_exception('deepseek_v41: only text content is supported, got a ' ~ part.type ~ ' part') -}}
+            {%- endif -%}
+            {%- if not loop.first -%}{{- '\n\n' -}}{%- endif -%}
+            {%- if part.text is string and '<｜deepseek_image｜>' in part.text -%}
+                {{- raise_exception('deepseek_v41: the image placeholder <｜deepseek_image｜> cannot appear in text (text-only engine)') -}}
+            {%- endif -%}
+            {{- part.text -}}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+
+{#- The tool prompt (render_tools) for a list of OpenAI tools. -#}
+{%- macro tools_block(tool_list) -%}
+    {{- tool_head -}}
+    {%- for t in tool_list -%}
+        {%- if t.namespace is defined and t.namespace -%}
+            {{- raise_exception('deepseek_v41: tool namespaces are not supported') -}}
+        {%- endif -%}
+        {{- t.function | tojson -}}
+        {%- if not loop.last -%}{{- '\n' -}}{%- endif -%}
+    {%- endfor -%}
+    {{- tool_tail -}}
+{%- endmacro -%}
+
+{#- Position of `id` among the ids of the tool calls (0 when absent). -#}
+{%- macro call_pos(calls, id) -%}
+    {%- set p = namespace(v=0, done=false) -%}
+    {%- for tc in calls -%}
+        {%- set tid = tc.id if (tc.id is defined and tc.id) else (tc.function.id if (tc.function.id is defined and tc.function.id) else '') -%}
+        {%- if tid and not p.done and tid == id -%}
+            {%- set p.v = loop.index0 -%}
+            {%- set p.done = true -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- p.v -}}
+{%- endmacro -%}
+
+{#- ---- reasoning effort ---- -#}
+{%- set thinking = enable_thinking is defined and enable_thinking -%}
+{%- set effort = reasoning_budget if (reasoning_budget is defined and reasoning_budget is not none) else 'high' -%}
+{%- set budget = none -%}
+{%- if effort is string -%}
+    {%- if effort in ['low', 'high', 'max'] -%}
+        {%- set budget = {'low': 50, 'high': 75, 'max': 100}[effort] -%}
+    {%- endif -%}
+{%- elif effort is integer and effort >= 1 and effort <= 100 -%}
+    {%- set budget = effort -%}
+{%- endif -%}
+{%- if budget is none -%}
+    {{- raise_exception('Invalid reasoning effort for deepseek_v41: ' ~ effort ~ ', should be int within [1,100] or low/high/max') -}}
+{%- endif -%}
+{%- set effort_text = ('Reasoning Effort: ' ~ budget ~ ' (range 1-100, the higher the value, the more thorough the reasoning)\n\n') if thinking else '' -%}
+
+{#- ---- pre-pass: tools anywhere, and the last user turn ---- -#}
+{%- set n = messages | length -%}
+{%- set global_tools = tools if (tools is defined and tools) else none -%}
+{%- set ns = namespace(has_tools=(global_tools is not none), last_user=-1, prev_u=false, run_task=none, run_start=-1, prev_task=none, order=none, slot=0, picked='', pick=-1, pick_key=0, stop=false) -%}
+{%- for m in messages -%}
+    {%- if m.tools is defined and m.tools -%}{%- set ns.has_tools = true -%}{%- endif -%}
+    {%- if m.reasoning_content is string and '<｜deepseek_image｜>' in m.reasoning_content -%}
+        {{- raise_exception('deepseek_v41: the image placeholder <｜deepseek_image｜> cannot appear in text (text-only engine)') -}}
+    {%- endif -%}
+{%- endfor -%}
+{%- set virtual = global_tools is not none and (n == 0 or messages[0].role != 'system') -%}
+{%- for m in messages -%}
+    {%- set i = loop.index0 -%}
+    {%- if m.role == 'user' or m.role == 'tool' -%}
+        {%- if not ns.prev_u or (m.role == 'user' and ns.run_task is not none) -%}
+            {%- set ns.run_start = i -%}
+            {%- set ns.run_task = m.task if (m.task is defined and m.task is not none) else none -%}
+        {%- endif -%}
+        {%- set ns.prev_u = true -%}
+        {%- if m.role == 'user' -%}{%- set ns.last_user = ns.run_start -%}{%- endif -%}
+    {%- else -%}
+        {%- set ns.prev_u = false -%}
+        {%- if m.role == 'system' and i > 0 -%}{%- set ns.last_user = i -%}{%- endif -%}
+    {%- endif -%}
+{%- endfor -%}
+
+{#- ---- render ---- -#}
+{{- bos_token -}}
+{%- if virtual -%}
+    {{- '<｜System｜>' ~ effort_text ~ '\n\n' ~ tools_block(global_tools) -}}
+{%- endif -%}
+{%- set ns.prev_u = false -%}
+{%- set ns.run_task = none -%}
+{%- for m in messages -%}
+    {%- set i = loop.index0 -%}
+    {%- set role = m.role -%}
+    {%- set nxt = messages[i + 1] if (i + 1 < n) else none -%}
+    {%- set is_u = (role == 'user' or role == 'tool') -%}
+
+    {#- the leading System token, with the reasoning effort in thinking mode -#}
+    {%- if i == 0 and not virtual -%}
+        {%- if thinking -%}{{- '<｜System｜>' ~ effort_text -}}
+        {%- elif role == 'system' -%}{{- '<｜System｜>' -}}
+        {%- endif -%}
+    {%- endif -%}
+
+    {%- if role == 'system' -%}
+        {%- if i > 0 -%}{{- '<｜System｜>' -}}{%- endif -%}
+        {{- text_of(m.content) -}}
+        {%- set mt = m.tools if (m.tools is defined and m.tools) else (global_tools if (i == 0 and not virtual) else none) -%}
+        {%- if mt -%}{{- '\n\n' ~ tools_block(mt) -}}{%- endif -%}
+        {%- if m.response_format is defined and m.response_format -%}
+            {{- '\n\n## Response Format:\n\nYou MUST strictly adhere to the following schema to reply:\n' ~ (m.response_format | tojson) -}}
+        {%- endif -%}
+
+    {%- elif is_u -%}
+        {#- consecutive user / tool messages are one user message (merge_tool_messages) -#}
+        {%- if not ns.prev_u or (role == 'user' and ns.run_task is not none) -%}
+            {%- set ns.run_start = i -%}
+            {%- set ns.run_task = m.task if (m.task is defined and m.task is not none) else none -%}
+            {%- set ns.slot = 0 -%}
+            {%- set ns.picked = '' -%}
+            {{- '<｜User｜>' -}}
+        {%- else -%}
+            {{- '\n\n' -}}
+        {%- endif -%}
+        {%- if role == 'tool' -%}
+            {#- sort_tool_results_by_call_order: slot k shows the k-th result in (call position, arrival) order -#}
+            {%- set ns.pick = i -%}
+            {%- if ns.order -%}
+                {%- set ns.pick = -1 -%}
+                {%- set ns.pick_key = 0 -%}
+                {%- set ns.stop = false -%}
+                {%- for j in range(ns.run_start, n) -%}
+                    {%- set mj = messages[j] -%}
+                    {%- if not ns.stop -%}
+                        {%- if j > ns.run_start and not (mj.role == 'tool' or (mj.role == 'user' and ns.run_task is none)) -%}
+                            {%- set ns.stop = true -%}
+                        {%- elif mj.role == 'tool' and not (('|' ~ j ~ '|') in ns.picked) -%}
+                            {%- set key = call_pos(ns.order, mj.tool_call_id if (mj.tool_call_id is defined and mj.tool_call_id) else '') | int -%}
+                            {%- if ns.pick < 0 or key < ns.pick_key -%}
+                                {%- set ns.pick = j -%}
+                                {%- set ns.pick_key = key -%}
+                            {%- endif -%}
+                        {%- endif -%}
+                    {%- endif -%}
+                {%- endfor -%}
+                {%- set ns.picked = ns.picked ~ '|' ~ ns.pick ~ '|' -%}
+            {%- endif -%}
+            {%- set tc_msg = messages[ns.pick] -%}
+            {{- '<tool_result>' ~ text_of(tc_msg.content) ~ '</tool_result>' -}}
+        {%- else -%}
+            {{- text_of(m.content) -}}
+        {%- endif -%}
+
+    {%- elif role == 'latest_reminder' -%}
+        {{- '<｜latest_reminder｜>' ~ m.content -}}
+
+    {%- elif role == 'assistant' -%}
+        {#- the generation header was written by the preceding user / system message -#}
+        {%- if thinking and ns.prev_task is none and (ns.has_tools or i > ns.last_user) -%}
+            {{- (m.reasoning_content if (m.reasoning_content is defined and m.reasoning_content) else '') ~ '</think>' -}}
+        {%- endif -%}
+        {{- text_of(m.content) -}}
+        {%- if m.tool_calls is defined and m.tool_calls -%}
+            {{- '\n\n<' ~ dsml ~ ' calls>\n' -}}
+            {%- for tc in m.tool_calls -%}
+                {%- if tc.namespace is defined and tc.namespace -%}
+                    {{- raise_exception('deepseek_v41: tool namespaces are not supported') -}}
+                {%- endif -%}
+                {%- if not loop.first -%}{{- '\n' -}}{%- endif -%}
+                {{- '<' ~ dsml ~ ' invoke name="' ~ tc.function.name ~ '">\n' -}}
+                {%- if tc.function.arguments is string -%}
+                    {{- raise_exception('deepseek_v41: tool call arguments must be an object') -}}
+                {%- endif -%}
+                {%- for key, value in tc.function.arguments.items() -%}
+                    {%- if not loop.first -%}{{- '\n' -}}{%- endif -%}
+                    {{- '<' ~ dsml ~ ' parameter name="' ~ key ~ '" string="' ~ ('true' if value is string else 'false') ~ '">' -}}
+                    {{- value if value is string else (value | tojson) -}}
+                    {{- '</' ~ dsml ~ ' parameter>' -}}
+                {%- endfor -%}
+                {{- '\n</' ~ dsml ~ ' invoke>' -}}
+            {%- endfor -%}
+            {{- '\n</' ~ dsml ~ ' calls>' -}}
+            {%- set ns.order = m.tool_calls -%}
+        {%- endif -%}
+        {%- if not (m.wo_eos is defined and m.wo_eos) -%}{{- eos_token -}}{%- endif -%}
+
+    {%- else -%}
+        {{- raise_exception('deepseek_v41: unknown role ' ~ role) -}}
+    {%- endif -%}
+
+    {#- after the last message of a user run, or any other message: the transition -#}
+    {%- set merges_next = is_u and nxt is not none and (nxt.role == 'tool' or (nxt.role == 'user' and ns.run_task is none)) -%}
+    {%- if not merges_next and (nxt is none or nxt.role == 'assistant' or nxt.role == 'latest_reminder') -%}
+        {%- set task = ns.run_task if is_u else (m.task if (m.task is defined and m.task is not none) else none) -%}
+        {%- if task is not none -%}
+            {%- if task not in task_tokens -%}
+                {{- raise_exception('Invalid task: ' ~ task) -}}
+            {%- endif -%}
+            {%- if task != 'action' -%}
+                {{- task_tokens[task] -}}
+            {%- else -%}
+                {{- '<｜Assistant｜>' ~ ('<think>' if thinking else '</think>') ~ task_tokens[task] -}}
+            {%- endif -%}
+        {%- elif is_u or (role == 'system' and i > 0) -%}
+            {%- set at = ns.run_start if is_u else i -%}
+            {{- '<｜Assistant｜>' ~ ('<think>' if (thinking and (ns.has_tools or at >= ns.last_user)) else '</think>') -}}
+        {%- endif -%}
+    {%- endif -%}
+
+    {%- set ns.prev_u = is_u -%}
+    {%- set ns.prev_task = ns.run_task if is_u else (m.task if (m.task is defined and m.task is not none) else none) -%}
+{%- endfor -%}

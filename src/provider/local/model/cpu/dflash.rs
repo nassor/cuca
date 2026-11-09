@@ -100,11 +100,7 @@
 //! block; the oracle test compares both (a reference block of 16 rows and a
 //! shorter one).
 
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
-
-use candle_core::quantized::gguf_file::{self, Value};
+use crate::provider::local::gguf::{self, Value};
 use candle_core::{Device, Tensor};
 
 use super::super::arch::Act;
@@ -339,12 +335,11 @@ impl DflashNet {
     /// not have, a mask token outside the target's vocabulary or a target
     /// without a token embedding.
     pub(crate) fn open(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         target: &Transformer,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        Self::open_with(content, path, target, context_length, false)
+        Self::open_with(content, target, context_length, false)
     }
 
     /// [`DflashNet::open`] with every matmul weight dequantized to f32 (the
@@ -355,19 +350,17 @@ impl DflashNet {
     /// As [`DflashNet::open`].
     #[cfg(test)]
     pub(crate) fn open_dequantized(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         target: &Transformer,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        Self::open_with(content, path, target, context_length, true)
+        Self::open_with(content, target, context_length, true)
     }
 
     /// [`DflashNet::open`], with every matmul weight dequantized to f32 when
     /// `dequantize` is set (the test reference).
     fn open_with(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         target: &Transformer,
         context_length: usize,
         dequantize: bool,
@@ -404,7 +397,7 @@ impl DflashNet {
 
         let mut loader = Loader {
             content,
-            reader: BufReader::new(File::open(path)?),
+            reader: content.reader(),
             dequantize,
             // A drafter only proposes: float weights are held as Q8_0.
             requantize: true,
@@ -804,10 +797,8 @@ mod tests {
         ctx: usize,
         dequantize: bool,
     ) -> DflashNet {
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&drafter.path).unwrap()))
-                .unwrap();
-        DflashNet::open_with(&content, &drafter.path, target, ctx, dequantize).unwrap()
+        let content = gguf::Content::open(&drafter.path).unwrap();
+        DflashNet::open_with(&content, target, ctx, dequantize).unwrap()
     }
 
     /// `n` random feature rows.
@@ -934,14 +925,14 @@ mod tests {
 
     /// Every tensor of a drafter file as f32.
     fn read_weights(drafter: &TinyModel) -> HashMap<String, Vec<f32>> {
-        let mut reader = BufReader::new(File::open(&drafter.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = gguf::Content::open(&drafter.path).unwrap();
         let names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names
             .into_iter()
             .map(|n| {
                 let t = content
-                    .tensor(&mut reader, &n, &Device::Cpu)
+                    .reader()
+                    .tensor(&n, &Device::Cpu)
                     .unwrap()
                     .dequantize(&Device::Cpu)
                     .unwrap()
@@ -969,9 +960,7 @@ mod tests {
 
     impl Reference {
         fn new(drafter: &TinyModel) -> Self {
-            let content =
-                gguf_file::Content::read(&mut BufReader::new(File::open(&drafter.path).unwrap()))
-                    .unwrap();
+            let content = gguf::Content::open(&drafter.path).unwrap();
             Self {
                 w: read_weights(drafter),
                 geo: read_geometry(&content.metadata).unwrap(),
@@ -1323,10 +1312,8 @@ mod tests {
 
     fn open_err(target: &Transformer, spec: &TinyDflash) -> String {
         let drafter = write_tiny_dflash(spec);
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&drafter.path).unwrap()))
-                .unwrap();
-        DflashNet::open(&content, &drafter.path, target, CTX)
+        let content = gguf::Content::open(&drafter.path).unwrap();
+        DflashNet::open(&content, target, CTX)
             .err()
             .expect("must be refused")
             .to_string()
@@ -1381,9 +1368,7 @@ mod tests {
     #[test]
     fn the_geometry_follows_the_metadata() {
         let drafter = write_tiny_dflash(&TinyDflash::default());
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&drafter.path).unwrap()))
-                .unwrap();
+        let content = gguf::Content::open(&drafter.path).unwrap();
         let g = read_geometry(&content.metadata).unwrap();
         assert_eq!(
             (g.n_embd, g.n_head, g.n_kv_head, g.head_dim, g.block_size),

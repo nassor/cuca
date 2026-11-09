@@ -33,7 +33,7 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 use serde_json::Value as Json;
 
 use super::super::tokenizer::byte_to_char;

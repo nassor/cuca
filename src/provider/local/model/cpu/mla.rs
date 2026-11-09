@@ -264,11 +264,9 @@ impl Transformer {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::BufReader;
 
+    use crate::provider::local::gguf::{self, Value};
     use candle_core::quantized::GgmlDType;
-    use candle_core::quantized::gguf_file::{self, Value};
     use candle_core::{Device, Tensor};
 
     use super::super::Mixer;
@@ -606,7 +604,7 @@ mod tests {
         assert!(moe.norm_weights && moe.scale == 1.5);
         let mut loader = super::super::Loader {
             content: &content,
-            reader: BufReader::new(File::open(&model.path).unwrap()),
+            reader: content.reader(),
             dequantize: true,
             requantize: false,
         };
@@ -632,6 +630,7 @@ mod tests {
             router,
             experts: super::super::ExpertBank::Resident(experts),
             shared: Some(shared),
+            ..
         } = &lw.ffn
         else {
             panic!("resident experts plus a shared expert");
@@ -740,8 +739,7 @@ mod tests {
             eprintln!("SKIP: set CUCA_MISTRAL4_GGUF");
             return;
         };
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(path).unwrap())).unwrap();
+        let content = gguf::Content::open(std::path::Path::new(&path)).unwrap();
         let hp = read_hparams(&content).unwrap();
         assert_eq!(hp.arch.name(), "mistral4");
         assert_eq!((hp.n_layer, hp.n_embd), (36, 4096));

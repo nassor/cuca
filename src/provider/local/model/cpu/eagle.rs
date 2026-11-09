@@ -62,12 +62,9 @@
 //! `context_length` positions.
 
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 use std::sync::Arc;
 
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 use candle_core::{Device, Tensor};
 
 use super::super::arch::Arch;
@@ -154,20 +151,15 @@ impl Transformer {
     /// [`CucaError::Provider`] when the file is not a `mistral4-eagle`
     /// drafter, lacks a tensor, or was trained for another model: a different
     /// hidden width, vocabulary, attention geometry, RoPE or query scaling.
-    pub(crate) fn load_eagle(
-        &self,
-        content: &gguf_file::Content,
-        path: &Path,
-    ) -> Result<EagleHead, CucaError> {
-        self.load_eagle_with(content, path, false)
+    pub(crate) fn load_eagle(&self, content: &gguf::Content) -> Result<EagleHead, CucaError> {
+        self.load_eagle_with(content, false)
     }
 
     /// [`Transformer::load_eagle`], with every matmul weight dequantized to
     /// f32 when `dequantize` is set (the test reference).
     pub(crate) fn load_eagle_with(
         &self,
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         dequantize: bool,
     ) -> Result<EagleHead, CucaError> {
         let hp = read_hparams(content)?;
@@ -182,7 +174,7 @@ impl Transformer {
         let n = hp.n_embd;
         let mut loader = Loader {
             content,
-            reader: BufReader::new(File::open(path)?),
+            reader: content.reader(),
             dequantize,
             requantize: false,
         };
@@ -427,7 +419,7 @@ fn check_compat(
     target: &Hparams,
     model_vocab: usize,
     hp: &Hparams,
-    content: &gguf_file::Content,
+    content: &gguf::Content,
 ) -> Result<(), CucaError> {
     let differs = |what: &str, drafter: String, model: String| {
         Err(err(format!(
@@ -495,7 +487,7 @@ fn check_compat(
 
 #[cfg(test)]
 mod tests {
-    use candle_core::quantized::gguf_file::Value;
+    use crate::provider::local::gguf::Value;
     use serde_json::Value as Json;
 
     use super::super::hybrid_tests::{content_of, load_dequantized};
@@ -517,7 +509,7 @@ mod tests {
     /// The target and its drafter as the engine loads them (quantized).
     fn production(target: &TinyModel, eagle: &TinyModel) -> (Transformer, EagleHead) {
         let m = load(target, CONTEXT);
-        let head = m.load_eagle(&content_of(eagle), &eagle.path).unwrap();
+        let head = m.load_eagle(&content_of(eagle)).unwrap();
         (m, head)
     }
 
@@ -595,9 +587,8 @@ mod tests {
             ..TinyMistral4::default()
         });
         let m = load_dequantized(&model);
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&gguf).unwrap())).unwrap();
-        let mut head = m.load_eagle_with(&content, &gguf, true).unwrap();
+        let content = gguf::Content::open(&gguf).unwrap();
+        let mut head = m.load_eagle_with(&content, true).unwrap();
 
         let tokens: Vec<u32> = flat(&reference["tokens"])
             .iter()
@@ -893,7 +884,7 @@ mod tests {
                 meta,
                 ..TinyEagle::default()
             });
-            m.load_eagle(&content_of(&eagle), &eagle.path)
+            m.load_eagle(&content_of(&eagle))
                 .err()
                 .map(|e| e.to_string())
         };
@@ -921,20 +912,16 @@ mod tests {
             assert!(e.contains(expect), "{expect}: {e}");
         }
         // The target's own file is not a drafter.
-        let e = m
-            .load_eagle(&content_of(&model), &model.path)
-            .err()
-            .unwrap()
-            .to_string();
+        let e = m.load_eagle(&content_of(&model)).err().unwrap().to_string();
         assert!(e.contains("not an EAGLE drafter"), "{e}");
         // And a drafter is not a model, nor a shared-K/V assistant.
         let eagle = write_tiny_eagle(&TinyEagle::default());
-        let e = Transformer::load(&content_of(&eagle), &eagle.path, CONTEXT)
+        let e = Transformer::load(&content_of(&eagle), CONTEXT)
             .err()
             .unwrap()
             .to_string();
         assert!(e.contains("drafter"), "{e}");
-        let e = Transformer::load_drafter(&content_of(&eagle), &eagle.path, CONTEXT)
+        let e = Transformer::load_drafter(&content_of(&eagle), CONTEXT)
             .err()
             .unwrap()
             .to_string();
@@ -962,9 +949,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let read = |p: &std::path::Path| {
-            gguf_file::Content::read(&mut BufReader::new(File::open(p).unwrap())).unwrap()
-        };
+        let read = |p: &std::path::Path| gguf::Content::open(p).unwrap();
         let (target, drafter) = (read(std::path::Path::new(&model)), read(&out));
         let thp = read_hparams(&target).unwrap();
         let vocab = target.tensor_infos["token_embd.weight"].shape.dims()[0];

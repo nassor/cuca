@@ -10,7 +10,10 @@
 //!   overrides it): a name from `ModelSource::PRESETS` (`gemma4-e2b-q4_0`,
 //!   `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`, ...), an unverified
 //!   `repo:revision:file` GGUF, or a safetensors checkpoint
-//!   `repo:revision` that is converted to a cached GGUF once; or
+//!   `repo:revision` that is converted to a cached GGUF once, or a checkpoint
+//!   name of `local_env::CHECKPOINT_PRESETS` that is no library preset
+//!   (`deepseek-v41-flash-1017`: the pinned DeepSeek-V4.1-Flash checkpoint,
+//!   converted once to a split GGUF set in `CUCA_CACHE_DIR`); or
 //! - `CUCA_LOCAL_DOWNLOAD=1` downloads the default preset (Gemma 4 E2B Q4_0).
 //!
 //! `CUCA_LOCAL_CONVERT_QUANT` (`f16`, `q8_0` or `q4_0`, default `q8_0`) sets
@@ -38,7 +41,9 @@
 //! `MATRIX|layer_split|...`). `CUCA_LOCAL_EXPERTS` sets
 //! `LocalModelConfig::experts` (`ExpertPlacement` syntax, e.g.
 //! `tiered:ram=4g`; unset = resident), so the whole matrix runs on tiered
-//! experts. Build for the host CPU, since
+//! experts. `CUCA_LOCAL_ENGRAM` sets `LocalModelConfig::engram` (`EngramCache`
+//! syntax, e.g. `ram=2g,threads=8`; only a model with Engram tables reads
+//! it). Build for the host CPU, since
 //! candle's SIMD kernels are chosen at compile time:
 //!
 //! ```sh
@@ -122,6 +127,10 @@ struct Capabilities {
     can_disable_thinking: bool,
     /// The model has a tool-call syntax.
     tools: bool,
+    /// A request that says nothing about thinking reasons anyway (DeepSeek
+    /// V4.1: `ChatTemplate::thinking_enabled` thinks unless told not to, as
+    /// DeepSeek's reference stack does), though it can be switched off.
+    thinks_by_default: bool,
 }
 
 impl Capabilities {
@@ -205,7 +214,7 @@ fn source_label(source: &ModelSource) -> String {
         // per-preset table of known limits (`known_limit`) applies to the
         // converted model too: the same model at the same revision, converted
         // instead of downloaded as a GGUF.
-        ModelSource::Checkpoint { repo, revision } => CHECKPOINT_PRESETS
+        ModelSource::Checkpoint { repo, revision } => local_env::CHECKPOINT_PRESETS
             .iter()
             .find(|(r, rev, _)| r == repo && rev == revision)
             .map_or_else(
@@ -215,31 +224,19 @@ fn source_label(source: &ModelSource) -> String {
     }
 }
 
-/// Checkpoints (`repo`, `revision`) and the GGUF preset made from the same
-/// weights: the harness reports a converted checkpoint under the preset's name
-/// so the known limits recorded for the preset apply to it.
-const CHECKPOINT_PRESETS: &[(&str, &str, &str)] = &[
-    (
-        "Qwen/Qwen3-0.6B",
-        "c1899de289a04d12100db370d81485cdf75e47ca",
-        "qwen3-0.6b-q8_0",
-    ),
-    (
-        "microsoft/Phi-4-mini-instruct",
-        "cfbefacb99257ffa30c83adab238a50856ac3083",
-        "phi4-mini-q4_0",
-    ),
-    (
-        "unsloth/gemma-3-1b-it",
-        "5b11413a10db4e486ef16a20101fd028f8f2499c",
-        "gemma3-1b-q4_0",
-    ),
-    (
-        "google/gemma-4-E2B-it-qat-q4_0-unquantized",
-        "6befbaca7398925921802abd1f277b495b78b738",
-        "gemma4-e2b-q4_0",
-    ),
-];
+/// `CUCA_LOCAL_MODEL=deepseek-v41-flash-1017` selects the pinned checkpoint
+/// (converted once to a split GGUF set); a library preset name is never shadowed.
+#[test]
+fn a_checkpoint_name_selects_its_pinned_checkpoint() {
+    assert!(matches!(
+        local_env::checkpoint_alias("deepseek-v41-flash-1017"),
+        Some(ModelSource::Checkpoint { repo, revision })
+            if repo == "deepseek-ai/DeepSeek-V4.1-Flash-1017"
+                && revision == "1bae0e1088993b9b82de08f59de5be5a34e42170"
+    ));
+    assert!(local_env::checkpoint_alias("qwen3-0.6b-q8_0").is_none());
+    assert!(local_env::checkpoint_alias("no-such-model").is_none());
+}
 
 /// What the oracle dump (`CUCA_LOCAL_REF_DIR`) of the GGUF file says about the
 /// chat turn [`ORACLE_USER`]: its prompt token count, and whether the rendered
@@ -305,6 +302,7 @@ async fn loaded() -> Option<Loaded> {
             let mut config = LocalModelConfig {
                 source: source.clone(),
                 experts: local_env::parsed("CUCA_LOCAL_EXPERTS").unwrap_or_default(),
+                engram: local_env::engram(),
                 convert: local_env::convert(),
                 on_download_progress: Some(local_env::download_progress()),
                 chat_template: local_env::chat_template(),
@@ -325,6 +323,9 @@ async fn loaded() -> Option<Loaded> {
                 reasoning: reported.reasoning,
                 can_disable_thinking: reported.can_disable_thinking,
                 tools: reported.tools,
+                thinks_by_default: reported.reasoning
+                    && reported.can_disable_thinking
+                    && source_label(&source).starts_with("deepseek-v41"),
             };
             println!("MATRIX|model|{caps:?}");
             Some(Loaded {
@@ -483,7 +484,7 @@ async fn greedy_text_and_usage() {
         caps.name,
         reply.thinking()
     );
-    if !caps.always_thinks() {
+    if !caps.always_thinks() && !caps.thinks_by_default {
         assert!(
             !reply.has_thinking(),
             "[{}] reasoning is off by default: {:?}",
@@ -503,11 +504,19 @@ async fn greedy_text_and_usage() {
         "[{}] every prompt token was either reused or prefilled",
         caps.name
     );
-    assert_eq!(
-        usage.reasoning_tokens, None,
-        "[{}] reasoning tokens are reported only when thinking is enabled",
-        caps.name
-    );
+    if caps.thinks_by_default {
+        assert!(
+            usage.reasoning_tokens.is_some_and(|n| n > 0),
+            "[{}] the default reply reasons, so reasoning tokens are reported",
+            caps.name
+        );
+    } else {
+        assert_eq!(
+            usage.reasoning_tokens, None,
+            "[{}] reasoning tokens are reported only when thinking is enabled",
+            caps.name
+        );
+    }
     match &live.oracle {
         Some(_) if known_limit(&caps.name, "oracle_prompt_tokens").is_some() => {
             println!(

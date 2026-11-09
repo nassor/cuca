@@ -295,18 +295,18 @@ compile_error!(
 
 use std::collections::HashMap;
 use std::f64::consts::FRAC_1_SQRT_2;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
 use std::ops::Range;
-use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
+use crate::provider::local::gguf::{self, GgufType};
 use burn::tensor::{AllocationProperty, Bytes, DType, Device, Int, Tensor, TensorData, activation};
-use candle_core::quantized::{GgmlDType, gguf_file};
+use candle_core::quantized::GgmlDType;
 
 use super::arch::{Act, Arch};
-use super::cpu::{Forward, Hidden, HostExperts};
-use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
+use super::cpu::{CpuExpert, Forward, Hidden, HostExperts, open_expert_store};
+use super::csa::Gating;
+use super::engram::{self, RowSource};
+use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, ggml_dtype, name, tensor_info};
 use super::moe::Routing;
 use super::moe_kernel::{self as mk, MoeCall, SlotLayout};
 #[cfg(test)]
@@ -324,8 +324,10 @@ use super::tp::{self, Collective, Cut, Tp};
 use super::{Batch, Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
 use crate::error::CucaError;
 use crate::provider::local::{
-    ExpertHeat, ExpertPlacement, ExpertTiers, LocalDevice, device_unavailable,
+    EngramCache, ExpertHeat, ExpertPlacement, ExpertTiers, LocalDevice, device_unavailable,
 };
+
+mod hyper;
 
 /// The burn device for `device`, opened now so that a missing adapter or
 /// driver is an error here rather than a panic at the first tensor.
@@ -684,8 +686,8 @@ fn upload_matrix_with(
 
 /// Reads tensors from the GGUF file into one reused buffer and uploads them.
 struct WeightReader<'a> {
-    content: &'a gguf_file::Content,
-    file: File,
+    content: &'a gguf::Content,
+    reader: gguf::TensorReader<'a>,
     buf: Vec<u8>,
     device: &'a Device,
     /// `ExpertPlacement::Host`: which layers keep their experts in host RAM.
@@ -693,17 +695,15 @@ struct WeightReader<'a> {
 }
 
 impl<'a> WeightReader<'a> {
-    /// A reader of the file at `path` (index `content`) that uploads to
-    /// `device`.
+    /// A reader of the files of `content` that uploads to `device`.
     fn open(
-        content: &'a gguf_file::Content,
-        path: &Path,
+        content: &'a gguf::Content,
         device: &'a Device,
         host: Option<HostPlan>,
     ) -> Result<Self, CucaError> {
         Ok(Self {
             content,
-            file: File::open(path)?,
+            reader: content.reader(),
             buf: Vec::new(),
             device,
             host,
@@ -717,10 +717,12 @@ impl<'a> WeightReader<'a> {
 struct HostPlan {
     lead: usize,
     n: usize,
-    path: std::path::PathBuf,
     hp: Hparams,
     /// Hold the hosted experts as f32 (the exact reference of the tests).
     dequantize: bool,
+    /// The experts stay in the file behind this RAM tier and the CPU
+    /// computes them (`ExpertPlacement::Tiered` without a device tier).
+    tiered: Option<Arc<ExpertStore<CpuExpert>>>,
 }
 
 impl WeightReader<'_> {
@@ -729,11 +731,9 @@ impl WeightReader<'_> {
     fn read_at(&mut self, tensor_name: &str, offset: usize, len: usize) -> Result<(), CucaError> {
         let info = tensor_info(self.content, tensor_name)?;
         self.buf.resize(len, 0);
-        self.file.seek(SeekFrom::Start(
-            self.content.tensor_data_offset + info.offset + offset as u64,
-        ))?;
-        self.file
-            .read_exact(&mut self.buf)
+        let at = self.content.location(info).1 + offset as u64;
+        self.reader
+            .read_at(info.file, at, &mut self.buf)
             .map_err(|e| err(format!("tensor `{tensor_name}`: {e} (truncated GGUF?)")))
     }
 
@@ -747,7 +747,7 @@ impl WeightReader<'_> {
                 "tensor `{tensor_name}`: expected shape {shape:?}, found {dims:?}"
             )));
         }
-        let dtype = info.ggml_dtype;
+        let dtype = ggml_dtype(info, tensor_name)?;
         let elements: usize = shape.iter().product();
         if !elements.is_multiple_of(dtype.block_size()) {
             return Err(err(format!(
@@ -801,7 +801,7 @@ impl WeightReader<'_> {
                 [rows, cols]
             )));
         }
-        let dtype = info.ggml_dtype;
+        let dtype = ggml_dtype(info, tensor_name)?;
         let block = dtype.block_size();
         if !cols.is_multiple_of(block) {
             return Err(err(format!(
@@ -912,11 +912,19 @@ impl WeightReader<'_> {
         e: usize,
         rows: &Range<usize>,
     ) -> Result<Vec<u8>, CucaError> {
-        let row_bytes = slice.cols / slice.dtype.block_size() * slice.dtype.type_size();
+        let row_bytes = slice.dtype.byte_len(slice.cols).ok_or_else(|| {
+            err(format!(
+                "tensor `{tensor_name}`: row length {} is not a whole number of {} blocks",
+                slice.cols,
+                slice.dtype.name()
+            ))
+        })?;
         // The up half of a fused gate/up tensor starts inside the expert's
         // record, which `slice` knows as an absolute file offset.
-        let tensor_start =
-            self.content.tensor_data_offset + tensor_info(self.content, tensor_name)?.offset;
+        let tensor_start = self
+            .content
+            .location(tensor_info(self.content, tensor_name)?)
+            .1;
         let within = (slice.offset(e) - tensor_start) as usize;
         self.read_at(
             tensor_name,
@@ -948,10 +956,11 @@ impl WeightReader<'_> {
             && il >= h.lead
             && il - h.lead < h.n
         {
-            return Ok(GpuExpertBank::Host {
-                experts: HostExperts::load(self.content, &h.path, &h.hp, il, h.dequantize)?,
-                layout,
-            });
+            let experts = match &h.tiered {
+                Some(store) => HostExperts::tiered(&h.hp, il, Arc::clone(store)),
+                None => HostExperts::load(self.content, &h.hp, il, h.dequantize)?,
+            };
+            return Ok(GpuExpertBank::Host { experts, layout });
         }
         let no_list = Tensor::<1, Int>::zeros([2], self.device);
         if let Some(plan) = tiers {
@@ -977,7 +986,11 @@ impl WeightReader<'_> {
         // the down matrix once its columns are cut.
         let part = tp.part(ff);
         let whole = part == (0..ff);
-        let down_dtype = tp::column_dtype(layer.down.dtype, ff, &part);
+        let down_dtype = if whole {
+            layer.down.dtype
+        } else {
+            GgufType::Ggml(tp::column_dtype(layer.down.ggml()?, ff, &part))
+        };
         let dtypes = [layer.gate.dtype, layer.up.dtype, down_dtype];
         let layout = SlotLayout::new(n_embd, part.len(), dtypes)?;
         if n_expert * layout.bytes() > MAX_PART_BYTES {
@@ -1003,8 +1016,15 @@ impl WeightReader<'_> {
                 down
             } else {
                 let mut cut = Vec::new();
-                append_columns(layer.down.dtype, &down, ff, &part, down_dtype, &mut cut)
-                    .map_err(|e| err(format!("layer {il} experts: {e}")))?;
+                append_columns(
+                    layer.down.ggml()?,
+                    &down,
+                    ff,
+                    &part,
+                    down_dtype.ggml().ok_or_else(|| err("a cut MXFP4 expert"))?,
+                    &mut cut,
+                )
+                .map_err(|e| err(format!("layer {il} experts: {e}")))?;
                 cut
             };
             let packed = mk::pack_expert(&layout, dtypes, &gate, &up, &down)?;
@@ -1129,7 +1149,20 @@ enum FfnWeights {
         router: Weight,
         experts: GpuExpertBank,
         shared: Option<GpuShared>,
+        /// The router's scoring function and selection bias and the SwiGLU
+        /// clamps ([`Behavior::moe_ext`](super::arch::Behavior)).
+        ext: Option<Box<GpuRouterExt>>,
     },
+}
+
+/// What a mixture-of-experts layer adds to a softmax top-k router.
+struct GpuRouterExt {
+    scoring: mk::Scoring,
+    /// Per-expert selection bias (`exp_probs_b`), `[n_expert]`.
+    bias: Option<Tensor<1>>,
+    /// SwiGLU clamp of the routed experts and of the shared expert (0: none).
+    clamp: f32,
+    clamp_shared: f32,
 }
 
 /// The shared expert of a Qwen 3.5 MoE layer: a dense gated FFN every token
@@ -1224,6 +1257,8 @@ enum Mixer {
     Attention(AttnWeights),
     Delta(Box<DeltaWeights>),
     Mla(Box<MlaWeights>),
+    /// Latent attention with compressed rows (hyper-connection models).
+    Csa(Box<hyper::GCsa>),
 }
 
 /// One routed expert converted on the host to the words of the MoE kernels
@@ -1364,6 +1399,7 @@ impl GpuExpertBank {
         route: Tensor<1>,
         call: &dyn Fn(usize, bool) -> MoeCall,
         device: &Device,
+        clamp: f32,
         shared: impl FnOnce() -> Option<Tensor<2>>,
     ) -> Result<Tensor<2>, CucaError> {
         let c = call(0, false);
@@ -1371,12 +1407,13 @@ impl GpuExpertBank {
         let (routed, extra) = match self {
             Self::Resident { pool, no_list, .. } => {
                 let c = call(t * k, false);
-                let hidden = mk::up(f, route.clone(), no_list.clone(), pool.clone(), &c);
+                let hidden =
+                    mk::up_clamped(f, route.clone(), no_list.clone(), pool.clone(), &c, clamp);
                 let scratch = Tensor::<2>::empty([t * k, n_embd], device);
                 let scratch = mk::down(hidden, route, no_list.clone(), pool.clone(), scratch, &c);
                 (mk::sum(scratch, &c), shared())
             }
-            Self::Tiered(bank) => (bank.run(f, route, call, device)?, shared()),
+            Self::Tiered(bank) => (bank.run(f, route, call, device, clamp)?, shared()),
             Self::Host { experts, .. } => {
                 let rows = t * n_embd;
                 let mut host = read_f32(
@@ -1488,6 +1525,7 @@ impl TieredBank {
         route: Tensor<1>,
         call: &dyn Fn(usize, bool) -> MoeCall,
         device: &Device,
+        clamp: f32,
     ) -> Result<Tensor<2>, CucaError> {
         let c = call(0, false);
         let (t, k, n_embd, n_expert) = (c.tokens, c.n_used, c.slot.down.rows, c.n_expert);
@@ -1559,7 +1597,14 @@ impl TieredBank {
                 .clone()
                 .ok_or_else(|| err("the expert pool is being written"))?;
             let c = call(pairs, true);
-            let hidden = mk::up(f.clone(), route.clone(), list.clone(), pool.clone(), &c);
+            let hidden = mk::up_clamped(
+                f.clone(),
+                route.clone(),
+                list.clone(),
+                pool.clone(),
+                &c,
+                clamp,
+            );
             scratch = mk::down(hidden, route.clone(), list, pool, scratch, &c);
             pending.retain(|e| group.binary_search(e).is_err());
         }
@@ -1585,6 +1630,8 @@ struct LayerWeights {
     post_ffw_norm: Option<Tensor<1>>,
     ple: Option<PleLayer>,
     out_scale: Option<f64>,
+    /// The layer's hyper-connection sites.
+    hc: Option<Box<hyper::GHc>>,
 }
 
 /// Model-level per-layer-embedding weights (Gemma 4).
@@ -1911,6 +1958,8 @@ struct Weights {
     /// `None` on every shard but the first.
     head: Option<Head>,
     ropes: Vec<RopeTable>,
+    /// The hyper-connection path's model-level weights.
+    hyper: Option<hyper::HyperWeights>,
 }
 
 /// One sequence's recurrent state: every delta-net layer's state (`None` for
@@ -1962,6 +2011,9 @@ pub(crate) struct GpuTransformer {
     /// The implicit sequence of the unit tests.
     #[cfg(test)]
     solo: Solo,
+    /// The tokens of the implicit sequence (engram history).
+    #[cfg(test)]
+    solo_ids: Vec<u32>,
     /// The recurrent state of every sequence slot of a hybrid model
     /// (`Sizing::max_sequences` of them; none for an attention-only model).
     slots: Vec<DeltaSlot>,
@@ -1969,6 +2021,8 @@ pub(crate) struct GpuTransformer {
     zero: Vec<Option<DeltaState>>,
     /// The model has delta-net layers.
     hybrid: bool,
+    /// The pools and compressor state of a hyper-connection model.
+    hyper: Option<hyper::HyperState>,
     /// Counters and heat of the expert tiers, with `ExpertPlacement::Tiered`.
     tiers: Option<Arc<TierShared>>,
 }
@@ -2041,12 +2095,12 @@ impl Weights {
     /// banks hold the tiers) instead of being read.
     fn load(
         reader: &mut WeightReader<'_>,
-        path: &Path,
         hp: &Hparams,
         tp: Tp,
         context_length: usize,
         tiers: Option<&TierPlan>,
         first: usize,
+        engram: Option<Arc<dyn RowSource>>,
     ) -> Result<Self, CucaError> {
         let content = reader.content;
         let device = reader.device.clone();
@@ -2080,7 +2134,7 @@ impl Weights {
             None => None,
         };
 
-        let ropes = build_rope_tables(content, path, hp, context_length)?
+        let ropes = build_rope_tables(content, hp, context_length)?
             .into_iter()
             .map(|t| {
                 let shape = [context_length, t.half];
@@ -2105,6 +2159,9 @@ impl Weights {
             first,
             head,
             ropes,
+            hyper: hp
+                .hyper
+                .map(|spec| hyper::HyperWeights::new(hp, spec, engram)),
         })
     }
 }
@@ -2127,6 +2184,11 @@ fn alloc_pools(
 ) -> Result<KvLayers, CucaError> {
     let mut kv: KvLayers = Vec::with_capacity(hp.n_layer);
     for (il, spec) in hp.layers.iter().enumerate() {
+        // A hyper-connection model keeps its pools in `hyper::HyperState`.
+        if hp.behavior.compressed_attention {
+            kv.push(None);
+            continue;
+        }
         // A layer before `first` runs elsewhere; only the pools of those
         // whose K/V a later layer reads exist here (see [`Back::mirror`]).
         if (il < first && !mirror.contains(&il)) || !spec.owns_kv(il) {
@@ -2152,7 +2214,7 @@ fn alloc_pools(
 ///
 /// The loader's errors for missing or malformed expert tensors.
 fn tier_layout(
-    content: &gguf_file::Content,
+    content: &gguf::Content,
     hp: &Hparams,
     spec: MoeSpec,
     first: usize,
@@ -2177,7 +2239,7 @@ fn tier_layout(
 /// The loader's errors for missing or malformed expert tensors,
 /// [`CucaError::Config`] for rows that are not whole blocks.
 fn layer_experts(
-    content: &gguf_file::Content,
+    content: &gguf::Content,
     il: usize,
     n_expert: usize,
     ff: usize,
@@ -2240,8 +2302,7 @@ fn build_packed_expert(
 /// below `n_used` experts per layer or heat of another shape; the loader's
 /// errors for unreadable expert tensors.
 fn open_tiers(
-    content: &gguf_file::Content,
-    path: &Path,
+    content: &gguf::Content,
     hp: &Hparams,
     tiers: &ExpertTiers,
     first: usize,
@@ -2267,8 +2328,9 @@ fn open_tiers(
         shared.check(heat)?;
     }
     let build: Arc<BuildFn<PackedExpert>> = Arc::new(build_packed_expert);
+    let files: Vec<&std::path::Path> = content.files().iter().map(|f| f.path.as_path()).collect();
     let store = ExpertStore::open(
-        path,
+        &files,
         hp.n_layer,
         layers,
         spec.n_expert,
@@ -2298,6 +2360,9 @@ pub(crate) struct Back {
     /// each pass's new rows over ([`MirrorRows`]), written into a pool this
     /// device holds for them under the same block tables.
     pub(crate) mirror: Vec<usize>,
+    /// The Engram table the CPU half shares (`None` for a model without
+    /// one), so that its row cache and counters are single.
+    pub(crate) engram: Option<Arc<dyn RowSource>>,
 }
 
 impl GpuTransformer {
@@ -2305,19 +2370,18 @@ impl GpuTransformer {
     /// device and room for one sequence (tests).
     #[cfg(test)]
     pub(crate) fn load(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
     ) -> Result<Self, CucaError> {
         Self::load_placed(
             content,
-            path,
             context_length,
             device,
             &[],
             &ExpertPlacement::Resident,
             &Sizing::single(context_length),
+            &EngramCache::default(),
         )
     }
 
@@ -2343,17 +2407,16 @@ impl GpuTransformer {
     /// a device that fails to open; [`CucaError::Io`] when the file cannot
     /// be read.
     pub(crate) fn load_placed(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
         shards: &[LocalDevice],
         experts: &ExpertPlacement,
         sizing: &Sizing,
+        engram: &EngramCache,
     ) -> Result<Self, CucaError> {
         Self::load_part(
             content,
-            path,
             context_length,
             device,
             shards,
@@ -2361,6 +2424,7 @@ impl GpuTransformer {
             sizing,
             None,
             false,
+            engram,
         )
     }
 
@@ -2374,8 +2438,7 @@ impl GpuTransformer {
     ///
     /// As [`GpuTransformer::load_placed`].
     pub(crate) fn load_back(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
         experts: &ExpertPlacement,
@@ -2384,7 +2447,6 @@ impl GpuTransformer {
     ) -> Result<Self, CucaError> {
         Self::load_part(
             content,
-            path,
             context_length,
             device,
             &[],
@@ -2392,6 +2454,8 @@ impl GpuTransformer {
             sizing,
             Some(back),
             false,
+            // A model with an Engram table gets it from `back`.
+            &EngramCache::default(),
         )
     }
 
@@ -2400,8 +2464,7 @@ impl GpuTransformer {
     /// the device kernels do not, so the exact reference of the host path.
     #[cfg(test)]
     pub(crate) fn load_host_exact(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
         experts: &ExpertPlacement,
@@ -2409,7 +2472,6 @@ impl GpuTransformer {
     ) -> Result<Self, CucaError> {
         Self::load_part(
             content,
-            path,
             context_length,
             device,
             &[],
@@ -2417,6 +2479,7 @@ impl GpuTransformer {
             sizing,
             None,
             true,
+            &EngramCache::default(),
         )
     }
 
@@ -2425,8 +2488,7 @@ impl GpuTransformer {
         reason = "the file, the placement and the part of the model are independent inputs"
     )]
     fn load_part(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
         shards: &[LocalDevice],
@@ -2434,6 +2496,7 @@ impl GpuTransformer {
         sizing: &Sizing,
         back: Option<&Back>,
         host_exact: bool,
+        engram: &EngramCache,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         if hp.arch.is_drafter() {
@@ -2456,7 +2519,27 @@ impl GpuTransformer {
 
         // Every shard cuts equal shapes, so one plan serves all.
         let first = back.map_or(0, |b| b.first);
+        // Tiers without a device tier: the experts stay behind the RAM tier
+        // and the CPU computes them.
+        let host_tiers = match experts {
+            ExpertPlacement::Tiered(t) if t.device_bytes == 0 => {
+                if first != 0 {
+                    return Err(CucaError::Config(
+                        "experts.device_bytes must be greater than 0 with gpu_layers: host-tiered experts serve a model that runs on one device".into(),
+                    ));
+                }
+                Some(open_expert_store(content, &hp, t, hp.n_layer, None)?)
+            }
+            _ => None,
+        };
         let host = match experts {
+            ExpertPlacement::Tiered(_) if host_tiers.is_some() => Some(HostPlan {
+                lead: hp.leading_dense,
+                n: usize::MAX,
+                hp: hp.clone(),
+                dequantize: false,
+                tiered: host_tiers.clone(),
+            }),
             ExpertPlacement::Host { layers } => {
                 if hp.moe.is_none() {
                     return Err(CucaError::Config(format!(
@@ -2467,39 +2550,26 @@ impl GpuTransformer {
                 Some(HostPlan {
                     lead: hp.leading_dense,
                     n: layers.unwrap_or(usize::MAX),
-                    path: path.to_path_buf(),
                     hp: hp.clone(),
                     dequantize: host_exact,
+                    tiered: None,
                 })
             }
             _ => None,
         };
         let tiers = match experts {
             ExpertPlacement::Resident | ExpertPlacement::Host { .. } => None,
+            ExpertPlacement::Tiered(_) if host_tiers.is_some() => None,
             ExpertPlacement::Tiered(t) => Some((
                 t,
-                open_tiers(
-                    content,
-                    path,
-                    &hp,
-                    t,
-                    first,
-                    back.and_then(|b| b.shared.clone()),
-                )?,
+                open_tiers(content, &hp, t, first, back.and_then(|b| b.shared.clone()))?,
             )),
         };
 
-        let embed = RowTable::open(
-            path,
-            content,
-            name::TOKEN_EMBD,
-            "embedding table",
-            hp.n_embd,
-        )?;
+        let embed = RowTable::open(content, name::TOKEN_EMBD, "embedding table", hp.n_embd)?;
         let vocab = embed.rows;
         let ple_table = match hp.ple_dim {
             Some(dim) => Some(RowTable::open(
-                path,
                 content,
                 name::PER_LAYER_TOKEN_EMBD,
                 "per-layer embedding table",
@@ -2508,18 +2578,22 @@ impl GpuTransformer {
             None => None,
         };
 
+        let engram_rows = match back.and_then(|b| b.engram.clone()) {
+            Some(shared) => Some(shared),
+            None => engram::open_table(content, &hp, engram)?,
+        };
         let plan = tiers.as_ref().map(|(_, plan)| plan);
         let mut weights: Vec<Weights> = Vec::with_capacity(world);
         for (shard, device) in devices.iter().enumerate() {
-            let mut reader = WeightReader::open(content, path, device, host.clone())?;
+            let mut reader = WeightReader::open(content, device, host.clone())?;
             weights.push(Weights::load(
                 &mut reader,
-                path,
                 &hp,
                 Tp { world, shard },
                 context_length,
                 plan,
                 first,
+                engram_rows.clone(),
             )?);
         }
         if let Some((tiers, plan)) = &tiers
@@ -2545,6 +2619,16 @@ impl GpuTransformer {
             .collect::<Result<Vec<_>, _>>()?;
         #[cfg(test)]
         let solo = Solo::new(&layout);
+        let hyper = match &weights[0].hyper {
+            Some(_) => Some(hyper::HyperState::new(
+                &weights[0].hp,
+                &layout,
+                &weights[0].device,
+                sizing.max_sequences,
+                first,
+            )?),
+            None => None,
+        };
         // One zero state per delta-net layer, shared by every empty slot
         // (the states are immutable); a hybrid model is never split.
         let zero: Vec<Option<DeltaState>> = weights[0]
@@ -2579,10 +2663,16 @@ impl GpuTransformer {
             layout,
             #[cfg(test)]
             solo,
+            #[cfg(test)]
+            solo_ids: Vec::new(),
             slots,
             zero,
             hybrid,
-            tiers: tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
+            hyper,
+            tiers: match &host_tiers {
+                Some(store) => Some(Arc::clone(store.shared())),
+                None => tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
+            },
         })
     }
 
@@ -2661,18 +2751,24 @@ impl GpuTransformer {
         batch: &Batch<'_>,
         hidden: Vec<f32>,
         per_layer: Option<Vec<f32>>,
+        pre: Option<Vec<f32>>,
         mirror: &[MirrorRows],
     ) -> Result<Vec<Forward>, CucaError> {
         let (tokens, segs) = self.plan_batch(batch)?;
+        // A hyper-connection model hands over its residual streams.
         let n_embd = self.weights[0].hp.n_embd;
-        if hidden.len() != tokens.len() * n_embd {
+        let width = self.weights[0]
+            .hyper
+            .as_ref()
+            .map_or(n_embd, |h| h.spec.streams * n_embd);
+        if hidden.len() != tokens.len() * width {
             return Err(err(format!(
-                "the hidden state holds {} values for {} rows of {n_embd}",
+                "the hidden state holds {} values for {} rows of {width}",
                 hidden.len(),
                 tokens.len()
             )));
         }
-        let outs = self.back_layers(hidden, per_layer, mirror, &segs);
+        let outs = self.back_layers(hidden, per_layer, pre, mirror, &segs);
         self.settle(&segs, outs)
     }
 
@@ -2731,6 +2827,8 @@ impl GpuTransformer {
                 slot: r.state.0,
                 want: r.want,
                 hidden: r.hidden,
+                tokens: r.tokens,
+                history: r.history,
             });
             tokens.extend_from_slice(r.tokens);
         }
@@ -2771,9 +2869,14 @@ impl GpuTransformer {
         &mut self,
         hidden: Vec<f32>,
         per_layer: Option<Vec<f32>>,
+        pre: Option<Vec<f32>>,
         mirror: &[MirrorRows],
         segs: &[Seg<'_>],
     ) -> Result<Vec<Forward>, CucaError> {
+        if let (Some(state), [weights]) = (&mut self.hyper, self.weights.as_slice()) {
+            let pre = pre.ok_or_else(|| err("a hyper-connection back needs the pre weights"))?;
+            return weights.run_hyper_offloaded(state, &self.layout, hidden, pre, segs);
+        }
         let ([weights], [kv]) = (self.weights.as_slice(), self.kv.as_mut_slice()) else {
             return Err(err(
                 "layer offload cannot be combined with tensor parallelism",
@@ -2812,6 +2915,9 @@ impl GpuTransformer {
         per_layer: Option<Vec<f32>>,
         segs: &[Seg<'_>],
     ) -> Result<Vec<Forward>, CucaError> {
+        if let (Some(state), [weights]) = (&mut self.hyper, self.weights.as_slice()) {
+            return weights.run_hyper(state, &self.layout, embeddings, segs);
+        }
         if let ([weights], [kv]) = (self.weights.as_slice(), self.kv.as_mut_slice()) {
             return weights.forward_layers(
                 kv,
@@ -2961,6 +3067,22 @@ impl GpuTransformer {
         })
     }
 
+    /// Start reading, in the background, the engram table rows of the next
+    /// `tokens` of a sequence whose earlier tokens are `history`. A hint: a
+    /// model without an engram table does nothing.
+    pub(crate) fn engram_prefetch(&self, history: &[u32], tokens: &[u32]) {
+        if let Some(w) = self.weights.first() {
+            w.engram_prefetch(history, tokens);
+        }
+    }
+
+    /// The counters of the engram table this device reads, when it has one.
+    pub(crate) fn engram_counters(
+        &self,
+    ) -> Option<std::sync::Arc<super::engram_io::EngramCounters>> {
+        self.weights.first()?.engram_counters()
+    }
+
     /// The block pools' layout: groups and blocks per group.
     pub(crate) fn kv_layout(&self) -> &KvLayout {
         &self.layout
@@ -2989,6 +3111,9 @@ impl GpuTransformer {
     /// [`GpuTransformer::restore`]s a snapshot. Unlike the CPU engine it keeps
     /// no verify record (no drafter can pair with a hybrid model on a GPU).
     pub(crate) fn rewind(&mut self, slot: usize, len: usize) -> usize {
+        if let Some(state) = &mut self.hyper {
+            return state.rewind(slot, len);
+        }
         if !self.hybrid {
             return len;
         }
@@ -3006,6 +3131,9 @@ impl GpuTransformer {
     /// failed pass). A no-op for an attention-only model and a slot out of
     /// range. Free: the zero tensors are shared handles.
     pub(crate) fn reset_slot(&mut self, slot: usize) {
+        if let Some(state) = &mut self.hyper {
+            state.reset(slot);
+        }
         if let Some(state) = self.slots.get_mut(slot) {
             state.layers.clone_from(&self.zero);
             state.len = 0;
@@ -3060,7 +3188,13 @@ impl GpuTransformer {
     /// be returned to: unbounded for an attention-only model, 1 for a hybrid
     /// one (no verify record is kept).
     pub(crate) fn rollback_rows(&self) -> usize {
-        if self.hybrid { 1 } else { usize::MAX }
+        if self.hyper.is_some() {
+            super::cpu::MAX_VERIFY_ROWS
+        } else if self.hybrid {
+            1
+        } else {
+            usize::MAX
+        }
     }
 }
 
@@ -3093,7 +3227,16 @@ impl GpuTransformer {
         exact: bool,
     ) -> Result<Forward, CucaError> {
         let seq = self.solo.begin(start_pos, tokens.len())?;
-        let batch = Batch::single(tokens, start_pos, &seq.tables, want, hidden, exact);
+        let history = self.solo_ids[..start_pos.min(self.solo_ids.len())].to_vec();
+        let batch = Batch::single(
+            tokens,
+            start_pos,
+            &history,
+            &seq.tables,
+            want,
+            hidden,
+            exact,
+        );
         let out = self.forward_batch(&batch).and_then(|mut outs| {
             if outs.len() == 1 {
                 Ok(outs.swap_remove(0))
@@ -3103,6 +3246,10 @@ impl GpuTransformer {
         });
         self.solo
             .finish(seq, out.is_ok().then_some(start_pos + tokens.len()));
+        if out.is_ok() {
+            self.solo_ids.truncate(start_pos);
+            self.solo_ids.extend_from_slice(tokens);
+        }
         out
     }
 
@@ -3115,6 +3262,7 @@ impl GpuTransformer {
         if kept != state {
             self.rewind(0, kept);
         }
+        self.solo_ids.truncate(kept);
         kept
     }
 
@@ -3189,8 +3337,7 @@ impl GpuDrafter {
     /// is not a drafter, the hidden widths, vocabularies or K/V geometry
     /// differ, or a weight cannot be read.
     pub(crate) fn open(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         target: &GpuTransformer,
         context_length: usize,
     ) -> Result<Self, CucaError> {
@@ -3240,10 +3387,10 @@ impl GpuDrafter {
             }
         }
         let (n_embd, n_embd_out) = (hp.n_embd, hp.n_embd_out);
-        let mut reader = WeightReader::open(content, path, &target.weights[0].device, None)?;
+        let mut reader = WeightReader::open(content, &target.weights[0].device, None)?;
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
-        let net = Weights::load(&mut reader, path, &hp, Tp::SOLO, context_length, None, 0)?;
+        let net = Weights::load(&mut reader, &hp, Tp::SOLO, context_length, None, 0, None)?;
         let vocab = net.head_parts()?.lm_head.rows();
         if vocab != target.vocab() {
             return Err(err(format!(
@@ -3555,6 +3702,9 @@ fn load_layer(
     let mixer = match (spec.delta(), spec.mla) {
         (Some(delta), _) => Mixer::Delta(Box::new(load_delta(reader, hp, il, delta)?)),
         (None, Some(mla)) => Mixer::Mla(Box::new(load_mla(reader, hp, il, spec, &mla)?)),
+        (None, None) if hp.behavior.compressed_attention => {
+            Mixer::Csa(Box::new(hyper::load_csa(reader, hp, il, spec)?))
+        }
         (None, None) => Mixer::Attention(load_attention(reader, hp, tp, il, spec, layout)?),
     };
 
@@ -3582,6 +3732,29 @@ fn load_layer(
             Some(spec),
         ) => FfnWeights::Moe {
             spec,
+            ext: match &hp.moe_ext {
+                Some(ext) => Some(Box::new(GpuRouterExt {
+                    scoring: match ext.gating {
+                        Gating::SqrtSoftplus => mk::Scoring::SqrtSoftplus,
+                        Gating::Softmax => mk::Scoring::Softmax,
+                        Gating::Sigmoid => {
+                            return Err(err("the sigmoid router is not supported on the GPU"));
+                        }
+                    },
+                    bias: if reader
+                        .content
+                        .tensor_infos
+                        .contains_key(&name::blk_bias(il, name::EXP_PROBS_B))
+                    {
+                        Some(reader.vector(&name::blk_bias(il, name::EXP_PROBS_B), spec.n_expert)?)
+                    } else {
+                        None
+                    },
+                    clamp: ext.clamp[il],
+                    clamp_shared: ext.clamp_shared[il],
+                })),
+                None => None,
+            },
             router: reader.matrix(&blk(name::FFN_GATE_INP), spec.n_expert, n_embd)?,
             experts: reader.expert_bank(il, spec.n_expert, ff, n_embd, fused, tiers, tp)?,
             shared: match shared_ff {
@@ -3644,6 +3817,11 @@ fn load_layer(
         )?,
         ple,
         out_scale,
+        hc: if hp.behavior.hyper_connections {
+            Some(Box::new(hyper::load_hc(reader, hp, il)?))
+        } else {
+            None
+        },
     })
 }
 
@@ -3660,6 +3838,10 @@ struct Seg<'a> {
     slot: usize,
     want: Want,
     hidden: Hidden,
+    /// The tokens of the rows.
+    tokens: &'a [u32],
+    /// The sequence's tokens before `start`.
+    history: &'a [u32],
 }
 
 /// Host-side row ranges, coalescing a range that continues the last one.
@@ -4219,6 +4401,9 @@ impl Weights {
             Mixer::Mla(mw) => self.mla(il, h, mw, pass, kv),
             Mixer::Delta(dw) => self.delta(il, h, dw, pass, slots),
             Mixer::Attention(aw) => self.attention(il, h, aw, pass, kv, ext),
+            Mixer::Csa(_) => Err(err(
+                "a hyper-connection layer runs through the hyper-connection pass",
+            )),
         }
     }
 
@@ -4584,6 +4769,7 @@ impl FfnWeights {
                 router,
                 experts,
                 shared,
+                ext,
             } => {
                 let [t, _] = f.dims();
                 let act_code = match act {
@@ -4605,13 +4791,31 @@ impl FfnWeights {
                     slot: layout,
                 };
                 let logits = linear(f.clone(), router);
-                let route = mk::route(logits, &call(t * spec.n_used, false), spec.norm_weights);
+                let (clamp, clamp_shared) = ext
+                    .as_ref()
+                    .map_or((0.0, 0.0), |e| (e.clamp, e.clamp_shared));
+                let route = match ext.as_deref() {
+                    None => mk::route(logits, &call(t * spec.n_used, false), spec.norm_weights),
+                    Some(e) => mk::route_scored(
+                        logits,
+                        e.bias.clone(),
+                        &call(t * spec.n_used, false),
+                        e.scoring,
+                        spec.norm_weights,
+                    ),
+                };
                 // The shared expert, scaled per token by
                 // `sigmoid(gate_inp . x)`: the dot product is an
                 // elementwise product and a row sum, not a matmul.
                 let shared_out = |sh: &GpuShared, f: Tensor<2>| {
-                    let hidden =
-                        activate(linear(f.clone(), &sh.gate), act) * linear(f.clone(), &sh.up);
+                    let (mut gate, mut up) =
+                        (linear(f.clone(), &sh.gate), linear(f.clone(), &sh.up));
+                    if clamp_shared > 0.0 {
+                        let limit = f64::from(clamp_shared);
+                        gate = gate.clamp_max(limit);
+                        up = up.clamp(-limit, limit);
+                    }
+                    let hidden = activate(gate, act) * up;
                     let y = linear(hidden, &sh.down);
                     match &sh.gate_inp {
                         Some(gate_inp) => {
@@ -4621,7 +4825,7 @@ impl FfnWeights {
                         None => y,
                     }
                 };
-                experts.run(f.clone(), route, &call, device, || {
+                experts.run(f.clone(), route, &call, device, clamp, || {
                     shared.as_ref().map(|sh| shared_out(sh, f))
                 })
             }
@@ -5102,16 +5306,23 @@ fn attend(
         .reshape([1, n_head, t, dv])
 }
 
+/// The opened GPU device the kernel unit tests of the sibling modules run on:
+/// `None` (a `SKIP:` line) unless `CUCA_LOCAL_DEVICE` names a GPU.
+#[cfg(test)]
+pub(super) fn kernel_test_device() -> Option<Device> {
+    tests::test_device().map(|d| open_device(d).expect("the test device opens"))
+}
+
 #[cfg(test)]
 mod tests {
-    use std::io::BufReader;
 
     use super::super::cpu::Transformer;
     use super::super::paged::{KvPools, SeqBlocks};
     use super::super::split::SplitModel;
     use super::super::tiny::{
-        Lcg, PROMPT, TinyMistral4, TinyModel, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB,
-        write_mistral4, write_qwen35, write_spec, write_tiny_model_with,
+        Lcg, PROMPT, TinyDeepseek41, TinyMistral4, TinyModel, TinyMoe, TinyOptions, TinyQwen35,
+        TinySpec, VOCAB, write_deepseek41, write_mistral4, write_qwen35, write_spec,
+        write_tiny_model_with,
     };
     use super::super::{SeqRows, StateSlot};
     use super::*;
@@ -5140,7 +5351,7 @@ mod tests {
 
     /// The GPU device under test, the first of [`test_devices`]; `None`
     /// (skip) when unset or `cpu`.
-    fn test_device() -> Option<LocalDevice> {
+    pub(super) fn test_device() -> Option<LocalDevice> {
         let device = test_devices().first().copied();
         if device.is_none() {
             println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
@@ -5148,15 +5359,15 @@ mod tests {
         device
     }
 
-    fn content_of(model: &TinyModel) -> gguf_file::Content {
-        gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap())).unwrap()
+    fn content_of(model: &TinyModel) -> gguf::Content {
+        gguf::Content::open(&model.path).unwrap()
     }
 
     fn load_both(model: &TinyModel, device: LocalDevice) -> (Transformer, GpuTransformer) {
         let content = content_of(model);
         (
-            Transformer::load_dequantized(&content, &model.path, 32).unwrap(),
-            GpuTransformer::load(&content, &model.path, 32, device).unwrap(),
+            Transformer::load_dequantized(&content, 32).unwrap(),
+            GpuTransformer::load(&content, 32, device).unwrap(),
         )
     }
 
@@ -5326,6 +5537,650 @@ mod tests {
         }
         for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
             check_hybrid_model(&write_qwen35(&spec), device, label);
+        }
+        for (label, spec) in hyper_variants() {
+            check_hyper_model(&write_deepseek41(&spec), device, label);
+        }
+    }
+
+    /// The tiny DeepSeek-V4.1 models of the GPU tests: Q8_0 experts, MXFP4
+    /// experts and an indexer without candidate blocks.
+    fn hyper_variants() -> Vec<(&'static str, TinyDeepseek41)> {
+        vec![
+            ("deepseek41", TinyDeepseek41::default()),
+            (
+                "deepseek41 mxfp4",
+                TinyDeepseek41 {
+                    mxfp4: true,
+                    ..TinyDeepseek41::default()
+                },
+            ),
+            (
+                "deepseek41 no candidates",
+                TinyDeepseek41 {
+                    candidates: None,
+                    ..TinyDeepseek41::default()
+                },
+            ),
+        ]
+    }
+
+    /// The tokens of the hyper-connection tests.
+    fn hyper_prompt(n: usize) -> Vec<u32> {
+        (0..n as u32)
+            .map(|i| (i * 5 + 3 + i / 7) % VOCAB as u32)
+            .collect()
+    }
+
+    /// Context of the tiny DeepSeek-V4.1 models.
+    const HYPER_CTX: usize = 96;
+
+    /// Both engines over one tiny hyper-connection model, the simulated
+    /// quantization off on both (its rounding decisions are chaotic: a one
+    /// ulp difference flips them).
+    fn load_hyper(content: &gguf::Content, device: LocalDevice) -> (Transformer, GpuTransformer) {
+        (
+            super::super::cpu::without_qdq(|| {
+                Transformer::load_dequantized(content, HYPER_CTX).unwrap()
+            }),
+            hyper::without_qdq(|| GpuTransformer::load(content, HYPER_CTX, device).unwrap()),
+        )
+    }
+
+    /// The GPU engine must reproduce the CPU engine on a hyper-connection
+    /// model: whole prefill, chunked prefill across the window, the
+    /// compressor's pairs and the candidate blocks, decode, every-position
+    /// logits and truncate-and-replay.
+    fn check_hyper_model(model: &TinyModel, device: LocalDevice, label: &str) {
+        let content = content_of(model);
+        let p = hyper_prompt(60);
+        let (mut cpu, mut gpu) = load_hyper(&content, device);
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &p,
+            0,
+            Want::All,
+            &format!("{label} prefill"),
+        );
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &[7],
+            p.len(),
+            Want::Last,
+            &format!("{label} decode"),
+        );
+
+        let (mut cpu, mut gpu) = load_hyper(&content, device);
+        let mut start = 0;
+        for size in [5usize, 1, 14, 3, 17, 1, 7] {
+            let chunk = &p[start..start + size];
+            compare(
+                &mut cpu,
+                &mut gpu,
+                chunk,
+                start,
+                Want::All,
+                &format!("{label} chunk at {start}"),
+            );
+            start += size;
+        }
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &p[start..],
+            start,
+            Want::Last,
+            &format!("{label} chunked"),
+        );
+
+        // Roll back into the last call (an odd position holds a half-pooled
+        // pair) and replay.
+        let (mut cpu, mut gpu) = load_hyper(&content, device);
+        cpu.forward(&p[..40], 0, Want::None).unwrap();
+        gpu.forward(&p[..40], 0, Want::None).unwrap();
+        cpu.forward(&p[40..], 40, Want::None).unwrap();
+        gpu.forward(&p[40..], 40, Want::None).unwrap();
+        assert_eq!(cpu.truncate_cache(53), 53, "{label}");
+        assert_eq!(gpu.truncate_cache(53), 53, "{label}");
+        compare(
+            &mut cpu,
+            &mut gpu,
+            &[4, 5, 6, 7],
+            53,
+            Want::All,
+            &format!("{label} replay"),
+        );
+    }
+
+    /// The converted real DeepSeek-V4.1-Flash on the GPU (dense weights and
+    /// attention on the device, the experts host-tiered) against the
+    /// streaming oracle of the CPU test (`cpu::real_tests`, same gates:
+    /// `CUCA_LOCAL_DS41_REAL`, `CUCA_CACHE_DIR`, `CUCA_LOCAL_DS41_REAL_RAM`
+    /// GiB of expert RAM, default 85). Without them it prints `SKIP:`.
+    fn real_model_on_the_gpu(mode: &str, qdq: bool) -> Option<f64> {
+        use super::super::cpu::real_tests::{prompt_ids, score, setup};
+        let device = test_device()?;
+        let (dir, model) = setup()?;
+        let ids = prompt_ids(&dir);
+        let gib: u64 = std::env::var("CUCA_LOCAL_DS41_REAL_RAM")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(85);
+        // `CUCA_LOCAL_DS41_REAL_GPU_LAYERS=n` runs the last `n` layers on the
+        // GPU and the rest on the CPU (layer offload), with a 3 GiB device
+        // tier for the GPU half's experts; otherwise every layer is on the
+        // GPU and the experts are host-tiered.
+        let split: Option<usize> = std::env::var("CUCA_LOCAL_DS41_REAL_GPU_LAYERS")
+            .ok()
+            .and_then(|v| v.parse().ok());
+        let experts = ExpertPlacement::Tiered(ExpertTiers {
+            ram_bytes: gib << 30,
+            device_bytes: if split.is_some() { 3 << 30 } else { 0 },
+            ..ExpertTiers::default()
+        });
+        let started = std::time::Instant::now();
+        let content = gguf::Content::open(&model).unwrap();
+        let (logits, loaded, pass, tiers, label) = if let Some(gpu_layers) = split {
+            let n_layer = read_hparams(&content).unwrap().n_layer;
+            let load = || {
+                SplitModel::load(
+                    &content,
+                    64,
+                    device,
+                    &experts,
+                    &Sizing::single(64),
+                    n_layer - gpu_layers,
+                    &EngramCache::default(),
+                )
+                .unwrap()
+            };
+            let mut m = if qdq {
+                load()
+            } else {
+                super::super::cpu::without_qdq(|| hyper::without_qdq(load))
+            };
+            let loaded = started.elapsed().as_secs_f64();
+            let mut pools = KvPools::new(m.kv_layout());
+            let mut seq = pools.seq();
+            pools.reserve(&mut seq, ids.len()).unwrap();
+            let started = std::time::Instant::now();
+            let rows = vec![SeqRows {
+                tokens: &ids,
+                start_pos: 0,
+                history: &[],
+                tables: &seq.tables,
+                state: StateSlot(0),
+                want: Want::All,
+                hidden: Hidden::None,
+            }];
+            let logits = m
+                .forward_batch(&Batch { rows, exact: true })
+                .unwrap()
+                .remove(0)
+                .logits
+                .unwrap();
+            let tiers = m.expert_tiers().map(|t| t.stats());
+            (
+                logits,
+                loaded,
+                started.elapsed().as_secs_f64(),
+                tiers,
+                format!("gpu {gpu_layers} layers"),
+            )
+        } else {
+            let load = || {
+                GpuTransformer::load_placed(
+                    &content,
+                    64,
+                    device,
+                    &[],
+                    &experts,
+                    &Sizing::single(64),
+                    &EngramCache::default(),
+                )
+                .unwrap()
+            };
+            let mut m = if qdq {
+                load()
+            } else {
+                hyper::without_qdq(load)
+            };
+            let loaded = started.elapsed().as_secs_f64();
+            let started = std::time::Instant::now();
+            let logits = m
+                .forward_ext(&ids, 0, Want::All, Hidden::None, true)
+                .unwrap()
+                .logits
+                .unwrap();
+            let tiers = m.expert_tiers().map(|t| t.stats());
+            (
+                logits,
+                loaded,
+                started.elapsed().as_secs_f64(),
+                tiers,
+                "gpu".to_string(),
+            )
+        };
+        let v = logits.len() / ids.len();
+        Some(score(
+            &dir,
+            mode,
+            &ids,
+            &logits,
+            v,
+            &format!("{label}|load {loaded:.0}s|pass {pass:.0}s"),
+            &format!("{tiers:?}"),
+            qdq,
+        ))
+    }
+
+    #[test]
+    fn real_model_on_the_gpu_matches_the_streaming_oracle_with_quantization_off() {
+        if let Some(kl) = real_model_on_the_gpu("off", false) {
+            assert!(kl < 5e-3, "KL {kl:.3e}");
+        }
+    }
+
+    #[test]
+    fn real_model_on_the_gpu_matches_the_streaming_oracle_with_quantization_on() {
+        if let Some(kl) = real_model_on_the_gpu("on", true) {
+            assert!(kl < 5e-2, "KL {kl:.3e}");
+        }
+    }
+
+    /// Speed of the real model on the GPU with its experts in the RAM tier
+    /// (`CUCA_LOCAL_DS41_REAL_SPEED=1`, same gates as above): the prompt cold
+    /// (every expert read from the file) and again warm, then one decode step
+    /// repeated at the same position, which finds its experts in RAM. It
+    /// prints `REAL|speed|...` and asserts nothing about the numbers.
+    #[test]
+    fn real_model_on_the_gpu_speed() {
+        use super::super::cpu::real_tests::{prompt_ids, setup};
+        if std::env::var_os("CUCA_LOCAL_DS41_REAL_SPEED").is_none() {
+            return;
+        }
+        let (Some(device), Some((dir, model))) = (test_device(), setup()) else {
+            return;
+        };
+        let ids = prompt_ids(&dir);
+        let experts = ExpertPlacement::Tiered(ExpertTiers {
+            ram_bytes: 85 << 30,
+            device_bytes: 0,
+            ..ExpertTiers::default()
+        });
+        let content = gguf::Content::open(&model).unwrap();
+        let mut m = GpuTransformer::load_placed(
+            &content,
+            64,
+            device,
+            &[],
+            &experts,
+            &Sizing::single(64),
+            &EngramCache::default(),
+        )
+        .unwrap();
+        let time = |m: &mut GpuTransformer, tokens: &[u32], at: usize| {
+            let started = std::time::Instant::now();
+            m.forward(tokens, at, Want::Last).unwrap().unwrap();
+            started.elapsed().as_secs_f64()
+        };
+        let cold = time(&mut m, &ids, 0);
+        m.truncate_cache(0);
+        let warm = time(&mut m, &ids, 0);
+        let first = time(&mut m, &[51119], ids.len());
+        let mut steps = Vec::new();
+        for _ in 0..6 {
+            m.truncate_cache(ids.len());
+            steps.push(time(&mut m, &[51119], ids.len()));
+        }
+        steps.sort_by(f64::total_cmp);
+        eprintln!(
+            "REAL|speed|gpu|prompt of {} tokens cold {cold:.1} s, warm {warm:.2} s ({:.1} tok/s)|first decode step {first:.2} s|warm decode step median {:.3} s best {:.3} s ({:.2} tok/s)|{:?}",
+            ids.len(),
+            ids.len() as f64 / warm,
+            steps[steps.len() / 2],
+            steps[0],
+            1.0 / steps[steps.len() / 2],
+            m.expert_tiers().map(|t| t.stats())
+        );
+    }
+
+    /// The engine on every tiny DeepSeek-V4.1 variant (Q8_0 experts, MXFP4
+    /// experts, an indexer without candidate blocks) against the CPU engine.
+    #[test]
+    fn gpu_matches_cpu_on_every_deepseek41_variant() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        for (label, spec) in hyper_variants() {
+            check_hyper_model(&write_deepseek41(&spec), device, label);
+        }
+    }
+
+    /// Three hyper-connection sequences run as batched steps (joint prefill,
+    /// decode rows at both parities of the compressor's pairs, a sequence
+    /// sitting one step out, a chunk next to decode rows, every-position
+    /// logits and hidden rows) equal each sequence run alone, and a prompt
+    /// that finds a 64-token prefix in the block store (a whole compressed
+    /// block) equals a cold prefill of the same prompt.
+    #[test]
+    fn gpu_hyper_batched_and_prefix_reuse_match_solo() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        for (label, spec) in hyper_variants() {
+            let model = write_deepseek41(&spec);
+            let content = content_of(&model);
+            let sizing = Sizing {
+                max_sequences: 3,
+                kv_tokens: 192,
+                max_rows: 32,
+            };
+            let mut batched = hyper::without_qdq(|| {
+                GpuTransformer::load_placed(
+                    &content,
+                    HYPER_CTX,
+                    device,
+                    &[],
+                    &ExpertPlacement::Resident,
+                    &sizing,
+                    &EngramCache::default(),
+                )
+                .unwrap()
+            });
+            let mut solo =
+                hyper::without_qdq(|| GpuTransformer::load(&content, HYPER_CTX, device).unwrap());
+            let (last, all, none) = (Want::Last, Want::All, Want::None);
+            let (plain, post, post_all) = (Hidden::None, Hidden::PostNorm, Hidden::PostNormAll);
+            // 30, 41 and 10 tokens per sequence in total.
+            let steps = [
+                vec![
+                    step(0, 5, last, plain),
+                    step(1, 9, last, post),
+                    step(2, 3, last, plain),
+                ],
+                vec![
+                    step(0, 1, last, post),
+                    step(1, 1, last, plain),
+                    step(2, 1, last, post),
+                ],
+                vec![
+                    step(0, 1, last, plain),
+                    step(1, 1, last, plain),
+                    step(2, 1, last, plain),
+                ],
+                // Sequence 0 sits this step out.
+                vec![step(1, 1, last, plain), step(2, 1, last, plain)],
+                // Sequence 0 prefills a chunk next to two decoding ones.
+                vec![
+                    step(0, 20, last, plain),
+                    step(1, 1, last, post),
+                    step(2, 1, last, plain),
+                ],
+                // Hidden rows only, every logits row, one logits row.
+                vec![
+                    step(0, 2, none, post_all),
+                    step(1, 3, all, post),
+                    step(2, 1, last, plain),
+                ],
+                vec![
+                    step(0, 1, last, plain),
+                    step(1, 1, last, plain),
+                    step(2, 2, last, post_all),
+                ],
+                vec![step(1, 24, all, plain)],
+            ];
+            let tokens: Vec<Vec<u32>> = (0..3)
+                .map(|s| hyper_prompt(90)[s * 9..s * 9 + 45].to_vec())
+                .collect();
+            let mut pools = KvPools::new(batched.kv_layout());
+            let mut seqs: Vec<SeqBlocks> = (0..3).map(|_| pools.seq()).collect();
+            let mut at = [0usize; 3];
+            let mut got: Vec<Vec<Forward>> = (0..3).map(|_| Vec::new()).collect();
+            for (si, rows_of_step) in steps.iter().enumerate() {
+                for st in rows_of_step {
+                    pools.reserve(&mut seqs[st.seq], at[st.seq] + st.n).unwrap();
+                }
+                let rows: Vec<SeqRows<'_>> = rows_of_step
+                    .iter()
+                    .map(|st| SeqRows {
+                        history: &tokens[st.seq][..at[st.seq]],
+                        tokens: &tokens[st.seq][at[st.seq]..at[st.seq] + st.n],
+                        start_pos: at[st.seq],
+                        tables: &seqs[st.seq].tables,
+                        state: StateSlot(st.seq),
+                        want: st.want,
+                        hidden: st.hidden,
+                    })
+                    .collect();
+                let outs = batched
+                    .forward_batch(&Batch { rows, exact: false })
+                    .unwrap();
+                assert_eq!(outs.len(), rows_of_step.len(), "{label} step {si}");
+                for (st, out) in rows_of_step.iter().zip(outs) {
+                    got[st.seq].push(out);
+                    at[st.seq] += st.n;
+                }
+            }
+            assert_eq!(at, [30, 41, 10], "{label}");
+            for (s, got) in got.iter().enumerate() {
+                assert_eq!(solo.truncate_cache(0), 0, "{label}");
+                let (mut pos, mut k) = (0, 0);
+                for st in steps.iter().flatten().filter(|st| st.seq == s) {
+                    let alone = solo
+                        .forward_ext(&tokens[s][pos..pos + st.n], pos, st.want, st.hidden, false)
+                        .unwrap();
+                    assert_forward_within(
+                        &got[k],
+                        &alone,
+                        1e-3,
+                        &format!("{label} seq {s} call {k}"),
+                    );
+                    pos += st.n;
+                    k += 1;
+                }
+            }
+
+            // Prefix reuse: the first prompt fills the store, 16 rows at a
+            // time as the engine does.
+            let mut pools = KvPools::new(batched.kv_layout());
+            let p = hyper_prompt(75);
+            let mut a = pools.seq();
+            let mut from = 0;
+            while from < p.len() {
+                let end = (from + 16).min(p.len());
+                pools.reserve(&mut a, end).unwrap();
+                let rows = vec![SeqRows {
+                    tokens: &p[from..end],
+                    start_pos: from,
+                    history: &p[..from],
+                    tables: &a.tables,
+                    state: StateSlot(0),
+                    want: Want::None,
+                    hidden: Hidden::None,
+                }];
+                batched
+                    .forward_batch(&Batch { rows, exact: false })
+                    .unwrap();
+                a.len = end;
+                pools.release_window(&mut a, end, Some(&p));
+                pools.publish(&mut a, &p);
+                from = end;
+            }
+            pools.finish(&mut a, &p);
+            // Another prompt with the same first 70 tokens finds the prefix:
+            // a multiple of 32 (the compressed blocks span 32 tokens).
+            let mut q = p[..70].to_vec();
+            q.extend_from_slice(&[1, 2, 3, 4, 5]);
+            let hit = pools.lookup(&q);
+            assert_eq!(
+                hit.len, 64,
+                "{label}: the prefix is a whole compressed block"
+            );
+            let mut b = hit.into_seq();
+            pools.reserve(&mut b, q.len()).unwrap();
+            let rows = vec![SeqRows {
+                tokens: &q[64..],
+                start_pos: 64,
+                history: &q[..64],
+                tables: &b.tables,
+                state: StateSlot(1),
+                want: Want::All,
+                hidden: Hidden::None,
+            }];
+            let warm = batched
+                .forward_batch(&Batch { rows, exact: false })
+                .unwrap()
+                .remove(0)
+                .logits
+                .unwrap();
+            assert_eq!(solo.truncate_cache(0), 0, "{label}");
+            let cold = solo.forward(&q, 0, Want::All).unwrap().unwrap();
+            assert_rows_within(
+                &warm,
+                &cold[64 * VOCAB..],
+                1e-3,
+                &format!("{label} prefix hit"),
+            );
+        }
+    }
+
+    /// The engram rows of the next chunk are requested while a chunk runs:
+    /// no row is read twice (a pass asks for rows the prefetch already
+    /// holds or is reading) and no output bit changes.
+    #[test]
+    fn gpu_engram_prefetch_reads_each_row_once_and_changes_no_bit() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        let model = write_deepseek41(&TinyDeepseek41::default());
+        let content = content_of(&model);
+        let p = hyper_prompt(50);
+        let run = |prefetch: bool| {
+            let mut m =
+                hyper::without_qdq(|| GpuTransformer::load(&content, HYPER_CTX, device).unwrap());
+            let counters = m.engram_counters().expect("the model has an engram table");
+            let mut out = Vec::new();
+            for (i, chunk) in p.chunks(16).enumerate() {
+                let end = (i + 1) * 16;
+                if prefetch && end < p.len() {
+                    m.engram_prefetch(&p[..end], &p[end..(end + 16).min(p.len())]);
+                }
+                out.push(m.forward(chunk, i * 16, Want::Last).unwrap().unwrap());
+            }
+            (out, counters.snapshot())
+        };
+        let (want, plain) = run(false);
+        let (got, hinted) = run(true);
+        assert_eq!(got, want, "a prefetch changes no bit");
+        assert!(plain.disk_reads > 0, "{plain:?}");
+        assert_eq!(
+            hinted.disk_reads, plain.disk_reads,
+            "{hinted:?} vs {plain:?}"
+        );
+        assert_eq!(hinted.lookups, plain.lookups);
+    }
+
+    /// Layer offload of a hyper-connection model: the cuts that keep every
+    /// source with the layers that read it (see [`split::legal_cut`]) give
+    /// the logits of the GPU-only load, with the compressor's pairs and the
+    /// engram history crossing the boundary in both halves, rolled back into
+    /// the last call; every other cut is rejected naming the legal ones. One
+    /// engram table serves both halves.
+    #[test]
+    fn gpu_offload_of_a_hyper_model_matches_single_device_at_every_legal_cut() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        for (label, spec) in hyper_variants().into_iter().take(1) {
+            let model = write_deepseek41(&spec);
+            let content = content_of(&model);
+            let hp = read_hparams(&content).unwrap();
+            let n_layer = hp.n_layer;
+            let legal = super::super::split::legal_gpu_layers(&hp);
+            // The tiny model has two cache sources, layers 1 and 3.
+            assert_eq!(legal, vec![0, 3, 5, n_layer], "{label}");
+            let sizing = Sizing {
+                max_sequences: 2,
+                kv_tokens: 192,
+                max_rows: 32,
+            };
+            let steps: Vec<Vec<Step>> = vec![
+                vec![step(0, 21, Want::Last, Hidden::None)],
+                vec![step(0, 1, Want::Last, Hidden::PostNorm)],
+                vec![step(1, 30, Want::All, Hidden::PostNormAll)],
+                vec![
+                    step(0, 1, Want::Last, Hidden::None),
+                    step(1, 1, Want::Last, Hidden::None),
+                ],
+                vec![
+                    step(0, 14, Want::All, Hidden::None),
+                    step(1, 3, Want::Last, Hidden::None),
+                ],
+                vec![
+                    step(0, 1, Want::Last, Hidden::None),
+                    step(1, 1, Want::Last, Hidden::None),
+                ],
+            ];
+            let tokens: Vec<Vec<u32>> = vec![hyper_prompt(40), hyper_prompt(50)[10..].to_vec()];
+            let mut reference = hyper::without_qdq(|| {
+                GpuTransformer::load_placed(
+                    &content,
+                    HYPER_CTX,
+                    device,
+                    &[],
+                    &ExpertPlacement::Resident,
+                    &sizing,
+                    &EngramCache::default(),
+                )
+                .unwrap()
+            });
+            let want = run_steps(&mut reference, &steps, &tokens);
+            let want_reads = reference.engram_counters().unwrap().snapshot();
+            drop(reference);
+            for gpu_layers in 1..n_layer {
+                if !legal.contains(&gpu_layers) {
+                    let e = super::super::split::plan(&hp, gpu_layers).unwrap_err();
+                    assert!(
+                        matches!(&e, CucaError::Config(m) if m.contains(&format!("gpu_layers {gpu_layers} cuts")) && m.contains("legal values: 0, 3, 5, 6")),
+                        "{label}: {e:?}"
+                    );
+                    continue;
+                }
+                let first = n_layer - gpu_layers;
+                let mut split = super::super::cpu::without_qdq(|| {
+                    hyper::without_qdq(|| {
+                        SplitModel::load_with(
+                            &content,
+                            HYPER_CTX,
+                            device,
+                            &ExpertPlacement::Resident,
+                            &sizing,
+                            first,
+                            true,
+                            &EngramCache::default(),
+                        )
+                        .unwrap()
+                    })
+                });
+                let got = run_steps(&mut split, &steps, &tokens);
+                // One table serves both halves: the counters cover every
+                // lookup and every row is read once, as on one device.
+                let reads = split.engram_counters().unwrap().snapshot();
+                assert_eq!(reads.lookups, want_reads.lookups, "{label}: {gpu_layers}");
+                assert_eq!(
+                    reads.disk_reads, want_reads.disk_reads,
+                    "{label}: {gpu_layers}"
+                );
+                for (call, (g, w)) in got.iter().zip(&want).enumerate() {
+                    let at = format!(
+                        "{label}: {gpu_layers} of {n_layer} layers on the GPU, call {call}"
+                    );
+                    assert_forward_within(g, w, 1e-3, &at);
+                }
+            }
         }
     }
 
@@ -5498,15 +6353,15 @@ mod tests {
         };
         let mut batched = GpuTransformer::load_placed(
             &content,
-            &model.path,
             CTX,
             device,
             &[],
             &ExpertPlacement::Resident,
             &sizing,
+            &EngramCache::default(),
         )
         .unwrap();
-        let mut solo = GpuTransformer::load(&content, &model.path, CTX, device).unwrap();
+        let mut solo = GpuTransformer::load(&content, CTX, device).unwrap();
         let hybrid = batched.is_hybrid();
         assert_eq!(solo.is_hybrid(), hybrid, "{label}");
 
@@ -5563,6 +6418,7 @@ mod tests {
             let rows: Vec<SeqRows<'_>> = rows_of_step
                 .iter()
                 .map(|st| SeqRows {
+                    history: &tokens[st.seq][..at[st.seq]],
                     tokens: &tokens[st.seq][at[st.seq]..at[st.seq] + st.n],
                     start_pos: at[st.seq],
                     tables: &seqs[st.seq].tables,
@@ -5611,6 +6467,7 @@ mod tests {
         }
 
         let bad = |slot: usize, start_pos: usize, tables: &'static [Vec<u32>]| SeqRows {
+            history: &[],
             tokens: &[1],
             start_pos,
             tables,
@@ -5648,6 +6505,7 @@ mod tests {
         batched.restore(3, &snapshot, pos).unwrap();
         for (k, st) in (3..).zip(steps[3..].iter().flatten().filter(|st| st.seq == 1)) {
             let rows = vec![SeqRows {
+                history: &[],
                 tokens: &tokens[1][pos..pos + st.n],
                 start_pos: pos,
                 tables: &seqs[1].tables,
@@ -5695,6 +6553,7 @@ mod tests {
         let twice = Batch {
             rows: vec![
                 SeqRows {
+                    history: &[],
                     tokens: &tokens[1][17..18],
                     start_pos: 17,
                     tables: &seqs[1].tables,
@@ -5703,6 +6562,7 @@ mod tests {
                     hidden: Hidden::None,
                 },
                 SeqRows {
+                    history: &[],
                     tokens: &tokens[1][17..18],
                     start_pos: 17,
                     tables: &seqs[1].tables,
@@ -5719,6 +6579,7 @@ mod tests {
         );
         let off = Batch {
             rows: vec![SeqRows {
+                history: &[],
                 tokens: &tokens[0][..1],
                 start_pos: 3,
                 tables: &seqs[0].tables,
@@ -5770,12 +6631,12 @@ mod tests {
         let content = content_of(model);
         GpuTransformer::load_placed(
             &content,
-            &model.path,
             32,
             device,
             &[],
             experts,
             &Sizing::single(32),
+            &EngramCache::default(),
         )
     }
 
@@ -5852,6 +6713,11 @@ mod tests {
                 });
                 (arch, model)
             })
+            .chain(
+                hyper_variants()
+                    .into_iter()
+                    .map(|(label, spec)| (label, write_deepseek41(&spec))),
+            )
             .chain([
                 ("qwen35moe", qwen35moe),
                 (
@@ -5872,10 +6738,20 @@ mod tests {
             ])
             .collect();
         for (arch, model) in &models {
-            let min = 2 * expert_device_bytes(model) as u64;
-            let want = greedy_run(
-                &mut load_placed_gpu(model, device, &ExpertPlacement::Resident).unwrap(),
-            );
+            // The smallest budget holds `n_used` experts per layer (two for
+            // most of the tiny models). The simulated quantization of a
+            // hyper-connection model is off: its rounding decisions are
+            // chaotic and tiers regroup the experts' rows.
+            let n_used = read_hparams(&content_of(model))
+                .unwrap()
+                .moe
+                .unwrap()
+                .n_used;
+            let min = n_used as u64 * expert_device_bytes(model) as u64;
+            let load = |placement: &ExpertPlacement| {
+                hyper::without_qdq(|| load_placed_gpu(model, device, placement))
+            };
+            let want = greedy_run(&mut load(&ExpertPlacement::Resident).unwrap());
             let tiers = |ram_bytes, warm_from| {
                 ExpertPlacement::Tiered(ExpertTiers {
                     ram_bytes,
@@ -5886,7 +6762,7 @@ mod tests {
             };
             let mut heat = None;
             for ram_bytes in [0, min] {
-                let mut tiered = load_placed_gpu(model, device, &tiers(ram_bytes, None)).unwrap();
+                let mut tiered = load(&tiers(ram_bytes, None)).unwrap();
                 let got = greedy_run(&mut tiered);
                 assert_close_logits(&got, &want, &format!("{arch} ram={ram_bytes}"));
                 let stats = tiered.expert_tiers().unwrap().stats();
@@ -5902,7 +6778,7 @@ mod tests {
             }
             // The warm start fills the device tier at load and changes no
             // logit.
-            let mut warm = load_placed_gpu(model, device, &tiers(min, heat)).unwrap();
+            let mut warm = load(&tiers(min, heat)).unwrap();
             let loaded = warm.expert_tiers().unwrap().stats();
             assert!(loaded.device_resident_bytes > 0, "{arch}: {loaded:?}");
             assert!(loaded.device_resident_bytes <= min, "{arch}: {loaded:?}");
@@ -5918,9 +6794,9 @@ mod tests {
                 loader_threads: 2,
                 ..ExpertTiers::default()
             });
-            let e = load_placed_gpu(model, device, &below).err().unwrap();
+            let e = load(&below).err().unwrap();
             assert!(
-                matches!(&e, CucaError::Config(m) if m.contains(&format!("at least 2 ({min} bytes)"))),
+                matches!(&e, CucaError::Config(m) if m.contains(&format!("at least {n_used} ({min} bytes)"))),
                 "{arch}: {e:?}"
             );
         }
@@ -5963,23 +6839,31 @@ mod tests {
         for (label, spec) in mistral4_variants() {
             models.push((label.to_string(), write_mistral4(&spec)));
         }
+        // The simulated quantization is off on the GPU side (see
+        // `load_hyper`): the host path computes the dequantized f32 matrices
+        // on the CPU where the resident kernel accumulates the blocks, and
+        // that rounding difference flips a quantizer decision downstream.
+        for (label, spec) in hyper_variants() {
+            models.push((label.to_string(), write_deepseek41(&spec)));
+        }
         // The CPU half holds the hosted experts as f32 (see
         // [`GpuTransformer::load_host_exact`]).
         for (label, model) in &models {
-            let want = greedy_run(
-                &mut load_placed_gpu(model, device, &ExpertPlacement::Resident).unwrap(),
-            );
+            let want = greedy_run(&mut hyper::without_qdq(|| {
+                load_placed_gpu(model, device, &ExpertPlacement::Resident).unwrap()
+            }));
             let content = content_of(model);
             for layers in [None, Some(1)] {
-                let mut host = GpuTransformer::load_host_exact(
-                    &content,
-                    &model.path,
-                    32,
-                    device,
-                    &ExpertPlacement::Host { layers },
-                    &Sizing::single(32),
-                )
-                .unwrap();
+                let mut host = hyper::without_qdq(|| {
+                    GpuTransformer::load_host_exact(
+                        &content,
+                        32,
+                        device,
+                        &ExpertPlacement::Host { layers },
+                        &Sizing::single(32),
+                    )
+                    .unwrap()
+                });
                 let got = greedy_run(&mut host);
                 assert_close_logits(&got, &want, &format!("{label} host {layers:?}"));
             }
@@ -5992,6 +6876,44 @@ mod tests {
             matches!(&e, CucaError::Config(m) if m.contains("host experts need a mixture-of-experts model")),
             "{e:?}"
         );
+    }
+
+    /// Host-tiered experts (`ExpertPlacement::Tiered` with no device tier: the
+    /// experts stay in the file behind a RAM tier and the CPU computes the
+    /// ones a pass needs) give the logits of host experts held in RAM: the
+    /// GPU half and the CPU arithmetic are the same, only where the experts
+    /// come from differs. The combination with `gpu_layers` is rejected.
+    #[test]
+    fn gpu_host_tiered_experts_match_gpu_host_experts() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        for (label, spec) in hyper_variants() {
+            let model = write_deepseek41(&spec);
+            let content = content_of(&model);
+            let hp = read_hparams(&content).unwrap();
+            let n_used = hp.moe.unwrap().n_used;
+            let per_expert = expert_device_bytes(&model) as u64;
+            let load = |placement: &ExpertPlacement| {
+                hyper::without_qdq(|| load_placed_gpu(&model, device, placement))
+            };
+            let want = greedy_run(&mut load(&ExpertPlacement::Host { layers: None }).unwrap());
+            for ram_bytes in [n_used as u64 * per_expert, 8 * per_expert] {
+                let tiered = ExpertPlacement::Tiered(ExpertTiers {
+                    ram_bytes,
+                    device_bytes: 0,
+                    loader_threads: 2,
+                    warm_from: None,
+                });
+                let mut m = load(&tiered).unwrap();
+                let got = greedy_run(&mut m);
+                assert_close_logits(&got, &want, &format!("{label} ram={ram_bytes}"));
+                let stats = m.expert_tiers().unwrap().stats();
+                assert!(stats.disk_reads > 0, "{label}: {stats:?}");
+                assert_eq!(stats.device_resident_bytes, 0, "{label}: {stats:?}");
+                assert!(stats.ram_resident_bytes <= ram_bytes, "{label}: {stats:?}");
+            }
+        }
     }
 
     /// Past a sliding window (the tiny Gemma 3 at 1400 positions, window 4,
@@ -6008,8 +6930,8 @@ mod tests {
             ..TinySpec::gemma3()
         });
         let content = content_of(&model);
-        let mut cpu = Transformer::load_dequantized(&content, &model.path, 1400).unwrap();
-        let mut gpu = GpuTransformer::load(&content, &model.path, 1400, device).unwrap();
+        let mut cpu = Transformer::load_dequantized(&content, 1400).unwrap();
+        let mut gpu = GpuTransformer::load(&content, 1400, device).unwrap();
         let tokens: Vec<u32> = (0..1350u32).map(|i| (i * 7 + i / 5) % 16).collect();
         for (i, chunk) in tokens.chunks(256).enumerate() {
             let at = i * 256;
@@ -7057,8 +7979,8 @@ mod tests {
             let (c_hidden, g_hidden) = (c.hidden.unwrap(), g.hidden.unwrap());
             let c_tables = cpu.solo_tables().to_vec();
             let cpu = super::super::Model::Cpu(cpu);
-            let cpu_drafter = Drafter::open(&content, &drafter.path, &cpu, 32).unwrap();
-            let gpu_drafter = GpuDrafter::open(&content, &drafter.path, &gpu, 32).unwrap();
+            let cpu_drafter = Drafter::open(&content, &cpu, 32).unwrap();
+            let gpu_drafter = GpuDrafter::open(&content, &gpu, 32).unwrap();
 
             let mut c_logits = Vec::new();
             let c_tokens = cpu_drafter
@@ -7125,16 +8047,14 @@ mod tests {
         let (_, mut gpu) = load_both(&model, device);
         let (model_content, drafter_content) = (content_of(&model), content_of(&drafter));
 
-        let e = GpuDrafter::open(&model_content, &model.path, &gpu, 32)
-            .err()
-            .unwrap();
+        let e = GpuDrafter::open(&model_content, &gpu, 32).err().unwrap();
         assert!(e.to_string().contains("not a drafter"), "{e}");
-        let e = GpuTransformer::load(&drafter_content, &drafter.path, 32, device)
+        let e = GpuTransformer::load(&drafter_content, 32, device)
             .err()
             .unwrap();
         assert!(e.to_string().contains("drafter"), "{e}");
 
-        let net = GpuDrafter::open(&drafter_content, &drafter.path, &gpu, 32).unwrap();
+        let net = GpuDrafter::open(&drafter_content, &gpu, 32).unwrap();
         let mut pick = |_: &mut [f32]| Some(0u32);
         let hidden = vec![0.1f32; gpu.n_embd()];
         gpu.forward(&PROMPT[..5], 0, Want::None).unwrap();
@@ -7245,6 +8165,7 @@ mod tests {
                 layout,
             },
             shared: None,
+            ext: None,
         };
         let input = |t: usize, step: usize| -> Vec<f32> {
             (0..t * n_embd)
@@ -7528,6 +8449,7 @@ mod tests {
             let rows: Vec<SeqRows<'_>> = rows_of_step
                 .iter()
                 .map(|st| SeqRows {
+                    history: &tokens[st.seq][..at[st.seq]],
                     tokens: &tokens[st.seq][at[st.seq]..at[st.seq] + st.n],
                     start_pos: at[st.seq],
                     tables: &seqs[st.seq].tables,
@@ -7564,12 +8486,12 @@ mod tests {
         let tokens: Vec<Vec<u32>> = (0..2).map(|s| stream(s, 24)).collect();
         let mut reference = GpuTransformer::load_placed(
             &content,
-            &model.path,
             CTX,
             device,
             &[],
             &ExpertPlacement::Resident,
             &sizing,
+            &EngramCache::default(),
         )
         .unwrap();
         let want = run_steps(&mut reference, &steps, &tokens);
@@ -7579,13 +8501,13 @@ mod tests {
             let first = n_layer - gpu_layers;
             let mut split = SplitModel::load_with(
                 &content,
-                &model.path,
                 CTX,
                 device,
                 &ExpertPlacement::Resident,
                 &sizing,
                 first,
                 true,
+                &EngramCache::default(),
             )
             .unwrap();
             assert_eq!(split.gpu_layers(), gpu_layers, "{label}");
@@ -7667,7 +8589,6 @@ mod tests {
         let sizing = Sizing::single(CTX);
         let mut front = Transformer::load_front(
             &content,
-            &model.path,
             CTX,
             &ExpertPlacement::Resident,
             &sizing,
@@ -7675,13 +8596,13 @@ mod tests {
                 layers: first,
                 shared: None,
                 export: mirror.clone(),
+                engram: None,
             },
             true,
         )
         .unwrap();
         let mut back = GpuTransformer::load_back(
             &content,
-            &model.path,
             CTX,
             device,
             &ExpertPlacement::Resident,
@@ -7690,10 +8611,11 @@ mod tests {
                 first,
                 shared: None,
                 mirror,
+                engram: None,
             },
         )
         .unwrap();
-        let mut reference = GpuTransformer::load(&content, &model.path, CTX, device).unwrap();
+        let mut reference = GpuTransformer::load(&content, CTX, device).unwrap();
         let want = reference
             .forward(&PROMPT[..6], 0, Want::Last)
             .unwrap()
@@ -7704,6 +8626,7 @@ mod tests {
         pools.reserve(&mut seq, 6).unwrap();
         let batch = Batch {
             rows: vec![SeqRows {
+                history: &[],
                 tokens: &PROMPT[..6],
                 start_pos: 0,
                 tables: &seq.tables,
@@ -7715,11 +8638,11 @@ mod tests {
         };
         let mut out = front.forward_front(&batch).unwrap();
         out.kv[0].seqs[0].0.pop();
-        let failed = back.forward_back(&batch, out.hidden, out.per_layer, &out.kv);
+        let failed = back.forward_back(&batch, out.hidden, out.per_layer, out.pre, &out.kv);
         assert!(failed.is_err(), "rows of the wrong size are rejected");
         let out = front.forward_front(&batch).unwrap();
         let mut served = back
-            .forward_back(&batch, out.hidden, out.per_layer, &out.kv)
+            .forward_back(&batch, out.hidden, out.per_layer, out.pre, &out.kv)
             .unwrap();
         let got = served.swap_remove(0).logits.unwrap();
         assert_rows_within(&got, &want, 1e-4, "after a rejected mirror write");
@@ -7743,12 +8666,12 @@ mod tests {
         let load = |shards: &[LocalDevice]| {
             GpuTransformer::load_placed(
                 &content,
-                &model.path,
                 CTX,
                 devices[0],
                 shards,
                 &ExpertPlacement::Resident,
                 &sizing,
+                &EngramCache::default(),
             )
             .unwrap()
         };
@@ -7858,12 +8781,12 @@ mod tests {
         let content = content_of(model);
         let e = GpuTransformer::load_placed(
             &content,
-            &model.path,
             32,
             device,
             &vec![device; shards],
             experts,
             &Sizing::single(32),
+            &EngramCache::default(),
         )
         .err()
         .unwrap_or_else(|| panic!("a split with {shards} shards must be rejected ({rule})"));
@@ -7933,6 +8856,13 @@ mod tests {
             1,
             &resident,
             "multi-head latent attention",
+        );
+        // Hyper-connections, compressed sparse attention and engram.
+        assert_split_rejected(
+            &write_deepseek41(&TinyDeepseek41::default()),
+            1,
+            &resident,
+            "hyper-connection residual streams",
         );
         // Tiered experts.
         let tiered = ExpertPlacement::Tiered(ExpertTiers {
@@ -8012,7 +8942,7 @@ mod tests {
             let content = content_of(&model);
             let hp = read_hparams(&content).unwrap();
             let device = Device::default();
-            let mut reader = WeightReader::open(&content, &model.path, &device, None).unwrap();
+            let mut reader = WeightReader::open(&content, &device, None).unwrap();
             let matrices: Vec<(String, usize, usize)> = content
                 .tensor_infos
                 .iter()

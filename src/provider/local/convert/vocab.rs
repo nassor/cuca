@@ -11,7 +11,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 use serde_json::{Map, Value as Json};
 use sha2::{Digest, Sha256};
 
@@ -702,6 +702,13 @@ const QWEN35: &str = r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?[\p{L}\p{M
 const GPT4O: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 const TEKKEN: &str = r"[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]*[\p{Ll}\p{Lm}\p{Lo}\p{M}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}]+[\p{Ll}\p{Lm}\p{Lo}\p{M}]*|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n/]*|\s*[\r\n]+|\s+(?!\S)|\s+";
 
+/// The three `Split` regexes of DeepSeek V3's pre-tokenizer.
+const DEEPSEEK3: [&str; 3] = [
+    r"\p{N}{1,3}",
+    "[\u{4e00}-\u{9fa5}\u{3040}-\u{309f}\u{30a0}-\u{30ff}]+",
+    "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+| ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+",
+];
+
 /// The `tokenizer.ggml.pre` this checkpoint's pre-tokenizer corresponds to,
 /// by `tokenizer.json` structure (the generic name of its chain).
 fn structural_pre(tok: &Json) -> Result<&'static str, CucaError> {
@@ -730,22 +737,20 @@ fn structural_pre(tok: &Json) -> Result<&'static str, CucaError> {
         .and_then(|m| m.get("ignore_merges"))
         .and_then(Json::as_bool)
         .unwrap_or(false);
-    let mut regex: Option<&str> = None;
+    let mut regexes: Vec<&str> = Vec::new();
     let mut digits = false;
     let mut byte_level_regex = false;
     for p in &parts {
         match p.get("type").and_then(Json::as_str) {
             Some("Split") => {
-                if regex.is_some() {
-                    return Err(unsupported(pre));
-                }
-                regex = p
+                let Some(regex) = p
                     .get("pattern")
                     .and_then(|x| x.get("Regex"))
-                    .and_then(Json::as_str);
-                if regex.is_none() {
+                    .and_then(Json::as_str)
+                else {
                     return Err(unsupported(pre));
-                }
+                };
+                regexes.push(regex);
             }
             Some("Digits") if p.get("individual_digits").and_then(Json::as_bool) == Some(true) => {
                 digits = true;
@@ -756,19 +761,23 @@ fn structural_pre(tok: &Json) -> Result<&'static str, CucaError> {
             _ => return Err(unsupported(pre)),
         }
     }
-    match (regex, digits, byte_level_regex) {
-        (Some(r), false, false) if r == LLAMA3 => Ok(if ignore_merges {
+    match (regexes.as_slice(), digits, byte_level_regex) {
+        ([r], false, false) if *r == LLAMA3 => Ok(if ignore_merges {
             "llama-bpe"
         } else {
             "smaug-bpe"
         }),
-        (Some(r), false, false) if r == QWEN2 => Ok("qwen2"),
-        (Some(r), false, false) if r == QWEN35 => Ok("qwen35"),
-        (Some(r), false, false) if r == GPT4O => Ok("gpt-4o"),
+        ([r], false, false) if *r == QWEN2 => Ok("qwen2"),
+        ([r], false, false) if *r == QWEN35 => Ok("qwen35"),
+        ([r], false, false) if *r == GPT4O => Ok("gpt-4o"),
         // llama.cpp's `tekken` always sets `ignore_merges`.
-        (Some(r), false, false) if r == TEKKEN && ignore_merges => Ok("tekken"),
-        (None, true, true) => Ok("starcoder"),
-        (None, false, true) => Ok("gpt-2"),
+        ([r], false, false) if *r == TEKKEN && ignore_merges => Ok("tekken"),
+        // DeepSeek V3's chain of three splits (digit groups, CJK runs, words);
+        // llama.cpp's `deepseek-v3`, which V4.1's probe-text hash renames
+        // `joyai-llm`.
+        (r, false, false) if r == DEEPSEEK3 && !ignore_merges => Ok("deepseek-v3"),
+        ([], true, true) => Ok("starcoder"),
+        ([], false, true) => Ok("gpt-2"),
         _ => Err(unsupported(pre)),
     }
 }
@@ -1154,6 +1163,19 @@ pub(crate) fn build(
             m.kv.push(("tokenizer.ggml.eot_token_id".into(), Value::U32(eot)));
             m
         }
+        // DeepSeek-V4.1 ships no Jinja: its prompt format is the reference
+        // `encoding.py`, which the builtin `deepseek-v41` template reproduces.
+        ConvArch::Deepseek41 => {
+            let mut m = gpt2(ck, hp)?;
+            let template = crate::provider::local::chat::expand_template_name("deepseek-v41")
+                .map_err(cfg_err)?;
+            m.kv.retain(|(k, _)| k != "tokenizer.chat_template");
+            m.kv.push((
+                "tokenizer.chat_template".into(),
+                string(template.into_owned()),
+            ));
+            m
+        }
     };
     if !meta.kv.iter().any(|(k, _)| k == "tokenizer.chat_template") {
         return Err(cfg_err("checkpoint has no chat template"));
@@ -1198,6 +1220,18 @@ mod tests {
         );
         // Tekken always merges whole vocabulary words first.
         assert!(structural_pre(&tok(seq(vec![split(TEKKEN), byte(false)]), false)).is_err());
+        // DeepSeek V3's three-split chain (V4.1's own tokenizer.json), in order.
+        let deepseek = |order: [usize; 3], ignore: bool| {
+            let mut parts: Vec<Json> = order.iter().map(|&i| split(DEEPSEEK3[i])).collect();
+            parts.push(byte(false));
+            tok(seq(parts), ignore)
+        };
+        assert_eq!(
+            structural_pre(&deepseek([0, 1, 2], false)).unwrap(),
+            "deepseek-v3"
+        );
+        assert!(structural_pre(&deepseek([1, 0, 2], false)).is_err());
+        assert!(structural_pre(&deepseek([0, 1, 2], true)).is_err());
         assert_eq!(structural_pre(&tok(byte(true), false)).unwrap(), "gpt-2");
         let digits = serde_json::json!({"type": "Digits", "individual_digits": true});
         assert_eq!(
@@ -1336,5 +1370,123 @@ mod tests {
         assert_eq!(tokens, ["a", "b", "[PAD2]", "<|im_end|>", " x", "[PAD5]"]);
         assert_eq!(types, [1, 1, 5, 3, 4, 5]);
         assert!(gpt2_tokens(&ck, 4).is_err());
+    }
+
+    /// The real DeepSeek-V4.1-Flash-1017 tokenizer files (the reference copy in
+    /// `.omp/local-models/ref/deepseek-v41/`, or `CUCA_DS41_REF_DIR`): the
+    /// three-split chain reads as `deepseek-v3` and its probe-text fingerprint is
+    /// llama.cpp's `joyai-llm`, which becomes `tokenizer.ggml.pre`; 129,280
+    /// entries, BOS 0, EOS 1 (also the padding id, as llama.cpp writes it), no
+    /// automatic BOS, the builtin chat template. Without the files the test prints
+    /// `SKIP:`.
+    #[test]
+    fn the_real_deepseek_v41_tokenizer_converts_to_joyai_llm() {
+        let dir = std::env::var_os("CUCA_DS41_REF_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| {
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join(".omp/local-models/ref/deepseek-v41")
+            });
+        if !dir.join("tokenizer.json").is_file() {
+            crate::provider::local::tokenizer::golden::skip("the DeepSeek-V4.1 tokenizer files");
+            return;
+        }
+        let read = |name: &str| -> Json {
+            serde_json::from_str(&std::fs::read_to_string(dir.join(name)).unwrap()).unwrap()
+        };
+        // The shards are not needed for the vocabulary.
+        let ck = CheckpointDir {
+            dir: dir.clone(),
+            config: read("config.json"),
+            generation_config: None,
+            tokenizer_json: Some(read("tokenizer.json")),
+            tokenizer_config: Some(read("tokenizer_config.json")),
+            tokenizer_model: None,
+            added_tokens: None,
+            chat_template_file: None,
+            shards: Vec::new(),
+        };
+        assert_eq!(
+            structural_pre(ck.tokenizer_json.as_ref().unwrap()).unwrap(),
+            "deepseek-v3"
+        );
+        let hp = Hp::new(&ck.config).unwrap();
+        let meta = build(ConvArch::Deepseek41, &ck, &hp).unwrap().unwrap();
+        let get = |key: &str| meta.kv.iter().find(|(k, _)| k == key).map(|(_, v)| v);
+        assert_eq!(
+            get("tokenizer.ggml.pre").unwrap().to_string().unwrap(),
+            "joyai-llm"
+        );
+        assert_eq!(
+            get("tokenizer.ggml.model").unwrap().to_string().unwrap(),
+            "gpt2"
+        );
+        assert_eq!(
+            get("tokenizer.ggml.tokens")
+                .unwrap()
+                .to_vec()
+                .unwrap()
+                .len(),
+            129_280
+        );
+        assert_eq!(
+            get("tokenizer.ggml.token_type")
+                .unwrap()
+                .to_vec()
+                .unwrap()
+                .len(),
+            129_280
+        );
+        assert_eq!(
+            get("tokenizer.ggml.merges")
+                .unwrap()
+                .to_vec()
+                .unwrap()
+                .len(),
+            127_741
+        );
+        for (key, want) in [
+            ("tokenizer.ggml.bos_token_id", 0),
+            ("tokenizer.ggml.eos_token_id", 1),
+            ("tokenizer.ggml.padding_token_id", 1),
+        ] {
+            assert_eq!(get(key).unwrap().to_u32().unwrap(), want, "{key}");
+        }
+        assert!(
+            !get("tokenizer.ggml.add_bos_token")
+                .unwrap()
+                .to_bool()
+                .unwrap()
+        );
+        assert!(
+            !get("tokenizer.ggml.add_eos_token")
+                .unwrap()
+                .to_bool()
+                .unwrap()
+        );
+        assert_eq!(
+            get("tokenizer.chat_template").unwrap().to_string().unwrap(),
+            crate::provider::local::chat::expand_template_name("deepseek-v41")
+                .unwrap()
+                .as_ref()
+        );
+        // Token types as llama.cpp's converter writes them (design 6.1): 1,278
+        // control, 5 user-defined (`<think>`, `</think>`, `\u{ff5c}DSML\u{ff5c}` and
+        // the two legacy `dsml:` spellings), the rest normal.
+        let types: Vec<i32> = get("tokenizer.ggml.token_type")
+            .unwrap()
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v| match v {
+                Value::I32(n) => *n,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        let count = |t: i32| types.iter().filter(|&&x| x == t).count();
+        assert_eq!(
+            (count(CONTROL), count(USER_DEFINED), count(NORMAL)),
+            (1278, 5, 127_997)
+        );
     }
 }

@@ -58,8 +58,12 @@ doctest = false
 # Dependency/feature split:
 # - provider-local does not use tokio-stream (its stream is a plain mpsc receiver).
 #   candle-core/candle-nn 0.11: candle-core hard-depends on tokenizers[onig], so the
-#   tree builds C (onig_sys); the engine code itself is pure Rust. Not used directly:
-#   candle-transformers, tokenizers, hf-hub, memmap2, rayon, rand.
+#   tree builds C (onig_sys); the engine code itself is pure Rust. tokenizers is also a
+#   direct optional dep for the converter's Engram token-map normalizers only (the
+#   engine's tokenizer stays hand-written). Not used directly:
+#   candle-transformers, hf-hub, memmap2, rayon, rand.
+#   serde_json/preserve_order: chat templates see JSON maps in the order the caller wrote
+#   them (DeepSeek V4.1 writes tool-call parameters and tool schemas in that order).
 # - Core (unconditional): bytes, futures-core, memchr, serde, serde_json. They define
 #   the public wire types, SSE parser, and response stream contract.
 # - Network and runtime dependencies are optional. Every provider enables reqwest and
@@ -97,8 +101,9 @@ provider-vllm = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 # provider-local: in-process GGUF language-model inference on CPU or GPU (src/provider/local/). Pure Rust:
 # no HTTP endpoint, no llama.cpp. reqwest is used only for the one-time model download
-# (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file.
-provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:tokio", "dep:unicode-general-category", "reqwest/rustls"]
+# (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file;
+# sysinfo's disk list answers the converter's free-space preflight.
+provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:sysinfo", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "reqwest/rustls", "serde_json/preserve_order"]
 # provider-local GPU backends (burn 0.22 / CubeCL). provider-local-gpu is the shared
 # engine; it selects no backend by itself and is enabled by each backend feature.
 # The graphics backends are Rust (wgpu: SPIR-V for vulkan, MSL for metal), but
@@ -232,6 +237,10 @@ minijinja-contrib = { version = "2.24", optional = true, features = ["pycompat"]
 # provider-local tokenizer: Unicode general categories for the hand-written BPE
 # pre-tokenizer splitters (pure Rust, no dependencies).
 unicode-general-category = { version = "1", optional = true }
+# provider-local converter: the Hugging Face normalizers (NFKC, NFD, StripAccents,
+# Lowercase, Replace, Strip) that DeepSeek-V4.1's Engram token map is defined by.
+# candle-core already compiles this crate with the same features.
+tokenizers = { version = "0.22", optional = true, default-features = false, features = ["onig"] }
 # provider-local-gpu: burn (CubeCL) runs the forward pass on a GPU. burn's `default`
 # features enable `optim`/`autodiff`, which inference never uses; the backend itself is
 # chosen by the provider-local-{vulkan,metal,cuda,rocm} features.

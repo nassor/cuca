@@ -20,10 +20,10 @@ The loader reads every dimension from the file's metadata and tensor shapes, sel
 
 ## Architectures
 
-`general.architecture` selects the behavior from one table in `src/provider/local/model/arch.rs`. The table has 19 entries: 17 models and 2 drafters. An architecture outside it fails the load with a `CucaError::Provider` that names it and lists them all:
+`general.architecture` selects the behavior from one table in `src/provider/local/model/arch.rs`. The table has 20 entries: 18 models and 2 drafters. An architecture outside it fails the load with a `CucaError::Provider` that names it and lists them all:
 
 ```text,name=Expected error for an unknown architecture
-unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, qwen3, phi3, smollm3, granite, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, muse-glimmer, mistral3, mistral4, gemma4-assistant, mistral4-eagle
+unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, qwen3, phi3, smollm3, granite, qwen3moe, olmoe, qwen35, qwen35moe, olmo2, ernie4_5, muse-glimmer, mistral3, mistral4, gemma4-assistant, mistral4-eagle, deepseek41
 ```
 
 | Architecture | Model families | Notes |
@@ -47,8 +47,9 @@ unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, q
 | `mistral4` | Mistral Small 4 (119B, 128 experts) | latent attention, see [Latent attention](#latent-attention); not tensor parallel |
 | `gemma4-assistant` | the Gemma 4 multi-token-prediction drafter | only through `LocalModelConfig::drafter` |
 | `mistral4-eagle` | the Mistral Small 4 EAGLE drafter (`mistralai/Mistral-Small-4-119B-2603-eagle`) | only through `LocalModelConfig::drafter`; CPU only |
+| `deepseek41` | DeepSeek-V4.1 Flash | hyper-connections and compressed sparse attention, see [DeepSeek-V4.1](#deepseek-v4-1); not tensor parallel |
 
-The DFlash drafter of Muse Glimmer has `general.architecture` `dflash`. It is not in the table above: it loads only through `LocalModelConfig::drafter` on the CPU, and as a main model it fails with an error that says so. A drafter architecture as a main model fails the same way. Drafters, their pairings and limits are on [Speculative decoding](@/providers/local/drafting.md).
+The `dflash` architecture is not in the table above: it loads only through `LocalModelConfig::drafter`, as the DFlash drafter of Muse Glimmer on the CPU or, with `dflash.hyper_connection.count` in the file, as the DSpark drafter of `deepseek41`; as a main model it fails with an error that says so. A drafter architecture as a main model fails the same way. Drafters, their pairings and limits are on [Speculative decoding](@/providers/local/drafting.md).
 
 Every architecture except the drafters runs on the CPU and on a GPU; the device limits and what was run are on [Run on a GPU](@/providers/local/gpu.md).
 
@@ -72,8 +73,21 @@ What each architecture adds to the common forward pass:
 - `qwen35` and `qwen35moe`: a hybrid stack; see [Hybrid models](#hybrid-models). `qwen35moe` has a mixture of experts in every layer: a softmax over all experts, the top k, the selected weights renormalised to sum to one, plus a shared expert (a dense gated FFN every token runs) whose output is scaled by `sigmoid(ffn_gate_inp_shexp . x)` and added to the routed output. The routed experts honor `ExpertPlacement`; the shared expert and the router stay resident.
 - `gemma4-assistant`: a four-layer, query-only decoder that reads the K/V cache of a `gemma4` target. It pairs only with a `gemma4` model of the same hidden width and vocabulary.
 - `mistral4-eagle`: two latent-attention layers over a dense FFN with a K/V cache of its own, sharing the target's embedding and LM head.
+- `deepseek41`: hyper-connection residual streams, latent attention with a sliding window and compressed sparse attention, per-layer Engram table lookups and a `sqrtsoftplus`-routed mixture of experts; see [DeepSeek-V4.1](#deepseek-v4-1).
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
+
+### DeepSeek-V4.1
+
+`deepseek41` runs on the CPU and on a GPU (see [Run on a GPU](@/providers/local/gpu.md#deepseek-v4-1-on-a-gpu)). The real DeepSeek-V4.1-Flash-1017 has run in the engine on the CPU and on Vulkan: it passes eight live scenarios on the CPU and matches the torch oracle, at about 0.2 tokens/s with its experts streaming from an HDD-class volume; the measurements, with their method, are on [Verification](@/providers/local/verification.md#deepseek-v4-1-real-checkpoint-on-the-cpu). Its drafter is the DSpark block drafter of the same checkpoint, a `dflash` file that runs on the CPU only (see [Speculative decoding](@/providers/local/drafting.md)). A checkpoint is converted once to a split GGUF set; see [Local checkpoint conversion](@/providers/local/checkpoints.md#deepseek-v4-1).
+
+- The residual stream is `hyper_connection.count` copies of the hidden state per token. Each attention and FFN block reads a weighted sum of the copies and writes back through coefficients predicted from the stream, normalised by `hyper_connection.sinkhorn_iterations` Sinkhorn passes.
+- Attention has low-rank queries, one shared vector per position as key and value (its last `rope.dimension_count` values rotate and the output is rotated back), a sink logit per head and a grouped low-rank output projection. Every layer attends to the last `attention.sliding_window` positions.
+- A layer with a non-zero entry in `attention.compress_ratios` (1 or 2) also attends to up to `attention.indexer.top_k` compressed rows. Row `j` pools the tokens `j * ratio` to `(j + 1) * ratio - 1` and is visible to a query once its last token has passed. An indexer scores the visible rows and keeps the best. `attention.kv_source_layers` compute the rows, `attention.indexer.source_layers` the picks, and the layers after a source reuse them. With `attention.indexer.candidate_source_layer` the later scoring layers look only inside the blocks that layer liked best.
+- The cached window keys, the compressed rows, the indexer's vectors and the attention output carry the quantization the model trained with: FP8 for the window keys and the output, FP4 for the rows and the indexer.
+- Engram layers (`ple.layers`) hash each token with the tokens before it into rows of `per_layer_token_embd.weight`, which gate a residual add. The table is never loaded into memory: a pool of reader threads reads the distinct rows of a pass from the file, and a row cache bounded by `LocalModelConfig::engram` keeps the most recently used ones (see [Engram cache](@/providers/local/configuration.md#engram-cache)).
+- The router scores experts with `sqrt(softplus(logit))` (`expert_gating_func` 4), selects with the `exp_probs_b` bias but weights with the unbiased scores, and clamps the SwiGLU activations of the routed and the shared expert (`swiglu_clamp_exp`, `swiglu_clamp_shexp`). Experts stored as MXFP4 run through the row-batched kernel with Q8_0 activations.
+- A window group holds 16 positions per block like every K/V layer. A compressed group holds one block per `16 * ratio` tokens, so `prompt_cache_usage.read_tokens` is a multiple of 32. A compressor keeps a half-finished pair of tokens between calls; a rollback within the last call restores it, and the scheduler limits a speculative round to 17 rows.
 
 ### Latent attention
 
@@ -130,7 +144,7 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 | `muse-glimmer-30b-q4_0` | `muse-glimmer` | `bartowski/Muse-Glimmer-30B-GGUF` | 16.27 GB | 1.74 GB |
 | `ministral3-3b-reasoning-q4_0` | `mistral3` | `bartowski/mistralai_Ministral-3-3B-Reasoning-2512-GGUF` | 2.05 GB | 3.49 GB |
 | `ministral3-3b-instruct-q4_0` | `mistral3` | `bartowski/mistralai_Ministral-3-3B-Instruct-2512-GGUF` | 2.05 GB | 3.49 GB |
-| `mistral-small-4-119b-q4_0` | `mistral4` | `bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF` | 67.71 GB (two parts, merged at load) | 755 MB |
+| `mistral-small-4-119b-q4_0` | `mistral4` | `bartowski/mistralai_Mistral-Small-4-119B-2603-GGUF` | 67.71 GB (two parts) | 755 MB |
 | `gemma4-e2b-mtp-f16` | `gemma4-assistant` | `unsloth/gemma-4-E2B-it-GGUF` | 0.17 GB | none: a drafter, reads the target's cache |
 | `muse-glimmer-30b-dflash-q4_0` | `dflash` | `ggml-org/Muse-Glimmer-30B-GGUF` | 1.45 GB | none from the pool: a drafter with its own 2,048-position K/V ring |
 
@@ -142,8 +156,8 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 - `muse-glimmer-30b-q4_0` is a dense model (52 layers, hidden 6,656, 32 query and 2 K/V heads of 128). Only its 13 full layers cache the whole context; the other 39 keep a 2,048-position window. The file is bartowski's imatrix Q4_0: Q4_0 with a Q6_K `output.weight` and `attn_q` in 26 layers (candle's kernel serves K-quants) and a Q4_1 `ffn_down` in 6. It always reasons, so give requests a generous `max_tokens`. The preset pins the repository's chat template.
 - `ministral3-3b-reasoning-q4_0` (26 layers, 8 K/V heads of 128, a tied head) is bartowski's imatrix Q4_0, and mistralai publishes no Q4_0 of it. It always reasons (`[THINK]`) and needs sampling to call a tool; see [Known limits](@/providers/local/verification.md#known-limits). The preset pins the repository's chat template.
 - `ministral3-3b-instruct-q4_0` is the same architecture without reasoning, also bartowski's imatrix Q4_0, with its template pinned.
-- `mistral-small-4-119b-q4_0` is bartowski's imatrix Q4_0 of Mistral Small 4 (36 layers, 128 experts per layer, 4 used, plus one shared expert). The file is published as two parts (39.92 and 27.79 GB) that the loader downloads, verifies by SHA-256, merges into one 67.71 GB cached GGUF and deletes. About twice the file's size is free during the merge. The weights are Q4_0 with Q4_1 and Q5_0 in places, Q8_0 for the shared experts and the latent projection, and a Q6_K `output`. Resident it holds 67.7 GB of RAM plus the 755 MB K/V pool. It reasons by default (`[THINK]`) and can switch reasoning off.
-- Presets pin both the revision and the SHA-256.
+- `mistral-small-4-119b-q4_0` is bartowski's imatrix Q4_0 of Mistral Small 4 (36 layers, 128 experts per layer, 4 used, plus one shared expert). The file is published as two parts (39.92 and 27.79 GB) that the loader downloads and verifies by SHA-256, then opens as one set (see [Split GGUF files](@/providers/local/model-sources.md#split-gguf-files)). The weights are Q4_0 with Q4_1 and Q5_0 in places, Q8_0 for the shared experts and the latent projection, and a Q6_K `output`. Resident it holds 67.7 GB of RAM plus the 755 MB K/V pool. It reasons by default (`[THINK]`) and can switch reasoning off.
+- Presets pin both the revision and the SHA-256. DeepSeek-V4.1 has no preset: it loads as a checkpoint, see [Local checkpoint conversion](@/providers/local/checkpoints.md#deepseek-v4-1).
 
 ## Weight formats
 
@@ -155,11 +169,13 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 | K-quants (Q2_K to Q6_K) | stays quantized; candle's quantized matmul, one activation row at a time | dequantized row by row at load, requantized to Q8_0 |
 | Q8_1 | stays quantized; candle's quantized matmul (no test covers it) | dequantized row by row at load, requantized to Q8_0 |
 | F32, F16, BF16 | held as f32 | uploaded as f32 (4 bytes per element) |
-| IQ family | rejected | rejected |
+| MXFP4 | stays quantized; cuca's batch-invariant kernel | stays quantized in the expert kernels |
+| IQ4_NL, I8 | read row by row as an embedding or per-layer table only; a weight matrix fails the load | the same |
+| Other IQ-family types | the file opens and the load fails when such a tensor is requested | the same |
 
 - Norm vectors, biases and scalars are f32 whatever their stored dtype. Resident weights are about the file size.
-- An IQ-family tensor makes the load fail with `` `PATH` is not a supported GGUF file: ... ``.
-- A GPU requantizes every quantized dtype other than Q4_0, Q4_1 and Q8_0 to Q8_0. Each element moves by at most half a Q8_0 step, a smaller error than the one a Q4_K, Q5_K or Q6_K file already carries, but GPU logits then differ from the CPU's by more than float rounding.
+- A tensor whose type the engine cannot run makes the load fail with ``tensor `NAME` has type TYPE, which this engine cannot run`` or `` `PATH` is not a supported GGUF file: ... ``.
+- A GPU requantizes every quantized dtype other than Q4_0, Q4_1, Q8_0 and MXFP4 to Q8_0. Each element moves by at most half a Q8_0 step, a smaller error than the one a Q4_K, Q5_K or Q6_K file already carries, but GPU logits then differ from the CPU's by more than float rounding.
 - A GPU file that mixes Q4_0, Q4_1 and Q8_0 weights, as the Q4_0 presets with a Q8_0 embedding do, keeps every weight in its own format, one copy each. A weight over 256 MiB on the GPU is split into row chunks.
 - Mixture of experts: expert tensors are split once at load into one quantized 2-D weight per expert, so memory is the file size. `LocalModelConfig::experts` can leave them in the file instead; see [Tiered expert placement](@/providers/local/expert-tiers.md).
 
@@ -169,16 +185,18 @@ Every CPU matrix multiplication of a Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0 weight, mixt
 
 A dtype is never dispatched to different kernels by batch size, because a row's bits must not depend on it. Prefill is row-exact: the logits of a prompt row are bit-identical whether the prompt is prefilled in one chunk, in several, or decoded one token at a time, so reusing a cached prefix never changes the output on the CPU. Attention reads the K/V blocks in place with an online-softmax kernel per query row and head, so a row is bit-identical alone or in a batch as well.
 
+MXFP4 weights run through the same `qmm.rs` kernel on the CPU, with Q8_0 activations.
+
 The K-quants stay on candle on purpose. Measured on a Ryzen 9 9950X3D2 (3D V-cache L3, release build for the host CPU), candle's K-quant prefill matched Q4_0's (`phi4-mini-q4_k_m` against `phi4-mini-q4_0`), a row-batched safe-Rust K-quant kernel was 2 to 3 times slower than candle's at one row, and the Q4_1, Q5_0 and Q5_1 kernels are 2 to 4 times faster than candle's from four rows on.
 
 ## Loading a GGUF that is not a preset
 
-Any file whose architecture is in the table and whose tokenizer is one of the supported schemes loads through `ModelSource::File(path)` or `ModelSource::hugging_face(repo, revision, file)`. The CPU reads every dtype candle reads: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and the K-quants.
+Any file whose architecture is in the table and whose tokenizer is one of the supported schemes loads through `ModelSource::File(path)` or `ModelSource::hugging_face(repo, revision, file)`. A split set (`<base>-00001-of-0000N.gguf`) loads from any of its parts. The CPU reads F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, the K-quants and MXFP4.
 
 The load fails with a `CucaError::Provider` that names the cause for:
 
 - an unknown architecture, tokenizer model or pre-tokenizer;
-- a tensor candle cannot read, such as an IQ-family one;
+- a tensor candle cannot read and no row reader covers, such as an IQ-family one other than IQ4_NL;
 - a missing tensor or metadata key, `tokenizer.chat_template` included;
 - a tensor with an unexpected shape, or a row length that is not a multiple of its dtype's block size;
 - a value length that differs from the key length (``GGUF metadata `ARCH.attention.value_length`: ... only equal key and value lengths are supported``), or odd or zero attention key lengths;

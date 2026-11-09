@@ -20,7 +20,7 @@
 
 use std::collections::HashMap;
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 
 use super::SamplingConfig;
 

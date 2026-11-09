@@ -30,28 +30,27 @@
 //!   which shifts its logits by at most half a Q8_0 step. It only proposes
 //!   tokens; the target's rows decide the output.
 
-use std::fs::File;
-use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::{Arc, Mutex, PoisonError};
 
-use candle_core::quantized::{GgmlDType, QMatMul as CandleMatMul, QTensor, gguf_file};
+use candle_core::quantized::{GgmlDType, QMatMul as CandleMatMul, QTensor};
 use candle_core::{D, DType, Device, Module, Tensor};
 use candle_nn::ops::{rms_norm, sigmoid, softmax_last_dim};
 use candle_nn::rotary_emb::{rope, rope_i};
 
 use super::arch::Act;
+use super::csa::Gating;
 use super::delta::{DeltaCell, DeltaKernel, DeltaState, Rows};
+use super::engram::{self, RowSource};
 use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
-#[cfg(feature = "provider-local-gpu")]
 use super::moe::Routing;
-use super::moe::route;
+use super::moe::{route, route_with};
 #[cfg(test)]
 use super::paged::Solo;
 use super::paged::{BLOCK_SIZE, BlockTable, KvLayout, Sizing};
 use super::params::{DeltaSpec, Hparams, LayerSpec, MlaSpec, MoeSpec};
 use super::qmm::QmmWeight;
-use super::quant::{RowTable, TokenEmbedding};
+use super::quant::{RowTable, TokenEmbedding, dequant_row};
 use super::rope::RopeKind;
 #[cfg(feature = "provider-local-gpu")]
 use super::split::MirrorRows;
@@ -60,14 +59,32 @@ use super::{
     Batch, Want, attention_mask, build_rope_tables, candle_err, check_context, err, read_hparams,
 };
 use crate::error::CucaError;
-use crate::provider::local::{ExpertPlacement, ExpertTiers};
+use crate::provider::local::gguf::{self, GgufType};
+use crate::provider::local::{EngramCache, ExpertPlacement, ExpertTiers};
 
 pub(crate) mod dflash;
+pub(crate) mod dspark;
+#[cfg(test)]
+mod dspark_tests;
 mod eagle;
 mod head;
+mod hyper;
+#[cfg(test)]
+mod hyper_tests;
+#[cfg(test)]
+pub(super) mod real_tests;
+
+/// Run `f` with models loaded on this thread simulating no quantization (the
+/// unquantized reference of the GPU oracle tests).
+#[cfg(all(test, feature = "provider-local-gpu"))]
+pub(super) fn without_qdq<R>(f: impl FnOnce() -> R) -> R {
+    hyper::without_qdq(f)
+}
 mod mla;
 pub(super) mod paged_attn;
 mod pairs;
+#[cfg(test)]
+mod tier_tests;
 pub(crate) use eagle::EagleHead;
 pub(crate) use head::NextnHead;
 use paged_attn::{PoolShape, attend_paged_rows, gather, store_rows};
@@ -197,12 +214,7 @@ fn requantize_q8_0(qt: &QTensor) -> candle_core::Result<QTensor> {
         );
     }
     let from_bytes = |dtype: GgmlDType, rows: usize, bytes: &[u8]| {
-        gguf_file::TensorInfo {
-            ggml_dtype: dtype,
-            shape: (rows, cols).into(),
-            offset: 0,
-        }
-        .read(&mut Cursor::new(bytes), 0, &Device::Cpu)
+        gguf::qtensor_from_bytes(dtype, &[rows, cols], bytes, &Device::Cpu)
     };
     let row_bytes = cols / dtype.block_size() * dtype.type_size();
     let bytes = qt.data()?;
@@ -317,11 +329,48 @@ pub(crate) struct CpuExpert {
     down: QMatMul,
 }
 
+/// The gated activation of an expert: `act(gate) * up`, with the clamp some
+/// models train with (the up branch to `[-limit, limit]`, the gate branch from
+/// above, before the activation).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Glu {
+    act: Act,
+    clamp: Option<f32>,
+}
+
+impl From<Act> for Glu {
+    fn from(act: Act) -> Self {
+        Self { act, clamp: None }
+    }
+}
+
+impl Glu {
+    /// `act` with a clamp at `limit` (none when `limit` is not positive).
+    fn clamped(act: Act, limit: f32) -> Self {
+        Self {
+            act,
+            clamp: (limit > 0.0).then_some(limit),
+        }
+    }
+
+    fn apply(self, gate: &Tensor, up: &Tensor) -> candle_core::Result<Tensor> {
+        match self.clamp {
+            None => activate(gate, self.act)? * up,
+            Some(limit) => {
+                let limit = f64::from(limit);
+                activate(&gate.minimum(limit)?, self.act)? * up.clamp(-limit, limit)?
+            }
+        }
+    }
+}
+
 impl CpuExpert {
     /// `down(act(gate x) * up x)` over the rows `x`.
-    fn forward(&self, x: &Tensor, act: Act) -> candle_core::Result<Tensor> {
-        self.down
-            .forward(&(activate(&self.gate.forward(x)?, act)? * self.up.forward(x)?)?)
+    fn forward(&self, x: &Tensor, glu: impl Into<Glu>) -> candle_core::Result<Tensor> {
+        self.down.forward(
+            &glu.into()
+                .apply(&self.gate.forward(x)?, &self.up.forward(x)?)?,
+        )
     }
 
     /// Run the expert over the rows of `flat` `(t, n_embd)` that `picks`
@@ -331,7 +380,7 @@ impl CpuExpert {
         &self,
         flat: &Tensor,
         picks: &[(u32, f32)],
-        act: Act,
+        glu: impl Into<Glu>,
         out: &mut [f32],
     ) -> candle_core::Result<()> {
         let n_embd = flat.dim(1)?;
@@ -341,7 +390,7 @@ impl CpuExpert {
             flat.device(),
         )?;
         let y = self
-            .forward(&flat.index_select(&ids, 0)?, act)?
+            .forward(&flat.index_select(&ids, 0)?, glu)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         for (&(token, weight), y) in picks.iter().zip(y.chunks_exact(n_embd)) {
@@ -365,7 +414,9 @@ impl CpuExpert {
 /// the CPU engine's own expert code.
 #[cfg(feature = "provider-local-gpu")]
 pub(crate) struct HostExperts {
-    experts: Vec<CpuExpert>,
+    bank: ExpertBank,
+    /// The SwiGLU clamp of the layer's routed experts (0: none).
+    clamp: f32,
 }
 
 #[cfg(feature = "provider-local-gpu")]
@@ -381,8 +432,7 @@ impl HostExperts {
     /// [`CucaError::Provider`] / [`CucaError::Io`] for missing or unreadable
     /// expert tensors.
     pub(crate) fn load(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         hp: &Hparams,
         il: usize,
         dequantize: bool,
@@ -399,13 +449,23 @@ impl HostExperts {
         };
         let mut loader = Loader {
             content,
-            reader: BufReader::new(File::open(path)?),
+            reader: content.reader(),
             dequantize,
             requantize: false,
         };
-        match loader.expert_bank(il, spec.n_expert, ff, hp.n_embd, fused, None)? {
-            ExpertBank::Resident(experts) => Ok(Self { experts }),
-            ExpertBank::Tiered { .. } => Err(err("host experts are resident")),
+        Ok(Self {
+            bank: loader.expert_bank(il, spec.n_expert, ff, hp.n_embd, fused, None)?,
+            clamp: hp.moe_ext.as_ref().map_or(0.0, |e| e.clamp[il]),
+        })
+    }
+
+    /// The experts of layer `il` left in the file, behind the RAM tier of
+    /// `store` (`ExpertPlacement::Tiered` without a device tier): the CPU
+    /// computes the experts a pass needs as it loads them.
+    pub(crate) fn tiered(hp: &Hparams, il: usize, store: Arc<ExpertStore<CpuExpert>>) -> Self {
+        Self {
+            bank: ExpertBank::Tiered { il, store },
+            clamp: hp.moe_ext.as_ref().map_or(0.0, |e| e.clamp[il]),
         }
     }
 
@@ -416,7 +476,8 @@ impl HostExperts {
     ///
     /// # Errors
     ///
-    /// [`CucaError::Provider`] for a failed matmul.
+    /// [`CucaError::Provider`] for a failed matmul or an expert a tier cannot
+    /// load.
     pub(crate) fn forward(
         &self,
         rows: &[f32],
@@ -427,18 +488,14 @@ impl HostExperts {
     ) -> Result<Vec<f32>, CucaError> {
         let run = || -> candle_core::Result<Vec<f32>> {
             let flat = Tensor::from_slice(rows, (t, n_embd), &Device::Cpu)?;
-            let mut out = vec![0f32; t * n_embd];
-            for (e, picks) in routing.per_expert.iter().enumerate() {
-                if picks.is_empty() {
-                    continue;
-                }
-                let x = self
-                    .experts
-                    .get(e)
-                    .ok_or_else(|| candle_core::Error::msg("expert out of range"))?;
-                x.add_picks(&flat, picks, act, &mut out)?;
-            }
-            Ok(out)
+            expert_sum(
+                &self.bank,
+                &flat,
+                routing,
+                Glu::clamped(act, self.clamp),
+                t,
+                n_embd,
+            )
         };
         run().map_err(candle_err)
     }
@@ -471,9 +528,9 @@ impl SharedExpert {
     ///
     /// The scalar gate is a sequential host dot product per row, so a row's
     /// value never depends on how many rows share the call.
-    fn forward(&self, flat: &Tensor, act: Act) -> candle_core::Result<Tensor> {
+    fn forward(&self, flat: &Tensor, glu: impl Into<Glu>) -> candle_core::Result<Tensor> {
         let (t, n_embd) = flat.dims2()?;
-        let y = self.ffn.forward(flat, act)?;
+        let y = self.ffn.forward(flat, glu)?;
         let Some(gate_inp) = &self.gate_inp else {
             return Ok(y);
         };
@@ -499,7 +556,20 @@ enum FfnWeights {
         router: QMatMul,
         experts: ExpertBank,
         shared: Option<SharedExpert>,
+        /// The router's scoring function, selection bias and the SwiGLU
+        /// clamps ([`Behavior::moe_ext`](super::arch::Behavior)).
+        ext: Option<Box<RouterExt>>,
     },
+}
+
+/// What a mixture-of-experts layer adds to a softmax top-k router.
+struct RouterExt {
+    gating: Gating,
+    /// Per-expert selection bias (`exp_probs_b`).
+    bias: Option<Vec<f32>>,
+    /// SwiGLU clamp of the routed experts and of the shared expert (0: none).
+    clamp: f32,
+    clamp_shared: f32,
 }
 
 /// Per-layer-embedding block of one layer (Gemma 4).
@@ -533,9 +603,11 @@ struct DeltaWeights {
 /// What mixes the tokens of one layer. The delta-net weights are boxed: they
 /// are much larger than an attention layer's handles.
 enum Mixer {
-    Attention(AttnWeights),
+    Attention(Box<AttnWeights>),
     Mla(Box<MlaWeights>),
     Delta(Box<DeltaWeights>),
+    /// Latent attention with compressed rows (hyper-connection models).
+    Csa(Box<hyper::CsaWeights>),
 }
 
 /// Weights of one transformer block.
@@ -551,6 +623,8 @@ struct LayerWeights {
     post_ffw_norm: Option<Tensor>,
     ple: Option<PleLayer>,
     out_scale: Option<f64>,
+    /// The layer's hyper-connection sites.
+    hc: Option<Box<hyper::HcLayer>>,
 }
 
 /// Model-level per-layer-embedding weights (Gemma 4).
@@ -599,7 +673,7 @@ impl KvLayer {
             data: Mutex::new(KvData {
                 k: vec![0.0; floats],
                 // A latent cache holds the value inside the key row.
-                v: if spec.mla.is_some() {
+                v: if spec.mla.is_some() || spec.kv_is_value {
                     Vec::new()
                 } else {
                     vec![0.0; floats]
@@ -613,6 +687,21 @@ impl KvLayer {
         })
     }
 
+    /// An empty pool of `blocks` blocks of compressed rows of `width` floats.
+    fn compressed(width: usize, blocks: usize) -> Arc<Self> {
+        Arc::new(Self {
+            data: Mutex::new(KvData {
+                k: vec![0.0; blocks * BLOCK_SIZE * width],
+                v: Vec::new(),
+            }),
+            shape: PoolShape {
+                n_head: 1,
+                n_kv_head: 1,
+                head_dim: width,
+            },
+        })
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, KvData> {
         self.data.lock().unwrap_or_else(PoisonError::into_inner)
     }
@@ -620,8 +709,8 @@ impl KvLayer {
 
 /// Reads tensors from the GGUF file, checking each against its expected shape.
 struct Loader<'a> {
-    content: &'a gguf_file::Content,
-    reader: BufReader<File>,
+    content: &'a gguf::Content,
+    reader: gguf::TensorReader<'a>,
     /// Hold matmul weights as dequantized f32 instead of quantized (test
     /// reference only: candle's quantized matmul rounds activations to Q8_0).
     dequantize: bool,
@@ -638,8 +727,8 @@ impl Loader<'_> {
 
     fn qtensor(&mut self, tensor_name: &str, shape: &[usize]) -> Result<QTensor, CucaError> {
         let qt = self
-            .content
-            .tensor(&mut self.reader, tensor_name, &Device::Cpu)
+            .reader
+            .tensor(tensor_name, &Device::Cpu)
             .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
         if qt.shape().dims() != shape {
             return Err(err(format!(
@@ -772,18 +861,24 @@ impl Loader<'_> {
         let Some(first) = parts.first() else {
             return Ok(out);
         };
-        let io = |e: std::io::Error| err(format!("tensor `{tensor_name}`: {e}"));
         let mut raw = vec![0u8; n_expert * first.stride];
         self.reader
-            .seek(SeekFrom::Start(first.offset(0)))
-            .map_err(io)?;
-        self.reader.read_exact(&mut raw).map_err(io)?;
+            .read_at(first.file(), first.offset(0), &mut raw)
+            .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
         for chunk in raw.chunks_exact(first.stride.max(1)) {
             for (part, weights) in parts.iter().zip(&mut out) {
                 let at = (part.offset(0) - first.offset(0)) as usize;
-                let qt = expert_qtensor(part, &chunk[at..at + part.file_bytes])
-                    .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
-                weights.push(self.to_matmul(Arc::new(qt), tensor_name)?);
+                let bytes = &chunk[at..at + part.file_bytes];
+                let matmul = if part.dtype == GgufType::Mxfp4 {
+                    mxfp4_matmul(part, bytes, self.dequantize)
+                } else {
+                    expert_qtensor(part, bytes)
+                        .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
+                        .and_then(|qt| self.to_matmul(Arc::new(qt), tensor_name))
+                        .map_err(|e| candle_core::Error::msg(e.to_string()))
+                }
+                .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
+                weights.push(matmul);
             }
         }
         Ok(out)
@@ -827,14 +922,45 @@ impl Loader<'_> {
     }
 }
 
+/// One MXFP4 expert matrix of `slice` from its file bytes: candle has no type
+/// for it, so the row-batched kernel reads the blocks itself (`dequantize`:
+/// an f32 matrix, the exact reference of the tests).
+fn mxfp4_matmul(
+    slice: &ExpertSlice,
+    bytes: &[u8],
+    dequantize: bool,
+) -> candle_core::Result<QMatMul> {
+    if dequantize {
+        let row_bytes = slice.file_bytes / slice.rows;
+        let mut values = vec![0f32; slice.rows * slice.cols];
+        for (src, dst) in bytes
+            .chunks_exact(row_bytes)
+            .zip(values.chunks_exact_mut(slice.cols))
+        {
+            dequant_row(GgufType::Mxfp4, src, 1.0, dst)
+                .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+        }
+        return Tensor::from_vec(values, (slice.rows, slice.cols), &Device::Cpu)
+            .map(QMatMul::tensor);
+    }
+    QmmWeight::mxfp4(Arc::from(bytes), slice.rows, slice.cols)
+        .map(QMatMul::RowBatched)
+        .ok_or_else(|| {
+            candle_core::Error::msg(format!(
+                "an MXFP4 matrix of {} x {} does not fit {} bytes",
+                slice.rows,
+                slice.cols,
+                bytes.len()
+            ))
+        })
+}
+
 /// One expert's `[rows, cols]` matrix of `slice` from its file bytes.
 fn expert_qtensor(slice: &ExpertSlice, bytes: &[u8]) -> candle_core::Result<QTensor> {
-    gguf_file::TensorInfo {
-        ggml_dtype: slice.dtype,
-        shape: (slice.rows, slice.cols).into(),
-        offset: 0,
-    }
-    .read(&mut Cursor::new(bytes), 0, &Device::Cpu)
+    let dtype = slice
+        .ggml()
+        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
+    gguf::qtensor_from_bytes(dtype, &[slice.rows, slice.cols], bytes, &Device::Cpu)
 }
 
 /// Build one expert of `layer` from its three matrices' file bytes, as the
@@ -846,9 +972,12 @@ fn build_cpu_expert(
     down: &[u8],
 ) -> Result<CpuExpert, CucaError> {
     let one = |slice: &ExpertSlice, bytes: &[u8], part: &str| {
-        expert_qtensor(slice, bytes)
-            .and_then(|qt| QMatMul::from_arc_row_batched(Arc::new(qt)))
-            .map_err(|e| err(format!("tensor `{}`: {e}", name::blk(layer.il, part))))
+        if slice.dtype == GgufType::Mxfp4 {
+            mxfp4_matmul(slice, bytes, false)
+        } else {
+            expert_qtensor(slice, bytes).and_then(|qt| QMatMul::from_arc_row_batched(Arc::new(qt)))
+        }
+        .map_err(|e| err(format!("tensor `{}`: {e}", name::blk(layer.il, part))))
     };
     Ok(CpuExpert {
         gate: one(&layer.gate, gate, name::FFN_GATE_EXPS)?,
@@ -866,9 +995,8 @@ fn build_cpu_expert(
 /// [`CucaError::Config`] for a model without experts, a RAM budget below
 /// `n_used` experts per layer or heat of another shape; the loader's errors
 /// for unreadable expert tensors.
-fn open_expert_store(
-    content: &gguf_file::Content,
-    path: &Path,
+pub(crate) fn open_expert_store(
+    content: &gguf::Content,
     hp: &Hparams,
     tiers: &ExpertTiers,
     upto: usize,
@@ -915,8 +1043,9 @@ fn open_expert_store(
         shared.check(heat)?;
     }
     let build: Arc<BuildFn<CpuExpert>> = Arc::new(build_cpu_expert);
+    let files: Vec<&Path> = content.files().iter().map(|f| f.path.as_path()).collect();
     let store = ExpertStore::open(
-        path,
+        &files,
         hp.n_layer,
         layers,
         spec.n_expert,
@@ -977,12 +1106,18 @@ pub(crate) struct Transformer {
     ropes: Vec<RopeTable>,
     /// The paged K/V of every K/V-owning layer (`None` for the others).
     kv: Vec<Option<Arc<KvLayer>>>,
+    /// The hyper-connection path's state: compressed-row pools, rotary
+    /// tables, compressor state ([`Behavior::hyper_connections`](super::arch::Behavior)).
+    hyper: Option<hyper::HyperModel>,
     layout: KvLayout,
     /// One state slot per sequence the model can run at once (hybrid models
     /// only; empty otherwise).
     slots: Vec<Slot>,
     #[cfg(test)]
     solo: Solo,
+    /// The tokens of the implicit sequence (engram history).
+    #[cfg(test)]
+    solo_ids: Vec<u32>,
     /// Whether any layer is a delta-net layer (has a recurrent state).
     hybrid: bool,
     /// Counters and heat of the expert tiers (`ExpertPlacement::Tiered`).
@@ -1015,6 +1150,10 @@ pub(crate) enum Hidden {
     /// bit-equal to what `PostNorm` computes, and with `Want::None` the final
     /// norm and the LM head are skipped altogether. A block-diffusion drafter
     /// reads these rows ([`dflash`]).
+    ///
+    /// For a hyper-connection model a layer's row is the mean over the
+    /// residual streams of what enters the layer (after its Engram lookup),
+    /// the rows a multi-token drafter of that model reads.
     Layers(LayerSet),
 }
 
@@ -1118,6 +1257,10 @@ struct Seg<'a> {
     record: bool,
     want: Want,
     hidden: Hidden,
+    /// The tokens of the rows.
+    tokens: &'a [u32],
+    /// The sequence's tokens before `start`.
+    history: &'a [u32],
 }
 
 /// A drafter's input and output projections: `pre` maps the concatenation of
@@ -1143,16 +1286,24 @@ pub(crate) struct Front {
     /// The K/V-owning layers among `0..layers` that a layer after them
     /// reads the K/V of ([`mirrored`](super::split::mirrored)).
     pub(crate) export: Vec<usize>,
+    /// The Engram table the other half shares (`None`: this half opens its
+    /// own, or the model has none), so that its row cache and counters are
+    /// single.
+    pub(crate) engram: Option<Arc<dyn RowSource>>,
 }
 
 /// What a [`Front`] hands to the layers after it: the residual stream
 /// and, for Gemma 4, the per-layer inputs every layer reads.
 #[cfg(feature = "provider-local-gpu")]
 pub(crate) struct FrontOut {
-    /// `[rows, n_embd]` row-major.
+    /// `[rows, n_embd]` row-major (`[rows, streams * n_embd]`, the
+    /// hyper-connection streams, for a model that has them).
     pub(crate) hidden: Vec<f32>,
     /// `[rows, n_layer, ple_dim]` row-major, `(ctx + tok) / sqrt(2)`.
     pub(crate) per_layer: Option<Vec<f32>>,
+    /// `[rows, streams]`: the pre weights the layers after the front start
+    /// from (hyper-connection models).
+    pub(crate) pre: Option<Vec<f32>>,
     /// The rows the pass wrote into the cache of every layer of
     /// [`Front::export`].
     pub(crate) kv: Vec<MirrorRows>,
@@ -1161,17 +1312,13 @@ pub(crate) struct FrontOut {
 impl Transformer {
     /// [`Transformer::load_placed`] with every expert resident (tests).
     #[cfg(test)]
-    pub(crate) fn load(
-        content: &gguf_file::Content,
-        path: &Path,
-        context_length: usize,
-    ) -> Result<Self, CucaError> {
+    pub(crate) fn load(content: &gguf::Content, context_length: usize) -> Result<Self, CucaError> {
         Self::load_placed(
             content,
-            path,
             context_length,
             &ExpertPlacement::Resident,
             &Sizing::single(context_length),
+            &EngramCache::default(),
         )
     }
 
@@ -1189,20 +1336,20 @@ impl Transformer {
     /// [`CucaError::Provider`] for unsupported or malformed checkpoints;
     /// [`CucaError::Io`] when the file cannot be read.
     pub(crate) fn load_placed(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         experts: &ExpertPlacement,
         sizing: &Sizing,
+        engram: &EngramCache,
     ) -> Result<Self, CucaError> {
         Self::load_with(
             content,
-            path,
             context_length,
             false,
             false,
             experts,
             sizing,
+            engram,
             None,
         )
     }
@@ -1216,8 +1363,7 @@ impl Transformer {
     /// As [`Transformer::load_placed`].
     #[cfg(feature = "provider-local-gpu")]
     pub(crate) fn load_front(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         experts: &ExpertPlacement,
         sizing: &Sizing,
@@ -1226,12 +1372,12 @@ impl Transformer {
     ) -> Result<Self, CucaError> {
         Self::load_with(
             content,
-            path,
             context_length,
             dequantize,
             false,
             experts,
             sizing,
+            &EngramCache::default(),
             Some(front),
         )
     }
@@ -1245,18 +1391,17 @@ impl Transformer {
     /// As [`Transformer::load_placed`], plus [`CucaError::Provider`] when the file
     /// is not a drafter architecture.
     pub(crate) fn load_drafter(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
     ) -> Result<Self, CucaError> {
         Self::load_with(
             content,
-            path,
             context_length,
             false,
             true,
             &ExpertPlacement::Resident,
             &Sizing::single(context_length),
+            &EngramCache::default(),
             None,
         )
     }
@@ -1265,18 +1410,17 @@ impl Transformer {
     /// exact-arithmetic reference the GPU engine is compared against.
     #[cfg(test)]
     pub(crate) fn load_dequantized(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
     ) -> Result<Self, CucaError> {
         Self::load_with(
             content,
-            path,
             context_length,
             true,
             false,
             &ExpertPlacement::Resident,
             &Sizing::single(context_length),
+            &EngramCache::default(),
             None,
         )
     }
@@ -1294,16 +1438,16 @@ impl Transformer {
 
     #[expect(
         clippy::too_many_arguments,
-        reason = "the file, the flavours of the load and the part of the model are independent inputs"
+        reason = "the file, the placement, the sizing, the Engram cache and the test modes are independent inputs"
     )]
     fn load_with(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         dequantize: bool,
         drafter: bool,
         experts: &ExpertPlacement,
         sizing: &Sizing,
+        engram: &EngramCache,
         front: Option<&Front>,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
@@ -1344,7 +1488,6 @@ impl Transformer {
             }
             ExpertPlacement::Tiered(tiers) => Some(open_expert_store(
                 content,
-                path,
                 &hp,
                 tiers,
                 upto,
@@ -1353,7 +1496,7 @@ impl Transformer {
         };
         let mut loader = Loader {
             content,
-            reader: BufReader::new(File::open(path)?),
+            reader: content.reader(),
             dequantize,
             requantize: drafter,
         };
@@ -1386,7 +1529,6 @@ impl Transformer {
                 let row_len = hp.n_layer * dim;
                 Some(PleWeights {
                     table: RowTable::open(
-                        path,
                         content,
                         name::PER_LAYER_TOKEN_EMBD,
                         "per-layer embedding table",
@@ -1399,13 +1541,14 @@ impl Transformer {
             None => None,
         };
 
-        let ropes = build_rope_tables(content, path, &hp, context_length)?
-            .into_iter()
+        let rope_tables = build_rope_tables(content, &hp, context_length)?;
+        let ropes = rope_tables
+            .iter()
             .map(|t| {
                 let shape = (context_length, t.half);
                 Ok(RopeTable {
-                    cos: Tensor::from_vec(t.cos, shape, &Device::Cpu).map_err(candle_err)?,
-                    sin: Tensor::from_vec(t.sin, shape, &Device::Cpu).map_err(candle_err)?,
+                    cos: Tensor::from_slice(&t.cos, shape, &Device::Cpu).map_err(candle_err)?,
+                    sin: Tensor::from_slice(&t.sin, shape, &Device::Cpu).map_err(candle_err)?,
                 })
             })
             .collect::<Result<Vec<_>, CucaError>>()?;
@@ -1413,12 +1556,21 @@ impl Transformer {
         let kv_layout = KvLayout::sized(&hp, context_length, sizing);
         let mut layers = Vec::with_capacity(upto);
         let mut kv_layers = Vec::with_capacity(upto);
+        let mut compressed = Vec::with_capacity(upto);
         for (il, spec) in hp.layers.iter().enumerate().take(upto) {
             let layout = LayerLayout::read(&hp, il, spec, content)?;
             match kv_layout.layer_group[il].filter(|_| spec.owns_kv(il)) {
                 Some(g) => kv_layers.push(Some(KvLayer::zeros(spec, kv_layout.blocks[g]))),
                 None => kv_layers.push(None),
             }
+            compressed.push(
+                match (spec.csa.filter(|c| c.owns_kv), kv_layout.csa_group[il]) {
+                    (Some(c), Some(g)) => {
+                        Some(KvLayer::compressed(c.row_width, kv_layout.blocks[g]))
+                    }
+                    _ => None,
+                },
+            );
             layers.push(load_layer(
                 &mut loader,
                 &hp,
@@ -1438,6 +1590,17 @@ impl Transformer {
             None
         };
 
+        let engram_rows = match front.and_then(|f| f.engram.clone()) {
+            Some(shared) => Some(shared),
+            None => engram::open_table(content, &hp, engram)?,
+        };
+        let hyper = hyper::HyperModel::new(
+            &hp,
+            &rope_tables,
+            compressed,
+            sizing.max_sequences,
+            engram_rows,
+        );
         let hybrid = hp.is_hybrid();
         for lw in &mut layers {
             if let Mixer::Delta(dw) = &mut lw.mixer {
@@ -1458,9 +1621,12 @@ impl Transformer {
             nextn,
             ropes,
             kv: kv_layers,
+            hyper,
             layout: kv_layout,
             #[cfg(test)]
             solo,
+            #[cfg(test)]
+            solo_ids: Vec::new(),
             hybrid,
             slots: (0..if hybrid {
                 sizing.max_sequences.max(1)
@@ -1537,11 +1703,12 @@ impl Transformer {
                 }
                 kv.push(MirrorRows { layer: il, seqs });
             }
+            let flat = |t: Tensor| t.flatten_all().and_then(|t| t.to_vec1::<f32>());
+            let hyper = m.hyper.is_some();
             Ok(FrontOut {
-                hidden: x.flatten_all()?.to_vec1::<f32>()?,
-                per_layer: ple
-                    .map(|p| p.flatten_all().and_then(|p| p.to_vec1::<f32>()))
-                    .transpose()?,
+                hidden: flat(x)?,
+                per_layer: ple.clone().filter(|_| !hyper).map(flat).transpose()?,
+                pre: ple.filter(|_| hyper).map(flat).transpose()?,
                 kv,
             })
         })
@@ -1604,6 +1771,8 @@ impl Transformer {
                     && (2..=MAX_VERIFY_ROWS).contains(&r.tokens.len()),
                 want: r.want,
                 hidden: r.hidden,
+                tokens: r.tokens,
+                history: r.history,
             });
             tokens.extend_from_slice(r.tokens);
         }
@@ -1630,6 +1799,9 @@ impl Transformer {
                 return Err(candle_err(e));
             }
         };
+        if let Some(hy) = &self.hyper {
+            hy.commit(segs.iter().map(|s| s.slot));
+        }
         if self.hybrid {
             for seg in &segs {
                 let slot = &mut self.slots[seg.slot];
@@ -1787,6 +1959,8 @@ impl Transformer {
                     record: false,
                     want: Want::None,
                     hidden: Hidden::None,
+                    tokens: &[],
+                    history: &[],
                 };
                 x = self.layer(il, &x, None, &[seg], Some((ext, len)))?;
             }
@@ -1823,6 +1997,11 @@ impl Transformer {
     /// For any other `len` it falls back to `0` (the zero state): the caller
     /// recomputes from there, or restores a snapshot ([`Transformer::restore`]).
     pub(crate) fn rewind(&mut self, slot: usize, len: usize) -> usize {
+        // A hyper-connection model keeps only the compressor's half-pooled
+        // pair (see [`hyper`]): the rest of its state is positional.
+        if let Some(hy) = &self.hyper {
+            return hy.rewind(slot, len);
+        }
         if !self.hybrid {
             return len;
         }
@@ -1889,7 +2068,7 @@ impl Transformer {
     /// returned to afterwards: unbounded for an attention-only model,
     /// [`MAX_VERIFY_ROWS`] for a hybrid one.
     pub(crate) fn rollback_rows(&self) -> usize {
-        if self.hybrid {
+        if self.hybrid || self.hyper.is_some() {
             MAX_VERIFY_ROWS
         } else {
             usize::MAX
@@ -1900,13 +2079,16 @@ impl Transformer {
     fn delta_layers(&self) -> impl Iterator<Item = &DeltaWeights> {
         self.layers.iter().filter_map(|l| match &l.mixer {
             Mixer::Delta(dw) => Some(dw.as_ref()),
-            Mixer::Attention(_) | Mixer::Mla(_) => None,
+            Mixer::Attention(_) | Mixer::Mla(_) | Mixer::Csa(_) => None,
         })
     }
 
     /// The zero state at position 0 for `slot` (a sequence start, or after a
     /// failed pass).
     pub(crate) fn reset_slot(&mut self, slot: usize) {
+        if let Some(hy) = &self.hyper {
+            hy.reset(slot);
+        }
         if !self.hybrid || slot >= self.slots.len() {
             return;
         }
@@ -1927,6 +2109,9 @@ impl Transformer {
         per_layer: Option<Vec<f32>>,
         segs: &[Seg<'_>],
     ) -> candle_core::Result<TrunkOut> {
+        if self.hyper.is_some() {
+            return self.hyper_trunk(embeddings, segs);
+        }
         let hp = &self.hp;
         let dev = &Device::Cpu;
         let eps = hp.eps as f32;
@@ -2113,6 +2298,9 @@ impl Transformer {
             Mixer::Attention(aw) => self.attention_in(&self.attn_calls(il, segs, ext)?, aw, h),
             Mixer::Mla(mw) => self.mla_in(&self.attn_calls(il, segs, ext)?, mw, h),
             Mixer::Delta(dw) => dw.forward_segs(h, segs),
+            Mixer::Csa(_) => Err(candle_core::Error::msg(
+                "a hyper-connection layer runs through `hyper_trunk`",
+            )),
         })
     }
 
@@ -2529,7 +2717,10 @@ fn load_layer(
     let mixer = match (spec.delta(), spec.mla) {
         (Some(delta), _) => Mixer::Delta(Box::new(load_delta(loader, hp, il, delta)?)),
         (None, Some(mla)) => Mixer::Mla(Box::new(load_mla(loader, hp, il, spec, &mla)?)),
-        (None, None) => Mixer::Attention(load_attention(loader, hp, il, spec, layout)?),
+        (None, None) if hp.behavior.compressed_attention => {
+            Mixer::Csa(Box::new(hyper::load_csa(loader, hp, il, spec)?))
+        }
+        (None, None) => Mixer::Attention(Box::new(load_attention(loader, hp, il, spec, layout)?)),
     };
 
     let ffn = match (layout.ffn, hp.moe) {
@@ -2556,6 +2747,22 @@ fn load_layer(
             Some(spec),
         ) => FfnWeights::Moe {
             spec,
+            ext: match &hp.moe_ext {
+                Some(ext) => Some(Box::new(RouterExt {
+                    gating: ext.gating,
+                    bias: if loader.has(&name::blk_bias(il, name::EXP_PROBS_B)) {
+                        Some(
+                            loader
+                                .floats(&name::blk_bias(il, name::EXP_PROBS_B), &[spec.n_expert])?,
+                        )
+                    } else {
+                        None
+                    },
+                    clamp: ext.clamp[il],
+                    clamp_shared: ext.clamp_shared[il],
+                })),
+                None => None,
+            },
             router: loader.matmul(&blk(name::FFN_GATE_INP), &[spec.n_expert, n_embd])?,
             experts: loader.expert_bank(il, spec.n_expert, ff, n_embd, fused, tiers)?,
             shared: match shared_ff {
@@ -2612,6 +2819,11 @@ fn load_layer(
         )?,
         ple,
         out_scale,
+        hc: if hp.behavior.hyper_connections {
+            Some(Box::new(hyper::load_hc_layer(loader, hp, il)?))
+        } else {
+            None
+        },
     })
 }
 
@@ -2895,53 +3107,77 @@ impl FfnWeights {
                 router,
                 experts,
                 shared,
+                ext,
             } => {
                 let (_, t, n_embd) = f.dims3()?;
                 let flat = f.reshape((t, n_embd))?;
                 let logits = router.forward(&flat)?.flatten_all()?.to_vec1::<f32>()?;
-                let routing = route(&logits, t, spec);
-                let mut pass = match experts {
-                    ExpertBank::Resident(_) => None,
-                    ExpertBank::Tiered { il, store } => {
-                        let shared = store.shared();
-                        shared.record(*il, &routing, t);
-                        let needed: Vec<u32> = (0..routing.per_expert.len() as u32)
-                            .filter(|&e| !routing.per_expert[e as usize].is_empty())
-                            .collect();
-                        add(&shared.lookups, needed.len() as u64);
-                        Some(store.pass(*il, &needed))
-                    }
+                let (routing, glu, shared_glu) = match ext.as_deref() {
+                    None => (route(&logits, t, spec), act.into(), act.into()),
+                    Some(ext) => (
+                        route_with(&logits, t, spec, ext.gating, ext.bias.as_deref()),
+                        Glu::clamped(act, ext.clamp),
+                        Glu::clamped(act, ext.clamp_shared),
+                    ),
                 };
-                let mut out = vec![0f32; t * n_embd];
-                for (e, picks) in routing.per_expert.iter().enumerate() {
-                    if picks.is_empty() {
-                        continue;
-                    }
-                    // Experts run in ascending order in both placements, so
-                    // the accumulation order (and the output) is the same.
-                    let fetched;
-                    let x = match (experts, pass.as_mut()) {
-                        (ExpertBank::Resident(all), _) => &all[e],
-                        (ExpertBank::Tiered { .. }, Some(pass)) => {
-                            fetched = pass
-                                .next(e as u32)
-                                .map_err(|e| candle_core::Error::msg(e.to_string()))?;
-                            &*fetched
-                        }
-                        (ExpertBank::Tiered { .. }, None) => {
-                            return Err(candle_core::Error::msg("tiered experts without a pass"));
-                        }
-                    };
-                    x.add_picks(&flat, picks, act, &mut out)?;
-                }
+                let out = expert_sum(experts, &flat, &routing, glu, t, n_embd)?;
                 let mut out = Tensor::from_vec(out, (t, n_embd), f.device())?;
                 if let Some(shared) = shared {
-                    out = (out + shared.forward(&flat, act)?)?;
+                    out = (out + shared.forward(&flat, shared_glu)?)?;
                 }
                 out.reshape((1, t, n_embd))
             }
         }
     }
+}
+
+/// The routed experts' output `[t, n_embd]` (row-major) over the rows `flat`
+/// for `routing`: every expert runs once over its own tokens, in ascending
+/// expert order in both placements (so the accumulation order, and the
+/// output, are the same), and the weighted outputs are summed per token.
+fn expert_sum(
+    experts: &ExpertBank,
+    flat: &Tensor,
+    routing: &Routing,
+    glu: Glu,
+    t: usize,
+    n_embd: usize,
+) -> candle_core::Result<Vec<f32>> {
+    let mut pass = match experts {
+        ExpertBank::Resident(_) => None,
+        ExpertBank::Tiered { il, store } => {
+            let shared = store.shared();
+            shared.record(*il, routing, t);
+            let needed: Vec<u32> = (0..routing.per_expert.len() as u32)
+                .filter(|&e| !routing.per_expert[e as usize].is_empty())
+                .collect();
+            add(&shared.lookups, needed.len() as u64);
+            Some(store.pass(*il, &needed))
+        }
+    };
+    let mut out = vec![0f32; t * n_embd];
+    for (e, picks) in routing.per_expert.iter().enumerate() {
+        if picks.is_empty() {
+            continue;
+        }
+        let fetched;
+        let x = match (experts, pass.as_mut()) {
+            (ExpertBank::Resident(all), _) => all
+                .get(e)
+                .ok_or_else(|| candle_core::Error::msg("expert out of range"))?,
+            (ExpertBank::Tiered { .. }, Some(pass)) => {
+                fetched = pass
+                    .next(e as u32)
+                    .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+                &*fetched
+            }
+            (ExpertBank::Tiered { .. }, None) => {
+                return Err(candle_core::Error::msg("tiered experts without a pass"));
+            }
+        };
+        x.add_picks(flat, picks, glu, &mut out)?;
+    }
+    Ok(out)
 }
 
 fn activate(x: &Tensor, act: Act) -> candle_core::Result<Tensor> {
@@ -3063,12 +3299,25 @@ impl Transformer {
         exact: bool,
     ) -> Result<Forward, CucaError> {
         let seq = self.solo.begin(start_pos, tokens.len())?;
-        let batch = Batch::single(tokens, start_pos, &seq.tables, want, hidden, exact);
+        let history = self.solo_ids[..start_pos.min(self.solo_ids.len())].to_vec();
+        let batch = Batch::single(
+            tokens,
+            start_pos,
+            &history,
+            &seq.tables,
+            want,
+            hidden,
+            exact,
+        );
         let out = self
             .forward_batch(&batch)
             .map(|mut outs| outs.swap_remove(0));
         self.solo
             .finish(seq, out.is_ok().then_some(start_pos + tokens.len()));
+        if out.is_ok() {
+            self.solo_ids.truncate(start_pos);
+            self.solo_ids.extend_from_slice(tokens);
+        }
         out
     }
 
@@ -3081,6 +3330,7 @@ impl Transformer {
         if kept != state {
             self.rewind(0, kept);
         }
+        self.solo_ids.truncate(kept);
         kept
     }
 
@@ -3176,7 +3426,7 @@ mod tests {
     /// equals itself in one pass.
     #[test]
     fn mistral3_scales_queries_by_absolute_position() {
-        use candle_core::quantized::gguf_file::Value;
+        use crate::provider::local::gguf::Value;
         let on = TinySpec::mistral3();
         let mut off = TinySpec::mistral3();
         off.meta.retain(|(k, _)| k != "attention.temperature_scale");
@@ -3267,6 +3517,7 @@ mod tests {
                 rows: step
                     .iter()
                     .map(|&(i, tokens, want, hidden)| super::super::SeqRows {
+                        history: &[],
                         tokens,
                         start_pos: lens[i],
                         tables: &seqs[i].tables,
@@ -3314,6 +3565,7 @@ mod tests {
         let mut a = pools.seq();
         pools.reserve(&mut a, 4).unwrap();
         let rows = |slot: usize, start: usize| super::super::SeqRows {
+            history: &[],
             tokens: &PROMPT[..2],
             start_pos: start,
             tables: &a.tables,
@@ -3384,10 +3636,9 @@ mod tests {
     #[test]
     fn load_rejects_context_length_above_the_model_maximum() {
         let model = write_tiny_model();
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         for n in [0, 33] {
-            let e = Transformer::load(&content, &model.path, n).err().unwrap();
+            let e = Transformer::load(&content, n).err().unwrap();
             assert!(matches!(e, CucaError::Config(_)), "{n}: {e}");
         }
     }
@@ -3524,12 +3775,11 @@ mod tests {
     #[test]
     fn moe_ffn_matches_a_per_token_reference() {
         let model = write_spec(&TinySpec::qwen3moe());
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         let hp = read_hparams(&content).unwrap();
         let mut loader = Loader {
             content: &content,
-            reader: BufReader::new(File::open(&model.path).unwrap()),
+            reader: content.reader(),
             dequantize: true,
             requantize: false,
         };
@@ -3546,6 +3796,7 @@ mod tests {
             router,
             experts: ExpertBank::Resident(experts),
             shared: None,
+            ..
         } = &lw.ffn
         else {
             panic!("qwen3moe FFN is a mixture of resident experts");
@@ -3608,16 +3859,14 @@ mod tests {
     #[test]
     fn qwen35moe_ffn_adds_the_gated_shared_expert() {
         let model = write_qwen35(&q35moe());
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         let hp = read_hparams(&content).unwrap();
         assert_eq!(hp.arch.name(), "qwen35moe");
         let moe = hp.moe.unwrap();
         assert!(moe.norm_weights);
         let mut loader = Loader {
             content: &content,
-            reader: BufReader::new(File::open(&model.path).unwrap()),
+            reader: content.reader(),
             dequantize: true,
             requantize: false,
         };
@@ -3642,6 +3891,7 @@ mod tests {
             router,
             experts: ExpertBank::Resident(experts),
             shared: Some(shared),
+            ..
         } = &lw.ffn
         else {
             panic!("qwen35moe FFN is resident experts plus a shared expert");
@@ -3699,10 +3949,8 @@ mod tests {
         let m = load(&model, 32);
         assert!(m.is_hybrid());
         assert_eq!((m.hp.n_layer, m.hp.nextn_predict_layers), (5, 1));
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
-        let e = m.load_head(&content, &model.path).err().unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
+        let e = m.load_head(&content).err().unwrap();
         assert!(
             matches!(&e, CucaError::Config(msg) if msg.contains("qwen35moe") && msg.contains("mixture-of-experts")),
             "{e:?}"
@@ -3769,14 +4017,12 @@ mod tests {
 
     /// The dtypes of the weights in a tiny GGUF.
     fn file_dtypes(model: &super::super::tiny::TinyModel) -> std::collections::BTreeSet<String> {
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         content
             .tensor_infos
             .iter()
             .filter(|(name, _)| name.ends_with(".weight"))
-            .map(|(_, info)| format!("{:?}", info.ggml_dtype))
+            .map(|(_, info)| info.dtype.name())
             .collect()
     }
 
@@ -4007,9 +4253,8 @@ mod tests {
         let mut spec = TinySpec::llama();
         spec.arch = "mamba2";
         let model = write_spec(&spec);
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
-        let e = Transformer::load(&content, &model.path, 32).err().unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
+        let e = Transformer::load(&content, 32).err().unwrap();
         assert!(e.to_string().contains("`mamba2`"), "{e}");
     }
 
@@ -4025,9 +4270,7 @@ mod tests {
 
     /// Bytes of one expert summed over the MoE layers of `model`.
     fn expert_bytes(model: &super::super::tiny::TinyModel) -> u64 {
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         let hp = read_hparams(&content).unwrap();
         let n_expert = hp.moe.unwrap().n_expert;
         (0..hp.n_layer)
@@ -4052,9 +4295,7 @@ mod tests {
         ram_bytes: u64,
         warm_from: Option<crate::provider::local::ExpertHeat>,
     ) -> Result<Transformer, CucaError> {
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         let tiers = ExpertTiers {
             ram_bytes,
             loader_threads: 2,
@@ -4063,10 +4304,10 @@ mod tests {
         };
         Transformer::load_placed(
             &content,
-            &model.path,
             32,
             &ExpertPlacement::Tiered(tiers),
             &Sizing::single(32),
+            &EngramCache::default(),
         )
     }
 
@@ -4172,7 +4413,7 @@ mod tests {
 /// references, bit-exact batching, and the cache snapshot semantics.
 #[cfg(test)]
 mod hybrid_tests {
-    use candle_core::quantized::gguf_file::Value;
+    use crate::provider::local::gguf::Value;
 
     use super::super::delta::tests::{Inputs, reference};
     use super::super::paged::KvPools;
@@ -4184,20 +4425,20 @@ mod hybrid_tests {
     use super::*;
 
     /// The parsed GGUF header of `model`.
-    pub(super) fn content_of(model: &TinyModel) -> gguf_file::Content {
-        gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap())).unwrap()
+    pub(super) fn content_of(model: &TinyModel) -> gguf::Content {
+        gguf::Content::open(&model.path).unwrap()
     }
 
     /// The model with every matmul weight dequantized to f32.
     pub(super) fn load_dequantized(model: &TinyModel) -> Transformer {
         Transformer::load_with(
             &content_of(model),
-            &model.path,
             CONTEXT,
             true,
             false,
             &ExpertPlacement::Resident,
             &Sizing::single(CONTEXT),
+            &EngramCache::default(),
             None,
         )
         .unwrap()
@@ -4228,6 +4469,8 @@ mod hybrid_tests {
             record: false,
             want: Want::None,
             hidden: Hidden::None,
+            tokens: &[],
+            history: &[],
         }
     }
 
@@ -4262,9 +4505,9 @@ mod hybrid_tests {
     /// The tensor `name` of `model` dequantized to f64.
     pub(super) fn tensor(model: &TinyModel, name: &str) -> Vec<f64> {
         let content = content_of(model);
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
         content
-            .tensor(&mut reader, name, &Device::Cpu)
+            .reader()
+            .tensor(name, &Device::Cpu)
             .unwrap()
             .dequantize(&Device::Cpu)
             .unwrap()
@@ -4300,7 +4543,7 @@ mod hybrid_tests {
         let content = content_of(&model);
         let mut loader = Loader {
             content: &content,
-            reader: BufReader::new(File::open(&model.path).unwrap()),
+            reader: content.reader(),
             dequantize: false,
             requantize: false,
         };
@@ -4774,7 +5017,7 @@ mod hybrid_tests {
         let load_err = |s: TinyQwen35| {
             let model = write_qwen35(&s);
             let content = content_of(&model);
-            Transformer::load(&content, &model.path, CONTEXT)
+            Transformer::load(&content, CONTEXT)
                 .err()
                 .unwrap()
                 .to_string()

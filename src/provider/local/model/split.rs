@@ -93,6 +93,18 @@ pub(crate) fn plan(hp: &Hparams, gpu_layers: usize) -> Result<Placement, CucaErr
             hp.arch.name()
         )));
     }
+    if gpu_layers > 0 && gpu_layers < n_layer && !legal_cut(hp, n_layer - gpu_layers) {
+        let legal = legal_gpu_layers(hp);
+        return Err(CucaError::Config(format!(
+            "gpu_layers {gpu_layers} cuts `{}` between layers that share compressed rows or indexer picks; legal values: {}",
+            hp.arch.name(),
+            legal
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
     Ok(if gpu_layers == 0 {
         Placement::Cpu
     } else if gpu_layers == n_layer {
@@ -102,6 +114,47 @@ pub(crate) fn plan(hp: &Hparams, gpu_layers: usize) -> Result<Placement, CucaErr
             first: n_layer - gpu_layers,
         }
     })
+}
+
+/// Whether the layers `first..` of `hp` can run apart from the layers
+/// before them. A layer with compressed sparse attention reads the compressed
+/// rows of its cache source layer and the picks of its index source layer
+/// (and, when it narrows its scoring to candidate blocks, those the candidate
+/// source layer published), none of which crosses the boundary: every source
+/// a layer from `first` on reads must itself be from `first` on. Every other
+/// model can be cut anywhere.
+pub(crate) fn legal_cut(hp: &Hparams, first: usize) -> bool {
+    let candidate_source = hp
+        .csa
+        .as_ref()
+        .and_then(|g| g.indexer.candidates)
+        .map(|(src, _, _)| src);
+    hp.layers.iter().skip(first).all(|l| {
+        l.csa.is_none_or(|c| {
+            c.kv_source >= first
+                && c.index_source >= first
+                && (c.candidates != super::csa::Candidates::Consumer
+                    || candidate_source.is_none_or(|src| src >= first))
+        })
+    })
+}
+
+/// The `gpu_layers` values [`plan`] accepts for `hp`, ascending: 0, the
+/// layer count and every cut [`legal_cut`] allows.
+pub(crate) fn legal_gpu_layers(hp: &Hparams) -> Vec<usize> {
+    let n = hp.n_layer;
+    let mut legal: Vec<usize> = std::iter::once(0)
+        .chain(
+            (1..n)
+                .filter(|&first| legal_cut(hp, first))
+                .rev()
+                .map(|first| n - first),
+        )
+        .chain(std::iter::once(n))
+        .collect();
+    legal.sort_unstable();
+    legal.dedup();
+    legal
 }
 
 /// The K/V-owning layers before `first` whose cache a layer from `first` on
@@ -137,10 +190,10 @@ pub(crate) use model::{SplitModel, SplitSnapshot};
 
 #[cfg(feature = "provider-local-gpu")]
 mod model {
-    use std::path::Path;
+
     use std::sync::Arc;
 
-    use candle_core::quantized::gguf_file;
+    use crate::provider::local::gguf;
 
     use super::super::cpu::{Forward, Front, Transformer};
     use super::super::delta::DeltaState;
@@ -150,7 +203,7 @@ mod model {
     use super::super::{Batch, read_hparams};
     use super::{Hparams, mirrored};
     use crate::error::CucaError;
-    use crate::provider::local::{ExpertPlacement, ExpertTiers, LocalDevice};
+    use crate::provider::local::{EngramCache, ExpertPlacement, ExpertTiers, LocalDevice};
 
     /// A model whose first layers run on the CPU and whose last layers (and
     /// head) run on a GPU; see the module docs.
@@ -161,6 +214,8 @@ mod model {
         first: usize,
         n_layer: usize,
         tiers: Option<Arc<TierShared>>,
+        /// The model keeps a compressor state per sequence slot in each half.
+        stateful: bool,
     }
 
     /// A recurrent-state snapshot of both halves.
@@ -245,23 +300,23 @@ mod model {
         ///
         /// As [`Transformer::load_front`] and [`GpuTransformer::load_back`].
         pub(crate) fn load(
-            content: &gguf_file::Content,
-            path: &Path,
+            content: &gguf::Content,
             context_length: usize,
             device: LocalDevice,
             experts: &ExpertPlacement,
             sizing: &Sizing,
             first: usize,
+            engram: &EngramCache,
         ) -> Result<Self, CucaError> {
             Self::load_with(
                 content,
-                path,
                 context_length,
                 device,
                 experts,
                 sizing,
                 first,
                 false,
+                engram,
             )
         }
 
@@ -269,24 +324,25 @@ mod model {
         /// f32 when `dequantize` (the reference of the tests).
         #[expect(
             clippy::too_many_arguments,
-            reason = "the file, the placement and the split point are independent inputs"
+            reason = "the load's independent inputs; a struct would only rename them"
         )]
         pub(crate) fn load_with(
-            content: &gguf_file::Content,
-            path: &Path,
+            content: &gguf::Content,
             context_length: usize,
             device: LocalDevice,
             experts: &ExpertPlacement,
             sizing: &Sizing,
             first: usize,
             dequantize: bool,
+            engram: &EngramCache,
         ) -> Result<Self, CucaError> {
             let hp = read_hparams(content)?;
             let (cpu_experts, gpu_experts, shared) = place_experts(&hp, experts, first)?;
             let mirror = mirrored(&hp, first);
+            // One table for both halves: one row cache, one set of counters.
+            let engram_rows = super::super::engram::open_table(content, &hp, engram)?;
             let front = Transformer::load_front(
                 content,
-                path,
                 context_length,
                 &cpu_experts,
                 sizing,
@@ -294,12 +350,12 @@ mod model {
                     layers: first,
                     shared: shared.clone(),
                     export: mirror.clone(),
+                    engram: engram_rows.clone(),
                 },
                 dequantize,
             )?;
             let back = GpuTransformer::load_back(
                 content,
-                path,
                 context_length,
                 device,
                 &gpu_experts,
@@ -308,6 +364,7 @@ mod model {
                     first,
                     shared: shared.clone(),
                     mirror,
+                    engram: engram_rows,
                 },
             )?;
             Ok(Self {
@@ -316,6 +373,7 @@ mod model {
                 first,
                 n_layer: hp.n_layer,
                 tiers: shared,
+                stateful: hp.behavior.hyper_connections,
             })
         }
 
@@ -349,7 +407,7 @@ mod model {
             let out = self.front.forward_front(batch)?;
             let result = self
                 .back
-                .forward_back(batch, out.hidden, out.per_layer, &out.kv);
+                .forward_back(batch, out.hidden, out.per_layer, out.pre, &out.kv);
             if result.is_err() {
                 for row in &batch.rows {
                     self.front.reset_slot(row.state.0);
@@ -366,6 +424,20 @@ mod model {
         /// The block pools' layout (shared by both halves).
         pub(crate) fn kv_layout(&self) -> &KvLayout {
             self.back.kv_layout()
+        }
+
+        /// Start reading the engram rows of the next `tokens` of a sequence.
+        /// Both halves share one table and the CPU half asks for the rows of
+        /// every engram layer, so it alone does.
+        pub(crate) fn engram_prefetch(&self, history: &[u32], tokens: &[u32]) {
+            self.front.engram_prefetch(history, tokens);
+        }
+
+        /// The counters of the engram table both halves read.
+        pub(crate) fn engram_counters(
+            &self,
+        ) -> Option<std::sync::Arc<super::super::engram_io::EngramCounters>> {
+            self.front.engram_counters()
         }
 
         /// Bytes of K/V data the pools hold, on both devices.
@@ -390,7 +462,7 @@ mod model {
         /// verification call, the GPU one only the end), so the request
         /// settles on the position both can hold.
         pub(crate) fn rewind(&mut self, slot: usize, len: usize) -> usize {
-            if !self.is_hybrid() {
+            if !self.is_hybrid() && !self.stateful {
                 return len;
             }
             let mut at = len;
@@ -441,10 +513,10 @@ mod model {
 mod tests {
     use super::super::tiny::{TinyOptions, TinySpec, write_spec, write_tiny_model_with};
     use super::*;
+    use crate::provider::local::gguf;
 
     fn hparams(model: &super::super::tiny::TinyModel) -> Hparams {
-        let mut reader = std::io::BufReader::new(std::fs::File::open(&model.path).unwrap());
-        let content = candle_core::quantized::gguf_file::Content::read(&mut reader).unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         super::super::read_hparams(&content).unwrap()
     }
 
@@ -480,20 +552,19 @@ mod tests {
         use crate::provider::local::{ExpertPlacement, GpuAdapter, LocalDevice};
 
         let model = write_spec(&TinySpec::llama());
-        let mut reader = std::io::BufReader::new(std::fs::File::open(&model.path).unwrap());
-        let content = candle_core::quantized::gguf_file::Content::read(&mut reader).unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         let n = super::super::read_hparams(&content).unwrap().n_layer;
         let vulkan = LocalDevice::Vulkan(GpuAdapter::Default);
         let load = |device: LocalDevice, shards: &[LocalDevice], gpu_layers: usize| {
             Model::load(
                 &content,
-                &model.path,
                 32,
                 device,
                 shards,
                 &ExpertPlacement::Resident,
                 &Sizing::single(32),
                 Some(gpu_layers),
+                &crate::provider::local::EngramCache::default(),
             )
         };
         let over = format!("gpu_layers {} exceeds the {n} layers", n + 1);

@@ -5,9 +5,10 @@
 //! objects, alone or in a JSON list; [`parse_xml_call`] reads the
 //! `<function=name><parameter=key>value</parameter></function>` blocks of
 //! Qwen 3.5; [`parse_args_call`] reads Mistral's `name[ARGS]{json}` (with an
-//! optional `[CALL_ID]id` after the name). All return a description of the first
-//! problem on malformed input; the caller wraps it into a provider error that
-//! quotes the raw body.
+//! optional `[CALL_ID]id` after the name); [`parse_dsml_calls`] reads the
+//! `<｜DSML｜ invoke name="f">` elements of a DeepSeek V4.1 block. All return a
+//! description of the first problem on malformed input; the caller wraps it
+//! into a provider error that quotes the raw body.
 
 use serde_json::{Map, Number, Value};
 
@@ -333,6 +334,93 @@ pub(crate) fn parse_args_call(
     Ok((id.map(str::to_string), name.to_string(), arguments))
 }
 
+/// The text after the opening (`</` when `closing`) tag `<{dsml}{name}` at the
+/// start of `s`, where any number of spaces may sit between the bar and the
+/// name (V4.1 writes one, V4 none).
+fn dsml_tag<'a>(s: &'a str, closing: bool, dsml: &str, name: &str) -> Option<&'a str> {
+    let rest = s.strip_prefix(if closing { "</" } else { "<" })?;
+    let rest = rest.strip_prefix(dsml)?.trim_start_matches(' ');
+    rest.strip_prefix(name)
+}
+
+/// Parse the body of a DeepSeek V4.1 call block, the text between
+/// `<｜DSML｜ calls>` and `</｜DSML｜ calls>`, into the calls it holds:
+///
+/// ```text
+/// <｜DSML｜ invoke name="get_weather">
+/// <｜DSML｜ parameter name="city" string="true">Paris</｜DSML｜ parameter>
+/// <｜DSML｜ parameter name="days" string="false">3</｜DSML｜ parameter>
+/// </｜DSML｜ invoke>
+/// ```
+///
+/// Parameter values are the exact text up to the first closing parameter tag
+/// (nothing is trimmed or unescaped): `string="true"` makes a JSON string,
+/// `string="false"` is parsed as JSON. Whitespace between elements is free, a
+/// repeated parameter name is an error, and an `invoke` name is kept as
+/// written (`ns::f` stays qualified).
+pub(crate) fn parse_dsml_calls(body: &str, dsml: &str) -> Result<Vec<(String, Value)>, String> {
+    let parameter_close = [
+        format!("</{dsml} parameter>"),
+        format!("</{dsml}parameter>"),
+    ];
+    let mut calls = Vec::new();
+    let mut rest = body.trim_start();
+    while !rest.is_empty() {
+        let after = dsml_tag(rest, false, dsml, "invoke")
+            .ok_or_else(|| format!("expected `<{dsml} invoke`"))?;
+        let (name, after) = after
+            .trim_start()
+            .strip_prefix("name=\"")
+            .and_then(|a| a.split_once("\">"))
+            .ok_or("expected `name=\"...\">` in an invoke tag")?;
+        if name.is_empty() {
+            return Err("empty tool name".to_string());
+        }
+        let mut arguments = Map::new();
+        rest = after.trim_start();
+        loop {
+            if let Some(after) = dsml_tag(rest, true, dsml, "invoke") {
+                let after = after
+                    .trim_start()
+                    .strip_prefix('>')
+                    .ok_or("expected `>` after the invoke close tag")?;
+                rest = after.trim_start();
+                break;
+            }
+            let after = dsml_tag(rest, false, dsml, "parameter")
+                .ok_or_else(|| format!("expected a parameter or `</{dsml} invoke>`"))?;
+            let (key, after) = after
+                .trim_start()
+                .strip_prefix("name=\"")
+                .and_then(|a| a.split_once('"'))
+                .ok_or("expected `name=\"...\"` in a parameter tag")?;
+            let (is_string, after) = after
+                .trim_start()
+                .strip_prefix("string=\"")
+                .and_then(|a| a.split_once("\">"))
+                .ok_or_else(|| format!("expected `string=\"true|false\">` after `{key}`"))?;
+            let (value, after_close) = parameter_close
+                .iter()
+                .filter_map(|close| after.find(close.as_str()).map(|at| (at, close.len())))
+                .min()
+                .map(|(at, len)| (&after[..at], at + len))
+                .ok_or_else(|| format!("parameter `{key}` is not closed"))?;
+            let value = match is_string {
+                "true" => Value::String(value.to_string()),
+                "false" => serde_json::from_str(value)
+                    .map_err(|e| format!("parameter `{key}` is not JSON: {e}"))?,
+                other => return Err(format!("`string=\"{other}\"` is neither true nor false")),
+            };
+            if arguments.insert(key.to_string(), value).is_some() {
+                return Err(format!("duplicate parameter `{key}`"));
+            }
+            rest = after[after_close..].trim_start();
+        }
+        calls.push((name.to_string(), Value::Object(arguments)));
+    }
+    Ok(calls)
+}
+
 /// Read one tool-call object.
 ///
 /// The name comes from `name`, from a string `function` (`{"function": "f",
@@ -628,6 +716,140 @@ mod tests {
             "{\"function\": \"\", \"arguments\": {}}",
         ] {
             assert!(parse_json_calls(bad).is_err(), "should reject {bad:?}");
+        }
+    }
+
+    const BAR: &str = "\u{ff5c}DSML\u{ff5c}";
+
+    fn invoke(name: &str, parameters: &[(&str, &str, &str)]) -> String {
+        let mut out = format!("<{BAR} invoke name=\"{name}\">\n");
+        for (key, is_string, value) in parameters {
+            out.push_str(&format!(
+                "<{BAR} parameter name=\"{key}\" string=\"{is_string}\">{value}</{BAR} parameter>\n"
+            ));
+        }
+        out.push_str(&format!("</{BAR} invoke>\n"));
+        out
+    }
+
+    #[test]
+    fn dsml_calls_read_strings_as_written_and_other_values_as_json() {
+        let body = format!(
+            "\n{}{}",
+            invoke(
+                "f",
+                &[
+                    ("s", "true", "he said \"hi\"\n  <b>&amp;</b>"),
+                    ("n", "false", "3"),
+                    ("x", "false", "2.50"),
+                    ("l", "false", "[1, \"a\", {\"k\": null}]"),
+                    ("e", "true", ""),
+                    ("numeric_string", "true", "123"),
+                ]
+            ),
+            invoke("g", &[])
+        );
+        let calls = parse_dsml_calls(&body, BAR).unwrap();
+        assert_eq!(
+            calls,
+            [
+                (
+                    "f".to_string(),
+                    json!({
+                        "s": "he said \"hi\"\n  <b>&amp;</b>",
+                        "n": 3,
+                        "x": 2.5,
+                        "l": [1, "a", {"k": null}],
+                        "e": "",
+                        "numeric_string": "123",
+                    })
+                ),
+                ("g".to_string(), json!({})),
+            ]
+        );
+    }
+
+    #[test]
+    fn dsml_arguments_keep_the_order_the_model_wrote() {
+        let body = invoke(
+            "f",
+            &[
+                ("zeta", "true", "z"),
+                ("alpha", "true", "a"),
+                ("mid", "true", "m"),
+            ],
+        );
+        let (_, arguments) = parse_dsml_calls(&body, BAR).unwrap().remove(0);
+        let keys: Vec<&str> = arguments
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["zeta", "alpha", "mid"]);
+    }
+
+    #[test]
+    fn dsml_names_stay_qualified_and_a_value_ends_at_the_first_closing_tag() {
+        let body = format!(
+            "<{BAR} invoke name=\"search::lookup\">\n<{BAR} parameter name=\"q\" string=\"true\">a</{BAR} parameter> b</{BAR} parameter>\n</{BAR} invoke>"
+        );
+        // The reference reads up to the first closing tag; the rest is not a tag.
+        assert!(parse_dsml_calls(&body, BAR).is_err());
+        let body = invoke("search::lookup", &[("q", "true", "x")]);
+        assert_eq!(
+            parse_dsml_calls(&body, BAR).unwrap(),
+            [("search::lookup".to_string(), json!({"q": "x"}))]
+        );
+    }
+
+    #[test]
+    fn dsml_tags_without_the_v41_space_parse_too() {
+        let body = "<\u{ff5c}DSML\u{ff5c}invoke name=\"f\">\n<\u{ff5c}DSML\u{ff5c}parameter name=\"a\" string=\"false\">1</\u{ff5c}DSML\u{ff5c}parameter>\n</\u{ff5c}DSML\u{ff5c}invoke>";
+        assert_eq!(
+            parse_dsml_calls(body, BAR).unwrap(),
+            [("f".to_string(), json!({"a": 1}))]
+        );
+    }
+
+    #[test]
+    fn an_empty_dsml_block_holds_no_calls() {
+        assert!(parse_dsml_calls("\n", BAR).unwrap().is_empty());
+    }
+
+    #[test]
+    fn malformed_dsml_blocks_are_rejected() {
+        let good = invoke("f", &[("a", "true", "v")]);
+        assert!(parse_dsml_calls(&good, BAR).is_ok());
+        for (what, bad) in [
+            ("text instead of an invoke", "hello".to_string()),
+            ("a wrong bar", good.replace(BAR, "\u{ff5c}XML\u{ff5c}")),
+            ("no name", good.replace(" name=\"f\"", "")),
+            ("an empty name", good.replace("name=\"f\"", "name=\"\"")),
+            ("no string flag", good.replace(" string=\"true\"", "")),
+            (
+                "a bad string flag",
+                good.replace("string=\"true\"", "string=\"maybe\""),
+            ),
+            (
+                "an unclosed parameter",
+                good.replace(&format!("</{BAR} parameter>"), ""),
+            ),
+            (
+                "an unclosed invoke",
+                good.replace(&format!("</{BAR} invoke>"), ""),
+            ),
+            (
+                "a repeated parameter",
+                invoke("f", &[("a", "true", "1"), ("a", "true", "2")]),
+            ),
+            (
+                "a value that is not JSON",
+                invoke("f", &[("a", "false", "{not json}")]),
+            ),
+            ("text between elements", good.replace("\n</", "\nstray</")),
+        ] {
+            assert!(parse_dsml_calls(&bad, BAR).is_err(), "{what}: {bad:?}");
         }
     }
 }

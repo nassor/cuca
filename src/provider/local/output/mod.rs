@@ -19,7 +19,12 @@
 //!   [`calls::parse_xml_call`]), Mistral's `[TOOL_CALLS]name[ARGS]{json}`
 //!   (repeated per call, no closing marker: a call ends at the next opener or
 //!   at the end of generation, [`calls::parse_args_call`]; an opener inside
-//!   reasoning is reasoning text);
+//!   reasoning is reasoning text), and DeepSeek V4.1's DSML block
+//!   (`<｜DSML｜ calls>` with one `<｜DSML｜ invoke name="f">` per call and a
+//!   `<｜DSML｜ parameter name="k" string="true|false">` per argument,
+//!   [`calls::parse_dsml_calls`]; the blank line before the block is part of
+//!   its opener, and the opener inside reasoning ends it and starts the call,
+//!   as in DeepSeek's own stream parser);
 //! - everything else is [`MessageContentBlock::Text`].
 //!
 //! Markers are matched on **text**, not ids, so a marker that the vocabulary
@@ -41,9 +46,13 @@
 
 mod atem;
 mod calls;
+#[cfg(test)]
+mod golden_deepseek;
 
 use self::atem::AtemParser;
-use self::calls::{parse_args_call, parse_json_calls, parse_tool_call, parse_xml_call};
+use self::calls::{
+    parse_args_call, parse_dsml_calls, parse_json_calls, parse_tool_call, parse_xml_call,
+};
 use super::chat::{ChatFormat, ToolSyntax};
 use super::tokenizer::Tokenizer;
 use crate::error::CucaError;
@@ -155,6 +164,19 @@ impl OutputParser {
                 markers.content.push(open_tool(open));
                 markers.thinking.push(open_tool(open));
                 markers.tool.push(close_tool(close));
+            }
+            // `\n\n<｜DSML｜ calls>` is what the model was trained to write after
+            // its answer, so the blank line belongs to the opener (the longer
+            // spelling wins at the same place, and a bare opener is accepted
+            // too). DeepSeek's own parser treats the opener inside reasoning as
+            // the start of a call, so the markers apply there as well.
+            ToolSyntax::Dsml { dsml, calls } => {
+                let open = format!("<{dsml}{calls}>");
+                for text in [format!("\n\n{open}"), open] {
+                    markers.content.push(open_tool(&text));
+                    markers.thinking.push(open_tool(&text));
+                }
+                markers.tool.push(close_tool(&format!("</{dsml}{calls}>")));
             }
             // The opener is not a marker inside reasoning: a model may write
             // it there as text.
@@ -544,6 +566,8 @@ impl OutputParser {
         let parsed = match self.format.tool_syntax() {
             ToolSyntax::Gemma4 { .. } => parse_tool_call(&body).map(|call| vec![(None, call)]),
             ToolSyntax::TaggedXml { .. } => parse_xml_call(&body).map(|call| vec![(None, call)]),
+            ToolSyntax::Dsml { dsml, .. } => parse_dsml_calls(&body, dsml)
+                .map(|calls| calls.into_iter().map(|c| (None, c)).collect()),
             ToolSyntax::MistralArgs { args, call_id, .. } => {
                 parse_args_call(&body, args, call_id.as_deref())
                     .map(|(id, name, arguments)| vec![(id, (name, arguments))])
@@ -616,7 +640,7 @@ fn partial_marker_suffix(hold: &str, markers: &[Marker]) -> usize {
 mod tests {
     use std::collections::HashMap;
 
-    use candle_core::quantized::gguf_file;
+    use crate::provider::local::gguf;
     use serde_json::{Value, json};
 
     use super::*;
@@ -740,7 +764,7 @@ mod tests {
             .expect("synthetic vocabulary is valid");
             let md = HashMap::from([(
                 "tokenizer.ggml.eos_token_id".to_string(),
-                gguf_file::Value::U32(0),
+                gguf::Value::U32(0),
             )]);
             let format = ChatFormat::detect(&md, &tokenizer, template)
                 .expect("format detects")

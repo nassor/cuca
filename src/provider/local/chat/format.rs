@@ -16,12 +16,13 @@
 //! - the **tool-call syntax** the template teaches the model: a custom
 //!   `call:name{key:<|"|>value<|"|>}` body between control tokens, tagged JSON
 //!   (`<tool_call>{"name": ..., "arguments": ...}</tool_call>`), the XML
-//!   style of Qwen 3.5, or Mistral's `[TOOL_CALLS]name[ARGS]{json}`; a
-//!   template without tool syntax leaves the output plain text.
+//!   style of Qwen 3.5, Mistral's `[TOOL_CALLS]name[ARGS]{json}` or
+//!   DeepSeek V4.1's DSML block; a template without tool syntax leaves the
+//!   output plain text.
 
 use std::collections::HashMap;
 
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 
 use super::local_err;
 use crate::error::CucaError;
@@ -134,6 +135,20 @@ pub(crate) enum ToolSyntax {
         /// Text that closes it (`</tool_call>`).
         close: String,
     },
+    /// DeepSeek V4.1's DSML: a `<｜DSML｜ calls>` block (the tag name is
+    /// `dsml` followed by `calls`) of `<｜DSML｜ invoke name="f">` elements,
+    /// each holding `<｜DSML｜ parameter name="k" string="true|false">value
+    /// </｜DSML｜ parameter>` elements, closed by `</｜DSML｜ calls>`. A
+    /// string parameter is raw text; any other value is JSON. The model writes
+    /// the block after the answer and a blank line.
+    Dsml {
+        /// The marker the tags carry after `<` and `</` (`｜DSML｜`, one
+        /// vocabulary token).
+        dsml: String,
+        /// What follows it in the block's own tag (` calls` for V4.1,
+        /// `tool_calls` for V4).
+        calls: String,
+    },
 }
 
 /// The output-side conventions of one chat model.
@@ -154,14 +169,14 @@ pub(crate) struct ChatFormat {
 }
 
 /// Read an id from a GGUF metadata value.
-fn md_id(md: &HashMap<String, gguf_file::Value>, key: &str) -> Option<u32> {
+fn md_id(md: &HashMap<String, gguf::Value>, key: &str) -> Option<u32> {
     match md.get(key)? {
-        gguf_file::Value::U32(n) => Some(*n),
-        gguf_file::Value::I32(n) => u32::try_from(*n).ok(),
-        gguf_file::Value::U64(n) => u32::try_from(*n).ok(),
-        gguf_file::Value::I64(n) => u32::try_from(*n).ok(),
-        gguf_file::Value::U16(n) => Some(u32::from(*n)),
-        gguf_file::Value::U8(n) => Some(u32::from(*n)),
+        gguf::Value::U32(n) => Some(*n),
+        gguf::Value::I32(n) => u32::try_from(*n).ok(),
+        gguf::Value::U64(n) => u32::try_from(*n).ok(),
+        gguf::Value::I64(n) => u32::try_from(*n).ok(),
+        gguf::Value::U16(n) => Some(u32::from(*n)),
+        gguf::Value::U8(n) => Some(u32::from(*n)),
         _ => None,
     }
 }
@@ -172,7 +187,7 @@ impl ChatFormat {
     ///
     /// Fails when no end-of-generation token can be determined.
     pub(crate) fn detect(
-        md: &HashMap<String, gguf_file::Value>,
+        md: &HashMap<String, gguf::Value>,
         tokenizer: &Tokenizer,
         template_source: &str,
     ) -> Result<Self, CucaError> {
@@ -243,6 +258,7 @@ impl ChatFormat {
                     note(close);
                 }
             }
+            ToolSyntax::Dsml { dsml, .. } => note(dsml),
         }
         marker_ids.sort_unstable();
         marker_ids.dedup();
@@ -358,6 +374,17 @@ fn detect_tools(tokenizer: &Tokenizer, template: &str) -> ToolSyntax {
             end_turn: "<|eot|>".into(),
         });
     }
+    if template.contains("｜DSML｜")
+        && tokenizer.token_id("｜DSML｜").is_some()
+        && let Some(calls) = [" calls", "tool_calls"]
+            .into_iter()
+            .find(|calls| template.contains(&format!("｜DSML｜{calls}")))
+    {
+        return ToolSyntax::Dsml {
+            dsml: "｜DSML｜".into(),
+            calls: calls.into(),
+        };
+    }
     if template.contains("[TOOL_CALLS]")
         && template.contains("[ARGS]")
         && ["[TOOL_CALLS]", "[ARGS]"]
@@ -425,10 +452,10 @@ pub(super) mod tests {
         .expect("synthetic vocabulary is valid")
     }
 
-    fn metadata(eos: u32) -> HashMap<String, gguf_file::Value> {
+    fn metadata(eos: u32) -> HashMap<String, gguf::Value> {
         HashMap::from([(
             "tokenizer.ggml.eos_token_id".to_string(),
-            gguf_file::Value::U32(eos),
+            gguf::Value::U32(eos),
         )])
     }
 
@@ -649,11 +676,11 @@ pub(super) mod tests {
         let mut md = metadata(4);
         md.insert(
             "tokenizer.ggml.eom_token_id".to_string(),
-            gguf_file::Value::I32(3),
+            gguf::Value::I32(3),
         );
         md.insert(
             "tokenizer.ggml.eot_token_id".to_string(),
-            gguf_file::Value::U32(99),
+            gguf::Value::U32(99),
         );
         let f = ChatFormat::detect(&md, &t, "").expect("detects");
         assert!(f.is_eog(1) && f.is_eog(2) && f.is_eog(3) && f.is_eog(4));
@@ -665,5 +692,63 @@ pub(super) mod tests {
         let t = tokenizer(&["a", "b"]);
         let err = ChatFormat::detect(&HashMap::new(), &t, "").expect_err("no EOG");
         assert!(err.to_string().contains("end-of-generation"), "{err}");
+    }
+
+    #[test]
+    fn deepseek_v41_is_detected_from_its_template_and_vocabulary() {
+        let template = include_str!("templates/deepseek-v41.jinja");
+        let t = tokenizer(&[
+            "<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>",
+            "<think>",
+            "</think>",
+            "\u{ff5c}DSML\u{ff5c}",
+            "x",
+        ]);
+        let f = ChatFormat::detect(&metadata(0), &t, template).expect("detects");
+        assert_eq!(
+            f.tool_syntax(),
+            &ToolSyntax::Dsml {
+                dsml: "\u{ff5c}DSML\u{ff5c}".into(),
+                calls: " calls".into(),
+            }
+        );
+        assert_eq!(
+            f.reasoning(),
+            Some(&Reasoning {
+                open: "<think>".into(),
+                close: "</think>".into(),
+                header: None
+            })
+        );
+        assert!(f.is_eog(0) && !f.is_eog(1) && !f.is_eog(4));
+        // The three single-token markers the parser reads raw, even when the
+        // tokenizer renders them as control tokens.
+        assert!([1, 2, 3].iter().all(|&id| f.is_marker(id)) && !f.is_marker(4));
+        assert!(f.writes_reasoning());
+        // Thinking mode ends the prompt in `<think>`, chat mode in `</think>`,
+        // also when the tool prompt has quoted both tags.
+        let tools = "## Tools ... inside <think>...</think> BEFORE any tool calls";
+        assert!(f.starts_in_thinking("<\u{ff5c}Assistant\u{ff5c}><think>"));
+        assert!(f.starts_in_thinking(&format!("{tools}<\u{ff5c}Assistant\u{ff5c}><think>")));
+        assert!(!f.starts_in_thinking("<\u{ff5c}Assistant\u{ff5c}></think>"));
+        assert!(!f.starts_in_thinking(&format!("{tools}<\u{ff5c}Assistant\u{ff5c}></think>")));
+
+        // V4's spelling of the block follows the template that teaches it.
+        let v4 = "<\u{ff5c}DSML\u{ff5c}tool_calls>";
+        let f = ChatFormat::detect(&metadata(0), &t, v4).expect("detects");
+        assert_eq!(
+            f.tool_syntax(),
+            &ToolSyntax::Dsml {
+                dsml: "\u{ff5c}DSML\u{ff5c}".into(),
+                calls: "tool_calls".into(),
+            }
+        );
+        // Without the bar token in the vocabulary, or without a block spelling
+        // in the template, the output stays plain.
+        let bare = tokenizer(&["<\u{ff5c}end\u{2581}of\u{2581}sentence\u{ff5c}>", "x"]);
+        let f = ChatFormat::detect(&metadata(0), &bare, template).expect("detects");
+        assert_eq!(f.tool_syntax(), &ToolSyntax::Plain);
+        let f = ChatFormat::detect(&metadata(0), &t, "\u{ff5c}DSML\u{ff5c} only").expect("detects");
+        assert_eq!(f.tool_syntax(), &ToolSyntax::Plain);
     }
 }

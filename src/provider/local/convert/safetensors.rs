@@ -31,8 +31,18 @@ pub(crate) enum StDtype {
     Bf16,
     /// 8-bit float, 4 exponent and 3 mantissa bits (`float8_e4m3fn`: no
     /// infinities, one NaN per sign). Read through its `_scale_inv` companion
-    /// tensor, see [`Shards::read_rows`].
+    /// tensor, see [`Shards::read_rows`], or its `.scale` grid, see
+    /// [`Shards::block_scaled_rows`].
     F8E4m3,
+    /// An unsigned 8-bit exponent, `2^(byte - 127)` (`float8_e8m0fnu`): the
+    /// block scales of DeepSeek-V4.1's FP8 weights and FP4 experts. Read as
+    /// bytes only.
+    F8E8m0,
+    /// Signed bytes (DeepSeek-V4.1 stores its packed FP4 expert weights as
+    /// `I8`). Read as bytes only.
+    I8,
+    /// Unsigned bytes. Read as bytes only.
+    U8,
     /// Any other safetensors dtype, by name; not convertible.
     Other(&'static str),
 }
@@ -47,23 +57,29 @@ impl StDtype {
             "I64" => Self::Other("I64"),
             "I32" => Self::Other("I32"),
             "I16" => Self::Other("I16"),
-            "I8" => Self::Other("I8"),
-            "U8" => Self::Other("U8"),
+            "I8" => Self::I8,
+            "U8" => Self::U8,
             "BOOL" => Self::Other("BOOL"),
             "F8_E4M3" => Self::F8E4m3,
+            "F8_E8M0" => Self::F8E8m0,
             "F8_E5M2" => Self::Other("F8_E5M2"),
             _ => Self::Other("unknown"),
         }
     }
 
-    /// Bytes per element, `None` for dtypes that cannot be read as `f32`.
+    /// Bytes per element, `None` for dtypes that cannot be sized.
     fn size(self) -> Option<usize> {
         match self {
             Self::F32 => Some(4),
             Self::F16 | Self::Bf16 => Some(2),
-            Self::F8E4m3 => Some(1),
+            Self::F8E4m3 | Self::F8E8m0 | Self::I8 | Self::U8 => Some(1),
             Self::Other(_) => None,
         }
+    }
+
+    /// Whether [`Shards::read_rows`] can decode the dtype to `f32`.
+    fn is_float(self) -> bool {
+        matches!(self, Self::F32 | Self::F16 | Self::Bf16 | Self::F8E4m3)
     }
 
     pub(crate) fn name(self) -> &'static str {
@@ -72,6 +88,9 @@ impl StDtype {
             Self::F16 => "F16",
             Self::Bf16 => "BF16",
             Self::F8E4m3 => "F8_E4M3",
+            Self::F8E8m0 => "F8_E8M0",
+            Self::I8 => "I8",
+            Self::U8 => "U8",
             Self::Other(n) => n,
         }
     }
@@ -79,7 +98,7 @@ impl StDtype {
 
 /// `float8_e4m3fn` to `f32`, indexed by the byte: bias 7, subnormals below
 /// exponent 1, and `S.1111.111` the only NaN.
-const E4M3: [f32; 256] = {
+pub(crate) const E4M3: [f32; 256] = {
     let mut lut = [0.0f32; 256];
     let mut i = 0;
     while i < 256 {
@@ -98,6 +117,22 @@ const E4M3: [f32; 256] = {
     }
     lut
 };
+
+/// Rows and columns per scale of a block-scaled FP8 weight (`weight_block_size`
+/// `[32, 32]`), and elements per scale along the contraction axis of an FP4
+/// expert.
+pub(crate) const BLOCK: usize = 32;
+
+/// `2^(byte - 127)`, the value of an `F8_E8M0` scale (`float8_e8m0fnu`: no sign,
+/// no zero, `255` is NaN), exact in `f32` over its whole range.
+pub(crate) fn e8m0(byte: u8) -> f32 {
+    match byte {
+        255 => f32::NAN,
+        // 2^-127 is the one subnormal.
+        0 => f32::from_bits(0x0040_0000),
+        e => f32::from_bits(u32::from(e) << 23),
+    }
+}
 
 /// Where one tensor lives.
 #[derive(Debug, Clone)]
@@ -301,7 +336,7 @@ impl Shards {
         out: &mut Vec<f32>,
     ) -> Result<(), CucaError> {
         let meta = self.require(name)?;
-        let Some(size) = meta.dtype.size() else {
+        let Some(size) = meta.dtype.size().filter(|_| meta.dtype.is_float()) else {
             return Err(CucaError::Config(format!(
                 "tensor `{name}` has dtype {}, which the converter cannot read",
                 meta.dtype.name()
@@ -364,6 +399,130 @@ impl Shards {
                     }
                 }
                 _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Read `buf.len()` bytes of tensor `name`'s data starting `offset` bytes
+    /// into it, whatever its dtype.
+    pub(crate) fn read_bytes(
+        &self,
+        name: &str,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<(), CucaError> {
+        let meta = self.require(name)?;
+        if offset + buf.len() as u64 > meta.len {
+            return Err(CucaError::Config(format!(
+                "tensor `{name}`: bytes {offset}..{} exceed its {} bytes",
+                offset + buf.len() as u64,
+                meta.len
+            )));
+        }
+        read_exact_at(&self.files[meta.shard], meta.start + offset, buf)
+            .map_err(|e| bad(&self.paths[meta.shard], format!("reading `{name}`: {e}")))
+    }
+
+    /// Read rows `first..first + n_rows` of the 1-byte tensor `name` (viewed as
+    /// `[rows, row_len]`) into `out`, which is cleared first; `row_len` is
+    /// [`TensorMeta::row_len`].
+    pub(crate) fn read_byte_rows(
+        &self,
+        name: &str,
+        first: usize,
+        n_rows: usize,
+        out: &mut Vec<u8>,
+    ) -> Result<(), CucaError> {
+        let meta = self.require(name)?;
+        if meta.dtype.size() != Some(1) {
+            return Err(CucaError::Config(format!(
+                "tensor `{name}` has dtype {}, not a 1-byte type",
+                meta.dtype.name()
+            )));
+        }
+        if first + n_rows > meta.rows() {
+            return Err(CucaError::Config(format!(
+                "tensor `{name}`: rows {first}..{} exceed its {} rows",
+                first + n_rows,
+                meta.rows()
+            )));
+        }
+        let row_len = meta.row_len();
+        out.clear();
+        out.resize(n_rows * row_len, 0);
+        self.read_bytes(name, (first * row_len) as u64, out)
+    }
+
+    /// The `.scale` grid of the block-scaled FP8 weight `name` (`<module>.weight`
+    /// has `<module>.scale`): an `F8_E8M0` matrix of `[ceil(rows / 32),
+    /// ceil(cols / 32)]` exponents, one per 32x32 block.
+    fn block_scale_name(&self, name: &str, meta: &TensorMeta) -> Result<String, CucaError> {
+        let scale_name = name
+            .strip_suffix(".weight")
+            .map(|module| format!("{module}.scale"))
+            .ok_or_else(|| {
+                CucaError::Config(format!(
+                    "FP8 tensor `{name}` is not named `<module>.weight`, so it has no `.scale` grid"
+                ))
+            })?;
+        let scale = self.tensor(&scale_name).ok_or_else(|| {
+            CucaError::Config(format!(
+                "FP8 tensor `{name}` has no `{scale_name}` companion"
+            ))
+        })?;
+        let want = [meta.rows().div_ceil(BLOCK), meta.row_len().div_ceil(BLOCK)];
+        if scale.dtype != StDtype::F8E8m0 || scale.shape != want {
+            return Err(CucaError::Config(format!(
+                "`{scale_name}` is {} {:?}, expected F8_E8M0 {want:?}: one exponent per {BLOCK}x{BLOCK} block of `{name}` {:?}",
+                scale.dtype.name(),
+                scale.shape,
+                meta.shape
+            )));
+        }
+        Ok(scale_name)
+    }
+
+    /// Rows `first..first + n_rows` of the matrix `name` as `f32`: a float
+    /// tensor as it is, an `F8_E4M3` tensor multiplied by the `2^(e - 127)` of
+    /// its 32x32 block (the checkpoint's `.scale` grid, see
+    /// [`Shards::block_scale_name`]); `out` is cleared first. The product of an
+    /// e4m3 value and a power of two is exact in `f32`.
+    ///
+    /// A caller that reads a whole tensor in row blocks sees the same values
+    /// whatever the blocking, since each row's scale row is read with it.
+    pub(crate) fn block_scaled_rows(
+        &self,
+        name: &str,
+        first: usize,
+        n_rows: usize,
+        out: &mut Vec<f32>,
+    ) -> Result<(), CucaError> {
+        let meta = self.require(name)?;
+        if meta.dtype != StDtype::F8E4m3 {
+            return self.read_rows(name, first, n_rows, out);
+        }
+        if meta.shape.len() != 2 {
+            return Err(CucaError::Config(format!(
+                "FP8 tensor `{name}` has shape {:?}, expected a matrix",
+                meta.shape
+            )));
+        }
+        let scale_name = self.block_scale_name(name, meta)?;
+        let cols = meta.row_len();
+        let mut raw = Vec::new();
+        self.read_byte_rows(name, first, n_rows, &mut raw)?;
+        let (first_grid, end_grid) = (first / BLOCK, (first + n_rows).div_ceil(BLOCK));
+        let mut grid = Vec::new();
+        self.read_byte_rows(&scale_name, first_grid, end_grid - first_grid, &mut grid)?;
+        let grid_cols = cols.div_ceil(BLOCK);
+        out.clear();
+        out.reserve(raw.len());
+        for (i, row) in raw.chunks_exact(cols.max(1)).enumerate() {
+            let grid_row = &grid[((first + i) / BLOCK - first_grid) * grid_cols..][..grid_cols];
+            for (bytes, &exponent) in row.chunks(BLOCK).zip(grid_row) {
+                let scale = e8m0(exponent);
+                out.extend(bytes.iter().map(|b| E4M3[usize::from(*b)] * scale));
             }
         }
         Ok(())

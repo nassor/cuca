@@ -1,4 +1,5 @@
-//! Row-batched quantized matmul for Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 weights.
+//! Row-batched quantized matmul for Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and MXFP4
+//! weights.
 //!
 //! candle's quantized matmul loops over the activation rows and streams the
 //! whole weight matrix once per row, so verifying `k + 1` drafted tokens in one
@@ -12,7 +13,7 @@
 //! The activations are quantised the way ggml pairs them with the weight
 //! dtype, exactly as candle's vec-dot partners do:
 //!
-//! - Q4_0, Q5_0, Q8_0: Q8_0 (`d = max|x| / 127` rounded to f16,
+//! - Q4_0, Q5_0, Q8_0, MXFP4: Q8_0 (`d = max|x| / 127` rounded to f16,
 //!   `q = round(x * (1 / d))`, 32-element blocks);
 //! - Q4_1, Q5_1: Q8_1, the same quants plus the sum term
 //!   `s = f16(f16(sum q) * d)`, which multiplies the weight block's minimum.
@@ -252,6 +253,40 @@ impl Legacy for Q8_0 {
         for i in 0..LANES {
             w[0][i] = i16::from(block[2 + i] as i8);
             w[1][i] = i16::from(block[2 + LANES + i] as i8);
+        }
+        w
+    }
+}
+
+/// The doubled E2M1 values an MXFP4 nibble selects (ggml's `kvalues_mxfp4`).
+const KVALUES_MXFP4: [i16; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// OCP MXFP4: one E8M0 scale byte, then 16 bytes of nibbles (element `i` is
+/// the low nibble of byte `i`, element `i + 16` its high nibble) that index
+/// the doubled E2M1 table; the block scale is `2^(e - 128)` (the table is
+/// doubled, so ggml's scale is the half of the E8M0 value).
+struct Mxfp4;
+
+impl Legacy for Mxfp4 {
+    type Block = [u8; 17];
+
+    #[inline(always)]
+    fn blocks(row: &[u8]) -> &[Self::Block] {
+        row.as_chunks().0
+    }
+
+    #[inline(always)]
+    fn scale(block: &Self::Block) -> f32 {
+        super::quant::e8m0_half(block[0])
+    }
+
+    #[inline(always)]
+    fn halves(block: &Self::Block) -> Halves {
+        let mut w = [[0i16; LANES]; 2];
+        for i in 0..LANES {
+            let b = block[1 + i];
+            w[0][i] = KVALUES_MXFP4[usize::from(b & 0x0F)];
+            w[1][i] = KVALUES_MXFP4[usize::from(b >> 4)];
         }
         w
     }
@@ -530,6 +565,7 @@ enum Kind {
     Q5_0,
     Q5_1,
     Q8_0,
+    Mxfp4,
 }
 
 impl Kind {
@@ -545,11 +581,17 @@ impl Kind {
     }
 }
 
+/// Where a weight's blocks live: candle's tensor, or bytes candle has no type
+/// for (MXFP4).
+enum Blocks {
+    Tensor(Arc<QTensor>),
+    Raw(Arc<[u8]>),
+}
+
 /// A quantized `[n, k]` weight (`y = x * w^T`) computed by the row-batched
-/// kernel: Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0. Holds
-/// the candle tensor and reads its bytes in place.
+/// kernel: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 or MXFP4. Reads the blocks in place.
 pub(crate) struct QmmWeight {
-    qt: Arc<QTensor>,
+    blocks: Blocks,
     kind: Kind,
     n: usize,
     k: usize,
@@ -565,11 +607,25 @@ impl QmmWeight {
             return None;
         };
         (k % QK == 0 && n > 0).then(|| Self {
-            qt: Arc::clone(qt),
+            blocks: Blocks::Tensor(Arc::clone(qt)),
             kind,
             n,
             k,
         })
+    }
+
+    /// An MXFP4 `[n, k]` weight over its file bytes (`k / 32` blocks of 17
+    /// bytes per row); `None` for a row that is not whole blocks or a wrong
+    /// byte count.
+    pub(crate) fn mxfp4(bytes: Arc<[u8]>, n: usize, k: usize) -> Option<Self> {
+        (k.is_multiple_of(QK) && n > 0 && bytes.len() == n * (k / QK) * size_of::<[u8; 17]>()).then(
+            || Self {
+                blocks: Blocks::Raw(bytes),
+                kind: Kind::Mxfp4,
+                n,
+                k,
+            },
+        )
     }
 
     /// Output width (weight rows).
@@ -614,7 +670,10 @@ impl QmmWeight {
         if m == 0 {
             return Ok(out);
         }
-        let data = self.qt.data()?;
+        let data = match &self.blocks {
+            Blocks::Tensor(qt) => qt.data()?,
+            Blocks::Raw(bytes) => std::borrow::Cow::Borrowed(&bytes[..]),
+        };
         let row_bytes = data.len() / self.n;
         let weights = data.get(..rows * row_bytes).unwrap_or(&data[..]);
         let (k, o) = (self.k, &mut out);
@@ -624,6 +683,7 @@ impl QmmWeight {
             Kind::Q5_0 => run::<Q5_0>(weights, x, m, k, rows, o)?,
             Kind::Q5_1 => run::<Q5_1>(weights, x, m, k, rows, o)?,
             Kind::Q8_0 => run::<Q8_0>(weights, x, m, k, rows, o)?,
+            Kind::Mxfp4 => run::<Mxfp4>(weights, x, m, k, rows, o)?,
         }
         Ok(out)
     }
@@ -1081,5 +1141,85 @@ mod tests {
         let t = Tensor::zeros((2, 4, 64), candle_core::DType::F32, &Device::Cpu).unwrap();
         let three_d = Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap());
         assert!(QmmWeight::new(&three_d).is_none());
+    }
+
+    // ---- MXFP4 ----------------------------------------------------------
+
+    use crate::provider::local::gguf::GgufType;
+    use crate::provider::local::model::quant::dequant_row;
+    use crate::provider::local::model::tiny::mxfp4_bytes;
+
+    fn mxfp4_weight(n: usize, k: usize, seed: u64) -> (Arc<[u8]>, Vec<f32>) {
+        let bytes = mxfp4_bytes(&noise(n * k, seed, 3.0));
+        let row_bytes = k / QK * 17;
+        let mut values = vec![0f32; n * k];
+        for (src, dst) in bytes
+            .chunks_exact(row_bytes)
+            .zip(values.chunks_exact_mut(k))
+        {
+            dequant_row(GgufType::Mxfp4, src, 1.0, dst).unwrap();
+        }
+        (Arc::from(bytes), values)
+    }
+
+    #[test]
+    fn mxfp4_matches_the_f64_reference() {
+        for (n, k, m) in shapes() {
+            let (bytes, wd) = mxfp4_weight(n, k, 11);
+            let x = noise(m * k, 5, 1.0);
+            let got = QmmWeight::mxfp4(bytes, n, k)
+                .unwrap()
+                .forward(&x, m)
+                .unwrap();
+            let xd = rounded_acts(&x, m, k);
+            let mut scale = 0f64;
+            let mut want = vec![0f64; m * n];
+            for j in 0..m {
+                for r in 0..n {
+                    want[j * n + r] = (0..k)
+                        .map(|e| f64::from(wd[r * k + e]) * xd[j * k + e])
+                        .sum();
+                    scale = scale.max(want[j * n + r].abs());
+                }
+            }
+            for (g, w) in got.iter().zip(&want) {
+                assert!(
+                    (f64::from(*g) - w).abs() <= 1e-4 * scale,
+                    "{n}x{k} m={m}: {g} vs {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mxfp4_rows_are_independent_of_the_batch_at_real_shapes() {
+        // The expert matrices of the real model: gate/up (2304 x 5120) and
+        // down (5120 x 2304).
+        for (n, k) in [(2304, 5120), (5120, 2304)] {
+            let (bytes, _) = mxfp4_weight(n, k, 3);
+            let q = QmmWeight::mxfp4(bytes, n, k).unwrap();
+            let x = noise(17 * k, 9, 1.0);
+            let batch = q.forward(&x, 17).unwrap();
+            for j in [0usize, 5, 16] {
+                let alone = q.forward(&x[j * k..(j + 1) * k], 1).unwrap();
+                assert_eq!(alone, batch[j * n..(j + 1) * n], "{n}x{k} row {j}");
+            }
+            let part = q.forward(&x[..3 * k], 3).unwrap();
+            assert_eq!(part, batch[..3 * n]);
+            let rows = q.forward_rows(&x, 17, n / 3).unwrap();
+            for j in 0..17 {
+                assert_eq!(
+                    rows[j * (n / 3)..(j + 1) * (n / 3)],
+                    batch[j * n..j * n + n / 3]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mxfp4_rejects_a_wrong_byte_count() {
+        assert!(QmmWeight::mxfp4(Arc::from(vec![0u8; 16]), 1, 32).is_none());
+        assert!(QmmWeight::mxfp4(Arc::from(vec![0u8; 17]), 1, 32).is_some());
+        assert!(QmmWeight::mxfp4(Arc::from(vec![0u8; 17]), 1, 48).is_none());
     }
 }

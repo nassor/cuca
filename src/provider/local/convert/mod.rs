@@ -14,7 +14,11 @@
 //! - [`tensors`]: tensor names and values (`modify_tensors`), planned from the
 //!   shard headers alone, then streamed and quantized one tensor at a time;
 //! - [`vocab`], [`spm`], [`chktxt`]: the tokenizer metadata;
-//! - [`gguf_writer`]: the streaming GGUF v3 writer.
+//! - [`gguf_writer`]: the streaming GGUF v3 writer;
+//! - [`deepseek41`]: DeepSeek-V4.1, whose FP8 32x32 / FP4 / Engram checkpoint
+//!   has its own planner and streaming writers and converts to a split set
+//!   (and its DSpark drafter to a `dflash` file); [`engram`] holds the
+//!   numpy-compatible hash constants of its Engram layers.
 //!
 //! The header (metadata plus every tensor's name, shape and type) is known
 //! before any weight is read, so the writer streams. A tensor that needs no
@@ -29,15 +33,18 @@
 pub(crate) mod arch;
 pub(crate) mod chktxt;
 pub(crate) mod config;
+pub(crate) mod deepseek41;
 pub(crate) mod dflash;
 pub(crate) mod eagle;
-pub(crate) mod gguf_merge;
+pub(crate) mod engram;
 pub(crate) mod gguf_writer;
 pub(crate) mod hf;
 #[cfg(test)]
 mod oracle;
 #[cfg(test)]
 mod oracle_dflash;
+#[cfg(test)]
+mod oracle_ds41;
 #[cfg(test)]
 mod oracle_local;
 pub(crate) mod safetensors;
@@ -51,17 +58,18 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 use sha2::{Digest, Sha256};
 
 use self::arch::ConvArch;
+pub(crate) use self::deepseek41::plan::Role;
 use self::gguf_writer::GgufWriter;
 use self::hf::CheckpointDir;
 use self::safetensors::Shards;
 use self::tensors::Plan;
 use super::download::{self, report};
 use super::tokenizer::Tokenizer;
-use super::{DownloadProgressCallback, ModelSource, WeightQuant};
+use super::{ConvertConfig, DownloadProgressCallback, EngramQuant, ModelSource, WeightQuant};
 use crate::error::CucaError;
 
 /// A [`CucaError::Config`] from a message (shared by every converter module).
@@ -72,16 +80,24 @@ fn cfg_err(msg: impl Into<String>) -> CucaError {
 /// Write buffer of the output file.
 const WRITE_BUFFER: usize = 1 << 20;
 
-/// Where the converted GGUF of `source` at `quant` lives under `cache_dir`:
+/// Where the converted GGUF of `source` under `convert` lives under `cache_dir`:
 /// `<cache>/converted/<repo / as -->/<revision>/model-<quant>.gguf` for a
 /// checkpoint, `<cache>/converted/dir-<key>/model-<quant>.gguf` for a
-/// directory (the key covers its path, `config.json` and shards).
+/// directory (the key covers its path, `config.json` and shards). A
+/// non-default [`ConvertConfig::engram_quant`] adds `-engram-<name>` to the
+/// stem. DeepSeek-V4.1 writes a split set next to this nominal path, see
+/// [`converted`].
 pub(crate) fn output_path(
     cache_dir: &Path,
     source: &ModelSource,
-    quant: WeightQuant,
+    convert: ConvertConfig,
 ) -> Result<PathBuf, CucaError> {
-    let file = format!("model-{}.gguf", quant.name());
+    let engram = if convert.engram_quant == EngramQuant::default() {
+        String::new()
+    } else {
+        format!("-engram-{}", convert.engram_quant.name())
+    };
+    let file = format!("model-{}{engram}.gguf", convert.quant.name());
     match source {
         ModelSource::Checkpoint { repo, revision } => {
             // Validates the components the way the download cache does.
@@ -168,13 +184,50 @@ fn model_name(dir: &Path) -> String {
     repo.rsplit("--").next().unwrap_or(repo).to_string()
 }
 
-/// Convert `checkpoint` to the GGUF file `out`.
+/// The file to load for the nominal conversion output `out` of a model in
+/// `role`, if the conversion finished: `out` itself, or for a DeepSeek-V4.1
+/// checkpoint the first part of the split set its backbone converts to
+/// ([`deepseek41::finished_set`]; the first part is renamed into place last,
+/// so it marks a complete set) or the file of its DSpark drafter
+/// ([`deepseek41::drafter_path`]).
+pub(crate) fn converted(out: &Path, role: Role) -> Option<PathBuf> {
+    if out.exists() {
+        return Some(out.to_path_buf());
+    }
+    match role {
+        Role::Main => deepseek41::finished_set(out),
+        Role::Drafter => Some(deepseek41::drafter_path(out)).filter(|p| p.exists()),
+    }
+}
+
+/// Convert `checkpoint` to the GGUF file `out` at `quant`: [`convert_set`] for
+/// the backbone, without its path.
+#[cfg(test)]
+pub(crate) fn convert(
+    checkpoint: &CheckpointDir,
+    out: &Path,
+    quant: WeightQuant,
+    progress: Option<&DownloadProgressCallback>,
+) -> Result<(), CucaError> {
+    let config = ConvertConfig {
+        quant,
+        ..ConvertConfig::default()
+    };
+    convert_set(checkpoint, out, config, Role::Main, progress).map(|_| ())
+}
+
+/// Convert `checkpoint`, in `role`, to the GGUF file `out`, returning the path to
+/// load.
 ///
 /// Writes `<out>.partial` and renames it into place under an exclusive
 /// `<out>.lock` file (the pattern of the model download), so concurrent
 /// loaders convert once and a present `out` is always complete. An existing
 /// `out` is left alone. `progress` receives the tensors converted so far in
-/// `downloaded_bytes` and the tensor count in `total_bytes`.
+/// `downloaded_bytes` and the tensor count in `total_bytes`. A DeepSeek-V4.1
+/// checkpoint writes a split set (as the `Main` role) or its drafter's file (as
+/// the `Drafter` role) next to `out` instead (see [`deepseek41`]), and reports
+/// bytes written and bytes to write; the returned path is the file to load. The
+/// role changes nothing for the other architectures.
 ///
 /// # Errors
 ///
@@ -182,15 +235,23 @@ fn model_name(dir: &Path) -> String {
 /// tokenizer the converter does not support, or a checkpoint the engine could
 /// not load after conversion (naming the missing metadata key);
 /// [`CucaError::Io`] for file errors.
-pub(crate) fn convert(
+pub(crate) fn convert_set(
     checkpoint: &CheckpointDir,
     out: &Path,
-    quant: WeightQuant,
+    convert: ConvertConfig,
+    role: Role,
     progress: Option<&DownloadProgressCallback>,
-) -> Result<(), CucaError> {
+) -> Result<PathBuf, CucaError> {
+    if deepseek41::is_deepseek41(&checkpoint.config) {
+        return match role {
+            Role::Main => deepseek41::convert(checkpoint, out, convert, progress),
+            Role::Drafter => deepseek41::convert_drafter(checkpoint, out, convert, progress),
+        };
+    }
     write_atomically(out, |partial| {
-        convert_locked(checkpoint, partial, quant, progress)
-    })
+        convert_locked(checkpoint, partial, convert.quant, progress)
+    })?;
+    Ok(out.to_path_buf())
 }
 
 /// Produce the file `out` with `build`, which writes the path it is given.
@@ -316,7 +377,7 @@ mod tests {
             revision: "abc".into(),
         };
         assert_eq!(
-            output_path(cache, &ck, WeightQuant::Q8_0).unwrap(),
+            output_path(cache, &ck, ConvertConfig::default()).unwrap(),
             cache
                 .join("converted")
                 .join("Qwen--Qwen3-0.6B")
@@ -327,8 +388,24 @@ mod tests {
             repo: "a/b".into(),
             revision: "../x".into(),
         };
-        assert!(output_path(cache, &bad, WeightQuant::F16).is_err());
-        assert!(output_path(cache, &ModelSource::File("x".into()), WeightQuant::F16).is_err());
+        let f16 = ConvertConfig {
+            quant: WeightQuant::F16,
+            ..ConvertConfig::default()
+        };
+        assert!(output_path(cache, &bad, f16).is_err());
+        assert!(output_path(cache, &ModelSource::File("x".into()), f16).is_err());
+        // A non-default Engram storage type is cached beside the default.
+        let q4 = ConvertConfig {
+            engram_quant: EngramQuant::Q4_0,
+            ..ConvertConfig::default()
+        };
+        assert_eq!(
+            output_path(cache, &ck, q4)
+                .unwrap()
+                .file_name()
+                .and_then(|n| n.to_str()),
+            Some("model-q8_0-engram-q4_0.gguf")
+        );
     }
 
     #[test]

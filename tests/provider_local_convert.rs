@@ -126,6 +126,7 @@ async fn converted_checkpoints_answer_like_the_oracle() {
             },
             convert: ConvertConfig {
                 quant: WeightQuant::F16,
+                ..ConvertConfig::default()
             },
             ..Default::default()
         })

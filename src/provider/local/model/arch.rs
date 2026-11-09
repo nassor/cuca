@@ -89,6 +89,12 @@ pub(crate) enum Arch {
     /// its own and shares the target's embedding table and LM head. It is
     /// loaded through `LocalModelConfig::drafter`, never as a main model.
     Mistral4Eagle,
+    /// DeepSeek V4.1 (`deepseek41`): hyper-connection residual streams, latent
+    /// multi-query attention with a per-head sink, a sliding window and
+    /// compressed sparse attention, hashed per-layer table lookups
+    /// ("engram") and a `sqrtsoftplus`-routed mixture of experts with a
+    /// SwiGLU clamp.
+    Deepseek41,
 }
 
 /// FFN gate activation.
@@ -233,6 +239,30 @@ pub(crate) struct Behavior {
     /// none) whose length is `rope.scaling.original_context_length` (llama.cpp
     /// `mistral3`).
     pub(crate) attn_temp_orig_ctx: bool,
+    /// The residual stream is `hyper_connection.count` parallel copies of the
+    /// hidden state: each sub-block reads a mix of them and writes back
+    /// through predicted coefficients; the head collapses them
+    /// ([`HyperSpec`](super::csa::HyperSpec)).
+    pub(crate) hyper_connections: bool,
+    /// Latent multi-query attention with compressed sparse attention and a
+    /// per-head sink logit in the softmax denominator: one
+    /// shared key/value vector per position (K equals V, the last
+    /// `rope.dimension_count` values rotate and the output is rotated back),
+    /// low-rank Q and a grouped low-rank output projection, a sliding window
+    /// on every layer and the layers' compressed caches and indexers
+    /// ([`CsaSpec`](super::csa::CsaSpec)).
+    pub(crate) compressed_attention: bool,
+    /// Hashed per-layer table lookups gating a residual add
+    /// ([`EngramSpec`](super::csa::EngramSpec)).
+    pub(crate) engram: bool,
+    /// The router's scoring function, selection bias and the SwiGLU clamps
+    /// come from `expert_gating_func`, `exp_probs_b` and `swiglu_clamp_*`
+    /// ([`MoeExt`](super::csa::MoeExt)).
+    pub(crate) moe_ext: bool,
+    /// Simulate the quantization the model was trained against on its cached
+    /// rows and indexer vectors (FP8 window keys, FP4 compressed rows and
+    /// indexer keys/queries) and on the attention output.
+    pub(crate) kv_qdq: bool,
 }
 
 const DEFAULT: Behavior = Behavior {
@@ -264,11 +294,16 @@ const DEFAULT: Behavior = Behavior {
     shared_expert_ungated: false,
     attn_temp_default: None,
     attn_temp_orig_ctx: false,
+    hyper_connections: false,
+    compressed_attention: false,
+    engram: false,
+    moe_ext: false,
+    kv_qdq: false,
 };
 
 impl Arch {
     /// Every supported architecture, for error messages.
-    pub(crate) const ALL: [Arch; 19] = [
+    pub(crate) const ALL: [Arch; 20] = [
         Arch::Gemma4,
         Arch::Gemma3,
         Arch::Llama,
@@ -288,6 +323,7 @@ impl Arch {
         Arch::Mistral4,
         Arch::Gemma4Assistant,
         Arch::Mistral4Eagle,
+        Arch::Deepseek41,
     ];
 
     /// The `general.architecture` string, which is also the metadata key
@@ -313,6 +349,7 @@ impl Arch {
             Arch::Mistral3 => "mistral3",
             Arch::Mistral4 => "mistral4",
             Arch::Mistral4Eagle => "mistral4-eagle",
+            Arch::Deepseek41 => "deepseek41",
         }
     }
 
@@ -392,6 +429,17 @@ impl Arch {
             Arch::Mistral4Eagle => Behavior {
                 mla: true,
                 attn_temp_default: Some((0.1, 8192)),
+                ..DEFAULT
+            },
+            Arch::Deepseek41 => Behavior {
+                moe: true,
+                shared_expert: true,
+                shared_expert_ungated: true,
+                hyper_connections: true,
+                compressed_attention: true,
+                engram: true,
+                moe_ext: true,
+                kv_qdq: true,
                 ..DEFAULT
             },
             Arch::Olmo2 => Behavior {

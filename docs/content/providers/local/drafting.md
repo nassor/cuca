@@ -1,6 +1,6 @@
 +++
 title = "Speculative decoding with a drafter"
-description = "DrafterSource, the four drafters, the draft and accept rounds, the governor that turns drafting off, measured speedups and what was verified."
+description = "DrafterSource, the five drafters, the draft and accept rounds, the governor that turns drafting off, measured speedups and what was verified."
 template = "page.html"
 weight = 10
 +++
@@ -9,7 +9,7 @@ weight = 10
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>A multi-token-prediction drafter proposes tokens that the target verifies in one batched pass; a governor drafts only while that is faster.</dd>
+<dd>A drafter (a multi-token-prediction head, an assistant, or a block drafter) proposes tokens that the target verifies in one batched pass; a governor drafts only while that is faster.</dd>
 <dt>You need</dt>
 <dd>The <code>provider-local</code> feature, and a drafter preset, a checkpoint source or an in-trunk prediction head.</dd>
 <dt>Read this if</dt>
@@ -18,7 +18,7 @@ weight = 10
 
 ## Drafters
 
-A drafter proposes tokens that the target model verifies in one batched forward pass, and the output is the target's. Drafting is off by default. `LocalModelConfig::drafter` is an `Option<DrafterSource>`. `DrafterSource::File(ModelSource)` is a separate drafter file, resolved and downloaded like any model source (`ModelSource::into()` converts). `DrafterSource::InTrunk` is the head inside the main model's own GGUF. The engine picks the drafter kind from the `general.architecture` of the drafter file.
+A drafter proposes tokens that the target model verifies in one batched forward pass, and the output is the target's. Drafting is off by default. `LocalModelConfig::drafter` is an `Option<DrafterSource>`. `DrafterSource::File(ModelSource)` is a separate drafter file, resolved and downloaded like any model source (`ModelSource::into()` converts). `DrafterSource::InTrunk` is the head inside the main model's own GGUF. The engine picks the drafter kind from the `general.architecture` of the drafter file; a `dflash` file that has the key `dflash.hyper_connection.count` is a DSpark drafter, any other `dflash` file a DFlash one.
 
 | Drafter | Source | Target | Device | K/V cache of its own | Requests |
 |---|---|---|---|---|---|
@@ -26,6 +26,7 @@ A drafter proposes tokens that the target model verifies in one batched forward 
 | Qwen 3.5 head | `InTrunk` | a dense `qwen35` `*-MTP` file | CPU | 4 KB per context position (0.8B model) | one at a time |
 | EAGLE (`mistral4-eagle`) | `File` with a checkpoint source | `mistral4` (Mistral Small 4) | CPU | 2.5 KB per context position | one at a time |
 | DFlash (`dflash`) | `File`: preset `muse-glimmer-30b-dflash-q4_0` or a checkpoint source | Muse Glimmer | CPU | a ring of the last 2,048 positions, 82 MB | one at a time |
+| DSpark (`dflash` with hyper-connections) | `File`: the converted `dspark-model-<quant>.gguf` or the target's own checkpoint source | `deepseek41` (DeepSeek-V4.1) | CPU | a ring of the file's sliding window per stage | one at a time |
 
 ```rust,name=A Gemma 4 target with its drafter
 use cuca::{LocalModel, LocalModelConfig, ModelSource};
@@ -87,6 +88,24 @@ A DFlash drafter proposes a whole block of tokens in one pass instead of one pas
 - It is CPU only and observes every position of one sequence, so the engine runs one request at a time. The context cache follows the trunk's prefix reuse, truncation and failed requests; a gap in it costs proposal quality, never output.
 - It fails to load when its width differs from the target's, when it reads a layer the target does not have, when its mask token is outside the target's vocabulary, or on a GPU device (`CucaError::Provider`, `` the DFlash drafter runs on the CPU only: use `LocalDevice::Cpu` ``). Muse Glimmer 30B is the one target that has been run with a DFlash drafter.
 
+### DSpark for DeepSeek-V4.1
+
+A DSpark drafter proposes a block of tokens in one pass, like DFlash, with stages that are blocks of the DeepSeek-V4.1 target's own kind. `DrafterSource::File` takes the converted file or the same checkpoint source as the target, `ModelSource::Checkpoint { repo: "deepseek-ai/DeepSeek-V4.1-Flash-1017", revision }`. The conversion writes the stages to their own GGUF, `dspark-model-<quant>.gguf` next to the backbone set (7.91 GB at the default precision), and an existing file is reused.
+
+```rust,name=DSpark next to its DeepSeek-V4.1 target
+// Inside LocalModelConfig { source, drafter: Some(...), draft_tokens: 5, ..Default::default() }
+let checkpoint = "deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>".parse::<ModelSource>()?;
+let drafter = DrafterSource::File(checkpoint);
+```
+
+- It reads the mean over the hyper-connection streams of the inputs of the layers `dflash.target_layers` lists, at every accepted position, and keeps each stage's keys of the last `attention.sliding_window` positions in a ring.
+- A round runs the three stages once over a block of `block_size` rows (5 in the real file): the pending token and mask tokens, embedded with the target's table. The rows attend to each other in both directions and to the ring. Every attention is window only, with no compressed rows and no indexer. The block always runs all its rows and a round keeps the first `draft_tokens` of them, so at most the block size.
+- The rows are ranked with the target's LM head. A small Markov head adds a logit bias that depends on the previous draft token, so the drafts are chosen in order. A confidence head scores each row; the oracle test checks it, and the governor's keep rule does not read it (see [Rounds and acceptance](#rounds-and-acceptance)).
+- Each stage holds 128 routed experts (3 used per token, MXFP4). They are read into RAM when the drafter opens, from a file separate from the target's, so no expert tier is involved.
+- It observes every position of one sequence, so the engine runs one request at a time. A gap in its context ring costs proposal quality, never output.
+
+It is CPU only. A GPU target fails with `CucaError::Provider`, ``the DSpark drafter runs on the CPU only: use `LocalDevice::Cpu` ``; with `gpu_layers` the load fails with `CucaError::Config`. The load also fails, with `CucaError::Provider`, when the target has another number of hyper-connection streams, when the drafter's width differs from the target's, when it reads a layer the target does not have, when its noise token is outside the target's vocabulary, or when its Markov head covers another number of tokens than the target's vocabulary.
+
 ## Rounds and acceptance
 
 - Each round the drafter proposes at most `draft_tokens` tokens (default 5, `1..=16`), fewer near `max_tokens` and the context limit. `draft_tokens` is ignored without a drafter and is only the cap: the rule below sets the length per round.
@@ -98,11 +117,11 @@ a_j * (t_j + (j - 1) * d)  >  e * (t_(j+1) - t_j + d)
 
 - `a_j` is the predicted acceptance of draft `j`, and `e` the expected tokens of the round without it (`1 + a_1 + ... + a_(j-1)`). `t_j` and `t_(j+1)` are the measured seconds of a verification pass over `j` and `j + 1` rows, rollback and drafter upkeep included, and `d` is the seconds of one drafter step. Before any measurement every row count costs the same, so the first rounds draft the full cap.
 - For a chained drafter (the Gemma 4 assistant, the Qwen 3.5 head, EAGLE), `a_j` is the product of the drafter's own probabilities of its proposals so far, times the ratio of accepted to predicted drafts the engine observed, clamped to 0.25 to 4.
-- A block drafter (DFlash) costs one pass of `f` seconds per round however many drafts are kept, so the rule is `a_j * (t_j + f) > e * (t_(j+1) - t_j)`. Its own confidence is flat on the mask rows, so `a_j` is `rho^j`, with `rho` the share of judged drafts that were accepted over about the last 20 rounds (an accepted draft or the first rejected one of a round is judged). `rho` is 1 before the first round.
+- A block drafter (DFlash, DSpark) costs one pass of `f` seconds per round however many drafts are kept, so the rule is `a_j * (t_j + f) > e * (t_(j+1) - t_j)`. Its own confidence is flat on the mask rows, so `a_j` is `rho^j`, with `rho` the share of judged drafts that were accepted over about the last 20 rounds (an accepted draft or the first rejected one of a round is judged). `rho` is 1 before the first round.
 - At temperature `0.0` a draft is accepted when it equals the target's greedy token. On the CPU the output equals plain decoding bit for bit. On a GPU, batched rows equal single steps only to float rounding, so a speculative greedy run can differ from plain decoding where two logits are that close.
 - Above `0.0` a draft is accepted with probability `min(1, p/q)`, where `p` and `q` are the target's and the drafter's distributions after temperature, `top_k` and `top_p`. A rejected draft is replaced by a token drawn from the residual `max(0, p - q)`, which preserves the target's sampling distribution.
 - A run with a fixed `seed` and a temperature above `0.0` always drafts exactly `draft_tokens`, so equal prompts reproduce equal tokens: neither the keep rule nor the governor applies.
-- A drafter speculates only while one request runs alone and none waits. With several running requests the engine batches their decode rows instead, which already shares the weight reads that speculation saves. The in-trunk head, EAGLE and DFlash observe every position of their one sequence, so with them `batching.max_sequences` is treated as 1.
+- A drafter speculates only while one request runs alone and none waits. With several running requests the engine batches their decode rows instead, which already shares the weight reads that speculation saves. The in-trunk head, EAGLE, DFlash and DSpark observe every position of their one sequence, so with them `batching.max_sequences` is treated as 1.
 - `LocalModel::draft_stats()` returns `DraftStats { rounds, drafted, accepted }`, summed over every request. `rounds` counts verification rounds that carried drafts. `DraftStats::acceptance_rate()` returns the accepted fraction, `None` before the first drafted token.
 
 ## Governor
@@ -116,7 +135,7 @@ An engine side governor drafts only while drafting is measurably faster than pla
 
 ## Lazy upkeep
 
-A drafter that keeps a cache of its own (EAGLE, DFlash, the Qwen 3.5 head) does not pay for it in plain rounds. A round that drafts nothing only hands its hidden rows (the features, for DFlash) to the drafter, which holds them with the range of positions it has not seen, at most 1,024 positions and 16 MiB. When a round drafts again, because of a probe or because drafting resumes, the drafter first takes the held rows into its cache in one batched pass, in chunks of the trunk's prefill size. At the bound it catches up first.
+A drafter that keeps a cache of its own (EAGLE, DFlash, DSpark, the Qwen 3.5 head) does not pay for it in plain rounds. A round that drafts nothing only hands its hidden rows (the features, for DFlash and DSpark) to the drafter, which holds them with the range of positions it has not seen, at most 1,024 positions and 16 MiB. When a round drafts again, because of a probe or because drafting resumes, the drafter first takes the held rows into its cache in one batched pass, in chunks of the trunk's prefill size. At the bound it catches up first.
 
 The CPU kernels are row exact, so the cache after catching up equals the one that per round upkeep leaves, bit for bit: proposals and output do not change, only where the cost falls. The catch up is a cost of switching and the governor charges it to neither mode. A new prompt drops the held rows it does not share, and a failed request forgets them.
 
@@ -193,3 +212,7 @@ Unit tests on tiny models, on the CPU unless noted:
 - `eagle_deferred_rows_catch_up_to_the_eager_cache`, `the_lag_holds_contiguous_rows_and_trims_from_a_position` and `the_lag_is_bounded_by_rows_and_by_bytes` check at the drafter level that rows handed over round by round and taken in one pass leave the cache that observing them as they came leaves, whatever the chunking and the caps, and that held rows follow truncation, replay at an earlier position and reset.
 - `gpu_drafter_matches_cpu_drafter` compares the GPU Gemma 4 assistant with the CPU one when `CUCA_LOCAL_DEVICE` names a GPU.
 - `dflash_drafter_matches_the_transformers_reference` runs when `CUCA_LOCAL_DFLASH_REF` names a directory of a tiny checkpoint pair and reference rounds (written by `make_tiny_dflash.py`, which is not in the repository). It bounds `max |dlogit|` by `CUCA_LOCAL_REF_TOL` (default 5e-4) and requires equal drafts; the recorded run measured below 2e-4.
+- For DSpark (CPU, a tiny `deepseek41` target with MXFP4 experts and a tiny DSpark file with MXFP4 or Q8_0 experts): `dspark_drafter_leaves_greedy_output_unchanged` compares greedy output with plain decoding at draft lengths 1, 2, 4, 5 and 16 and checks that no round drafts more than 5. Further tests cover `max_tokens` and the context limit, a warm prefix equal to a cold one, recovery from a failed request, reproducible sampling for a seed, the measured cost model, and the recognition of the file by `dflash.hyper_connection.count`.
+- `dspark_tests.rs` runs when `CUCA_LOCAL_DS41_REF` names the tiny DeepSeek-V4.1 reference directory. It converts that checkpoint's drafter at `f16` and requires the block logits and the confidence within 1e-4 of the reference and the same draft ids, the target's own features within 5e-4 of the reference's hidden rows, and observation in several steps or after a truncation to equal one pass.
+
+With the real DeepSeek-V4.1-Flash-1017 target, DSpark ran once on the CPU, with the converted set at the default precision, `tiered:ram=90g,threads=16` experts and `CUCA_LOCAL_DRAFTER` naming the same checkpoint, from an HDD-class volume (experts streamed at about 0.4 to 0.5 GB/s), in a release build with `-C target-cpu=native`. On `Explain in two sentences what a mixture of experts model is.` with thinking off, temperature 0 and 48 tokens, the speculative output equals plain greedy decoding. 5 of 15 drafted tokens were accepted (33 %) in 7 rounds. It gives no speedup: plain decoding ran at 0.185 tokens/s and the drafter run at 0.172, because both are bound by reading the experts and verifying extra rows reads more of them (87.3 GB against 83.8 GB read). One prompt is one measurement, not an acceptance rate for the model.

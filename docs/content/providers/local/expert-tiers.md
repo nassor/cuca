@@ -11,7 +11,7 @@ weight = 12
 <dt>In one line</dt>
 <dd><code>ExpertPlacement::Tiered</code> keeps a mixture-of-experts model's experts in the GGUF file and loads them on demand through caches of a byte size you choose, with the same output as the resident load.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts (<code>qwen3moe</code>, <code>olmoe</code>, <code>qwen35moe</code> or <code>mistral4</code>).</dd>
+<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts (<code>qwen3moe</code>, <code>olmoe</code>, <code>qwen35moe</code>, <code>mistral4</code> or <code>deepseek41</code>).</dd>
 <dt>Read this if</dt>
 <dd>A mixture-of-experts model is larger than the RAM or device memory you want to spend on it, or you need the cache counters and the heat export.</dd>
 </dl>
@@ -24,8 +24,8 @@ A token routes to `n_used` of a layer's `n_expert` experts, yet the default plac
 
 | Field | Default | Rule |
 |---|---|---|
-| `ram_bytes` | `0` | bytes of RAM for cached experts. On `LocalDevice::Cpu` it must be above 0. On a GPU device `0` disables the RAM tier |
-| `device_bytes` | `0` | bytes of device memory for cached experts. Must be above 0 on a GPU device and exactly 0 on `LocalDevice::Cpu` |
+| `ram_bytes` | `0` | bytes of RAM for cached experts. On `LocalDevice::Cpu` it must be above 0. On a GPU device `0` disables the RAM tier, unless `device_bytes` is 0 too |
+| `device_bytes` | `0` | bytes of device memory for cached experts. Above 0 gives a GPU device a device tier. On a GPU device, `0` with a `ram_bytes` above 0 is host-tiered (below). Exactly 0 on `LocalDevice::Cpu` |
 | `loader_threads` | `4` | disk reader threads, `1..=64` |
 | `warm_from` | `None` | an `ExpertHeat` from an earlier session; the hottest experts load at startup |
 
@@ -55,11 +55,28 @@ A tier must hold `n_used` experts in every layer, so the minimum budget is `n_us
 | `qwen3-30b-a3b-q4_0` | 128, 8 | 48 | 127,991,808 | 1,023,934,464 | `ram=4g`: 33<br>`ram=1100m`: 9 |
 | `qwen3.6-35b-a3b-q4_0` | 256, 8 | 40 | 71,106,560 | 568,852,480 | `ram=600m`: 8<br>`ram=4g`: 60<br>`device=2g`: 30<br>`device=4g`: 60<br>`device=6g`: 90 |
 | `mistral-small-4-119b-q4_0` | 128, 4 | 36 | about 511.7 MB | about 2.05 GB | `ram=8g`: 16<br>`ram=48g`: 100 |
+| `deepseek-ai/DeepSeek-V4.1-Flash-1017` (checkpoint source) | 384, 6 | 40 | 752,025,600 | 4,512,153,600 | `ram=48g`: 68<br>`ram=64g`: 91 |
 
 - In the Qwen3 models the down matrices are Q4_0 in most layers and Q4_1 in the rest, so `per_expert` is a sum over layers: for Qwen3-30B-A3B, 42 layers of 2,654,208 bytes and 6 of 2,752,512.
 - The shared expert and the router are dense weights and stay resident.
-- A GPU tier counts the MoE kernels' own layout, which holds as many bytes as the file for Q4_0, Q4_1 and Q8_0 experts (every other dtype is requantized to Q8_0, a float dtype held as f32; see [Weight formats](@/providers/local/models.md#weight-formats)). The figures above hold on a GPU too, except that a layer's device pool is one buffer of at most 1 GiB, which caps its slots.
+- A GPU tier counts the MoE kernels' own layout, which holds as many bytes as the file for Q4_0, Q4_1, Q8_0 and MXFP4 experts (every other dtype is requantized to Q8_0, a float dtype held as f32; see [Weight formats](@/providers/local/models.md#weight-formats)). The figures above hold on a GPU too, except that a layer's device pool is one buffer of at most 1 GiB, which caps its slots.
+- A GPU device with `device_bytes = 0` and a `ram_bytes` budget has no device tier (host-tiered): the experts sit behind the RAM tier, which counts file bytes as on the CPU, and the CPU computes them while attention, the router, the shared expert and the head run on the GPU. It does not combine with `gpu_layers` (`experts.device_bytes must be greater than 0 with gpu_layers: host-tiered experts serve a model that runs on one device`) or with `shards`.
 - The minimum printed by a failed load is the number to use.
+
+## DeepSeek-V4.1 experts
+
+Every one of the 40 layers of `deepseek41` is a mixture of experts with 384 routed experts and 6 used per token. The experts are three stacked tensors per layer (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`, shape `[384, rows, cols]`) in the backbone part of the split set, in MXFP4: 32 values take 17 bytes (16 bytes of nibbles and one E8M0 scale byte). A matrix of 2304 rows by 5120 columns takes 6,266,880 bytes, so one expert of one layer is 18,800,640 bytes and one expert of all 40 layers is 752,025,600 bytes. The figures in the table above are this arithmetic, from the tensor shapes.
+
+- Resident placement would hold all 384 experts of all layers, about 288.8 GB by the arithmetic above, in RAM. Tiered placement keeps the dense weights resident and the experts behind a cache.
+- The router scores with `sqrt(softplus)` and a selection bias, which changes which experts are picked and nothing about the tiers.
+- A tier needs 6 slots, so its minimum is 4,512,153,600 bytes. A GPU layer's device pool is one buffer of at most 1 GiB, which holds about 57 experts of a layer, so a device tier on this model caps near 57 slots per layer.
+- The heat table costs `4 * 40 * 384` = 61,440 bytes.
+- A tiered `deepseek41` model prefills in steps of 4096 rows by default (`BatchingConfig::max_step_tokens`), because a step costs the experts its rows route to and a bigger step shares them among more rows.
+- Each expert read takes its three matrices from the part file of the set that holds them, with positional reads on that file's handle.
+- On the real checkpoint with `tiered:ram=90g,threads=16` (CPU, default-precision set on an HDD-class volume that serves the experts at about 0.4 to 0.5 GB/s), a 16-token pass reads about 32.7 GB of experts cold and takes 13 s warm. A chat request of 42 prompt tokens and 17 generated tokens read 78.2 GB in 4,158 expert reads for 7,592 lookups, because the RAM tier starts cold in every process. Decoding is bound by those reads, at about 5 s per token cold.
+
+The DSpark drafter's three stages hold 128 experts each in their own file and are not tiered; see [Speculative decoding](@/providers/local/drafting.md#dspark-for-deepseek-v4-1).
+
 
 ## Tiers
 
@@ -128,7 +145,7 @@ Placement decides speed only. An expert is built from the same file bytes as in 
 
 What ran:
 
-- The CPU unit tests `tiered_experts_match_resident_bit_for_bit` and `tiered_fused_experts_match_resident_bit_for_bit`, and on a GPU (when `CUCA_LOCAL_DEVICE` names one) `gpu_tiered_experts_match_gpu_resident`, on tiny models.
+- The CPU unit tests `tiered_experts_match_resident_bit_for_bit` and `tiered_fused_experts_match_resident_bit_for_bit`, and on a GPU (when `CUCA_LOCAL_DEVICE` names one) `gpu_tiered_experts_match_gpu_resident`, on tiny models. The tiny `deepseek41` models with MXFP4 experts are among them: `a_warm_start_serves_the_first_pass_from_the_experts_it_loaded` checks a cold and a warm tiered load against the resident logits, and the GPU tiered, host and host-tiered tests run on all three tiny `deepseek41` variants. A gated test, `real_tests.rs`, loads the converted real set with tiered experts when `CUCA_LOCAL_DS41_REAL` is set; the repository records no result of it.
 - `tests/provider_local_tiers.rs`: on the CPU every run of the table below equaled the resident replies (for Mistral Small 4 at `ram=8g`, the `ram=48g` run, which equals them). On Vulkan (RX 9070 XT, Windows) it reproduced the reference replies for OLMoE 1B-7B (`tiered:device=1g,ram=0` against resident), Qwen3-30B-A3B (`tiered:device=6g,ram=12g` cold and warm against `tiered:device=2g,ram=0`) and Qwen3.6-35B-A3B (`tiered:device=4g,ram=12g` and `tiered:device=2g,ram=4g`). The live suite `tests/provider_local.rs` passed all seven scenarios for Qwen3-30B-A3B at `tiered:device=6g,ram=12g`.
 
 ## Statistics and heat
@@ -232,7 +249,7 @@ Vulkan: RX 9070 XT with 15.9 GiB, Windows, release build. The rates include the 
 - `experts.loader_threads must be in 1..=64, got N`.
 - `experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu`.
 - `experts.ram_bytes must be greater than 0 on LocalDevice::Cpu`.
-- `experts.device_bytes must be greater than 0 on <device>` for a GPU device, with the device as `LocalDevice`'s `Debug` text.
+- On a GPU device with both `device_bytes` and `ram_bytes` at 0: ``experts: on <device> set device_bytes (a device tier) or ram_bytes (host-tiered: the CPU computes the experts from the RAM tier)``, with the device as `LocalDevice`'s `Debug` text.
 
 At load, once the file is open, `LocalModel::load` also fails with `CucaError::Config` for:
 

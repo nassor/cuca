@@ -5,27 +5,103 @@
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
 use std::sync::Arc;
 
 use candle_core::Device;
-use candle_core::quantized::{GgmlDType, QTensor, gguf_file};
+use candle_core::quantized::{GgmlDType, QTensor};
 
 use super::layout::tensor_info;
 use super::{candle_err, err};
 use crate::error::CucaError;
+use crate::provider::local::gguf::{self, GgufType};
 
 /// Dequantize one row of a tensor into `out`, multiplying every element by
 /// `scale`.
 ///
-/// F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 are decoded in place, with
-/// no allocation. Every other dtype candle reads (the K-quants and Q8_1) goes
-/// through candle's own dequantizer, which allocates per call.
+/// F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, MXFP4 and I8 are
+/// decoded in place, with no allocation. Every other dtype candle reads (the
+/// K-quants and Q8_1) goes through candle's own dequantizer, which allocates
+/// per call. A type the engine does not know is an error.
 ///
 /// `bytes` holds the row's blocks and must be exactly `out.len() /
 /// block_size` blocks of `type_size` bytes (for example 18 bytes per 32
 /// elements for Q4_0, 34 for Q8_0, 144 per 256 for Q4_K).
 pub(crate) fn dequant_row(
+    dtype: impl Into<GgufType>,
+    bytes: &[u8],
+    scale: f32,
+    out: &mut [f32],
+) -> Result<(), CucaError> {
+    match dtype.into() {
+        GgufType::Ggml(d) => dequant_ggml_row(d, bytes, scale, out),
+        ty @ (GgufType::Iq4Nl | GgufType::Mxfp4) => {
+            check_row(ty, bytes, out)?;
+            for (b, o) in bytes
+                .chunks_exact(ty.type_size().unwrap_or(1))
+                .zip(out.as_chunks_mut::<32>().0)
+            {
+                let (lo, hi) = o.split_at_mut(16);
+                if ty == GgufType::Iq4Nl {
+                    let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32() * scale;
+                    for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[2..18]) {
+                        *lo = f32::from(IQ4_NL_VALUES[usize::from(q & 0x0F)]) * d;
+                        *hi = f32::from(IQ4_NL_VALUES[usize::from(q >> 4)]) * d;
+                    }
+                } else {
+                    let d = e8m0_half(b[0]) * scale;
+                    for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[1..17]) {
+                        *lo = f32::from(MXFP4_VALUES[usize::from(q & 0x0F)]) * d;
+                        *hi = f32::from(MXFP4_VALUES[usize::from(q >> 4)]) * d;
+                    }
+                }
+            }
+            Ok(())
+        }
+        GgufType::I8 => {
+            check_row(GgufType::I8, bytes, out)?;
+            for (o, &q) in out.iter_mut().zip(bytes) {
+                *o = f32::from(q.cast_signed()) * scale;
+            }
+            Ok(())
+        }
+        GgufType::Unknown(id) => Err(err(format!("cannot dequantize ggml type {id}"))),
+    }
+}
+
+/// IQ4_NL's 16-entry code table (llama.cpp `kvalues_iq4nl`).
+const IQ4_NL_VALUES: [i8; 16] = [
+    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
+];
+
+/// MXFP4's E2M1 table, doubled (llama.cpp `kvalues_mxfp4`): the block scale
+/// [`e8m0_half`] carries the other half.
+const MXFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// `2^(e - 128)`, the E8M0 scale byte `e` as ggml's `GGML_E8M0_TO_FP32_HALF`
+/// (exact in f32, including the two denormal exponents).
+pub(crate) fn e8m0_half(e: u8) -> f32 {
+    f32::from_bits(if e < 2 {
+        0x0020_0000u32 << e
+    } else {
+        u32::from(e - 1) << 23
+    })
+}
+
+/// A row of `bytes` must be whole blocks of `ty` covering `out`.
+fn check_row(ty: GgufType, bytes: &[u8], out: &[f32]) -> Result<(), CucaError> {
+    if ty.byte_len(out.len()) != Some(bytes.len()) {
+        return Err(err(format!(
+            "row of {} bytes does not hold {} {} elements",
+            bytes.len(),
+            out.len(),
+            ty.name()
+        )));
+    }
+    Ok(())
+}
+
+/// [`dequant_row`] for the types candle implements.
+fn dequant_ggml_row(
     dtype: GgmlDType,
     bytes: &[u8],
     scale: f32,
@@ -121,13 +197,7 @@ pub(crate) fn dequant_row(
             }
         }
         other => {
-            let info = gguf_file::TensorInfo {
-                ggml_dtype: other,
-                shape: out.len().into(),
-                offset: 0,
-            };
-            let values = info
-                .read(&mut std::io::Cursor::new(bytes), 0, &Device::Cpu)
+            let values = gguf::qtensor_from_bytes(other, &[out.len()], bytes, &Device::Cpu)
                 .and_then(|t| t.dequantize(&Device::Cpu))
                 .and_then(|t| t.to_vec1::<f32>())
                 .map_err(candle_err)?;
@@ -230,7 +300,7 @@ pub(crate) struct RowTable {
     label: &'static str,
     file: File,
     base: u64,
-    dtype: GgmlDType,
+    dtype: GgufType,
     pub(crate) rows: usize,
     pub(crate) row_len: usize,
     row_bytes: usize,
@@ -238,11 +308,10 @@ pub(crate) struct RowTable {
 }
 
 impl RowTable {
-    /// Index the `[rows, row_len]` tensor `tensor` of the GGUF file at
-    /// `path`; no row is read yet.
+    /// Index the `[rows, row_len]` tensor `tensor` of the GGUF file (the part
+    /// of a set that holds it); no row is read yet.
     pub(crate) fn open(
-        path: &Path,
-        content: &gguf_file::Content,
+        content: &gguf::Content,
         tensor: &'static str,
         label: &'static str,
         row_len: usize,
@@ -254,15 +323,14 @@ impl RowTable {
                 "tensor `{tensor}`: expected shape [rows, {row_len}], found {dims:?}"
             )));
         }
-        let dtype = info.ggml_dtype;
-        if !row_len.is_multiple_of(dtype.block_size()) {
+        let dtype = info.dtype;
+        let Some(row_bytes) = dtype.byte_len(row_len) else {
             return Err(err(format!(
-                "tensor `{tensor}`: row length {row_len} is not a multiple of the {dtype:?} block size {}",
-                dtype.block_size()
+                "tensor `{tensor}`: row length {row_len} is not a whole number of {} blocks",
+                dtype.name()
             )));
-        }
-        let row_bytes = row_len / dtype.block_size() * dtype.type_size();
-        let base = content.tensor_data_offset + info.offset;
+        };
+        let (path, base) = content.location(info);
         let file = File::open(path)?;
         let end = base + dims[0] as u64 * row_bytes as u64;
         if file.metadata()?.len() < end {
@@ -321,6 +389,41 @@ mod tests {
     }
 
     #[test]
+    fn dequant_row_mxfp4_pairs_the_doubled_table_with_the_half_scale() {
+        // e = 127 -> scale 1.0 (ggml's half scale 0.5 times the doubled table):
+        // nibble 7 is 6.0, 15 is -6.0; low nibbles are elements 0..16.
+        let mut block = vec![127u8];
+        block.extend((0..16u8).map(|j| 7 | ((15 << 4) * u8::from(j == 0))));
+        let mut out = [0f32; 32];
+        dequant_row(GgufType::Mxfp4, &block, 1.0, &mut out).unwrap();
+        assert_eq!((out[0], out[16], out[1]), (6.0, -6.0, 6.0));
+        let mut out = [0f32; 32];
+        block[0] = 126;
+        dequant_row(GgufType::Mxfp4, &block, 2.0, &mut out).unwrap();
+        assert_eq!(out[0], 6.0);
+        assert!(dequant_row(GgufType::Mxfp4, &block[..16], 1.0, &mut out).is_err());
+    }
+
+    #[test]
+    fn dequant_row_iq4_nl_indexes_its_table() {
+        let mut block = Vec::from(f16_bytes(2.0));
+        block.extend((0..16u8).map(|j| j | ((15 - j) << 4)));
+        let mut out = [0f32; 32];
+        dequant_row(GgufType::Iq4Nl, &block, 0.5, &mut out).unwrap();
+        assert_eq!(
+            (out[0], out[15], out[16], out[31]),
+            (-127.0, 113.0, 113.0, -127.0)
+        );
+    }
+
+    #[test]
+    fn dequant_row_i8_scales_signed_bytes() {
+        let mut out = [0f32; 3];
+        dequant_row(GgufType::I8, &[255, 2, 128], 2.0, &mut out).unwrap();
+        assert_eq!(out, [-2.0, 4.0, -256.0]);
+    }
+
+    #[test]
     fn dequant_row_q4_0() {
         // One block, scale 0.5: low nibbles are elements 0..16, high nibbles
         // elements 16..32, each minus 8.
@@ -359,7 +462,7 @@ mod tests {
         assert!(dequant_row(GgmlDType::Q4K, &[0u8; 144], 1.0, &mut out).is_err());
     }
 
-    /// Nibble bytes `j | (15 - j) << 4` of a 32-element legacy block.
+    /// Nibble bytes `j | ((15 - j) << 4)` of a 32-element legacy block.
     fn nibbles() -> Vec<u8> {
         (0..16u8).map(|j| j | ((15 - j) << 4)).collect()
     }

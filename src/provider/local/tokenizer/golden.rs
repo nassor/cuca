@@ -43,7 +43,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 use serde::Deserialize;
 
 use super::Tokenizer;
@@ -103,9 +103,8 @@ pub(crate) fn skip(what: &str) {
 }
 
 /// Read the GGUF header metadata of `path` (tensor data is not touched).
-pub(crate) fn read_metadata(path: &Path) -> HashMap<String, gguf_file::Value> {
-    let mut file = std::fs::File::open(path).expect("model file opens");
-    gguf_file::Content::read(&mut file)
+pub(crate) fn read_metadata(path: &Path) -> HashMap<String, gguf::Value> {
+    gguf::Content::open(path)
         .expect("GGUF header parses")
         .metadata
 }
@@ -321,6 +320,147 @@ fn tokenizer_corpus_matches_reference_ids() {
         "{} of {} differ:\n{}",
         failures.len(),
         cases.len(),
+        failures.join("\n")
+    );
+}
+
+/// DeepSeek-V4.1-Flash-1017's `tokenizer.json`: `CUCA_DS41_TOKENIZER_JSON`, else
+/// the reference copy under `.omp/local-models/ref/deepseek-v41/`.
+fn deepseek_v41_tokenizer_json() -> Option<PathBuf> {
+    let path = std::env::var_os("CUCA_DS41_TOKENIZER_JSON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(".omp/local-models/ref/deepseek-v41/tokenizer.json")
+        });
+    path.is_file().then_some(path)
+}
+
+/// The GGUF tokenizer metadata the converter writes for a HuggingFace byte-level
+/// BPE `tokenizer.json` with the `joyai-llm` pre-tokenizer: base entries and added
+/// tokens by id, every added token CONTROL except the five that decode as text
+/// (`<think>`, `</think>`, `｜DSML｜` and the two legacy `dsml:` openers), the
+/// merges as `"left right"` strings, BOS 0, EOS 1 and no automatic BOS.
+fn deepseek_v41_metadata(tokenizer_json: &serde_json::Value) -> HashMap<String, gguf::Value> {
+    const TEXT_TOKENS: [&str; 5] = ["<think>", "</think>", "｜DSML｜", "<dsml:", "</dsml:"];
+    let vocab = tokenizer_json["model"]["vocab"].as_object().expect("vocab");
+    let added = tokenizer_json["added_tokens"]
+        .as_array()
+        .expect("added tokens");
+    let id_of = |value: &serde_json::Value| value.as_u64().expect("id") as usize;
+    let size = vocab
+        .values()
+        .map(id_of)
+        .chain(added.iter().map(|t| id_of(&t["id"])))
+        .max()
+        .expect("a vocabulary")
+        + 1;
+    let mut tokens = vec![String::new(); size];
+    let mut types = vec![1i32; size];
+    for (text, id) in vocab {
+        tokens[id_of(id)] = text.clone();
+    }
+    for token in added {
+        let id = id_of(&token["id"]);
+        let text = token["content"].as_str().expect("content");
+        tokens[id] = text.to_string();
+        types[id] = if TEXT_TOKENS.contains(&text) { 4 } else { 3 };
+    }
+    let merges = tokenizer_json["model"]["merges"]
+        .as_array()
+        .expect("merges");
+    let merges = merges.iter().map(|merge| match merge {
+        serde_json::Value::String(pair) => pair.clone(),
+        pair => format!(
+            "{} {}",
+            pair[0].as_str().unwrap(),
+            pair[1].as_str().unwrap()
+        ),
+    });
+    let strings = |items: Vec<String>| {
+        gguf::Value::Array(items.into_iter().map(gguf::Value::String).collect())
+    };
+    HashMap::from([
+        (
+            "tokenizer.ggml.model".into(),
+            gguf::Value::String("gpt2".into()),
+        ),
+        (
+            "tokenizer.ggml.pre".into(),
+            gguf::Value::String("joyai-llm".into()),
+        ),
+        ("tokenizer.ggml.tokens".into(), strings(tokens)),
+        (
+            "tokenizer.ggml.token_type".into(),
+            gguf::Value::Array(types.into_iter().map(gguf::Value::I32).collect()),
+        ),
+        ("tokenizer.ggml.merges".into(), strings(merges.collect())),
+        ("tokenizer.ggml.bos_token_id".into(), gguf::Value::U32(0)),
+        ("tokenizer.ggml.eos_token_id".into(), gguf::Value::U32(1)),
+        (
+            "tokenizer.ggml.add_bos_token".into(),
+            gguf::Value::Bool(false),
+        ),
+    ])
+}
+
+/// The tokenizer of DeepSeek-V4.1-Flash-1017 (byte-level BPE, the `joyai-llm`
+/// three-stage pre-tokenizer, 129,280 entries) against `tokenizers` 0.23:
+/// the ids of 45 probe texts and 300 seeded random ones
+/// (`testdata/deepseek_v41_tokenizer.json`), and the decoded text of every probe
+/// without control tokens. Needs the reference `tokenizer.json`; without it the
+/// test prints `SKIP:` and passes (`CUCA_REQUIRE_LIVE=1` makes it fail).
+#[test]
+fn deepseek_v41_ids_match_reference_tokenizer() {
+    #[derive(Deserialize)]
+    struct Case {
+        text: String,
+        ids: Vec<u32>,
+    }
+    #[derive(Deserialize)]
+    struct DeepseekFixture {
+        cases: Vec<Case>,
+        fuzz: Vec<Case>,
+    }
+    let fixture: DeepseekFixture =
+        serde_json::from_str(include_str!("../testdata/deepseek_v41_tokenizer.json"))
+            .expect("fixture parses");
+    let Some(path) = deepseek_v41_tokenizer_json() else {
+        skip("DeepSeek-V4.1 tokenizer.json (set CUCA_DS41_TOKENIZER_JSON)");
+        return;
+    };
+    let json: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).expect("reads")).expect("parses");
+    let tokenizer = Tokenizer::from_gguf(&deepseek_v41_metadata(&json)).expect("tokenizer builds");
+    assert_eq!(tokenizer.vocab_size(), 129_280);
+    assert!(!tokenizer.add_bos() && !tokenizer.add_eos());
+    assert_eq!((tokenizer.bos_id(), tokenizer.eos_id()), (Some(0), Some(1)));
+
+    let mut failures = Vec::new();
+    for case in fixture.cases.iter().chain(&fixture.fuzz) {
+        compare(
+            &mut failures,
+            "deepseek-v41",
+            "encode",
+            &case.text,
+            &case.ids,
+            &tokenizer.encode(&case.text),
+        );
+        if !case.ids.iter().any(|&id| tokenizer.is_control(id)) {
+            let mut bytes = Vec::new();
+            for &id in &case.ids {
+                tokenizer.decode_into(id, &mut bytes);
+            }
+            if bytes != case.text.as_bytes() {
+                failures.push(format!("decode of {:?} gives {bytes:?}", case.text));
+            }
+        }
+    }
+    assert_eq!(fixture.cases.len() + fixture.fuzz.len(), 345);
+    assert!(
+        failures.is_empty(),
+        "{} differ:\n{}",
+        failures.len(),
         failures.join("\n")
     );
 }

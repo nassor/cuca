@@ -53,9 +53,7 @@ use crate::error::CucaError;
 use crate::provider::local::model::cpu::{Forward, Hidden};
 use crate::provider::local::model::mtp::Drafter;
 use crate::provider::local::model::paged::{BLOCK_SIZE, BlockKey, SeqBlocks, block_keys};
-use crate::provider::local::model::{
-    Batch, RecurrentSnapshot, SeqRows, StateSlot, Want, prefill_chunk,
-};
+use crate::provider::local::model::{Batch, RecurrentSnapshot, SeqRows, StateSlot, Want};
 use crate::provider::local::output::OutputParser;
 use crate::provider::local::sampler::{
     Dist, Scratch, SplitMix64, greedy, greedy_with_prob, sample,
@@ -134,6 +132,17 @@ impl Stopper {
 /// A fresh tool-call id.
 fn call_id(rng: &mut SplitMix64) -> String {
     format!("call_{:016x}", rng.next_u64())
+}
+
+/// `acc += more`, group by group (`acc` empty: a copy of `more`).
+fn add_owed(acc: &mut Vec<usize>, more: &[usize]) {
+    if acc.is_empty() {
+        acc.extend_from_slice(more);
+    } else {
+        for (a, n) in acc.iter_mut().zip(more) {
+            *a += n;
+        }
+    }
 }
 
 /// One request being served: its tokens, K/V blocks, sampling state and
@@ -588,18 +597,14 @@ impl Engine {
 
     // ---- admission ----
 
-    /// Blocks the full-attention pool still owes the prompts being
-    /// prefilled.
-    fn committed(&self) -> usize {
-        self.running
-            .iter()
-            .filter(|s| s.phase == Phase::Prefill)
-            .map(|s| {
-                (s.prompt.len() + 1)
-                    .div_ceil(BLOCK_SIZE)
-                    .saturating_sub(self.pools.full_blocks(&s.blocks))
-            })
-            .sum()
+    /// Blocks each window-less pool still owes the prompts being prefilled
+    /// ([`KvPools::owed`]), per group.
+    fn committed(&self) -> Vec<usize> {
+        let mut sum = Vec::new();
+        for s in self.running.iter().filter(|s| s.phase == Phase::Prefill) {
+            add_owed(&mut sum, &self.pools.owed(&s.blocks, s.prompt.len() + 1));
+        }
+        sum
     }
 
     /// How many leading ids of `prompt` the drafter's cache still holds
@@ -653,10 +658,9 @@ impl Engine {
         {
             let prompt = std::mem::take(&mut self.waiting[0].prompt);
             let mut blocks = self.prefix_for(&prompt);
-            let need = (prompt_len + 1)
-                .div_ceil(BLOCK_SIZE)
-                .saturating_sub(self.pools.full_blocks(&blocks));
-            if self.pools.available() < self.committed() + need {
+            let mut owed = self.committed();
+            add_owed(&mut owed, &self.pools.owed(&blocks, prompt_len + 1));
+            if !self.pools.can_give(&owed) {
                 self.pools.release(&mut blocks);
                 self.waiting[0].prompt = prompt;
                 break;
@@ -953,6 +957,7 @@ impl Engine {
                         SeqRows {
                             tokens: &p.tokens,
                             start_pos: p.start,
+                            history: &seq.ids[..p.start.min(seq.ids.len())],
                             tables: &seq.blocks.tables,
                             state: StateSlot(seq.slot.unwrap_or(0)),
                             want: p.want,
@@ -972,6 +977,19 @@ impl Engine {
             }
         };
         let step_ns = saturating_u64(started.elapsed().as_nanos());
+        // The next chunk of every prompt still being prefilled is known: a
+        // model with an Engram table starts reading its rows now, behind the
+        // reads this step needed (the readers serve jobs in order), while the
+        // scheduler applies the step and plans the next one.
+        for p in plans.iter() {
+            if matches!(p.kind, Kind::Prefill { last: false }) {
+                let seq = &self.running[p.seq];
+                let end = p.start + p.tokens.len();
+                let next = (seq.prompt.len() - end).min(self.batching.prefill_chunk);
+                self.model
+                    .engram_prefetch(&seq.prompt[..end], &seq.prompt[end..end + next]);
+            }
+        }
         let rows: usize = plans.iter().map(|p| p.tokens.len()).sum();
         let prefill_rows: usize = plans
             .iter()
@@ -1008,7 +1026,7 @@ impl Engine {
     /// `room` rows. `None` when its blocks cannot be reserved (the sequence
     /// is marked failed).
     fn plan_prefill(&mut self, i: usize, room: usize) -> Option<Plan> {
-        let chunk = prefill_chunk(self.context_length);
+        let chunk = self.batching.prefill_chunk;
         let observes = self.observes();
         let tap = self.drafter.is_some() && self.running.len() == 1;
         let features = self.drafter.as_ref().and_then(Drafter::feature_rows);
@@ -1734,6 +1752,28 @@ mod tests {
         );
     }
 
+    /// The queue test on a model with compressed (strided) K/V pools: every
+    /// window-less pool is gated, a prompt waits until its blocks are free,
+    /// and the replies are what they are alone.
+    #[test]
+    fn requests_queue_on_a_model_with_compressed_pools() {
+        use crate::provider::local::model::tiny::{TinyDeepseek41, write_deepseek41};
+        let model = write_deepseek41(&TinyDeepseek41::default());
+        // The pools of 112 positions hold one 60-token prompt (4 blocks) and
+        // not a second one (8 blocks).
+        let prompts = [prompt(60, 0), prompt(60, 2), prompt(10, 5)];
+        let mut e = engine_sized(&model, 96, 0.0, None, 3, Some(112));
+        let mut clients: Vec<Client> = prompts.iter().map(|p| submit(&mut e, p, 4, 1024)).collect();
+        e.turn();
+        assert_eq!(e.running.len(), 1, "the second prompt does not fit yet");
+        assert_eq!(e.waiting.len(), 2);
+        finish(&mut e, &mut clients);
+        for (c, p) in clients.iter().zip(&prompts) {
+            assert_eq!(c.text(), alone(&model, 96, p, 4).0, "queueing is invisible");
+        }
+        assert_eq!(e.pools.stats().iter().map(|s| s.used).sum::<usize>(), 0);
+    }
+
     #[test]
     fn requests_queue_when_the_pool_is_full_and_run_in_order() {
         let model = llama96();
@@ -1763,7 +1803,7 @@ mod tests {
             write_qwen35(&TinyQwen35 {
                 meta: vec![(
                     "context_length".into(),
-                    candle_core::quantized::gguf_file::Value::U32(96),
+                    crate::provider::local::gguf::Value::U32(96),
                 )],
                 ..TinyQwen35::default()
             }),
@@ -1789,7 +1829,7 @@ mod tests {
         let model = write_qwen35(&TinyQwen35 {
             meta: vec![(
                 "context_length".into(),
-                candle_core::quantized::gguf_file::Value::U32(96),
+                crate::provider::local::gguf::Value::U32(96),
             )],
             ..TinyQwen35::default()
         });

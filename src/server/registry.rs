@@ -48,7 +48,7 @@ pub enum SlotStatus {
     Failed(Arc<str>),
 }
 
-/// Progress a load reports (download, conversion or merge): `done` of
+/// Progress a load reports (download or conversion): `done` of
 /// `total` units, whatever the unit is.
 #[derive(Debug, Default)]
 struct LoadProgress {
@@ -138,7 +138,7 @@ impl ModelSlot {
                     done = p.downloaded_bytes,
                     total = (total > 0).then_some(total),
                     percent = (total > 0).then(|| p.downloaded_bytes * 100 / total),
-                    "loading: download, conversion or merge progress"
+                    "loading: download or conversion progress"
                 );
             }
         })

@@ -173,7 +173,7 @@ Every request gets an `x-request-id` (an incoming one is kept) and an `http` spa
 - When response headers go out: `status` and `latency_ms`, at `info` (at `debug` for `/health`, `/metrics` and the stats route).
 - When a chat request finishes: `request_id`, `model`, `status`, `outcome`, `prompt_tokens`, `completion_tokens`, `cached_tokens`, `queue_ms`, `ttft_ms`, `itl_ms`, `e2e_ms` and `finish_reason`. A balancer's line has `upstream`, `decision`, `retries`, `status`, `ttft_ms` and `e2e_ms` inside a `proxy` span.
 
-Model loads log their download, conversion or merge progress about every 5%, then one `model ready` line with the context length, K/V and weight sizes and `max_sequences`.
+Model loads log their download or conversion progress about every 5%, then one `model ready` line with the context length, K/V and weight sizes and `max_sequences`.
 
 ## Bounds
 

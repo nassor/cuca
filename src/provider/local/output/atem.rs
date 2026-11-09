@@ -309,7 +309,7 @@ fn parameter_value(raw: &str) -> Value {
 mod tests {
     use std::collections::HashMap;
 
-    use candle_core::quantized::gguf_file;
+    use crate::provider::local::gguf;
     use serde_json::json;
 
     use super::super::super::chat::ToolSyntax;
@@ -361,7 +361,7 @@ mod tests {
         .expect("vocabulary");
         let md = HashMap::from([(
             "tokenizer.ggml.eos_token_id".to_string(),
-            gguf_file::Value::U32(0),
+            gguf::Value::U32(0),
         )]);
         let format = ChatFormat::detect(&md, &tokenizer, TEMPLATE).expect("format");
         let mut parser = AtemParser::new(atem_of(&format));

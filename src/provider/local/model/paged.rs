@@ -49,27 +49,54 @@ pub(crate) const NO_BLOCK: u32 = u32::MAX;
 /// The blocks of one sequence in one group, by block index.
 pub(crate) type BlockTable = Vec<u32>;
 
-/// K/V-owning layers that share one attention window.
+/// K/V-owning layers that share one attention window, or the layers whose
+/// compressed rows share one compression ratio.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct KvGroup {
     /// Sliding-window length in tokens (the query included); `None` for full
     /// attention.
     pub(crate) window: Option<usize>,
-    /// The K/V-owning layers of the group, ascending.
+    /// Tokens per row: 1 for K/V positions, the compression ratio for a
+    /// group of compressed rows. A block holds [`BLOCK_SIZE`] rows, so it
+    /// spans `BLOCK_SIZE * stride` tokens.
+    pub(crate) stride: usize,
+    /// The rows are compressed rows (with their index keys) of the layers'
+    /// compressed caches, not K/V positions.
+    pub(crate) compressed: bool,
+    /// The layers of the group that own its rows, ascending.
     pub(crate) layers: Vec<usize>,
 }
 
-/// One group per distinct window among the K/V-owning layers of `hp`, in
-/// order of first appearance.
+impl KvGroup {
+    /// Tokens one block of the group spans.
+    pub(crate) fn span(&self) -> usize {
+        BLOCK_SIZE * self.stride
+    }
+}
+
+/// One group per distinct (window, compression) among the cache-owning
+/// layers of `hp`, in order of first appearance: the K/V groups of the layers
+/// that own K/V positions, and a group of compressed rows per ratio.
 pub(crate) fn kv_groups(hp: &Hparams) -> Vec<KvGroup> {
     let mut groups: Vec<KvGroup> = Vec::new();
-    for (il, spec) in hp.kv_owners() {
-        match groups.iter_mut().find(|g| g.window == spec.window) {
-            Some(g) => g.layers.push(il),
-            None => groups.push(KvGroup {
-                window: spec.window,
-                layers: vec![il],
-            }),
+    let mut add = |window: Option<usize>, stride: usize, compressed: bool, il: usize| match groups
+        .iter_mut()
+        .find(|g| g.window == window && g.stride == stride && g.compressed == compressed)
+    {
+        Some(g) => g.layers.push(il),
+        None => groups.push(KvGroup {
+            window,
+            stride,
+            compressed,
+            layers: vec![il],
+        }),
+    };
+    for (il, spec) in hp.layers.iter().enumerate() {
+        if spec.owns_kv(il) {
+            add(spec.window, 1, false, il);
+        }
+        if let Some(c) = spec.csa.filter(|c| c.owns_kv) {
+            add(None, c.ratio, true, il);
         }
     }
     groups
@@ -84,6 +111,9 @@ pub(crate) struct KvLayout {
     /// The group of each layer that reads K/V (owners and the layers that
     /// share an owner's cache); `None` for layers without attention.
     pub(crate) layer_group: Vec<Option<usize>>,
+    /// The group of compressed rows each layer reads (`None` for the layers
+    /// without compressed attention).
+    pub(crate) csa_group: Vec<Option<usize>>,
 }
 
 /// How many sequences the pools and state slots of a loaded model serve, and
@@ -158,6 +188,10 @@ impl KvLayout {
         let blocks = groups
             .iter()
             .map(|g| match g.window {
+                // A block of a compressed group spans `stride` times the
+                // tokens; every running sequence may leave one block of
+                // rounding in it.
+                None if g.stride > 1 => full.div_ceil(g.stride) + max_sequences.max(1),
                 None => full,
                 Some(w) => {
                     let per_sequence = (w.saturating_sub(1) + max_rows).div_ceil(BLOCK_SIZE) + 2;
@@ -166,15 +200,22 @@ impl KvLayout {
             })
             .collect();
         let mut layer_group = vec![None; hp.layers.len()];
+        let mut csa_group = vec![None; hp.layers.len()];
         for (il, spec) in hp.layers.iter().enumerate() {
             layer_group[il] = groups
                 .iter()
-                .position(|g| g.layers.contains(&spec.kv_source));
+                .position(|g| !g.compressed && g.layers.contains(&spec.kv_source));
+            csa_group[il] = spec.csa.and_then(|c| {
+                groups
+                    .iter()
+                    .position(|g| g.compressed && g.layers.contains(&c.kv_source))
+            });
         }
         Self {
             groups,
             blocks,
             layer_group,
+            csa_group,
         }
     }
 
@@ -191,7 +232,12 @@ impl KvLayout {
                     .iter()
                     .map(|&il| {
                         let l = &hp.layers[il];
-                        (4 * BLOCK_SIZE * l.kv_floats_per_position()) as u64
+                        let floats = if g.compressed {
+                            l.csa.map_or(0, |c| c.row_width)
+                        } else {
+                            l.kv_floats_per_position()
+                        };
+                        (4 * BLOCK_SIZE * floats) as u64
                     })
                     .sum();
                 per_block * n as u64
@@ -486,27 +532,51 @@ impl KvPools {
     }
 
     /// The group whose pool bounds how many positions the sequences hold
-    /// together: the full-attention one (the first group without a window,
-    /// or the first group).
+    /// together: the full-attention one with the finest rows (the first
+    /// group without a window and the smallest stride, so that its blocks
+    /// are the [`BLOCK_SIZE`]-token blocks the callers count), or the first
+    /// group.
     fn full_group(&self) -> usize {
         self.groups
             .iter()
-            .position(|g| g.window.is_none())
-            .unwrap_or(0)
+            .enumerate()
+            .filter(|(_, g)| g.window.is_none())
+            .min_by_key(|(i, g)| (g.stride, *i))
+            .map_or(0, |(i, _)| i)
     }
 
-    /// Blocks the full-attention pool can still hand out: free ones and
-    /// cached ones (evicted on demand).
-    pub(crate) fn available(&self) -> usize {
-        self.pools.get(self.full_group()).map_or(0, |p| {
-            let s = p.stats();
-            s.free + s.cached
-        })
+    /// Per group, the blocks `seq` still needs for `tokens` positions: those
+    /// beyond the ones it holds, in the groups without a window (a sliding
+    /// group's pool is sized per running sequence and is not gated, `0`). A
+    /// compressed group counts its own blocks, which span `16 * stride`
+    /// tokens, so a strided pool can be the binding one.
+    pub(crate) fn owed(&self, seq: &SeqBlocks, tokens: usize) -> Vec<usize> {
+        self.groups
+            .iter()
+            .zip(&seq.tables)
+            .map(|(g, table)| {
+                if g.window.is_none() {
+                    tokens.div_ceil(g.span()).saturating_sub(table.len())
+                } else {
+                    0
+                }
+            })
+            .collect()
     }
 
-    /// Blocks `seq` holds in the full-attention pool.
-    pub(crate) fn full_blocks(&self, seq: &SeqBlocks) -> usize {
-        seq.tables.get(self.full_group()).map_or(0, Vec::len)
+    /// Whether every window-less pool can hand out `owed[group]` more blocks:
+    /// free ones and cached ones (evicted on demand).
+    pub(crate) fn can_give(&self, owed: &[usize]) -> bool {
+        self.groups
+            .iter()
+            .zip(&self.pools)
+            .zip(owed)
+            .all(|((g, pool), &n)| {
+                g.window.is_some() || {
+                    let s = pool.stats();
+                    s.free + s.cached >= n
+                }
+            })
     }
 
     /// Counts of the full-attention pool.
@@ -525,8 +595,8 @@ impl KvPools {
     /// [`CucaError::Provider`] when a pool has no block to give; the blocks
     /// allocated so far stay in `seq`.
     pub(crate) fn reserve(&mut self, seq: &mut SeqBlocks, upto: usize) -> Result<(), CucaError> {
-        let need = upto.div_ceil(BLOCK_SIZE);
-        for (table, pool) in seq.tables.iter_mut().zip(&mut self.pools) {
+        for ((table, pool), g) in seq.tables.iter_mut().zip(&mut self.pools).zip(&self.groups) {
+            let need = upto.div_ceil(g.span());
             while table.len() < need {
                 let block = pool
                     .alloc()
@@ -579,16 +649,27 @@ impl KvPools {
     pub(crate) fn truncate(&mut self, seq: &mut SeqBlocks, len: usize) -> usize {
         let mut len = len.min(seq.len);
         if len < seq.len {
-            // A named block is read-only: keep whole blocks only.
-            let tail = len / BLOCK_SIZE;
-            let partial = !len.is_multiple_of(BLOCK_SIZE);
-            let named = partial
-                && seq.tables.iter().zip(&self.pools).any(|(t, p)| {
-                    t.get(tail)
+            // A named block is read-only: keep whole blocks only. A block of
+            // a compressed group spans several 16-token blocks, so rounding
+            // down for one group can leave the end inside a block of another.
+            loop {
+                let mut changed = false;
+                for ((g, t), p) in self.groups.iter().zip(&seq.tables).zip(&self.pools) {
+                    let span = g.span();
+                    if len.is_multiple_of(span) {
+                        continue;
+                    }
+                    let tail = len / span;
+                    if t.get(tail)
                         .is_some_and(|&b| b != NO_BLOCK && p.is_hashed(b))
-                });
-            if named {
-                len = tail * BLOCK_SIZE;
+                    {
+                        len = tail * span;
+                        changed = true;
+                    }
+                }
+                if !changed {
+                    break;
+                }
             }
             // Every sliding group must still hold the window before `len`.
             let missing = self.groups.iter().zip(&seq.tables).any(|(g, t)| {
@@ -603,8 +684,8 @@ impl KvPools {
                 len = 0;
             }
         }
-        let keep = len.div_ceil(BLOCK_SIZE);
-        for (table, pool) in seq.tables.iter_mut().zip(&mut self.pools) {
+        for ((table, pool), g) in seq.tables.iter_mut().zip(&mut self.pools).zip(&self.groups) {
+            let keep = len.div_ceil(g.span());
             while table.len() > keep {
                 if let Some(b) = table.pop().filter(|&b| b != NO_BLOCK) {
                     pool.release(b);
@@ -629,10 +710,13 @@ impl KvPools {
     pub(crate) fn publish(&mut self, seq: &mut SeqBlocks, ids: &[u32]) {
         let len = seq.len;
         Self::extend_chain(seq, ids, len);
-        for (table, pool) in seq.tables.iter().zip(&mut self.pools) {
+        for ((table, pool), g) in seq.tables.iter().zip(&mut self.pools).zip(&self.groups) {
             for (i, &b) in table.iter().enumerate() {
-                if b != NO_BLOCK && i < seq.chain.len() {
-                    pool.register(b, BlockKey::of(&seq.chain, ids, i));
+                // Block `i` is named by the last 16-token block it spans,
+                // once all of them are full.
+                let last = (i + 1) * g.stride - 1;
+                if b != NO_BLOCK && last < seq.chain.len() {
+                    pool.register(b, BlockKey::of(&seq.chain, ids, last));
                 }
             }
         }
@@ -672,12 +756,24 @@ impl KvPools {
     /// group has them (0 when none does).
     pub(crate) fn lookup(&mut self, prompt: &[u32]) -> Hit {
         let keys = block_keys(prompt, prompt.len().saturating_sub(1) / BLOCK_SIZE);
-        // Longest chain the full-attention group holds (no such group: any).
-        let full = self.groups.iter().position(|g| g.window.is_none());
-        let mut n = match full {
-            Some(g) => keys.iter().take_while(|k| self.pools[g].holds(k)).count(),
-            None => keys.len(),
-        };
+        // Block `j` of a group with rows of `stride` tokens is named by the
+        // last 16-token block it spans, `(j + 1) * stride - 1`; a prefix of
+        // `n` blocks holds `n / stride` of them.
+        let key_of = |g: &KvGroup, j: usize| (j + 1) * g.stride - 1;
+        // Longest chain every full-attention group holds (no such group:
+        // any), in 16-token blocks.
+        let mut n = keys.len();
+        for (g, pool) in self.groups.iter().zip(&self.pools) {
+            if g.window.is_none() {
+                let rows = (0..keys.len() / g.stride)
+                    .take_while(|&j| pool.holds(&keys[key_of(g, j)]))
+                    .count();
+                n = n.min(rows * g.stride);
+            }
+        }
+        // The prefix must end at a block of every group.
+        let step = self.groups.iter().map(|g| g.stride).fold(1, lcm);
+        n -= n % step;
         // The first block each sliding group needs for a prefix of `n` blocks.
         let first = |w: usize, n: usize| (n * BLOCK_SIZE).saturating_sub(w - 1) / BLOCK_SIZE;
         while n > 0 {
@@ -688,17 +784,17 @@ impl KvPools {
             if ok {
                 break;
             }
-            n -= 1;
+            n -= step;
         }
         let mut tables = Vec::with_capacity(self.groups.len());
         for (g, pool) in self.groups.iter().zip(&mut self.pools) {
             let from = g.window.map_or(0, |w| first(w, n));
             let mut table = vec![NO_BLOCK; from];
-            for key in &keys[from.min(n)..n] {
+            for j in from.min(n / g.stride)..n / g.stride {
                 // Present by the checks above; a miss would leave a hole the
                 // attention never reads for a full group, so stop the prefix
                 // rather than hand out a table with one.
-                if let Some(b) = pool.lookup(key) {
+                if let Some(b) = pool.lookup(&keys[key_of(g, j)]) {
                     table.push(b);
                 }
             }
@@ -709,7 +805,6 @@ impl KvPools {
             tables,
         }
     }
-
     /// Every block free, every hash forgotten (after a failed forward pass:
     /// the K/V of the running sequences is not trusted).
     pub(crate) fn reset(&mut self) {
@@ -717,6 +812,14 @@ impl KvPools {
             pool.reset();
         }
     }
+}
+
+fn lcm(a: usize, b: usize) -> usize {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        (x, y) = (y, x % y);
+    }
+    a / x * b
 }
 
 /// One implicit sequence over its own pools, for the unit tests of the
@@ -796,11 +899,14 @@ mod tests {
                 .enumerate()
                 .map(|(i, &(window, _))| KvGroup {
                     window,
+                    stride: 1,
+                    compressed: false,
                     layers: vec![i],
                 })
                 .collect(),
             blocks: groups.iter().map(|g| g.1).collect(),
             layer_group: (0..groups.len()).map(Some).collect(),
+            csa_group: vec![None; groups.len()],
         };
         KvPools::new(&layout)
     }
@@ -1045,5 +1151,92 @@ mod tests {
         assert_eq!(held.tables[0].len(), 2);
         // On a boundary the blocks are untouched.
         assert_eq!(p.truncate(&mut held, 32), 32);
+    }
+
+    /// A layout of `(window, stride, blocks)` groups.
+    fn strided_pools(groups: &[(Option<usize>, usize, usize)]) -> KvPools {
+        let layout = KvLayout {
+            groups: groups
+                .iter()
+                .enumerate()
+                .map(|(i, &(window, stride, _))| KvGroup {
+                    window,
+                    stride,
+                    compressed: stride > 1,
+                    layers: vec![i],
+                })
+                .collect(),
+            blocks: groups.iter().map(|g| g.2).collect(),
+            layer_group: (0..groups.len()).map(Some).collect(),
+            csa_group: vec![None; groups.len()],
+        };
+        KvPools::new(&layout)
+    }
+
+    #[test]
+    fn a_compressed_group_spans_stride_times_the_tokens_per_block() {
+        let mut p = strided_pools(&[(None, 1, 16), (None, 2, 8)]);
+        let mut seq = p.seq();
+        p.reserve(&mut seq, 70).unwrap();
+        assert_eq!(seq.tables[0].len(), 5);
+        assert_eq!(seq.tables[1].len(), 3);
+        p.reserve(&mut seq, 97).unwrap();
+        assert_eq!(seq.tables[0].len(), 7);
+        assert_eq!(seq.tables[1].len(), 4);
+    }
+
+    #[test]
+    fn a_strided_pool_can_be_the_binding_one_for_admission() {
+        // 8 blocks of 16 tokens in the finest group, 3 blocks of 32 tokens in
+        // the stride-2 group, and a window group that is never gated.
+        let mut p = strided_pools(&[(Some(40), 1, 4), (None, 1, 8), (None, 2, 3)]);
+        let seq = p.seq();
+        let fits = p.owed(&seq, 96);
+        assert_eq!(fits, [0, 6, 3]);
+        assert!(p.can_give(&fits));
+        // One more token needs a 4th stride-2 block: that pool says no while
+        // the finest group (7 of 8 blocks) still could.
+        let over = p.owed(&seq, 97);
+        assert_eq!(over, [0, 7, 4]);
+        assert!(!p.can_give(&over));
+        // Blocks the sequence holds are not owed again; a cached block
+        // counts as available.
+        let mut held = p.seq();
+        p.reserve(&mut held, 64).unwrap();
+        assert_eq!(p.owed(&held, 96), [0, 2, 1]);
+        p.release(&mut held);
+        assert!(p.can_give(&p.owed(&p.seq(), 96)));
+    }
+
+    #[test]
+    fn a_prefix_is_found_in_multiples_of_the_largest_stride() {
+        let mut p = strided_pools(&[(Some(40), 1, 16), (None, 1, 16), (None, 2, 8)]);
+        let all = ids(0, 100);
+        let mut seq = fill(&mut p, &all[..80]);
+        p.finish(&mut seq, &all[..80]);
+        // 80 tokens are five 16-token blocks but only two 32-token ones.
+        let hit = p.lookup(&all);
+        assert_eq!(hit.len, 64);
+        assert_eq!(hit.tables[1].len(), 4);
+        assert_eq!(hit.tables[2].len(), 2);
+        // A prompt that shares 48 tokens can only resume at 32.
+        let mut other = all[..48].to_vec();
+        other.extend(ids(500, 30));
+        let hit = p.lookup(&other);
+        assert_eq!(hit.len, 32);
+        assert_eq!(hit.tables[2].len(), 1);
+    }
+
+    #[test]
+    fn rolling_back_into_a_named_compressed_block_rounds_down_to_its_start() {
+        let mut p = strided_pools(&[(None, 1, 16), (None, 2, 8)]);
+        let all = ids(0, 70);
+        let mut seq = fill(&mut p, &all);
+        p.publish(&mut seq, &all);
+        // Block 1 of the compressed group (tokens 32..64) is named, so a
+        // rollback to 40 keeps whole blocks of both groups only.
+        assert_eq!(p.truncate(&mut seq, 40), 32);
+        assert_eq!(seq.tables[0].len(), 2);
+        assert_eq!(seq.tables[1].len(), 1);
     }
 }

@@ -1,4 +1,4 @@
-//! llama.cpp's named chat templates.
+//! The engine's named chat templates: llama.cpp's and this engine's own.
 //!
 //! A GGUF's `tokenizer.chat_template` (or a `--chat-template` argument) can be a
 //! bare *name* instead of Jinja: llama.cpp's converter writes `mistral-v7-tekken`
@@ -8,13 +8,16 @@
 //! render the same GGUFs, so [`expand`] turns a known name into the equivalent
 //! Jinja text, which the engine then handles like any template.
 //!
-//! The table is limited to the names a 2025 or later model uses: the v7 formats
-//! of Mistral Small 3.0/3.1 (2501, 2503) and Devstral Small 2505. llama.cpp's
-//! other Mistral names (`mistral-v1`, `mistral-v3`, `mistral-v3-tekken`, the
-//! Llama 2 and Mistral Nemo era) serve models from before 2025 and are not
-//! ported.
+//! The llama.cpp table is limited to the names a 2025 or later model uses: the
+//! v7 formats of Mistral Small 3.0/3.1 (2501, 2503) and Devstral Small 2505.
+//! llama.cpp's other Mistral names (`mistral-v1`, `mistral-v3`,
+//! `mistral-v3-tekken`, the Llama 2 and Mistral Nemo era) serve models from
+//! before 2025 and are not ported. `deepseek-v41` is not a llama.cpp name (it
+//! has no built-in for DeepSeek V4.x, whose checkpoint ships no Jinja either):
+//! it is the template that reproduces DeepSeek's reference `encoding.py` for
+//! V4.1, for the GGUFs the converter will write and for template overrides.
 //!
-//! The port follows the C++ branch exactly:
+//! The Mistral port follows the C++ branch exactly:
 //!
 //! - `system` writes `[SYSTEM_PROMPT]{sp}{content}[/SYSTEM_PROMPT]` wherever the
 //!   message sits (no merging into the first user turn), `user` writes
@@ -28,6 +31,10 @@
 //!   calls) contributes an empty content, as the C++ `std::string` does.
 
 use std::borrow::Cow;
+
+/// `deepseek-v41`: DeepSeek's `encoding/encoding.py` of
+/// DeepSeek-V4.1-Flash-1017 as Jinja (the file `templates/deepseek-v41.jinja`).
+pub(crate) const DEEPSEEK_V41: &str = include_str!("templates/deepseek-v41.jinja");
 
 /// `mistral-v7`: the SentencePiece variant, a space after every opener and
 /// before every assistant turn.
@@ -50,6 +57,7 @@ fn lookup(name: &str) -> Option<&'static str> {
     match name {
         "mistral-v7" => Some(MISTRAL_V7),
         "mistral-v7-tekken" => Some(MISTRAL_V7_TEKKEN),
+        "deepseek-v41" => Some(DEEPSEEK_V41),
         _ => None,
     }
 }
@@ -79,7 +87,7 @@ pub(crate) fn expand(source: &str) -> Result<Cow<'_, str>, String> {
     if looks_like_a_name(source) {
         return Err(format!(
             "`{source}` is a bare chat template name, not a Jinja template; the names this engine renders are \
-             `mistral-v7` and `mistral-v7-tekken` (llama.cpp's other built-in names belong to models from before 2025)"
+             `mistral-v7`, `mistral-v7-tekken` and `deepseek-v41` (llama.cpp's other built-in names belong to models from before 2025)"
         ));
     }
     Ok(Cow::Borrowed(source))

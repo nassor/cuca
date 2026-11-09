@@ -53,21 +53,21 @@ mod scheduler;
 mod stop;
 
 use std::collections::VecDeque;
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 use tokio::sync::mpsc;
 
 use self::scheduler::{Sequence, SnapshotStore, StepBufs};
 use super::chat::{ChatFormat, ChatTemplate, expand_template_name};
+use super::model::Model;
 use super::model::arch::Arch;
 use super::model::mtp::Drafter;
 use super::model::paged::{KvPools, Sizing};
-use super::model::{Model, prefill_chunk};
+#[cfg(test)]
+use super::model::prefill_chunk;
 use super::sampler::{SplitMix64, random_seed};
 use super::sampling::{FileSampling, Sampling};
 use super::tokenizer::Tokenizer;
@@ -119,6 +119,9 @@ pub(crate) struct Batching {
     pub(crate) max_sequences: usize,
     /// Rows of one forward step across all sequences.
     pub(crate) max_step_tokens: usize,
+    /// Most tokens of one sequence's prompt in one step
+    /// ([`super::model::prefill_rows`]).
+    pub(crate) prefill_chunk: usize,
     /// Register finished and full blocks in the prefix store.
     pub(crate) prefix_cache: bool,
 }
@@ -573,9 +576,8 @@ impl Engine {
     /// [`CucaError::Io`] when the file cannot be opened or read,
     /// [`CucaError::Config`] when `config.context_length` exceeds the model
     /// maximum or `config.device` is compiled out, and
-    /// [`CucaError::Provider`] for a file that is not a GGUF file candle can
-    /// parse (for example an unsupported tensor dtype such as an IQ
-    /// quantization), an unsupported checkpoint (wrong architecture, a
+    /// [`CucaError::Provider`] for a file that is not a GGUF file (or split
+    /// set) the reader can parse, an unsupported checkpoint (wrong architecture, a
     /// weight dtype the GPU engine does not read), a missing tensor or
     /// metadata key, a drafter that does not match the model (an in-trunk
     /// head the file does not carry, or one asked for on a GPU), or an
@@ -589,21 +591,7 @@ impl Engine {
         config: &LocalModelConfig,
         chat_template: Option<&str>,
     ) -> Result<(Self, Arc<Tokenizer>, ChatTemplate, ChatFormat), CucaError> {
-        let io_err = |e: &dyn std::fmt::Display| CucaError::Io {
-            message: format!("reading GGUF `{}`: {e}", path.display()),
-        };
-        let mut reader = BufReader::new(File::open(path).map_err(|e| io_err(&e))?);
-        let content = gguf_file::Content::read(&mut reader).map_err(|e| match e {
-            // A read failure of the file itself; anything else is a header
-            // candle cannot interpret (a tensor dtype it does not implement,
-            // such as an IQ quantization, is the usual cause).
-            candle_core::Error::Io(_) => io_err(&e),
-            other => local_err(format!(
-                "`{}` is not a supported GGUF file: {other}",
-                path.display()
-            )),
-        })?;
-        drop(reader);
+        let content = open_gguf(path, &config.shard_dirs)?;
 
         let hp = super::model::read_hparams(&content)?;
         let context_length = super::resolve_context_length(config.context_length, hp.n_ctx_train);
@@ -612,7 +600,7 @@ impl Engine {
         // sequence like an in-trunk head does (`file_drafter_observes`), and
         // an EAGLE drafter runs on the CPU only.
         let file_drafter = match drafter {
-            Some(ResolvedDrafter::File(dp)) => Some(read_drafter_header(dp)?),
+            Some(ResolvedDrafter::File(dp)) => Some(open_gguf(dp, &config.shard_dirs)?),
             _ => None,
         };
         let file_arch = file_drafter.as_ref().map_or("", architecture_of);
@@ -624,31 +612,40 @@ impl Engine {
         }
         let observing =
             matches!(drafter, Some(ResolvedDrafter::InTrunk)) || file_drafter_observes(file_arch);
-        let (batching, sizing) = resolve_batching(config, context_length, observing)?;
+        // Tiered experts make a prefill step's cost the experts it touches, so
+        // a model that can run big steps does (`prefill_rows`).
+        let tiered = matches!(config.experts, super::ExpertPlacement::Tiered(_));
+        let chunk = super::model::prefill_rows(&hp, context_length, tiered);
+        let (batching, sizing) = resolve_batching_with(config, context_length, observing, chunk)?;
         let model = Model::load(
             &content,
-            path,
             context_length,
             config.device,
             &config.shards,
             &config.experts,
             &sizing,
             config.gpu_layers,
+            &config.engram,
         )?;
         let drafter = drafter
             .map(|source| match (source, &file_drafter) {
-                (ResolvedDrafter::File(dp), Some(dc)) => match file_arch {
-                    super::model::cpu::dflash::ARCH => {
-                        Drafter::open_dflash(dc, dp, &model, context_length)
+                (ResolvedDrafter::File(_), Some(dc)) => match file_arch {
+                    super::model::cpu::dflash::ARCH
+                        if super::model::cpu::dspark::is_dspark(&dc.metadata) =>
+                    {
+                        Drafter::open_dspark(dc, &model, context_length)
                     }
-                    a if a == Arch::Mistral4Eagle.name() => Drafter::open_eagle(dc, dp, &model),
-                    _ => Drafter::open(dc, dp, &model, context_length),
+                    super::model::cpu::dflash::ARCH => {
+                        Drafter::open_dflash(dc, &model, context_length)
+                    }
+                    a if a == Arch::Mistral4Eagle.name() => Drafter::open_eagle(dc, &model),
+                    _ => Drafter::open(dc, &model, context_length),
                 },
                 (ResolvedDrafter::File(dp), None) => Err(local_err(format!(
                     "the drafter file `{}` was not indexed",
                     dp.display()
                 ))),
-                (ResolvedDrafter::InTrunk, _) => Drafter::open_in_trunk(&content, path, &model),
+                (ResolvedDrafter::InTrunk, _) => Drafter::open_in_trunk(&content, &model),
             })
             .transpose()?;
         let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
@@ -668,7 +665,11 @@ impl Engine {
             config.draft_tokens,
             stats,
         );
-        engine.file_bytes = std::fs::metadata(path).map_or(0, |m| m.len());
+        engine.file_bytes = content
+            .files()
+            .iter()
+            .map(|f| std::fs::metadata(&f.path).map_or(0, |m| m.len()))
+            .sum();
         Ok((engine, tokenizer, template, format))
     }
 
@@ -762,25 +763,34 @@ impl Engine {
     pub(crate) fn expert_tiers(&self) -> Option<Arc<super::model::tier::TierShared>> {
         self.model.expert_tiers()
     }
+
+    /// The counters of the Engram table's row cache; `None` for a model
+    /// without an Engram table.
+    pub(crate) fn engram_counters(&self) -> Option<Arc<super::model::engram_io::EngramCounters>> {
+        self.model.engram_counters()
+    }
 }
 
-/// The index of the drafter GGUF at `path`.
-fn read_drafter_header(path: &Path) -> Result<gguf_file::Content, CucaError> {
-    let mut reader = BufReader::new(File::open(path).map_err(|e| CucaError::Io {
-        message: format!("reading GGUF `{}`: {e}", path.display()),
-    })?);
-    gguf_file::Content::read(&mut reader).map_err(|e| {
-        local_err(format!(
-            "`{}` is not a supported GGUF file: {e}",
+/// The index of the GGUF file (or split set) at `path`, whose missing parts
+/// are also looked for in `extra_dirs`.
+fn open_gguf(path: &Path, extra_dirs: &[PathBuf]) -> Result<gguf::Content, CucaError> {
+    gguf::Content::open_with(path, extra_dirs).map_err(|e| match e {
+        // A read failure of the file itself; anything else is a header the
+        // reader cannot interpret.
+        candle_core::Error::Io(_) => CucaError::Io {
+            message: format!("reading GGUF `{}`: {e}", path.display()),
+        },
+        other => local_err(format!(
+            "`{}` is not a supported GGUF file: {other}",
             path.display()
-        ))
+        )),
     })
 }
 
 /// The chat format and template of a loaded model: those of `chat_template`
 /// when given, else the ones the GGUF embeds.
 fn load_chat(
-    content: &gguf_file::Content,
+    content: &gguf::Content,
     tokenizer: &Tokenizer,
     chat_template: Option<&str>,
 ) -> Result<(ChatFormat, ChatTemplate), CucaError> {
@@ -816,15 +826,37 @@ fn load_chat(
 }
 
 /// Resolve `config.batching` against the model's context length: the
-/// scheduler's limits and the sizing of the K/V pools and state slots.
+/// scheduler's limits and the sizing of the K/V pools and state slots, with
+/// the default prefill chunk of the context length (tests).
 ///
 /// # Errors
 ///
 /// [`CucaError::Config`] for a `kv_tokens` below one context plus a block.
+#[cfg(test)]
 fn resolve_batching(
     config: &LocalModelConfig,
     context_length: usize,
     observing: bool,
+) -> Result<(Batching, Sizing), CucaError> {
+    resolve_batching_with(
+        config,
+        context_length,
+        observing,
+        prefill_chunk(context_length),
+    )
+}
+
+/// [`resolve_batching`] for a model that prefills `chunk` tokens of one prompt
+/// per step ([`super::model::prefill_rows`]).
+///
+/// # Errors
+///
+/// [`CucaError::Config`] for a `kv_tokens` below one context plus a block.
+fn resolve_batching_with(
+    config: &LocalModelConfig,
+    context_length: usize,
+    observing: bool,
+    chunk: usize,
 ) -> Result<(Batching, Sizing), CucaError> {
     use super::model::paged::BLOCK_SIZE;
     let b = &config.batching;
@@ -843,24 +875,25 @@ fn resolve_batching(
     let max_sequences = if observing { 1 } else { b.max_sequences };
     let max_step_tokens = b
         .max_step_tokens
-        .unwrap_or_else(|| prefill_chunk(context_length).max(max_sequences));
+        .unwrap_or_else(|| chunk.max(max_sequences));
     let sizing = Sizing {
         max_sequences,
         kv_tokens,
         max_rows: max_step_tokens
-            .min(prefill_chunk(context_length))
+            .min(chunk)
             .max(super::model::cpu::MAX_VERIFY_ROWS),
     };
     let batching = Batching {
         max_sequences,
         max_step_tokens,
+        prefill_chunk: chunk,
         prefix_cache: b.prefix_cache,
     };
     Ok((batching, sizing))
 }
 
 /// The `general.architecture` of a GGUF file (empty when absent).
-fn architecture_of(content: &gguf_file::Content) -> &str {
+fn architecture_of(content: &gguf::Content) -> &str {
     content
         .metadata
         .get("general.architecture")
@@ -918,7 +951,7 @@ pub(crate) mod testing {
         ChatFormat::detect(
             &std::collections::HashMap::from([(
                 "tokenizer.ggml.eos_token_id".to_string(),
-                gguf_file::Value::U32(1),
+                gguf::Value::U32(1),
             )]),
             tokenizer,
             "<|channel>thought\n <|tool_call>call:f{}<tool_call|>",
@@ -993,6 +1026,7 @@ pub(crate) mod testing {
             Batching {
                 max_sequences,
                 max_step_tokens,
+                prefill_chunk: prefill_chunk(context_length),
                 prefix_cache: true,
             },
             None,
@@ -1011,10 +1045,8 @@ pub(crate) mod testing {
         draft_tokens: usize,
     ) -> Engine {
         let mut e = engine(model, context_length, temperature, seed);
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&drafter.path).unwrap()))
-                .unwrap();
-        e.drafter = Some(Drafter::open(&content, &drafter.path, &e.model, context_length).unwrap());
+        let content = gguf::Content::open(&drafter.path).unwrap();
+        e.drafter = Some(Drafter::open(&content, &e.model, context_length).unwrap());
         e.draft_tokens = draft_tokens;
         e
     }
@@ -1031,10 +1063,8 @@ pub(crate) mod testing {
         draft_tokens: usize,
     ) -> Engine {
         let mut e = engine(model, context_length, temperature, seed);
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
-        e.drafter = Some(Drafter::open_in_trunk(&content, &model.path, &e.model).unwrap());
+        let content = gguf::Content::open(&model.path).unwrap();
+        e.drafter = Some(Drafter::open_in_trunk(&content, &e.model).unwrap());
         e.draft_tokens = draft_tokens;
         e.governor = Governor::always_speculating();
         e.cost = CostModel::always_drafting();
@@ -1053,10 +1083,8 @@ pub(crate) mod testing {
         draft_tokens: usize,
     ) -> Engine {
         let mut e = engine(model, context_length, temperature, seed);
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&eagle.path).unwrap()))
-                .unwrap();
-        e.drafter = Some(Drafter::open_eagle(&content, &eagle.path, &e.model).unwrap());
+        let content = gguf::Content::open(&eagle.path).unwrap();
+        e.drafter = Some(Drafter::open_eagle(&content, &e.model).unwrap());
         e.draft_tokens = draft_tokens;
         e.governor = Governor::always_speculating();
         e.cost = CostModel::always_drafting();
@@ -1075,11 +1103,27 @@ pub(crate) mod testing {
         draft_tokens: usize,
     ) -> Engine {
         let mut e = engine(model, context_length, temperature, seed);
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&drafter.path).unwrap()))
-                .unwrap();
-        e.drafter =
-            Some(Drafter::open_dflash(&content, &drafter.path, &e.model, context_length).unwrap());
+        let content = gguf::Content::open(&drafter.path).unwrap();
+        e.drafter = Some(Drafter::open_dflash(&content, &e.model, context_length).unwrap());
+        e.draft_tokens = draft_tokens;
+        e.governor = Governor::always_speculating();
+        e.cost = CostModel::always_drafting();
+        e
+    }
+
+    /// [`engine`] drafting with a DSpark block drafter, `draft_tokens` per
+    /// round, and a governor and cost model that always draft the full cap.
+    pub(crate) fn engine_with_dspark(
+        model: &TinyModel,
+        drafter: &TinyModel,
+        context_length: usize,
+        temperature: f32,
+        seed: Option<u64>,
+        draft_tokens: usize,
+    ) -> Engine {
+        let mut e = engine(model, context_length, temperature, seed);
+        let content = gguf::Content::open(&drafter.path).unwrap();
+        e.drafter = Some(Drafter::open_dspark(&content, &e.model, context_length).unwrap());
         e.draft_tokens = draft_tokens;
         e.governor = Governor::always_speculating();
         e.cost = CostModel::always_drafting();
@@ -1113,12 +1157,15 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::testing::{
-        engine, engine_in_trunk, engine_with_dflash, engine_with_drafter, engine_with_eagle,
+        engine, engine_in_trunk, engine_with_dflash, engine_with_drafter, engine_with_dspark,
+        engine_with_eagle,
     };
     use super::*;
+    use crate::provider::local::model::tiny::{
+        TinyDeepseek41, write_deepseek41, write_tiny_drafter, write_tiny_model,
+    };
     use crate::provider::local::model::tiny::{TinyDflash, write_tiny_dflash};
     use crate::provider::local::model::tiny::{TinyQwen35, TinySpec, write_qwen35, write_spec};
-    use crate::provider::local::model::tiny::{write_tiny_drafter, write_tiny_model};
     use crate::request::PromptCacheUsage;
 
     struct Outcome {
@@ -1269,6 +1316,36 @@ mod tests {
         // Shorter than a block: nothing to reuse.
         let out = run(&mut e, &prompt[..10], Some(3));
         assert_eq!(out.metadata.prompt_cache_usage.unwrap().read_tokens, 0);
+    }
+
+    /// A hyper-connection model with compressed attention keeps its
+    /// compressed rows in blocks that span 32 tokens: a prefix is reused in
+    /// multiples of 32, and the reply after a hit equals the cold one.
+    #[test]
+    fn a_compressed_attention_model_reuses_prefixes_in_whole_compressed_blocks() {
+        let model = write_deepseek41(&TinyDeepseek41::default());
+        let mut e = engine(&model, 96, 0.0, None);
+        let prompt = long_prompt(70);
+        let cold = run(&mut e, &prompt, Some(6));
+        let again = run(&mut e, &prompt, Some(6));
+        assert_eq!(
+            again.metadata.prompt_cache_usage,
+            Some(PromptCacheUsage {
+                read_tokens: 64,
+                write_tokens: 6
+            })
+        );
+        assert_eq!(text(&again), text(&cold));
+        assert!(!text(&cold).is_empty());
+
+        // A prompt that shares 40 tokens reuses the 32 the compressed blocks
+        // cover, and replies as a cold engine does.
+        let mut diverging = prompt[..40].to_vec();
+        diverging.extend([15, 14, 15, 14, 15, 14, 15]);
+        let warm = run(&mut e, &diverging, Some(6));
+        assert_eq!(warm.metadata.prompt_cache_usage.unwrap().read_tokens, 32);
+        let mut fresh = engine(&model, 96, 0.0, None);
+        assert_eq!(text(&run(&mut fresh, &diverging, Some(6))), text(&warm));
     }
 
     #[test]
@@ -1422,10 +1499,11 @@ mod tests {
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
     }
 
-    /// A GGUF header declaring one tensor of dtype 20 (IQ4_NL), which candle
-    /// cannot read: the load must name an unsupported file, not an I/O error.
+    /// A GGUF header declaring one tensor of type 16 (an IQ type the engine
+    /// does not know): the header opens, and the tensor that is asked for
+    /// names its type instead of the whole file failing to parse.
     #[test]
-    fn open_reports_an_unreadable_tensor_dtype_as_unsupported() {
+    fn an_unknown_tensor_dtype_opens_and_names_the_tensor_on_use() {
         let mut bytes = b"GGUF".to_vec();
         bytes.extend(3u32.to_le_bytes()); // version
         bytes.extend(1u64.to_le_bytes()); // tensors
@@ -1434,22 +1512,21 @@ mod tests {
         bytes.push(b'x');
         bytes.extend(1u32.to_le_bytes()); // dimensions
         bytes.extend(32u64.to_le_bytes());
-        bytes.extend(20u32.to_le_bytes()); // IQ4_NL
+        bytes.extend(16u32.to_le_bytes()); // IQ2_XXS
         bytes.extend(0u64.to_le_bytes()); // offset
         bytes.resize(bytes.len().next_multiple_of(32) + 64, 0);
         let path = std::env::temp_dir().join(format!("cuca-iq4-{}.gguf", std::process::id()));
         std::fs::write(&path, &bytes).unwrap();
 
+        let content = open_gguf(&path, &[]).unwrap();
+        let msg = content.reader().bytes("x").unwrap_err().to_string();
+        assert!(msg.contains("`x`") && msg.contains("ggml type 16"), "{msg}");
         let config = LocalModelConfig::default();
         let result = Engine::open(&path, None, Arc::default(), &config, None);
         let _ = std::fs::remove_file(&path);
-        let err = match result {
-            Err(e) => e,
-            Ok(_) => panic!("an IQ4_NL tensor must not load"),
-        };
         assert!(
-            matches!(&err, CucaError::Provider { message, .. } if message.contains("not a supported GGUF file")),
-            "{err:?}"
+            matches!(result, Err(CucaError::Provider { .. })),
+            "a file without a model must not load"
         );
     }
 
@@ -1680,17 +1757,11 @@ mod tests {
         use crate::provider::local::model::cpu::Transformer;
         let model = write_tiny_model();
         let drafter = write_tiny_drafter();
-        let mut reader = BufReader::new(File::open(&drafter.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
-        let e = Transformer::load(&content, &drafter.path, 32)
-            .err()
-            .unwrap();
+        let content = gguf::Content::open(&drafter.path).unwrap();
+        let e = Transformer::load(&content, 32).err().unwrap();
         assert!(e.to_string().contains("drafter"), "{e}");
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
-        let e = Transformer::load_drafter(&content, &model.path, 32)
-            .err()
-            .unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
+        let e = Transformer::load_drafter(&content, 32).err().unwrap();
         assert!(e.to_string().contains("not a drafter"), "{e}");
     }
 
@@ -1706,6 +1777,7 @@ mod tests {
             Batching {
                 max_sequences: 4,
                 max_step_tokens: 256,
+                prefill_chunk: 256,
                 prefix_cache: true
             }
         );
@@ -1747,7 +1819,7 @@ mod tests {
     /// `base` with a context of 128.
     fn hybrid(base: TinyQwen35) -> crate::provider::local::model::tiny::TinyModel {
         write_qwen35(&TinyQwen35 {
-            meta: vec![("context_length".into(), gguf_file::Value::U32(128))],
+            meta: vec![("context_length".into(), gguf::Value::U32(128))],
             ..base
         })
     }
@@ -2113,8 +2185,7 @@ mod tests {
     #[test]
     fn default_context_length_resolves_to_the_model_maximum() {
         let model = write_tiny_model();
-        let mut reader = BufReader::new(File::open(&model.path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         let hp = super::super::model::read_hparams(&content).unwrap();
         let resolved = super::super::resolve_context_length(None, hp.n_ctx_train);
         assert_eq!(resolved, 32);
@@ -2123,25 +2194,25 @@ mod tests {
         assert!(
             Model::load(
                 &content,
-                &model.path,
                 resolved,
                 device,
                 &[],
                 &resident,
                 &Sizing::single(resolved),
                 None,
+                &super::super::EngramCache::default(),
             )
             .is_ok()
         );
         let e = Model::load(
             &content,
-            &model.path,
             33,
             device,
             &[],
             &resident,
             &Sizing::single(33),
             None,
+            &super::super::EngramCache::default(),
         )
         .err();
         assert!(
@@ -2235,10 +2306,7 @@ mod tests {
         use crate::provider::local::model::tiny::{TinyMistral4, write_mistral4};
         write_mistral4(&TinyMistral4 {
             dense_layers: 1,
-            meta: vec![(
-                "context_length".into(),
-                gguf_file::Value::U32(context as u32),
-            )],
+            meta: vec![("context_length".into(), gguf::Value::U32(context as u32))],
             ..TinyMistral4::default()
         })
     }
@@ -2425,9 +2493,8 @@ mod tests {
     fn the_eagle_drafter_serves_one_mistral4_sequence_on_the_cpu() {
         use crate::provider::local::model::mtp::Drafter;
         let (model, eagle) = (mistral4(32), eagle());
-        let header = |m: &crate::provider::local::model::tiny::TinyModel| {
-            read_drafter_header(&m.path).unwrap()
-        };
+        let header =
+            |m: &crate::provider::local::model::tiny::TinyModel| open_gguf(&m.path, &[]).unwrap();
         // A file whose drafter takes every position's row (EAGLE, DFlash)
         // pins the engine to one sequence; a plain assistant does not.
         let observes = |m: &crate::provider::local::model::tiny::TinyModel| {
@@ -2463,7 +2530,7 @@ mod tests {
         // Another target model is refused, loudly.
         let gemma = engine(&write_tiny_model(), 32, 0.0, None);
         let content = header(&eagle);
-        let e = Drafter::open_eagle(&content, &eagle.path, &gemma.model)
+        let e = Drafter::open_eagle(&content, &gemma.model)
             .err()
             .unwrap()
             .to_string();
@@ -2722,6 +2789,177 @@ mod tests {
         assert!(take_block_draft(0.5, 1.0, 1.0, 2.0, 10.0));
         // The chained rule with the same numbers charges the pass per draft.
         assert!(!take_draft(0.5, 1.0, 2, 1.0, 2.0, 10.0));
+    }
+
+    /// The positions the DSpark drafter of `e` holds context for.
+    fn dspark_held(e: &Engine) -> (usize, usize) {
+        match &e.drafter {
+            Some(drafter @ Drafter::Dspark(net, _)) => {
+                let (lo, hi) = net.held();
+                (lo, hi + drafter.pending())
+            }
+            _ => panic!("the engine has no DSpark drafter"),
+        }
+    }
+
+    fn ds41() -> crate::provider::local::model::tiny::TinyModel {
+        use crate::provider::local::model::tiny::{TinyDeepseek41, write_deepseek41};
+        write_deepseek41(&TinyDeepseek41 {
+            mxfp4: true,
+            ..TinyDeepseek41::default()
+        })
+    }
+
+    #[test]
+    fn dspark_drafter_leaves_greedy_output_unchanged() {
+        use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
+        let model = ds41();
+        let prompts: [&[u32]; 5] = [
+            &PROMPT,
+            &[2, 9, 9, 9, 10],
+            &[2, 13, 12, 11, 10, 9, 13],
+            &[2, 11],
+            &[2, 12, 10, 14, 13, 11, 9, 15, 10, 12, 14, 11],
+        ];
+        let (mut drafted, mut accepted) = (0, 0);
+        for mxfp4 in [true, false] {
+            let drafter = write_tiny_dspark(&TinyDspark {
+                mxfp4,
+                ..TinyDspark::default()
+            });
+            for k in [1usize, 2, 4, 5, 16] {
+                for prompt in prompts {
+                    let mut plain = engine(&model, 96, 0.0, None);
+                    let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, k);
+                    let expected = run(&mut plain, prompt, None);
+                    let got = run(&mut spec, prompt, None);
+                    let what = format!("mxfp4 {mxfp4} k {k} prompt {prompt:?}");
+                    assert_same_reply(&got, &expected, &what);
+                    assert_eq!(got.items.len(), expected.items.len(), "{what}");
+                    assert_eq!(spec.last_ids, plain.last_ids, "{what}");
+                    assert_eq!(dspark_held(&spec).1, spec.last_ids.len(), "{what}");
+                    let stats = spec.stats.snapshot();
+                    assert!(stats.drafted <= stats.rounds * 5, "{what}");
+                    drafted += stats.drafted;
+                    accepted += stats.accepted;
+                }
+            }
+        }
+        assert!(drafted > 0, "the drafter proposed tokens");
+        eprintln!("DSPARK|drafted {drafted}|accepted {accepted}");
+    }
+
+    #[test]
+    fn dspark_drafter_respects_max_tokens_and_the_context_limit() {
+        use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
+        let model = ds41();
+        let drafter = write_tiny_dspark(&TinyDspark::default());
+        for max in [1u32, 2, 3, 7] {
+            let mut plain = engine(&model, 96, 0.0, None);
+            let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, 4);
+            let a = run(&mut plain, &PROMPT, Some(max));
+            let b = run(&mut spec, &PROMPT, Some(max));
+            assert_same_reply(&a, &b, &format!("max {max}"));
+            assert_eq!(dspark_held(&spec).1, spec.last_ids.len(), "max {max}");
+        }
+        for ctx in [12usize, 14, 20] {
+            let mut plain = engine(&model, ctx, 0.0, None);
+            let mut spec = engine_with_dspark(&model, &drafter, ctx, 0.0, None, 5);
+            let a = run(&mut plain, &PROMPT, None);
+            let b = run(&mut spec, &PROMPT, None);
+            assert_same_reply(&a, &b, &format!("ctx {ctx}"));
+        }
+    }
+
+    #[test]
+    fn dspark_warm_prefix_reuse_equals_cold() {
+        use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
+        let model = ds41();
+        let drafter = write_tiny_dspark(&TinyDspark::default());
+        let first = long_prompt(40);
+        let mut second = first[..36].to_vec();
+        second.extend_from_slice(&[10, 11, 12, 13, 14, 15]);
+        let mut warm = engine_with_dspark(&model, &drafter, 96, 0.0, None, 4);
+        run(&mut warm, &first, Some(8));
+        assert_eq!(dspark_held(&warm).1, warm.last_ids.len());
+        let w = run(&mut warm, &second, Some(10));
+        assert_eq!(dspark_held(&warm).1, warm.last_ids.len());
+        let c = run(&mut engine(&model, 96, 0.0, None), &second, Some(10));
+        assert_same_reply(&w, &c, "warm == cold");
+    }
+
+    #[test]
+    fn dspark_drafter_recovers_from_a_failed_request() {
+        use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
+        let model = ds41();
+        let drafter = write_tiny_dspark(&TinyDspark::default());
+        let mut e = engine_with_dspark(&model, &drafter, 96, 0.0, None, 3);
+        let prompt = [2u32, 9, 10, 3, 11, 12, 13];
+        let before = run(&mut e, &prompt, Some(4));
+        let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
+        assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
+        assert!(e.last_ids.is_empty());
+        assert_eq!(dspark_held(&e), (0, 0));
+        let after = run(&mut e, &prompt, Some(4));
+        assert_eq!(text(&after), text(&before));
+        assert_eq!(dspark_held(&e).1, e.last_ids.len());
+    }
+
+    #[test]
+    fn dspark_drafter_with_sampling_is_reproducible_for_a_seed() {
+        use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
+        let model = ds41();
+        let drafter = write_tiny_dspark(&TinyDspark::default());
+        // The random target ends many sampled replies at once: reproduce
+        // several seeds and require that some of them drafted.
+        let mut drafted = 0;
+        for seed in 1..25u64 {
+            let run_once = || {
+                let mut e = engine_with_dspark(&model, &drafter, 96, 1.0, Some(seed), 3);
+                let out = run(&mut e, &long_prompt(12), None);
+                (text(&out), completion_tokens(&out), e.stats.snapshot())
+            };
+            let (a, b) = (run_once(), run_once());
+            assert_eq!(a, b, "seed {seed}");
+            drafted += a.2.drafted;
+        }
+        assert!(drafted > 0, "a seeded run always drafts");
+    }
+
+    /// The measured cost model and governor price the block drafter per round
+    /// like DFlash's: the output is still plain greedy's.
+    #[test]
+    fn dspark_drafter_with_the_measured_cost_model_matches_plain() {
+        use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
+        let model = ds41();
+        let drafter = write_tiny_dspark(&TinyDspark::default());
+        let prompt = long_prompt(20);
+        let mut plain = engine(&model, 96, 0.0, None);
+        let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, 5);
+        spec.governor = Governor::default();
+        spec.cost = CostModel::default();
+        for _ in 0..6 {
+            let a = run(&mut plain, &prompt, Some(24));
+            let b = run(&mut spec, &prompt, Some(24));
+            assert_eq!(text(&a), text(&b));
+        }
+        assert!(spec.cost.draft.n > 0, "the cost model measured drafting");
+        assert!(spec.stats.snapshot().drafted > 0);
+    }
+
+    /// A DSpark file is a `dflash` file, told apart by its stream count, and
+    /// observes every position like a DFlash one.
+    #[test]
+    fn a_dspark_file_is_recognised_by_its_hyper_connections() {
+        use crate::provider::local::model::cpu::dspark::is_dspark;
+        use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
+        let dspark = write_tiny_dspark(&TinyDspark::default());
+        let content = gguf::Content::open(&dspark.path).unwrap();
+        assert!(is_dspark(&content.metadata));
+        assert!(file_drafter_observes(architecture_of(&content)));
+        let dflash = write_tiny_dflash(&TinyDflash::default());
+        let content = gguf::Content::open(&dflash.path).unwrap();
+        assert!(!is_dspark(&content.metadata));
     }
 
     /// A `dflash` file observes every position of one sequence, so the

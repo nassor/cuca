@@ -5,7 +5,7 @@
 //! Every `CUCA_*` variable those tests read is parsed here, so a name or a
 //! default lives in one place; each test file decides which of them it honours
 //! (for example only `provider_local.rs` and `provider_local_tiers.rs` read
-//! `CUCA_LOCAL_EXPERTS`). The variables, and the files that use them, are
+//! `CUCA_LOCAL_EXPERTS` and `CUCA_LOCAL_ENGRAM`). The variables, and the files that use them, are
 //! listed in `AGENTS.md` (Testing & QA). A value that does not parse panics
 //! naming its variable. `examples/local_model.rs` stays self-contained and
 //! does not use this module.
@@ -21,8 +21,8 @@ use std::str::FromStr;
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{
     BatchingConfig, ConvertConfig, CucaClient, DownloadProgressCallback, DrafterSource,
-    LocalDevice, LocalModel, LocalModelConfig, ModelSource, UnifiedRequest, UnifiedResponse,
-    WeightQuant,
+    EngramCache, LocalDevice, LocalModel, LocalModelConfig, ModelSource, UnifiedRequest,
+    UnifiedResponse, WeightQuant,
 };
 use tokio_stream::StreamExt;
 
@@ -83,12 +83,63 @@ pub fn path_source(path: impl Into<PathBuf>) -> ModelSource {
     }
 }
 
+/// Checkpoints (`repo`, `revision`) and the GGUF preset made from the same
+/// weights: the harness reports a converted checkpoint under the preset's name
+/// so the known limits recorded for the preset apply to it. A name that is no
+/// library preset (`deepseek-v41-flash-1017`) also selects its checkpoint as
+/// `CUCA_LOCAL_MODEL`.
+pub const CHECKPOINT_PRESETS: &[(&str, &str, &str)] = &[
+    (
+        "Qwen/Qwen3-0.6B",
+        "c1899de289a04d12100db370d81485cdf75e47ca",
+        "qwen3-0.6b-q8_0",
+    ),
+    (
+        "microsoft/Phi-4-mini-instruct",
+        "cfbefacb99257ffa30c83adab238a50856ac3083",
+        "phi4-mini-q4_0",
+    ),
+    (
+        "unsloth/gemma-3-1b-it",
+        "5b11413a10db4e486ef16a20101fd028f8f2499c",
+        "gemma3-1b-q4_0",
+    ),
+    (
+        "google/gemma-4-E2B-it-qat-q4_0-unquantized",
+        "6befbaca7398925921802abd1f277b495b78b738",
+        "gemma4-e2b-q4_0",
+    ),
+    (
+        "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "1bae0e1088993b9b82de08f59de5be5a34e42170",
+        "deepseek-v41-flash-1017",
+    ),
+];
+
+/// The checkpoint a `CUCA_LOCAL_MODEL` value names in [`CHECKPOINT_PRESETS`]
+/// when it is no library preset.
+pub fn checkpoint_alias(name: &str) -> Option<ModelSource> {
+    if ModelSource::preset(name).is_some() {
+        return None;
+    }
+    CHECKPOINT_PRESETS
+        .iter()
+        .find(|(_, _, alias)| alias.eq_ignore_ascii_case(name.trim()))
+        .map(|(repo, revision, _)| ModelSource::Checkpoint {
+            repo: (*repo).to_string(),
+            revision: (*revision).to_string(),
+        })
+}
+
 /// The model to load, from `CUCA_LOCAL_MODEL_PATH` (wins), else
 /// `CUCA_LOCAL_MODEL`, else (when `download_default`) the default preset under
 /// `CUCA_LOCAL_DOWNLOAD=1`; `None` when none applies.
 pub fn model_source(download_default: bool) -> Option<ModelSource> {
     if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
         return Some(path_source(path));
+    }
+    if let Some(alias) = env("CUCA_LOCAL_MODEL").and_then(|name| checkpoint_alias(&name)) {
+        return Some(alias);
     }
     if let Some(source) = parsed("CUCA_LOCAL_MODEL") {
         return Some(source);
@@ -127,11 +178,26 @@ pub fn gpu_layers() -> Option<usize> {
     parsed("CUCA_LOCAL_GPU_LAYERS")
 }
 
+/// `LocalModelConfig::engram` from `CUCA_LOCAL_ENGRAM` (`EngramCache` syntax,
+/// for example `ram=2g,threads=8`; default: the library default).
+pub fn engram() -> EngramCache {
+    parsed("CUCA_LOCAL_ENGRAM").unwrap_or_default()
+}
+
 /// `LocalModelConfig::convert` from `CUCA_LOCAL_CONVERT_QUANT` (default q8_0).
 pub fn convert() -> ConvertConfig {
     ConvertConfig {
         quant: parsed::<WeightQuant>("CUCA_LOCAL_CONVERT_QUANT").unwrap_or_default(),
+        ..ConvertConfig::default()
     }
+}
+
+/// `CUCA_LOCAL_DS41_REF`: the directory of the DeepSeek-V4.1 oracle dump (the
+/// tiny release-format checkpoint `target/`, the exact float tensors and
+/// metadata under `expected/`, and the torch port's logits), written by
+/// `.omp/local-models/ref/ds41/make_ref.py`.
+pub fn ds41_ref() -> Option<std::path::PathBuf> {
+    env("CUCA_LOCAL_DS41_REF").map(std::path::PathBuf::from)
 }
 
 /// The text of the file `CUCA_LOCAL_CHAT_TEMPLATE` names, for

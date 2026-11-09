@@ -7,7 +7,7 @@
 //! reads is produced; [`check`] loads the result through it so a gap fails the
 //! conversion naming the key.
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 use serde_json::{Map, Value as Json};
 
 use super::arch::ConvArch;
@@ -1090,6 +1090,12 @@ pub(crate) fn build(
             }
         }
         ConvArch::Mistral4 => mla(arch, hp, &mut kv, n_block)?,
+        // Converted by `deepseek41`, which writes its own metadata.
+        ConvArch::Deepseek41 => {
+            return Err(cfg_err(
+                "DeepSeek-V4.1 checkpoints convert through convert::deepseek41",
+            ));
+        }
         ConvArch::Mistral4Eagle => {
             mla(arch, hp, &mut kv, n_block)?;
             kv.u32("embedding_length_out", hp.n_embd()?)?;

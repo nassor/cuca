@@ -78,11 +78,8 @@
 //! bookkeeping is 8 bytes per slot plus one hidden row (`4 * n_embd` bytes).
 
 use std::borrow::Cow;
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
 
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 use candle_core::{DType, Device, Tensor};
 
 use super::super::layout::{LayerLayout, name};
@@ -157,20 +154,15 @@ impl Transformer {
     ///
     /// [`CucaError::Provider`] when the file declares no prediction block or
     /// lacks one of its tensors.
-    pub(crate) fn load_head(
-        &self,
-        content: &gguf_file::Content,
-        path: &Path,
-    ) -> Result<NextnHead, CucaError> {
-        self.load_head_with(content, path, false)
+    pub(crate) fn load_head(&self, content: &gguf::Content) -> Result<NextnHead, CucaError> {
+        self.load_head_with(content, false)
     }
 
     /// [`Transformer::load_head`], with every matmul weight dequantized to
     /// f32 when `dequantize` is set (the test reference).
     pub(crate) fn load_head_with(
         &self,
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         dequantize: bool,
     ) -> Result<NextnHead, CucaError> {
         let hp = &self.hp;
@@ -192,7 +184,7 @@ impl Transformer {
         let layout = LayerLayout::read(hp, il, spec, content)?;
         let mut loader = Loader {
             content,
-            reader: BufReader::new(File::open(path)?),
+            reader: content.reader(),
             dequantize,
             requantize: false,
         };
@@ -439,16 +431,14 @@ mod tests {
     /// The trunk and its head, every matmul weight dequantized to f32.
     fn dequantized(model: &TinyModel) -> (Transformer, NextnHead) {
         let m = load_dequantized(model);
-        let head = m
-            .load_head_with(&content_of(model), &model.path, true)
-            .unwrap();
+        let head = m.load_head_with(&content_of(model), true).unwrap();
         (m, head)
     }
 
     /// The trunk and its head as the engine loads them (quantized).
     fn production(model: &TinyModel) -> (Transformer, NextnHead) {
         let m = load(model, CONTEXT);
-        let head = m.load_head(&content_of(model), &model.path).unwrap();
+        let head = m.load_head(&content_of(model)).unwrap();
         (m, head)
     }
 
@@ -784,11 +774,7 @@ mod tests {
             ..TinyQwen35::default()
         });
         let m = load(&model, CONTEXT);
-        let e = m
-            .load_head(&content_of(&model), &model.path)
-            .err()
-            .unwrap()
-            .to_string();
+        let e = m.load_head(&content_of(&model)).err().unwrap().to_string();
         assert!(e.contains("no in-trunk multi-token-prediction head"), "{e}");
     }
 

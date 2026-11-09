@@ -40,6 +40,7 @@ Preset families and what their published files carry:
 | OLMo 2 | `gpt2` | `dbrx` |
 | OLMoE | `gpt2` | `olmo` |
 | Muse Glimmer | `gpt2` | `llama4` |
+| DeepSeek-V4.1 | `gpt2` | `joyai-llm` |
 
 ## Pre-tokenizers
 
@@ -53,6 +54,7 @@ A `gpt2` model with no `pre`, or `default`, uses the default chain. SentencePiec
 - `starcoder`, `refact`, `command-r`, `exaone`, `mellum2`: single digits are split first, then the GPT-2 expression runs on the fragments between them.
 - `gpt-4o`, `llama4`, `kanana2`, `talkie`, `minimax-m2`: the GPT-4o expression, with case classes from real Unicode categories. llama.cpp approximates them with ASCII case only, so the two can differ on non-ASCII mixed-case runs such as `éÉ`.
 - `tekken`, `pixtral`: the Tekken expression of Mistral Nemo, Pixtral, Mistral Small 3 and Mistral Small 4, as llama.cpp maps both names (`LLAMA_VOCAB_PRE_TYPE_TEKKEN`). It is the GPT-4o expression without the contraction suffix on words and with single digits. A whole word found in the vocabulary skips the merges, and a BOS token is added by default.
+- `deepseek-v3`, `joyai-llm`, `hunyuan-dense`, `hy_v4`: the DeepSeek V3 chain of three splits, run in sequence on the fragments the previous one left: digit groups of one to three, runs of CJK and kana, then a word pattern. Every word goes through the merges, and no BOS is added by default. `joyai-llm` is the name llama.cpp's probe-text hash gives DeepSeek-V4.1's own vocabulary.
 - `gemma4`: the space-escaped scheme above.
 
 Any other value fails the load with ``unsupported pre-tokenizer `NAME` ``. The stages run in sequence on the fragments the previous stage left, as in llama.cpp, so the starcoder family keeps a whitespace run before a digit whole where a single GPT-2 regular expression would give its last space to the digit.
@@ -62,12 +64,14 @@ The `tekken` and `pixtral` names are the Tekken expression, which is what Mistra
 ## Special tokens and BOS
 
 - Special tokens (control, user-defined and unknown types) are cut out of the text longest first before the scheme runs, so `<|im_start|>` in a rendered prompt is one token.
+- DeepSeek-V4.1 has 129,280 entries, BOS id 0 and EOS id 1. Its converted file sets `add_bos_token` false because the `deepseek-v41` chat template writes the BOS text itself. `<think>`, `</think>`, `｜DSML｜` and the two legacy `dsml:` openers are decoded as text, and every other added token is a control token.
 - The prompt gets a BOS token when `tokenizer.ggml.add_bos_token`, or the scheme's default, says so, and never a second one when the rendered template already starts with it. EOS is appended under `tokenizer.ggml.add_eos_token` the same way.
 - For a SentencePiece model with `add_space_prefix`, text after a special token such as `</s>` gets a leading space token, as in llama.cpp. Hugging Face's tokenizer does not add it, so such a model's prompt has one more token than the reference tokenizer's. Some GGUF files of ERNIE 4.5 omit the key and so take the default; current llama.cpp conversions write it as `false`.
 
 ## What was checked
 
 - `tokenizer/golden.rs` compares the ids of 16 texts and 3 chat prompts for 7 models (Qwen 3, Gemma 3 270M and 1B, SmolLM 3, Phi 4 mini, the R1 Qwen distill, Qwen 3.5) with the ids of each model's Hugging Face `tokenizer.json`. It reads cached model files and prints `SKIP:` for a missing one. Where llama.cpp and Hugging Face differ, the expected ids follow llama.cpp, except for the GPT-4o case classes, which follow Hugging Face.
+- The DeepSeek V3 chain is compared with Hugging Face `tokenizers` on the pre-tokenizer sequence of DeepSeek-V4.1-Flash-1017's `tokenizer.json`: `deepseek_words_match_the_reference_tokenizer` in `tokenizer/pretok.rs` checks the word cuts of 45 probe texts and 300 seeded random ones against a committed fixture. `deepseek_v41_ids_match_reference_tokenizer` in `tokenizer/golden.rs` checks the ids of the same 345 texts for the whole tokenizer and the decoded text of every probe without control tokens. The second test needs the reference `tokenizer.json` (`CUCA_DS41_TOKENIZER_JSON`) and prints `SKIP:` without it.
 - `tokenizer_corpus_matches_reference_ids` (driven by `CUCA_TOK_GGUF` and `CUCA_TOK_CASES`, skipped without them) gave identical ids for:
   - 4,537 texts, those and every one of Mistral Small 4's 1,000 special tokens alone and in context, against its `tokenizer.json`;
   - 1,536 texts against Mistral Small 3.2's `tekken.json` read by `mistral_common`, through the headers of the published GGUFs (pre-tokenizers `pixtral` and `tekken`);

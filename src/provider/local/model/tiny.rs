@@ -23,17 +23,20 @@
 //! storage (fused or split, NORM or NEOX row order) hold the same values.
 
 use std::fs::File;
-use std::io::BufReader;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use candle_core::quantized::gguf_file::{self, Value};
+use crate::provider::local::gguf::{self, Value};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
 
 use super::cpu::Transformer;
 use super::paged::Sizing;
 
+mod deepseek41;
+mod dspark;
 mod eagle;
+pub(crate) use deepseek41::{TinyDeepseek41, mxfp4_bytes, write_deepseek41};
+pub(crate) use dspark::{TinyDspark, write_tiny_dspark};
 pub(crate) use eagle::{TinyEagle, write_tiny_eagle};
 
 pub(crate) const VOCAB: usize = 16;
@@ -139,7 +142,7 @@ fn write(path: &std::path::Path, meta: &[(String, Value)], tensors: &[(String, Q
     let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
     let mut file = File::create(path).unwrap();
-    gguf_file::write(&mut file, &meta_refs, &tensor_refs).unwrap();
+    gguf::write(&mut file, &meta_refs, &tensor_refs).unwrap();
 }
 
 fn kv(key: &str, value: Value) -> (String, Value) {
@@ -736,14 +739,13 @@ pub(crate) fn load(model: &TinyModel, context_length: usize) -> Transformer {
 
 /// [`load`] for `sizing` sequences.
 pub(crate) fn load_sized(model: &TinyModel, context_length: usize, sizing: &Sizing) -> Transformer {
-    let mut reader = BufReader::new(File::open(&model.path).unwrap());
-    let content = gguf_file::Content::read(&mut reader).unwrap();
+    let content = gguf::Content::open(&model.path).unwrap();
     Transformer::load_placed(
         &content,
-        &model.path,
         context_length,
         &crate::provider::local::ExpertPlacement::Resident,
         sizing,
+        &crate::provider::local::EngramCache::default(),
     )
     .unwrap()
 }

@@ -59,6 +59,11 @@ pub(crate) enum ConvArch {
     /// sees it as the `EagleMistralLarge3ForCausalLM` class of the config
     /// that [`super::eagle::config_from_params`] derives from `params.json`.
     Mistral4Eagle,
+    /// `DeepseekV41ForCausalLM` (DeepSeek-V4.1-Flash): hyper-connections,
+    /// compressed and indexed sparse attention, stacked MXFP4 experts and the
+    /// Engram tables. Converted by [`super::deepseek41`], which does not use
+    /// the generic tensor planner.
+    Deepseek41,
 }
 
 impl ConvArch {
@@ -82,6 +87,7 @@ impl ConvArch {
             "Ernie4_5ForCausalLM" | "Ernie4_5_ForCausalLM" => Self::Ernie4_5,
             "MuseGlimmerForConditionalGeneration" => Self::MuseGlimmer,
             "Ministral3ForCausalLM" => Self::Mistral3,
+            "DeepseekV41ForCausalLM" => Self::Deepseek41,
             super::eagle::ARCHITECTURE => Self::Mistral4Eagle,
             _ => return None,
         })
@@ -141,6 +147,7 @@ impl ConvArch {
             Self::Mistral4 => "mistral4",
             Self::Mistral3 => "mistral3",
             Self::Mistral4Eagle => "mistral4-eagle",
+            Self::Deepseek41 => "deepseek41",
         }
     }
 
@@ -215,6 +222,7 @@ mod tests {
             ConvArch::Mistral4,
             ConvArch::Mistral3,
             ConvArch::Mistral4Eagle,
+            ConvArch::Deepseek41,
         ];
         for conv in all {
             assert!(Arch::from_name(conv.gguf_name()).is_ok(), "{conv:?}");

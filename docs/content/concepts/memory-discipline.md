@@ -74,8 +74,13 @@ Memory reports usage on every request. A `ContextUsageObserver` receives a `Cont
 | Step rows | `BatchingConfig::max_step_tokens`, at most 2048, default the prefill chunk | decode rows come first, prompts prefill in the rest | none |
 | Tiered experts, RAM | `ExpertTiers::ram_bytes` | evict the coolest expert the pass no longer needs | `LocalModel::expert_tier_stats()` |
 | Tiered experts, device | `ExpertTiers::device_bytes`, GPU only | same policy | `LocalModel::expert_tier_stats()` |
+| Engram row cache (DeepSeek-V4.1) | `EngramCache::ram_bytes`, 1 MiB to 1 TiB, default 4 GiB; a cached row counts its bytes plus 48 bytes of bookkeeping | evict the least recently used row; a row evicted before its pass uses it is read again | `LocalModel::engram_stats()` |
 
 The K/V pool never grows. Only the oldest request alone in a pool smaller than it needs fails, with a `CucaError::Provider`. The queues apply backpressure and refuse nothing, which suits a single in-process caller that can wait. See [Local configuration](@/providers/local/configuration.md) and [Expert tiers](@/providers/local/expert-tiers.md).
+
+The Engram table of a DeepSeek-V4.1 model (209 GB at the default Q8_0) stays in the GGUF file. Reader threads (`EngramCache::reader_threads`, 1 to 64, default 16) fetch the distinct rows of each pass, and the cache only decides how many of them are read twice.
+
+A checkpoint conversion is bounded the same way: it streams one tensor at a time, and DeepSeek-V4.1 streams in blocks of rows through two buffers of at most 32 MiB of `f32`. Converting the 510 GB DeepSeek-V4.1-Flash-1017 checkpoint peaked at about 220 MB of resident memory (release build, this checkpoint, default precision). See [Checkpoints](@/providers/local/checkpoints.md).
 
 ## The server
 

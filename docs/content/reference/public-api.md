@@ -64,11 +64,11 @@ Available in every build that compiles. There are 17.
 
 ## Feature-gated re-exports
 
-There are 183, in 22 groups.
+There are 186, in 22 groups.
 
 | Gate | Items |
 |---|---|
-| `provider-local` | `BatchingConfig`, `ConvertConfig`, `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `ExpertHeat`, `ExpertPlacement`, `ExpertTierStats`, `ExpertTiers`, `GenerationReport`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalGeneration`, `LocalModel`, `LocalModelConfig`, `ModelPart`, `ModelPreset`, `ModelSource`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `SamplingConfig`, `ServingStats`, `WeightQuant` |
+| `provider-local` | `BatchingConfig`, `ConvertConfig`, `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `EngramCache`, `EngramQuant`, `EngramStats`, `ExpertHeat`, `ExpertPlacement`, `ExpertTierStats`, `ExpertTiers`, `GenerationReport`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalGeneration`, `LocalModel`, `LocalModelConfig`, `ModelPart`, `ModelPreset`, `ModelSource`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `SamplingConfig`, `ServingStats`, `WeightQuant` |
 | `plugin-cost` | `CostConfig`, `CostEntry`, `CostObserver`, `CostPlugin`, `CostUsage`, `ModelRates`, `PricingResolver`, `PricingTable`, `UnpricedModelPolicy` |
 | `plugin-guardrails` | `JsonGuardrailPlugin` |
 | `plugin-hitl` | `ApprovalChannel`, `ApprovalDecision`, `ApprovalRequest`, `HitlPlugin`, `OneshotApprovalChannel`, `Risk` |
@@ -130,15 +130,17 @@ Under `provider-local`, the re-exports above are the whole public path: `cuca::p
 | `ModelPart`, `PresetPart` | a split-GGUF part: `file` and `sha256` (`ModelPart`, digest optional), `file`, `sha256` and `size_bytes` (`PresetPart`) |
 | `ModelTemplate`, `PresetTemplate` | a chat template file: `repo`, `revision`, `file` and `sha256` (optional in `ModelTemplate`) |
 | `DrafterSource` | `File(ModelSource)`, `InTrunk`; `From<ModelSource>` |
-| `ConvertConfig`, `WeightQuant` | `ConvertConfig { quant }`; `WeightQuant` is `F16`, `Q8_0` (default) or `Q4_0`, with `name` and `FromStr` |
+| `ConvertConfig`, `WeightQuant`, `EngramQuant` | `ConvertConfig { quant, engram_quant }`; `WeightQuant` is `F16`, `Q8_0` (default) or `Q4_0`, with `name` and `FromStr`; `EngramQuant` is `Q8_0` (default), `Q4_0` or `Bf16`, the storage type of DeepSeek-V4.1's Engram tables (ignored by other architectures), with `name` and `FromStr`. A non-default `engram_quant` adds `-engram-<name>` to the cached file name |
+| `EngramCache` | `ram_bytes` (4 GiB default, 1 MiB to 1 TiB), `reader_threads` (16 default, 1 to 64); `validate`, `FromStr` (`ram=8g,threads=32`) |
 | `BatchingConfig` | `max_sequences` (4), `kv_tokens`, `max_step_tokens`, `prefix_cache` (true); `FromStr` |
 | `ExpertPlacement`, `ExpertTiers` | `Resident` (default), `Tiered(ExpertTiers)`, `Host { layers }`; `FromStr` |
 | `SamplingConfig` | `temperature`, `top_k`, `top_p`, `seed`, all `Option`; `DEFAULT_TEMPERATURE` (1.0), `DEFAULT_TOP_K` (64), `DEFAULT_TOP_P` (0.95) |
 | `LocalDevice`, `GpuAdapter` | `Cpu`, `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`, `Cuda(usize)`, `Rocm(usize)`; `Default`, `Discrete(usize)`, `Integrated(usize)`; `required_feature`, `FromStr` |
-| `LocalModelConfig` | fields `source`, `cache_dir`, `hf_token`, `context_length`, `sampling`, `chat_template`, `device`, `drafter`, `draft_tokens`, `on_download_progress`, `experts`, `convert`, `batching`, `shards`, `gpu_layers`; `set_devices` |
-| `LocalModel` | `load`, `generate`, `capabilities`, `sampling`, `context_length`, `kv_cache_bytes`, `weights_file_bytes`, `layer_split`, `draft_stats`, `serving_stats`, `expert_tier_stats`, `expert_heat` |
+| `LocalModelConfig` | fields `source`, `cache_dir`, `hf_token`, `context_length`, `sampling`, `chat_template`, `device`, `drafter`, `draft_tokens`, `on_download_progress`, `experts`, `convert`, `batching`, `shards`, `gpu_layers`, `engram`, `shard_dirs`; `set_devices` |
+| `LocalModel` | `load`, `generate`, `capabilities`, `sampling`, `context_length`, `kv_cache_bytes`, `weights_file_bytes`, `layer_split`, `draft_stats`, `serving_stats`, `expert_tier_stats`, `expert_heat`, `engram_stats` |
 | `LocalGeneration`, `GenerationReport` | the stream of one `LocalModel::generate` request, with no client and no plugin hooks, and its `report()`: `usage`, `prompt_cache`, `finish_reason` (`stop` or `length`), `queue_secs` |
 | `LocalCapabilities`, `DraftStats`, `ServingStats`, `ExpertTierStats`, `ExpertHeat` | statistics and capability reports; `DraftStats::acceptance_rate` |
+| `EngramStats` | `lookups`, `cache_hits`, `disk_reads`, `bytes_read`, `resident_rows`, `resident_bytes`, `capacity_rows`; `hit_rate`. `LocalModel::engram_stats` is `None` for a model without an Engram table |
 | `DownloadProgress`, `DownloadProgressCallback` | `downloaded_bytes`, `total_bytes`; `DownloadProgressCallback::new` |
 
 The meaning of each configuration field is on [Local configuration](@/providers/local/configuration.md). `tests/public_exports.rs` does not name any of these types.

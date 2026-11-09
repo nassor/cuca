@@ -18,7 +18,7 @@ weight = 11
 
 ## Devices and GPU features
 
-The model runs on the CPU unless `LocalModelConfig::device` selects a GPU. A GPU device runs the forward pass through burn 0.22 and CubeCL, and the engine thread owns the device. Every supported architecture runs through the GPU forward pass. The in-trunk head, the EAGLE drafter and the DFlash drafter are CPU only; the Gemma 4 assistant runs on the GPU.
+The model runs on the CPU unless `LocalModelConfig::device` selects a GPU. A GPU device runs the forward pass through burn 0.22 and CubeCL, and the engine thread owns the device. Every supported architecture runs through the GPU forward pass. The in-trunk head, the EAGLE drafter, the DFlash drafter and the DSpark drafter are CPU only; the Gemma 4 assistant runs on the GPU.
 
 | Feature | Backend | Extra build needs |
 |---|---|---|
@@ -91,6 +91,7 @@ The load fails with `CucaError::Config` (`tensor parallelism: <rule> (<numbers>)
 
 - a gated delta-net layer (Qwen 3.5 and its mixture of experts variant);
 - multi-head latent attention (`mistral4`);
+- hyper-connections with compressed sparse attention (`deepseek41`);
 - a full-width Q/K norm (OLMo 2, OLMoE);
 - an `n_head` not divisible by the device count, or K/V heads that neither divide nor replicate;
 - a query width per device that is not a multiple of 32, or a dense FFN, expert or shared expert width that does not divide into multiples of 32 per device.
@@ -99,11 +100,11 @@ The load fails with `CucaError::Config` (`tensor parallelism: <rule> (<numbers>)
 
 - Q4_0, Q4_1 and Q8_0 matmul weights are repacked at load and stay quantized on the device, one copy per weight.
 - F32, F16 and BF16 matmul weights are held as f32 (4 bytes per element, so an F16 or BF16 weight doubles). Norm vectors, biases and scalars are f32.
-- Every other quantized dtype (Q5_0, Q5_1, Q8_1 and the K-quants Q2_K to Q6_K) is requantized to Q8_0 at load, about 1.06 bytes per element. A 3.8 B parameter Q4_K_M file needs about 4 GB on the device rather than 15 GB. Each element moves by at most half a Q8_0 step, `block_max / 254`, and Q8_0 resolves a block with more levels than Q4_K, Q5_K or Q6_K do, so the extra error is below the one the file already carries.
+- MXFP4 experts stay in the file's format in the expert kernels. Every other quantized dtype (Q5_0, Q5_1, Q8_1 and the K-quants Q2_K to Q6_K) is requantized to Q8_0 at load, about 1.06 bytes per element. A 3.8 B parameter Q4_K_M file needs about 4 GB on the device rather than 15 GB. Each element moves by at most half a Q8_0 step, `block_max / 254`, and Q8_0 resolves a block with more levels than Q4_K, Q5_K or Q6_K do, so the extra error is below the one the file already carries.
 - A weight over 256 MiB is split into row chunks, so no weight buffer exceeds 256 MiB and no buffer at all exceeds 1 GiB. The chunk size keeps burn's memory pages small, which lets a nearly full card place the next page.
 - The token embedding is uploaded once, as the LM head, only when it is tied to it. Embedding lookups read rows from the file on the host, and Gemma 4's per-layer embedding table is never uploaded.
 - The K/V cache lives on the device as the same block pools as on the CPU: f32, twice `context_length` positions by default, in blocks of 16. The RoPE tables are on the device.
-- A mixture of experts keeps its experts in the MoE kernels' layout: the file's bytes for Q4_0, Q4_1 and Q8_0 experts, Q8_0 for other quantized dtypes, f32 for float dtypes. `ExpertPlacement::Tiered` reads no expert at load; see [Tiered expert placement](@/providers/local/expert-tiers.md).
+- A mixture of experts keeps its experts in the MoE kernels' layout: the file's bytes for Q4_0, Q4_1, Q8_0 and MXFP4 experts, Q8_0 for other quantized dtypes, f32 for float dtypes. `ExpertPlacement::Tiered` reads no expert at load; see [Tiered expert placement](@/providers/local/expert-tiers.md).
 - Dropping the last clone of a `LocalModel` on a GPU returns its device memory to the driver, so another model can load in the same process.
 - The first forward pass of each new input shape is slow while CubeCL autotunes and compiles kernels. Continuous batching adds shapes: every distinct number of rows in a step pays this once per process. A current figure for that first request is not recorded.
 
@@ -112,10 +113,29 @@ Dtype handling on the CPU is on [Weight formats](@/providers/local/models.md#wei
 ## Kernels
 
 - Dense weights (attention projections, dense FFNs, the LM head) run through two CubeCL kernels of this crate. Up to 64 input rows (decode, batched decode, verification, prompt tails) one matrix-vector kernel dots the blocks with the input in f32, with several threads per row for weights that have few rows. More rows (prefill) dequantize slices of the weight to f32 and use burn's float matmul. burn's quantized matmul is not used by any weight.
-- A mixture of experts runs four kernel dispatches per layer: softmax and top-k of the router logits, `act(gate . x) * (up . x)` for every (token, expert) pair, the down projections weighted by the routing, and a sum over each token's experts in expert order. A resident layer never reads the router output back, so a resident token queues all its layers without waiting for the host. A tiered layer reads back the router output (ids and weights, a few hundred floats) to find the experts its pool lacks.
+- A mixture of experts runs four kernel dispatches per layer: softmax and top-k of the router logits, `act(gate . x) * (up . x)` for every (token, expert) pair, the down projections weighted by the routing, and a sum over each token's experts in expert order. The up and down kernels split the blocks of each output row over 8 lanes of a cube (a row's result does not depend on the other rows of the launch). A resident layer never reads the router output back, so a resident token queues all its layers without waiting for the host. A tiered layer reads back the router output (ids and weights, a few hundred floats) to find the experts its pool lacks.
 - Attention over one query row (a decode step, every drafter layer) reads the paged K/V in place with one kernel, a single launch per layer when every sequence in the step decodes one row. Several rows (prefill, verification) gather the visible blocks and use burn's matmul attention with a mask. A `mistral4` layer caches one shared `[latent 256 | rotary 64]` row per position and no value pool: the key up-projection is absorbed into the query and the value up-projection applies to the attended latent, so no per-head K or V is built.
 - A gated delta-net layer (Qwen 3.5) runs its recurrence token by token on the device. Its recurrent state is a set of immutable device tensors, so a snapshot costs nothing. The GPU keeps no verify record for a hybrid model, and no drafter pairs with one on a GPU.
 - On Vulkan, single-token decode is bound by the host: each queued operation costs about 10 microseconds of host time.
+
+## DeepSeek-V4.1 on a GPU
+
+`deepseek41` runs on one GPU through the kernels of `hc_kernel.rs`, `csa_kernel.rs`, `topk_kernel.rs` and `qdq_kernel.rs` and the MoE kernels of `moe_kernel.rs`.
+
+- The residual stream is one `[rows, streams * n_embd]` tensor. One kernel per site computes the mixing coefficients of every token (the matrix-vector product with `hc_*_fn`, the sigmoids, the row softmax and the Sinkhorn passes), others collapse a stream to a sub-block input and expand the output back.
+- Each layer owns a window pool and, for a compressed-row owner, a compressed pool, both 2-D `[blocks * 16, width]` tensors addressed through the sequence's block tables. One kernel writes the new rows in place, one rotates the tail of every head, one pools the pairs of a ratio-2 compressor, and one attends over the window and the picked compressed rows with the head's sink, split over key chunks and merged in chunk order. A row's result does not depend on the other rows of the launch.
+- The indexer scores every visible compressed row on the device and selects the best rows with a radix threshold select (ties go to the lower row), so a decode step reads nothing back for it. The candidate blocks of the source layer stay on the device for the layers that narrow their scoring.
+- The simulated quantization (FP8 window keys and output, FP4 compressed rows and indexer vectors) runs in elementwise kernels.
+- The compressor's half-finished pair stays in each sequence slot as device tensors: the last rows of the previous call, staged during a pass and kept when it succeeds, so a rollback within the last call restores it.
+- MXFP4 experts keep their file blocks (16 nibble bytes and an E8M0 scale byte per 32 values, 17 bytes) in the expert pool: one expert of the real model takes 18.8 MB, so a layer's 384 experts (7.2 GB) need tiers. The router scores `sqrt(softplus)`, adds the selection bias for the choice only, and the SwiGLU clamp applies in the up kernel; the shared expert uses burn operations.
+- Engram rows are read on the host from the GGUF file (`EngramTable`, bounded by `LocalModelConfig::engram`, see [Local limits and errors](@/providers/local/limits-and-errors.md#engram-row-cache)) and uploaded per engram layer. The rows of a pass are requested at its entry and the rows of the next prefill chunk while a chunk runs, and `LocalModel::engram_stats()` reports the counters. A model split by `gpu_layers` opens one table for both halves.
+- A pool must fit one device buffer (1 GiB). A compressed row is 640 floats, so a pool holds about 419,000 rows: `kv_tokens` up to about 419,000 for a ratio-1 owner and 838,000 for a ratio-2 one. A load whose pools do not fit fails naming `kv_tokens`.
+- The window pools take 80 KB per cached position at the real shape (40 layers of 512 floats), for the window and one call's rows of each running sequence plus `kv_tokens - context_length` positions kept for prefix reuse. With the default `kv_tokens` of twice the context that is 2.6 GB at 32k context and 10 GB at 128k; `kv_tokens` equal to the context keeps them at about 0.35 GB per sequence.
+- A tiered model prefills in steps of 4096 rows. The indexer scores them in tiles of at most 64 MB of scores, and a launch of the sparse attention whose partial results would pass 512 MiB (4096 rows at the real shape) takes the fused path, which is slower and gives the same values.
+- Measured on the real checkpoint (RX 9070 XT, 16 GB): 10.0 GB of device memory after the load with host-tiered experts, 12.0 GB at the peak of a chat request, 13.0 GB for a 16-token pass with every position's logits. With `gpu_layers = 20` and a 3 GiB device tier the peak is 10.5 GB. The expert RAM tier (85 GiB in the runs) is host memory.
+- Tensor parallelism is rejected (`tensor parallelism: hyper-connection residual streams ...`).
+- `gpu_layers` is accepted only for cuts that keep every cache source with the layers that read it: each layer with compressed attention reads the compressed rows of its cache source layer, the picks of its index source layer and, when it narrows its scoring, the candidate blocks of the candidate source layer. The other values fail with `` gpu_layers N cuts `deepseek41` between layers that share compressed rows or indexer picks; legal values: ... ``. At the real layout (compressed rows owned by layers 2, 8, 14 and 20, layers 24 to 36 narrowing their scoring to the candidates of layer 20) the legal values are 20, 26, 32, 38, 39 and 40 of 40, and 0. The CPU half hands the GPU half the stream and the pre weights.
+- Experts: `ExpertPlacement::Host` and `ExpertPlacement::Tiered` with `device_bytes = 0` (host-tiered: the experts stay in the file behind a RAM tier and the CPU computes the ones a pass needs) keep the attention, the router, the shared experts and the head on the GPU. A device tier works for a model whose experts fit it.
 
 ## Layer offload (`gpu_layers`)
 
@@ -207,6 +227,7 @@ Unit tests on tiny random models:
 - `gpu_batched_matches_gpu_solo_on_every_architecture` runs three sequences in batched steps (a joint prefill, decode rows, a sequence sitting one step out, a prefill chunk next to decode rows, and a snapshot restored into another slot) and compares each with a solo run.
 - `gpu_tiered_experts_match_gpu_resident`, `gpu_host_experts_match_gpu_resident`, `gpu_offload_matches_single_device_at_every_split` and `gpu_offload_serves_again_after_a_rejected_mirror_write` cover the placements.
 - `gpu_sharded_matches_single_device`, `gpu_all_reduce_adds_in_shard_order` and `gpu_sharded_rejects_unsplittable_heads` cover tensor parallelism, and `gpu_drafter_matches_cpu_drafter` the Gemma 4 assistant.
+- For DeepSeek-V4.1 the tests build tiny `deepseek41` models (Q8_0 experts, MXFP4 experts, and an indexer without candidate blocks): `gpu_matches_cpu_on_every_deepseek41_variant` against the CPU engine, `gpu_hyper_batched_and_prefix_reuse_match_solo`, `gpu_engram_prefetch_reads_each_row_once_and_changes_no_bit`, `gpu_offload_of_a_hyper_model_matches_single_device_at_every_legal_cut` for `gpu_layers`, and the tiered and host placements (`gpu_tiered_experts_match_gpu_resident`, `gpu_host_experts_match_gpu_resident`, `gpu_host_tiered_experts_match_gpu_host_experts`). `gpu_sharded_rejects_unsplittable_heads` includes the tensor parallelism rejection. The model-level comparisons run with the simulated quantization switched off on both sides; the quantization kernels have their own tests (`power_of_two_scales_are_bit_exact`, `e4m3_scale_matches_up_to_rare_division_steps`, `rows_do_not_depend_on_the_batch`).
 
 Compile-checked only:
 
@@ -217,3 +238,4 @@ Not run:
 
 - Tensor parallelism over two distinct GPUs, and Muse Glimmer with `shards`.
 - Models on a GPU other than those listed above. The `mistral3` architecture ran only as a tiny model, and the Ministral 3 presets have not run on a GPU. The remaining presets ran on the CPU.
+- DeepSeek-V4.1 on a GPU faster than the CPU engine by more than about 1.2 times: the experts run on the CPU (see [DeepSeek-V4.1 on a GPU](#deepseek-v4-1-on-a-gpu)), so a decode step with the experts in RAM takes 0.41 s against 0.48 s, and a cold one is bound by the volume holding the experts.

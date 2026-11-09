@@ -66,15 +66,17 @@
 //!
 //! # Split GGUF files
 //!
-//! A model published as llama.cpp splits (`<base>-00001-of-0000N.gguf`) is
-//! merged once into one cached GGUF: [`ModelSource::File`] naming any part
-//! merges the set into `<cache>/merged/`, and a Hugging Face source whose file
+//! A model published as llama.cpp splits (`<base>-00001-of-0000N.gguf`) loads
+//! as one set, part by part, without a merged copy: [`ModelSource::File`]
+//! naming any part reads every part in place, looking for the others next to
+//! it and in [`LocalModelConfig::shard_dirs`] (so the experts and a huge
+//! Engram table can sit on different disks). A Hugging Face source whose file
 //! is a split name downloads and verifies every part
-//! ([`ModelSource::HuggingFace`]'s `parts`, [`ModelPreset::parts`]), merges
-//! them into `<base>.gguf` next to where they were downloaded and deletes the
-//! parts. The merge needs about twice the model's size free until the parts
-//! are deleted, streams the tensor data, and is reported through
-//! `LocalModelConfig::on_download_progress` as bytes copied.
+//! ([`ModelSource::HuggingFace`]'s `parts`, [`ModelPreset::parts`]) into the
+//! cache, where the parts stay, and loads the set from the first part: no
+//! merged copy is written, so a split model needs its own size on disk and
+//! no more. Each part's download is reported through
+//! `LocalModelConfig::on_download_progress`.
 //!
 //! # Bounds
 //!
@@ -118,7 +120,8 @@
 //!   device holds its slice of the weights and of the K/V pools, and the
 //!   partial outputs are summed twice per layer, by NCCL on CUDA and in a
 //!   fixed host-staged order elsewhere. See the GPU page of the docs.
-//! - Prefill runs in chunks of at most 256 tokens, bounding the score matrix,
+//! - Prefill runs in chunks of at most 256 tokens (4,096 for tiered experts
+//!   under compressed sparse attention), bounding the score matrix,
 //!   and a step carries at most [`BatchingConfig::max_step_tokens`] rows in
 //!   all. An in-trunk drafter observes every position of its sequence, so
 //!   with one the engine serves one request at a time; a file drafter
@@ -229,6 +232,7 @@ mod chat;
 mod convert;
 mod download;
 mod engine;
+mod gguf;
 mod model;
 mod output;
 mod sampler;
@@ -247,6 +251,7 @@ use futures_core::Stream;
 use tokio::sync::{mpsc, oneshot};
 
 use self::chat::{ChatFormat, ChatTemplate, chat_prompt};
+pub use self::model::engram_io::EngramStats;
 pub use self::model::tier::{ExpertHeat, ExpertTierStats};
 use self::tokenizer::Tokenizer;
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
@@ -274,6 +279,8 @@ pub(crate) fn resolve_context_length(configured: Option<usize>, model_max: usize
 
 /// Default [`LocalModelConfig::draft_tokens`].
 const DEFAULT_DRAFT_TOKENS: usize = 5;
+/// Largest accepted [`BatchingConfig::max_step_tokens`].
+const MAX_STEP_TOKENS: usize = 8192;
 /// Largest accepted [`LocalModelConfig::draft_tokens`].
 pub(crate) const MAX_DRAFT_TOKENS: usize = 16;
 /// Connect timeout of the one-off download client.
@@ -309,8 +316,8 @@ pub struct ModelPreset {
     /// every `<base>-0000i-of-0000N.gguf` file with its digest and size, in
     /// part order. Empty for a single-file preset. For a split preset `file`
     /// and `sha256` are those of the first part and `size_bytes` is the sum of
-    /// the parts; loading downloads and verifies every part, merges them into
-    /// one cached `<base>.gguf` and deletes the parts.
+    /// the parts; loading downloads and verifies every part into the cache
+    /// and opens the set from the first part (nothing is merged).
     pub parts: &'static [PresetPart],
     /// A chat template that replaces the one embedded in the GGUF (a file of
     /// the model's original repository, pinned like a model part), for a
@@ -644,7 +651,7 @@ const PRESET_TABLE: &[ModelPreset] = &[
             "mistral3",
         )
     },
-    // Two parts of `llama-gguf-split`: merged into one cached file at load.
+    // Two parts of `llama-gguf-split`: loaded as one set, unmerged.
     // imatrix Q4_0 (Q4_1 in the layers' `ffn_down_exps`, Q5_0 in places, Q8_0
     // for the shared experts and the latent projection, Q6_K `output`).
     ModelPreset {
@@ -725,9 +732,8 @@ pub enum ModelSource {
         /// for a single file. When `file` is a split name
         /// (`<base>-00001-of-0000N.gguf`), loading downloads every part
         /// (named by `parts`, or derived from `file` and unverified when
-        /// `parts` is empty), merges them into `<base>.gguf` next to where
-        /// the parts were downloaded and deletes the parts. `parts[0]` must
-        /// be `file`.
+        /// `parts` is empty) into the cache and opens the set from the first
+        /// part; nothing is merged. `parts[0]` must be `file`.
         parts: Vec<ModelPart>,
         /// A chat template file that replaces the GGUF's embedded one (see
         /// [`LocalModelConfig::chat_template`], which wins over it);
@@ -737,9 +743,10 @@ pub enum ModelSource {
         template: Option<Box<ModelTemplate>>,
     },
     /// A GGUF file already on disk; nothing is downloaded. A file named like a
-    /// split part (`<base>-00001-of-0000N.gguf`; any part names the set) is
-    /// merged with its siblings in the same directory into one GGUF under
-    /// `<cache>/merged/`, and that file is loaded; the parts stay in place.
+    /// split part (`<base>-00001-of-0000N.gguf`; any part names the set) loads
+    /// as the whole set, with no merging or copying: the parts are looked for
+    /// next to the named file and in [`LocalModelConfig::shard_dirs`], so they
+    /// may sit on different volumes.
     File(PathBuf),
     /// A Hugging Face safetensors checkpoint (`config.json`, the weight
     /// shards, the tokenizer files), downloaded into the cache pinned to
@@ -1138,13 +1145,63 @@ impl std::str::FromStr for WeightQuant {
     }
 }
 
+/// Storage type of DeepSeek-V4.1's Engram tables (`per_layer_token_embd`, 196.6
+/// billion values read one row at a time), [`ConvertConfig::engram_quant`].
+/// Parses from a string (`str::parse`, ASCII case-insensitive): `q8_0`, `q4_0`
+/// or `bf16`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum EngramQuant {
+    /// 8-bit blocks of 32: 208.9 GB, the default.
+    #[default]
+    Q8_0,
+    /// 4-bit blocks of 32: 110.6 GB, visible rounding noise.
+    Q4_0,
+    /// bfloat16: 393.2 GB, the checkpoint's FP8 values times their scales,
+    /// exactly.
+    Bf16,
+}
+
+impl EngramQuant {
+    /// The lowercase name: `q8_0`, `q4_0` or `bf16`.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Q8_0 => "q8_0",
+            Self::Q4_0 => "q4_0",
+            Self::Bf16 => "bf16",
+        }
+    }
+}
+
+impl std::str::FromStr for EngramQuant {
+    type Err = CucaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.trim();
+        [Self::Q8_0, Self::Q4_0, Self::Bf16]
+            .into_iter()
+            .find(|q| q.name().eq_ignore_ascii_case(s))
+            .ok_or_else(|| {
+                CucaError::Config(format!(
+                    "unknown Engram quantization `{s}`; expected q8_0, q4_0 or bf16"
+                ))
+            })
+    }
+}
+
 /// How a safetensors checkpoint ([`ModelSource::Checkpoint`],
 /// [`ModelSource::Dir`]) is converted to GGUF; ignored for GGUF sources.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct ConvertConfig {
     /// Precision of the weight matrices; [`WeightQuant::Q8_0`] by default.
     /// Each precision is converted once and cached next to the others.
+    /// DeepSeek-V4.1's routed experts stay in their native MXFP4 at every
+    /// precision but `f16`, which stores them (and everything else) exactly as
+    /// half floats.
     pub quant: WeightQuant,
+    /// Storage type of DeepSeek-V4.1's Engram tables; ignored by every other
+    /// architecture. A conversion with another value than the default is
+    /// cached next to the default one.
+    pub engram_quant: EngramQuant,
 }
 
 /// Where a mixture-of-experts model's routed experts live
@@ -1197,7 +1254,12 @@ pub enum ExpertPlacement {
 ///   quantized matmul weights (an expert costs its file bytes);
 /// - on a GPU device, a device tier of `device_bytes` holding the uploaded
 ///   weights, in front of an optional RAM tier of `ram_bytes` holding
-///   upload-ready host copies (`0` reads every device miss from the file).
+///   upload-ready host copies (`0` reads every device miss from the file);
+/// - on a GPU device with `device_bytes = 0` and a `ram_bytes` budget, no
+///   device tier: the experts are *host-tiered*, the RAM tier holds them as
+///   on the CPU and the CPU computes them while attention, the router, the
+///   shared expert and the head run on the GPU (for a model whose experts
+///   dwarf the device memory).
 ///
 /// A budget becomes the same number of slots in every MoE layer: `budget /
 /// (bytes of one expert summed over the MoE layers)`, at most the expert
@@ -1335,6 +1397,111 @@ impl std::str::FromStr for ExpertPlacement {
     }
 }
 
+/// The row cache and the readers of an Engram table
+/// ([`LocalModelConfig::engram`]).
+///
+/// DeepSeek-V4.1's Engram table is one tensor of 768 M rows (209 GB at the
+/// default Q8_0), too large for RAM, from which every token position reads 24
+/// random rows per engram layer (272 bytes each at Q8_0). The table stays in
+/// the GGUF file: a pool of `reader_threads` threads reads the distinct rows a
+/// forward pass needs, sorted by file offset and in parallel (a disk serves
+/// many outstanding random reads much faster than one at a time), and the
+/// most recently used rows stay in an LRU cache of `ram_bytes`, so a repeated
+/// phrase, prompt or conversation prefix reads fewer rows the second time.
+/// The cache holds the rows as the file stores them and counts a per-row
+/// overhead of 48 bytes against the budget; at the bound it evicts the least
+/// recently used row. Its memory is allocated as it fills, so a short session
+/// does not pay for the bound. A cache smaller than the distinct rows of one
+/// forward pass still gives correct output: rows evicted before use are read
+/// again.
+///
+/// The values do not change the model's output, only how fast it runs.
+/// [`LocalModel::engram_stats`] reports the lookups, hits and reads. A model
+/// without an Engram table ignores the setting. Parses from a string
+/// (`str::parse`): `ram=<size>` and `threads=<n>` in any order, each at most
+/// once, `<size>` a byte count with an optional `k`, `m` or `g` suffix
+/// (powers of 1024): `ram=8g,threads=32`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EngramCache {
+    /// Bytes of RAM for cached rows, `1 MiB..=1 TiB` (default 4 GiB: about 15
+    /// million Q8_0 rows).
+    pub ram_bytes: u64,
+    /// Disk reader threads, `1..=64` (default 16).
+    pub reader_threads: usize,
+}
+
+/// Default [`EngramCache::ram_bytes`].
+const DEFAULT_ENGRAM_RAM_BYTES: u64 = 4 << 30;
+/// Smallest accepted [`EngramCache::ram_bytes`].
+const MIN_ENGRAM_RAM_BYTES: u64 = 1 << 20;
+/// Largest accepted [`EngramCache::ram_bytes`].
+const MAX_ENGRAM_RAM_BYTES: u64 = 1 << 40;
+/// Default [`EngramCache::reader_threads`].
+const DEFAULT_ENGRAM_READER_THREADS: usize = 16;
+/// Largest accepted [`EngramCache::reader_threads`].
+const MAX_ENGRAM_READER_THREADS: usize = 64;
+
+impl Default for EngramCache {
+    fn default() -> Self {
+        Self {
+            ram_bytes: DEFAULT_ENGRAM_RAM_BYTES,
+            reader_threads: DEFAULT_ENGRAM_READER_THREADS,
+        }
+    }
+}
+
+impl EngramCache {
+    /// Check both values against their bounds.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] naming the value and its bounds.
+    pub fn validate(&self) -> Result<(), CucaError> {
+        if !(MIN_ENGRAM_RAM_BYTES..=MAX_ENGRAM_RAM_BYTES).contains(&self.ram_bytes) {
+            return Err(invalid(format!(
+                "engram.ram_bytes must be in {MIN_ENGRAM_RAM_BYTES}..={MAX_ENGRAM_RAM_BYTES} (1 MiB to 1 TiB), got {}",
+                self.ram_bytes
+            )));
+        }
+        if !(1..=MAX_ENGRAM_READER_THREADS).contains(&self.reader_threads) {
+            return Err(invalid(format!(
+                "engram.reader_threads must be in 1..={MAX_ENGRAM_READER_THREADS}, got {}",
+                self.reader_threads
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Parses `ram=<size>` and `threads=<n>` (any subset, ASCII
+/// case-insensitive); see [`EngramCache`]. The result is not validated:
+/// [`LocalModel::load`] does that.
+impl std::str::FromStr for EngramCache {
+    type Err = CucaError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let mut cache = Self::default();
+        let lower = s.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return Ok(cache);
+        }
+        parse_pairs(&lower, |key, value| {
+            match key {
+                "ram" => cache.ram_bytes = parse_size(value)?,
+                "threads" => cache.reader_threads = value.parse().ok()?,
+                _ => return None,
+            }
+            Some(())
+        })
+        .ok_or_else(|| {
+            CucaError::Config(format!(
+                "unknown engram cache `{s}`; expected a comma-separated subset of ram=<size>,threads=<n>"
+            ))
+        })?;
+        Ok(cache)
+    }
+}
+
 /// Configuration for [`LocalModel::load`].
 ///
 /// `Debug` redacts `hf_token`.
@@ -1446,6 +1613,18 @@ pub struct LocalModelConfig {
     /// (neither combines with offload), or, once the file is read, when the
     /// count exceeds the model's layer count.
     pub gpu_layers: Option<usize>,
+    /// The row cache and reader threads of an Engram table (DeepSeek-V4.1);
+    /// ignored by a model without one. See [`EngramCache`].
+    pub engram: EngramCache,
+    /// Directories searched, after the one next to the model file, for the
+    /// missing parts of a split GGUF set (`<base>-00001-of-0000N.gguf`): the
+    /// parts of one model may live on different volumes, for example the
+    /// experts on a fast disk and DeepSeek-V4.1's 209 GB Engram table on a
+    /// large one. Empty (the default) looks next to the model file only. A
+    /// converted checkpoint's parts are written next to its model file
+    /// (`<cache>/converted/`), so this is for GGUF sets you place yourself
+    /// (`ModelSource::File` naming the first part).
+    pub shard_dirs: Vec<PathBuf>,
 }
 
 impl Default for LocalModelConfig {
@@ -1466,6 +1645,8 @@ impl Default for LocalModelConfig {
             batching: BatchingConfig::default(),
             shards: Vec::new(),
             gpu_layers: None,
+            engram: EngramCache::default(),
+            shard_dirs: Vec::new(),
         }
     }
 }
@@ -1517,6 +1698,8 @@ impl fmt::Debug for LocalModelConfig {
             .field("batching", &self.batching)
             .field("shards", &self.shards)
             .field("gpu_layers", &self.gpu_layers)
+            .field("engram", &self.engram)
+            .field("shard_dirs", &self.shard_dirs)
             .finish()
     }
 }
@@ -1531,6 +1714,7 @@ struct Loaded {
     kv_cache_bytes: u64,
     file_bytes: u64,
     tiers: Option<Arc<model::tier::TierShared>>,
+    engram: Option<Arc<model::engram_io::EngramCounters>>,
     serving: Arc<engine::ServingCounters>,
     sampling: SamplingConfig,
     layer_split: Option<(usize, usize)>,
@@ -1553,6 +1737,9 @@ struct LocalModelInner {
     /// Counters and heat of the expert tiers; `None` unless
     /// [`ExpertPlacement::Tiered`].
     tiers: Option<Arc<model::tier::TierShared>>,
+    /// Counters of the Engram table's row cache; `None` for a model without
+    /// an Engram table.
+    engram: Option<Arc<model::engram_io::EngramCounters>>,
     /// Layers on the GPU and in all when the model runs split over the CPU
     /// and the GPU ([`LocalModelConfig::gpu_layers`]).
     layer_split: Option<(usize, usize)>,
@@ -1622,7 +1809,12 @@ struct LocalModelInner {
 ///   and a two-mode `reasoning_effort` of `none` or `high`): the request's
 ///   effort level is ignored. A template that reads `reasoning_strength`
 ///   (Muse Glimmer) gets the effort level as `low`, `medium`, `high` or
-///   `xhigh`; a request without an effort leaves the template's default.
+///   `xhigh`; a request without an effort leaves the template's default. A
+///   template that reads `reasoning_budget` (DeepSeek V4.1) thinks unless the
+///   request disables thinking, as DeepSeek's reference stack does, and maps
+///   the effort to its budget: `minimal` and `low` to `low` (50), `medium`,
+///   `high` and `xhigh` to `high` (75, also the default); its `max` (100) has
+///   no unified effort.
 /// - The engine is text-only: image blocks are rejected.
 /// - `UnifiedRequest::model` is not used for routing, since one client holds
 ///   one model. `temperature`, `max_tokens`, `top_p`, `top_k`, `seed` and
@@ -1777,8 +1969,12 @@ pub struct BatchingConfig {
     /// raising `max_sequences` does not raise it.
     pub kv_tokens: Option<usize>,
     /// Most rows (tokens) of one forward step across all sequences, at least
-    /// `max_sequences` and at most 2048. `None` (the default) is the prefill
-    /// chunk of the context length (256 at 8192 positions).
+    /// `max_sequences` and at most 8192. `None` (the default) is the prefill
+    /// chunk of the context length (256 at 8192 positions); with
+    /// [`ExpertPlacement::Tiered`] experts and compressed sparse attention
+    /// (DeepSeek-V4.1) it is 4096, because a step then costs the experts its
+    /// rows route to, which nearly every row of a large step shares: the
+    /// bigger the step the fewer expert bytes are read per prompt token.
     pub max_step_tokens: Option<usize>,
     /// Keep the K/V of finished requests, and of prefix blocks leaving a
     /// sliding window, in the prefix store for later prompts (the default).
@@ -1852,8 +2048,8 @@ impl LocalModel {
         self.inner.kv_cache_bytes
     }
 
-    /// Size in bytes of the GGUF file the model was loaded from (the
-    /// converted or merged one for a checkpoint or split source): the
+    /// Size in bytes of the GGUF file the model was loaded from (every part of
+    /// a split set; the converted one for a checkpoint source): the
     /// footprint of the weights, up to what the engine leaves out (Gemma 4's
     /// per-layer embeddings stay on disk) and what a GPU re-encodes
     /// (requantized dtypes, `f32` upload of 16-bit weights). `0` when the
@@ -1922,6 +2118,13 @@ impl LocalModel {
         self.inner.tiers.as_ref().map(|t| t.heat())
     }
 
+    /// The counters of the Engram table's row cache (lookups, hits, rows and
+    /// bytes read, resident rows), cumulative since load; `None` unless the
+    /// model has an Engram table (DeepSeek-V4.1). See [`EngramCache`].
+    pub fn engram_stats(&self) -> Option<EngramStats> {
+        self.inner.engram.as_ref().map(|c| c.snapshot())
+    }
+
     /// Load the model described by `config`: resolve or download the file,
     /// read the weights, tokenizer and chat template, and start the engine
     /// thread.
@@ -1954,7 +2157,7 @@ impl LocalModel {
             let drafter = match &config.drafter {
                 None => None,
                 Some(DrafterSource::File(source)) => Some(engine::ResolvedDrafter::File(
-                    resolve_model_path(&config, source)?,
+                    resolve_drafter_path(&config, source)?,
                 )),
                 Some(DrafterSource::InTrunk) => Some(engine::ResolvedDrafter::InTrunk),
             };
@@ -2009,6 +2212,7 @@ impl LocalModel {
                             kv_cache_bytes: engine.kv_cache_bytes(),
                             file_bytes: engine.file_bytes(),
                             tiers: engine.expert_tiers(),
+                            engram: engine.engram_counters(),
                             serving: engine.serving_counters(),
                             sampling: engine.sampling().config(),
                             layer_split: engine.layer_split(),
@@ -2046,6 +2250,7 @@ impl LocalModel {
                     draft_stats,
                     serving: loaded.serving,
                     tiers: loaded.tiers,
+                    engram: loaded.engram,
                     layer_split: loaded.layer_split,
                 }),
             }),
@@ -2103,7 +2308,8 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
         return Err(e);
     }
     validate_drafter(config)?;
-    validate_experts(config)
+    validate_experts(config)?;
+    config.engram.validate()
 }
 
 /// Tensor parallelism: every device a GPU of one backend, no drafter, resident
@@ -2169,10 +2375,10 @@ fn validate_batching(batching: &BatchingConfig) -> Result<(), CucaError> {
         )));
     }
     if let Some(step) = batching.max_step_tokens
-        && !(batching.max_sequences..=2048).contains(&step)
+        && !(batching.max_sequences..=MAX_STEP_TOKENS).contains(&step)
     {
         return Err(invalid(format!(
-            "batching.max_step_tokens must be in max_sequences..=2048 ({}..=2048), got {step}",
+            "batching.max_step_tokens must be in max_sequences..={MAX_STEP_TOKENS} ({}..={MAX_STEP_TOKENS}), got {step}",
             batching.max_sequences
         )));
     }
@@ -2196,7 +2402,9 @@ fn validate_drafter(config: &LocalModelConfig) -> Result<(), CucaError> {
     Ok(())
 }
 
-/// Host experts need a GPU device; tiered budgets follow the device.
+/// Host experts need a GPU device; tiered budgets follow the device: a GPU
+/// takes a device tier, a RAM tier, or only a RAM tier, which makes the experts
+/// host-tiered.
 fn validate_experts(config: &LocalModelConfig) -> Result<(), CucaError> {
     let cpu = config.device == LocalDevice::Cpu;
     match &config.experts {
@@ -2212,9 +2420,11 @@ fn validate_experts(config: &LocalModelConfig) -> Result<(), CucaError> {
                     t.loader_threads
                 )));
             }
-            if !cpu && t.device_bytes == 0 {
+            // A GPU without a device tier computes on the CPU from the RAM
+            // tier (host-tiered experts).
+            if !cpu && t.device_bytes == 0 && t.ram_bytes == 0 {
                 return Err(invalid(format!(
-                    "experts.device_bytes must be greater than 0 on {:?}",
+                    "experts: on {:?} set device_bytes (a device tier) or ram_bytes (host-tiered: the CPU computes the experts from the RAM tier)",
                     config.device
                 )));
             }
@@ -2293,8 +2503,26 @@ fn resolve_model_path(
     config: &LocalModelConfig,
     source: &ModelSource,
 ) -> Result<PathBuf, CucaError> {
+    resolve_role_path(config, source, convert::Role::Main)
+}
+
+/// [`resolve_model_path`] for a drafter: a checkpoint source that is also the
+/// target's (DeepSeek-V4.1's DSpark stages live in the target's checkpoint)
+/// converts to the drafter's own file.
+fn resolve_drafter_path(
+    config: &LocalModelConfig,
+    source: &ModelSource,
+) -> Result<PathBuf, CucaError> {
+    resolve_role_path(config, source, convert::Role::Drafter)
+}
+
+fn resolve_role_path(
+    config: &LocalModelConfig,
+    source: &ModelSource,
+    role: convert::Role,
+) -> Result<PathBuf, CucaError> {
     match source {
-        ModelSource::File(path) => resolve_file(config, path),
+        ModelSource::File(path) => resolve_file(path),
         ModelSource::HuggingFace {
             repo,
             revision,
@@ -2305,7 +2533,7 @@ fn resolve_model_path(
         } => resolve_hugging_face(config, repo, revision, file, sha256.as_deref(), parts),
         ModelSource::Checkpoint { repo, revision } => {
             let cache_dir = cache_root(config)?;
-            convert_cached(config, source, &cache_dir, || {
+            convert_cached(config, source, &cache_dir, role, || {
                 let (runtime, client) = download_runtime()?;
                 runtime.block_on(convert::hf::fetch(
                     &client,
@@ -2325,41 +2553,28 @@ fn resolve_model_path(
                 });
             }
             let cache_dir = cache_root(config)?;
-            convert_cached(config, source, &cache_dir, || {
+            convert_cached(config, source, &cache_dir, role, || {
                 convert::hf::CheckpointDir::open(dir)
             })
         }
     }
 }
 
-/// A GGUF on disk; a split part is merged with its siblings first.
-fn resolve_file(config: &LocalModelConfig, path: &Path) -> Result<PathBuf, CucaError> {
+/// A GGUF on disk. A split part (`<base>-00001-of-0000N.gguf`) is returned as
+/// it is: the reader opens the whole set from any of its parts
+/// ([`LocalModelConfig::shard_dirs`] says where to look for the others), so
+/// nothing is merged or copied.
+fn resolve_file(path: &Path) -> Result<PathBuf, CucaError> {
     if !path.is_file() {
         return Err(CucaError::Io {
             message: format!("model file `{}` does not exist", path.display()),
         });
     }
-    let is_part = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .and_then(convert::gguf_merge::SplitName::parse)
-        .is_some();
-    if !is_part {
-        return Ok(path.to_path_buf());
-    }
-    let Some(plan) = convert::gguf_merge::plan_local(&cache_root(config)?, path)? else {
-        return Ok(path.to_path_buf());
-    };
-    convert::gguf_merge::merge(
-        &plan.parts,
-        &plan.merged,
-        config.on_download_progress.as_ref(),
-    )?;
-    Ok(plan.merged)
+    Ok(path.to_path_buf())
 }
 
 /// A file of a Hugging Face repository, downloaded and verified into the
-/// cache; a split GGUF downloads every part and merges them.
+/// cache; a split GGUF downloads every part and the first part names the set.
 fn resolve_hugging_face(
     config: &LocalModelConfig,
     repo: &str,
@@ -2369,7 +2584,7 @@ fn resolve_hugging_face(
     parts: &[ModelPart],
 ) -> Result<PathBuf, CucaError> {
     let cache_dir = cache_root(config)?;
-    let Some((names, merged_file)) = convert::gguf_merge::repo_parts(file) else {
+    let Some(names) = repo_part_files(file) else {
         if !parts.is_empty() {
             return Err(invalid(format!(
                 "`{file}` is not named like a split GGUF part (`<base>-00001-of-0000N.gguf`) but the source lists {} parts",
@@ -2381,22 +2596,35 @@ fn resolve_hugging_face(
         return Ok(path);
     };
     let wanted = split_parts(file, &names, sha256, parts)?;
-    let merged = download::cached_path(&cache_dir, repo, revision, &merged_file)?;
-    if !merged.exists() {
-        let (runtime, client) = download_runtime()?;
-        runtime.block_on(download::ensure_split_downloaded(
-            &client,
-            download::HF_ENDPOINT,
-            &cache_dir,
-            repo,
-            revision,
-            &wanted,
-            &merged,
-            hf_token(config).as_deref(),
-            config.on_download_progress.as_ref(),
-        ))?;
-    }
-    Ok(merged)
+    let (runtime, client) = download_runtime()?;
+    runtime.block_on(download::ensure_parts_downloaded(
+        &client,
+        download::HF_ENDPOINT,
+        &cache_dir,
+        repo,
+        revision,
+        &wanted,
+        hf_token(config).as_deref(),
+        config.on_download_progress.as_ref(),
+    ))
+}
+
+/// The repository paths of every part of the split GGUF `file` (a repository
+/// path such as `dir/<base>-00001-of-0000N.gguf`), in part order; `None` for a
+/// file that is not named like a split part.
+fn repo_part_files(file: &str) -> Option<Vec<String>> {
+    let (dir, name) = match file.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name),
+        None => (String::new(), file),
+    };
+    let split = gguf::SplitName::parse(name)?;
+    Some(
+        split
+            .part_names()
+            .into_iter()
+            .map(|n| format!("{dir}{n}"))
+            .collect(),
+    )
 }
 
 /// The `(file, sha256)` of every part of the split GGUF `file` (`names`, in
@@ -2433,26 +2661,27 @@ fn split_parts(
         .collect())
 }
 
-/// The converted GGUF of a checkpoint `source` under `cache_dir`; `open`
-/// supplies the checkpoint, only when it is not converted yet.
+/// The converted GGUF of a checkpoint `source` under `cache_dir`, for a model
+/// in `role`; `open` supplies the checkpoint, only when it is not converted yet.
 fn convert_cached(
     config: &LocalModelConfig,
     source: &ModelSource,
     cache_dir: &Path,
+    role: convert::Role,
     open: impl FnOnce() -> Result<convert::hf::CheckpointDir, CucaError>,
 ) -> Result<PathBuf, CucaError> {
-    let quant = config.convert.quant;
-    let out = convert::output_path(cache_dir, source, quant)?;
-    if !out.exists() {
-        let checkpoint = open()?;
-        convert::convert(
-            &checkpoint,
-            &out,
-            quant,
-            config.on_download_progress.as_ref(),
-        )?;
+    let out = convert::output_path(cache_dir, source, config.convert)?;
+    if let Some(done) = convert::converted(&out, role) {
+        return Ok(done);
     }
-    Ok(out)
+    let checkpoint = open()?;
+    convert::convert_set(
+        &checkpoint,
+        &out,
+        config.convert,
+        role,
+        config.on_download_progress.as_ref(),
+    )
 }
 
 /// The chat template that replaces the GGUF's, if any:
@@ -2641,7 +2870,7 @@ impl LocalModel {
         let job = engine::Job {
             prompt_ids,
             start_in_thinking: inner.format.starts_in_thinking(&rendered),
-            enable_thinking: prompt.enable_thinking,
+            enable_thinking: inner.template.thinking_enabled(&prompt),
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             top_p: req.top_p,
@@ -2814,8 +3043,8 @@ mod tests {
     }
 
     #[test]
-    fn a_file_naming_a_split_part_resolves_to_the_merged_gguf() {
-        use super::convert::gguf_merge::fixtures::{load, split, temp_dir};
+    fn a_file_naming_a_split_part_is_opened_as_a_set_without_merging() {
+        use super::gguf::fixtures::{load, split, temp_dir};
 
         let model = super::model::tiny::write_tiny_model();
         let dir = temp_dir("source");
@@ -2829,20 +3058,25 @@ mod tests {
             };
             resolve_model_path(&config, &config.source)
         };
-        // Any part names the set; the merged file is the same one.
-        let merged = resolve(&parts[1]).unwrap();
-        assert!(merged.starts_with(cache.join("merged")), "{merged:?}");
-        assert_eq!(merged.file_name().unwrap(), "tiny.gguf");
-        assert_eq!(load(&merged).1.len(), load(&model.path).1.len());
-        assert_eq!(resolve(&parts[0]).unwrap(), merged);
-        assert!(parts.iter().all(|p| p.exists()), "the user's parts stay");
+        // Any part names the set, and nothing is copied into the cache.
+        for part in &parts {
+            assert_eq!(&resolve(part).unwrap(), part);
+        }
+        assert!(!cache.exists(), "no merged file");
+        let set = gguf::Content::open(&parts[1]).unwrap();
+        assert_eq!(set.files().len(), 3);
+        assert_eq!(set.tensor_infos.len(), load(&model.path).1.len());
         // A file that is not a split part loads as it is.
         assert_eq!(resolve(&model.path).unwrap(), model.path);
-        // A missing sibling names the file.
-        std::fs::remove_file(&parts[2]).unwrap();
-        let err = resolve(&parts[0]).unwrap_err().to_string();
+        // A missing sibling names the file; `shard_dirs` finds it elsewhere.
+        let elsewhere = temp_dir("elsewhere");
+        std::fs::rename(&parts[2], elsewhere.join(parts[2].file_name().unwrap())).unwrap();
+        let err = gguf::Content::open(&parts[0]).unwrap_err().to_string();
         assert!(err.contains("tiny-00003-of-00003.gguf"), "{err}");
+        let found = gguf::Content::open_with(&parts[0], std::slice::from_ref(&elsewhere)).unwrap();
+        assert_eq!(found.tensor_infos.len(), set.tensor_infos.len());
         let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(elsewhere);
     }
 
     /// A source's pinned template is read from its cache location (no network
@@ -3063,7 +3297,7 @@ mod tests {
                 "batching.max_step_tokens",
             ),
             (
-                config_with(|c| c.batching.max_step_tokens = Some(2049)),
+                config_with(|c| c.batching.max_step_tokens = Some(8193)),
                 "batching.max_step_tokens",
             ),
             (
@@ -3121,7 +3355,13 @@ mod tests {
     #[test]
     fn validate_accepts_the_boundaries() {
         assert!(validate(&LocalModelConfig::default()).is_ok());
-        for text in ["seqs=1", "seqs=64,step=64", "step=2048", "kv=1"] {
+        for text in [
+            "seqs=1",
+            "seqs=64,step=64",
+            "step=2048",
+            "step=8192",
+            "kv=1",
+        ] {
             let config = config_with(|c| c.batching = text.parse().unwrap());
             assert!(validate(&config).is_ok(), "{text}");
         }
@@ -3408,9 +3648,11 @@ mod tests {
             };
             assert!(validate(&experts(ExpertPlacement::Host { layers: None })).is_ok());
             assert!(validate(&experts(tiers(0, 1 << 30, 4))).is_ok());
+            // A RAM tier alone is host-tiered: the CPU computes the experts.
+            assert!(validate(&experts(tiers(1 << 30, 0, 4))).is_ok());
             assert_rejected(
                 &experts(tiers(0, 0, 4)),
-                "experts.device_bytes must be greater than 0",
+                "set device_bytes (a device tier) or ram_bytes (host-tiered",
             );
         }
         // Different backends do not mix (when both are compiled in).

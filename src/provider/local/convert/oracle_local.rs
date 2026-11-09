@@ -50,7 +50,7 @@ fn local_checkpoint_matches_the_reference() {
     };
     let content = read_gguf(&path);
     let ctx = prompt.len() + greedy.len() + 8;
-    let mut model = Transformer::load_dequantized(&content, &path, ctx).unwrap();
+    let mut model = Transformer::load_dequantized(&content, ctx).unwrap();
 
     // Prefill in passes that end at every compared position (the LM head runs
     // there only: a long prompt's logits for every row would be terabytes of

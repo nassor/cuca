@@ -16,6 +16,9 @@
 //! - `CUCA_LOCAL_EXPERTS_REF`: the reference placement (default
 //!   `resident`); set it to a small tiered placement when the resident model
 //!   does not fit the device.
+//! - `CUCA_LOCAL_ENGRAM`: `LocalModelConfig::engram` (`EngramCache` syntax,
+//!   e.g. `ram=2g,threads=8`) for a model with Engram tables; its counters
+//!   print with the tier counters.
 //! - `CUCA_LOCAL_DEVICE`: `LocalDevice` syntax; a GPU needs its feature.
 //! - `CUCA_LOCAL_GPU_LAYERS`: `LocalModelConfig::gpu_layers` (layer offload:
 //!   the last `n` layers on the GPU, the rest on the CPU with the RAM tier).
@@ -77,6 +80,7 @@ async fn phase(
         device,
         gpu_layers: local_env::gpu_layers(),
         experts,
+        engram: local_env::engram(),
         convert: local_env::convert(),
         ..Default::default()
     })
@@ -92,6 +96,9 @@ async fn phase(
     let secs = started.elapsed().as_secs_f64();
     let tokens: u64 = replies.iter().map(|r| r.1).sum();
     let stats = model.expert_tier_stats();
+    if let Some(engram) = model.engram_stats() {
+        println!("TIERS|{label}|engram|{engram:?}");
+    }
     match (at_load, stats) {
         (Some(l), Some(s)) => println!(
             "TIERS|{label}|{:.1} tok/s|{s:?}|hit rate {:.3}|read at load {}",

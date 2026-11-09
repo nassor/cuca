@@ -4,6 +4,61 @@
 
 ### Added
 
+- `provider-local`: DeepSeek-V4.1 (`deepseek41`, DeepSeek-V4.1-Flash-1017 with FP8 dense and FP4
+  expert weights) on the CPU engine and on one GPU. The generic loader reads it
+  through `Behavior` flags: hyper-connection residual streams, latent attention with a per-head sink
+  and a sliding window, compressed sparse attention (compressors, an indexer with hierarchical
+  candidate blocks, cache source layers, FP8 and FP4 simulated quantization of the cached rows,
+  grouped output projection), per-layer Engram token embeddings, a `sqrtsoftplus` router with a
+  selection bias and SwiGLU clamps, and MXFP4 experts through the row-batched kernel
+  (`model/qmm.rs`). The K/V pools gain compressed groups whose blocks span `16 * ratio` tokens. The
+  GPU engine runs it with CubeCL kernels (`hc_kernel.rs`, `csa_kernel.rs`, `topk_kernel.rs`,
+  `qdq_kernel.rs`, MXFP4 experts in `moe_kernel.rs`); experts can be host-tiered
+  (`ExpertPlacement::Tiered` with `device_bytes = 0`), `gpu_layers` is accepted at cuts that keep
+  every cache source with its readers, and tensor parallelism is rejected. The CPU engine is checked
+  against a torch oracle on a tiny release-format checkpoint, and the GPU engine against the CPU
+  engine on tiny synthetic models. The real DeepSeek-V4.1-Flash-1017 (default-precision set, experts
+  tiered from an HDD-class volume) matches a torch streaming oracle on 16 prompt tokens in one pass,
+  on the CPU (top-1 equal at 15 of 16 positions with the quantizers off, KL 8.9e-8 at the last
+  position) and on Vulkan (same top-1 count, KL 1.9e-8), answers `Paris` and `72` to short chat
+  prompts on both, and passes eight scenarios of the live suite on the CPU. It decodes at about 0.2
+  tokens/s on either engine because the experts stream from disk.
+- `provider-local`: `EngramCache` (`LocalModelConfig::engram`, parsed from `ram=<size>,threads=<n>`)
+  bounds the Engram reader. The table (209 GB at the default Q8_0) stays in the GGUF; `threads`
+  reader threads (1 to 64, default 16) fetch the distinct rows of each pass, and an LRU cache of
+  `ram` bytes (1 MiB to 1 TiB, default 4 GiB, 48 bytes of bookkeeping per row counted) evicts the
+  least recently used row at the bound. `LocalModel::engram_stats` returns `EngramStats` (lookups,
+  cache hits, disk reads, bytes read, resident rows and bytes, capacity). Both engines prefetch the
+  rows of a pass at its entry and of the next prefill chunk, and a model split by `gpu_layers` opens
+  one table, one cache and one set of counters for both halves.
+- `provider-local`: the DSpark block drafter of DeepSeek-V4.1 (a `dflash` GGUF with
+  `dflash.hyper_connection.count`): stages of the target's own block kind, drafting a block of
+  5 tokens per round with a Markov head and a confidence head, through `DrafterSource::File`.
+  Speculative output equals plain greedy output. On the real target (CPU, one prompt) 5 of 15
+  drafts were accepted and there was no speedup, since decoding is disk bound.
+- `provider-local`: the GGUF reader is the crate's own (`src/provider/local/gguf/`). It reads the
+  dtypes MXFP4, IQ4_NL and I8 beside candle's, keeps an unknown dtype id until its tensor is asked
+  for, and opens a split set (`<base>-00001-of-0000N.gguf`) natively. Row decoding handles F32, F16,
+  BF16, the legacy quantizations, IQ4_NL, MXFP4 and I8 in place.
+- `provider-local`: the DeepSeek-V4.1 checkpoint converts once, in pure Rust, to a cached split set
+  (`model-<quant>-00001-of-00003.gguf` holds the metadata, `-00002-` the backbone, `-00003-` the
+  Engram table; two parts for a model without Engram layers) and its DSpark stages to
+  `dspark-model-<quant>.gguf`. Matrices follow `quant` (dense FP8 becomes Q8_0 at the default), FP4
+  experts are repacked to native MXFP4, `quant = f16` dequantizes exactly, and hyper-connection,
+  router, sink and norm tensors stay
+  F32. `ConvertConfig` gains `engram_quant` (`EngramQuant`: `Q8_0` by default, `Q4_0`, `Bf16`); a
+  non-default value adds `-engram-<name>` to the cached file name. The conversion checks the free
+  space of the output volume first and fails with a `CucaError::Config` naming the sizes. The
+  converter is checked against the tiny torch oracle (bit-exact tensors and metadata) and its
+  output on the full release checkpoint against the published ggml-org headers.
+- `provider-local`: the builtin chat template `deepseek-v41`, DeepSeek's DSML tool-call syntax
+  (`ToolSyntax::Dsml`, parsed by `parse_dsml_calls`), thinking on by default with `reasoning_budget`
+  (`low` for a minimal or low effort, `high` for medium and above), the pre-tokenizers `joyai-llm`
+  and `deepseek-v3` (a three-stage split chain), and JSON maps that keep the caller's key order
+  (`serde_json/preserve_order` under `provider-local`).
+- `provider-local` depends on `tokenizers` 0.22 (`onig`, already compiled for candle) for the
+  converter's Engram token-map normalizers only, and on `sysinfo` for the converter's free-space
+  check. The engine's tokenizer stays hand-written.
 - `server` feature and the `cuca` binary (`src/bin/cuca.rs`, `required-features = ["server"]`) with
   `cuca serve`: an OpenAI-compatible HTTP server over `provider-local`, as vLLM and llama.cpp's
   server speak it. It loads one or more models concurrently (`--model [name=]source`, a preset, a
@@ -51,6 +106,14 @@
 - `ServingStats` gains `max_sequences`, `used_blocks`, `total_blocks`, `prefill_rows`,
   `generated_tokens`, `admissions`, `queue_wait_ns`, `step_ns`, `last_step_ns` and `last_step_rows`,
   all atomics on the engine thread.
+
+### Changed
+
+- `provider-local`: a split GGUF set is no longer merged. `ModelSource::File` naming any part opens
+  the set from its parts, which are looked for next to the named file and in
+  `LocalModelConfig::shard_dirs` (new), and a Hugging Face source whose file is a split name
+  downloads every part into the cache and keeps them there. A split model needs its own size on
+  disk and no more.
 
 ## 0.7.0 - 2026-11-07
 

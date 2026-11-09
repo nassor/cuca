@@ -11,11 +11,9 @@
 //! top-1 equal, top-k overlap, top-k logits within 2 % relative L2, and the
 //! first greedy ids equal.
 
-use std::fs::File;
-use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 use serde_json::Value;
 
 use crate::provider::local::model::cpu::{Hidden, Transformer};
@@ -82,6 +80,7 @@ pub(super) fn f16_config(source: ModelSource) -> LocalModelConfig {
         source,
         convert: ConvertConfig {
             quant: WeightQuant::F16,
+            ..ConvertConfig::default()
         },
         ..Default::default()
     }
@@ -93,8 +92,8 @@ pub(super) fn convert_dir(dir: PathBuf) -> PathBuf {
     resolve_model_path(&config, &config.source).expect("conversion")
 }
 
-pub(super) fn read_gguf(path: &Path) -> gguf_file::Content {
-    gguf_file::Content::read(&mut BufReader::new(File::open(path).unwrap())).unwrap()
+pub(super) fn read_gguf(path: &Path) -> gguf::Content {
+    gguf::Content::open(path).unwrap()
 }
 
 /// The token ids of a JSON array.
@@ -215,7 +214,7 @@ fn converted_checkpoints_match_the_transformers_oracle() {
             .map(|p| ids(&p["ids"]).len() + ids(&p["greedy_ids"]).len() + 8)
             .max()
             .unwrap();
-        let mut model = Transformer::load(&content, &path, ctx).unwrap();
+        let mut model = Transformer::load(&content, ctx).unwrap();
         for prompt in prompts {
             let name = prompt["name"].as_str().unwrap();
             let prompt_ids = ids(&prompt["ids"]);

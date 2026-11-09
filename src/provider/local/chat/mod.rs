@@ -19,6 +19,8 @@ mod format;
 #[cfg(test)]
 mod golden;
 #[cfg(test)]
+mod golden_deepseek;
+#[cfg(test)]
 mod golden_new;
 mod template;
 
@@ -90,6 +92,28 @@ impl ThinkingRequest {
         match self {
             Self::On(_) => "high",
             Self::Unset | Self::Off => "none",
+        }
+    }
+
+    /// Whether thinking is on for a model that thinks unless told not to: only
+    /// an explicit disable switches it off.
+    pub(crate) fn enabled_unless_off(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+
+    /// The value of `reasoning_budget` for a DeepSeek V4.1-style template:
+    /// `low` (effort 50) for a minimal or low request and `high` (75) for
+    /// medium, high and xhigh, as DeepSeek's reference stack maps them, which
+    /// leaves its `max` (100) unreachable through the unified effort. `None`
+    /// leaves the variable undefined so the template applies its default,
+    /// `high`.
+    pub(crate) fn budget(self) -> Option<&'static str> {
+        match self {
+            Self::On(Some(ThinkingEffort::Minimal | ThinkingEffort::Low)) => Some("low"),
+            Self::On(Some(
+                ThinkingEffort::Medium | ThinkingEffort::High | ThinkingEffort::XHigh,
+            )) => Some("high"),
+            Self::Unset | Self::Off | Self::On(None) => None,
         }
     }
 }
@@ -360,6 +384,20 @@ mod tests {
         assert_eq!(ThinkingRequest::Off.two_mode_effort(), "none");
         assert_eq!(ThinkingRequest::On(None).two_mode_effort(), "high");
         assert_eq!(ThinkingRequest::On(Some(Low)).two_mode_effort(), "high");
+        // reasoning_budget of a DeepSeek V4.1 model: low, or high where the
+        // request names medium, high or xhigh; otherwise the template's own
+        // default, and it thinks unless the request disables it.
+        assert_eq!(ThinkingRequest::Unset.budget(), None);
+        assert_eq!(ThinkingRequest::Off.budget(), None);
+        assert_eq!(ThinkingRequest::On(None).budget(), None);
+        assert_eq!(ThinkingRequest::On(Some(Minimal)).budget(), Some("low"));
+        assert_eq!(ThinkingRequest::On(Some(Low)).budget(), Some("low"));
+        for effort in [Medium, High, XHigh] {
+            assert_eq!(ThinkingRequest::On(Some(effort)).budget(), Some("high"));
+        }
+        assert!(ThinkingRequest::Unset.enabled_unless_off());
+        assert!(ThinkingRequest::On(None).enabled_unless_off());
+        assert!(!ThinkingRequest::Off.enabled_unless_off());
     }
 
     #[test]

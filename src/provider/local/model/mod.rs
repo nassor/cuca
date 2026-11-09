@@ -170,9 +170,18 @@
 
 pub(crate) mod arch;
 pub(crate) mod cpu;
+pub(crate) mod csa;
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) mod csa_kernel;
 pub(crate) mod delta;
+pub(crate) mod engram;
+pub(crate) mod engram_io;
 #[cfg(feature = "provider-local-gpu")]
 pub(crate) mod gpu;
+pub(crate) mod hc;
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) mod hc_kernel;
+pub(crate) mod kvquant;
 pub(crate) mod layout;
 pub(crate) mod moe;
 #[cfg(feature = "provider-local-gpu")]
@@ -183,6 +192,8 @@ pub(crate) mod paged;
 pub(crate) mod paged_kernel;
 pub(crate) mod params;
 mod pool;
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) mod qdq_kernel;
 pub(crate) mod qmm;
 pub(crate) mod quant;
 pub(crate) mod rope;
@@ -191,19 +202,17 @@ pub(crate) mod tier;
 #[cfg(test)]
 pub(crate) mod tiny;
 #[cfg(feature = "provider-local-gpu")]
+pub(crate) mod topk_kernel;
+#[cfg(feature = "provider-local-gpu")]
 pub(crate) mod tp;
 
-use std::fs::File;
-use std::io::BufReader;
-use std::path::Path;
-
+use crate::provider::local::gguf;
 use candle_core::Device;
-use candle_core::quantized::gguf_file;
 
 use self::layout::name;
 use self::params::Hparams;
 use self::rope::{CosSin, Factors};
-use super::{ExpertPlacement, ExpertTiers, LocalDevice};
+use super::{EngramCache, ExpertPlacement, ExpertTiers, LocalDevice};
 use crate::error::CucaError;
 use crate::types::ProviderEndpoint;
 
@@ -243,6 +252,10 @@ pub(crate) struct SeqRows<'a> {
     /// The tokens, at positions `start_pos..`.
     pub(crate) tokens: &'a [u32],
     pub(crate) start_pos: usize,
+    /// The sequence's tokens before `start_pos` (at least the last few; empty
+    /// is allowed for a sequence that starts at 0): a model that hashes
+    /// n-grams of the tokens reads the ones ahead of the first row here.
+    pub(crate) history: &'a [u32],
     /// The sequence's block tables, one per K/V group of the model, holding
     /// every block the rows write.
     pub(crate) tables: &'a [paged::BlockTable],
@@ -270,6 +283,7 @@ impl<'a> Batch<'a> {
     pub(crate) fn single(
         tokens: &'a [u32],
         start_pos: usize,
+        history: &'a [u32],
         tables: &'a [paged::BlockTable],
         want: Want,
         hidden: cpu::Hidden,
@@ -279,6 +293,7 @@ impl<'a> Batch<'a> {
             rows: vec![SeqRows {
                 tokens,
                 start_pos,
+                history,
                 tables,
                 state: StateSlot(0),
                 want,
@@ -350,6 +365,30 @@ pub(crate) fn prefill_chunk(context_length: usize) -> usize {
     (2_097_152 / context_length.max(1)).clamp(16, 256)
 }
 
+/// Rows of a prefill step of a model whose routed experts are tiered, when
+/// its attention keeps no context-wide score matrix ([`prefill_rows`]).
+pub(crate) const TIERED_PREFILL_ROWS: usize = 4096;
+
+/// Most tokens one prefill call of the model `hp` processes by default.
+///
+/// Usually [`prefill_chunk`]. With tiered experts a step costs the reads of
+/// every expert some row of it routes to, and `n` rows of a model that picks
+/// `k` of `E` experts touch `E (1 - (1 - k / E)^n)` distinct experts per layer
+/// (98 % of them at 256 rows for `E = 384`, `k = 6`): the read cost of a step
+/// is nearly independent of its rows past that, so throughput grows with the
+/// rows, and the step is [`TIERED_PREFILL_ROWS`]. That is allowed only for
+/// attention that never builds an `n_head * chunk * context_length` score
+/// matrix (compressed sparse attention scores one row and head at a time with
+/// an online softmax); any other attention keeps the [`prefill_chunk`] bound.
+pub(crate) fn prefill_rows(hp: &Hparams, context_length: usize, tiered: bool) -> usize {
+    let base = prefill_chunk(context_length);
+    if tiered && hp.moe.is_some() && hp.csa.is_some() {
+        base.max(TIERED_PREFILL_ROWS)
+    } else {
+        base
+    }
+}
+
 /// Most rows one forward call writes: the largest [`prefill_chunk`], and the
 /// widest verification call ([`cpu::MAX_VERIFY_ROWS`]). The sliding-window
 /// block pools are sized for it ([`paged::KvLayout::new`]).
@@ -360,8 +399,7 @@ pub(crate) fn max_call_rows(context_length: usize) -> usize {
 /// The per-pair factors of `spec`, read from the tensor its [`Factors`]
 /// names, validated against the rotated pair count.
 fn rope_factors(
-    content: &gguf_file::Content,
-    path: &Path,
+    content: &gguf::Content,
     hp: &Hparams,
     spec: &rope::RopeSpec,
     context_length: usize,
@@ -372,9 +410,9 @@ fn rope_factors(
         Factors::LongShort if context_length > hp.n_ctx_orig => name::ROPE_FACTORS_LONG,
         Factors::LongShort => name::ROPE_FACTORS_SHORT,
     };
-    let mut reader = BufReader::new(File::open(path)?);
     let values = content
-        .tensor(&mut reader, tensor, &Device::Cpu)
+        .reader()
+        .tensor(tensor, &Device::Cpu)
         .and_then(|q| q.dequantize(&Device::Cpu))
         .and_then(|t| t.flatten_all())
         .and_then(|t| t.to_vec1::<f32>())
@@ -397,15 +435,14 @@ fn rope_factors(
 /// Cosine and sine tables for every distinct rotary embedding of `hp`, for
 /// `context_length` positions.
 pub(crate) fn build_rope_tables(
-    content: &gguf_file::Content,
-    path: &Path,
+    content: &gguf::Content,
     hp: &Hparams,
     context_length: usize,
 ) -> Result<Vec<CosSin>, CucaError> {
     hp.ropes
         .iter()
         .map(|spec| {
-            let factors = rope_factors(content, path, hp, spec, context_length)?;
+            let factors = rope_factors(content, hp, spec, context_length)?;
             Ok(spec.tables(factors.as_deref(), context_length))
         })
         .collect()
@@ -428,7 +465,7 @@ pub(crate) fn check_context(hp: &Hparams, context_length: usize) -> Result<(), C
 ///
 /// [`CucaError::Provider`] for a DFlash drafter file (it needs a target, see
 /// [`mtp::Drafter`]) or whatever [`Hparams::from_metadata`] rejects.
-pub(crate) fn read_hparams(content: &gguf_file::Content) -> Result<Hparams, CucaError> {
+pub(crate) fn read_hparams(content: &gguf::Content) -> Result<Hparams, CucaError> {
     if content
         .metadata
         .get("general.architecture")
@@ -490,7 +527,8 @@ impl Model {
     /// positions; `shards` are the devices after `device` that share the
     /// model (tensor parallelism, GPU only: empty for one device); `sizing`
     /// says how many sequences the K/V pools and the recurrent-state slots
-    /// serve.
+    /// serve; `engram` sizes the Engram table's row cache and readers (a
+    /// model with such a table).
     ///
     /// # Errors
     ///
@@ -501,47 +539,47 @@ impl Model {
     /// read.
     #[expect(
         clippy::too_many_arguments,
-        reason = "the file, the devices, the placements and the sizing are independent inputs"
+        reason = "the load's independent inputs; a struct would only rename them"
     )]
     pub(crate) fn load(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
         shards: &[LocalDevice],
         experts: &ExpertPlacement,
         sizing: &paged::Sizing,
         gpu_layers: Option<usize>,
+        engram: &EngramCache,
     ) -> Result<Self, CucaError> {
         if let Some(n) = gpu_layers {
             return Self::load_offloaded(
                 content,
-                path,
                 context_length,
                 device,
                 shards,
                 experts,
                 sizing,
                 n,
+                engram,
             );
         }
         match device {
             LocalDevice::Cpu => Ok(Model::Cpu(cpu::Transformer::load_placed(
                 content,
-                path,
                 context_length,
                 experts,
                 sizing,
+                engram,
             )?)),
             #[cfg(feature = "provider-local-gpu")]
             device => Ok(Model::Gpu(gpu::GpuTransformer::load_placed(
                 content,
-                path,
                 context_length,
                 device,
                 shards,
                 experts,
                 sizing,
+                engram,
             )?)),
             #[cfg(not(feature = "provider-local-gpu"))]
             device => {
@@ -564,17 +602,17 @@ impl Model {
     /// `device`, or a GPU compiled out; otherwise as [`Model::load`].
     #[expect(
         clippy::too_many_arguments,
-        reason = "the file, the devices, the placements and the sizing are independent inputs"
+        reason = "the load's independent inputs; a struct would only rename them"
     )]
     fn load_offloaded(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
         shards: &[LocalDevice],
         experts: &ExpertPlacement,
         sizing: &paged::Sizing,
         gpu_layers: usize,
+        engram: &EngramCache,
     ) -> Result<Self, CucaError> {
         if !shards.is_empty() {
             return Err(CucaError::Config(
@@ -592,33 +630,33 @@ impl Model {
             // Nothing on the GPU: a CPU model, no device opens.
             split::Placement::Cpu => Self::load(
                 content,
-                path,
                 context_length,
                 LocalDevice::Cpu,
                 &[],
                 &cpu_experts(experts),
                 sizing,
                 None,
+                engram,
             ),
             split::Placement::Gpu => Self::load(
                 content,
-                path,
                 context_length,
                 device,
                 &[],
                 experts,
                 sizing,
                 None,
+                engram,
             ),
             #[cfg(feature = "provider-local-gpu")]
             split::Placement::Split { first } => Ok(Model::Split(split::SplitModel::load(
                 content,
-                path,
                 context_length,
                 device,
                 experts,
                 sizing,
                 first,
+                engram,
             )?)),
             #[cfg(not(feature = "provider-local-gpu"))]
             split::Placement::Split { .. } => Err(super::device_unavailable(device)
@@ -644,6 +682,32 @@ impl Model {
     /// with `ExpertPlacement::Tiered`.
     pub(crate) fn expert_tiers(&self) -> Option<std::sync::Arc<tier::TierShared>> {
         on_model!(self, m => m.expert_tiers())
+    }
+
+    /// The counters of the Engram table's row cache; `None` for a model
+    /// without an Engram table (and for one on a GPU, which has none yet).
+    pub(crate) fn engram_counters(&self) -> Option<std::sync::Arc<engram_io::EngramCounters>> {
+        match self {
+            Model::Cpu(m) => m.engram_counters(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.engram_counters(),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.engram_counters(),
+        }
+    }
+
+    /// Hint that the rows of `tokens` (the next ones of a sequence whose
+    /// earlier tokens are `history`) will be looked up soon: a model with an
+    /// Engram table starts reading their table rows in the background. Changes
+    /// no output.
+    pub(crate) fn engram_prefetch(&self, history: &[u32], tokens: &[u32]) {
+        match self {
+            Model::Cpu(m) => m.engram_prefetch(history, tokens),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.engram_prefetch(history, tokens),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(m) => m.engram_prefetch(history, tokens),
+        }
     }
 
     /// Run the rows of several sequences through the model in one pass (a

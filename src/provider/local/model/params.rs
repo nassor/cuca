@@ -8,9 +8,10 @@
 
 use std::collections::HashMap;
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 
 use super::arch::{Act, Arch, AttnScale, Behavior, EmbdScale, Swa};
+use super::csa::{CsaGlobals, CsaSpec, EngramSpec, HyperSpec, MoeExt};
 use super::rope::{Factors, RopeSpec, Yarn};
 use super::{err, meta_err};
 use crate::error::CucaError;
@@ -56,7 +57,7 @@ impl<'a> Keys<'a> {
         format!("{}.{key}", self.prefix)
     }
 
-    fn value(&self, key: &str) -> Option<&'a Value> {
+    pub(crate) fn value(&self, key: &str) -> Option<&'a Value> {
         self.md.get(&self.full(key))
     }
 
@@ -206,6 +207,12 @@ pub(crate) struct LayerSpec {
     /// that row, [`MlaSpec::latent_width`]) and the value is its first
     /// [`MlaSpec::kv_lora`] columns.
     pub(crate) mla: Option<MlaSpec>,
+    /// One shared vector per position serves as key and value (the cache
+    /// holds one array per layer, [`Behavior::compressed_attention`](super::arch::Behavior)).
+    pub(crate) kv_is_value: bool,
+    /// Compressed sparse attention role (`None`: the layer attends to its
+    /// window only, or is not a compressed-attention layer at all).
+    pub(crate) csa: Option<CsaSpec>,
 }
 
 /// Dimensions of a multi-head latent attention layer (DeepSeek-style, as
@@ -257,7 +264,7 @@ impl LayerSpec {
     /// values, or the latent row alone (the value is a slice of it).
     pub(crate) fn kv_floats_per_position(&self) -> usize {
         let per_row = self.n_kv_head * self.head_dim;
-        if self.mla.is_some() {
+        if self.mla.is_some() || self.kv_is_value {
             per_row
         } else {
             2 * per_row
@@ -345,6 +352,16 @@ pub(crate) struct Hparams {
     /// blocks). It is not part of [`Hparams::layers`], so the trunk's K/V
     /// accounting ([`KvLayout`](super::paged::KvLayout)) leaves it out.
     pub(crate) nextn: Option<LayerSpec>,
+    /// Hyper-connection residual streams
+    /// ([`Behavior::hyper_connections`](super::arch::Behavior)).
+    pub(crate) hyper: Option<HyperSpec>,
+    /// What the compressed-attention layers share
+    /// ([`Behavior::compressed_attention`](super::arch::Behavior)).
+    pub(crate) csa: Option<CsaGlobals>,
+    /// Hashed table lookups ([`Behavior::engram`](super::arch::Behavior)).
+    pub(crate) engram: Option<EngramSpec>,
+    /// The router beyond softmax ([`Behavior::moe_ext`](super::arch::Behavior)).
+    pub(crate) moe_ext: Option<MoeExt>,
 }
 
 impl Hparams {
@@ -362,6 +379,7 @@ impl Hparams {
     }
 
     /// Layers that compute their own K/V.
+    #[cfg(test)]
     pub(crate) fn kv_owners(&self) -> impl Iterator<Item = (usize, &LayerSpec)> {
         self.layers
             .iter()
@@ -600,6 +618,10 @@ impl Hparams {
         };
 
         let mut ropes: Vec<RopeSpec> = Vec::new();
+        let csa = behavior
+            .compressed_attention
+            .then(|| super::csa::read_csa(&k, arch, n_layer, &n_head, &mut ropes))
+            .transpose()?;
         // The geometry of attention block `il` (a trunk layer, or the
         // prediction block that follows the trunk), reading its K/V from
         // `kv_source`.
@@ -697,10 +719,21 @@ impl Hparams {
                 kv_source,
                 scale: scale as f32,
                 mla,
+                kv_is_value: false,
+                csa: None,
             })
         };
         let mut layers = Vec::with_capacity(n_layer);
-        for il in 0..n_layer {
+        let csa_globals = match csa {
+            Some((csa_layers, globals)) => {
+                layers = csa_layers;
+                Some(globals)
+            }
+            None => None,
+        };
+        // The compressed-attention stack has built its layers already.
+        let plain_layers = if csa_globals.is_some() { 0 } else { n_layer };
+        for il in 0..plain_layers {
             if let Some((interval, delta)) = hybrid
                 && !(il + 1).is_multiple_of(interval)
             {
@@ -714,6 +747,8 @@ impl Hparams {
                     kv_source: usize::MAX,
                     scale: 1.0,
                     mla: None,
+                    kv_is_value: false,
+                    csa: None,
                 });
                 continue;
             }
@@ -760,6 +795,18 @@ impl Hparams {
             None
         };
         let moe = read_moe(&k, arch, &behavior)?;
+        let hyper = behavior
+            .hyper_connections
+            .then(|| super::csa::read_hyper(&k, arch))
+            .transpose()?;
+        let engram = behavior
+            .engram
+            .then(|| super::csa::read_engram(md, arch, &k, n_layer))
+            .transpose()?;
+        let moe_ext = behavior
+            .moe_ext
+            .then(|| super::csa::read_moe_ext(md, arch, &k, n_layer))
+            .transpose()?;
 
         let leading_dense = if behavior.mla {
             let n = k.usize_opt("leading_dense_block_count")?.unwrap_or(0);
@@ -802,6 +849,10 @@ impl Hparams {
             attn_temp,
             nextn_predict_layers,
             nextn,
+            hyper,
+            csa: csa_globals,
+            engram,
+            moe_ext,
         })
     }
 }
@@ -934,7 +985,7 @@ fn read_moe(k: &Keys<'_>, arch: Arch, behavior: &Behavior) -> Result<Option<MoeS
     Ok(Some(MoeSpec {
         n_expert,
         n_used,
-        norm_weights: if behavior.mla {
+        norm_weights: if behavior.mla || behavior.moe_ext {
             k.bool_opt("expert_weights_norm")?
                 .unwrap_or(behavior.moe_norm_weights)
         } else {
@@ -1071,7 +1122,7 @@ pub(crate) fn md(entries: &[(&str, Value)]) -> Metadata {
 
 #[cfg(test)]
 mod tests {
-    use candle_core::quantized::gguf_file::Value::{Array, Bool, F32, String as Str, U32};
+    use crate::provider::local::gguf::Value::{Array, Bool, F32, String as Str, U32};
 
     use super::super::paged::KvLayout;
     use super::super::rope::RopeKind;

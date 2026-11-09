@@ -35,14 +35,15 @@ Three presets pin the repository's current template because the published GGUFs 
 
 ### Named templates
 
-llama.cpp's converter writes a template name instead of Jinja for some Mistral checkpoints, and llama.cpp renders it in C++ (`llm_chat_apply_template`). A `tokenizer.chat_template` or a `chat_template` override that is exactly one of the names below is expanded to equivalent Jinja at load, before anything is derived from the template (`src/provider/local/chat/builtin.rs`):
+llama.cpp's converter writes a template name instead of Jinja for some Mistral checkpoints, and llama.cpp renders it in C++ (`llm_chat_apply_template`). A `tokenizer.chat_template` or a `chat_template` override that is exactly one of the names below is expanded to equivalent Jinja at load, before anything is derived from the template (`src/provider/local/chat/builtin.rs`). `deepseek-v41` is the engine's own name: DeepSeek-V4.1 ships no Jinja, and the converter writes this name into its GGUF.
 
 | Name | Used by | Renders |
 |---|---|---|
 | `mistral-v7-tekken` | Mistral Small 3.0 and 3.1, Devstral Small 2505 | `[SYSTEM_PROMPT]{system}[/SYSTEM_PROMPT]`, `[INST]{user}[/INST]`, `{assistant}</s>` |
 | `mistral-v7` | the SentencePiece variant | the same, with one space after `[SYSTEM_PROMPT]` and `[INST]` and before each assistant turn |
+| `deepseek-v41` | DeepSeek-V4.1 | the prompt format of DeepSeek's `encoding.py`: thinking and chat modes, tools in the first system message, DSML tool calls |
 
-The port follows llama.cpp's branch: a system message is written where it stands, every role other than system and user (assistant, tool) is written as an assistant turn, no BOS is written (the tokenizer adds it), the generation prompt adds nothing, and declared tools are ignored, so the model never sees them. Any other bare name (letters, digits, `.`, `-`, `_` only) fails the load with a message naming the two supported ones, instead of rendering the name as the prompt. The table holds only names a 2025 or later model uses.
+The Mistral names follow llama.cpp's branch: a system message is written where it stands, every role other than system and user (assistant, tool) is written as an assistant turn, no BOS is written (the tokenizer adds it), the generation prompt adds nothing, and declared tools are ignored, so the model never sees them. Any other bare name (letters, digits, `.`, `-`, `_` only) fails the load with a message naming the three supported ones, instead of rendering the name as the prompt. The table holds only names a 2025 or later model uses.
 
 ## Variables and helpers
 
@@ -53,9 +54,9 @@ Variables the template sees:
 - `messages`: the request's messages in OpenAI shape; see [Request translation](@/providers/local/requests.md#request-translation).
 - `tools`: defined only when the request declares at least one tool, because templates test `tools is not none`. Each tool is `{"type": "function", "function": {"name", "description", "parameters"}}`.
 - `add_generation_prompt`: always true.
-- `enable_thinking` and `thinking`: both true when the request enables thinking, otherwise both false.
+- `enable_thinking` and `thinking`: both true when the request enables thinking, otherwise both false; for a template that reads `reasoning_budget` both are true unless the request disables thinking.
 - `preserve_thinking`: always false.
-- `reasoning_strength` and `reasoning_effort`: defined only for a template that reads them; see [Thinking](@/providers/local/requests.md#thinking).
+- `reasoning_strength`, `reasoning_effort` and `reasoning_budget`: defined only for a template that reads them; see [Thinking](@/providers/local/requests.md#thinking).
 - `bos_token` and `eos_token`: the token texts, or empty.
 
 Helpers:
@@ -65,7 +66,7 @@ Helpers:
 - The `tojson` filter lays JSON out like Python's `json.dumps` (`", "` and `": "` separators, with `indent`, `sort_keys` and `ensure_ascii`) and keeps the order of an object's keys, as Python does.
 - The `string` filter renders like Python's `str()`, so a dict prints as `{'a': 1}`.
 
-Tool call arguments stay JSON objects, as templates expect. The key order inside a tool's JSON schema (`parameters`) is the order of the request's `serde_json` map: sorted by key, unless your application enables the `preserve_order` feature of `serde_json`, in which case it is the order you wrote. Arguments of tool calls in the history are sorted the same way.
+Tool call arguments stay JSON objects, as templates expect. `provider-local` enables the `preserve_order` feature of `serde_json`, so the key order inside a tool's JSON schema (`parameters`) and inside a call's arguments is the order the caller wrote, which the `deepseek-v41` template writes out parameter by parameter.
 
 ## Reasoning
 
@@ -73,7 +74,7 @@ When the template writes a reasoning block, the engine finds its markers from th
 
 - `<|channel>thought` ... `<channel|>`: Gemma 4's channel. The template must contain `<|channel>` and the vocabulary both markers. The header word `thought` and the whitespace after the opening marker are dropped.
 - `[THINK]` ... `[/THINK]`: Mistral Small 4 and Ministral 3. Both are single control tokens and the template must mention `[THINK]`. The prompt ends after `[/INST]`, so the model opens the block itself, and a `[TOOL_CALLS]` written inside it stays reasoning text.
-- `<think>` ... `</think>`: Qwen 3, Qwen 3.5, SmolLM 3, Granite 3.3 and the R1 distills; the template must contain either tag.
+- `<think>` ... `</think>`: Qwen 3, Qwen 3.5, SmolLM 3, Granite 3.3, the R1 distills and DeepSeek-V4.1; the template must contain either tag.
 - Messages addressed to `self`: Muse Glimmer's channel protocol, below.
 
 The text between the markers arrives as `Thinking` blocks. If the rendered prompt ends inside an open block, generation starts in thinking. Markers are matched on text, so a marker that the vocabulary spells as several tokens works like a single control token. A close marker with no open marker is dropped.
@@ -83,6 +84,7 @@ Whether a request can switch thinking off follows the template:
 - Gemma 4, Qwen 3, Qwen 3.5 and SmolLM 3 read `enable_thinking`, and Granite 3.3 reads `thinking`, which the request sets to the same value.
 - Muse Glimmer reads `reasoning_strength` (`low`, `medium`, `high` or `xhigh`, default `high`). It cannot switch reasoning off: a request that disables thinking gets `low`, the least reasoning the model has.
 - A template that reads `reasoning_effort` (Mistral Small 4: `none` or `high`, and it raises on any other value) is a switch like `enable_thinking`.
+- A template that reads `reasoning_budget` (DeepSeek-V4.1: `low`, `high` or `max`, default `high`) is a switch that is on by default: it reasons unless the request disables thinking.
 - The DeepSeek-R1 distills read none of these and reason on every request.
 
 `LocalModel::capabilities()` reports `reasoning` and `can_disable_thinking` from the same detection. `reasoning_tokens` in the usage counts the tokens inside reasoning blocks, markers included.
@@ -94,6 +96,7 @@ The template says how the model was taught to call tools, and the output parser 
 Syntaxes, in detection order:
 
 - Channel protocol ("ATEM"), Muse Glimmer: a turn is a sequence of messages `<|start|>assistant to=RECIPIENT<|message|>BODY END`, where `END` is `<|eom|>` when more messages follow and `<|eot|>`, an end-of-generation token, at the end of the turn. The prompt ends with `<|start|>assistant`, so generation starts at ` to=...`. A message addressed to `self` is reasoning (`Thinking` blocks), one to `user` (or without a recipient) is answer text, and any other recipient is a tool call. Its body is `<atem:function_calls>`, one `<atem:invoke name="NAME">` per call and one `<atem:parameter name="KEY">VALUE</atem:parameter>` per argument. `<|eom|>` ends a message and generation continues. Markup quoted inside an answer or inside the reasoning stays text. A value is read as JSON when it is a JSON number, boolean, `null`, list or object without surrounding whitespace and as the raw string otherwise, so a string that looks like one of these reads back as it. Detected when the template contains `<atem:function_calls>` and `<|eom|>` and the vocabulary has `<|start|>`, `<|message|>`, `<|eom|>` and `<|eot|>`.
+- DSML, DeepSeek-V4.1: a block `<｜DSML｜ calls>` ... `</｜DSML｜ calls>` that the model writes after its answer and a blank line, holding one `<｜DSML｜ invoke name="NAME">` per call and one `<｜DSML｜ parameter name="KEY" string="true|false">VALUE</｜DSML｜ parameter>` per argument. `string="true"` makes the value a JSON string of the exact text; `string="false"` parses it as JSON. A repeated parameter name is a malformed call. The opener inside reasoning starts the call. Detected when the template contains `｜DSML｜` followed by ` calls` or `tool_calls` and the vocabulary has the `｜DSML｜` token. `parse_dsml_calls` in `output/calls.rs` parses the body.
 - Mistral Small 4, Devstral, Ministral 3 and Mistral Small 3.2: `[TOOL_CALLS]name[ARGS]{json}` once per call, with no closing marker. A call ends at the next `[TOOL_CALLS]` or at the end of the reply, and the arguments are one JSON object. Mistral Small 3.2 writes `[TOOL_CALLS]name[CALL_ID]id[ARGS]{json}` and its template requires 9-character ids, so the id the model wrote becomes the call's id. Detected when the template contains `[TOOL_CALLS]` and `[ARGS]` and the vocabulary has both tokens (`[CALL_ID]` likewise).
 - Gemma 4: `<|tool_call>call:name{key:<|"|>value<|"|>}<tool_call|>` between control tokens. Detected when the template contains `<|tool_call>` and the vocabulary has both markers.
 - XML, Qwen 3.5: `<tool_call>` ... `</tool_call>` around `<function=name>` and one `<parameter=key>` element per argument, with the value between a newline after the opening tag and a newline before the closing one. Detected when the template contains `<tool_call>`, `</tool_call>`, `<function=` and `<parameter=`. A value is read as JSON when it is valid JSON and as a string otherwise, so a string argument that is itself valid JSON, such as `42` or `true`, comes back as that JSON value.
@@ -119,5 +122,6 @@ The parser holds back bytes until they form complete UTF-8, drops leading whites
 
 - `renders_match_the_reference_jinja_environment` in `src/provider/local/chat/golden.rs` renders 9 templates (Gemma 3 1B and 270M, Gemma 4, Granite 3.3, Phi 4 mini, Qwen 3, Qwen 3.5, the R1 Qwen distill, SmolLM 3) over 7 cases (a plain turn, a system prompt, a multi-turn history, thinking on and off, tools declared, a tool call with its result). The text equals what Python `jinja2` renders with `trim_blocks`, `lstrip_blocks`, a `json.dumps(ensure_ascii=False)` `tojson` and `strftime_now` pinned to 2026-10-18 UTC. The fixtures are in `src/provider/local/testdata/`.
 - `chat/golden_new.rs` runs the same test for Muse Glimmer (25 cases, every reasoning strength among them), Mistral Small 4 (42 cases: tool calls with mapping, string and empty-string arguments, reasoning as a top-level field and as content blocks, consecutive messages of one role, list contents, `reasoning_effort` `none` and `high`, and five the template rejects), Mistral Small 3.2 (29 cases, with its call ids and alternation rule) and both Ministral 3 templates (44 cases each: system prompt or none, tools, tool calls and results, reasoning in the history, multi-turn, content lists, and the cases that must raise). Every render equals what `transformers`' `apply_chat_template` gives in Python, errors included.
-- The two named templates equal llama.cpp's expected output for the v7 case of `tests/test-chat-template.cpp` and `mistral_common`'s Tekken v7 rendering of six conversations.
+- The two Mistral names equal llama.cpp's expected output for the v7 case of `tests/test-chat-template.cpp` and `mistral_common`'s Tekken v7 rendering of six conversations.
+- `chat/golden_deepseek.rs` renders the `deepseek-v41` template over 400 cases (the official test pairs, about 80 hand-written conversations and seeded random ones: system and tool messages, thinking and chat modes, efforts, tool loops, per-message tools) and requires the bytes of DeepSeek's reference `encoding.py`. `output/golden_deepseek.rs` parses 20 reference completions, cut into tokens one character at a time, in groups and with the special tokens whole, and requires the blocks the reference parser returns.
 - The unit tests of `output/atem.rs` hold the fixtures of llama.cpp's `tests/test-chat.cpp` for the channel protocol (a plain answer, a first-message call, inform-then-act, quoted markup, reasoning containing markup), and `mistral_think_then_call` in `output/mod.rs` covers the Mistral shape that llama.cpp's Ministral 3 parser also reads.

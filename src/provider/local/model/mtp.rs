@@ -109,12 +109,11 @@
 //! replaces the ones it covers and is observed together with the rest, and a
 //! reset forgets them.
 
-use std::path::Path;
-
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 
 use super::arch::Arch;
 use super::cpu::dflash::DflashNet;
+use super::cpu::dspark::DsparkNet;
 use super::cpu::{EagleHead, Hidden, NextnHead, Transformer};
 #[cfg(feature = "provider-local-gpu")]
 use super::gpu::GpuDrafter;
@@ -255,6 +254,9 @@ pub(crate) enum Drafter {
     /// A DFlash block drafter in its own file, driven by the target's
     /// per-layer features (CPU only).
     Dflash(DflashNet, Lag),
+    /// A DSpark block drafter (DeepSeek-V4.1) in its own file, driven by the
+    /// target's per-layer features (CPU only).
+    Dspark(DsparkNet, Lag),
 }
 
 impl Drafter {
@@ -265,8 +267,7 @@ impl Drafter {
     /// [`CucaError::Provider`] when `target` is not a Gemma 4 model, the
     /// hidden widths or vocabularies differ, or the file is not a drafter.
     pub(crate) fn open(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         target: &Model,
         context_length: usize,
     ) -> Result<Self, CucaError> {
@@ -278,7 +279,7 @@ impl Drafter {
         }
         match target {
             Model::Cpu(target) => {
-                let net = Transformer::load_drafter(content, path, context_length)?;
+                let net = Transformer::load_drafter(content, context_length)?;
                 if net.n_embd_out() != target.n_embd() {
                     return Err(err(format!(
                         "drafter hidden width {} differs from the target's {}: it was trained for another model size",
@@ -300,7 +301,6 @@ impl Drafter {
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(target) => Ok(Self::Gpu(GpuDrafter::open(
                 content,
-                path,
                 target,
                 context_length,
             )?)),
@@ -319,13 +319,12 @@ impl Drafter {
     /// [`CucaError::Provider`] when `target` runs on a GPU, or its file has
     /// no prediction block or lacks one of the block's tensors.
     pub(crate) fn open_in_trunk(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         target: &Model,
     ) -> Result<Self, CucaError> {
         match target {
             Model::Cpu(target) => Ok(Self::InTrunk(
-                target.load_head(content, path)?,
+                target.load_head(content)?,
                 Lag::new(target.context_length()),
             )),
             #[cfg(feature = "provider-local-gpu")]
@@ -347,11 +346,7 @@ impl Drafter {
     /// [`CucaError::Provider`] when `target` is not a `mistral4` model on the
     /// CPU, the file is not an EAGLE drafter, or it was trained for another
     /// model (see [`Transformer::load_eagle`]).
-    pub(crate) fn open_eagle(
-        content: &gguf_file::Content,
-        path: &Path,
-        target: &Model,
-    ) -> Result<Self, CucaError> {
+    pub(crate) fn open_eagle(content: &gguf::Content, target: &Model) -> Result<Self, CucaError> {
         if target.arch() != Arch::Mistral4 {
             return Err(err(format!(
                 "the `mistral4-eagle` drafter pairs with a `mistral4` model, not `{}`",
@@ -360,7 +355,7 @@ impl Drafter {
         }
         match target {
             Model::Cpu(target) => Ok(Self::Eagle(
-                target.load_eagle(content, path)?,
+                target.load_eagle(content)?,
                 Lag::new(target.context_length()),
             )),
             #[cfg(feature = "provider-local-gpu")]
@@ -383,14 +378,13 @@ impl Drafter {
     /// a plain DFlash drafter this target can feed (see
     /// [`DflashNet::open`](super::cpu::dflash::DflashNet)).
     pub(crate) fn open_dflash(
-        content: &gguf_file::Content,
-        path: &Path,
+        content: &gguf::Content,
         target: &Model,
         context_length: usize,
     ) -> Result<Self, CucaError> {
         match target {
             Model::Cpu(target) => Ok(Self::Dflash(
-                DflashNet::open(content, path, target, context_length)?,
+                DflashNet::open(content, target, context_length)?,
                 Lag::new(context_length),
             )),
             #[cfg(feature = "provider-local-gpu")]
@@ -405,17 +399,53 @@ impl Drafter {
         }
     }
 
+    /// The DSpark block drafter in `content` for `target` (DeepSeek-V4.1; a
+    /// `dflash` file with hyper-connection streams, see
+    /// [`DsparkNet::open`](super::cpu::dspark::DsparkNet)).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when `target` runs on a GPU or is not the
+    /// hyper-connection model the file was trained for.
+    pub(crate) fn open_dspark(
+        content: &gguf::Content,
+        target: &Model,
+        context_length: usize,
+    ) -> Result<Self, CucaError> {
+        match target {
+            Model::Cpu(target) => Ok(Self::Dspark(
+                DsparkNet::open(content, target, context_length)?,
+                Lag::new(context_length),
+            )),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(_) => Err(err(
+                "the DSpark drafter runs on the CPU only: use `LocalDevice::Cpu`",
+            )),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(_) => Err(CucaError::Config(
+                "the DSpark drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
+                    .into(),
+            )),
+        }
+    }
+
     /// Whether the drafter needs the trunk's hidden row of every position
     /// ([`Drafter::observe`]), not just the last one.
     pub(crate) fn observes(&self) -> bool {
-        matches!(self, Self::InTrunk(..) | Self::Eagle(..) | Self::Dflash(..))
+        matches!(
+            self,
+            Self::InTrunk(..) | Self::Eagle(..) | Self::Dflash(..) | Self::Dspark(..)
+        )
     }
 
     /// The unobserved rows of a drafter that defers its upkeep, `None` for
     /// the others.
     fn lag(&mut self) -> Option<&mut Lag> {
         match self {
-            Self::InTrunk(_, lag) | Self::Eagle(_, lag) | Self::Dflash(_, lag) => Some(lag),
+            Self::InTrunk(_, lag)
+            | Self::Eagle(_, lag)
+            | Self::Dflash(_, lag)
+            | Self::Dspark(_, lag) => Some(lag),
             _ => None,
         }
     }
@@ -520,7 +550,10 @@ impl Drafter {
     #[cfg(test)]
     pub(crate) fn pending(&self) -> usize {
         match self {
-            Self::InTrunk(_, lag) | Self::Eagle(_, lag) | Self::Dflash(_, lag) => lag.len(),
+            Self::InTrunk(_, lag)
+            | Self::Eagle(_, lag)
+            | Self::Dflash(_, lag)
+            | Self::Dspark(_, lag) => lag.len(),
             _ => 0,
         }
     }
@@ -530,9 +563,10 @@ impl Drafter {
     #[cfg(test)]
     pub(crate) fn stale_drafts(&self) -> usize {
         match self {
-            Self::InTrunk(_, lag) | Self::Eagle(_, lag) | Self::Dflash(_, lag) => {
-                lag.stale_drafts.get()
-            }
+            Self::InTrunk(_, lag)
+            | Self::Eagle(_, lag)
+            | Self::Dflash(_, lag)
+            | Self::Dspark(_, lag) => lag.stale_drafts.get(),
             _ => 0,
         }
     }
@@ -593,8 +627,19 @@ impl Drafter {
                 }
                 net.observe(pos, hidden)
             }
+            (Self::Dspark(net, _), Model::Cpu(_)) => {
+                if hidden.len() != tokens.len() * net.feature_width() {
+                    return Err(err(format!(
+                        "DSpark observe: {} tokens with {} feature floats, expected {} each",
+                        tokens.len(),
+                        hidden.len(),
+                        net.feature_width()
+                    )));
+                }
+                net.observe(pos, hidden)
+            }
             #[cfg(feature = "provider-local-gpu")]
-            (Self::InTrunk(..) | Self::Dflash(..) | Self::Eagle(..), _) => {
+            (Self::InTrunk(..) | Self::Dflash(..) | Self::Dspark(..) | Self::Eagle(..), _) => {
                 Err(err("the drafter and its target run on different devices"))
             }
             _ => Ok(()),
@@ -608,6 +653,7 @@ impl Drafter {
     pub(crate) fn feature_rows(&self) -> Option<Hidden> {
         match self {
             Self::Dflash(net, _) => Some(Hidden::Layers(net.features())),
+            Self::Dspark(net, _) => Some(Hidden::Layers(net.features())),
             _ => None,
         }
     }
@@ -616,7 +662,7 @@ impl Drafter {
     /// number of drafts it returns (a block drafter), not one pass per
     /// draft: the cost model prices such a drafter per round.
     pub(crate) fn block(&self) -> bool {
-        matches!(self, Self::Dflash(..))
+        matches!(self, Self::Dflash(..) | Self::Dspark(..))
     }
 
     /// The first `shared` tokens of the trunk's sequence stay and any later
@@ -634,6 +680,10 @@ impl Drafter {
                 head.truncate(shared);
             }
             Self::Dflash(net, lag) => {
+                lag.trim_from(shared);
+                net.truncate(shared);
+            }
+            Self::Dspark(net, lag) => {
                 lag.trim_from(shared);
                 net.truncate(shared);
             }
@@ -679,7 +729,11 @@ impl Drafter {
         pick: &mut dyn FnMut(&mut [f32]) -> Option<u32>,
     ) -> Result<Vec<u32>, CucaError> {
         #[cfg(test)]
-        if let Self::InTrunk(_, lag) | Self::Eagle(_, lag) | Self::Dflash(_, lag) = self {
+        if let Self::InTrunk(_, lag)
+        | Self::Eagle(_, lag)
+        | Self::Dflash(_, lag)
+        | Self::Dspark(_, lag) = self
+        {
             lag.stale_drafts
                 .set(lag.stale_drafts.get() + usize::from(!lag.is_empty()));
         }
@@ -707,6 +761,7 @@ impl Drafter {
                 target.eagle_draft(head, hidden, first, len, k, pick)
             }
             (Self::Dflash(net, _), Model::Cpu(target)) => net.draft(target, first, len, k, pick),
+            (Self::Dspark(net, _), Model::Cpu(target)) => net.draft(target, first, len, k, pick),
             #[cfg(feature = "provider-local-gpu")]
             (Self::Gpu(drafter), Model::Gpu(target)) => {
                 drafter.draft(target, tables, hidden, first, len, k, pick)

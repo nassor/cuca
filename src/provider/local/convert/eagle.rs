@@ -147,8 +147,9 @@ pub(crate) fn config_from_params(params: &Value) -> Result<Value, CucaError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::provider::local::gguf;
     use candle_core::Device;
-    use candle_core::quantized::{GgmlDType, gguf_file};
+    use candle_core::quantized::GgmlDType;
 
     use super::super::hf::CheckpointDir;
     use super::super::safetensors::Shards;
@@ -237,7 +238,7 @@ mod tests {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/provider/local/testdata/eagle")
     }
 
-    fn convert_fixture(tag: &str, quant: WeightQuant) -> (gguf_file::Content, std::path::PathBuf) {
+    fn convert_fixture(tag: &str, quant: WeightQuant) -> (gguf::Content, std::path::PathBuf) {
         let out = std::env::temp_dir().join(format!(
             "cuca-eagle-{tag}-{}-{}.gguf",
             std::process::id(),
@@ -245,7 +246,7 @@ mod tests {
         ));
         let ck = CheckpointDir::open(&fixture_dir()).unwrap();
         super::super::convert(&ck, &out, quant, None).unwrap();
-        let content = gguf_file::Content::read(&mut std::fs::File::open(&out).unwrap()).unwrap();
+        let content = gguf::Content::open(&out).unwrap();
         (content, out)
     }
 
@@ -336,7 +337,7 @@ mod tests {
             let mut got: Vec<(String, Vec<usize>, GgmlDType)> = content
                 .tensor_infos
                 .iter()
-                .map(|(n, i)| (n.clone(), i.shape.dims().to_vec(), i.ggml_dtype))
+                .map(|(n, i)| (n.clone(), i.shape.dims().to_vec(), i.dtype.ggml().unwrap()))
                 .collect();
             got.sort_by(|a, b| a.0.cmp(&b.0));
             want.sort_by(|a, b| a.0.cmp(&b.0));
@@ -354,10 +355,10 @@ mod tests {
     fn the_fixture_values_are_the_fp8_values_times_their_scales() {
         let (content, out) = convert_fixture("values", WeightQuant::F16);
         let shards = Shards::open(&[fixture_dir().join(WEIGHTS_FILE)]).unwrap();
-        let mut file = std::fs::File::open(&out).unwrap();
-        let mut tensor = |name: &str| -> Vec<f32> {
+        let tensor = |name: &str| -> Vec<f32> {
             content
-                .tensor(&mut file, name, &Device::Cpu)
+                .reader()
+                .tensor(name, &Device::Cpu)
                 .unwrap()
                 .dequantize(&Device::Cpu)
                 .unwrap()

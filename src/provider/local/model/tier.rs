@@ -15,6 +15,10 @@
 //!   GPU: packed, upload-ready host bytes);
 //! - disk: the GGUF file, read with positional reads ([`read_exact_at`])
 //!   by a pool of loader threads, so one file handle serves every thread.
+//!   On Windows the handle is opened unbuffered (`FILE_FLAG_NO_BUFFERING`, see
+//!   [`ExpertFile`]) so the expert sweep does not fill the OS cache; elsewhere
+//!   reads stay buffered, because `O_DIRECT` cannot be requested without
+//!   `unsafe` code or a new dependency.
 //!
 //! # Bounds
 //!
@@ -60,7 +64,7 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
 
-use candle_core::quantized::{GgmlDType, gguf_file};
+use crate::provider::local::gguf::{self, GgufType};
 
 use super::err;
 use super::layout::tensor_info;
@@ -134,13 +138,124 @@ pub(crate) fn read_exact_at(file: &File, offset: u64, buf: &mut [u8]) -> std::io
     read_fully_at(buf, offset, |rest, at| read_some_at(file, rest, at))
 }
 
+/// Alignment of unbuffered reads: buffer address, file offset and length must
+/// be multiples of the volume's sector size (512 or 4096 bytes).
+const DIRECT_ALIGN: usize = 4096;
+
+/// `FILE_FLAG_NO_BUFFERING` of `CreateFile`.
+#[cfg(windows)]
+const FILE_FLAG_NO_BUFFERING: u32 = 0x2000_0000;
+
+/// A reusable buffer for [`ExpertFile::read`]: the bytes asked for are the
+/// slice [`ReadBuf::bytes`], somewhere inside the allocation (an unbuffered
+/// read needs an aligned start and an aligned length).
+#[derive(Default)]
+struct ReadBuf {
+    raw: Vec<u8>,
+    from: usize,
+    len: usize,
+}
+
+impl ReadBuf {
+    fn bytes(&self) -> &[u8] {
+        &self.raw[self.from..self.from + self.len]
+    }
+}
+
+/// A file of the GGUF set read for experts: with the OS cache bypassed where
+/// the platform allows it from safe code (Windows: `FILE_FLAG_NO_BUFFERING`),
+/// else buffered.
+///
+/// Experts stream through the RAM tier, which is the cache that matters:
+/// buffered reads would duplicate every expert in the OS cache (hundreds of
+/// gigabytes of mostly cold experts that evict the engine's own working set
+/// and fill Windows' standby list). The unbuffered path reads the sector
+/// aligned superset of the range (at most one alignment unit of waste at each
+/// end) into an over-allocated buffer, whose aligned window is found from the
+/// buffer's address (no `unsafe`). Unix would need `O_DIRECT`, whose open flag
+/// is not exposed by the standard library (`libc` would be a new dependency),
+/// so there reads stay buffered, as they do where the platform refuses the
+/// flag (for example a network share).
+struct ExpertFile {
+    file: File,
+    direct: bool,
+}
+
+impl ExpertFile {
+    /// Open `path`, unbuffered when the platform allows it.
+    fn open(path: &Path) -> std::io::Result<Self> {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            let direct = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_NO_BUFFERING)
+                .open(path);
+            if let Ok(file) = direct {
+                return Ok(Self { file, direct: true });
+            }
+        }
+        Ok(Self {
+            file: File::open(path)?,
+            direct: false,
+        })
+    }
+
+    /// Read the `len` bytes at `offset` into `buf`.
+    ///
+    /// # Errors
+    ///
+    /// The I/O error; [`std::io::ErrorKind::UnexpectedEof`] when the file ends first.
+    fn read(&self, offset: u64, len: usize, buf: &mut ReadBuf) -> std::io::Result<()> {
+        if !self.direct {
+            buf.raw.resize(len, 0);
+            buf.from = 0;
+            buf.len = len;
+            return read_exact_at(&self.file, offset, &mut buf.raw);
+        }
+        let head = (offset % DIRECT_ALIGN as u64) as usize;
+        let span = (head + len).next_multiple_of(DIRECT_ALIGN);
+        buf.raw.resize(span + DIRECT_ALIGN, 0);
+        let from = buf.raw.as_ptr().align_offset(DIRECT_ALIGN);
+        let window = buf
+            .raw
+            .get_mut(from..from + span)
+            .ok_or_else(|| std::io::Error::other("no aligned window in the read buffer"))?;
+        // The file may end inside the last unit: accept a short read once the
+        // range is covered (whole units are asked for, as the flag requires).
+        let need = head + len;
+        let at = offset - head as u64;
+        let mut done = 0;
+        while done < need {
+            match read_some_at(&self.file, &mut window[done..], at + done as u64) {
+                Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+                Ok(n) => {
+                    done += n;
+                    // Only the end of the file ends a read inside a unit, and
+                    // the next read could not be unit aligned anyway.
+                    if done < need && !done.is_multiple_of(DIRECT_ALIGN) {
+                        return Err(std::io::ErrorKind::UnexpectedEof.into());
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
+            }
+        }
+        buf.from = from + head;
+        buf.len = len;
+        Ok(())
+    }
+}
+
 /// Where one expert's `[rows, cols]` matrix of a stacked `[n_expert, rows,
 /// cols]` tensor lives in the file.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ExpertSlice {
-    pub(crate) dtype: GgmlDType,
+    pub(crate) dtype: GgufType,
     pub(crate) rows: usize,
     pub(crate) cols: usize,
+    /// The file of the set that holds the tensor.
+    file: usize,
     /// File offset of expert 0.
     start: u64,
     /// Bytes of one expert's matrix in the file.
@@ -154,7 +269,7 @@ impl ExpertSlice {
     /// The expert layout of `tensor_name`, which must have the shape
     /// `[n_expert, rows, cols]` and whole blocks per row.
     pub(crate) fn read(
-        content: &gguf_file::Content,
+        content: &gguf::Content,
         tensor_name: &str,
         n_expert: usize,
         rows: usize,
@@ -168,20 +283,22 @@ impl ExpertSlice {
                 info.shape.dims()
             )));
         }
-        let dtype = info.ggml_dtype;
-        if !cols.is_multiple_of(dtype.block_size()) {
+        let dtype = info.dtype;
+        let Some(row_bytes) = dtype.byte_len(cols) else {
             return Err(err(format!(
-                "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size {}",
-                dtype.block_size()
+                "tensor `{tensor_name}`: row length {cols} is not a whole number of {} blocks",
+                dtype.name()
             )));
-        }
+        };
+        let (_, start) = content.location(info);
         Ok(Self {
             dtype,
             rows,
             cols,
-            start: content.tensor_data_offset + info.offset,
-            file_bytes: rows * (cols / dtype.block_size() * dtype.type_size()),
-            stride: rows * (cols / dtype.block_size() * dtype.type_size()),
+            file: info.file,
+            start,
+            file_bytes: rows * row_bytes,
+            stride: rows * row_bytes,
         })
     }
 
@@ -189,7 +306,7 @@ impl ExpertSlice {
     /// shape `[n_expert, 2 * ff, cols]`: for every expert the first `ff` rows
     /// are the gate matrix and the next `ff` rows the up matrix.
     pub(crate) fn read_fused(
-        content: &gguf_file::Content,
+        content: &gguf::Content,
         tensor_name: &str,
         n_expert: usize,
         ff: usize,
@@ -208,6 +325,26 @@ impl ExpertSlice {
             ..gate
         };
         Ok((gate, up))
+    }
+
+    /// The candle type of the experts' blocks.
+    ///
+    /// # Errors
+    ///
+    /// A type candle's block layouts do not cover (MXFP4 has its own kernels,
+    /// not a candle type).
+    pub(crate) fn ggml(&self) -> Result<candle_core::quantized::GgmlDType, CucaError> {
+        self.dtype.ggml().ok_or_else(|| {
+            err(format!(
+                "experts of type {} cannot run on this engine",
+                self.dtype.name()
+            ))
+        })
+    }
+
+    /// The file of the set that holds the experts.
+    pub(crate) fn file(&self) -> usize {
+        self.file
     }
 
     /// File offset of expert `e`'s matrix.
@@ -575,28 +712,30 @@ struct Job<T> {
 
 /// What every loader thread reads.
 struct LoaderCtx<T> {
-    file: File,
+    /// The files of the GGUF set, indexed like [`ExpertSlice::file`].
+    files: Vec<ExpertFile>,
     layers: Vec<Option<LayerExperts>>,
     build: Arc<BuildFn<T>>,
 }
 
 impl<T> LoaderCtx<T> {
-    fn load(&self, job_layer: usize, e: u32, bufs: &mut [Vec<u8>; 3]) -> Reply<T> {
+    fn load(&self, job_layer: usize, e: u32, bufs: &mut [ReadBuf; 3]) -> Reply<T> {
         let layer = self
             .layers
             .get(job_layer)
             .and_then(Option::as_ref)
             .ok_or_else(|| err(format!("layer {job_layer} has no experts")))?;
         for (buf, slice) in bufs.iter_mut().zip([&layer.gate, &layer.up, &layer.down]) {
-            buf.resize(slice.file_bytes, 0);
-            read_exact_at(&self.file, slice.offset(e as usize), buf).map_err(|io| {
-                err(format!(
-                    "layer {} expert {e}: {io} (truncated GGUF?)",
-                    layer.il
-                ))
-            })?;
+            self.files[slice.file]
+                .read(slice.offset(e as usize), slice.file_bytes, buf)
+                .map_err(|io| {
+                    err(format!(
+                        "layer {} expert {e}: {io} (truncated GGUF?)",
+                        layer.il
+                    ))
+                })?;
         }
-        let value = (self.build)(layer, &bufs[0], &bufs[1], &bufs[2])?;
+        let value = (self.build)(layer, bufs[0].bytes(), bufs[1].bytes(), bufs[2].bytes())?;
         let read = layer.gate.file_bytes + layer.up.file_bytes + layer.down.file_bytes;
         Ok((Arc::new(value), read))
     }
@@ -622,7 +761,7 @@ impl<T: Send + Sync + 'static> Loader<T> {
             let handle = std::thread::Builder::new()
                 .name(format!("cuca-expert-loader-{i}"))
                 .spawn(move || {
-                    let mut bufs = [Vec::new(), Vec::new(), Vec::new()];
+                    let mut bufs: [ReadBuf; 3] = Default::default();
                     loop {
                         let job = queue.lock().unwrap_or_else(PoisonError::into_inner).recv();
                         let Ok(job) = job else { return };
@@ -681,7 +820,7 @@ pub(crate) struct ExpertStore<T> {
 }
 
 impl<T: Send + Sync + 'static> ExpertStore<T> {
-    /// Open the file at `path` for the experts of `layers` (every MoE layer
+    /// Open the `files` of the GGUF set for the experts of `layers` (every MoE layer
     /// of a model with `n_layer` layers) behind a RAM tier of `ram_bytes`,
     /// with `loader_threads` readers that build each expert with `build`.
     /// `allow_no_ram` accepts `ram_bytes == 0` (no RAM tier).
@@ -695,7 +834,7 @@ impl<T: Send + Sync + 'static> ExpertStore<T> {
         reason = "the file, the model shape, the budget and the loader are independent inputs"
     )]
     pub(crate) fn open(
-        path: &Path,
+        files: &[&Path],
         n_layer: usize,
         layers: Vec<LayerExperts>,
         n_expert: usize,
@@ -719,7 +858,10 @@ impl<T: Send + Sync + 'static> ExpertStore<T> {
             }
         }
         let ctx = Arc::new(LoaderCtx {
-            file: File::open(path)?,
+            files: files
+                .iter()
+                .map(|path| ExpertFile::open(path))
+                .collect::<Result<_, _>>()?,
             layers: by_layer,
             build,
         });
@@ -985,6 +1127,8 @@ impl<T: Send + Sync + 'static> Pass<'_, T> {
 
 #[cfg(test)]
 mod tests {
+    use candle_core::quantized::GgmlDType;
+
     use super::*;
     use std::io::Write;
     use std::sync::atomic::AtomicUsize;
@@ -1021,6 +1165,46 @@ mod tests {
         read_exact_at(&file, 3, &mut buf[..2]).unwrap();
         assert_eq!(&buf[..2], &[3, 4]);
         let e = read_exact_at(&file, 250, &mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn aligned_reads_return_the_requested_range_and_stop_at_the_end() {
+        let bytes: Vec<u8> = (0..20_000u32).map(|i| (i * 7 + i / 251) as u8).collect();
+        let tmp = TempFile::new("direct", &bytes);
+        let direct = ExpertFile {
+            file: File::open(&tmp.0).unwrap(),
+            direct: true,
+        };
+        let mut buf = ReadBuf::default();
+        let ranges = [
+            (0, 1),
+            (0, 4096),
+            (1, 4096),
+            (4095, 2),
+            (4096, 8192),
+            (5000, 9000),
+            (12_345, 7_655),
+            (19_999, 1),
+            (16_384, 3_616),
+        ];
+        for (offset, len) in ranges {
+            direct.read(offset, len, &mut buf).unwrap();
+            let want = &bytes[offset as usize..offset as usize + len];
+            assert_eq!(buf.bytes(), want, "offset {offset} len {len}");
+        }
+        // Past the end: the file stops before the range does.
+        let e = direct.read(19_990, 20, &mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        let e = direct.read(20_000, 1, &mut buf).unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+        // The platform's own open reads the same bytes.
+        let platform = ExpertFile::open(&tmp.0).unwrap();
+        platform.read(777, 15_000, &mut buf).unwrap();
+        assert_eq!(buf.bytes(), &bytes[777..15_777]);
+        platform.read(19_990, 10, &mut buf).unwrap();
+        assert_eq!(buf.bytes(), &bytes[19_990..]);
+        let e = platform.read(19_990, 11, &mut buf).unwrap_err();
         assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
@@ -1213,8 +1397,9 @@ mod tests {
                     bytes.extend(std::iter::repeat_n((il * 16 + e) as u8, file_bytes));
                 }
                 ExpertSlice {
-                    dtype: GgmlDType::F32,
+                    dtype: GgufType::Ggml(GgmlDType::F32),
                     rows: 1,
+                    file: 0,
                     cols: 4,
                     start,
                     file_bytes,
@@ -1244,7 +1429,7 @@ mod tests {
         });
         let shared = Arc::new(TierShared::new(n_layer, n_expert));
         let store = ExpertStore::open(
-            &tmp.0,
+            &[tmp.0.as_path()],
             n_layer,
             layers,
             n_expert,

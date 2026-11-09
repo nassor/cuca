@@ -6,7 +6,7 @@
 //! build their weights from it, so optional tensors are handled the same on
 //! the CPU and on a GPU.
 
-use candle_core::quantized::gguf_file;
+use crate::provider::local::gguf;
 
 use super::err;
 use super::params::{Hparams, LayerSpec};
@@ -45,6 +45,34 @@ pub(crate) mod name {
     pub(crate) const ATTN_KV_A_NORM: &str = "attn_kv_a_norm";
     pub(crate) const ATTN_K_B: &str = "attn_k_b";
     pub(crate) const ATTN_V_B: &str = "attn_v_b";
+    // Latent multi-query attention with compressed sparse attention
+    // (DeepSeek V4.1): the single shared K/V projection, the grouped
+    // low-rank output projection (`a` per group, `b` over the groups), the
+    // per-head sinks, the compressor of the cache owners and the indexer.
+    pub(crate) const ATTN_KV: &str = "attn_kv";
+    pub(crate) const ATTN_OUTPUT_A: &str = "attn_output_a";
+    pub(crate) const ATTN_OUTPUT_B: &str = "attn_output_b";
+    pub(crate) const ATTN_SINKS: &str = "attn_sinks";
+    pub(crate) const ATTN_COMPRESSOR_KV: &str = "attn_compressor_kv";
+    pub(crate) const ATTN_COMPRESSOR_GATE: &str = "attn_compressor_gate";
+    pub(crate) const ATTN_COMPRESSOR_NORM: &str = "attn_compressor_norm";
+    pub(crate) const INDEXER_ATTN_K: &str = "indexer.attn_k";
+    pub(crate) const INDEXER_K_NORM: &str = "indexer.k_norm";
+    pub(crate) const INDEXER_ATTN_Q_B: &str = "indexer.attn_q_b";
+    pub(crate) const INDEXER_PROJ: &str = "indexer.proj";
+    // Hyper-connection coefficient sites of the attention and the FFN.
+    pub(crate) const HC_ATTN_FN: &str = "hc_attn_fn";
+    pub(crate) const HC_ATTN_BASE: &str = "hc_attn_base";
+    pub(crate) const HC_ATTN_SCALE: &str = "hc_attn_scale";
+    pub(crate) const HC_FFN_FN: &str = "hc_ffn_fn";
+    pub(crate) const HC_FFN_BASE: &str = "hc_ffn_base";
+    pub(crate) const HC_FFN_SCALE: &str = "hc_ffn_scale";
+    // The router's selection-only bias (`blk.N.exp_probs_b.bias`).
+    pub(crate) const EXP_PROBS_B: &str = "exp_probs_b";
+    // Hashed table lookup of an engram layer: the projection of the fetched
+    // rows to the stream keys and the value, and the gate's weights.
+    pub(crate) const ENGRAM_KV: &str = "engram_kv";
+    pub(crate) const ENGRAM_GATE: &str = "engram_gate";
     pub(crate) const FFN_NORM: &str = "ffn_norm";
     pub(crate) const FFN_GATE: &str = "ffn_gate";
     pub(crate) const FFN_UP: &str = "ffn_up";
@@ -121,10 +149,29 @@ pub(crate) fn ffn_norm_part(post_attention_is_ffn_norm: bool) -> &'static str {
 }
 
 /// The index entry of `tensor_name`, without reading its data.
+#[cfg(feature = "provider-local-gpu")]
+/// The candle type of tensor `tensor`, which the engines that read tensors
+/// through candle's block layouts (every CPU path, the GPU uploads) require.
+///
+/// # Errors
+///
+/// A type only the row readers know (IQ4_NL, MXFP4, I8) or none at all.
+pub(crate) fn ggml_dtype(
+    info: &gguf::TensorInfo,
+    tensor: &str,
+) -> Result<candle_core::quantized::GgmlDType, CucaError> {
+    info.dtype.ggml().ok_or_else(|| {
+        err(format!(
+            "tensor `{tensor}` has type {}, which this engine cannot run",
+            info.dtype.name()
+        ))
+    })
+}
+
 pub(crate) fn tensor_info<'a>(
-    content: &'a gguf_file::Content,
+    content: &'a gguf::Content,
     tensor_name: &str,
-) -> Result<&'a gguf_file::TensorInfo, CucaError> {
+) -> Result<&'a gguf::TensorInfo, CucaError> {
     content.tensor_infos.get(tensor_name).ok_or_else(|| {
         err(format!(
             "tensor `{tensor_name}`: missing from the GGUF file"
@@ -186,7 +233,7 @@ pub(crate) struct LayerLayout {
     pub(crate) ffn: Ffn,
 }
 
-fn dims<'a>(content: &'a gguf_file::Content, tensor: &str) -> Result<&'a [usize], CucaError> {
+fn dims<'a>(content: &'a gguf::Content, tensor: &str) -> Result<&'a [usize], CucaError> {
     tensor_info(content, tensor).map(|i| i.shape.dims())
 }
 
@@ -201,7 +248,7 @@ impl LayerLayout {
         hp: &Hparams,
         il: usize,
         spec: &LayerSpec,
-        content: &gguf_file::Content,
+        content: &gguf::Content,
     ) -> Result<Self, CucaError> {
         let has = |tensor: &str| content.tensor_infos.contains_key(tensor);
         let has_part = |part: &str| has(&name::blk(il, part));

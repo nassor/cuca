@@ -41,9 +41,9 @@ Eight features: seven HTTP adapters and one in-process engine. Each `dep:` entry
 | `provider-llamacpp` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-vllm` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-lmstudio` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-local` | `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:tokio`, `dep:unicode-general-category`, `reqwest/rustls` |
+| `provider-local` | `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:sysinfo`, `dep:tokio`, `dep:tokenizers`, `dep:unicode-general-category`, `reqwest/rustls`, `serde_json/preserve_order` |
 
-`provider-local` does not use `tokio-stream`: its stream is a plain mpsc receiver. It uses `reqwest` only for the one-time model download.
+`provider-local` does not use `tokio-stream`: its stream is a plain mpsc receiver. It uses `reqwest` only for the one-time model download, `sysinfo` only for the free-space check of the converter's output volume, and `tokenizers` only for the converter's DeepSeek-V4.1 Engram token map; the engine's own tokenizer is hand-written. `serde_json/preserve_order` keeps JSON maps in the order the caller wrote them, which chat templates see.
 
 ## Local GPU features
 
@@ -128,7 +128,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `futures-core` | `0.3` | default |
 | `memchr` | `2` | default |
 | `serde` | `1` | `derive` |
-| `serde_json` | `1` | default |
+| `serde_json` | `1` | default; `provider-local` adds `preserve_order` |
 
 ## Optional dependencies
 
@@ -155,13 +155,14 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `minijinja` | `2.24` | `loader` | `provider-local` |
 | `minijinja-contrib` | `2.24` | `pycompat` | `provider-local` |
 | `unicode-general-category` | `1` | default | `provider-local` (the byte-level BPE pre-tokenizers) |
+| `tokenizers` | `0.22` | `onig`; no defaults | `provider-local` (the converter's Engram token map) |
 | `burn` | `0.22` | `std`, `fusion`, `autotune`, `extension`, `cubecl`; no defaults | `provider-local-gpu` (backends `burn/vulkan`, `burn/metal`, `burn/cuda`, `burn/rocm`) |
 | `burn-cubecl` | `0.22` | `std`, `fusion`, `autotune`; no defaults | `provider-local-gpu` |
 | `cubecl` | `0.11` | `stdlib`; no defaults | `provider-local-gpu` |
 | `axum` | `0.8` | `tokio`, `http1`, `json`, `query`, `matched-path`; no defaults | `server` |
 | `clap` | `4` | `derive`, `env` | `server` |
 | `tracing-subscriber` | `0.3` | `env-filter`, `json` | `server` |
-| `sysinfo` | `0.40` | `system`, `disk`; no defaults | `server` |
+| `sysinfo` | `0.40` | `system`, `disk`; no defaults | `provider-local` (the converter's free-space check), `server` |
 | `nvml-wrapper` | `0.13` | default | `server` (NVIDIA, loaded at run time) |
 | `wmi` | `0.18` | no defaults | `server`, Windows only (GPU counters) |
 | `winreg` | `0.56` | default | `server`, Windows only (adapter table) |
@@ -178,7 +179,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 
 ### C compilers and downloads
 
-- `candle-core` hard-depends on `tokenizers[onig]`, so `provider-local` compiles C through `onig_sys` and needs a C compiler.
+- `candle-core` hard-depends on `tokenizers[onig]`, so `provider-local` compiles C through `onig_sys` and needs a C compiler. `provider-local` also names `tokenizers` itself, with the same features.
 - The Vulkan and Metal backends are Rust (wgpu: SPIR-V, MSL). Every GPU feature still compiles C, because CubeCL's runtime pulls an embedded store (`turso`) that builds C through `cc`.
 - On Windows, a dependency's build script runs the SDK resource compiler (`rc.exe`; `windres` on the GNU target) for the GPU features.
 - `provider-local-cuda` and `provider-local-rocm` pull CubeCL's LLVM backend. Its build script, `tracel-llvm-bundler`, downloads a prebuilt LLVM on the first build (network needed once, then cached) and links it statically.

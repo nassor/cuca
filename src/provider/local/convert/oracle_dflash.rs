@@ -56,11 +56,8 @@ fn dflash_drafter_matches_the_transformers_reference() {
         .max()
         .unwrap();
     let ctx = longest + block + 8;
-    let mut target =
-        Transformer::load_dequantized(&read_gguf(&target_path), &target_path, ctx).unwrap();
-    let mut net =
-        DflashNet::open_dequantized(&read_gguf(&drafter_path), &drafter_path, &target, ctx)
-            .unwrap();
+    let mut target = Transformer::load_dequantized(&read_gguf(&target_path), ctx).unwrap();
+    let mut net = DflashNet::open_dequantized(&read_gguf(&drafter_path), &target, ctx).unwrap();
 
     let mut worst = 0f32;
     let mut seen = 0;

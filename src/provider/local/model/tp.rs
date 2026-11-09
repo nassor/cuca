@@ -108,12 +108,13 @@
 
 use std::ops::Range;
 
+use crate::provider::local::gguf;
 #[cfg(feature = "provider-local-cuda")]
 use burn::tensor::distributed::{
     CollectiveTensor, DistributedConfig, DistributedContext, ReduceOperation, all_reduce,
 };
 use burn::tensor::{Device, Tensor, TensorData};
-use candle_core::quantized::{GgmlDType, gguf_file};
+use candle_core::quantized::GgmlDType;
 
 use super::gpu::{push_rows, read_f32};
 use super::layout::{Ffn, LayerLayout, Qkv, name};
@@ -151,7 +152,7 @@ fn check_width(what: &str, il: usize, width: usize, world: usize) -> Result<(), 
 /// [`CucaError::Config`] naming the rule and the numbers it failed on;
 /// [`CucaError::Provider`] for a tensor the layout needs and the file lacks.
 pub(super) fn validate(
-    content: &gguf_file::Content,
+    content: &gguf::Content,
     hp: &Hparams,
     world: usize,
     experts: &ExpertPlacement,
@@ -169,6 +170,12 @@ pub(super) fn validate(
         return Err(rule(
             "multi-head latent attention layers cannot be split (one shared latent K/V row per position; the per-head up-projections are not sliced)",
             format!("layer {il}, architecture {}", hp.arch.name()),
+        ));
+    }
+    if hp.behavior.hyper_connections {
+        return Err(rule(
+            "hyper-connection residual streams, compressed sparse attention, attention sinks, the grouped output projection and engram lookups cannot be split",
+            format!("architecture {}", hp.arch.name()),
         ));
     }
     if hp.behavior.qk_norm_full {
@@ -620,8 +627,6 @@ fn host_all_reduce_sum(parts: Vec<Tensor<2>>) -> Result<Vec<Tensor<2>>, CucaErro
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::BufReader;
 
     use super::super::read_hparams;
     use super::super::tiny::{TinySpec, write_spec};
@@ -693,9 +698,7 @@ mod tests {
     #[test]
     fn local_hparams_cut_the_head_counts() {
         let model = write_spec(&TinySpec::llama());
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                .unwrap();
+        let content = gguf::Content::open(&model.path).unwrap();
         let hp = read_hparams(&content).unwrap();
         let (n_head, n_kv) = (hp.layers[0].n_head, hp.layers[0].n_kv_head);
         let local = tp(2, 1).local_hparams(&hp);
@@ -807,9 +810,7 @@ mod tests {
         ];
         for spec in specs {
             let model = write_spec(&spec);
-            let content =
-                gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                    .unwrap();
+            let content = gguf::Content::open(&model.path).unwrap();
             let hp = read_hparams(&content).unwrap();
             for world in [2usize, 4] {
                 if validate(&content, &hp, world, &ExpertPlacement::Resident).is_err() {
@@ -878,9 +879,7 @@ mod tests {
     fn validate_names_the_rule_and_the_numbers() {
         let rejected = |spec: TinySpec, world: usize, rule: &str| {
             let model = write_spec(&spec);
-            let content =
-                gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                    .unwrap();
+            let content = gguf::Content::open(&model.path).unwrap();
             let hp = read_hparams(&content).unwrap();
             let e = validate(&content, &hp, world, &ExpertPlacement::Resident).unwrap_err();
             let CucaError::Config(message) = e else {
@@ -918,6 +917,20 @@ mod tests {
         );
         rejected(TinySpec::llama(), 2, "dense FFN width");
         rejected(TinySpec::olmo2(), 2, "full-width Q/K norm");
+        {
+            let model = super::super::tiny::write_deepseek41(
+                &super::super::tiny::TinyDeepseek41::default(),
+            );
+            let content = gguf::Content::open(&model.path).unwrap();
+            let hp = read_hparams(&content).unwrap();
+            let e = validate(&content, &hp, 2, &ExpertPlacement::Resident).unwrap_err();
+            let message = e.to_string();
+            assert!(
+                message.contains("tensor parallelism: hyper-connection residual streams")
+                    && message.contains("deepseek41"),
+                "{message}"
+            );
+        }
         // One shard and a model that splits pass.
         for (spec, world) in [
             (llama, 2),
@@ -925,9 +938,7 @@ mod tests {
             (TinySpec::llama(), 1),
         ] {
             let model = write_spec(&spec);
-            let content =
-                gguf_file::Content::read(&mut BufReader::new(File::open(&model.path).unwrap()))
-                    .unwrap();
+            let content = gguf::Content::open(&model.path).unwrap();
             let hp = read_hparams(&content).unwrap();
             validate(&content, &hp, world, &ExpertPlacement::Resident).unwrap();
         }

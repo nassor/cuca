@@ -38,7 +38,7 @@
 
 use std::path::Path;
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 use serde_json::Value as Json;
 
 use super::cfg_err;
@@ -345,12 +345,11 @@ pub(crate) fn convert(
 
 #[cfg(test)]
 mod tests {
-    use std::fs::File;
-    use std::io::BufReader;
     use std::path::PathBuf;
 
+    use crate::provider::local::gguf;
     use candle_core::Device;
-    use candle_core::quantized::{GgmlDType, gguf_file};
+    use candle_core::quantized::GgmlDType;
 
     use super::super::safetensors::tests::{f32_bytes, temp_dir, write_file};
     use super::*;
@@ -403,15 +402,15 @@ mod tests {
 
     /// The tensors of a drafter file as `(name, shape, f32 values)`.
     fn read_gguf(path: &Path) -> Vec<(String, Vec<usize>, Vec<f32>)> {
-        let mut reader = BufReader::new(File::open(path).unwrap());
-        let content = gguf_file::Content::read(&mut reader).unwrap();
+        let content = gguf::Content::open(path).unwrap();
         let mut names: Vec<String> = content.tensor_infos.keys().cloned().collect();
         names.sort();
         names
             .into_iter()
             .map(|n| {
                 let t = content
-                    .tensor(&mut reader, &n, &Device::Cpu)
+                    .reader()
+                    .tensor(&n, &Device::Cpu)
                     .unwrap()
                     .dequantize(&Device::Cpu)
                     .unwrap();
@@ -479,13 +478,12 @@ mod tests {
         let got = read_gguf(&out);
         assert_eq!(got.len(), 3 + 11 * 2);
         assert_eq!(got, want, "every tensor keeps its values and shape");
-        let content =
-            gguf_file::Content::read(&mut BufReader::new(File::open(&out).unwrap())).unwrap();
+        let content = gguf::Content::open(&out).unwrap();
         for (name, info) in &content.tensor_infos {
             let norm = name.ends_with("norm.weight");
             assert_eq!(
-                info.ggml_dtype,
-                if norm { GgmlDType::F32 } else { GgmlDType::F16 },
+                info.dtype,
+                gguf::GgufType::Ggml(if norm { GgmlDType::F32 } else { GgmlDType::F16 }),
                 "{name}"
             );
         }
@@ -529,9 +527,8 @@ mod tests {
         let model = write_spec(&TinySpec::muse_glimmer());
         let target = load(&model, 32);
         let open = |path: &Path| {
-            let content =
-                gguf_file::Content::read(&mut BufReader::new(File::open(path).unwrap())).unwrap();
-            DflashNet::open(&content, path, &target, 32).unwrap()
+            let content = gguf::Content::open(path).unwrap();
+            DflashNet::open(&content, &target, 32).unwrap()
         };
         let (mut a, mut b) = (open(&fixture.path), open(&out));
         let feats = crate::provider::local::model::tiny::Lcg(3).values(10 * a.feature_width(), 1.5);

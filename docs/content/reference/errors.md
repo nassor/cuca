@@ -100,8 +100,9 @@ Unsupported sampling fields, raised when the request body is built, before any n
 - Layer offload: ``gpu_layers needs a GPU `device`, got cpu``, ``gpu_layers cannot be combined with tensor parallelism (`shards`)`` and ``gpu_layers cannot be combined with a `drafter` ``.
 - `batching.max_sequences must be in 1..=64, got N` and `batching.max_step_tokens must be in max_sequences..=2048 ({max_sequences}..=2048), got N`.
 - `DrafterSource::InTrunk runs on the CPU only, not on {device:?}`, and `draft_tokens must be in 1..=16, got N` when a drafter is set.
-- Expert placement: `experts.loader_threads must be in 1..=64, got N`, `experts.device_bytes must be greater than 0 on {device:?}`, `experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu`, `experts.ram_bytes must be greater than 0 on LocalDevice::Cpu` and `ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does`.
+- Expert placement: `experts.loader_threads must be in 1..=64, got N`, `experts: on {device:?} set device_bytes (a device tier) or ram_bytes (host-tiered: the CPU computes the experts from the RAM tier)` for a GPU with both at 0, `experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu`, `experts.ram_bytes must be greater than 0 on LocalDevice::Cpu` and `ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does`.
 - Split GGUF parts and templates: `is not named like a split GGUF part (...) but the source lists N parts`, ``the parts of `{file}` must be [...] in order, got [...]`` and ``chat template `{path}` is not UTF-8``.
+- Engram and conversion: `engram.ram_bytes must be in 1048576..=1099511627776 (1 MiB to 1 TiB), got N`, `engram.reader_threads must be in 1..=64, got N`, ``unknown engram cache `{s}`; expected a comma-separated subset of ram=<size>,threads=<n>``, ``unknown Engram quantization `{s}`; expected q8_0, q4_0 or bf16``, and ``converting {what} writes X GB into `{dir}`, which has Y GB free; ...`` when the output volume of a DeepSeek-V4.1 conversion is too small.
 
 ## `PluginError`
 

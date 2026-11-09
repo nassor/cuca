@@ -369,7 +369,7 @@ fn reorder(src: &[f32], dst: &mut [f32], nk: usize, nvk: usize, unit: usize) {
 /// into [`ENCODE_CHUNK`]-element pieces that the calling thread and, for a
 /// large tensor, one helper thread per spare core encode in parallel: the
 /// bytes are those of a single-threaded pass.
-fn encode(dtype: Dtype, data: &[f32], out: &mut Vec<u8>) -> Result<(), CucaError> {
+pub(super) fn encode(dtype: Dtype, data: &[f32], out: &mut Vec<u8>) -> Result<(), CucaError> {
     let block = dtype.block_size();
     if !data.len().is_multiple_of(block) {
         return Err(cfg_err(format!(
@@ -410,8 +410,9 @@ fn encode(dtype: Dtype, data: &[f32], out: &mut Vec<u8>) -> Result<(), CucaError
 /// Encode whole blocks of `src` into `dst`, which holds exactly their bytes.
 ///
 /// The quantizers are llama.cpp's `quantize_row_q4_0` / `quantize_row_q8_0`
-/// reference code (candle's `from_float` for the two types), operation for
-/// operation, so the bytes are those of `ggml`.
+/// reference code (candle's `from_float` for the two types) and
+/// `quantize_row_mxfp4_ref`, operation for operation, so the bytes are those
+/// of `ggml`.
 fn encode_piece(dtype: Dtype, src: &[f32], dst: &mut [u8]) {
     match dtype {
         Dtype::F32 => {
@@ -424,6 +425,11 @@ fn encode_piece(dtype: Dtype, src: &[f32], dst: &mut [u8]) {
                 *d = half::f16::from_f32(*x).to_le_bytes();
             }
         }
+        Dtype::Bf16 => {
+            for (d, x) in dst.as_chunks_mut::<2>().0.iter_mut().zip(src) {
+                *d = half::bf16::from_f32(*x).to_le_bytes();
+            }
+        }
         Dtype::Q8_0 => {
             let blocks = dst.as_chunks_mut::<34>().0.iter_mut();
             for (d, xs) in blocks.zip(src.as_chunks::<32>().0) {
@@ -434,6 +440,36 @@ fn encode_piece(dtype: Dtype, src: &[f32], dst: &mut [u8]) {
                 head.copy_from_slice(&half::f16::from_f32(scale).to_le_bytes());
                 for (q, x) in qs.iter_mut().zip(xs) {
                     *q = f32::round(x * inv) as i8 as u8;
+                }
+            }
+        }
+        Dtype::Mxfp4 => {
+            // llama.cpp's `quantize_row_mxfp4_ref`: the scale is the power of
+            // two that puts the block's largest value in [4, 8) of the doubled
+            // E2M1 grid (values above 6 clamp), each element rounds to the
+            // nearest grid point.
+            const GRID: [f32; 8] = [0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0];
+            let nearest = |v: f32| {
+                let m = GRID
+                    .iter()
+                    .enumerate()
+                    .min_by(|a, b| (v.abs() - a.1).abs().total_cmp(&(v.abs() - b.1).abs()))
+                    .map_or(0, |(i, _)| i as u8);
+                if v < 0.0 && m != 0 { m | 8 } else { m }
+            };
+            let blocks = dst.as_chunks_mut::<17>().0.iter_mut();
+            for (d, xs) in blocks.zip(src.as_chunks::<32>().0) {
+                let amax = xs.iter().fold(0f32, |m, x| m.max(x.abs()));
+                let e = if amax > 0.0 {
+                    ((amax.log2().floor() as i32) - 2 + 127).clamp(0, 254) as u8
+                } else {
+                    0
+                };
+                let inv = 1.0 / crate::provider::local::model::quant::e8m0_half(e);
+                d[0] = e;
+                let (lo, hi) = xs.split_at(16);
+                for ((q, a), b) in d[1..].iter_mut().zip(lo).zip(hi) {
+                    *q = nearest(a * inv) | (nearest(b * inv) << 4);
                 }
             }
         }
@@ -1859,6 +1895,27 @@ mod tests {
     /// The encoders (threaded, written without candle tensors) produce the
     /// bytes of candle's quantizers, which are `ggml`'s, on values that
     /// exercise ties, zero blocks, large and non-finite inputs.
+    #[test]
+    fn mxfp4_encoding_round_trips_grid_values() {
+        use crate::provider::local::gguf::GgufType;
+        use crate::provider::local::model::quant::dequant_row;
+        let grid = [0.0f32, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0];
+        // The largest magnitude 6 puts the scale at 1.0 (e = 127).
+        let src: Vec<f32> = (0..32)
+            .map(|i| grid[i % 8] * if i % 3 == 0 { -1.0 } else { 1.0 })
+            .collect();
+        let mut dst = Vec::new();
+        encode(Dtype::Mxfp4, &src, &mut dst).unwrap();
+        assert_eq!(dst[0], 127);
+        let mut back = [0f32; 32];
+        dequant_row(GgufType::Mxfp4, &dst, 1.0, &mut back).unwrap();
+        let want: Vec<f32> = src
+            .iter()
+            .map(|&x| if x == 0.0 { 0.0 } else { x })
+            .collect();
+        assert_eq!(back.to_vec(), want);
+    }
+
     #[test]
     fn encoders_match_candle() {
         use candle_core::quantized::{GgmlDType, QTensor};

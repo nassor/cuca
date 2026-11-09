@@ -13,18 +13,23 @@
 //!   keywords) instead of minijinja's compact, HTML-escaped one, so tool
 //!   declarations are byte-identical to what the model saw in training. It
 //!   keeps the order of an object's keys (minijinja's own maps are sorted,
-//!   Python's `dict` keeps insertion order): the `tools` variable is built from
-//!   insertion-ordered objects, in the OpenAI order a Python caller writes
-//!   (`type`, then `function` with `name`, `description`, `parameters`). The
-//!   key order *inside* a tool's JSON schema is the order of the request's
-//!   `serde_json` map: sorted by key, unless the application enables
-//!   `serde_json`'s `preserve_order`, in which case it is the order written;
+//!   Python's `dict` keeps insertion order): `messages` and `tools` are built
+//!   from insertion-ordered objects, so a tool call's arguments come in the
+//!   order they were written, and `tools` in the OpenAI order a Python caller
+//!   writes (`type`, then `function` with `name`, `description`,
+//!   `parameters`). The key order *inside* a JSON schema is the order of the
+//!   request's `serde_json` map, which keeps the order written because
+//!   `provider-local` enables `serde_json`'s `preserve_order`;
 //! - a `string` filter that renders maps, lists, `None` and booleans the way
 //!   Python's `str()` does (`{'a': 1}`), as templates that interpolate a tool
 //!   dict with `| string` expect;
 //! - the HuggingFace-only `{% generation %}` / `{% endgeneration %}` tags
 //!   (assistant-mask markers with no output) are rewritten to a no-op
 //!   `{% if true %}` block before compilation.
+//!
+//! Besides the knobs of the reasoning families (`reasoning_strength`,
+//! `reasoning_effort`), a template that reads `reasoning_budget` (DeepSeek V4.1)
+//! thinks unless the request disables it.
 //!
 //! The template text is otherwise never modified, and nothing in this module is
 //! specific to one model family.
@@ -66,6 +71,11 @@ pub(crate) struct ChatTemplate {
     /// Whether the template reads `reasoning_effort` (Mistral Small 4: none
     /// or high).
     reads_effort: bool,
+    /// Whether the template reads `reasoning_budget` (DeepSeek V4.1: `low`,
+    /// `high` or `max`, or 1 to 100). Such a template thinks by default, as
+    /// DeepSeek's reference stack does: a request without a thinking
+    /// configuration gets reasoning on.
+    reads_budget: bool,
 }
 
 impl ChatTemplate {
@@ -87,12 +97,14 @@ impl ChatTemplate {
         });
         env.add_filter("tojson", tojson);
         env.add_filter("string", py_string);
+        let reads_budget = reads_variable(&source, "reasoning_budget");
         let reads_effort = reads_variable(&source, "reasoning_effort");
         // A two-mode `reasoning_effort` switches reasoning on and off like
         // `enable_thinking`.
         let reads_enable_thinking = source.contains("enable_thinking")
             || reads_variable(&source, "thinking")
-            || reads_effort;
+            || reads_effort
+            || reads_budget;
         let reads_strength = reads_variable(&source, "reasoning_strength");
         env.add_template_owned(TEMPLATE_NAME, strip_generation_tags(&source))
             .map_err(template_err)?;
@@ -103,6 +115,7 @@ impl ChatTemplate {
             reads_enable_thinking,
             reads_strength,
             reads_effort,
+            reads_budget,
         })
     }
 
@@ -138,6 +151,17 @@ impl ChatTemplate {
         self.reads_enable_thinking
     }
 
+    /// Whether `prompt` renders with reasoning on: the request's flag, except
+    /// that a template reading `reasoning_budget` (DeepSeek V4.1) thinks
+    /// unless the request disables it, as DeepSeek's reference stack does.
+    pub(crate) fn thinking_enabled(&self, prompt: &ChatPrompt) -> bool {
+        if self.reads_budget {
+            prompt.thinking.enabled_unless_off()
+        } else {
+            prompt.enable_thinking
+        }
+    }
+
     /// Render `prompt` to the text fed to the tokenizer, with the generation
     /// prompt requested (`add_generation_prompt = true`).
     ///
@@ -147,15 +171,39 @@ impl ChatTemplate {
         self.render_at(prompt, unix_now())
     }
 
+    /// [`ChatTemplate::render_at`] with `reasoning_budget` set to a raw value
+    /// (a string, or an integer 1 to 100) instead of the one the request's
+    /// effort selects.
+    #[cfg(test)]
+    pub(crate) fn render_with_budget(
+        &self,
+        prompt: &ChatPrompt,
+        unix_secs: i64,
+        budget: Value,
+    ) -> Result<String, CucaError> {
+        self.render_vars(prompt, unix_secs, Some(budget))
+    }
+
     /// [`ChatTemplate::render`] with `strftime_now` pinned to `unix_secs`.
     pub(crate) fn render_at(
         &self,
         prompt: &ChatPrompt,
         unix_secs: i64,
     ) -> Result<String, CucaError> {
+        self.render_vars(prompt, unix_secs, None)
+    }
+
+    /// The rendering shared by [`ChatTemplate::render_at`] and the tests that
+    /// set `reasoning_budget` themselves.
+    fn render_vars(
+        &self,
+        prompt: &ChatPrompt,
+        unix_secs: i64,
+        budget: Option<Value>,
+    ) -> Result<String, CucaError> {
         let template = self.env.get_template(TEMPLATE_NAME).map_err(template_err)?;
         let mut vars: BTreeMap<&str, Value> = BTreeMap::new();
-        vars.insert("messages", Value::from_serialize(&prompt.messages));
+        vars.insert("messages", json_to_value(&prompt.messages));
         if let Some(tools) = prompt.tools.as_array().filter(|tools| !tools.is_empty()) {
             vars.insert(
                 "tools",
@@ -163,8 +211,9 @@ impl ChatTemplate {
             );
         }
         vars.insert("add_generation_prompt", Value::from(true));
-        vars.insert("enable_thinking", Value::from(prompt.enable_thinking));
-        vars.insert("thinking", Value::from(prompt.enable_thinking));
+        let thinking = self.thinking_enabled(prompt);
+        vars.insert("enable_thinking", Value::from(thinking));
+        vars.insert("thinking", Value::from(thinking));
         vars.insert("preserve_thinking", Value::from(false));
         // Reasoning knobs of their own are defined only for templates that
         // read them: another template may use the same name with other values.
@@ -178,6 +227,11 @@ impl ChatTemplate {
                 "reasoning_effort",
                 Value::from(prompt.thinking.two_mode_effort()),
             );
+        }
+        if self.reads_budget
+            && let Some(budget) = budget.or_else(|| prompt.thinking.budget().map(Value::from))
+        {
+            vars.insert("reasoning_budget", budget);
         }
         vars.insert("bos_token", Value::from(self.bos_token.as_str()));
         vars.insert("eos_token", Value::from(self.eos_token.as_str()));
@@ -862,7 +916,8 @@ mod tests {
     fn tools_keep_the_openai_key_order_and_stay_ordinary_mappings() {
         let prompt = ChatPrompt {
             messages: json!([]),
-            // serde_json hands the keys over sorted: wrapper and function swap.
+            // The caller wrote the keys against the OpenAI order: wrapper and
+            // function swap, and the schema keeps the order it was written in.
             tools: json!([{
                 "function": {
                     "parameters": { "type": "object", "properties": {} },
@@ -882,7 +937,7 @@ mod tests {
         assert_eq!(
             rendered,
             "{\"type\": \"function\", \"function\": {\"name\": \"f\", \"description\": \"d\", \
-             \"parameters\": {\"properties\": {}, \"type\": \"object\"}, \"strict\": true}}|True|f|\
+             \"parameters\": {\"type\": \"object\", \"properties\": {}}, \"strict\": true}}|True|f|\
              name,description,parameters,strict,|4|True|1"
         );
         let sorted = render("{{ tools[0] | tojson(sort_keys=true) }}", &prompt).expect("renders");
@@ -890,6 +945,58 @@ mod tests {
             sorted.starts_with("{\"function\": {\"description\""),
             "{sorted}"
         );
+    }
+
+    /// `messages` reach the template with their keys in the order written
+    /// (minijinja's own maps would sort them), nested maps included, and stay
+    /// ordinary mappings.
+    #[test]
+    fn messages_keep_the_key_order_they_were_written_in() {
+        let messages: serde_json::Value = serde_json::from_str(
+            r#"[{"role":"assistant","content":null,"tool_calls":[{"id":"c","function":{"name":"f","arguments":{"zeta":1,"alpha":{"y":1,"b":2}}}}]}]"#,
+        )
+        .expect("parses");
+        let source = "{% for k in messages[0] %}{{ k }},{% endfor %}|\
+                      {% for k, v in messages[0].tool_calls[0].function.arguments.items() %}{{ k }},{% endfor %}|\
+                      {{ messages[0].tool_calls[0].function.arguments | tojson }}|\
+                      {{ messages[0] is mapping }}|{{ messages[0].content is none }}|{{ 'role' in messages[0] }}|{{ messages | length }}";
+        assert_eq!(
+            render(source, &prompt(messages)).expect("renders"),
+            "role,content,tool_calls,|zeta,alpha,|{\"zeta\": 1, \"alpha\": {\"y\": 1, \"b\": 2}}|True|True|True|1"
+        );
+    }
+
+    /// `reasoning_budget` is defined only for a template that reads it, and
+    /// such a template thinks unless the request disables it.
+    #[test]
+    fn a_budget_template_thinks_by_default_and_maps_the_effort() {
+        use crate::provider::local::chat::ThinkingRequest;
+        use crate::request::ThinkingEffort::{High, Low, Medium, Minimal, XHigh};
+        let source = "{{ reasoning_budget if reasoning_budget is defined else 'default' }}|{{ enable_thinking }}|{{ thinking }}";
+        let mut p = prompt(json!([]));
+        for (request, want) in [
+            (ThinkingRequest::Unset, "default|True|True"),
+            (ThinkingRequest::Off, "default|False|False"),
+            (ThinkingRequest::On(None), "default|True|True"),
+            (ThinkingRequest::On(Some(Minimal)), "low|True|True"),
+            (ThinkingRequest::On(Some(Low)), "low|True|True"),
+            (ThinkingRequest::On(Some(Medium)), "high|True|True"),
+            (ThinkingRequest::On(Some(High)), "high|True|True"),
+            (ThinkingRequest::On(Some(XHigh)), "high|True|True"),
+        ] {
+            p.thinking = request;
+            p.enable_thinking = matches!(request, ThinkingRequest::On(_));
+            assert_eq!(render(source, &p).expect("renders"), want, "{request:?}");
+        }
+        // A template that does not read the budget keeps the request's own flag,
+        // so an unset request does not think.
+        let other = "{{ enable_thinking }}";
+        p.thinking = ThinkingRequest::On(Some(Low));
+        p.enable_thinking = true;
+        assert_eq!(render(other, &p).expect("renders"), "True");
+        p.thinking = ThinkingRequest::Unset;
+        p.enable_thinking = false;
+        assert_eq!(render(other, &p).expect("renders"), "False");
     }
 
     #[test]

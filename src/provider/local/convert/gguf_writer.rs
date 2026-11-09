@@ -7,13 +7,13 @@
 //! follows one tensor at a time through [`GgufWriter::write`]: the writer
 //! itself holds no tensor data, so the model is never resident. Data is aligned to
 //! `general.alignment` (32) between tensors and before the first one, exactly
-//! as `candle_core::quantized::gguf_file::write` lays a file out, so
-//! `gguf_file::Content::read` loads either.
+//! as `gguf::write` lays a file out, so
+//! `gguf::Content::read` loads either.
 
 use std::collections::VecDeque;
 use std::io::Write;
 
-use candle_core::quantized::gguf_file::Value;
+use crate::provider::local::gguf::Value;
 
 use crate::error::CucaError;
 
@@ -35,6 +35,12 @@ pub(crate) enum Dtype {
     F16,
     Q4_0,
     Q8_0,
+    /// OCP MXFP4: 17 bytes per 32 values (one E8M0 scale byte, then 16 bytes of
+    /// nibbles). The converter repacks the checkpoint's FP4 experts into raw
+    /// blocks; `tensors::encode` also quantizes floats to them.
+    Mxfp4,
+    /// bfloat16, two bytes per value.
+    Bf16,
 }
 
 impl Dtype {
@@ -45,14 +51,16 @@ impl Dtype {
             Self::F16 => 1,
             Self::Q4_0 => 2,
             Self::Q8_0 => 8,
+            Self::Mxfp4 => 39,
+            Self::Bf16 => 30,
         }
     }
 
     /// Elements per storage block.
     pub(crate) fn block_size(self) -> usize {
         match self {
-            Self::F32 | Self::F16 => 1,
-            Self::Q4_0 | Self::Q8_0 => 32,
+            Self::F32 | Self::F16 | Self::Bf16 => 1,
+            Self::Q4_0 | Self::Q8_0 | Self::Mxfp4 => 32,
         }
     }
 
@@ -60,9 +68,10 @@ impl Dtype {
     pub(crate) fn type_size(self) -> usize {
         match self {
             Self::F32 => 4,
-            Self::F16 => 2,
+            Self::F16 | Self::Bf16 => 2,
             Self::Q4_0 => 18,
             Self::Q8_0 => 34,
+            Self::Mxfp4 => 17,
         }
     }
 
@@ -336,7 +345,7 @@ pub(crate) fn pad_to(n: u64) -> u64 {
 mod tests {
     use std::io::Cursor;
 
-    use candle_core::quantized::gguf_file::{self, Content};
+    use crate::provider::local::gguf::{self, Content};
     use candle_core::quantized::{GgmlDType, QTensor};
     use candle_core::{Device, Tensor};
 
@@ -350,8 +359,8 @@ mod tests {
     }
 
     /// A model-shaped file written by `GgufWriter` reads back, through
-    /// `gguf_file::Content::read`, with the metadata, shapes, types and bytes
-    /// `gguf_file::write` stores for the same tensors.
+    /// `gguf::Content::read`, with the metadata, shapes, types and bytes
+    /// `gguf::write` stores for the same tensors.
     #[test]
     fn matches_candles_writer() {
         let mut rng = Lcg(5);
@@ -396,7 +405,7 @@ mod tests {
         let meta_ref: Vec<(&str, &Value)> = metadata.iter().map(|(k, v)| (k.as_str(), v)).collect();
         let tensor_ref: Vec<(&str, &QTensor)> =
             tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
-        gguf_file::write(&mut reference, &meta_ref, &tensor_ref).unwrap();
+        gguf::write(&mut reference, &meta_ref, &tensor_ref).unwrap();
 
         let specs: Vec<TensorSpec> = tensors
             .iter()
@@ -422,10 +431,14 @@ mod tests {
         }
         let written = writer.finish().unwrap().into_inner();
 
-        let mut a = Cursor::new(reference.into_inner());
-        let mut b = Cursor::new(written);
-        let ca = Content::read(&mut a).unwrap();
-        let cb = Content::read(&mut b).unwrap();
+        let reference = reference.into_inner();
+        let ca = Content::from_reader(&mut Cursor::new(&reference)).unwrap();
+        let cb = Content::from_reader(&mut Cursor::new(&written)).unwrap();
+        let raw = |c: &Content, bytes: &[u8], name: &str| {
+            let info = &c.tensor_infos[name];
+            let at = c.location(info).1 as usize;
+            bytes[at..at + info.byte_len().unwrap()].to_vec()
+        };
         assert_eq!(cb.tensor_infos.len(), ca.tensor_infos.len());
         for (key, va) in &ca.metadata {
             assert_eq!(
@@ -439,11 +452,10 @@ mod tests {
             let ia = &ca.tensor_infos[name];
             let ib = &cb.tensor_infos[name];
             assert_eq!(ia.shape.dims(), ib.shape.dims(), "{name}");
-            assert_eq!(ia.ggml_dtype, ib.ggml_dtype, "{name}");
-            let ta = ca.tensor(&mut a, name, &Device::Cpu).unwrap();
-            let tb = cb.tensor(&mut b, name, &Device::Cpu).unwrap();
-            assert_eq!(ta.data().unwrap(), tb.data().unwrap(), "{name}");
-            assert_eq!(qt.data().unwrap(), tb.data().unwrap(), "{name}");
+            assert_eq!(ia.dtype, ib.dtype, "{name}");
+            let (ta, tb) = (raw(&ca, &reference, name), raw(&cb, &written, name));
+            assert_eq!(ta, tb, "{name}");
+            assert_eq!(qt.data().unwrap().as_ref(), tb.as_slice(), "{name}");
         }
     }
 

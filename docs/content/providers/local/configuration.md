@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>LocalModelConfig</code> holds the model source, cache, context length, sampling, device, drafter, expert placement, batching and offload; <code>SamplingConfig</code> and <code>BatchingConfig</code> hold the sampler and scheduler settings.</dd>
+<dd><code>LocalModelConfig</code> holds the model source, cache, context length, sampling, device, drafter, expert placement, Engram cache, batching and offload; <code>SamplingConfig</code> and <code>BatchingConfig</code> hold the sampler and scheduler settings.</dd>
 <dt>You need</dt>
 <dd>The <code>provider-local</code> feature. Entry points are on <a href="@/providers/local/_index.md">Local (in-process)</a>.</dd>
 <dt>Read this if</dt>
@@ -32,21 +32,24 @@ All fields are public. `LocalModel::load` validates the configuration before it 
 | `drafter` | `None` | `Option<DrafterSource>`: a draft model for speculative decoding |
 | `draft_tokens` | `5` | most tokens a drafter proposes per round, `1..=16`; checked only with a drafter |
 | `experts` | `ExpertPlacement::Resident` | where a mixture-of-experts model's experts live |
-| `convert` | `ConvertConfig::default()` | weight precision of a converted checkpoint |
+| `convert` | `ConvertConfig::default()` | `quant` and `engram_quant` of a converted checkpoint |
 | `batching` | `BatchingConfig::default()` | how concurrent requests share the engine; see [BatchingConfig](#batchingconfig) |
 | `shards` | `[]` | more GPUs to split the model over (tensor parallelism) |
 | `gpu_layers` | `None` | layers to run on the GPU, the rest on the CPU |
-| `on_download_progress` | `None` | download, conversion and merge progress observer |
+| `engram` | `EngramCache::default()` | row cache and reader threads of an Engram table; see [Engram cache](#engram-cache) |
+| `shard_dirs` | `[]` | extra directories searched for the parts of a split GGUF set |
+| `on_download_progress` | `None` | download and conversion progress observer |
 
 - `source` defaults to the preset `gemma4-e2b-q4_0`.
 - `context_length: None` resolves to the smaller of 8,192 and the model's own maximum. An explicit value must be at least 1 and at most the model's maximum.
 - `device` needs the matching cargo feature for a GPU, else `load` fails with `CucaError::Config` naming it. `LocalModelConfig::set_devices("cuda:0+cuda:1")` fills `device` and `shards` from one `+`-separated text. See [Devices and GPU features](@/providers/local/gpu.md#devices-and-gpu-features).
 - `chat_template` also replaces the template a preset pins. Everything derived from the template follows it. A template that does not compile, or cannot render a one-message conversation, fails `load` with `CucaError::Config`.
-- `drafter` takes a `DrafterSource::File(ModelSource)` or `DrafterSource::InTrunk`; the pairings and limits are on [Speculative decoding](@/providers/local/drafting.md). `DrafterSource::InTrunk` needs the CPU.
-- `experts` matters only for a model with experts. `Tiered` needs a RAM budget on the CPU and a device budget on a GPU. `Host` needs a GPU. Text forms are `resident`, `host`, `host:layers=<n>` and `tiered:ram=4g`; see [Tiered expert placement](@/providers/local/expert-tiers.md) and [Run on a GPU](@/providers/local/gpu.md).
-- `convert` applies to `ModelSource::Checkpoint` and `ModelSource::Dir` only. `WeightQuant` is `f16`, `q8_0` (default) or `q4_0`.
+- `drafter` takes a `DrafterSource::File(ModelSource)` or `DrafterSource::InTrunk`; the pairings and limits are on [Speculative decoding](@/providers/local/drafting.md). `DrafterSource::InTrunk` needs the CPU. For DeepSeek-V4.1 the `File` source is the model's own checkpoint source, which converts to the DSpark drafter's file; it runs on the CPU only.
+- `experts` matters only for a model with experts. `Tiered` needs a RAM budget on the CPU; on a GPU it needs a device budget, a RAM budget or both, and a RAM budget alone is host-tiered: the CPU computes the experts from the RAM tier. `Host` needs a GPU. Text forms are `resident`, `host`, `host:layers=<n>` and `tiered:ram=4g`; see [Tiered expert placement](@/providers/local/expert-tiers.md) and [Run on a GPU](@/providers/local/gpu.md).
+- `convert` applies to `ModelSource::Checkpoint` and `ModelSource::Dir` only. `WeightQuant` is `f16`, `q8_0` (default) or `q4_0`. `EngramQuant` is `q8_0` (default), `q4_0` or `bf16` and applies to DeepSeek-V4.1's Engram table only. A non-default `engram_quant` converts and caches next to the default one; see [DeepSeek-V4.1](@/providers/local/checkpoints.md#deepseek-v4-1).
 - `shards` makes the model run on `1 + shards.len()` devices, `device` being the first. Every device is a GPU of one backend, there is no `drafter`, `experts` is `Resident`, and the model must be splittable; see [Tensor parallelism](@/providers/local/gpu.md#tensor-parallelism).
 - `gpu_layers: Some(n)` runs the last `n` layers and the output head on `device` and the rest on the CPU. It needs a GPU `device`, no `shards` and no `drafter`; `n` may not exceed the model's layer count. `Some(0)` loads the model on the CPU, and `LocalModel::layer_split()` reports the split. See [Layer offload](@/providers/local/gpu.md#layer-offload-gpu-layers).
+- `shard_dirs` is searched after the directory of the named first part, for `ModelSource::File` naming a split set whose parts sit on different volumes; see [Split GGUF files](@/providers/local/model-sources.md#split-gguf-files).
 - `Debug` for `LocalModelConfig` prints `hf_token` as `<redacted>`.
 
 ## SamplingConfig
@@ -77,10 +80,23 @@ The fields are `Option` so "set" and "default" can be told apart: `top_k: Some(6
 | `prefix_cache` | `true` | keep the K/V of finished requests for later prompts |
 
 - `kv_tokens: None` is twice `context_length`. An explicit value is at least `context_length + 16` and rounds up to whole blocks of 16. It is the K/V memory knob, reported by `LocalModel::kv_cache_bytes`: raising `max_sequences` does not raise it, and a pool too small for the running requests makes them wait or preempt each other. The cost per model is in [Local limits and errors](@/providers/local/limits-and-errors.md#limits).
-- `max_step_tokens` is at least `max_sequences` and at most 2,048. `None` is the prefill chunk of the context length, `clamp(2,097,152 / context_length, 16, 256)`, so 256 at 8,192 positions.
+- `max_step_tokens` is at least `max_sequences` and at most 8,192. `None` is the prefill chunk of the context length, `clamp(2,097,152 / context_length, 16, 256)`, so 256 at 8,192 positions. With tiered experts under compressed sparse attention (DeepSeek-V4.1) it is 4,096, because a larger step reads fewer expert bytes per prompt token.
 - `prefix_cache: false` registers nothing in the prefix store, so every prompt prefills in full.
 - A drafter that reads every position of its sequence (the in-trunk head, the EAGLE and the DFlash drafters) forces `max_sequences` to 1. A Gemma 4 assistant drafts only while one request runs alone.
 - `LocalModel::serving_stats()` returns `ServingStats`. Gauges: `running`, `waiting`, `max_sequences`, `free_blocks`, `cached_blocks`, `used_blocks`, `total_blocks` and `snapshot_bytes`. Totals since load: `prefix_hit_tokens`, `preemptions`, `steps`, `batched_rows`, `prefill_rows` (the part of `batched_rows` that are prompt rows), `generated_tokens`, `admissions`, `queue_wait_ns` (the wait between dispatch and first admission, summed), `step_ns` (forward pass time, summed) and, for the last pass, `last_step_ns` and `last_step_rows`. `batched_rows > steps` means steps carried several rows. The counters are atomics the engine thread updates, so reading them never waits for a step.
+
+## Engram cache
+
+A model with an Engram table (DeepSeek-V4.1) reads rows of `per_layer_token_embd.weight` from the GGUF file. `EngramCache` sets how: a pool of reader threads reads the distinct rows of a forward pass sorted by file offset, and a row cache keeps the most recently used rows. It parses from text such as `ram=8g,threads=32`, any subset, `<size>` a byte count with an optional `k`, `m` or `g` suffix (powers of 1024). The bounds and error messages are on [Local limits and errors](@/providers/local/limits-and-errors.md#engram-row-cache).
+
+| Field | Default | Meaning |
+|---|---|---|
+| `ram_bytes` | 4 GiB | bytes of RAM for cached rows, `1 MiB..=1 TiB` |
+| `reader_threads` | `16` | disk reader threads, `1..=64` |
+
+- The cache holds rows as the file stores them and counts 48 bytes of overhead per row against `ram_bytes`. At the bound it evicts the least recently used row. Its memory is allocated as it fills, so a short session does not pay for the bound.
+- A cache smaller than the distinct rows of one pass still gives correct output: rows evicted before use are read again. The values change speed, never the output.
+- `LocalModel::engram_stats()` returns `EngramStats`: `lookups`, `cache_hits`, `disk_reads`, `bytes_read`, `resident_rows`, `resident_bytes` and `capacity_rows`, and `hit_rate()`. A model without an Engram table ignores the setting.
 
 ## Environment variables
 
@@ -103,10 +119,14 @@ The library reads these:
 | `CUCA_LOCAL_CONVERT_QUANT` | `f16`, `q8_0` or `q4_0`; default `q8_0` |
 | `CUCA_LOCAL_DEVICE` | `LocalDevice` text, or a `+`-separated list for tensor parallelism; default `cpu` |
 | `CUCA_LOCAL_GPU_LAYERS` | `gpu_layers` |
-| `CUCA_LOCAL_DRAFTER` | drafter preset name, or `in-trunk` |
-| `CUCA_LOCAL_DRAFTER_PATH` | path of a drafter GGUF file; wins over `CUCA_LOCAL_DRAFTER` |
+| `CUCA_LOCAL_DRAFTER` | drafter preset name, `in-trunk`, or `repo:revision`, a checkpoint that is converted to the drafter's file (DeepSeek-V4.1: the same value as `CUCA_LOCAL_MODEL`) |
+| `CUCA_LOCAL_DRAFTER_PATH` | path of a drafter GGUF file or checkpoint directory; wins over `CUCA_LOCAL_DRAFTER` |
 | `CUCA_LOCAL_EXPERTS` | `ExpertPlacement` text, for example `tiered:ram=4g`; default `resident` |
+| `CUCA_LOCAL_ENGRAM` | `EngramCache` text, for example `ram=2g,threads=8` |
 | `CUCA_LOCAL_BATCHING` | `BatchingConfig` text |
 | `CUCA_LOCAL_CHAT_TEMPLATE` | path of a `.jinja` file, read into `chat_template` |
+| `CUCA_LOCAL_PROMPT` | the user message; default `Explain CUCA in one sentence.` |
+| `CUCA_LOCAL_THINKING` | `off` disables thinking; any other value or none leaves it enabled |
+| `CUCA_LOCAL_MAX_TOKENS` | `max_tokens`; default `1024` |
 
 The live tests read the same variables, parsed in `tests/local_env/mod.rs`, plus test-only ones. Every variable, with the files that read it, is on [Environment variables](@/reference/environment.md).

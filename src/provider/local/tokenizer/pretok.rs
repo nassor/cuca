@@ -14,7 +14,8 @@
 //!
 //! Character classes follow Unicode: `\p{L}` is the five letter categories,
 //! `\p{M}` the three mark categories, `\p{P}` the punctuation categories,
-//! `\p{N}` is [`char::is_numeric`] and `\s` is [`char::is_whitespace`]. The
+//! `\p{S}` the four symbol categories, `\p{N}` is [`char::is_numeric`] and `\s`
+//! is [`char::is_whitespace`]. The
 //! GPT-4o stages distinguish upper and lower case letters with the real
 //! `\p{Lu}`/`\p{Ll}` categories; llama.cpp approximates that split with ASCII
 //! case only (every non-ASCII letter counts as both), so the two can differ on
@@ -25,6 +26,8 @@
 //! then GPT-2) a whitespace run right before a digit ends its fragment and so
 //! stays whole, where a single GPT-2 regex would give its last space to the
 //! digits. That is llama.cpp's behaviour and is what this module reproduces.
+//! The DeepSeek V3 family (`deepseek-v3`, `joyai-llm`) is a three-stage chain
+//! of the same kind: digit groups, runs of CJK and kana, then a word pattern.
 //!
 //! Allocation: a split call fills two caller-owned range vectors; stages
 //! allocate nothing.
@@ -103,6 +106,18 @@ pub(super) enum Stage {
     /// The GPT-2 pattern `'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+|
     /// ?[^\s\p{L}\p{N}]+|\s+(?!\S)`.
     Gpt2,
+    /// `\p{N}{1,3}`.
+    Digits1To3,
+    /// `[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+`: a run of CJK ideographs,
+    /// hiragana and katakana.
+    CjkRun,
+    /// The DeepSeek word pattern, tried alternative by alternative: an ASCII
+    /// punctuation character followed by ASCII letters, an optional prefix
+    /// that is not a newline, letter, punctuation or symbol followed by a run
+    /// of letters and marks, an optional space, a run of punctuation and
+    /// symbols and newlines, and the three whitespace alternatives of the
+    /// word family.
+    DeepseekWord,
     /// A member of the llama3 / qwen / GPT-4o word family.
     Word(WordRule),
 }
@@ -128,6 +143,10 @@ const QWEN35_STAGES: &[Stage] = &[Stage::Word(QWEN35)];
 const GPT4O_STAGES: &[Stage] = &[Stage::Word(GPT4O)];
 /// The Tekken pattern.
 const TEKKEN_STAGES: &[Stage] = &[Stage::Word(TEKKEN)];
+/// The DeepSeek V3 chain (llama.cpp's `deepseek-v3`, `joyai-llm`,
+/// `hunyuan-dense` and `hy_v4`): digits in groups of up to three, runs of CJK
+/// and kana, then the word pattern.
+const DEEPSEEK3_STAGES: &[Stage] = &[Stage::Digits1To3, Stage::CjkRun, Stage::DeepseekWord];
 
 /// What a `tokenizer.ggml.pre` value selects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -179,6 +198,12 @@ impl Pre {
             "tekken" | "pixtral" => words(TEKKEN_STAGES, true, true),
             "gpt-4o" | "llama4" | "kanana2" | "talkie" | "minimax-m2" => {
                 words(GPT4O_STAGES, false, false)
+            }
+            // The V3-family chain: llama.cpp's `deepseek-v3`, and the
+            // `joyai-llm` name the probe-text hash of DeepSeek-V4.1's own
+            // vocabulary resolves to.
+            "deepseek-v3" | "joyai-llm" | "hunyuan-dense" | "hy_v4" => {
+                words(DEEPSEEK3_STAGES, false, false)
             }
             "gemma4" => Some(Self::Gemma4),
             _ => None,
@@ -263,6 +288,9 @@ fn match_at(stage: Stage, s: &str, pos: usize) -> Option<usize> {
         }
         Stage::PunctRun => is_punct_run_char(c).then(|| run_end(s, pos, is_punct_run_char)),
         Stage::Gpt2 => gpt2_at(s, pos, c),
+        Stage::Digits1To3 => is_number(c).then(|| number_group_end(s, pos, 3)),
+        Stage::CjkRun => is_cjk_or_kana(c).then(|| run_end(s, pos, is_cjk_or_kana)),
+        Stage::DeepseekWord => deepseek_word_at(s, pos, c),
         Stage::Word(rule) => word_at(rule, s, pos, c),
     }
 }
@@ -378,6 +406,42 @@ fn is_punctuation(c: char) -> bool {
             | GeneralCategory::FinalPunctuation
             | GeneralCategory::OtherPunctuation
     )
+}
+
+/// `\p{S}`: math, currency, modifier and other symbols.
+fn is_symbol(c: char) -> bool {
+    if c.is_ascii() {
+        return matches!(c, '$' | '+' | '<' | '=' | '>' | '^' | '`' | '|' | '~');
+    }
+    matches!(
+        get_general_category(c),
+        GeneralCategory::MathSymbol
+            | GeneralCategory::CurrencySymbol
+            | GeneralCategory::ModifierSymbol
+            | GeneralCategory::OtherSymbol
+    )
+}
+
+/// `[\p{P}\p{S}]`.
+fn is_punct_or_symbol(c: char) -> bool {
+    is_punctuation(c) || is_symbol(c)
+}
+
+/// `[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]`.
+fn is_cjk_or_kana(c: char) -> bool {
+    matches!(c, '\u{4e00}'..='\u{9fa5}' | '\u{3040}'..='\u{309f}' | '\u{30a0}'..='\u{30ff}')
+}
+
+/// End of the run of at most `max` consecutive `\p{N}` characters at `pos`.
+fn number_group_end(s: &str, pos: usize, max: usize) -> usize {
+    let mut end = pos;
+    for c in s[pos..].chars().take(max) {
+        if !is_number(c) {
+            break;
+        }
+        end += c.len_utf8();
+    }
+    end
 }
 
 /// `[\p{P}\$\+<=>\^~\|]`.
@@ -526,6 +590,42 @@ fn word_at(rule: WordRule, s: &str, pos: usize, c: char) -> Option<usize> {
         return Some(end);
     }
     // `\s+(?!\S)`, then `\s+`
+    if run.end == s.len() || run.last_start == pos {
+        return Some(run.end);
+    }
+    Some(run.last_start)
+}
+
+/// The DeepSeek word pattern at `pos` (`c` is the character there).
+fn deepseek_word_at(s: &str, pos: usize, c: char) -> Option<usize> {
+    let next = pos + c.len_utf8();
+    // An ASCII punctuation character, then ASCII letters.
+    if c.is_ascii_punctuation() && char_at(s, next).is_some_and(|d| d.is_ascii_alphabetic()) {
+        return Some(run_end(s, next, |d| d.is_ascii_alphabetic()));
+    }
+    // `[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+`
+    let letter = |x: char| is_letter(x) || is_mark(x);
+    let prefix = c != '\r' && c != '\n' && !is_letter(c) && !is_punct_or_symbol(c);
+    if prefix && char_at(s, next).is_some_and(letter) {
+        return Some(run_end(s, next, letter));
+    }
+    if letter(c) {
+        return Some(run_end(s, pos, letter));
+    }
+    // ` ?[\p{P}\p{S}]+[\r\n]*`
+    let body = if c == ' ' { next } else { pos };
+    if char_at(s, body).is_some_and(is_punct_or_symbol) {
+        let end = run_end(s, body, is_punct_or_symbol);
+        return Some(run_end(s, end, |x| x == '\r' || x == '\n'));
+    }
+    if !is_space(c) {
+        return None;
+    }
+    let run = whitespace_run(s, pos);
+    // `\s*[\r\n]+`, then `\s+(?!\S)` and `\s+`
+    if let Some(end) = run.last_newline_end {
+        return Some(end);
+    }
     if run.end == s.len() || run.last_start == pos {
         return Some(run.end);
     }
@@ -877,11 +977,150 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_digits_cut_first_in_groups_of_three() {
+        check(
+            "deepseek-v3",
+            &[
+                ("12345 6789", &["123", "45", " ", "678", "9"]),
+                ("x1234y", &["x", "123", "4", "y"]),
+                ("-1.5", &["-", "1", ".", "5"]),
+                (
+                    "\u{661}\u{662}\u{663}\u{664}",
+                    &["\u{661}\u{662}\u{663}", "\u{664}"],
+                ),
+                ("v2.0", &["v", "2", ".", "0"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn deepseek_cjk_and_kana_runs_are_cut_before_the_word_rule() {
+        check(
+            "deepseek-v3",
+            &[
+                // A space before a run stays a lone fragment: the CJK stage cut the
+                // run out before the word rule saw the space.
+                (" \u{4f60}\u{597d}", &[" ", "\u{4f60}\u{597d}"]),
+                ("ab\u{4f60}\u{597d}cd", &["ab", "\u{4f60}\u{597d}", "cd"]),
+                (
+                    "\u{3072}\u{3089}\u{30ab}\u{30bf}x",
+                    &["\u{3072}\u{3089}\u{30ab}\u{30bf}", "x"],
+                ),
+                // Hangul and the halfwidth katakana are ordinary letters.
+                ("\u{d55c}\u{ad6d}\u{c5b4}", &["\u{d55c}\u{ad6d}\u{c5b4}"]),
+                ("\u{ff71}\u{ff72}", &["\u{ff71}\u{ff72}"]),
+            ],
+        );
+    }
+
+    #[test]
+    fn deepseek_word_alternatives_keep_their_priority() {
+        check(
+            "deepseek-v3",
+            &[
+                ("Hello world", &["Hello", " world"]),
+                // An ASCII punctuation mark takes the letters behind it before the
+                // punctuation-run alternative can.
+                ("a.b", &["a", ".b"]),
+                ("a..b", &["a", "..", "b"]),
+                ("foo.bar()\n\n", &["foo", ".bar", "()\n\n"]),
+                // No contraction handling: the apostrophe is punctuation.
+                ("don't", &["don", "'t"]),
+                ("rock 'n' roll'", &["rock", " '", "n", "'", " roll", "'"]),
+                // The fullwidth marks are not ASCII punctuation.
+                ("a\u{ff0c}b", &["a", "\u{ff0c}", "b"]),
+                // Any non-letter prefix other than a newline may lead a word.
+                ("\tbed", &["\tbed"]),
+                ("$x", &["$x"]),
+                ("a\nb", &["a", "\n", "b"]),
+                ("a\r\nb", &["a", "\r\n", "b"]),
+                // Symbols and punctuation share one run, with trailing newlines.
+                (" \u{20ac}\u{a3}!\r\n", &[" \u{20ac}\u{a3}!\r\n"]),
+                ("\u{1f600}\u{1f680}", &["\u{1f600}\u{1f680}"]),
+                ("x \u{1f600}", &["x", " \u{1f600}"]),
+                // Marks join letters and may start a word.
+                ("e\u{301}x", &["e\u{301}x"]),
+                (" \u{301}x", &[" \u{301}x"]),
+                // Whitespace runs leave their last character to the next word.
+                ("a   b", &["a", "  ", " b"]),
+                ("end  ", &["end", "  "]),
+                ("a \n  \n b", &["a", " \n  \n", " b"]),
+                ("a\u{3000}b", &["a", "\u{3000}b"]),
+                ("", &[]),
+            ],
+        );
+    }
+
+    #[test]
+    fn deepseek_names_resolve_to_one_chain_without_bos_or_ignore_merges() {
+        let Some(Pre::Words(chain)) = Pre::from_name(Some("deepseek-v3")) else {
+            panic!("deepseek-v3 resolves");
+        };
+        assert!(!chain.ignore_merges() && !chain.add_bos());
+        for alias in ["joyai-llm", "hunyuan-dense", "hy_v4"] {
+            assert_eq!(
+                Pre::from_name(Some(alias)),
+                Pre::from_name(Some("deepseek-v3"))
+            );
+        }
+        // The earlier DeepSeek chains belong to pre-2025 models.
+        for old in ["deepseek-llm", "deepseek-coder"] {
+            assert!(Pre::from_name(Some(old)).is_none(), "{old}");
+        }
+    }
+
+    /// The chain against HuggingFace `tokenizers` (`pre_tokenize_str` of the
+    /// pre-tokenizer sequence in DeepSeek-V4.1-Flash-1017's `tokenizer.json`):
+    /// 45 probes (English, code, CJK and kana, digits, whitespace, emoji,
+    /// special tokens in text, whole prompts with tool markup) and 300 seeded
+    /// random texts. The fixture also records the ids of the full tokenizer,
+    /// which `golden.rs` checks.
+    #[test]
+    fn deepseek_words_match_the_reference_tokenizer() {
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            regexes: Vec<String>,
+            cases: Vec<Case>,
+            fuzz: Vec<Case>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Case {
+            text: String,
+            words: Vec<String>,
+        }
+        let fixture: Fixture =
+            serde_json::from_str(include_str!("../testdata/deepseek_v41_tokenizer.json")).unwrap();
+        assert_eq!(fixture.regexes.len(), 3);
+        assert_eq!(fixture.regexes[0], r"\p{N}{1,3}");
+        assert_eq!((fixture.cases.len(), fixture.fuzz.len()), (45, 300));
+        let mut failures = Vec::new();
+        for case in fixture.cases.iter().chain(&fixture.fuzz) {
+            let got = words("joyai-llm", &case.text);
+            if got != case.words {
+                failures.push(format!(
+                    "{:?}: got {got:?}, want {:?}",
+                    case.text, case.words
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} differ:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
+
+    #[test]
     fn pre_names_resolve() {
         assert!(matches!(Pre::from_name(Some("gemma4")), Some(Pre::Gemma4)));
         assert!(Pre::from_name(Some("definitely-not-a-pre")).is_none());
         for name in [
             "default",
+            "deepseek-v3",
+            "joyai-llm",
+            "hunyuan-dense",
+            "hy_v4",
             "llama3",
             "llama-v3",
             "llama-bpe",
@@ -962,5 +1201,7 @@ mod tests {
         assert_eq!(words("llama3", &spaces).len(), 2);
         let upper = "A".repeat(200_000) + "1";
         assert_eq!(words("gpt-4o", &upper).len(), 2);
+        let dashes = "-".repeat(200_000) + "a";
+        assert_eq!(words("deepseek-v3", &dashes).len(), 2);
     }
 }

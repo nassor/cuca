@@ -242,6 +242,7 @@ mod real_models {
                 ToolSyntax::TaggedJson { .. } => "tagged",
                 ToolSyntax::TaggedXml { .. } => "xml",
                 ToolSyntax::MistralArgs { .. } => "mistral",
+                ToolSyntax::Dsml { .. } => "dsml",
             };
             assert_eq!(kind, expect.tools, "{id}: tool syntax");
             for text in expect.eog {

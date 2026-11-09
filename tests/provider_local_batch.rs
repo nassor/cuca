@@ -56,6 +56,7 @@ async fn loaded() -> Option<(LocalModel, String)> {
                 batching: local_env::batching().unwrap_or_default(),
                 chat_template: local_env::chat_template(),
                 gpu_layers: local_env::gpu_layers(),
+                engram: local_env::engram(),
                 ..Default::default()
             };
             local_env::set_devices(&mut config);
