@@ -128,7 +128,7 @@
 
 - `provider-local-*`: the GPU kernels allocate their outputs contiguously (`empty_device_contiguous_dtype`).
   A HIP tensor pads its rows to the device's pitch, which the kernels' linear indexing ignored;
-  on ROCm (Windows, RX 9070 XT) 21 of 37 `model::gpu` tests failed before and 1 fails after.
+  on ROCm (Windows, RX 9070 XT) 21 of 37 `model::gpu` tests failed before and 1 fails after (3 of the 37 are env-gated).
   `provider-local-rocm` builds and runs on Windows (docs: `ROCm on Windows`); a missing HIP runtime
   now names `ROCM_PATH`/`HIP_PATH` and `HIP_DEVICE_LIB_PATH` in its error.
 
