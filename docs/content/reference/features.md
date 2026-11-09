@@ -148,7 +148,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
 | `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction`, `service-scheduler`, `server` |
 | `postcard` | `1` | `use-std`; no defaults | `plugin-session-log`, `service-prompt-cache` |
-| `wide` | `1.7` | default | `service-vector-store` |
+| `wide` | `1.7` | default | `provider-local` (the row-batched quantized matmul), `service-vector-store` |
 | `candle-core` | `0.11.0` | no defaults | `provider-local` |
 | `candle-nn` | `0.11.0` | no defaults | `provider-local` |
 | `half` | `2` | default | `provider-local` |

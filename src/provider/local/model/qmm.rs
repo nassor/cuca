@@ -49,6 +49,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::utils::barrier_pool;
 use half::f16;
+use wide::{f32x4, f32x16, i8x16, i8x32, i16x16, i16x32, u8x32};
 
 use super::pool::for_each;
 
@@ -59,19 +60,45 @@ const QK: usize = 32;
 const LANES: usize = QK / 2;
 /// Weight rows decoded together.
 const NR: usize = 4;
-/// Activation rows per full register tile.
+/// Activation rows per register tile.
 const MR: usize = 4;
-/// Activation rows of the tile that serves a remainder of one to three rows.
-const MIN_TILE: usize = 3;
 /// Below this many weight elements the matmul runs on the calling thread.
 const SERIAL_BELOW: usize = 1 << 17;
 
-/// A block's 32 quants as i16 lanes: elements `0..16`, then `16..32`.
-///
-/// Every product of a weight (`-128..=127`, or `0..=31` for the 5-bit
-/// formats) and an activation quant (`-127..=127`) fits an `i16`, and so does
-/// the sum of two, so the halves are combined in `i16` without overflow.
+/// A block's 32 quants as two halves of sixteen: lane `l` of the first half is
+/// element `l`, lane `l` of the second is element `l + 16`. The definition of
+/// a format's quants ([`Legacy::halves`]).
 type Halves = [[i16; LANES]; 2];
+
+/// A block's 32 quants as `i16` lanes, element `l` in lane `2 * l` and element
+/// `l + 16` in lane `2 * l + 1`: one multiply-add of two such vectors
+/// (`vpmaddwd`) yields the sixteen lane sums the module docs define, with no
+/// further shuffle. A product of a weight quant (`-128..=127`) and an
+/// activation quant (`-127..=127`) fits an `i16` and the sum of two fits an
+/// `i32` exactly.
+type Quants = i16x32;
+
+/// [`Halves`] in the layout of [`Quants`].
+#[inline(always)]
+fn interleave(h: &Halves) -> Quants {
+    let mut lanes = [0i16; QK];
+    for l in 0..LANES {
+        lanes[2 * l] = h[0][l];
+        lanes[2 * l + 1] = h[1][l];
+    }
+    Quants::new(lanes)
+}
+
+/// The 16 nibble bytes of a block as 32 bytes `[lo0, hi0, lo1, hi1, ...]`:
+/// byte `i` holds element `i` in its low nibble and element `i + 16` in its
+/// high one, which is the pair [`Quants`] puts side by side.
+#[inline(always)]
+fn nibble_pairs(nibbles: &[u8]) -> i8x32 {
+    let bytes: [i8; LANES] = std::array::from_fn(|i| nibbles[i] as i8);
+    let wide = i16x16::from_i8x16(i8x16::new(bytes)) & i16x16::splat(0xFF);
+    let pairs = (wide & i16x16::splat(0x0F)) | ((wide & i16x16::splat(0xF0)) << 4u32);
+    i8x32::from_ne_bytes(pairs.to_ne_bytes())
+}
 
 /// A 32-element weight block: its bytes, f32 scale, optional minimum and quants.
 trait Legacy {
@@ -85,7 +112,14 @@ trait Legacy {
     fn min(_block: &Self::Block) -> f32 {
         0.0
     }
+    /// The block's quants, scalar: the format's definition.
     fn halves(block: &Self::Block) -> Halves;
+    /// [`Legacy::halves`] as [`Quants`]. A format that overrides it with
+    /// vector code returns the same lanes (`decode_equals_halves`).
+    #[inline(always)]
+    fn decode(block: &Self::Block) -> Quants {
+        interleave(&Self::halves(block))
+    }
 }
 
 /// The f16 at byte `at` of a block, widened.
@@ -121,6 +155,11 @@ impl Legacy for Q4_0 {
         }
         w
     }
+
+    #[inline(always)]
+    fn decode(block: &Self::Block) -> Quants {
+        Quants::from_i8x32(nibble_pairs(&block[2..18]) - i8x32::splat(8))
+    }
 }
 
 /// `d: f16`, `m: f16`, then 16 bytes of nibbles: element = nibble `* d + m`.
@@ -154,6 +193,11 @@ impl Legacy for Q4_1 {
             w[1][i] = i16::from(b >> 4);
         }
         w
+    }
+
+    #[inline(always)]
+    fn decode(block: &Self::Block) -> Quants {
+        Quants::from_i8x32(nibble_pairs(&block[4..20]))
     }
 }
 
@@ -231,6 +275,20 @@ impl Legacy for Q5_1 {
     }
 }
 
+/// Byte `2 * l` of the interleaved layout is element `l`, byte `2 * l + 1`
+/// element `l + 16`: the shuffle that turns a block's 32 bytes in element order
+/// into [`Quants`]' order.
+const INTERLEAVE: u8x32 = {
+    let mut at = [0u8; QK];
+    let mut l = 0;
+    while l < LANES {
+        at[2 * l] = l as u8;
+        at[2 * l + 1] = (l + LANES) as u8;
+        l += 1;
+    }
+    u8x32::new(at)
+};
+
 /// `d: f16`, then 32 signed bytes.
 struct Q8_0;
 
@@ -256,10 +314,28 @@ impl Legacy for Q8_0 {
         }
         w
     }
+
+    #[inline(always)]
+    fn decode(block: &Self::Block) -> Quants {
+        let bytes: [i8; QK] = std::array::from_fn(|i| block[2 + i] as i8);
+        Quants::from_i8x32(i8x32::new(bytes).shuffle(INTERLEAVE))
+    }
 }
 
 /// The doubled E2M1 values an MXFP4 nibble selects (ggml's `kvalues_mxfp4`).
 const KVALUES_MXFP4: [i16; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
+
+/// [`KVALUES_MXFP4`] as a byte table, once in each 128-bit half of a vector
+/// (a byte shuffle looks up within its half).
+const MXFP4_TABLE: i8x32 = {
+    let mut t = [0i8; QK];
+    let mut i = 0;
+    while i < QK {
+        t[i] = KVALUES_MXFP4[i % 16] as i8;
+        i += 1;
+    }
+    i8x32::new(t)
+};
 
 /// OCP MXFP4: one E8M0 scale byte, then 16 bytes of nibbles (element `i` is
 /// the low nibble of byte `i`, element `i + 16` its high nibble) that index
@@ -290,24 +366,26 @@ impl Legacy for Mxfp4 {
         }
         w
     }
+
+    #[inline(always)]
+    fn decode(block: &Self::Block) -> Quants {
+        Quants::from_i8x32(MXFP4_TABLE.swizzle_half_relaxed(nibble_pairs(&block[1..17])))
+    }
 }
 
 /// Activations of one call, quantised to Q8_0 (or Q8_1, which adds the sum
 /// term) and laid out block-major so the blocks of consecutive rows at one
-/// block index are contiguous. At least [`MIN_TILE`] rows are stored (zero
-/// padding beyond `m`): see [`chunk`].
+/// block index are contiguous.
 struct Acts {
     /// Blocks per row.
     nb: usize,
     /// Rows.
     m: usize,
-    /// Rows stored per block index: `m.max(MIN_TILE)`.
-    stride: usize,
-    /// `[nb][stride]` quants.
-    qs: Vec<Halves>,
-    /// `[nb][stride]` f16-rounded scales.
+    /// `[nb][m]` quants in [`Quants`]' layout.
+    qs: Vec<Quants>,
+    /// `[nb][m]` f16-rounded scales.
     scales: Vec<f32>,
-    /// `[nb][stride]` Q8_1 sum terms `f16(f16(sum of the quants) * d)`; empty
+    /// `[nb][m]` Q8_1 sum terms `f16(f16(sum of the quants) * d)`; empty
     /// for plain Q8_0.
     sums: Vec<f32>,
 }
@@ -324,67 +402,105 @@ fn round_away(t: f32) -> f32 {
     }
 }
 
+/// One activation block quantised: its quants in [`Quants`]' layout, its
+/// f16-rounded scale and, when `with_sums`, the Q8_1 sum term.
+#[inline(always)]
+fn quantise_block(src: &[f32; QK], with_sums: bool) -> (Quants, f32, f32) {
+    // `max` ignores NaN and is associative, so eight running maxima give the
+    // sequential fold's value.
+    let mut maxima = [0f32; 8];
+    for lane in src.as_chunks::<8>().0 {
+        for (m8, &v) in maxima.iter_mut().zip(lane) {
+            *m8 = m8.max(v.abs());
+        }
+    }
+    let amax = maxima.iter().fold(0f32, |a, &v| a.max(v));
+    let d = amax / 127.0;
+    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let d16 = f16::from_f32(d);
+    let mut lanes = [0i16; QK];
+    for l in 0..LANES {
+        lanes[2 * l] = i16::from(round_away(src[l] * id) as i8);
+        lanes[2 * l + 1] = i16::from(round_away(src[l + LANES] * id) as i8);
+    }
+    let sum = if with_sums {
+        let sum: i32 = lanes.iter().map(|&q| i32::from(q)).sum();
+        (f16::from_f32(sum as f32) * d16).to_f32()
+    } else {
+        0.0
+    };
+    (Quants::new(lanes), d16.to_f32(), sum)
+}
+
+/// One job of [`Acts::new`]: a run of blocks' quants, scales and sum terms.
+type Part<'a> = (&'a mut [Quants], &'a mut [f32], &'a mut [f32]);
+
 impl Acts {
     /// Quantise `x` (`m` rows of `k` floats, `k` a multiple of [`QK`]) the way
     /// candle's `BlockQ8_0::from_float` does, or `BlockQ8_1::from_float` when
     /// `with_sums`.
+    ///
+    /// A large call splits the blocks over the pool: each block is quantised
+    /// from its own 32 values alone, so the split changes no bit.
     fn new(x: &[f32], m: usize, k: usize, with_sums: bool) -> Self {
         let nb = k / QK;
-        let stride = m.max(MIN_TILE);
-        let mut qs = vec![[[0i16; LANES]; 2]; nb * stride];
-        let mut scales = vec![0f32; nb * stride];
-        let mut sums = vec![0f32; if with_sums { nb * stride } else { 0 }];
-        for (j, row) in x.chunks_exact(k).enumerate().take(m) {
-            for (b, src) in row.as_chunks::<QK>().0.iter().enumerate() {
-                // `max` ignores NaN and is associative, so eight running
-                // maxima give the sequential fold's value.
-                let mut maxima = [0f32; 8];
-                for lane in src.as_chunks::<8>().0 {
-                    for (m8, &v) in maxima.iter_mut().zip(lane) {
-                        *m8 = m8.max(v.abs());
+        let mut qs = vec![Quants::default(); nb * m];
+        let mut scales = vec![0f32; nb * m];
+        let mut sums = vec![0f32; if with_sums { nb * m } else { 0 }];
+        let pooled = m * k >= SERIAL_BELOW && barrier_pool().n_workers() > 0;
+        let threads = barrier_pool().n_workers() + 1;
+        let per = if pooled {
+            nb.div_ceil(threads * 4).max(1)
+        } else {
+            nb.max(1)
+        };
+        let width = (per * m).max(1);
+        let mut sum_chunks = sums.chunks_mut(width);
+        let jobs: Vec<Mutex<Part<'_>>> = qs
+            .chunks_mut(width)
+            .zip(scales.chunks_mut(width))
+            .map(|(q, s)| {
+                let su: &mut [f32] = if with_sums {
+                    sum_chunks.next().unwrap_or_default()
+                } else {
+                    &mut []
+                };
+                Mutex::new((q, s, su))
+            })
+            .collect();
+        for_each(
+            jobs.len(),
+            pooled && jobs.len() > 1,
+            || (),
+            |(), i| {
+                let mut part = jobs[i].lock().unwrap_or_else(PoisonError::into_inner);
+                let (q, s, su) = &mut *part;
+                for bi in 0..q.len() / m {
+                    let b = i * per + bi;
+                    for j in 0..m {
+                        let at = j * k + b * QK;
+                        let Ok(src) = <&[f32; QK]>::try_from(&x[at..at + QK]) else {
+                            continue;
+                        };
+                        let (quants, scale, sum) = quantise_block(src, with_sums);
+                        q[bi * m + j] = quants;
+                        s[bi * m + j] = scale;
+                        if with_sums {
+                            su[bi * m + j] = sum;
+                        }
                     }
                 }
-                let amax = maxima.iter().fold(0f32, |a, &v| a.max(v));
-                let d = amax / 127.0;
-                let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                let d16 = f16::from_f32(d);
-                scales[b * stride + j] = d16.to_f32();
-                let dst = &mut qs[b * stride + j];
-                for (half, vals) in dst.iter_mut().zip(src.as_chunks::<LANES>().0) {
-                    for (q, &v) in half.iter_mut().zip(vals) {
-                        *q = i16::from(round_away(v * id) as i8);
-                    }
-                }
-                if with_sums {
-                    let sum: i32 = dst.iter().flatten().map(|&q| i32::from(q)).sum();
-                    sums[b * stride + j] = (f16::from_f32(sum as f32) * d16).to_f32();
-                }
-            }
-        }
+            },
+        );
+        drop(jobs);
         Self {
             nb,
             m,
-            stride,
             qs,
             scales,
             sums,
         }
     }
-}
-
-/// Exact integer dot of one weight block with one activation block, as
-/// sixteen lane sums.
-#[inline(always)]
-fn dot_block(w: &Halves, x: &Halves) -> [i32; LANES] {
-    let mut p = [0i32; LANES];
-    for (l, pl) in p.iter_mut().enumerate() {
-        *pl = i32::from(
-            w[0][l]
-                .wrapping_mul(x[0][l])
-                .wrapping_add(w[1][l].wrapping_mul(x[1][l])),
-        );
-    }
-    p
 }
 
 /// Pairwise tree over the lanes, in a fixed order.
@@ -397,87 +513,110 @@ fn hsum(a: &[f32; LANES]) -> f32 {
     ((h[0] + h[4]) + (h[1] + h[5])) + ((h[2] + h[6]) + (h[3] + h[7]))
 }
 
-/// Repeat `$body` with `$i` bound to 0, 1, 2 and 3: a full unroll, so indices
-/// into small arrays are constants and the arrays live in registers.
-macro_rules! unroll4 {
-    ($i:ident => $body:expr) => {{
-        {
-            let $i = 0usize;
-            $body
-        }
-        {
-            let $i = 1usize;
-            $body
-        }
-        {
-            let $i = 2usize;
-            $body
-        }
-        {
-            let $i = 3usize;
-            $body
-        }
-    }};
+/// Up to [`NR`] weight rows with every block decoded: the quants, f32 scales
+/// and minima of rows by `nb` blocks, kept apart from the weights so that one
+/// decode serves every activation tile.
+struct Decoded {
+    nb: usize,
+    /// `[row][block]`.
+    quants: Vec<Quants>,
+    scales: Vec<f32>,
+    /// Empty for a format without minima.
+    mins: Vec<f32>,
 }
 
-/// `R <= 4` weight rows against activation rows `j0..j0 + M` (`M <= 4`) of a
-/// 32-element-block format: `out[i][jj]` is the dot of weight row `i` with
-/// activation row `j0 + jj`. Unrolled so the accumulators stay in registers.
+impl Decoded {
+    fn new<L: Legacy>(nb: usize) -> Self {
+        Self {
+            nb,
+            quants: vec![Quants::default(); NR * nb],
+            scales: vec![0f32; NR * nb],
+            mins: vec![0f32; if L::HAS_MIN { NR * nb } else { 0 }],
+        }
+    }
+
+    /// Decode `rows` (at most [`NR`], each `nb` blocks) into rows `0..`.
+    fn load<L: Legacy>(&mut self, rows: &[&[L::Block]]) {
+        let nb = self.nb;
+        for (r, row) in rows.iter().enumerate() {
+            for (b, block) in row.iter().enumerate() {
+                self.quants[r * nb + b] = L::decode(block);
+                self.scales[r * nb + b] = L::scale(block);
+                if L::HAS_MIN {
+                    self.mins[r * nb + b] = L::min(block);
+                }
+            }
+        }
+    }
+}
+
+/// `d * sc[jj]` for the `M` activation rows of a block: the f32 products the
+/// accumulation scales by, four at a time when a tile is full.
+#[inline(always)]
+fn scale_products<const M: usize>(d: f32, sc: &[f32]) -> [f32; M] {
+    let mut s = [0f32; M];
+    if M == MR {
+        let four = f32x4::splat(d) * f32x4::new([sc[0], sc[1], sc[2], sc[3]]);
+        s.copy_from_slice(&four.to_array());
+    } else {
+        for (p, &x) in s.iter_mut().zip(sc) {
+            *p = d * x;
+        }
+    }
+    s
+}
+
+/// `R <= 4` decoded weight rows against activation rows `j0..j0 + M` (`M <=
+/// 4`): `out[i][jj]` is the dot of weight row `i` with activation row `j0 +
+/// jj`, defined as sixteen `f32` lanes that each add, in block order, the
+/// exact integer sum of the block's two elements of that lane times the
+/// product of the two block scales, reduced by [`hsum`]. The accumulators stay
+/// in registers across the blocks.
 ///
 /// A format with a block minimum (`L::HAS_MIN`) adds `min * s` per block to a
 /// scalar sum in block order, where `s` is the activation block's Q8_1 sum
 /// term, after the lanes are reduced.
 #[inline(always)]
-#[allow(clippy::needless_range_loop)] // indices are unrolled constants
-fn legacy_tile<L: Legacy, const R: usize, const M: usize>(
-    rows: &[&[L::Block]; R],
+fn tile<L: Legacy, const R: usize, const M: usize>(
+    dec: &Decoded,
     act: &Acts,
     j0: usize,
 ) -> [[f32; M]; R] {
-    let mut acc = [[[0f32; LANES]; MR]; NR];
-    let mut extra = [[0f32; MR]; NR];
-    // Every row holds `act.nb` blocks: `run` validates the weight's byte length
-    // against it before any tile runs.
-    debug_assert!(rows.iter().all(|row| row.len() == act.nb));
-    for b in 0..act.nb {
-        let xs = &act.qs[b * act.stride + j0..b * act.stride + j0 + M];
-        let sc = &act.scales[b * act.stride + j0..b * act.stride + j0 + M];
-        let sums: &[f32] = if L::HAS_MIN {
-            &act.sums[b * act.stride + j0..b * act.stride + j0 + M]
-        } else {
-            &[]
-        };
-        let mut d = [0f32; NR];
-        let mut mn = [0f32; NR];
-        let mut w = [[[0i16; LANES]; 2]; NR];
-        unroll4!(r => if r < R {
-            d[r] = L::scale(&rows[r][b]);
-            if L::HAS_MIN {
-                mn[r] = L::min(&rows[r][b]);
+    let nb = act.nb;
+    let mut acc = [[f32x16::ZERO; M]; R];
+    let mut extra = [[0f32; M]; R];
+    let rows: [&[Quants]; R] = std::array::from_fn(|r| &dec.quants[r * nb..(r + 1) * nb]);
+    let scales: [&[f32]; R] = std::array::from_fn(|r| &dec.scales[r * nb..(r + 1) * nb]);
+    for b in 0..nb {
+        let at = b * act.m + j0;
+        let xs = &act.qs[at..at + M];
+        let sc = &act.scales[at..at + M];
+        for r in 0..R {
+            let w = rows[r][b];
+            let s = scale_products::<M>(scales[r][b], sc);
+            for jj in 0..M {
+                let p = f32x16::from_i32x16(w.dot(xs[jj]));
+                acc[r][jj] += p * f32x16::splat(s[jj]);
             }
-            w[r] = L::halves(&rows[r][b]);
-        });
-        unroll4!(jj => if jj < M {
-            let dx = sc[jj];
-            unroll4!(r => if r < R {
-                let p = dot_block(&w[r], &xs[jj]);
-                let s = d[r] * dx;
-                for l in 0..LANES {
-                    acc[r][jj][l] += p[l] as f32 * s;
+        }
+        if L::HAS_MIN {
+            let sums = &act.sums[at..at + M];
+            for (r, row) in extra.iter_mut().enumerate() {
+                let mn = dec.mins[r * nb + b];
+                for (e, &s) in row.iter_mut().zip(sums) {
+                    *e += mn * s;
                 }
-                if L::HAS_MIN {
-                    extra[r][jj] += mn[r] * sums[jj];
-                }
-            });
-        });
+            }
+        }
     }
     let mut out = [[0f32; M]; R];
     for r in 0..R {
         for jj in 0..M {
+            let lanes = acc[r][jj].to_array();
             out[r][jj] = if L::HAS_MIN {
-                hsum(&acc[r][jj]) + extra[r][jj]
+                hsum(&lanes) + extra[r][jj]
             } else {
-                hsum(&acc[r][jj])
+                hsum(&lanes)
             };
         }
     }
@@ -485,35 +624,27 @@ fn legacy_tile<L: Legacy, const R: usize, const M: usize>(
 }
 
 /// Store `tile[i][jj]` (weight row `r0 + i`, activation row `j0 + jj`) into the
-/// chunk's `res[j * rows + r]` scratch, skipping padding rows (`>= m`).
+/// chunk's `res[j * rows + r]` scratch.
 #[inline(always)]
 fn put<const R: usize, const M: usize>(
     tile: [[f32; M]; R],
     res: &mut [f32],
-    m: usize,
     rows: usize,
     r0: usize,
     j0: usize,
 ) {
     for (i, tile_row) in tile.iter().enumerate() {
         for (jj, v) in tile_row.iter().enumerate() {
-            if j0 + jj < m {
-                res[(j0 + jj) * rows + r0 + i] = *v;
-            }
+            res[(j0 + jj) * rows + r0 + i] = *v;
         }
     }
 }
 
-/// `R` weight rows against every activation row: full [`MR`]-row tiles, then
-/// one [`MIN_TILE`]-row tile for the remaining 1..=3 rows, placed to end at row
-/// `m` (overlapping rows are recomputed identically) or, when `m` is below
-/// [`MIN_TILE`], starting at row 0 over the zero padding.
-///
-/// Tiles of one and two rows compile to much slower code than three and four,
-/// so a lone row is computed as a three-row tile with two dummy rows.
+/// `R` decoded weight rows against every activation row: full [`MR`]-row
+/// tiles, then one tile for the remaining 1..=3 rows.
 #[inline(always)]
-fn rows_of<L: Legacy, const R: usize>(
-    rs: &[&[L::Block]; R],
+fn tiles<L: Legacy, const R: usize>(
+    dec: &Decoded,
     act: &Acts,
     res: &mut [f32],
     rows: usize,
@@ -522,37 +653,35 @@ fn rows_of<L: Legacy, const R: usize>(
     let m = act.m;
     let mut j0 = 0;
     while m - j0 >= MR {
-        put(legacy_tile::<L, R, MR>(rs, act, j0), res, m, rows, r, j0);
+        put(tile::<L, R, MR>(dec, act, j0), res, rows, r, j0);
         j0 += MR;
     }
-    if j0 < m {
-        let j1 = m.saturating_sub(MIN_TILE);
-        put(
-            legacy_tile::<L, R, MIN_TILE>(rs, act, j1),
-            res,
-            m,
-            rows,
-            r,
-            j1,
-        );
+    match m - j0 {
+        0 => {}
+        1 => put(tile::<L, R, 1>(dec, act, j0), res, rows, r, j0),
+        2 => put(tile::<L, R, 2>(dec, act, j0), res, rows, r, j0),
+        _ => put(tile::<L, R, 3>(dec, act, j0), res, rows, r, j0),
     }
 }
 
 /// Weight rows `w` (a whole number of rows) against every activation row;
 /// `res[j * rows + r]` receives the dot of weight row `r` with activation row
-/// `j`.
-fn chunk<L: Legacy>(w: &[u8], act: &Acts, res: &mut [f32]) {
+/// `j`. A group of [`NR`] rows is decoded once and dotted against all the
+/// activation tiles.
+fn chunk<L: Legacy>(w: &[u8], act: &Acts, dec: &mut Decoded, res: &mut [f32]) {
     let row_bytes = act.nb * size_of::<L::Block>();
     let rows = w.len() / row_bytes;
     let row = |r: usize| L::blocks(&w[r * row_bytes..(r + 1) * row_bytes]);
     let mut r = 0;
     while r + NR <= rows {
         let rs: [&[L::Block]; NR] = std::array::from_fn(|i| row(r + i));
-        rows_of::<L, NR>(&rs, act, res, rows, r);
+        dec.load::<L>(&rs);
+        tiles::<L, NR>(dec, act, res, rows, r);
         r += NR;
     }
     while r < rows {
-        rows_of::<L, 1>(&[row(r)], act, res, rows, r);
+        dec.load::<L>(&[row(r)]);
+        tiles::<L, 1>(dec, act, res, rows, r);
         r += 1;
     }
 }
@@ -692,7 +821,8 @@ impl QmmWeight {
 /// Quantise the `m` activation rows for the format `L`, split the `[m, n]`
 /// output into `rows_per_chunk`-wide column chunks per activation row and
 /// compute them over the pool; each worker claims chunks dynamically,
-/// computes one into a private scratch and copies it out.
+/// computes one into a private scratch (with its own decode buffers) and
+/// copies it out.
 fn run<L: Legacy>(
     data: &[u8],
     x: &[f32],
@@ -727,13 +857,14 @@ fn run<L: Legacy>(
     for_each(
         n_chunks,
         !serial,
-        || vec![0f32; m * rows_per_chunk],
-        |res, c| {
+        || (vec![0f32; m * rows_per_chunk], Decoded::new::<L>(act.nb)),
+        |(res, dec), c| {
             let r0 = c * rows_per_chunk;
             let rows = rows_per_chunk.min(n - r0);
             chunk::<L>(
                 &data[r0 * row_bytes..(r0 + rows) * row_bytes],
                 act,
+                dec,
                 &mut res[..m * rows],
             );
             for (j, row) in dst.chunks_exact(n_chunks).enumerate() {
@@ -786,6 +917,122 @@ mod tests {
         [(10, 2 * QK, 7), (3, QK, 1), (600, 256, 5), (64, 3 * QK, 17)]
     }
 
+    /// Element `e` of block `b` of activation row `j`, from the kernel's
+    /// [`Quants`] layout.
+    fn act_quant(act: &Acts, b: usize, j: usize, e: usize) -> i16 {
+        let lane = if e < LANES {
+            2 * e
+        } else {
+            2 * (e - LANES) + 1
+        };
+        act.qs[b * act.m + j].to_array()[lane]
+    }
+
+    /// The definition in the module docs, scalar and in the straightforward
+    /// order: the product of weight row `r` and activation row `j` is sixteen
+    /// `f32` lanes, each adding its two elements' exact integer sum times the
+    /// product of the block scales block by block, reduced by [`hsum`].
+    fn scalar_definition<L: Legacy>(data: &[u8], act: &Acts, n: usize) -> Vec<f32> {
+        let row_bytes = act.nb * size_of::<L::Block>();
+        let mut out = vec![0f32; act.m * n];
+        for j in 0..act.m {
+            for r in 0..n {
+                let mut lanes = [0f32; LANES];
+                let mut extra = 0f32;
+                for (b, block) in L::blocks(&data[r * row_bytes..(r + 1) * row_bytes])
+                    .iter()
+                    .enumerate()
+                {
+                    let w = L::halves(block);
+                    let s = L::scale(block) * act.scales[b * act.m + j];
+                    for (l, lane) in lanes.iter_mut().enumerate() {
+                        let p = i32::from(w[0][l]) * i32::from(act_quant(act, b, j, l))
+                            + i32::from(w[1][l]) * i32::from(act_quant(act, b, j, l + LANES));
+                        *lane += p as f32 * s;
+                    }
+                    if L::HAS_MIN {
+                        extra += L::min(block) * act.sums[b * act.m + j];
+                    }
+                }
+                out[j * n + r] = if L::HAS_MIN {
+                    hsum(&lanes) + extra
+                } else {
+                    hsum(&lanes)
+                };
+            }
+        }
+        out
+    }
+
+    /// [`scalar_definition`] for the format `q` holds.
+    fn scalar_forward(q: &QmmWeight, x: &[f32], m: usize) -> Vec<f32> {
+        let data = match &q.blocks {
+            Blocks::Tensor(qt) => qt.data().unwrap().into_owned(),
+            Blocks::Raw(bytes) => bytes.to_vec(),
+        };
+        let act = |has_min| Acts::new(x, m, q.k, has_min);
+        match q.kind {
+            Kind::Q4_0 => scalar_definition::<Q4_0>(&data, &act(false), q.n),
+            Kind::Q4_1 => scalar_definition::<Q4_1>(&data, &act(true), q.n),
+            Kind::Q5_0 => scalar_definition::<Q5_0>(&data, &act(false), q.n),
+            Kind::Q5_1 => scalar_definition::<Q5_1>(&data, &act(true), q.n),
+            Kind::Q8_0 => scalar_definition::<Q8_0>(&data, &act(false), q.n),
+            Kind::Mxfp4 => scalar_definition::<Mxfp4>(&data, &act(false), q.n),
+        }
+    }
+
+    #[test]
+    fn the_kernel_equals_the_scalar_definition_bit_for_bit() {
+        for dtype in DTYPES {
+            for (n, k, m) in [
+                (10, 2 * QK, 7),
+                (3, 3 * QK, 1),
+                (130, 512, 41),
+                (64, 3 * QK, 17),
+                (37, 4 * QK, 6),
+                (9, 8 * QK, 2),
+            ] {
+                let w = weight(n, k, dtype, 11);
+                let x = awkward_acts(m, k);
+                let q = QmmWeight::new(&w).unwrap();
+                let got = q.forward(&x, m).unwrap();
+                let want = scalar_forward(&q, &x, m);
+                for (i, (g, r)) in got.iter().zip(&want).enumerate() {
+                    assert_eq!(
+                        g.to_bits(),
+                        r.to_bits(),
+                        "{dtype:?} {n}x{k} m={m} output {i}: {g} vs {r}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every format's vector decode gives the lanes of its scalar definition,
+    /// on random blocks.
+    #[test]
+    fn decode_equals_halves() {
+        fn check<L: Legacy>(name: &str) {
+            let bytes: Vec<u8> = noise(4096 * size_of::<L::Block>(), 7, 127.0)
+                .iter()
+                .map(|&v| (v * 2.0) as i32 as u8)
+                .collect();
+            for (i, block) in L::blocks(&bytes).iter().enumerate() {
+                assert_eq!(
+                    L::decode(block).to_array(),
+                    interleave(&L::halves(block)).to_array(),
+                    "{name} block {i}"
+                );
+            }
+        }
+        check::<Q4_0>("Q4_0");
+        check::<Q4_1>("Q4_1");
+        check::<Q5_0>("Q5_0");
+        check::<Q5_1>("Q5_1");
+        check::<Q8_0>("Q8_0");
+        check::<Mxfp4>("Mxfp4");
+    }
+
     /// The activations as the kernel sees them: quantised and dequantised.
     fn rounded_acts(x: &[f32], m: usize, k: usize) -> Vec<f64> {
         let mut xd = vec![0f64; m * k];
@@ -794,8 +1041,7 @@ mod tests {
             for b in 0..act.nb {
                 for e in 0..QK {
                     xd[j * k + b * QK + e] =
-                        f64::from(act.qs[b * act.stride + j][e / LANES][e % LANES])
-                            * f64::from(act.scales[b * act.stride + j]);
+                        f64::from(act_quant(&act, b, j, e)) * f64::from(act.scales[b * act.m + j]);
                 }
             }
         }
@@ -852,7 +1098,7 @@ mod tests {
                     .map(|b| {
                         let at = (r * act.nb + b) * block;
                         let min = f64::from(f16_le(&data[at..at + block], 2));
-                        min.abs() * f64::from(act.sums[b * act.stride + j]).abs() * 1.0e-3
+                        min.abs() * f64::from(act.sums[b * act.m + j]).abs() * 1.0e-3
                     })
                     .sum();
             }
@@ -1026,20 +1272,20 @@ mod tests {
                 for b in 0..k / QK {
                     let block = &bytes[(j * (k / QK) + b) * size..][..size];
                     assert_eq!(
-                        act.scales[b * act.stride + j],
+                        act.scales[b * act.m + j],
                         f16_le(block, 0),
                         "{dtype:?} scale of row {j} block {b}"
                     );
                     if with_sums {
                         assert_eq!(
-                            act.sums[b * act.stride + j],
+                            act.sums[b * act.m + j],
                             f16_le(block, 2),
                             "{dtype:?} sum term of row {j} block {b}"
                         );
                     }
                     for e in 0..QK {
                         assert_eq!(
-                            act.qs[b * act.stride + j][e / LANES][e % LANES],
+                            act_quant(&act, b, j, e),
                             i16::from(block[quants_at + e] as i8),
                             "{dtype:?} quant {e} of row {j} block {b}"
                         );

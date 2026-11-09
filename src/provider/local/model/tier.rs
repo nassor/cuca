@@ -31,7 +31,9 @@
 //! is computing may outlive its eviction while it is computed (the pass holds
 //! its handle), so one expert per MoE layer pass can transiently exceed the
 //! RAM table (the GPU device tier states its own transient in `gpu`). The
-//! heat table is `4 * n_layer * n_expert` bytes, fixed at load.
+//! heat table is `4 * n_layer * n_expert` bytes, fixed at load. Outside the
+//! budgets, each loader thread keeps three read buffers (one per matrix) that
+//! grow to the largest run it read, at most [`MAX_RUN`] matrices each.
 //!
 //! # Policy
 //!
@@ -51,7 +53,12 @@
 //!   flight; with no RAM tier, at most the loader threads); compute walks the
 //!   list in the same ascending order and waits
 //!   for each expert's read, so the accumulation order, and with it the
-//!   arithmetic, is the resident mode's.
+//!   arithmetic, is the resident mode's. Missing experts that are adjacent
+//!   in the file (same layer, consecutive ids, matrices stored one expert
+//!   after the other) are read as one run of at most [`MAX_RUN`] experts, one
+//!   read per matrix: a longer read takes the drive nearer its sequential
+//!   rate. Each expert of a run is built, counted and slotted on its own, so
+//!   the bytes, the budgets and the output are the single-expert reads'.
 //! - Warm start: heat exported from an earlier session
 //!   ([`TierShared::heat`], `LocalModel::expert_heat`) seeds the counters and
 //!   loads the hottest experts of every layer at startup.
@@ -208,14 +215,22 @@ impl ExpertFile {
     /// The I/O error; [`std::io::ErrorKind::UnexpectedEof`] when the file ends first.
     fn read(&self, offset: u64, len: usize, buf: &mut ReadBuf) -> std::io::Result<()> {
         if !self.direct {
-            buf.raw.resize(len, 0);
+            // Grow only: a smaller read reuses the larger allocation, and the
+            // old bytes need no copy when it grows.
+            if buf.raw.len() < len {
+                buf.raw.clear();
+                buf.raw.resize(len, 0);
+            }
             buf.from = 0;
             buf.len = len;
-            return read_exact_at(&self.file, offset, &mut buf.raw);
+            return read_exact_at(&self.file, offset, &mut buf.raw[..len]);
         }
         let head = (offset % DIRECT_ALIGN as u64) as usize;
         let span = (head + len).next_multiple_of(DIRECT_ALIGN);
-        buf.raw.resize(span + DIRECT_ALIGN, 0);
+        if buf.raw.len() < span + DIRECT_ALIGN {
+            buf.raw.clear();
+            buf.raw.resize(span + DIRECT_ALIGN, 0);
+        }
         let from = buf.raw.as_ptr().align_offset(DIRECT_ALIGN);
         let window = buf
             .raw
@@ -362,6 +377,22 @@ pub(crate) struct LayerExperts {
     pub(crate) down: ExpertSlice,
     /// Bytes one built expert of this layer occupies in the RAM tier.
     pub(crate) stored_bytes: usize,
+}
+
+/// The most adjacent experts one loader job reads with a single read per
+/// matrix. A longer read takes the drive nearer its sequential rate, and a
+/// loader thread holds up to three read buffers of this many matrices.
+const MAX_RUN: usize = 4;
+
+impl LayerExperts {
+    /// Whether the matrices of adjacent experts are adjacent in the file, so
+    /// that a run of experts is one range per matrix (a fused gate/up tensor
+    /// interleaves its halves and has no such range).
+    fn contiguous(&self) -> bool {
+        [&self.gate, &self.up, &self.down]
+            .iter()
+            .all(|s| s.stride == s.file_bytes)
+    }
 }
 
 /// Slots per layer a tier of `budget` bytes holds when one expert of every
@@ -704,10 +735,17 @@ pub(crate) type BuildFn<T> =
 /// A loader's reply: the built expert and the file bytes read.
 type Reply<T> = Result<(Arc<T>, usize), CucaError>;
 
+/// A run of adjacent experts being fetched: the positions of its experts in
+/// the caller's list and their reply channels.
+type Run<'a, T> = (&'a [usize], Vec<Receiver<Reply<T>>>);
+
+/// The experts `first..first + replies.len()` of `layer`, read together (one
+/// expert unless the layer is [`LayerExperts::contiguous`]).
 struct Job<T> {
     layer: usize,
-    expert: u32,
-    reply: Sender<Reply<T>>,
+    first: u32,
+    /// One channel per expert of the run, in order.
+    replies: Vec<Sender<Reply<T>>>,
 }
 
 /// What every loader thread reads.
@@ -716,28 +754,59 @@ struct LoaderCtx<T> {
     files: Vec<ExpertFile>,
     layers: Vec<Option<LayerExperts>>,
     build: Arc<BuildFn<T>>,
+    /// Reads issued, one per matrix of a job (tests).
+    #[cfg(test)]
+    reads: AtomicU64,
 }
 
 impl<T> LoaderCtx<T> {
-    fn load(&self, job_layer: usize, e: u32, bufs: &mut [ReadBuf; 3]) -> Reply<T> {
-        let layer = self
-            .layers
-            .get(job_layer)
-            .and_then(Option::as_ref)
-            .ok_or_else(|| err(format!("layer {job_layer} has no experts")))?;
+    /// Read the experts `first..first + replies.len()` of `job_layer` with
+    /// one read per matrix, build each and send it down its own channel as
+    /// soon as it is built, so a pass computes the first while the rest are
+    /// built. A run of more than one expert needs a contiguous layer. A failed
+    /// read fails every expert of the run.
+    fn load_run(
+        &self,
+        job_layer: usize,
+        first: u32,
+        replies: &[Sender<Reply<T>>],
+        bufs: &mut [ReadBuf; 3],
+    ) {
+        let Some(layer) = self.layers.get(job_layer).and_then(Option::as_ref) else {
+            for reply in replies {
+                let _ = reply.send(Err(err(format!("layer {job_layer} has no experts"))));
+            }
+            return;
+        };
+        debug_assert!(replies.len() == 1 || layer.contiguous());
         for (buf, slice) in bufs.iter_mut().zip([&layer.gate, &layer.up, &layer.down]) {
-            self.files[slice.file]
-                .read(slice.offset(e as usize), slice.file_bytes, buf)
-                .map_err(|io| {
-                    err(format!(
-                        "layer {} expert {e}: {io} (truncated GGUF?)",
-                        layer.il
-                    ))
-                })?;
+            #[cfg(test)]
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            let at = slice.offset(first as usize);
+            if let Err(io) = self.files[slice.file].read(at, replies.len() * slice.file_bytes, buf)
+            {
+                for (i, reply) in replies.iter().enumerate() {
+                    let _ = reply.send(Err(err(format!(
+                        "layer {} expert {}: {io} (truncated GGUF?)",
+                        layer.il,
+                        first as usize + i
+                    ))));
+                }
+                return;
+            }
         }
-        let value = (self.build)(layer, bufs[0].bytes(), bufs[1].bytes(), bufs[2].bytes())?;
         let read = layer.gate.file_bytes + layer.up.file_bytes + layer.down.file_bytes;
-        Ok((Arc::new(value), read))
+        for (i, reply) in replies.iter().enumerate() {
+            let range = |slice: &ExpertSlice| i * slice.file_bytes..(i + 1) * slice.file_bytes;
+            let built = (self.build)(
+                layer,
+                &bufs[0].bytes()[range(&layer.gate)],
+                &bufs[1].bytes()[range(&layer.up)],
+                &bufs[2].bytes()[range(&layer.down)],
+            );
+            // The requester may have given up (a failed pass).
+            let _ = reply.send(built.map(|value| (Arc::new(value), read)));
+        }
     }
 }
 
@@ -765,9 +834,7 @@ impl<T: Send + Sync + 'static> Loader<T> {
                     loop {
                         let job = queue.lock().unwrap_or_else(PoisonError::into_inner).recv();
                         let Ok(job) = job else { return };
-                        let reply = ctx.load(job.layer, job.expert, &mut bufs);
-                        // The requester may have given up (a failed pass).
-                        let _ = job.reply.send(reply);
+                        ctx.load_run(job.layer, job.first, &job.replies, &mut bufs);
                     }
                 })
                 .map_err(|e| err(format!("cannot start an expert loader thread: {e}")))?;
@@ -776,18 +843,25 @@ impl<T: Send + Sync + 'static> Loader<T> {
         Ok(loader)
     }
 
-    fn request(&self, layer: usize, expert: u32) -> Result<Receiver<Reply<T>>, CucaError> {
-        let (reply, rx) = mpsc::channel();
+    /// Ask for the `n` adjacent experts from `first` of `layer` as one job:
+    /// one receiver per expert, in order.
+    fn request(
+        &self,
+        layer: usize,
+        first: u32,
+        n: usize,
+    ) -> Result<Vec<Receiver<Reply<T>>>, CucaError> {
+        let (replies, receivers): (Vec<_>, Vec<_>) = (0..n).map(|_| mpsc::channel()).unzip();
         self.jobs
             .as_ref()
             .ok_or_else(|| err("expert loader thread stopped"))?
             .send(Job {
                 layer,
-                expert,
-                reply,
+                first,
+                replies,
             })
             .map_err(|_| err("expert loader thread stopped"))?;
-        Ok(rx)
+        Ok(receivers)
     }
 }
 
@@ -864,6 +938,8 @@ impl<T: Send + Sync + 'static> ExpertStore<T> {
                 .collect::<Result<_, _>>()?,
             layers: by_layer,
             build,
+            #[cfg(test)]
+            reads: AtomicU64::new(0),
         });
         let loader_threads = loader_threads.max(1);
         Ok(Self {
@@ -912,19 +988,50 @@ impl<T: Send + Sync + 'static> ExpertStore<T> {
     ///
     /// The first read or build error.
     pub(crate) fn fetch(&self, il: usize, experts: &[u32]) -> Result<Vec<Arc<T>>, CucaError> {
-        let mut out = Vec::with_capacity(experts.len());
-        for chunk in experts.chunks(2 * self.loader_threads) {
-            let replies = chunk
-                .iter()
-                .map(|&e| self.loader.request(il, e))
-                .collect::<Result<Vec<_>, _>>()?;
-            for rx in &replies {
-                let (value, bytes) = receive(rx)?;
-                self.count_read(bytes);
-                out.push(value);
+        // Adjacent ids are read as one run; the answers come back in the
+        // order asked.
+        let mut order: Vec<usize> = (0..experts.len()).collect();
+        order.sort_unstable_by_key(|&i| experts[i]);
+        let max_run = self.max_run(il);
+        let mut out: Vec<Option<Arc<T>>> = vec![None; experts.len()];
+        let mut batch: Vec<Run<'_, T>> = Vec::new();
+        let (mut queued, mut at) = (0, 0);
+        while at < order.len() {
+            let mut n = 1;
+            while n < max_run
+                && at + n < order.len()
+                && experts[order[at + n - 1]].checked_add(1) == Some(experts[order[at + n]])
+            {
+                n += 1;
+            }
+            let run = &order[at..at + n];
+            batch.push((run, self.loader.request(il, experts[run[0]], n)?));
+            queued += n;
+            at += n;
+            if queued >= 2 * self.loader_threads || at == order.len() {
+                for (run, receivers) in batch.drain(..) {
+                    for (&i, rx) in run.iter().zip(&receivers) {
+                        let (value, bytes) = receive(rx)?;
+                        self.count_read(bytes);
+                        out[i] = Some(value);
+                    }
+                }
+                queued = 0;
             }
         }
-        Ok(out)
+        out.into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| err("an expert was not loaded"))
+    }
+
+    /// The most adjacent experts of layer `il` one job reads together: 1
+    /// unless the layer's matrices are contiguous (see [`MAX_RUN`]).
+    fn max_run(&self, il: usize) -> usize {
+        if self.layer(il).is_some_and(LayerExperts::contiguous) {
+            MAX_RUN
+        } else {
+            1
+        }
     }
 
     /// Load into the RAM tier, per MoE layer, the hottest experts of `heat`
@@ -1003,16 +1110,17 @@ pub(crate) struct Pass<'a, T> {
 
 impl<T: Send + Sync + 'static> Pass<'_, T> {
     /// Request missing experts while the slots allow it (see the module
-    /// docs), evicting for room.
+    /// docs), evicting for room. Adjacent ids are requested as one job (see
+    /// [`MAX_RUN`]); each expert of a run still takes its own slot.
     fn issue(&mut self) {
         let store = self.store;
         let max_in_flight = 2 * store.loader_threads;
+        let max_run = store.max_run(self.il);
         if store.ram_slots == 0 {
-            while self.in_flight.len() < store.loader_threads.min(max_in_flight)
-                && !self.pending.is_empty()
-            {
-                let e = self.pending.remove(0);
-                self.request(e);
+            let cap = store.loader_threads.min(max_in_flight);
+            while self.in_flight.len() < cap && !self.pending.is_empty() {
+                let n = self.leading_run(max_run.min(cap - self.in_flight.len()));
+                self.request_run(n);
             }
             return;
         }
@@ -1021,40 +1129,67 @@ impl<T: Send + Sync + 'static> Pass<'_, T> {
         }
         let mut table = store.table(self.il);
         let mut heat: Option<Vec<u32>> = None;
-        while let Some(&next) = self.pending.first() {
-            if self.in_flight.len() >= max_in_flight {
+        loop {
+            // Make room, expert by expert, for the run at the head of
+            // `pending`.
+            let mut run = 0;
+            while run < max_run && run < self.pending.len() {
+                let next = self.pending[run];
+                if run > 0 && self.pending[run - 1].checked_add(1) != Some(next) {
+                    break;
+                }
+                if self.in_flight.len() + run >= max_in_flight {
+                    break;
+                }
+                if table.len() + self.in_flight.len() + run >= store.ram_slots {
+                    let heat = heat.get_or_insert_with(|| store.shared.heat_snapshot(self.il));
+                    let later = &self.needed[self.cursor..];
+                    let Some(victim) = table.victim(heat, later) else {
+                        break;
+                    };
+                    let victim_needed = later.binary_search(&victim).is_ok();
+                    if victim_needed && victim < next {
+                        // Every resident expert is needed before the one to
+                        // fetch: wait for compute to move past them.
+                        break;
+                    }
+                    table.remove(victim);
+                    sub(
+                        &store.shared.ram_resident_bytes,
+                        store.stored_bytes(self.il),
+                    );
+                    if victim_needed {
+                        let at = self.pending.partition_point(|&p| p < victim);
+                        self.pending.insert(at, victim);
+                    }
+                }
+                run += 1;
+            }
+            if run == 0 {
                 break;
             }
-            if table.len() + self.in_flight.len() >= store.ram_slots {
-                let heat = heat.get_or_insert_with(|| store.shared.heat_snapshot(self.il));
-                let later = &self.needed[self.cursor..];
-                let Some(victim) = table.victim(heat, later) else {
-                    break;
-                };
-                let victim_needed = later.binary_search(&victim).is_ok();
-                if victim_needed && victim < next {
-                    // Every resident expert is needed before the one to
-                    // fetch: wait for compute to move past them.
-                    break;
-                }
-                table.remove(victim);
-                sub(
-                    &store.shared.ram_resident_bytes,
-                    store.stored_bytes(self.il),
-                );
-                if victim_needed {
-                    let at = self.pending.partition_point(|&p| p < victim);
-                    self.pending.insert(at, victim);
-                }
-            }
-            self.pending.remove(0);
-            self.request(next);
+            self.request_run(run);
         }
     }
 
-    fn request(&mut self, e: u32) {
-        match self.store.loader.request(self.il, e) {
-            Ok(rx) => self.in_flight.push((e, rx)),
+    /// The length of the run of adjacent ids at the head of `pending`, at
+    /// most `most`.
+    fn leading_run(&self, most: usize) -> usize {
+        let mut n = 1;
+        while n < most
+            && n < self.pending.len()
+            && self.pending[n - 1].checked_add(1) == Some(self.pending[n])
+        {
+            n += 1;
+        }
+        n
+    }
+
+    /// Request the first `n` experts of `pending` as one job.
+    fn request_run(&mut self, n: usize) {
+        let experts: Vec<u32> = self.pending.drain(..n).collect();
+        match self.store.loader.request(self.il, experts[0], n) {
+            Ok(receivers) => self.in_flight.extend(experts.into_iter().zip(receivers)),
             Err(error) => self.failed = Some(error),
         }
     }
@@ -1387,6 +1522,26 @@ mod tests {
         alive: &Arc<AtomicUsize>,
         peak: &Arc<AtomicUsize>,
     ) -> (TempFile, ExpertStore<Built>) {
+        store_shaped(n_layer, n_expert, slots, threads, alive, peak, 0, 0)
+    }
+
+    /// [`store`] with `gap` padding bytes after every expert's matrix (a
+    /// stride above the matrix size, as a fused gate/up tensor has) and the
+    /// last `cut` bytes of the file missing.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a test fixture's independent knobs"
+    )]
+    fn store_shaped(
+        n_layer: usize,
+        n_expert: usize,
+        slots: usize,
+        threads: usize,
+        alive: &Arc<AtomicUsize>,
+        peak: &Arc<AtomicUsize>,
+        gap: usize,
+        cut: usize,
+    ) -> (TempFile, ExpertStore<Built>) {
         let file_bytes = 16;
         let mut bytes = Vec::new();
         let mut layers = Vec::new();
@@ -1395,6 +1550,7 @@ mod tests {
                 let start = bytes.len() as u64;
                 for e in 0..n_expert {
                     bytes.extend(std::iter::repeat_n((il * 16 + e) as u8, file_bytes));
+                    bytes.extend(std::iter::repeat_n(0xEE, gap));
                 }
                 ExpertSlice {
                     dtype: GgufType::Ggml(GgmlDType::F32),
@@ -1403,7 +1559,7 @@ mod tests {
                     cols: 4,
                     start,
                     file_bytes,
-                    stride: file_bytes,
+                    stride: file_bytes + gap,
                 }
             };
             let (gate, up, down) = (slice(&mut bytes), slice(&mut bytes), slice(&mut bytes));
@@ -1415,6 +1571,7 @@ mod tests {
                 stored_bytes: 100,
             });
         }
+        bytes.truncate(bytes.len() - cut);
         let tmp = TempFile::new("store", &bytes);
         let (alive2, peak2) = (Arc::clone(alive), Arc::clone(peak));
         let build: Arc<BuildFn<Built>> = Arc::new(move |l, g, u, d| {
@@ -1442,6 +1599,109 @@ mod tests {
         )
         .unwrap();
         (tmp, store)
+    }
+
+    /// Reads issued so far, one per matrix of a job.
+    fn reads(store: &ExpertStore<Built>) -> u64 {
+        store.ctx.reads.load(Ordering::Relaxed)
+    }
+
+    #[test]
+    fn adjacent_missing_experts_read_as_runs_with_the_same_bytes_and_counters() {
+        let (alive, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (_tmp, store) = store(1, 16, 16, 4, &alive, &peak);
+        let needed = [0u32, 1, 2, 3, 4, 5, 9, 10, 12];
+        let mut pass = store.pass(0, &needed);
+        for e in needed {
+            let x = pass.next(e).unwrap();
+            assert_eq!((x.il, x.e), (0, e));
+        }
+        // [0..4), [4, 5], [9, 10] and [12]: four jobs of three reads, not
+        // nine experts of three.
+        assert_eq!(reads(&store), 12);
+        let stats = store.shared().stats();
+        assert_eq!((stats.disk_reads, stats.bytes_read), (9, 9 * 48));
+        assert_eq!(stats.ram_resident_bytes, 900);
+        // A second pass over the same experts reads nothing.
+        let before = reads(&store);
+        let mut pass = store.pass(0, &needed);
+        for e in needed {
+            assert_eq!(pass.next(e).unwrap().e, e);
+        }
+        assert_eq!(reads(&store), before);
+        assert_eq!(store.shared().stats().ram_hits, 9);
+    }
+
+    #[test]
+    fn a_run_is_cut_at_max_run_and_without_a_ram_tier_at_the_loader_threads() {
+        let (alive, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (_tmp, store) = store(1, 16, 16, 8, &alive, &peak);
+        let needed: Vec<u32> = (0..10).collect();
+        let mut pass = store.pass(0, &needed);
+        for &e in &needed {
+            assert_eq!(pass.next(e).unwrap().e, e);
+        }
+        // Ten adjacent experts: runs of 4, 4 and 2.
+        assert_eq!(reads(&store), 9);
+
+        // No RAM tier: at most `threads` experts in flight. Two threads read
+        // the pair [2, 3] at once; each consumed expert then frees one place,
+        // so 4 and 5 follow alone.
+        let (alive, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (_tmp, store) = store_shaped(1, 16, 0, 2, &alive, &peak, 0, 0);
+        let mut pass = store.pass(0, &[2, 3, 4, 5]);
+        for e in [2, 3, 4, 5] {
+            assert_eq!(pass.next(e).unwrap().e, e);
+        }
+        assert_eq!(reads(&store), 9);
+        assert!(peak.load(Ordering::SeqCst) <= 3, "{peak:?}");
+    }
+
+    #[test]
+    fn a_layer_whose_experts_are_not_adjacent_reads_expert_by_expert() {
+        let (alive, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (_tmp, store) = store_shaped(1, 8, 8, 4, &alive, &peak, 16, 0);
+        assert!(!store.layer(0).unwrap().contiguous());
+        let needed = [0u32, 1, 2, 3, 4];
+        let mut pass = store.pass(0, &needed);
+        for e in needed {
+            assert_eq!(pass.next(e).unwrap().e, e);
+        }
+        assert_eq!(reads(&store), 15);
+    }
+
+    #[test]
+    fn fetch_returns_the_experts_in_the_order_asked_and_reads_adjacent_ones_together() {
+        let (alive, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let (_tmp, store) = store(1, 16, 16, 4, &alive, &peak);
+        let asked = [9u32, 3, 4, 5, 0, 10];
+        let got = store.fetch(0, &asked).unwrap();
+        assert_eq!(got.iter().map(|x| x.e).collect::<Vec<_>>(), asked);
+        // [0], [3, 4, 5] and [9, 10].
+        assert_eq!(reads(&store), 9);
+        assert_eq!(store.shared().stats().disk_reads, 6);
+        assert!(store.fetch(0, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_failed_read_fails_every_expert_of_its_run() {
+        let (alive, peak) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        // The last matrix of the layer loses its final 20 bytes: experts 6 and
+        // 7 of `down` are cut, so the run [4, 5, 6, 7] cannot be read as one.
+        let (_tmp, store) = store_shaped(1, 8, 8, 4, &alive, &peak, 0, 20);
+        let mut pass = store.pass(0, &[4, 5, 6, 7]);
+        for e in [4, 5, 6, 7] {
+            let error = pass.next(e).err().expect("the run fails").to_string();
+            assert!(
+                error.contains(&format!("expert {e}")) && error.contains("truncated GGUF"),
+                "{error}"
+            );
+        }
+        // The experts before the cut read fine.
+        let mut pass = store.pass(0, &[0, 1]);
+        for e in [0, 1] {
+            assert_eq!(pass.next(e).unwrap().e, e);
+        }
     }
 
     #[test]

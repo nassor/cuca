@@ -103,7 +103,7 @@ provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 # no HTTP endpoint, no llama.cpp. reqwest is used only for the one-time model download
 # (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file;
 # sysinfo's disk list answers the converter's free-space preflight.
-provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:sysinfo", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "reqwest/rustls", "serde_json/preserve_order"]
+provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:sysinfo", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "dep:wide", "reqwest/rustls", "serde_json/preserve_order"]
 # provider-local GPU backends (burn 0.22 / CubeCL). provider-local-gpu is the shared
 # engine; it selects no backend by itself and is enabled by each backend feature.
 # The graphics backends are Rust (wgpu: SPIR-V for vulkan, MSL for metal), but
@@ -224,8 +224,10 @@ opentelemetry = { version = "0.32", optional = true }
 # runtime needed), so the telemetry tests stay on the current-thread Tokio flavor.
 opentelemetry_sdk = { version = "0.32", optional = true, features = ["metrics", "testing"] }
 tracing = { version = "0.1", optional = true }
-# wide: portable SIMD (`f32x8`) for the vector store's cosine scan. Stable-only
-# by construction: `std::simd` is nightly, and this crate pins stable 1.98.
+# wide: portable SIMD, stable-only by construction (`std::simd` is nightly, and
+# this crate pins stable 1.98, forbids `unsafe` and reaches the vector units
+# through it): `f32x8` for the vector store's cosine scan, and the i16 multiply-add
+# and f32 lanes of provider-local's row-batched quantized matmul (`model/qmm.rs`).
 wide = { version = "1.7", optional = true }
 # provider-local: candle for CPU tensors and quantized matmul; half for f16 block
 # scales; minijinja (+pycompat for the chat templates' Python string methods).

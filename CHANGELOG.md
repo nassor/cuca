@@ -114,6 +114,15 @@
   `LocalModelConfig::shard_dirs` (new), and a Hugging Face source whose file is a split name
   downloads every part into the cache and keeps them there. A split model needs its own size on
   disk and no more.
+- `provider-local`: the row-batched quantized matmul (`model/qmm.rs`) decodes four weight rows once
+  into `i16` lane pairs and multiply-adds them against every activation tile through `wide`
+  (`provider-local` now owns that dependency), and quantizes the activations over the pool. Its
+  results are unchanged bit for bit and a test checks them against the scalar definition. A
+  2,014-token prompt on the real DeepSeek-V4.1-Flash-1017 from an SSD prefills in 147.4 s against
+  276.1 s on the CPU; one MXFP4 expert matrix of 41 rows takes 0.84 ms against 4.96 ms.
+- `provider-local`: the expert loader reads missing experts that are adjacent in the file as one run
+  of up to 4 per matrix (layers that store their experts expert after expert; the bytes, counters and
+  budgets are the single reads'). Cold expert reads from the SSD rise from 3.41 to 3.50 GB/s.
 
 ## 0.7.0 - 2026-11-07
 
