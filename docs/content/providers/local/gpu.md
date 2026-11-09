@@ -176,7 +176,7 @@ loaded on Vulkan(Default): 17 of 35 layers on the GPU (layers 18 to 34), layers 
 
 `provider-local-rocm` builds on Windows and runs on the RX 9070 XT (gfx1201) with the HIP runtime of an AMD driver, but only part of what the engine does is verified on it. CubeCL loads `amdhip64.dll` and `hiprtc.dll` by those names at run time, and compiles kernels with its own LLVM, which needs the AMD device libraries (`ocml.bc`). The Adrenalin driver (32.0.32015.12012) ships `amdhip64_7.dll` in `System32` and no `hiprtc`, so the runtime has to come from somewhere else.
 
-The HIP SDK installer (AMD's download page, an `-install` command line) provides the same files under `C:\Program Files\AMD\ROCm\<version>\bin`, but it needs administrator rights and bundles a display driver, and it was not tried. The run below used the `rocm_sdk_core` wheel instead: a 710 MB zip that needs no administrator rights and no Python. Its file names carry the version (`amdhip64_7.dll`, `hiprtc0714.dll`), so two copies under the names CubeCL asks for are made.
+AMD's HIP SDK installer is the other route: its documentation says it needs administrator rights and bundles a display driver. It was not run here, so which DLL names and folders it provides is unverified. The run below used the `rocm_sdk_core` wheel instead: a 710 MB zip that needs no administrator rights and no Python. Its file names carry the version (`amdhip64_7.dll`, `hiprtc0714.dll`), so two copies under the names CubeCL asks for are made.
 
 ```powershell,name=Windows (PowerShell): install the HIP runtime without administrator rights
 $root = "C:\rocm"
@@ -192,7 +192,7 @@ hipInfo.exe | Select-String "^device#|^Name|gcnArchName"
 Test-Path "$sdk\lib\llvm\amdgcn\bitcode\ocml.bc"
 ```
 
-Expected output on the test machine: `device# 0` is `AMD Radeon(TM) Graphics` (`gfx1036`), `device# 1` is `AMD Radeon RX 9070 XT` (`gfx1201`), and `Test-Path` prints `True`. The download, unpacking and these checks took 14 s. The wheel comes from the `gfx120X-all` nightly index of the ROCm project for RDNA4 cards; nightlies are replaced over time, so keep the file, and pick the version that matches the HIP bindings in `cubecl-hip-sys` (7.14.60850 here). An index listing is at `https://rocm.nightlies.amd.com/v2/gfx120X-all/rocm-sdk-core/`; other GPU families have their own index.
+Expected output on the test machine: `device# 0` is `AMD Radeon(TM) Graphics` (`gfx1036`), `device# 1` is `AMD Radeon RX 9070 XT` (`gfx1201`), and `Test-Path` prints `True`. The download, unpacking and these checks took 14 s. The wheel comes from the `gfx120X-all` nightly index, which is specific to the GPU family (gfx1200 and gfx1201, the RDNA4 cards): another card needs its own family directory, which was not tried. Nightlies are replaced over time, so keep the file named above (HIP 7.14.60850, which matches `cubecl-hip-sys` 7.14.6085001); other versions were not tested. An index listing is at `https://rocm.nightlies.amd.com/v2/gfx120X-all/rocm-sdk-core/`. `Expand-Archive` refuses a `.whl`, which is why the block uses `tar -xf`.
 
 ```powershell,name=Windows (PowerShell): run on ROCm
 $sdk = "C:\rocm\_rocm_sdk_core"
