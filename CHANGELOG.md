@@ -128,9 +128,17 @@
 
 - `provider-local-*`: the GPU kernels allocate their outputs contiguously (`empty_device_contiguous_dtype`).
   A HIP tensor pads its rows to the device's pitch, which the kernels' linear indexing ignored;
-  on ROCm (Windows, RX 9070 XT) 21 of 37 `model::gpu` tests failed before and 1 fails after (3 of the 37 are env-gated).
-  `provider-local-rocm` builds and runs on Windows (docs: `ROCm on Windows`); a missing HIP runtime
-  now names `ROCM_PATH`/`HIP_PATH` and `HIP_DEVICE_LIB_PATH` in its error.
+  on ROCm (Windows, RX 9070 XT) 21 of 37 `model::gpu` tests failed before, and 38 pass after (four of
+  them real-model tests that need `CUCA_LOCAL_DS41_REAL`). `provider-local-rocm` builds and runs on
+  Windows with the DLLs of AMD's ROCm 10.1.0 tarball (docs: `ROCm on Windows`, with the install steps
+  and the `hipconfig` build caveat); a missing HIP runtime now names `ROCM_PATH`/`HIP_PATH` and
+  `HIP_DEVICE_LIB_PATH` in its error.
+- `gpu_moe_one_row_experts_match_single_tokens`: its router rows are scaled apart. Rows of equal
+  weights gave eight experts equal logits, and the last bit of a four-row and a one-row matmul chose
+  different experts for the last slot, so the test failed in 2 of 3 runs on ROCm.
+- New gated test `real_model_on_the_gpu_production_paths_match_the_oracle` runs the real model
+  through the engine's own paths (inexact, token by token, last-position logits, chunks, the
+  engine's sizing).
 
 ## 0.7.0 - 2026-11-07
 

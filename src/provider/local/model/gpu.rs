@@ -5795,6 +5795,157 @@ mod tests {
         }
     }
 
+    /// The real model through the paths the engine takes instead of the
+    /// oracle's one exact pass (`CUCA_LOCAL_DS41_REAL_PATHS=1`, same gates as
+    /// above): one inexact prefill, then a shorter prefill and the rest one
+    /// token per step (the decode kernels), the exact pass again as the
+    /// control, and the last position's logits alone, the prompt whole and in
+    /// chunks of 4 rows. Each path's every-position logits are scored against
+    /// the oracle's dumps; it fails when one disagrees. Quantization is off
+    /// unless `CUCA_LOCAL_DS41_REAL_QDQ` is set; `CUCA_LOCAL_DS41_REAL_CTX`
+    /// (default 64), `_SEQS` (1) and `_ROWS` (the context's call rows) size
+    /// the pools like the engine's.
+    #[test]
+    fn real_model_on_the_gpu_production_paths_match_the_oracle() {
+        use super::super::cpu::real_tests::{prompt_ids, score, setup};
+        if std::env::var_os("CUCA_LOCAL_DS41_REAL_PATHS").is_none() {
+            return;
+        }
+        let (Some(device), Some((dir, model))) = (test_device(), setup()) else {
+            return;
+        };
+        let ids = prompt_ids(&dir);
+        let env =
+            |name: &str| -> Option<usize> { std::env::var(name).ok().and_then(|v| v.parse().ok()) };
+        let ctx = env("CUCA_LOCAL_DS41_REAL_CTX").unwrap_or(64);
+        let qdq = std::env::var_os("CUCA_LOCAL_DS41_REAL_QDQ").is_some();
+        let mode = if qdq { "on" } else { "off" };
+        let sizing = Sizing {
+            max_sequences: env("CUCA_LOCAL_DS41_REAL_SEQS").unwrap_or(1),
+            max_rows: env("CUCA_LOCAL_DS41_REAL_ROWS")
+                .unwrap_or_else(|| Sizing::single(ctx).max_rows),
+            ..Sizing::single(ctx)
+        };
+        let experts = ExpertPlacement::Tiered(ExpertTiers {
+            ram_bytes: 85 << 30,
+            device_bytes: 0,
+            ..ExpertTiers::default()
+        });
+        let content = gguf::Content::open(&model).unwrap();
+        let load = || {
+            GpuTransformer::load_placed(
+                &content,
+                ctx,
+                device,
+                &[],
+                &experts,
+                &sizing,
+                &EngramCache::default(),
+            )
+            .unwrap()
+        };
+        let mut m = if qdq {
+            load()
+        } else {
+            hyper::without_qdq(load)
+        };
+        let split = ids.len() - 6;
+        let mut failed = Vec::new();
+        let mut baseline = Vec::new();
+        for path in ["inexact", "decode", "exact"] {
+            m.truncate_cache(0);
+            let started = std::time::Instant::now();
+            let logits = match path {
+                "decode" => {
+                    let mut all = m
+                        .forward_ext(&ids[..split], 0, Want::All, Hidden::None, false)
+                        .unwrap()
+                        .logits
+                        .unwrap();
+                    for at in split..ids.len() {
+                        let step = m
+                            .forward_ext(&ids[at..=at], at, Want::All, Hidden::None, false)
+                            .unwrap()
+                            .logits
+                            .unwrap();
+                        all.extend_from_slice(&step);
+                    }
+                    all
+                }
+                _ => m
+                    .forward_ext(&ids, 0, Want::All, Hidden::None, path == "exact")
+                    .unwrap()
+                    .logits
+                    .unwrap(),
+            };
+            let secs = started.elapsed().as_secs_f64();
+            let v = logits.len() / ids.len();
+            let scored = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                score(
+                    &dir,
+                    mode,
+                    &ids,
+                    &logits,
+                    v,
+                    &format!("gpu {path} ctx {ctx}|{secs:.0}s"),
+                    "",
+                    qdq,
+                )
+            }));
+            if path == "exact" {
+                baseline = logits[(ids.len() - 1) * v..].to_vec();
+            }
+            if scored.is_err() {
+                failed.push(path);
+            }
+        }
+        // The engine's own calls: only the last position's logits, the prompt
+        // whole and in chunks of 4 rows.
+        let top = |row: &[f32]| {
+            row.iter()
+                .enumerate()
+                .max_by(|a, b| a.1.total_cmp(b.1))
+                .map_or(0, |(i, _)| i)
+        };
+        for (path, chunk, exact) in [
+            ("last", ids.len(), false),
+            ("chunks of 4", 4, false),
+            ("last, exact", ids.len(), true),
+            ("last, exact again", ids.len(), true),
+        ] {
+            m.truncate_cache(0);
+            let started = std::time::Instant::now();
+            let mut row = Vec::new();
+            for (n, part) in ids.chunks(chunk).enumerate() {
+                row = m
+                    .forward_ext(part, n * chunk, Want::Last, Hidden::None, exact)
+                    .unwrap()
+                    .logits
+                    .unwrap();
+            }
+            let worst = row
+                .iter()
+                .zip(&baseline)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            let ok = top(&row) == top(&baseline) && (qdq || worst < 2.0);
+            eprintln!(
+                "REAL|{mode}|gpu {path} ctx {ctx}|{:.0}s|top-1 {} against {}|last logits max|diff| {worst:.3}|{}",
+                started.elapsed().as_secs_f64(),
+                top(&row),
+                top(&baseline),
+                if ok { "ok" } else { "WRONG" }
+            );
+            if !ok {
+                failed.push(path);
+            }
+        }
+        assert!(
+            failed.is_empty(),
+            "paths that disagree with the oracle: {failed:?}"
+        );
+    }
+
     /// Speed of the real model on the GPU with its experts in the RAM tier
     /// (`CUCA_LOCAL_DS41_REAL_SPEED=1`, same gates as above): the prompt cold
     /// (every expert read from the file) and again warm, then one decode step
@@ -8097,7 +8248,11 @@ mod tests {
     /// each get one row, after longer and single-token passes have tuned the
     /// kernels: every row equals the same row's single-token pass. Gathering
     /// the one row and scaling it by a `[1, 1]` device tensor loses the
-    /// device on this sequence.
+    /// device on this sequence. The router rows are scaled apart: rows of
+    /// equal logits would let the last bit of a matmul, which a four-row and
+    /// a one-row product (and the kernel an autotune picks) round differently,
+    /// choose a different expert for the last slot, and the test would
+    /// compare two routes.
     #[test]
     fn gpu_moe_one_row_experts_match_single_tokens() {
         let Some(device) = test_device() else {
@@ -8109,7 +8264,8 @@ mod tests {
             if dtype == GgmlDType::F32 {
                 for i in 0..out * inn {
                     let v = (((i + seed) * 13 + 1) % 17) as f32 * 0.002 - 0.015;
-                    raw.extend(v.to_le_bytes());
+                    let scale = 1.0 + (i / inn) as f32 * 0.01;
+                    raw.extend((v * scale).to_le_bytes());
                 }
             } else {
                 for b in 0..out * inn / 32 {

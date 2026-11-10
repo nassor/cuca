@@ -174,31 +174,35 @@ loaded on Vulkan(Default): 17 of 35 layers on the GPU (layers 18 to 34), layers 
 
 ## ROCm on Windows
 
-`provider-local-rocm` builds on Windows and runs on the RX 9070 XT (gfx1201) with the HIP runtime of an AMD driver, but only part of what the engine does is verified on it. CubeCL loads `amdhip64.dll` and `hiprtc.dll` by those names at run time, and compiles kernels with its own LLVM, which needs the AMD device libraries (`ocml.bc`). The Adrenalin driver (32.0.32015.12012) ships `amdhip64_7.dll` in `System32` and no `hiprtc`, so the runtime has to come from somewhere else.
+`provider-local-rocm` builds and runs on Windows on the RX 9070 XT (gfx1201). CubeCL loads `amdhip64.dll` and `hiprtc.dll` by those names at run time and compiles its kernels with its own LLVM, which reads the AMD device libraries (`ocml.bc`) from `HIP_DEVICE_LIB_PATH`. The Adrenalin driver (32.0.32015.12012) ships `amdhip64_7.dll` in `System32` and no `hiprtc`, so the HIP runtime has to come from AMD's ROCm 10.1.0 release.
 
-AMD's HIP SDK installer is the other route: its documentation says it needs administrator rights and bundles a display driver. It was not run here, so which DLL names and folders it provides is unverified. The run below used the `rocm_sdk_core` wheel instead: a 710 MB zip that needs no administrator rights and no Python. Its file names carry the version (`amdhip64_7.dll`, `hiprtc0714.dll`), so two copies under the names CubeCL asks for are made.
+The Windows tarball of that release needs no administrator rights to extract. The environment steps on AMD's install page use `setx ... /M`, which does need them; the per-session variables below replace those steps. The tarball is per GPU family, `gfx120X-all` covering gfx1200 and gfx1201, the RDNA4 cards; another card needs its own family, which was not tried.
 
 ```powershell,name=Windows (PowerShell): install the HIP runtime without administrator rights
-$root = "C:\rocm"
-$wheel = "rocm_sdk_core-7.14.0a20260612-py3-none-win_amd64.whl"
-New-Item -ItemType Directory -Force $root | Out-Null
-curl.exe -L -o "$root\$wheel" "https://rocm.nightlies.amd.com/v2/gfx120X-all/$wheel"
-tar -xf "$root\$wheel" -C $root
-$sdk = "$root\_rocm_sdk_core"
-Copy-Item "$sdk\bin\amdhip64_7.dll" "$sdk\bin\amdhip64.dll"
-Copy-Item "$sdk\bin\hiprtc0714.dll" "$sdk\bin\hiprtc.dll"
-$env:PATH = "$sdk\bin;" + $env:PATH
-hipInfo.exe | Select-String "^device#|^Name|gcnArchName"
-Test-Path "$sdk\lib\llvm\amdgcn\bitcode\ocml.bc"
+$root = "C:\TheRock"
+$tar = "therock-dist-windows-gfx120X-all-10.1.0.tar.gz"
+New-Item -ItemType Directory -Force "$root\build" | Out-Null
+curl.exe -L -o "$root\$tar" "https://stable.repo.amd.com/rocm/core/tarball/$tar"
+tar -xzf "$root\$tar" -C "$root\build" --strip-components=1
+# The five DLLs CubeCL needs, in a folder of their own, two under the names it asks for.
+$dll = "$root\cuca-dlls"
+New-Item -ItemType Directory -Force $dll | Out-Null
+Copy-Item "$root\build\bin\amdhip64_7.dll" "$dll\amdhip64.dll"
+Copy-Item "$root\build\bin\hiprtc0716.dll" "$dll\hiprtc.dll"
+foreach ($n in "hiprtc0716.dll", "hiprtc-builtins0716.dll", "amd_comgr.dll", "rocm_kpack.dll") {
+    Copy-Item "$root\build\bin\$n" "$dll\$n"
+}
+& "$root\build\bin\hipInfo.exe" | Select-String "^device#|^Name|gcnArchName"
+Test-Path "$root\build\lib\llvm\amdgcn\bitcode\ocml.bc"
 ```
 
-Expected output on the test machine: `device# 0` is `AMD Radeon(TM) Graphics` (`gfx1036`), `device# 1` is `AMD Radeon RX 9070 XT` (`gfx1201`), and `Test-Path` prints `True`. The download, unpacking and these checks took 14 s. The wheel comes from the `gfx120X-all` nightly index, which is specific to the GPU family (gfx1200 and gfx1201, the RDNA4 cards): another card needs its own family directory, which was not tried. Nightlies are replaced over time, so keep the file named above (HIP 7.14.60850, which matches `cubecl-hip-sys` 7.14.6085001); other versions were not tested. An index listing is at `https://rocm.nightlies.amd.com/v2/gfx120X-all/rocm-sdk-core/`. `Expand-Archive` refuses a `.whl`, which is why the block uses `tar -xf`.
+The download (2.24 GB) took 29 s and the extraction 14 s. `hipInfo` lists `device# 0` as `AMD Radeon(TM) Graphics` (`gfx1036`, the Ryzen's integrated GPU) and `device# 1` as `AMD Radeon RX 9070 XT` (`gfx1201`), and `Test-Path` prints `True`. The DLLs carry the version in their names (`amdhip64_7.dll`, `hiprtc0716.dll`) in this release, and the tarball has no `amdhip64.dll` or `hiprtc.dll`, hence the copies.
 
 ```powershell,name=Windows (PowerShell): run on ROCm
-$sdk = "C:\rocm\_rocm_sdk_core"
-$env:PATH = "$sdk\bin;" + $env:PATH
-$env:HIP_PATH = "$sdk\bin"
-$env:HIP_DEVICE_LIB_PATH = "$sdk\lib\llvm\amdgcn\bitcode"
+$dll = "C:\TheRock\cuca-dlls"
+$env:PATH = "$dll;" + $env:PATH
+$env:HIP_PATH = $dll
+$env:HIP_DEVICE_LIB_PATH = "C:\TheRock\build\lib\llvm\amdgcn\bitcode"
 $env:CUCA_LOCAL_DEVICE = "rocm:1"
 $env:CUCA_LOCAL_MODEL = "qwen3-0.6b-q8_0"
 $env:CUCA_LOCAL_PROMPT = "Explain in two sentences what a mixture of experts model is."
@@ -207,14 +211,26 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 cargo run --release --no-default-features --features provider-local-rocm --example local_model
 ```
 
-The run prints `loaded on Rocm(1)` and then the reply, which on the test machine equals the Vulkan reply. The first process to run it took 247 s to the first block while CubeCL compiled its kernels; later processes took 16.5 s. The variables are per shell: set them again in a new one.
+The run prints `loaded on Rocm(1)` and then the reply. The variables are per shell: set them again in a new one.
 
-- The bin directory must be on `PATH`, because `amdhip64.dll` imports `rocm_kpack.dll` from its own folder and the loader does not search there. Without it, or without the libraries, the load fails with `device Rocm(1): 0 such device(s) found`, whose message now names the three variables.
-- HIP numbers the Ryzen's integrated GPU 0 (gfx1036) and the RX 9070 XT 1, so the device is `rocm:1`.
-- Kernels allocate their outputs contiguously. HIP pads the rows of an ordinary tensor to the device's pitch, which the kernels' linear indexing ignores; before the fix 21 of the 37 `model::gpu` tests failed with wrong values.
-- `CUCA_LOCAL_DEVICE=rocm:1 cargo test --release --no-default-features --features provider-local-rocm --lib model::gpu -- --test-threads=1`: 33 pass, 3 return early without `CUCA_LOCAL_DS41_REAL` (the two oracle checks below passed when run with it) and `gpu_moe_one_row_experts_match_single_tokens` fails (row 3: -0.00609 against -0.00267, the same value before and after the contiguous fix; not investigated). The first run takes 20 minutes because every kernel compiles.
-- `qwen3-0.6b-q8_0`, thinking off, 23 tokens: the reply is byte for byte the Vulkan reply. First block after 16.5 s (8.4 s on Vulkan), 27.1 tokens/s after it (24.3 on Vulkan). The first process to run it took 247 s to the first block.
-- `deepseek41`, host-tiered `tiered:ram=85g,threads=32`: the 16-token oracle check passes (quantizers off: top-1 equal at 15 of 16 positions, KL 5.6e-8; on: 13 of 16, KL 8.6e-8), but generation is wrong. `What is 9 * 8?` with thinking on produced unrelated text after 475.6 s to the first block (3.48 tokens/s after it, 11.0 GiB of device memory), and the 21-token `Paris` prompt (thinking off, 6 tokens) produced unrelated characters after 436.9 s to the first block, then 0.063 tokens/s. Both are far slower than the same model's steady Vulkan rates, which may mean kernels compile again at each step; that was not checked. The wrongness was not bisected: the oracle harness runs with a 64-position context, the example with the engine's sizing and chunking. The cause is not found, so `deepseek41` on ROCm is not usable.
+- Keep the SDK's own `bin` folder off `PATH`, for the build as well as the run. It holds `hipconfig.exe`, which the build script of `cubecl-hip-sys` runs to pick its bindings by HIP version; that crate (7.14.6085001) bundles bindings up to HIP 7.14.60850 and the tarball reports 7.16.26385, so with the folder on `PATH` the build of `cubecl-hip` fails with 87 errors (unresolved `hipGraph_t`, `hipStream_t`, `hipError_t` and the like). Without `hipconfig` on `PATH` it takes its newest bundled bindings, and the 7.16 DLLs run them: every result below was obtained that way.
+- The DLL folder must be on `PATH`, because `amdhip64.dll` imports `rocm_kpack.dll` from its own folder and the loader does not search there. Without it, or without the libraries, the load fails with `device Rocm(1): 0 such device(s) found`, whose message names `ROCM_PATH`, `HIP_PATH`, the `PATH` requirement and `HIP_DEVICE_LIB_PATH`.
+- HIP numbers the integrated GPU 0 and the RX 9070 XT 1, so the device is `rocm:1`.
+- The `rocm-sdk-core` 10.1.0 wheel (AMD's page gives `python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,device-all]==10.1.0"`; the test machine had it installed in Python's `site-packages`) holds the same files in `_rocm_sdk_core`. The copies and the `PATH` rule are the same, and the runs of the `qwen3-0.6b-q8_0` reply, the `deepseek41` generation and the production-path test below were made with its DLLs; the test suites, the oracle checks and the speed test with the tarball's. The nightly 7.14 wheel of the `gfx120X-all` index also ran the `qwen3-0.6b-q8_0` request with the same reply.
+- Kernels allocate their outputs contiguously. HIP pads the rows of an ordinary tensor to the device's pitch, which the kernels' linear indexing ignores; before that change 21 of the 37 `model::gpu` tests failed with wrong values.
+- `CUCA_LOCAL_DEVICE=rocm:1 cargo test --release --no-default-features --features provider-local-rocm --lib model::gpu -- --test-threads=1` passes 38 tests in 553 s (tarball DLLs); four of them, the real-model tests, return early without `CUCA_LOCAL_DS41_REAL`. `gpu_moe_one_row_experts_match_single_tokens` failed in 2 of 3 runs before its router was changed: the router rows came in groups of identical weights, so eight experts had exactly equal logits, and the last bit of a four-row and a one-row matmul (the kernel an autotune picks differs from run to run) decided which of them took the eighth slot, giving a different expert in the two passes. The rows are now scaled apart and the test passed in 4 of 4 runs.
+- `qwen3-0.6b-q8_0`, thinking off, 23 tokens: the reply is byte for byte the Vulkan reply in every run. With the kernels compiled, decode runs at 27 to 29 tokens/s (24.3 on Vulkan).
+- The oracle check of `deepseek41` (`real_model_on_the_gpu_matches_the_streaming_oracle_with_quantization_{off,on}`, host-tiered `ram=85g`, the 16-token prompt): quantizers off, top-1 equal at 15 of 16 positions, smallest top-10 overlap 8, KL 1.78e-7 at the last position, the pass 294 s; on, 13 of 16, overlap 6, KL 5.29e-8, 539 s. `real_model_on_the_gpu_production_paths_match_the_oracle` (`CUCA_LOCAL_DS41_REAL_PATHS=1`) runs the prompt as an inexact prefill, as a shorter prefill then one token per step, exactly, as last-position logits whole and in chunks of 4, with the context, sequence count and step rows of the engine (`CUCA_LOCAL_DS41_REAL_CTX=8192`, `_SEQS=4`, `_ROWS=4096`, `_QDQ=1`): every path passes the oracle's checks and the last-position paths pick the same top-1 token as the exact one.
+- `deepseek41` from `examples/local_model.rs`, host-tiered `tiered:ram=85g,threads=32`, greedy: `What is the capital of France? Answer in one word.` with thinking off answers `Paris` (21 prompt tokens, 1 completion token), and `What is 9 * 8?` with thinking on reasons `We need answer simple. 9*8=72. Need concise.` and answers `72` (42 prompt tokens, 17 completion tokens), as on Vulkan. Peak device memory 10.0 GiB (11.7 GiB on Vulkan).
+- With the experts in the RAM tier (`real_model_on_the_gpu_speed`, the 16-token prompt): ROCm takes 177.1 s for the cold prompt, 1.15 s warm (14.0 tokens/s), 3.45 s for the first decode step and a median of 0.202 s for a warm one (4.94 tokens/s); Vulkan takes 19.7 s, 1.08 s (14.8 tokens/s), 2.04 s and 0.192 s (5.20 tokens/s). Once the kernels are compiled the two backends run at the same speed.
+
+### Open: the first block of a ROCm process
+
+The first block of a ROCm process takes far longer than Vulkan's and varies from run to run; the cause is not found.
+
+- `qwen3-0.6b-q8_0`, the same request in nine processes (two with the settings named below): first block after 63.7 to 362.7 s (63.7, 66.8, 84.6, 105.2, 126.5, 136.5, 233.8, 268.5, 362.7), then 28.4 or 29.3 tokens/s in two runs and 0.2 to 0.65 tokens/s in five (the rest not recorded). On Vulkan it is 8.4 s and 24.3 tokens/s.
+- `deepseek41` with the 21-token prompt: first block after 282.6 and 683.8 s in two runs, 30.1 s on Vulkan with the same expert reads; the 42-token request 403.4 s, then 0.065 tokens/s. The disk is not the limit: reading the model file with a 16 MB buffer between the runs gave 3.2 and 3.4 GB/s.
+- With `CUBECL_DEBUG_OPTION=profile` the first block of the `qwen3-0.6b-q8_0` request takes 9.4 s and decode 8.8 tokens/s; with `CUBECL_DEBUG_LOG=<file>` 9.8 and 9.9 s and 8.7 and 8.8 tokens/s (81 kernel compilations in the logged run). `CUBECL_AUTOTUNE_LEVEL=minimal` changed nothing (136.5 s), and CubeCL's persistent compilation cache (`[compilation] cache = true` in a `cubecl.toml`) did not help (66.8 s, then 362.7 s).
 
 ## Measured speed
 
