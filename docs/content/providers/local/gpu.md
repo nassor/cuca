@@ -230,7 +230,7 @@ The first block of a ROCm process takes far longer than Vulkan's and varies from
 
 - `qwen3-0.6b-q8_0`, the same request in nine processes (two with the settings named below): first block after 63.7 to 362.7 s (63.7, 66.8, 84.6, 105.2, 126.5, 136.5, 233.8, 268.5, 362.7), then 28.4 or 29.3 tokens/s in two runs and 0.2 to 0.65 tokens/s in five (the rest not recorded). On Vulkan it is 8.4 s and 24.3 tokens/s.
 - `deepseek41` with the 21-token prompt: first block after 282.6 and 683.8 s in two runs, 30.1 s on Vulkan with the same expert reads; the 42-token request 403.4 s, then 0.065 tokens/s. The disk is not the limit: reading the model file with a 16 MB buffer between the runs gave 3.2 and 3.4 GB/s.
-- With `CUBECL_DEBUG_OPTION=profile` the first block of the `qwen3-0.6b-q8_0` request takes 9.4 s and decode 8.8 tokens/s; with `CUBECL_DEBUG_LOG=<file>` 9.8 and 9.9 s and 8.7 and 8.8 tokens/s (81 kernel compilations in the logged run). `CUBECL_AUTOTUNE_LEVEL=minimal` changed nothing (136.5 s), and CubeCL's persistent compilation cache (`[compilation] cache = true` in a `cubecl.toml`) did not help (66.8 s, then 362.7 s).
+- With `CUBECL_DEBUG_OPTION=profile` the first block of the `qwen3-0.6b-q8_0` request takes 9.4 s and decode 8.8 tokens/s; with `CUBECL_DEBUG_LOG=<file>` 9.8 and 9.9 s and 8.7 and 8.8 tokens/s (81 kernel compilations in the logged run). `CUBECL_AUTOTUNE_LEVEL=minimal` changed nothing (136.5 s), and CubeCL's persistent compilation cache (`[compilation] cache = true` in a `cubecl.toml`) did not help (66.8 s, then 362.7 s). Neither did a single stream (`[streaming] policy = "single"` and `max_streams = 1`): 437.4, 32.4 and 299.6 s in three runs.
 
 ## Measured speed
 
