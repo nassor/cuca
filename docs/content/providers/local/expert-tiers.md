@@ -11,7 +11,7 @@ weight = 12
 <dt>In one line</dt>
 <dd><code>ExpertPlacement::Tiered</code> keeps a mixture-of-experts model's experts in the GGUF file and loads them on demand through caches of a byte size you choose, with the same output as the resident load.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts (<code>qwen3moe</code>, <code>olmoe</code>, <code>qwen35moe</code>, <code>mistral4</code> or <code>deepseek41</code>).</dd>
+<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts (<code>qwen3moe</code>, <code>olmoe</code>, <code>qwen35moe</code>, <code>mistral4</code>, <code>deepseek41</code>, or <code>gemma4</code> with <code>expert_count</code> above 0: the CPU only, the GPU engine does not run it yet).</dd>
 <dt>Read this if</dt>
 <dd>A mixture-of-experts model is larger than the RAM or device memory you want to spend on it, or you need the cache counters and the heat export.</dd>
 </dl>
@@ -54,6 +54,7 @@ A tier must hold `n_used` experts in every layer, so the minimum budget is `n_us
 | `olmoe-1b-7b-q4_0` | 64, 8 | 16 | 56,885,248 | 455,081,984 | `ram=500m`: 9 |
 | `qwen3-30b-a3b-q4_0` | 128, 8 | 48 | 127,991,808 | 1,023,934,464 | `ram=4g`: 33<br>`ram=1100m`: 9 |
 | `qwen3.6-35b-a3b-q4_0` | 256, 8 | 40 | 71,106,560 | 568,852,480 | `ram=600m`: 8<br>`ram=4g`: 60<br>`device=2g`: 30<br>`device=4g`: 60<br>`device=6g`: 90 |
+| `gemma4-26b-a4b-q4_0` | 128, 8 | 30 | 100,362,240 | 802,897,920 | `ram=4g`: 42<br>`ram=6g`: 64<br>`ram=8g`: 85 |
 | `mistral-small-4-119b-q4_0` | 128, 4 | 36 | about 511.7 MB | about 2.05 GB | `ram=8g`: 16<br>`ram=48g`: 100 |
 | `deepseek-ai/DeepSeek-V4.1-Flash-1017` (checkpoint source) | 384, 6 | 40 | 752,025,600 | 4,512,153,600 | `ram=48g`: 68<br>`ram=64g`: 91 |
 
@@ -228,6 +229,7 @@ CPU: Ryzen 9 9950X3D2 with 125 GB of RAM, release build with `RUSTFLAGS="-C targ
 
 - Mistral Small 4 is 67.7 GB next to 125 GB of RAM, so only part of the file stayed in the page cache. One expert of all 36 layers is 511.7 MB. The cold run at `ram=48g` read 4,618 experts (65.7 GB) out of 26,205 lookups, and the cold run at `ram=8g` read 18,081 (257 GB).
 - Qwen3.6-35B-A3B: the cold runs read 18,861 experts (33.6 GB) at `ram=4g` and 38,510 (68.5 GB) at `ram=600m`, out of 55,597 lookups, from a file that was in the OS page cache. In a separate run of one 1,024-token reply (`examples/local_model.rs`) the peak resident set was 18.8 GiB with resident experts, 5.95 GiB at `ram=4g` and 2.43 GiB at `ram=600m`. The model loaded in 8.3 s resident against 0.8 s tiered.
+- Gemma 4 26B-A4B (`gemma4-26b-a4b-q4_0`, fused gate/up experts, 12.85 GB of the 14.62 GB file are experts): one reply of 164 tokens with thinking off and greedy sampling (`examples/local_model.rs`, same CPU) printed the same text resident and at `tiered:ram=6g,threads=8` (64 of 128 experts per layer). The file sat on an HDD-class volume but had just been read many times, so it was in the OS page cache and every expert read was a cache hit: the tiered rate is a page-cache-warm figure, not a disk or SSD one, and no cold-disk run was made. Resident it decoded at 10.0 tokens per second with a peak resident set of 13.8 GiB; tiered at 8.8 tokens per second with 7.8 GiB, 41,407 lookups, 37,355 of them RAM hits (0.90) and 4,052 expert reads (13.56 GB). The dense branch of each layer, the router and its scales, the attention and the embedding stay resident whatever the budget (about 1.8 GB).
 
 Vulkan: RX 9070 XT with 15.9 GiB, Windows, release build. The rates include the kernel tuning that each new matrix shape pays on first use, which a short run does not amortize.
 

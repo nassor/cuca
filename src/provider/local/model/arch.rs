@@ -199,6 +199,21 @@ pub(crate) struct Behavior {
     /// to the routed experts' output (Qwen 3.5 MoE). Only read when `moe` is
     /// set.
     pub(crate) shared_expert: bool,
+    /// The architecture covers dense and mixture-of-experts models under one
+    /// name: the FFN is a mixture of experts when the file carries
+    /// `{arch}.expert_count` above 0 (Gemma 4: E2B and E4B are dense, 26B-A4B
+    /// has 128 experts). Read when `moe` is not set.
+    pub(crate) moe_if_experts: bool,
+    /// A mixture-of-experts layer keeps a dense gated FFN beside its routed
+    /// experts and both read the residual stream `x` (Gemma 4 26B-A4B): the
+    /// dense branch is `post_ffw_norm_1(ffn(ffn_norm(x)))`, the routed branch
+    /// `post_ffw_norm_2(experts(pre_ffw_norm_2(x)))`, and the layer's FFN
+    /// output `post_ffw_norm(dense + routed)`. The router reads
+    /// `rmsnorm(x) * ffn_gate_inp.scale / sqrt(n_embd)` (no learned norm
+    /// weight), softmaxes over every expert, keeps the top `n_used`,
+    /// renormalises, and multiplies each kept weight by that expert's
+    /// `ffn_down_exps.scale`. Read when the layer is a mixture of experts.
+    pub(crate) dual_branch_moe: bool,
     /// Every attention layer has an `attn_gate` projection (`n_embd` to
     /// `n_head * head_dim`) of its normed input whose sigmoid multiplies the
     /// attention output before `attn_output` (Muse Glimmer). Unlike
@@ -284,6 +299,8 @@ const DEFAULT: Behavior = Behavior {
     qk_norm_full: false,
     moe_norm_weights: true,
     shared_expert: false,
+    moe_if_experts: false,
+    dual_branch_moe: false,
     attn_gate_tensor: false,
     nope_full_layers: false,
     swa_base_from_freq_base: false,
@@ -382,7 +399,15 @@ impl Arch {
     /// The behaviours of this architecture.
     pub(crate) fn behavior(self) -> Behavior {
         match self {
-            Arch::Gemma4 | Arch::Gemma4Assistant => Behavior {
+            // Gemma 4 is its drafter's dense behaviour plus what a file with
+            // experts adds: the drafter is dense, and a file with experts is
+            // not a Gemma 4 assistant.
+            Arch::Gemma4 => Behavior {
+                moe_if_experts: true,
+                dual_branch_moe: true,
+                ..Arch::Gemma4Assistant.behavior()
+            },
+            Arch::Gemma4Assistant => Behavior {
                 rope: RopeKind::Neox,
                 act: Act::Gelu,
                 post_norms: true,
@@ -535,6 +560,19 @@ mod tests {
             Arch::Olmoe,
         ] {
             assert_eq!(arch.behavior().rope, RopeKind::Neox, "{arch:?}");
+        }
+    }
+
+    /// Gemma 4 covers dense and mixture-of-experts models under one name and
+    /// keeps the dense FFN beside the experts; its drafter and every other
+    /// architecture decide a mixture of experts by their table row alone.
+    #[test]
+    fn only_gemma4_is_dense_or_a_mixture_of_experts_by_its_file() {
+        for arch in Arch::ALL {
+            let b = arch.behavior();
+            assert_eq!(b.moe_if_experts, arch == Arch::Gemma4, "{arch:?}");
+            assert_eq!(b.dual_branch_moe, arch == Arch::Gemma4, "{arch:?}");
+            assert!(!(b.moe && b.moe_if_experts), "{arch:?}");
         }
     }
 

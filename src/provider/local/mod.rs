@@ -443,6 +443,15 @@ const PRESET_TABLE: &[ModelPreset] = &[
         "gemma4",
     ),
     preset(
+        "gemma4-26b-a4b-q4_0",
+        "ggml-org/gemma-4-26B-A4B-it-GGUF",
+        "1ca99aae748b4b01f609fa51eb23682ee5f00b85",
+        "gemma-4-26B-A4B-it-Q4_0.gguf",
+        "d208665ab1cd3a69f7a9a4bc59430e8448c8093d9b06334f566ac59d6d504a03",
+        14_618_145_824,
+        "gemma4",
+    ),
+    preset(
         "gemma3-270m-q8_0",
         "ggml-org/gemma-3-270m-it-GGUF",
         "e7647be17ae1108f2f605ed061ca0608b171afff",

@@ -966,8 +966,9 @@ fn read_mla(k: &Keys<'_>, arch: Arch, n_kv_head: &[usize]) -> Result<MlaSpec, Cu
 /// The mixture-of-experts routing of the architecture (`None` for a dense
 /// one).
 fn read_moe(k: &Keys<'_>, arch: Arch, behavior: &Behavior) -> Result<Option<MoeSpec>, CucaError> {
-    if !behavior.moe {
-        if k.usize_opt("expert_count")?.is_some_and(|n| n > 0) {
+    let has_experts = k.usize_opt("expert_count")?.is_some_and(|n| n > 0);
+    if !behavior.moe && !(behavior.moe_if_experts && has_experts) {
+        if has_experts {
             return Err(err(format!(
                 "`{}` checkpoints with experts are not supported",
                 arch.name()
@@ -1300,7 +1301,36 @@ mod tests {
             Array(vec![Bool(true)]),
             "expected 35 entries",
         );
-        reject("gemma4.expert_count", U32(8), "experts are not supported");
+        // Experts without the number of used ones are not a top-k router.
+        reject("gemma4.expert_count", U32(8), "expert_used_count");
+    }
+
+    /// A Gemma 4 file with experts is a mixture of experts (the 26B-A4B
+    /// dialect) and a dense one is not.
+    #[test]
+    fn gemma4_is_a_mixture_of_experts_when_the_file_has_experts() {
+        assert!(
+            Hparams::from_metadata(&e2b_metadata(), &none)
+                .unwrap()
+                .moe
+                .is_none()
+        );
+        let mut meta = e2b_metadata();
+        meta.insert("gemma4.expert_count".into(), U32(128));
+        meta.insert("gemma4.expert_used_count".into(), U32(8));
+        let p = Hparams::from_metadata(&meta, &none).unwrap();
+        assert_eq!(
+            p.moe,
+            Some(MoeSpec {
+                n_expert: 128,
+                n_used: 8,
+                norm_weights: true,
+                scale: 1.0,
+            })
+        );
+        assert_eq!(p.leading_dense, 0);
+        meta.insert("gemma4.expert_used_count".into(), U32(129));
+        assert!(Hparams::from_metadata(&meta, &none).is_err());
     }
 
     fn llama_metadata() -> Metadata {

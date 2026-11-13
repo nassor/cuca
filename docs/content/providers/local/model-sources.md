@@ -38,7 +38,7 @@ A file of an architecture the engine does not know, or a tokenizer it does not i
 
 ## Presets
 
-`ModelSource::PRESETS` has 25 entries: 23 models and 2 drafters. Each is pinned to one Hugging Face commit and one SHA-256. The names, sizes and K/V cost are on [Local models and formats](@/providers/local/models.md#presets).
+`ModelSource::PRESETS` has 26 entries: 24 models and 2 drafters. Each is pinned to one Hugging Face commit and one SHA-256. The names, sizes and K/V cost are on [Local models and formats](@/providers/local/models.md#presets).
 
 A `ModelPreset` has these fields:
 

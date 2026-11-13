@@ -4,6 +4,27 @@
 
 ### Added
 
+- `provider-local`: Gemma 4 26B-A4B, the mixture-of-experts Gemma 4 (`gemma4` GGUF with
+  `gemma4.expert_count` above 0), on the CPU engine, with resident or tiered experts, and the preset
+  `gemma4-26b-a4b-q4_0` (`ggml-org/gemma-4-26B-A4B-it-GGUF`, Q4_0, 14.62 GB, pinned to a commit and
+  SHA-256). A `gemma4` file with experts used to fail with ``"`gemma4` checkpoints with experts are
+  not supported"``; the loader now reads it through two `Behavior` flags, `moe_if_experts` (the file
+  decides whether the FFN is a mixture of experts) and `dual_branch_moe` (every layer keeps a dense
+  gated GELU FFN beside the routed experts, each branch with its own norms, a router that reads
+  `rmsnorm(x) * ffn_gate_inp.scale / sqrt(n_embd)`, and a per-expert `ffn_down_exps.scale` on the
+  routing weights), and `LayerLayout::v_from_k` takes the values of a layer without `attn_v` from its
+  key projection (the full-attention layers). Dense Gemma 4 E2B and E4B load as before. The GPU
+  engine rejects the model with a `CucaError::Provider` that says it runs on the CPU engine only,
+  and the checkpoint converter still refuses the Gemma 4 mixture of experts. A tiny release-format
+  file (`TinyGemma4Moe`) matches transformers' `Gemma4ForCausalLM` to 7.6e-6 in logits with exact
+  f32 weights and eleven perturbed references (a dropped per-expert scale, router scale, K-as-V,
+  value norm and others) each differ by 0.65 or more. The real file on the CPU agrees with llama.cpp
+  on the chat template, the prompt ids and the chat answer; its log-probabilities sit within 0.31 of
+  llama.cpp's after 16 tokens, about what llama.cpp moves against itself when its K/V cache is f32
+  and flash attention is off (0.15 to 1.87), and the first 6 layers agree to 0.012. It passes the
+  live suite resident and with `tiered:ram=6g`. On a Ryzen 9 9950X3D2 under other load it loads in
+  about 6 s, decodes at about 10 tokens per second, prefills about 56 tokens per second (llama.cpp
+  on the same machine: 15 and 165), and holds 13.8 GiB resident (7.8 GiB at `tiered:ram=6g`).
 - `provider-local`: DeepSeek-V4.1 (`deepseek41`, DeepSeek-V4.1-Flash-1017 with FP8 dense and FP4
   expert weights) on the CPU engine and on one GPU. The generic loader reads it
   through `Behavior` flags: hyper-connection residual streams, latent attention with a per-head sink

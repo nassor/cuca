@@ -28,7 +28,7 @@ unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, q
 
 | Architecture | Model families | Notes |
 |---|---|---|
-| `gemma4` | Gemma 4 (E2B, E4B) | |
+| `gemma4` | Gemma 4 (E2B, E4B, 26B-A4B) | 26B-A4B is a mixture of experts, see [Gemma 4 mixture of experts](#gemma-4-mixture-of-experts) |
 | `gemma3` | Gemma 3 (270M, 1B) | |
 | `llama` | Llama-family models published as `llama` (for example DeepSeek-R1-Distill-Llama, Mistral-style models) | |
 | `qwen2` | DeepSeek-R1-Distill-Qwen and other Qwen 2.5-family models | |
@@ -51,11 +51,11 @@ unsupported GGUF architecture `NAME`; supported: gemma4, gemma3, llama, qwen2, q
 
 The `dflash` architecture is not in the table above: it loads only through `LocalModelConfig::drafter`, as the DFlash drafter of Muse Glimmer on the CPU or, with `dflash.hyper_connection.count` in the file, as the DSpark drafter of `deepseek41`; as a main model it fails with an error that says so. A drafter architecture as a main model fails the same way. Drafters, their pairings and limits are on [Speculative decoding](@/providers/local/drafting.md).
 
-Every architecture except the drafters runs on the CPU and on a GPU; the device limits and what was run are on [Run on a GPU](@/providers/local/gpu.md).
+Every architecture except the drafters runs on the CPU and on a GPU, with one exception: the Gemma 4 mixture of experts (26B-A4B) runs on the CPU engine only and the GPU engine rejects it. The device limits and what was run are on [Run on a GPU](@/providers/local/gpu.md).
 
 What each architecture adds to the common forward pass:
 
-- `gemma4`: sliding and full layers with their own head sizes and RoPE bases, shared K/V layers (the last `shared_kv_layers` layers read an earlier layer's cache), per-layer embeddings, a weightless value norm, a per-layer output scale, and a final logit soft-cap. The per-layer embedding table is never loaded: each token's row is read from the GGUF file.
+- `gemma4`: sliding and full layers with their own head sizes and RoPE bases, shared K/V layers (the last `shared_kv_layers` layers read an earlier layer's cache), per-layer embeddings, a weightless value norm, a per-layer output scale, and a final logit soft-cap. The per-layer embedding table is never loaded: each token's row is read from the GGUF file. A file with `gemma4.expert_count` above 0 is the 26B-A4B mixture of experts: a dense FFN beside the routed experts in every layer, per-layer K/V head counts, and no `attn_v` on the full-attention layers; see [Gemma 4 mixture of experts](#gemma-4-mixture-of-experts).
 - `gemma3`: sliding and full layers (every sixth layer is full), QK-norm, post-attention and post-FFN norms.
 - `llama`: the Llama 3 RoPE scaling that the file carries as `rope_freqs.weight`, optional biases, a tied or separate output head.
 - `qwen2`: Q, K and V biases.
@@ -76,6 +76,16 @@ What each architecture adds to the common forward pass:
 - `deepseek41`: hyper-connection residual streams, latent attention with a sliding window and compressed sparse attention, per-layer Engram table lookups and a `sqrtsoftplus`-routed mixture of experts; see [DeepSeek-V4.1](#deepseek-v4-1).
 
 The common forward pass covers grouped-query attention, causal and sliding-window masks, `NORM` and `NEOX` RoPE (partial rotary, linear and YaRN scaling, per-pair factors), RMSNorm, SiLU and GELU gated FFNs, tied and separate output heads, and mixture-of-experts routing. Optional tensors (biases, QK-norm, fused projections, a separate `output.weight`) are detected by their presence in the file.
+
+### Gemma 4 mixture of experts
+
+`gemma4` is dense or a mixture of experts by its file: `Behavior::moe_if_experts` reads the experts when `gemma4.expert_count` is above 0, and `Behavior::dual_branch_moe` gives every such layer the structure of Gemma 4 26B-A4B. The published `ggml-org/gemma-4-26B-A4B-it-GGUF` has 30 layers (25 sliding layers with a 1,024-position window and 8 K/V heads of 256, 5 full layers with 2 K/V heads of 512), hidden width 2,816, 128 experts of width 704 with 8 used per token, and a dense FFN of width 2,112 in every layer. It runs on the CPU engine only, with resident or tiered experts. The GPU engine rejects it with a `CucaError::Provider` that names the architecture, says the GPU engine does not run the Gemma 4 mixture of experts yet and tells you to use `LocalDevice::Cpu`. The HF-checkpoint converter does not convert it either (see [Local checkpoint conversion](@/providers/local/checkpoints.md)).
+
+- A layer adds `post_ffw_norm(post_ffw_norm_1(dense(ffn_norm(x))) + post_ffw_norm_2(experts(pre_ffw_norm_2(x))))` to the residual stream `x` after attention. The dense branch is a gated GELU FFN (`ffn_gate`, `ffn_up`, `ffn_down`); the experts are the fused `ffn_gate_up_exps` (every expert's gate rows, then its up rows) and `ffn_down_exps`, with GELU.
+- The router reads `rmsnorm(x) * ffn_gate_inp.scale / sqrt(n_embd)` (the RMSNorm has no learned weight), scores every expert with the F32 matrix `ffn_gate_inp`, takes the softmax over all experts, keeps the 8 largest, renormalises them, and multiplies each kept weight by that expert's entry of `ffn_down_exps.scale`. Renormalising is invisible in the output, because `post_ffw_norm_2` normalises the routed sum.
+- The full-attention layers have no `attn_v`: their values are the key projection's output, normalised by the weightless value norm, while the keys get `attn_k_norm` and RoPE first (`LayerLayout::v_from_k`, found by the missing tensor).
+- There are no per-layer embeddings and no shared K/V layers. The K/V cache is f32 like every model's: 1.75 GB at 16,384 positions with 2 sequences and 256-row steps, 6.18 GB at the preset table's 8,192 positions with 4 sequences (the sliding layers keep a window per sequence and cache prefixes over the rest of the pool).
+- Tiered experts leave `ffn_gate_up_exps` and `ffn_down_exps` in the file: 100,362,240 bytes per expert slot over the 30 layers, 802,897,920 bytes for the 8 an expert pass needs, and 12.85 GB of the 14.62 GB file are experts. The dense branch, the router and its scales, the attention and the embedding stay resident.
 
 ### DeepSeek-V4.1
 
@@ -118,7 +128,7 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 
 ## Presets
 
-`ModelSource::PRESETS` has 25 entries: 23 models and 2 drafters. Each is pinned to a repository commit and a SHA-256; the entry points are on [Model sources](@/providers/local/model-sources.md#presets). Sizes are the file in decimal units. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller) with the default batching (4 sequences, steps of 256 rows): the block pools, which hold twice `context_length` positions. Each value is computed from the GGUF header of the pinned file with the pool layout code (`KvLayout::pool_bytes`), without loading the model. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
+`ModelSource::PRESETS` has 26 entries: 24 models and 2 drafters. Each is pinned to a repository commit and a SHA-256; the entry points are on [Model sources](@/providers/local/model-sources.md#presets). Sizes are the file in decimal units. The K/V column is `LocalModel::kv_cache_bytes` at the default `context_length` (8,192 positions, or the model's own maximum when smaller) with the default batching (4 sequences, steps of 256 rows): the block pools, which hold twice `context_length` positions. Each value is computed from the GGUF header of the pinned file with the pool layout code (`KvLayout::pool_bytes`), without loading the model. Weights are resident at about the file size on top of it, except for a mixture-of-experts model on tiered placement.
 
 | Preset | Architecture | Repository | Size | K/V |
 |---|---|---|---|---|
@@ -126,6 +136,7 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 | `gemma4-e2b-q8_0` | `gemma4` | `ggml-org/gemma-4-E2B-it-GGUF` | 4.97 GB | 481 MB |
 | `gemma4-e4b-q4_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 4.59 GB | 1.47 GB |
 | `gemma4-e4b-q8_0` | `gemma4` | `ggml-org/gemma-4-E4B-it-GGUF` | 8.03 GB | 1.47 GB |
+| `gemma4-26b-a4b-q4_0` | `gemma4` | `ggml-org/gemma-4-26B-A4B-it-GGUF` | 14.62 GB | 6.18 GB |
 | `gemma3-270m-q8_0` | `gemma3` | `ggml-org/gemma-3-270m-it-GGUF` | 0.29 GB | 451 MB |
 | `gemma3-1b-q4_0` | `gemma3` | `unsloth/gemma-3-1b-it-GGUF` | 0.72 GB | 647 MB |
 | `qwen3-0.6b-q8_0` | `qwen3` | `Qwen/Qwen3-0.6B-GGUF` | 0.64 GB | 3.76 GB |
@@ -153,6 +164,7 @@ Qwen 3.5 mixes gated delta-net layers with gated full-attention layers. A delta-
 - `gemma4-e2b-mtp-f16` and `muse-glimmer-30b-dflash-q4_0` have `drafter: true`: they load only through `LocalModelConfig::drafter`. The first pairs with the Gemma 4 E2B presets, the second with `muse-glimmer-30b-q4_0` on the CPU and proposes a block of up to 15 tokens per pass.
 - `qwen3.5-0.8b-q8_0` carries the in-trunk prediction head, so `DrafterSource::InTrunk` works with it.
 - `qwen3.6-35b-a3b-q4_0` has 40 layers of 256 experts, 8 used, so every layer is a mixture of experts. Its file carries a prediction block that the engine ignores. RAM budgets for tiered placement are on [Tiered expert placement](@/providers/local/expert-tiers.md).
+- `gemma4-26b-a4b-q4_0` is the Gemma 4 26B-A4B mixture of experts (see [Gemma 4 mixture of experts](#gemma-4-mixture-of-experts)): 30 layers of 128 experts, 8 used, beside a dense FFN. The file is `ggml-org`'s plain Q4_0: every matrix except the F32 routers (`ffn_gate_inp`) is Q4_0 and the token embedding, which is also the output head, is Q8_0, so every quantized matmul runs through the batch-invariant kernel and the routers through candle's float matmul. Its K/V is large at the table's settings because the 25 sliding layers keep a window per running sequence and cache prefixes over the pool (1.75 GB at 16,384 positions with 2 sequences). It thinks only when asked (`enable_thinking`); with thinking off the template ends the prompt with an empty thought channel. The chat template is the file's own (Google's canonical Gemma 4 template of 2026-07-09).
 - `muse-glimmer-30b-q4_0` is a dense model (52 layers, hidden 6,656, 32 query and 2 K/V heads of 128). Only its 13 full layers cache the whole context; the other 39 keep a 2,048-position window. The file is bartowski's imatrix Q4_0: Q4_0 with a Q6_K `output.weight` and `attn_q` in 26 layers (candle's kernel serves K-quants) and a Q4_1 `ffn_down` in 6. It always reasons, so give requests a generous `max_tokens`. The preset pins the repository's chat template.
 - `ministral3-3b-reasoning-q4_0` (26 layers, 8 K/V heads of 128, a tied head) is bartowski's imatrix Q4_0, and mistralai publishes no Q4_0 of it. It always reasons (`[THINK]`) and needs sampling to call a tool; see [Known limits](@/providers/local/verification.md#known-limits). The preset pins the repository's chat template.
 - `ministral3-3b-instruct-q4_0` is the same architecture without reasoning, also bartowski's imatrix Q4_0, with its template pinned.

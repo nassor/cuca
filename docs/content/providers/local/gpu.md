@@ -18,7 +18,7 @@ weight = 11
 
 ## Devices and GPU features
 
-The model runs on the CPU unless `LocalModelConfig::device` selects a GPU. A GPU device runs the forward pass through burn 0.22 and CubeCL, and the engine thread owns the device. Every supported architecture runs through the GPU forward pass. The in-trunk head, the EAGLE drafter, the DFlash drafter and the DSpark drafter are CPU only; the Gemma 4 assistant runs on the GPU.
+The model runs on the CPU unless `LocalModelConfig::device` selects a GPU. A GPU device runs the forward pass through burn 0.22 and CubeCL, and the engine thread owns the device. Every supported architecture runs through the GPU forward pass except the Gemma 4 mixture of experts (26B-A4B), which runs on the CPU engine only: a GPU load of it fails with a `CucaError::Provider`. The in-trunk head, the EAGLE drafter, the DFlash drafter and the DSpark drafter are CPU only; the Gemma 4 assistant runs on the GPU.
 
 | Feature | Backend | Extra build needs |
 |---|---|---|

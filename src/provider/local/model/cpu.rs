@@ -67,6 +67,8 @@ pub(crate) mod dspark;
 #[cfg(test)]
 mod dspark_tests;
 mod eagle;
+#[cfg(test)]
+mod gemma4_moe_tests;
 mod head;
 mod hyper;
 #[cfg(test)]
@@ -272,7 +274,9 @@ enum QkvWeights {
     /// Separate projections; K/V exist only on layers that own K/V.
     Split {
         q: Linear,
-        kv: Option<(Linear, Linear)>,
+        /// The key projection and, unless the layer's values are its keys
+        /// ([`LayerLayout::v_from_k`]), the value projection.
+        kv: Option<(Linear, Option<Linear>)>,
     },
 }
 
@@ -620,11 +624,31 @@ struct LayerWeights {
     /// pre-norms.
     ffn_norm: Option<Tensor>,
     ffn: FfnWeights,
+    /// The norms and scales around the dense and routed branches of a
+    /// dual-branch mixture-of-experts layer (Gemma 4 26B-A4B).
+    dual: Option<Box<DualFfn>>,
     post_ffw_norm: Option<Tensor>,
     ple: Option<PleLayer>,
     out_scale: Option<f64>,
     /// The layer's hyper-connection sites.
     hc: Option<Box<hyper::HcLayer>>,
+}
+
+/// The weights a [`Behavior::dual_branch_moe`](super::arch::Behavior) layer
+/// adds around its dense FFN (`FfnWeights::Moe::shared`) and routed experts.
+struct DualFfn {
+    /// `pre_ffw_norm_2`: in front of the routed experts.
+    pre_moe: Tensor,
+    /// `post_ffw_norm_1`: behind the dense branch.
+    post_dense: Tensor,
+    /// `post_ffw_norm_2`: behind the routed branch.
+    post_moe: Tensor,
+    /// `ffn_gate_inp.scale`: the router input's per-channel scale.
+    router_scale: Tensor,
+    /// Unit weights of the router's scale-less RMSNorm.
+    ones: Tensor,
+    /// `ffn_down_exps.scale`: each expert's multiplier on its routing weight.
+    expert_scale: Vec<f32>,
 }
 
 /// Model-level per-layer-embedding weights (Gemma 4).
@@ -2339,11 +2363,16 @@ impl Transformer {
         }
         let x = (x + scaled(attn)?)?;
 
-        let f = match &lw.ffn_norm {
-            Some(w) => rms(&x, w, eps)?,
-            None => x.clone(),
+        let mut f = match &lw.dual {
+            Some(dual) => self.dual_ffn(lw, dual, &x)?,
+            None => {
+                let f = match &lw.ffn_norm {
+                    Some(w) => rms(&x, w, eps)?,
+                    None => x.clone(),
+                };
+                lw.ffn.forward(&f, hp.act())?
+            }
         };
-        let mut f = lw.ffn.forward(&f, hp.act())?;
         if let Some(w) = &lw.post_ffw_norm {
             f = rms(&f, w, post_eps)?;
         }
@@ -2358,6 +2387,65 @@ impl Transformer {
             Some(s) => x.affine(s, 0.0),
             None => Ok(x),
         }
+    }
+
+    /// The FFN of a dual-branch layer over the residual stream `x`
+    /// `(1, t, n_embd)`, before the layer's `post_ffw_norm`: the dense FFN of
+    /// `ffn_norm(x)` behind `post_ffw_norm_1`, plus the routed experts of
+    /// `pre_ffw_norm_2(x)` behind `post_ffw_norm_2`. The router reads
+    /// `rmsnorm(x) * scale / sqrt(n_embd)`, softmaxes over all experts, keeps
+    /// the top `n_used`, renormalises and multiplies each kept weight by its
+    /// expert's output scale (transformers' `Gemma4TextRouter`).
+    fn dual_ffn(
+        &self,
+        lw: &LayerWeights,
+        dual: &DualFfn,
+        x: &Tensor,
+    ) -> candle_core::Result<Tensor> {
+        let hp = &self.hp;
+        let eps = hp.eps as f32;
+        let post_eps = hp.post_eps as f32;
+        let FfnWeights::Moe {
+            spec,
+            router,
+            experts,
+            shared: Some(dense),
+            ..
+        } = &lw.ffn
+        else {
+            return Err(candle_core::Error::msg(
+                "a dual-branch layer needs routed experts and a dense FFN",
+            ));
+        };
+        let (_, t, n_embd) = x.dims3()?;
+        let flat = x.reshape((t, n_embd))?;
+
+        let dense_in = match &lw.ffn_norm {
+            Some(w) => rms(&flat, w, eps)?,
+            None => flat.clone(),
+        };
+        let dense_out = rms(
+            &dense.forward(&dense_in, hp.act())?,
+            &dual.post_dense,
+            post_eps,
+        )?;
+
+        let scores = rms(&flat, &dual.ones, eps)?
+            .broadcast_mul(&dual.router_scale)?
+            .affine((n_embd as f64).sqrt().recip(), 0.0)?;
+        let logits = router.forward(&scores)?.flatten_all()?.to_vec1::<f32>()?;
+        let mut routing = route(&logits, t, spec);
+        for (picks, &scale) in routing.per_expert.iter_mut().zip(&dual.expert_scale) {
+            for pick in picks {
+                pick.1 *= scale;
+            }
+        }
+        let routed_in = rms(&flat, &dual.pre_moe, eps)?;
+        let routed = expert_sum(experts, &routed_in, &routing, hp.act().into(), t, n_embd)?;
+        let routed = Tensor::from_vec(routed, (t, n_embd), x.device())?;
+        let routed = rms(&routed, &dual.post_moe, post_eps)?;
+
+        (dense_out + routed)?.reshape((1, t, n_embd))
     }
 
     /// The attention calls of layer `il`: what each sequence of `segs`
@@ -2714,6 +2802,7 @@ fn load_layer(
 ) -> Result<LayerWeights, CucaError> {
     let n_embd = hp.n_embd;
     let blk = |part: &str| name::blk(il, part);
+    let dense_ffn = hp.behavior.dual_branch_moe;
     let mixer = match (spec.delta(), spec.mla) {
         (Some(delta), _) => Mixer::Delta(Box::new(load_delta(loader, hp, il, delta)?)),
         (None, Some(mla)) => Mixer::Mla(Box::new(load_mla(loader, hp, il, spec, &mla)?)),
@@ -2768,11 +2857,32 @@ fn load_layer(
             shared: match shared_ff {
                 Some(sff) => Some(SharedExpert {
                     ffn: CpuExpert {
-                        gate: loader.matmul(&blk(name::FFN_GATE_SHEXP), &[sff, n_embd])?,
-                        up: loader.matmul(&blk(name::FFN_UP_SHEXP), &[sff, n_embd])?,
-                        down: loader.matmul(&blk(name::FFN_DOWN_SHEXP), &[n_embd, sff])?,
+                        gate: loader.matmul(
+                            &blk(if dense_ffn {
+                                name::FFN_GATE
+                            } else {
+                                name::FFN_GATE_SHEXP
+                            }),
+                            &[sff, n_embd],
+                        )?,
+                        up: loader.matmul(
+                            &blk(if dense_ffn {
+                                name::FFN_UP
+                            } else {
+                                name::FFN_UP_SHEXP
+                            }),
+                            &[sff, n_embd],
+                        )?,
+                        down: loader.matmul(
+                            &blk(if dense_ffn {
+                                name::FFN_DOWN
+                            } else {
+                                name::FFN_DOWN_SHEXP
+                            }),
+                            &[n_embd, sff],
+                        )?,
                     },
-                    gate_inp: if hp.behavior.shared_expert_ungated {
+                    gate_inp: if hp.behavior.shared_expert_ungated || dense_ffn {
                         None
                     } else {
                         Some(loader.floats(&blk(name::FFN_GATE_INP_SHEXP), &[n_embd])?)
@@ -2782,6 +2892,19 @@ fn load_layer(
             },
         },
         (Ffn::Moe { .. }, None) => return Err(err("expert tensors without an expert count")),
+    };
+
+    let dual = match (hp.moe, layout.ffn) {
+        (Some(spec), Ffn::Moe { .. }) if hp.behavior.dual_branch_moe => Some(Box::new(DualFfn {
+            pre_moe: loader.vector(&blk(name::PRE_FFW_NORM_2), n_embd)?,
+            post_dense: loader.vector(&blk(name::POST_FFW_NORM_1), n_embd)?,
+            post_moe: loader.vector(&blk(name::POST_FFW_NORM_2), n_embd)?,
+            router_scale: loader.vector(&name::blk_scale(il, name::FFN_GATE_INP), n_embd)?,
+            ones: Tensor::ones(n_embd, DType::F32, &Device::Cpu).map_err(candle_err)?,
+            expert_scale: loader
+                .floats(&name::blk_scale(il, name::FFN_DOWN_EXPS), &[spec.n_expert])?,
+        })),
+        _ => None,
     };
 
     let (ple, out_scale) = if hp.behavior.gemma4_extras {
@@ -2812,6 +2935,7 @@ fn load_layer(
             n_embd,
         )?,
         ffn,
+        dual,
         post_ffw_norm: loader.opt_vector(
             layout.post_ffw_norm,
             &blk(name::POST_FFW_NORM),
@@ -2867,7 +2991,16 @@ fn load_attention(
             kv: if owns {
                 Some((
                     loader.linear(il, name::ATTN_K, [kv_width, n_embd], layout.biases.k)?,
-                    loader.linear(il, name::ATTN_V, [kv_width, n_embd], layout.biases.v)?,
+                    if layout.v_from_k {
+                        None
+                    } else {
+                        Some(loader.linear(
+                            il,
+                            name::ATTN_V,
+                            [kv_width, n_embd],
+                            layout.biases.v,
+                        )?)
+                    },
                 ))
             } else {
                 None
@@ -3059,7 +3192,14 @@ impl AttnWeights {
             QkvWeights::Split { q, kv } => {
                 let q = q.forward(h)?;
                 match kv {
-                    Some((k, v)) => Ok((q, Some((k.forward(h)?, v.forward(h)?)))),
+                    Some((k, v)) => {
+                        let k = k.forward(h)?;
+                        let v = match v {
+                            Some(v) => v.forward(h)?,
+                            None => k.clone(),
+                        };
+                        Ok((q, Some((k, v))))
+                    }
                     None => Ok((q, None)),
                 }
             }
@@ -3079,7 +3219,14 @@ impl AttnWeights {
         match &self.qkv {
             QkvWeights::Split {
                 kv: Some((k, v)), ..
-            } => Ok((k.forward(h)?, v.forward(h)?)),
+            } => {
+                let k = k.forward(h)?;
+                let v = match v {
+                    Some(v) => v.forward(h)?,
+                    None => k.clone(),
+                };
+                Ok((k, v))
+            }
             _ => self
                 .project(h, nh, nkv, d)?
                 .1
@@ -3353,8 +3500,8 @@ mod tests {
 
     use super::super::rope::{RopeKind, rotate_reference};
     use super::super::tiny::{
-        PROMPT, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB, assert_close, load,
-        write_qwen35, write_spec, write_tiny_model, write_tiny_model_with,
+        PROMPT, TinyGemma4Moe, TinyMoe, TinyOptions, TinyQwen35, TinySpec, VOCAB, assert_close,
+        load, write_gemma4_moe, write_qwen35, write_spec, write_tiny_model, write_tiny_model_with,
     };
     use super::*;
 
@@ -3418,6 +3565,145 @@ mod tests {
     #[test]
     fn gemma4_tiny_model_satisfies_the_invariants() {
         check_invariants(&write_tiny_model(), "gemma4");
+    }
+
+    /// The Gemma 4 mixture-of-experts layers (a dense FFN beside the routed
+    /// experts, K as V on the full layer, per-layer K/V heads) keep every
+    /// cache invariant, with the dtypes of the real file and with a mix.
+    #[test]
+    fn gemma4_moe_tiny_model_satisfies_the_invariants() {
+        for mixed in [false, true] {
+            let model = write_gemma4_moe(&TinyGemma4Moe {
+                mixed,
+                ..TinyGemma4Moe::default()
+            });
+            check_invariants(&model, "gemma4 moe");
+        }
+    }
+
+    /// The dual-branch FFN of a Gemma 4 mixture-of-experts layer equals a
+    /// scalar f64 evaluation of the formulas over the dequantized weights:
+    /// `post_1(dense(ffn_norm x)) + post_2(experts(pre_2 x))`, the router on
+    /// `rmsnorm(x) * scale / sqrt(n_embd)`, softmax, top-k, renormalised and
+    /// multiplied by the per-expert scale, GELU experts on fused gate/up
+    /// rows.
+    #[test]
+    fn gemma4_moe_ffn_matches_a_scalar_reference() {
+        fn rms64(x: &[f64], w: Option<&[f64]>, eps: f64) -> Vec<f64> {
+            let mean = x.iter().map(|v| v * v).sum::<f64>() / x.len() as f64;
+            let r = 1.0 / (mean + eps).sqrt();
+            x.iter()
+                .enumerate()
+                .map(|(i, v)| v * r * w.map_or(1.0, |w| w[i]))
+                .collect()
+        }
+        fn gelu64(x: f64) -> f64 {
+            0.5 * x
+                * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (x + 0.044715 * x * x * x)).tanh())
+        }
+        fn matvec(w: &[f64], rows: usize, cols: usize, x: &[f64]) -> Vec<f64> {
+            (0..rows)
+                .map(|r| (0..cols).map(|c| w[r * cols + c] * x[c]).sum())
+                .collect()
+        }
+
+        let model = write_gemma4_moe(&TinyGemma4Moe::default());
+        let content = gguf::Content::open(&model.path).unwrap();
+        let m = Transformer::load_dequantized(&content, 32).unwrap();
+        let mut rd = Loader {
+            content: &content,
+            reader: content.reader(),
+            dequantize: true,
+            requantize: false,
+        };
+        let mut get = |full: String, shape: &[usize]| -> Vec<f64> {
+            rd.floats(&full, shape)
+                .unwrap()
+                .into_iter()
+                .map(f64::from)
+                .collect()
+        };
+        let (n, t) = (64usize, 5usize);
+        let (n_expert, n_used, eff, dff) = (8usize, 2usize, 32usize, 64usize);
+        let eps = m.hp.eps;
+        for il in [0usize, 3] {
+            let blk = |part: &str| name::blk(il, part);
+            let lw = &m.layers[il];
+            let dual = lw.dual.as_ref().expect("a dual-branch layer");
+            let x: Vec<f32> = (0..t * n)
+                .map(|i| ((i * 37 % 23) as f32 - 11.0) * 0.15)
+                .collect();
+            let got = m
+                .dual_ffn(
+                    lw,
+                    dual,
+                    &Tensor::from_vec(x.clone(), (1, t, n), &Device::Cpu).unwrap(),
+                )
+                .unwrap()
+                .flatten_all()
+                .unwrap()
+                .to_vec1::<f32>()
+                .unwrap();
+
+            let ffn_norm = get(blk(name::FFN_NORM), &[n]);
+            let pre_2 = get(blk(name::PRE_FFW_NORM_2), &[n]);
+            let post_1 = get(blk(name::POST_FFW_NORM_1), &[n]);
+            let post_2 = get(blk(name::POST_FFW_NORM_2), &[n]);
+            let (gate, up, down) = (
+                get(blk(name::FFN_GATE), &[dff, n]),
+                get(blk(name::FFN_UP), &[dff, n]),
+                get(blk(name::FFN_DOWN), &[n, dff]),
+            );
+            let router = get(blk(name::FFN_GATE_INP), &[n_expert, n]);
+            let router_scale = get(name::blk_scale(il, name::FFN_GATE_INP), &[n]);
+            let expert_scale = get(name::blk_scale(il, name::FFN_DOWN_EXPS), &[n_expert]);
+            let gate_up = get(blk(name::FFN_GATE_UP_EXPS), &[n_expert, 2 * eff, n]);
+            let exps_down = get(blk(name::FFN_DOWN_EXPS), &[n_expert, n, eff]);
+
+            let mut want = Vec::new();
+            for row in x.chunks_exact(n) {
+                let row: Vec<f64> = row.iter().copied().map(f64::from).collect();
+                // dense branch
+                let h = rms64(&row, Some(&ffn_norm), eps);
+                let (g, u) = (matvec(&gate, dff, n, &h), matvec(&up, dff, n, &h));
+                let a: Vec<f64> = g.iter().zip(&u).map(|(g, u)| gelu64(*g) * u).collect();
+                let dense = rms64(&matvec(&down, n, dff, &a), Some(&post_1), eps);
+                // router
+                let scores: Vec<f64> = rms64(&row, None, eps)
+                    .iter()
+                    .zip(&router_scale)
+                    .map(|(v, s)| v * s / (n as f64).sqrt())
+                    .collect();
+                let logits = matvec(&router, n_expert, n, &scores);
+                let max = logits.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let probs: Vec<f64> = logits.iter().map(|l| (l - max).exp()).collect();
+                let mut order: Vec<usize> = (0..n_expert).collect();
+                order.sort_by(|&a, &b| probs[b].total_cmp(&probs[a]));
+                let kept = &order[..n_used];
+                let total: f64 = kept.iter().map(|&e| probs[e]).sum();
+                // routed branch
+                let h2 = rms64(&row, Some(&pre_2), eps);
+                let mut moe = vec![0f64; n];
+                for &e in kept {
+                    let w = probs[e] / total * expert_scale[e];
+                    let gu = matvec(&gate_up[e * 2 * eff * n..][..2 * eff * n], 2 * eff, n, &h2);
+                    let a: Vec<f64> = (0..eff).map(|i| gelu64(gu[i]) * gu[eff + i]).collect();
+                    let y = matvec(&exps_down[e * n * eff..][..n * eff], n, eff, &a);
+                    for (o, v) in moe.iter_mut().zip(&y) {
+                        *o += w * v;
+                    }
+                }
+                let moe = rms64(&moe, Some(&post_2), eps);
+                want.extend(dense.iter().zip(&moe).map(|(a, b)| a + b));
+            }
+            let scale = want.iter().fold(1.0f64, |m, v| m.max(v.abs()));
+            for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert!(
+                    (f64::from(*g) - w).abs() <= 1e-4 * scale,
+                    "layer {il}, value {i}: {g} vs {w}"
+                );
+            }
+        }
     }
 
     /// `mistral3`: the query of position `p` is scaled by `1 + beta *
@@ -3546,6 +3832,7 @@ mod tests {
             check_batched(&write_spec(&spec), spec.arch);
         }
         check_batched(&write_tiny_model(), "gemma4");
+        check_batched(&write_gemma4_moe(&TinyGemma4Moe::default()), "gemma4 moe");
         check_batched(&write_qwen35(&TinyQwen35::default()), "qwen35");
     }
 
@@ -4355,6 +4642,45 @@ mod tests {
                 "{arch}: {stats:?}"
             );
         }
+    }
+
+    /// The fused gate/up experts of the Gemma 4 mixture of experts, tiered at
+    /// the smallest budget, equal the resident load bit for bit (the dense
+    /// branch, the router scales and the per-expert scales stay resident).
+    #[test]
+    fn gemma4_moe_tiered_experts_match_resident_bit_for_bit() {
+        let model = write_gemma4_moe(&TinyGemma4Moe::default());
+        let content = gguf::Content::open(&model.path).unwrap();
+        let hp = read_hparams(&content).unwrap();
+        let n_expert = hp.moe.unwrap().n_expert;
+        let per_expert: u64 = (0..hp.n_layer)
+            .map(|il| {
+                let (gate, up) = ExpertSlice::read_fused(
+                    &content,
+                    &name::blk(il, name::FFN_GATE_UP_EXPS),
+                    n_expert,
+                    32,
+                    64,
+                )
+                .unwrap();
+                let down = ExpertSlice::read(
+                    &content,
+                    &name::blk(il, name::FFN_DOWN_EXPS),
+                    n_expert,
+                    64,
+                    32,
+                )
+                .unwrap();
+                (gate.file_bytes + up.file_bytes + down.file_bytes) as u64
+            })
+            .sum();
+        let min = 2 * per_expert;
+        let want = greedy_run(&mut load(&model, 32));
+        let mut tiered = load_tiered(&model, min, None).unwrap();
+        assert_eq!(greedy_run(&mut tiered), want);
+        let stats = tiered.expert_tiers().unwrap().stats();
+        assert!(stats.disk_reads > 0, "{stats:?}");
+        assert!(stats.ram_resident_bytes <= min, "{stats:?}");
     }
 
     #[test]

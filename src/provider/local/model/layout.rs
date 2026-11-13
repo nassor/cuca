@@ -91,6 +91,14 @@ pub(crate) mod name {
     pub(crate) const FFN_DOWN_SHEXP: &str = "ffn_down_shexp";
     pub(crate) const FFN_GATE_INP_SHEXP: &str = "ffn_gate_inp_shexp";
     pub(crate) const POST_FFW_NORM: &str = "post_ffw_norm";
+    // Gemma 4 mixture of experts: the norm in front of the routed branch and
+    // the norms behind the dense and the routed branch
+    // ([`Behavior::dual_branch_moe`](super::super::arch::Behavior)). The
+    // router's input scale is `ffn_gate_inp.scale` and the per-expert output
+    // scale `ffn_down_exps.scale` (both without `.weight`).
+    pub(crate) const PRE_FFW_NORM_2: &str = "pre_ffw_norm_2";
+    pub(crate) const POST_FFW_NORM_1: &str = "post_ffw_norm_1";
+    pub(crate) const POST_FFW_NORM_2: &str = "post_ffw_norm_2";
     pub(crate) const INP_GATE: &str = "inp_gate";
     pub(crate) const PROJ: &str = "proj";
     pub(crate) const POST_NORM: &str = "post_norm";
@@ -128,6 +136,12 @@ pub(crate) mod name {
     /// Full tensor name of the bias of `part` in block `layer`.
     pub(crate) fn blk_bias(layer: usize, part: &str) -> String {
         format!("blk.{layer}.{part}.bias")
+    }
+
+    /// Full tensor name of the scale vector of `part` in block `layer`
+    /// (`ffn_gate_inp.scale`).
+    pub(crate) fn blk_scale(layer: usize, part: &str) -> String {
+        format!("blk.{layer}.{part}.scale")
     }
 
     /// Full tensor name of `part` in block `layer` when it has no suffix
@@ -195,7 +209,9 @@ pub(crate) enum Ffn {
     /// rows followed by the up rows.
     Dense { ff: usize, fused: bool },
     /// Mixture of experts, each of width `ff`, plus a shared expert of width
-    /// `shared_ff` when the layer has one. `fused` when `ffn_gate_up_exps`
+    /// `shared_ff` when the layer has one (for
+    /// [`Behavior::dual_branch_moe`](super::arch::Behavior) the layer's dense
+    /// FFN, in the plain `ffn_*` tensors). `fused` when `ffn_gate_up_exps`
     /// holds every expert's gate and up rows in one tensor instead of
     /// `ffn_gate_exps` and `ffn_up_exps`.
     Moe {
@@ -230,6 +246,10 @@ pub(crate) struct LayerLayout {
     /// Latent attention: the `attn_q_a` ... `attn_v_b` tensors replace the
     /// query/key/value projections.
     pub(crate) mla: bool,
+    /// The layer owns K/V but has no `attn_v`: its values are the key
+    /// projection's output (the full-attention layers of the Gemma 4
+    /// mixture-of-experts models, `attention_k_eq_v` in the checkpoint).
+    pub(crate) v_from_k: bool,
     pub(crate) ffn: Ffn,
 }
 
@@ -290,8 +310,17 @@ impl LayerLayout {
                 )));
             }
             let ff = if fused { rows / 2 } else { *rows };
-            let shared_ff = if hp.behavior.shared_expert {
-                let shared = name::blk(il, name::FFN_DOWN_SHEXP);
+            // The shared expert of a dual-branch layer is its dense FFN and
+            // keeps the plain `ffn_*` names.
+            let shared_ff = if hp.behavior.shared_expert || hp.behavior.dual_branch_moe {
+                let shared = name::blk(
+                    il,
+                    if hp.behavior.dual_branch_moe {
+                        name::FFN_DOWN
+                    } else {
+                        name::FFN_DOWN_SHEXP
+                    },
+                );
                 let d = dims(content, &shared)?;
                 let [_, sff] = d else {
                     return Err(err(format!(
@@ -348,6 +377,10 @@ impl LayerLayout {
         if attn_gate {
             tensor_info(content, &name::blk(il, name::ATTN_GATE))?;
         }
+        // A K/V owner without `attn_v` reads its values from the key
+        // projection (llama.cpp: "if v_proj is not present, use k_proj").
+        let v_from_k =
+            owns && hp.behavior.gemma4_extras && qkv == Qkv::Split && !has_part(name::ATTN_V);
         Ok(Self {
             qkv,
             biases,
@@ -357,6 +390,7 @@ impl LayerLayout {
             post_ffw_norm,
             attn_gate,
             mla,
+            v_from_k,
             ffn,
         })
     }

@@ -2510,6 +2510,12 @@ impl GpuTransformer {
                 hp.arch.name()
             )));
         }
+        if hp.behavior.dual_branch_moe && hp.moe.is_some() {
+            return Err(err(format!(
+                "`{}` checkpoints with experts (the Gemma 4 mixture of experts: a dense FFN beside the routed experts) are not supported by the GPU engine yet; the GPU engine does not run the Gemma 4 mixture of experts, use LocalDevice::Cpu",
+                hp.arch.name()
+            )));
+        }
         let hybrid = hp.behavior.hybrid_delta_net;
         check_context(&hp, context_length)?;
         let world = 1 + shards.len();

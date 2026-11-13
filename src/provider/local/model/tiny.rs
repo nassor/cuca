@@ -289,6 +289,150 @@ pub(crate) fn write_tiny_model_with(o: TinyOptions) -> TinyModel {
     TinyModel { path }
 }
 
+/// A tiny Gemma 4 mixture-of-experts model in the dialect of the 26B-A4B
+/// GGUF: a dense gated FFN beside fused routed experts in every layer, the
+/// three extra FFN norms, the router and per-expert scales, per-layer
+/// key/value head counts, no per-layer embeddings, no shared K/V, and no
+/// `attn_v` on the full-attention layers (their values are their keys).
+#[derive(Clone)]
+pub(crate) struct TinyGemma4Moe {
+    pub(crate) n_expert: usize,
+    pub(crate) n_used: usize,
+    /// Dtype of the attention, dense FFN and expert matrices.
+    pub(crate) weight_dtype: GgmlDType,
+    /// Rotate the dtypes of the quantized matrices ([`mix_dtypes`]).
+    pub(crate) mixed: bool,
+    /// Seed of the random weights.
+    pub(crate) seed: u64,
+}
+
+impl Default for TinyGemma4Moe {
+    fn default() -> Self {
+        Self {
+            n_expert: 8,
+            n_used: 2,
+            weight_dtype: GgmlDType::Q4_0,
+            mixed: false,
+            seed: 21,
+        }
+    }
+}
+
+/// Layers, head counts and sizes of [`TinyGemma4Moe`].
+pub(crate) const G4M_SLIDING: [bool; 4] = [true, true, true, false];
+pub(crate) const G4M_N_KV: [usize; 4] = [2, 2, 2, 1];
+pub(crate) const G4M_N_HEAD: usize = 4;
+pub(crate) const G4M_FF: usize = 64;
+pub(crate) const G4M_EXPERT_FF: usize = 32;
+pub(crate) const G4M_WINDOW: usize = 6;
+
+pub(crate) fn write_gemma4_moe(s: &TinyGemma4Moe) -> TinyModel {
+    let path = temp_path("gemma4moe");
+    let mut rng = Lcg(s.seed);
+    let dt = s.weight_dtype;
+    let mut tensors: Vec<(String, QTensor)> = Vec::new();
+    tensors.push((
+        "token_embd.weight".into(),
+        quantized(&mut rng, &[VOCAB, N_EMBD], GgmlDType::Q8_0, 0.5),
+    ));
+    tensors.push(("output_norm.weight".into(), norm(&mut rng, N_EMBD)));
+    let mut factors = vec![1.0f32; G4_HEAD_FULL / 4];
+    factors.resize(G4_HEAD_FULL / 2, 1e30);
+    tensors.push(("rope_freqs.weight".into(), f32_tensor(factors)));
+    for (il, &sliding) in G4M_SLIDING.iter().enumerate() {
+        let d = if sliding { G4_HEAD_SWA } else { G4_HEAD_FULL };
+        let nkv = G4M_N_KV[il];
+        let b = |part: &str| format!("blk.{il}.{part}.weight");
+        let scale = |part: &str| format!("blk.{il}.{part}.scale");
+        tensors.push((b("attn_norm"), norm(&mut rng, N_EMBD)));
+        tensors.push((
+            b("attn_q"),
+            quantized(&mut rng, &[G4M_N_HEAD * d, N_EMBD], dt, 0.3),
+        ));
+        tensors.push((b("attn_q_norm"), norm(&mut rng, d)));
+        tensors.push((
+            b("attn_k"),
+            quantized(&mut rng, &[nkv * d, N_EMBD], dt, 0.3),
+        ));
+        tensors.push((b("attn_k_norm"), norm(&mut rng, d)));
+        if sliding {
+            tensors.push((
+                b("attn_v"),
+                quantized(&mut rng, &[nkv * d, N_EMBD], dt, 0.3),
+            ));
+        }
+        tensors.push((
+            b("attn_output"),
+            quantized(&mut rng, &[N_EMBD, G4M_N_HEAD * d], dt, 0.3),
+        ));
+        tensors.push((b("post_attention_norm"), norm(&mut rng, N_EMBD)));
+        tensors.push((b("ffn_norm"), norm(&mut rng, N_EMBD)));
+        for (part, dims) in [
+            ("ffn_gate", [G4M_FF, N_EMBD]),
+            ("ffn_up", [G4M_FF, N_EMBD]),
+            ("ffn_down", [N_EMBD, G4M_FF]),
+        ] {
+            tensors.push((b(part), quantized(&mut rng, &dims, dt, 0.3)));
+        }
+        tensors.push((b("post_ffw_norm_1"), norm(&mut rng, N_EMBD)));
+        tensors.push((b("pre_ffw_norm_2"), norm(&mut rng, N_EMBD)));
+        tensors.push((b("post_ffw_norm_2"), norm(&mut rng, N_EMBD)));
+        tensors.push((b("post_ffw_norm"), norm(&mut rng, N_EMBD)));
+        tensors.push((
+            b("ffn_gate_inp"),
+            quantized(&mut rng, &[s.n_expert, N_EMBD], GgmlDType::F32, 0.8),
+        ));
+        tensors.push((scale("ffn_gate_inp"), norm(&mut rng, N_EMBD)));
+        tensors.push((
+            b("ffn_gate_up_exps"),
+            quantized(&mut rng, &[s.n_expert, 2 * G4M_EXPERT_FF, N_EMBD], dt, 0.3),
+        ));
+        tensors.push((
+            b("ffn_down_exps"),
+            quantized(&mut rng, &[s.n_expert, N_EMBD, G4M_EXPERT_FF], dt, 0.3),
+        ));
+        tensors.push((scale("ffn_down_exps"), norm(&mut rng, s.n_expert)));
+        tensors.push((
+            b("layer_output_scale"),
+            f32_tensor(vec![0.7 + 0.05 * il as f32]),
+        ));
+    }
+    if s.mixed {
+        mix_dtypes(&mut tensors);
+    }
+
+    let pattern = Value::Array(G4M_SLIDING.iter().copied().map(Value::Bool).collect());
+    let kv_heads = Value::Array(G4M_N_KV.iter().map(|&n| u(n)).collect());
+    let meta = vec![
+        kv("general.architecture", Value::String("gemma4".into())),
+        kv("gemma4.block_count", u(G4M_SLIDING.len())),
+        kv("gemma4.context_length", u(CONTEXT)),
+        kv("gemma4.embedding_length", u(N_EMBD)),
+        kv("gemma4.feed_forward_length", u(G4M_FF)),
+        kv("gemma4.attention.head_count", u(G4M_N_HEAD)),
+        kv("gemma4.attention.head_count_kv", kv_heads),
+        kv("gemma4.attention.key_length", u(G4_HEAD_FULL)),
+        kv("gemma4.attention.value_length", u(G4_HEAD_FULL)),
+        kv("gemma4.attention.key_length_swa", u(G4_HEAD_SWA)),
+        kv("gemma4.attention.value_length_swa", u(G4_HEAD_SWA)),
+        kv("gemma4.attention.sliding_window", u(G4M_WINDOW)),
+        kv("gemma4.attention.sliding_window_pattern", pattern),
+        kv("gemma4.attention.shared_kv_layers", u(0)),
+        kv("gemma4.embedding_length_per_layer_input", u(0)),
+        kv("gemma4.expert_count", u(s.n_expert)),
+        kv("gemma4.expert_used_count", u(s.n_used)),
+        kv("gemma4.expert_feed_forward_length", u(G4M_EXPERT_FF)),
+        kv("gemma4.rope.freq_base", Value::F32(1e6)),
+        kv("gemma4.rope.freq_base_swa", Value::F32(1e4)),
+        kv("gemma4.rope.dimension_count", u(G4_HEAD_FULL)),
+        kv("gemma4.rope.dimension_count_swa", u(G4_HEAD_SWA)),
+        kv("gemma4.attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
+        kv("gemma4.final_logit_softcapping", Value::F32(30.0)),
+    ];
+    write(&path, &meta, &tensors);
+    TinyModel { path }
+}
+
 // ---------------------------------------------------------------------------
 // Every other architecture
 // ---------------------------------------------------------------------------
