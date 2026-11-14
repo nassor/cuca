@@ -263,14 +263,6 @@ fn engram_dtype(quant: EngramQuant) -> Dtype {
     }
 }
 
-/// Whether `dtype` is a float the matrix reader decodes.
-fn is_float(dtype: StDtype) -> bool {
-    matches!(
-        dtype,
-        StDtype::F32 | StDtype::F16 | StDtype::Bf16 | StDtype::F8E4m3
-    )
-}
-
 /// Planning state: the checkpoint's index, the tensors consumed so far and the
 /// items made.
 struct Planner<'a> {
@@ -300,7 +292,7 @@ impl Planner<'_> {
         part: Part,
     ) -> Result<(), CucaError> {
         let (dtype, mut dims) = self.find(tensor)?;
-        if !is_float(dtype) {
+        if !dtype.is_float() {
             return Err(cfg_err(format!(
                 "tensor `{tensor}` has dtype {}, which the converter does not read as a matrix",
                 dtype.name()
@@ -444,7 +436,7 @@ impl Planner<'_> {
             );
             let (qd, qdims) = self.find(&q)?;
             let (kd, kdims) = self.find(&k)?;
-            if !is_float(qd) || !is_float(kd) || qdims != kdims {
+            if !qd.is_float() || !kd.is_float() || qdims != kdims {
                 return Err(cfg_err(format!(
                     "`{q}` {qdims:?} and `{k}` {kdims:?} cannot be multiplied elementwise"
                 )));

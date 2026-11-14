@@ -78,7 +78,7 @@ impl StDtype {
     }
 
     /// Whether [`Shards::read_rows`] can decode the dtype to `f32`.
-    fn is_float(self) -> bool {
+    pub(crate) fn is_float(self) -> bool {
         matches!(self, Self::F32 | Self::F16 | Self::Bf16 | Self::F8E4m3)
     }
 
