@@ -30,14 +30,10 @@ pub(crate) use self::template::ChatTemplate;
 
 use serde_json::json;
 
+use super::model::err as local_err;
 use crate::error::CucaError;
 use crate::request::{ThinkingEffort, UnifiedRequest};
-use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
-
-/// Build a local-provider error.
-fn local_err(message: impl Into<String>) -> CucaError {
-    CucaError::provider(ProviderEndpoint::Local, message)
-}
+use crate::types::{MessageContentBlock, MessageRole, UnifiedMessage};
 
 /// What a request asked of the model's reasoning, as templates with a
 /// reasoning knob of their own read it (`reasoning_strength`,

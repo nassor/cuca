@@ -47,6 +47,7 @@ use std::fmt;
 use std::ops::Range;
 
 use crate::provider::local::gguf::{self, Value};
+use crate::provider::local::model::err as local_err;
 
 pub(super) use self::bpe::byte_to_char;
 use self::bpe::{Merges, Scratch, Unknown, char_to_byte};
@@ -57,7 +58,6 @@ use self::vocab::{
     TYPE_USER_DEFINED, Vocab, parse_byte_token,
 };
 use crate::error::CucaError;
-use crate::types::ProviderEndpoint;
 
 /// The word-boundary marker substituted for ASCII space.
 const SPACE_MARK: char = '\u{2581}';
@@ -65,11 +65,6 @@ const SPACE_MARK: char = '\u{2581}';
 /// Whether `name` is a `tokenizer.ggml.pre` value this module implements.
 pub(crate) fn supports_pre(name: &str) -> bool {
     Pre::from_name(Some(name)).is_some()
-}
-
-/// Build a local-provider error.
-fn local_err(message: impl Into<String>) -> CucaError {
-    CucaError::provider(ProviderEndpoint::Local, message)
 }
 
 /// How a BPE vocabulary turns text into words.
@@ -312,25 +307,20 @@ impl Tokenizer {
         };
         let vocab = Vocab::new(&pieces, token_types)?;
 
-        let (default_bos, default_eos) = match kind {
-            Kind::Spm => (true, false),
-            Kind::Byte(pre) => (pre.add_bos(), false),
-            Kind::Escaped => (true, false),
+        let default_bos = match &kind {
+            Kind::Byte(pre) => pre.add_bos(),
+            _ => true,
         };
         let mut config = Config {
             bos: md.token_id("tokenizer.ggml.bos_token_id", n),
             eos: md.token_id("tokenizer.ggml.eos_token_id", n),
-            add_bos: md
-                .boolean("tokenizer.ggml.add_bos_token")
-                .unwrap_or(default_bos),
-            add_eos: md
-                .boolean("tokenizer.ggml.add_eos_token")
-                .unwrap_or(default_eos),
+            // llama.cpp forces BOS on for gemma4 whatever the metadata says.
+            add_bos: matches!(kind, Kind::Escaped)
+                || md
+                    .boolean("tokenizer.ggml.add_bos_token")
+                    .unwrap_or(default_bos),
+            add_eos: md.boolean("tokenizer.ggml.add_eos_token").unwrap_or(false),
         };
-        // llama.cpp forces BOS on for gemma4 whatever the metadata says.
-        if matches!(kind, Kind::Escaped) {
-            config.add_bos = true;
-        }
 
         let engine = match kind {
             Kind::Spm => {
@@ -452,26 +442,22 @@ impl Tokenizer {
         match ty {
             TYPE_NORMAL | TYPE_UNUSED | TYPE_UNDEFINED => {
                 let mut buf = [0u8; 4];
-                if matches!(
+                let byte_level = matches!(
                     self.engine,
                     Engine::Bpe {
                         words: Words::Byte(_),
                         ..
                     }
-                ) {
-                    for c in text.chars() {
-                        match char_to_byte(c) {
-                            Some(byte) => out.push(byte),
-                            None => out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes()),
-                        }
-                    }
-                } else {
-                    for c in text.chars() {
-                        if c == SPACE_MARK {
-                            out.push(b' ');
-                        } else {
-                            out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-                        }
+                );
+                for c in text.chars() {
+                    let byte = if byte_level {
+                        char_to_byte(c)
+                    } else {
+                        (c == SPACE_MARK).then_some(b' ')
+                    };
+                    match byte {
+                        Some(byte) => out.push(byte),
+                        None => out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes()),
                     }
                 }
             }

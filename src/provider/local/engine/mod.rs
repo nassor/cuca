@@ -64,6 +64,7 @@ use self::scheduler::{Sequence, SnapshotStore, StepBufs};
 use super::chat::{ChatFormat, ChatTemplate, expand_template_name};
 use super::model::Model;
 use super::model::arch::Arch;
+use super::model::err as local_err;
 use super::model::mtp::Drafter;
 use super::model::paged::{KvPools, Sizing};
 #[cfg(test)]
@@ -74,7 +75,7 @@ use super::tokenizer::Tokenizer;
 use super::{LocalDevice, LocalModelConfig, MAX_DRAFT_TOKENS};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
-use crate::types::{MessageContentBlock, ProviderEndpoint};
+use crate::types::MessageContentBlock;
 
 /// A [`DrafterSource`](super::DrafterSource) with its file resolved: the path
 /// of the drafter GGUF, or the head inside the main model's own file.
@@ -555,10 +556,6 @@ impl ServingCounters {
     }
 }
 
-fn local_err(message: impl Into<String>) -> CucaError {
-    CucaError::provider(ProviderEndpoint::Local, message)
-}
-
 impl Engine {
     /// Read the GGUF file at `path` and build the engine, the tokenizer and
     /// the chat template from it.
@@ -905,7 +902,7 @@ fn architecture_of(content: &gguf::Content) -> &str {
 /// every position ([`Drafter::observes`]), so that the engine serves one
 /// sequence at a time.
 fn file_drafter_observes(arch: &str) -> bool {
-    matches!(arch, super::model::cpu::dflash::ARCH) || arch == Arch::Mistral4Eagle.name()
+    arch == super::model::cpu::dflash::ARCH || arch == Arch::Mistral4Eagle.name()
 }
 
 fn saturating_u32(n: usize) -> u32 {

@@ -110,10 +110,7 @@ impl Stopper {
                     self.stopped = cut.done;
                 }
                 other => {
-                    let held = self.stop.flush();
-                    if !held.is_empty() {
-                        out.push_back(Ok(MessageContentBlock::Text(held)));
-                    }
+                    self.finish(out);
                     out.push_back(other);
                 }
             }
