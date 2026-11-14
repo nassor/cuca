@@ -536,6 +536,22 @@ fn whitespace_run(s: &str, pos: usize) -> WhitespaceRun {
     run
 }
 
+/// The whitespace alternatives of the word family at `pos` (`c` is the
+/// character there): `\s*[\r\n]+`, then `\s+(?!\S)`, then `\s+`.
+fn whitespace_at(s: &str, pos: usize, c: char) -> Option<usize> {
+    if !is_space(c) {
+        return None;
+    }
+    let run = whitespace_run(s, pos);
+    if let Some(end) = run.last_newline_end {
+        return Some(end);
+    }
+    if run.end == s.len() || run.last_start == pos {
+        return Some(run.end);
+    }
+    Some(run.last_start)
+}
+
 /// `[^\r\n\p{L}\p{N}]`: characters allowed as the optional prefix of a word.
 fn is_word_prefix(c: char) -> bool {
     c != '\r' && c != '\n' && !is_letter(c) && !is_number(c)
@@ -559,14 +575,7 @@ fn word_at(rule: WordRule, s: &str, pos: usize, c: char) -> Option<usize> {
 
     // `\p{N}{1,3}` / `\p{N}`
     if is_number(c) {
-        let mut end = pos;
-        for d in s[pos..].chars().take(rule.max_digits) {
-            if !is_number(d) {
-                break;
-            }
-            end += d.len_utf8();
-        }
-        return Some(end);
+        return Some(number_group_end(s, pos, rule.max_digits));
     }
 
     // ` ?[^\s\p{L}\p{N}]+[\r\n]*` (`[\r\n/]*` for GPT-4o; `\p{M}` excluded too
@@ -581,19 +590,7 @@ fn word_at(rule: WordRule, s: &str, pos: usize, c: char) -> Option<usize> {
         return Some(run_end(s, end, tail));
     }
 
-    if !is_space(c) {
-        return None;
-    }
-    let run = whitespace_run(s, pos);
-    // `\s*[\r\n]+`
-    if let Some(end) = run.last_newline_end {
-        return Some(end);
-    }
-    // `\s+(?!\S)`, then `\s+`
-    if run.end == s.len() || run.last_start == pos {
-        return Some(run.end);
-    }
-    Some(run.last_start)
+    whitespace_at(s, pos, c)
 }
 
 /// The DeepSeek word pattern at `pos` (`c` is the character there).
@@ -618,18 +615,7 @@ fn deepseek_word_at(s: &str, pos: usize, c: char) -> Option<usize> {
         let end = run_end(s, body, is_punct_or_symbol);
         return Some(run_end(s, end, |x| x == '\r' || x == '\n'));
     }
-    if !is_space(c) {
-        return None;
-    }
-    let run = whitespace_run(s, pos);
-    // `\s*[\r\n]+`, then `\s+(?!\S)` and `\s+`
-    if let Some(end) = run.last_newline_end {
-        return Some(end);
-    }
-    if run.end == s.len() || run.last_start == pos {
-        return Some(run.end);
-    }
-    Some(run.last_start)
+    whitespace_at(s, pos, c)
 }
 
 /// `[^\r\n\p{L}\p{N}]?\p{L}+` (letters widened to `[\p{L}\p{M}]` for qwen35).

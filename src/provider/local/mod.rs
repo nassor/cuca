@@ -2020,14 +2020,13 @@ impl LocalModel {
                 Some(DrafterSource::InTrunk) => Some(engine::ResolvedDrafter::InTrunk),
             };
             let chat_template = resolve_chat_template(&config)?;
-            let (engine, tokenizer, template, format) = engine::Engine::open(
+            engine::Engine::open(
                 &path,
                 drafter.as_ref(),
                 shared,
                 &config,
                 chat_template.as_deref(),
-            )?;
-            Ok((engine, tokenizer, template, format))
+            )
         })
         .await
     }
