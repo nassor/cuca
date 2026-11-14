@@ -149,59 +149,48 @@ impl EngramSpec {
     }
 }
 
-/// Every unsigned integer of an array-valued key.
-fn usize_array(k: &Keys<'_>, arch: Arch, key: &str) -> Result<Option<Vec<usize>>, CucaError> {
-    let Some(v) = k.value(key) else {
+/// The elements of an array-valued key, each read by `item` (`what` names
+/// what a rejected element is not); `None` when the key is absent.
+pub(crate) fn array_of<T>(
+    value: Option<&Value>,
+    key: &str,
+    what: &str,
+    item: impl Fn(&Value) -> Option<T>,
+) -> Result<Option<Vec<T>>, CucaError> {
+    let Some(v) = value else {
         return Ok(None);
     };
-    let full = format!("{}.{key}", arch.name());
     let Value::Array(items) = v else {
-        return Err(meta_err(&full, "not an array"));
+        return Err(meta_err(key, "not an array"));
     };
     items
         .iter()
-        .map(|v| value_usize(v).ok_or_else(|| meta_err(&full, "not an unsigned integer")))
+        .map(|v| item(v).ok_or_else(|| meta_err(key, what)))
         .collect::<Result<Vec<_>, _>>()
         .map(Some)
+}
+
+/// Every unsigned integer of an array-valued key.
+fn usize_array(k: &Keys<'_>, arch: Arch, key: &str) -> Result<Option<Vec<usize>>, CucaError> {
+    let full = format!("{}.{key}", arch.name());
+    array_of(k.value(key), &full, "not an unsigned integer", value_usize)
 }
 
 /// An array of 64-bit unsigned integers.
 fn u64_array(md: &Metadata, key: &str) -> Result<Option<Vec<u64>>, CucaError> {
-    let Some(v) = md.get(key) else {
-        return Ok(None);
-    };
-    let Value::Array(items) = v else {
-        return Err(meta_err(key, "not an array"));
-    };
-    items
-        .iter()
-        .map(|v| match v {
-            Value::U64(n) => Ok(*n),
-            other => value_usize(other)
-                .map(|n| n as u64)
-                .ok_or_else(|| meta_err(key, "not an unsigned integer")),
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    array_of(md.get(key), key, "not an unsigned integer", |v| match v {
+        Value::U64(n) => Some(*n),
+        other => value_usize(other).map(|n| n as u64),
+    })
 }
 
 /// An array of floats.
 pub(crate) fn f32_array(md: &Metadata, key: &str) -> Result<Option<Vec<f32>>, CucaError> {
-    let Some(v) = md.get(key) else {
-        return Ok(None);
-    };
-    let Value::Array(items) = v else {
-        return Err(meta_err(key, "not an array"));
-    };
-    items
-        .iter()
-        .map(|v| match v {
-            Value::F32(x) => Ok(*x),
-            Value::F64(x) => Ok(*x as f32),
-            _ => Err(meta_err(key, "not a float")),
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    array_of(md.get(key), key, "not a float", |v| match v {
+        Value::F32(x) => Some(*x),
+        Value::F64(x) => Some(*x as f32),
+        _ => None,
+    })
 }
 
 /// `hyper_connection.*`.
@@ -513,6 +502,21 @@ pub(crate) fn read_engram(
     })
 }
 
+/// `expert_gating_func` of the architecture named `arch`.
+pub(crate) fn read_gating(k: &Keys<'_>, arch: &str) -> Result<Gating, CucaError> {
+    Ok(match k.usize_opt("expert_gating_func")? {
+        None | Some(1) => Gating::Softmax,
+        Some(2) => Gating::Sigmoid,
+        Some(4) => Gating::SqrtSoftplus,
+        Some(other) => {
+            return Err(meta_err(
+                &format!("{arch}.expert_gating_func"),
+                format!("gating function {other} is not supported"),
+            ));
+        }
+    })
+}
+
 /// `expert_gating_func` and the SwiGLU clamps.
 pub(crate) fn read_moe_ext(
     md: &Metadata,
@@ -520,17 +524,7 @@ pub(crate) fn read_moe_ext(
     k: &Keys<'_>,
     n_layer: usize,
 ) -> Result<MoeExt, CucaError> {
-    let gating = match k.usize_opt("expert_gating_func")? {
-        None | Some(1) => Gating::Softmax,
-        Some(2) => Gating::Sigmoid,
-        Some(4) => Gating::SqrtSoftplus,
-        Some(other) => {
-            return Err(meta_err(
-                &format!("{}.expert_gating_func", arch.name()),
-                format!("gating function {other} is not supported"),
-            ));
-        }
-    };
+    let gating = read_gating(k, arch.name())?;
     let per_layer = |key: &str| -> Result<Vec<f32>, CucaError> {
         let full = format!("{}.{key}", arch.name());
         match f32_array(md, &full)? {

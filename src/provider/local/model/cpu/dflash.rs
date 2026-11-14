@@ -104,6 +104,7 @@ use crate::provider::local::gguf::{self, Value};
 use candle_core::{Device, Tensor};
 
 use super::super::arch::Act;
+use super::super::csa::array_of;
 use super::super::layout::name;
 use super::super::params::{Keys, Metadata, value_usize};
 use super::super::rope::{RopeKind, RopeSpec};
@@ -142,17 +143,7 @@ struct Geometry {
 
 /// A non-negative integer array under `key`.
 pub(super) fn array_usize(md: &Metadata, key: &str) -> Result<Option<Vec<usize>>, CucaError> {
-    let Some(value) = md.get(key) else {
-        return Ok(None);
-    };
-    let Value::Array(items) = value else {
-        return Err(meta_err(key, "not an array"));
-    };
-    items
-        .iter()
-        .map(|v| value_usize(v).ok_or_else(|| meta_err(key, "not an unsigned integer")))
-        .collect::<Result<Vec<_>, _>>()
-        .map(Some)
+    array_of(md.get(key), key, "not an unsigned integer", value_usize)
 }
 
 /// Whether `md` describes a plain DFlash drafter this engine runs (the

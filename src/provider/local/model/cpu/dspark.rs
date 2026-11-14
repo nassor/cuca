@@ -54,7 +54,7 @@ use std::sync::Arc;
 use crate::provider::local::gguf;
 
 use super::super::arch::Arch;
-use super::super::csa::{Gating, HyperSpec, f32_array, read_hyper};
+use super::super::csa::{Gating, HyperSpec, f32_array, read_gating, read_hyper};
 use super::super::hc::{collapse, dot};
 use super::super::kvquant;
 use super::super::layout::{name, tensor_info};
@@ -177,17 +177,7 @@ fn read_geometry(md: &Metadata) -> Result<(Geometry, HyperSpec), CucaError> {
         .and_then(|id| u32::try_from(id).ok())
         .ok_or_else(|| meta_err(mask_key, "missing: the drafter's noise token"))?;
     let shared_ff = k.usize("feed_forward_length")?;
-    let gating = match k.usize_opt("expert_gating_func")? {
-        None | Some(1) => Gating::Softmax,
-        Some(2) => Gating::Sigmoid,
-        Some(4) => Gating::SqrtSoftplus,
-        Some(other) => {
-            return Err(meta_err(
-                &format!("{PREFIX}.expert_gating_func"),
-                format!("gating function {other} is not supported"),
-            ));
-        }
-    };
+    let gating = read_gating(&k, PREFIX)?;
     let geo = Geometry {
         n_embd,
         n_head,
