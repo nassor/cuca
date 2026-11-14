@@ -328,6 +328,76 @@ pub(super) fn row_groups(
         .collect()
 }
 
+/// The heads `o` `(t, row)` through the grouped low-rank output: group `grp`
+/// of the columns goes through `out_a[grp]` to `rank` values, and the
+/// concatenated groups through `out_b`.
+pub(super) fn grouped_out(
+    out_a: &[QMatMul],
+    out_b: &QMatMul,
+    o: &[f32],
+    t: usize,
+    row: usize,
+    rank: usize,
+) -> candle_core::Result<Vec<f32>> {
+    let groups = out_a.len();
+    let width = row / groups;
+    let mut mid = vec![0f32; t * groups * rank];
+    for (grp, w) in out_a.iter().enumerate() {
+        let mut cols = vec![0f32; t * width];
+        for (dst, row) in cols
+            .chunks_exact_mut(width)
+            .zip(o.chunks_exact(groups * width))
+        {
+            dst.copy_from_slice(&row[grp * width..(grp + 1) * width]);
+        }
+        let part = mm(w, &cols, width)?;
+        for (dst, src) in mid
+            .chunks_exact_mut(groups * rank)
+            .zip(part.chunks_exact(rank))
+        {
+            dst[grp * rank..(grp + 1) * rank].copy_from_slice(src);
+        }
+    }
+    mm(out_b, &mid, groups * rank)
+}
+
+/// The residual streams of the rows with embeddings `embeddings` (`d` floats
+/// each): every row repeats its embedding in all `s` streams, and the first
+/// stream is the one the first layer's attention reads.
+pub(super) fn start_streams(embeddings: &[f32], s: usize, d: usize) -> (Vec<f32>, Vec<f32>) {
+    let t = embeddings.len() / d;
+    let mut stream = vec![0f32; t * s * d];
+    for (row, e) in stream
+        .chunks_exact_mut(s * d)
+        .zip(embeddings.chunks_exact(d))
+    {
+        for copy in row.chunks_exact_mut(d) {
+            copy.copy_from_slice(e);
+        }
+    }
+    let mut pre_mix = vec![0f32; t * s];
+    for row in pre_mix.chunks_exact_mut(s) {
+        row[0] = 1.0;
+    }
+    (stream, pre_mix)
+}
+
+/// `scores` as softmax numerators `exp(score - max)`, with an attention sink
+/// of logit `sink` in the denominator, which is returned.
+pub(super) fn sink_softmax(scores: &mut [f32], sink: f32) -> f32 {
+    let m = scores
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max)
+        .max(-1e30);
+    let mut denom = 0.0;
+    for sc in scores.iter_mut() {
+        *sc = (*sc - m).exp();
+        denom += *sc;
+    }
+    denom + (sink - m).exp()
+}
+
 /// The attention weights of layer `il`.
 pub(super) fn load_csa(
     loader: &mut Loader<'_>,
@@ -614,19 +684,7 @@ impl Transformer {
             .ok_or_else(|| msg("hyper-connection pass without hyper-connections"))?;
         let (s, d) = (hy.spec.streams, hp.n_embd);
         let t = embeddings.len() / d;
-        let mut stream = vec![0f32; t * s * d];
-        for (row, e) in stream
-            .chunks_exact_mut(s * d)
-            .zip(embeddings.chunks_exact(d))
-        {
-            for copy in row.chunks_exact_mut(d) {
-                copy.copy_from_slice(e);
-            }
-        }
-        let mut pre_mix = vec![0f32; t * s];
-        for row in pre_mix.chunks_exact_mut(s) {
-            row[0] = 1.0;
-        }
+        let (mut stream, mut pre_mix) = start_streams(&embeddings, s, d);
         let mut rows = RowMap {
             seg: Vec::with_capacity(t),
             pos: Vec::with_capacity(t),
@@ -986,17 +1044,7 @@ impl Transformer {
                     scores.push(dot(qv, &cdata.k[off..off + hd]) * scale);
                 }
             }
-            let m = scores
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max)
-                .max(-1e30);
-            let mut denom = 0.0;
-            for sc in scores.iter_mut() {
-                *sc = (*sc - m).exp();
-                denom += *sc;
-            }
-            denom += (cw.sinks[head] - m).exp();
+            let denom = sink_softmax(scores, cw.sinks[head]);
             out.fill(0.0);
             let mut at = 0;
             for pos in lo..=p {
@@ -1039,22 +1087,7 @@ impl Transformer {
                 kvquant::qdq_fp8_ue8m0(row, 32);
             }
         });
-        let width = nh * hd / g.out_groups;
-        let mut mid = vec![0f32; t * g.out_groups * g.out_rank];
-        for (grp, w) in cw.out_a.iter().enumerate() {
-            let mut cols = vec![0f32; t * width];
-            for (dst, row) in cols.chunks_exact_mut(width).zip(o.chunks_exact(nh * hd)) {
-                dst.copy_from_slice(&row[grp * width..(grp + 1) * width]);
-            }
-            let part = mm(w, &cols, width)?;
-            for (dst, src) in mid
-                .chunks_exact_mut(g.out_groups * g.out_rank)
-                .zip(part.chunks_exact(g.out_rank))
-            {
-                dst[grp * g.out_rank..(grp + 1) * g.out_rank].copy_from_slice(src);
-            }
-        }
-        mm(&cw.out_b, &mid, g.out_groups * g.out_rank)
+        grouped_out(&cw.out_a, &cw.out_b, &o, t, nh * hd, g.out_rank)
     }
 
     /// The compressed rows the tokens of this call complete: pool them,

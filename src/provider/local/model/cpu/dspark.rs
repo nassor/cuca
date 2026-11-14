@@ -64,7 +64,9 @@ use super::super::quant::TokenEmbedding;
 use super::super::rope::{RopeKind, RopeSpec};
 use super::super::{candle_err, err, meta_err};
 use super::dflash::array_usize;
-use super::hyper::{HcLayer, Rope, mm, qdq_disabled, rms_row, row_groups};
+use super::hyper::{
+    HcLayer, Rope, grouped_out, mm, qdq_disabled, rms_row, row_groups, sink_softmax, start_streams,
+};
 use super::{
     CpuExpert, FfnWeights, LayerSet, Loader, QMatMul, RouterExt, SharedExpert, Transformer,
 };
@@ -527,19 +529,7 @@ impl DsparkNet {
         let mut ids = vec![self.geo.mask_token; n];
         ids[0] = first;
         let embeddings = target.embedding_rows(&ids)?;
-        let mut stream = vec![0f32; n * s * d];
-        for (row, e) in stream
-            .chunks_exact_mut(s * d)
-            .zip(embeddings.chunks_exact(d))
-        {
-            for copy in row.chunks_exact_mut(d) {
-                copy.copy_from_slice(e);
-            }
-        }
-        let mut pre_mix = vec![0f32; n * s];
-        for row in pre_mix.chunks_exact_mut(s) {
-            row[0] = 1.0;
-        }
+        let (mut stream, mut pre_mix) = start_streams(&embeddings, s, d);
         for il in 0..self.stages.len() {
             self.stage(il, &mut stream, &mut pre_mix, len)
                 .map_err(candle_err)?;
@@ -661,17 +651,7 @@ impl DsparkNet {
             for key in kv.chunks_exact(hd) {
                 scores.push(dot(qv, key) * scale);
             }
-            let m = scores
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max)
-                .max(-1e30);
-            let mut denom = 0.0;
-            for sc in scores.iter_mut() {
-                *sc = (*sc - m).exp();
-                denom += *sc;
-            }
-            denom += (st.sinks[head] - m).exp();
+            let denom = sink_softmax(scores, st.sinks[head]);
             out.fill(0.0);
             let mut at = 0;
             for p in lo..hi {
@@ -704,22 +684,7 @@ impl DsparkNet {
                 kvquant::qdq_fp8_ue8m0(row, 32);
             }
         });
-        let width = nh * hd / g.out_groups;
-        let mut mid = vec![0f32; t * g.out_groups * g.out_rank];
-        for (grp, w) in st.out_a.iter().enumerate() {
-            let mut cols = vec![0f32; t * width];
-            for (dst, row) in cols.chunks_exact_mut(width).zip(o.chunks_exact(nh * hd)) {
-                dst.copy_from_slice(&row[grp * width..(grp + 1) * width]);
-            }
-            let part = mm(w, &cols, width)?;
-            for (dst, src) in mid
-                .chunks_exact_mut(g.out_groups * g.out_rank)
-                .zip(part.chunks_exact(g.out_rank))
-            {
-                dst[grp * g.out_rank..(grp + 1) * g.out_rank].copy_from_slice(src);
-            }
-        }
-        mm(&st.out_b, &mid, g.out_groups * g.out_rank)
+        grouped_out(&st.out_a, &st.out_b, &o, t, nh * hd, g.out_rank)
     }
 }
 
