@@ -58,6 +58,25 @@ struct PagingRow {
     timestamp: Option<u64>,
 }
 
+/// Connects to WMI on this thread if not connected (COM is initialised by the
+/// `wmi` crate), retrying every [`WMI_RETRY_TICKS`] after a failure.
+fn connect(wmi: &mut Option<WMIConnection>, connect_in: &mut u32) {
+    if wmi.is_some() {
+        return;
+    }
+    *connect_in = connect_in.saturating_sub(1);
+    if *connect_in > 0 {
+        return;
+    }
+    match WMIConnection::new() {
+        Ok(con) => *wmi = Some(con),
+        Err(e) => {
+            tracing::debug!("sysmon: WMI connect failed: {e}");
+            *connect_in = WMI_RETRY_TICKS;
+        }
+    }
+}
+
 /// Page-in and page-out rates from the raw paging counters.
 ///
 /// Pages input counts every hard fault resolved from disk, memory-mapped file
@@ -82,18 +101,7 @@ impl SwapProbe {
     /// `(in, out)` in bytes per second; `(None, None)` on the first tick or if
     /// the counters cannot be read.
     pub(super) fn sample(&mut self, _dt_s: f64) -> (Option<f64>, Option<f64>) {
-        if self.wmi.is_none() {
-            self.connect_in = self.connect_in.saturating_sub(1);
-            if self.connect_in == 0 {
-                match WMIConnection::new() {
-                    Ok(con) => self.wmi = Some(con),
-                    Err(e) => {
-                        tracing::debug!("sysmon: WMI connect failed: {e}");
-                        self.connect_in = WMI_RETRY_TICKS;
-                    }
-                }
-            }
-        }
+        connect(&mut self.wmi, &mut self.connect_in);
         let row = self
             .wmi
             .as_ref()
@@ -177,7 +185,7 @@ impl GpuProbe {
 
     pub(super) fn sample(&mut self) -> Vec<GpuStats> {
         self.registry_age = self.registry_age.saturating_add(1);
-        self.connect();
+        connect(&mut self.wmi, &mut self.connect_in);
 
         let (mem, process, util) = match &self.wmi {
             Some(con) => {
@@ -238,25 +246,6 @@ impl GpuProbe {
             }
         }
         gpus
-    }
-
-    /// Connects to WMI on this thread if not connected (COM is initialised by
-    /// the `wmi` crate), retrying every [`WMI_RETRY_TICKS`] after a failure.
-    fn connect(&mut self) {
-        if self.wmi.is_some() {
-            return;
-        }
-        self.connect_in = self.connect_in.saturating_sub(1);
-        if self.connect_in > 0 {
-            return;
-        }
-        match WMIConnection::new() {
-            Ok(con) => self.wmi = Some(con),
-            Err(e) => {
-                tracing::debug!("sysmon: WMI connect failed: {e}");
-                self.connect_in = WMI_RETRY_TICKS;
-            }
-        }
     }
 
     /// The registry entry for `luid`; of stale duplicates, the most recently seen.

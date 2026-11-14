@@ -8,7 +8,7 @@
 //!   translator's `Thinking` handling.
 //! - **Anthropic bridge** (`https://api.deepseek.com/anthropic`): speaks the
 //!   Anthropic Messages API
-//!   ([`build_anthropic_request`]/[`anthropic_stream`]) and expects Claude-style
+//!   ([`build_anthropic_request`](crate::provider::anthropic::build_anthropic_request)/[`anthropic_stream`]) and expects Claude-style
 //!   model ids, which are translated to DeepSeek ids by
 //!   [`translate_bridge_model`].
 //!
@@ -18,7 +18,7 @@
 
 use crate::client::{CucaClient, ProviderDispatch};
 use crate::error::CucaError;
-use crate::provider::anthropic::{AnthropicAuth, anthropic_stream, build_anthropic_request};
+use crate::provider::anthropic::{AnthropicAuth, anthropic_stream};
 use crate::provider::openai_compat::openai_compat_stream;
 use crate::request::{PromptCacheDirective, UnifiedRequest};
 
@@ -60,21 +60,6 @@ pub(crate) fn bridge_unified_request(mut req: UnifiedRequest) -> UnifiedRequest 
     req.model = translate_bridge_model(&req.model);
     req.prompt_cache = PromptCacheDirective::Disabled;
     req
-}
-
-/// Build the Anthropic-shape bridge body for a [`UnifiedRequest`].
-///
-/// Testable seam used by [`CucaClient::dispatch_deepseek`]: stages the request
-/// through [`bridge_unified_request`], then builds the Anthropic-shape body.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "test-only seam: dispatch calls bridge_unified_request and anthropic_stream directly"
-    )
-)]
-pub(crate) fn bridge_request(req: UnifiedRequest) -> Result<serde_json::Value, CucaError> {
-    build_anthropic_request(&bridge_unified_request(req))
 }
 
 impl CucaClient {
@@ -119,6 +104,11 @@ mod tests {
     use crate::types::ProviderEndpoint;
 
     use super::*;
+    use crate::provider::anthropic::build_anthropic_request;
+
+    fn bridge_request(req: UnifiedRequest) -> Result<serde_json::Value, CucaError> {
+        build_anthropic_request(&bridge_unified_request(req))
+    }
 
     // --- translate_bridge_model ---
 
