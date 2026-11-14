@@ -141,7 +141,7 @@ struct Geometry {
 }
 
 /// A non-negative integer array under `key`.
-fn array_usize(md: &Metadata, key: &str) -> Result<Option<Vec<usize>>, CucaError> {
+pub(super) fn array_usize(md: &Metadata, key: &str) -> Result<Option<Vec<usize>>, CucaError> {
     let Some(value) = md.get(key) else {
         return Ok(None);
     };

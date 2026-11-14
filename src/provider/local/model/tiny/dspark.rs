@@ -11,8 +11,8 @@ use super::deepseek41::{
     DS_WINDOW, Raw, mxfp4_bytes, raw_f32, raw_q,
 };
 use super::{
-    DFLASH_MASK, GgmlDType, Lcg, N_EMBD, TinyModel, VOCAB, Value, gguf, kv, norm, quantized,
-    temp_path, u,
+    DFLASH_MASK, GgmlDType, Lcg, N_EMBD, TinyModel, VOCAB, Value, gguf, kv, norm, overlay,
+    quantized, temp_path, u,
 };
 use crate::provider::local::gguf::GgufType;
 
@@ -213,13 +213,7 @@ pub(crate) fn write_tiny_dspark(s: &TinyDspark) -> TinyModel {
         kf("has_confidence_head", Value::Bool(true)),
         kv("tokenizer.ggml.mask_token_id", Value::U32(DFLASH_MASK)),
     ];
-    for (key, value) in &s.meta {
-        let full = format!("{p}.{key}");
-        match meta.iter_mut().find(|(k, _)| *k == full) {
-            Some(entry) => entry.1 = value.clone(),
-            None => meta.push((full, value.clone())),
-        }
-    }
+    overlay(&mut meta, p, &s.meta);
     let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let raw: Vec<gguf::RawTensor> = tensors
         .iter()

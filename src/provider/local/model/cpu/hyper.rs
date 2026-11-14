@@ -107,6 +107,129 @@ pub(super) struct HcLayer {
     engram: Option<EngramLayer>,
 }
 
+impl HcLayer {
+    /// The attention and FFN sites and their norms of layer `il`, without a
+    /// table lookup.
+    pub(super) fn load(
+        loader: &mut Loader<'_>,
+        n_embd: usize,
+        il: usize,
+        spec: &HyperSpec,
+    ) -> Result<Self, CucaError> {
+        Ok(Self {
+            attn: load_hc(
+                loader,
+                n_embd,
+                il,
+                spec,
+                name::HC_ATTN_FN,
+                name::HC_ATTN_BASE,
+                name::HC_ATTN_SCALE,
+            )?,
+            ffn: load_hc(
+                loader,
+                n_embd,
+                il,
+                spec,
+                name::HC_FFN_FN,
+                name::HC_FFN_BASE,
+                name::HC_FFN_SCALE,
+            )?,
+            attn_norm: loader.floats(&name::blk(il, name::ATTN_NORM), &[n_embd])?,
+            ffn_norm: loader.floats(&name::blk(il, name::FFN_NORM), &[n_embd])?,
+            engram: None,
+        })
+    }
+
+    /// One layer over the block rows of `stream` (`[rows][streams][n_embd]`):
+    /// attention then FFN, each between its collapse and expansion. `attend`
+    /// maps the normed rows `(t, n_embd)` to the attention output and `ffn`
+    /// the normed rows to the FFN output. `pre_mix` is what the previous
+    /// FFN predicted for the attention to read.
+    pub(super) fn run(
+        &self,
+        spec: &HyperSpec,
+        eps: f32,
+        stream: &mut Vec<f32>,
+        pre_mix: &mut [f32],
+        attend: impl FnOnce(&[f32]) -> candle_core::Result<Vec<f32>>,
+        ffn: impl FnOnce(&Tensor) -> candle_core::Result<Tensor>,
+    ) -> candle_core::Result<()> {
+        let (s, d) = (spec.streams, self.attn_norm.len());
+        let t = stream.len() / (s * d);
+        let cl = coeff_len(s);
+
+        // Attention.
+        let mut attn_c = vec![0f32; t * cl];
+        par_chunks(&mut attn_c, cl, |r, c| {
+            coefficients(
+                &stream[r * s * d..(r + 1) * s * d],
+                &self.attn,
+                spec,
+                eps,
+                c,
+            );
+        });
+        let mut h = vec![0f32; t * d];
+        par_chunks(&mut h, d, |r, out| {
+            let mut x = vec![0f32; d];
+            collapse(
+                &stream[r * s * d..(r + 1) * s * d],
+                &pre_mix[r * s..(r + 1) * s],
+                &mut x,
+            );
+            rms_row(&x, &self.attn_norm, eps, out);
+        });
+        let y = attend(&h)?;
+        let mut next = vec![0f32; t * s * d];
+        par_chunks(&mut next, s * d, |r, out| {
+            let c = &attn_c[r * cl..(r + 1) * cl];
+            expand(
+                &y[r * d..(r + 1) * d],
+                &stream[r * s * d..(r + 1) * s * d],
+                &c[s..2 * s],
+                &c[2 * s..],
+                out,
+            );
+        });
+
+        // Feed-forward.
+        let mut ffn_c = vec![0f32; t * cl];
+        par_chunks(&mut ffn_c, cl, |r, c| {
+            coefficients(&next[r * s * d..(r + 1) * s * d], &self.ffn, spec, eps, c);
+        });
+        let mut f_in = vec![0f32; t * d];
+        par_chunks(&mut f_in, d, |r, out| {
+            let mut x = vec![0f32; d];
+            collapse(
+                &next[r * s * d..(r + 1) * s * d],
+                hc::pre(&attn_c[r * cl..(r + 1) * cl], s),
+                &mut x,
+            );
+            rms_row(&x, &self.ffn_norm, eps, out);
+        });
+        let f = ffn(&Tensor::from_vec(f_in, (1, t, d), &Device::Cpu)?)?
+            .flatten_all()?
+            .to_vec1::<f32>()?;
+        let mut out = vec![0f32; t * s * d];
+        par_chunks(&mut out, s * d, |r, o| {
+            let c = &ffn_c[r * cl..(r + 1) * cl];
+            expand(
+                &f[r * d..(r + 1) * d],
+                &next[r * s * d..(r + 1) * s * d],
+                &c[s..2 * s],
+                &c[2 * s..],
+                o,
+            );
+        });
+        for (dst, c) in pre_mix.chunks_exact_mut(s).zip(ffn_c.chunks_exact(cl)) {
+            dst.copy_from_slice(&c[..s]);
+        }
+        *stream = out;
+        Ok(())
+    }
+}
+
 /// The weights of one engram layer: the projection of the fetched rows to a
 /// key per stream and one value, and the product of the query and key
 /// weights.
@@ -118,7 +241,7 @@ struct EngramLayer {
     gate: Vec<f32>,
 }
 
-pub(super) fn load_hc(
+fn load_hc(
     loader: &mut Loader<'_>,
     n_embd: usize,
     il: usize,
@@ -146,46 +269,26 @@ pub(super) fn load_hc_layer(
         .hyper
         .as_ref()
         .ok_or_else(|| err("hyper-connections without a stream count"))?;
-    Ok(HcLayer {
-        attn: load_hc(
-            loader,
-            hp.n_embd,
-            il,
-            spec,
-            name::HC_ATTN_FN,
-            name::HC_ATTN_BASE,
-            name::HC_ATTN_SCALE,
-        )?,
-        ffn: load_hc(
-            loader,
-            hp.n_embd,
-            il,
-            spec,
-            name::HC_FFN_FN,
-            name::HC_FFN_BASE,
-            name::HC_FFN_SCALE,
-        )?,
-        attn_norm: loader.floats(&name::blk(il, name::ATTN_NORM), &[hp.n_embd])?,
-        ffn_norm: loader.floats(&name::blk(il, name::FFN_NORM), &[hp.n_embd])?,
-        engram: match hp
-            .engram
-            .as_ref()
-            .and_then(|e| e.index_of(il).map(|o| (e, o)))
-        {
-            Some((e, ordinal)) => Some(EngramLayer {
-                ordinal,
-                kv: loader.matmul(
-                    &name::blk(il, name::ENGRAM_KV),
-                    &[(spec.streams + 1) * hp.n_embd, e.cols() * e.row_dim],
-                )?,
-                gate: loader.floats(
-                    &name::blk(il, name::ENGRAM_GATE),
-                    &[spec.streams, hp.n_embd],
-                )?,
-            }),
-            None => None,
-        },
-    })
+    let mut layer = HcLayer::load(loader, hp.n_embd, il, spec)?;
+    layer.engram = match hp
+        .engram
+        .as_ref()
+        .and_then(|e| e.index_of(il).map(|o| (e, o)))
+    {
+        Some((e, ordinal)) => Some(EngramLayer {
+            ordinal,
+            kv: loader.matmul(
+                &name::blk(il, name::ENGRAM_KV),
+                &[(spec.streams + 1) * hp.n_embd, e.cols() * e.row_dim],
+            )?,
+            gate: loader.floats(
+                &name::blk(il, name::ENGRAM_GATE),
+                &[spec.streams, hp.n_embd],
+            )?,
+        }),
+        None => None,
+    };
+    Ok(layer)
 }
 
 /// The `[rows, cols]` matrix `tensor_name` as `groups` matmul weights of
@@ -744,81 +847,14 @@ impl Transformer {
         let (Some(hc), Mixer::Csa(cw)) = (lw.hc.as_deref(), &lw.mixer) else {
             return Err(msg(format!("layer {il} has no hyper-connection weights")));
         };
-        let (s, d) = (hy.spec.streams, hp.n_embd);
-        let t = stream.len() / (s * d);
-        let eps = hp.eps as f32;
-        let cl = coeff_len(s);
-
-        // Attention.
-        let mut attn_c = vec![0f32; t * cl];
-        par_chunks(&mut attn_c, cl, |r, c| {
-            coefficients(
-                &stream[r * s * d..(r + 1) * s * d],
-                &hc.attn,
-                &hy.spec,
-                eps,
-                c,
-            );
-        });
-        let mut h = vec![0f32; t * d];
-        par_chunks(&mut h, d, |r, out| {
-            let mut x = vec![0f32; d];
-            collapse(
-                &stream[r * s * d..(r + 1) * s * d],
-                &pre_mix[r * s..(r + 1) * s],
-                &mut x,
-            );
-            rms_row(&x, &hc.attn_norm, eps, out);
-        });
-        let y = self.csa_attention(il, cw, &h, rows, segs, shared)?;
-        let mut next = vec![0f32; t * s * d];
-        par_chunks(&mut next, s * d, |r, out| {
-            let c = &attn_c[r * cl..(r + 1) * cl];
-            expand(
-                &y[r * d..(r + 1) * d],
-                &stream[r * s * d..(r + 1) * s * d],
-                &c[s..2 * s],
-                &c[2 * s..],
-                out,
-            );
-        });
-
-        // Feed-forward.
-        let mut ffn_c = vec![0f32; t * cl];
-        par_chunks(&mut ffn_c, cl, |r, c| {
-            coefficients(&next[r * s * d..(r + 1) * s * d], &hc.ffn, &hy.spec, eps, c);
-        });
-        let mut f_in = vec![0f32; t * d];
-        par_chunks(&mut f_in, d, |r, out| {
-            let mut x = vec![0f32; d];
-            collapse(
-                &next[r * s * d..(r + 1) * s * d],
-                hc::pre(&attn_c[r * cl..(r + 1) * cl], s),
-                &mut x,
-            );
-            rms_row(&x, &hc.ffn_norm, eps, out);
-        });
-        let f = lw
-            .ffn
-            .forward(&Tensor::from_vec(f_in, (1, t, d), &Device::Cpu)?, hp.act())?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let mut out = vec![0f32; t * s * d];
-        par_chunks(&mut out, s * d, |r, o| {
-            let c = &ffn_c[r * cl..(r + 1) * cl];
-            expand(
-                &f[r * d..(r + 1) * d],
-                &next[r * s * d..(r + 1) * s * d],
-                &c[s..2 * s],
-                &c[2 * s..],
-                o,
-            );
-        });
-        for (dst, c) in pre_mix.chunks_exact_mut(s).zip(ffn_c.chunks_exact(cl)) {
-            dst.copy_from_slice(&c[..s]);
-        }
-        *stream = out;
-        Ok(())
+        hc.run(
+            &hy.spec,
+            hp.eps as f32,
+            stream,
+            pre_mix,
+            |h| self.csa_attention(il, cw, h, rows, segs, shared),
+            |f| lw.ffn.forward(f, hp.act()),
+        )
     }
 
     /// The attention of layer `il` over the normed rows `h` `(t, n_embd)`:

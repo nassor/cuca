@@ -186,7 +186,7 @@ fn u64_array(md: &Metadata, key: &str) -> Result<Option<Vec<u64>>, CucaError> {
 }
 
 /// An array of floats.
-fn f32_array(md: &Metadata, key: &str) -> Result<Option<Vec<f32>>, CucaError> {
+pub(crate) fn f32_array(md: &Metadata, key: &str) -> Result<Option<Vec<f32>>, CucaError> {
     let Some(v) = md.get(key) else {
         return Ok(None);
     };

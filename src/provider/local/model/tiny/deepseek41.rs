@@ -13,7 +13,8 @@
 use std::fs::File;
 
 use super::{
-    GgmlDType, Lcg, N_EMBD, TinyModel, VOCAB, Value, gguf, kv, norm, quantized, temp_path, u,
+    GgmlDType, Lcg, N_EMBD, TinyModel, VOCAB, Value, gguf, kv, norm, overlay, quantized, temp_path,
+    u,
 };
 use crate::provider::local::gguf::GgufType;
 
@@ -247,8 +248,7 @@ pub(crate) fn write_deepseek41(s: &TinyDeepseek41) -> TinyModel {
                 0.5,
             ));
         }
-        if let Some(ordinal) = DS_ENGRAM_LAYERS.iter().position(|&l| l == il) {
-            let _ = ordinal;
+        if DS_ENGRAM_LAYERS.contains(&il) {
             tensors.push(mat(
                 &mut rng,
                 b("engram_kv"),
@@ -387,13 +387,7 @@ pub(crate) fn write_deepseek41(s: &TinyDeepseek41) -> TinyModel {
         meta.push(kf("attention.indexer.candidate_top_k_blocks", u(2)));
         meta.push(kf("attention.indexer.candidate_block_size", u(4)));
     }
-    for (key, value) in &s.meta {
-        let full = format!("{p}.{key}");
-        match meta.iter_mut().find(|(k, _)| *k == full) {
-            Some(entry) => entry.1 = value.clone(),
-            None => meta.push((full, value.clone())),
-        }
-    }
+    overlay(&mut meta, p, &s.meta);
 
     let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
     let raw: Vec<gguf::RawTensor> = tensors

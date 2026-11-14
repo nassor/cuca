@@ -225,7 +225,7 @@ mod tests {
 
     #[test]
     fn collapse_and_expand_follow_their_definitions() {
-        let (s, d) = (3, 2);
+        let s = 3;
         let x = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
         let mut y = [0.0; 2];
         collapse(&x, &[0.5, 0.25, 0.25], &mut y);
@@ -239,7 +239,6 @@ mod tests {
         let mut out = [0.0; 6];
         expand(&[10.0, 20.0], &x, &post, &comb, &mut out);
         assert_eq!(out, [11.0, 22.0, 23.0, 44.0, 35.0, 66.0]);
-        let _ = d;
     }
 
     // Goldens from the torch port of the reference (`hc_mixes` +

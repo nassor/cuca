@@ -262,41 +262,14 @@ impl Transformer {
         hidden: &[f32],
     ) -> Result<(), CucaError> {
         let d = self.hp.n_embd;
-        let n = tokens.len();
-        if n == 0 || hidden.len() != n * d {
-            return Err(err(format!(
-                "EAGLE observe: {n} tokens with {} hidden floats, expected {}",
-                hidden.len(),
-                n * d
-            )));
-        }
-        // Pair `(h[j], t[j + 1])` for `j` from `first`.
-        let (first, rows, ids) = match head.log.tail.as_ref().filter(|(at, _)| at + 1 == pos) {
-            Some((_, prev)) => {
-                let mut rows = Vec::with_capacity(n * d);
-                rows.extend_from_slice(prev);
-                rows.extend_from_slice(&hidden[..(n - 1) * d]);
-                (pos - 1, Cow::Owned(rows), tokens)
-            }
-            None => (pos, Cow::Borrowed(&hidden[..(n - 1) * d]), &tokens[1..]),
-        };
-        head.log.drop_from(first);
-        let m = ids.len();
-        if m > 0 {
-            let slot = head.log.pairs.len();
-            if slot + m > head.log.capacity {
-                return Err(err(format!(
-                    "the EAGLE cache holds {} positions, {} do not fit",
-                    head.log.capacity,
-                    slot + m
-                )));
-            }
+        let (first, rows, ids) = head.log.begin("EAGLE", d, pos, tokens, hidden)?;
+        if !ids.is_empty() {
             let emb = self.embedding_rows(ids)?;
+            let slot = head.log.pairs.len();
             self.eagle_store(head, emb, &rows, slot, first)
                 .map_err(candle_err)?;
-            head.log.pairs.extend(first..first + m);
         }
-        head.log.tail = Some((pos + n - 1, hidden[(n - 1) * d..].to_vec()));
+        head.log.finish(first, ids.len(), d, pos, hidden);
         Ok(())
     }
 
@@ -363,14 +336,7 @@ impl Transformer {
                 "EAGLE draft: needs the hidden row of the last position",
             ));
         }
-        let slot = head.log.pairs.len();
-        if slot + k > head.log.capacity {
-            return Err(err(format!(
-                "the EAGLE cache holds {} positions, {} do not fit",
-                head.log.capacity,
-                slot + k
-            )));
-        }
+        let slot = head.log.reserve("EAGLE", k)?;
         let mut drafts = Vec::with_capacity(k);
         let mut hidden = Cow::Borrowed(hidden);
         let mut token = first;

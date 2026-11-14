@@ -51,11 +51,11 @@
 
 use std::sync::Arc;
 
-use crate::provider::local::gguf::{self, Value};
+use crate::provider::local::gguf;
 
 use super::super::arch::Arch;
-use super::super::csa::{Gating, HyperSpec, read_hyper};
-use super::super::hc::{self, HcWeights, coeff_len, coefficients, collapse, dot, expand};
+use super::super::csa::{Gating, HyperSpec, f32_array, read_hyper};
+use super::super::hc::{collapse, dot};
 use super::super::kvquant;
 use super::super::layout::{name, tensor_info};
 use super::super::params::{Keys, Metadata, MoeSpec, value_usize};
@@ -63,7 +63,8 @@ use super::super::pool::{par_chunks, par_chunks_with};
 use super::super::quant::TokenEmbedding;
 use super::super::rope::{RopeKind, RopeSpec};
 use super::super::{candle_err, err, meta_err};
-use super::hyper::{Rope, load_hc, mm, qdq_disabled, rms_row, row_groups};
+use super::dflash::array_usize;
+use super::hyper::{HcLayer, Rope, mm, qdq_disabled, rms_row, row_groups};
 use super::{
     CpuExpert, FfnWeights, LayerSet, Loader, QMatMul, RouterExt, SharedExpert, Transformer,
 };
@@ -108,37 +109,10 @@ struct Geometry {
     features: Vec<usize>,
 }
 
-fn array(md: &Metadata, key: &str) -> Result<Option<Vec<Value>>, CucaError> {
-    match md.get(key) {
-        None => Ok(None),
-        Some(Value::Array(items)) => Ok(Some(items.clone())),
-        Some(_) => Err(meta_err(key, "not an array")),
-    }
-}
-
-fn usizes(md: &Metadata, key: &str) -> Result<Option<Vec<usize>>, CucaError> {
-    array(md, key)?
-        .map(|items| {
-            items
-                .iter()
-                .map(|v| value_usize(v).ok_or_else(|| meta_err(key, "not an unsigned integer")))
-                .collect()
-        })
-        .transpose()
-}
-
 fn floats(md: &Metadata, key: &str, n: usize) -> Result<Vec<f32>, CucaError> {
-    let Some(items) = array(md, key)? else {
+    let Some(v) = f32_array(md, key)? else {
         return Ok(vec![0.0; n]);
     };
-    let v = items
-        .iter()
-        .map(|v| match v {
-            Value::F32(x) => Ok(*x),
-            Value::F64(x) => Ok(*x as f32),
-            _ => Err(meta_err(key, "not a float")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
     if v.len() != n {
         return Err(meta_err(key, format!("{} entries for {n} stages", v.len())));
     }
@@ -163,7 +137,7 @@ fn read_geometry(md: &Metadata) -> Result<(Geometry, HyperSpec), CucaError> {
     let rope_dims = k.usize("rope.dimension_count")?;
     let window = k.usize("attention.sliding_window")?;
     let block_size = k.usize("block_size")?;
-    let ratios = usizes(md, &format!("{PREFIX}.attention.compress_ratios"))?;
+    let ratios = array_usize(md, &format!("{PREFIX}.attention.compress_ratios"))?;
     if ratios.is_some_and(|r| r.iter().any(|&x| x != 0)) {
         return Err(err(
             "a DSpark drafter attends to a window only: its compress ratios must be 0".to_string(),
@@ -186,7 +160,7 @@ fn read_geometry(md: &Metadata) -> Result<(Geometry, HyperSpec), CucaError> {
     let target_key = format!("{PREFIX}.target_layers");
     // llama.cpp lists the layers whose *input* feeds the drafter; a
     // hyper-connection target hands those inputs over as they are.
-    let features = usizes(md, &target_key)?
+    let features = array_usize(md, &target_key)?
         .ok_or_else(|| meta_err(&target_key, "missing: the drafter needs its target layers"))?;
     if features.is_empty() || features.windows(2).any(|w| w[0] >= w[1]) {
         return Err(meta_err(
@@ -257,10 +231,7 @@ fn read_geometry(md: &Metadata) -> Result<(Geometry, HyperSpec), CucaError> {
 
 /// One stage: a hyper-connection block over a window-only attention.
 struct Stage {
-    hc_attn: HcWeights,
-    hc_ffn: HcWeights,
-    attn_norm: Vec<f32>,
-    ffn_norm: Vec<f32>,
+    hc: HcLayer,
     q_a: QMatMul,
     q_a_norm: Vec<f32>,
     q_b: QMatMul,
@@ -627,88 +598,14 @@ impl DsparkNet {
         len: usize,
     ) -> candle_core::Result<()> {
         let st = &self.stages[il];
-        let (s, d) = (self.spec.streams, self.geo.n_embd);
-        let t = stream.len() / (s * d);
-        let eps = self.geo.eps;
-        let cl = coeff_len(s);
-
-        let mut attn_c = vec![0f32; t * cl];
-        par_chunks(&mut attn_c, cl, |r, c| {
-            coefficients(
-                &stream[r * s * d..(r + 1) * s * d],
-                &st.hc_attn,
-                &self.spec,
-                eps,
-                c,
-            );
-        });
-        let mut h = vec![0f32; t * d];
-        par_chunks(&mut h, d, |r, out| {
-            let mut x = vec![0f32; d];
-            collapse(
-                &stream[r * s * d..(r + 1) * s * d],
-                &pre_mix[r * s..(r + 1) * s],
-                &mut x,
-            );
-            rms_row(&x, &st.attn_norm, eps, out);
-        });
-        let y = self.attention(il, &h, len)?;
-        let mut next = vec![0f32; t * s * d];
-        par_chunks(&mut next, s * d, |r, out| {
-            let c = &attn_c[r * cl..(r + 1) * cl];
-            expand(
-                &y[r * d..(r + 1) * d],
-                &stream[r * s * d..(r + 1) * s * d],
-                &c[s..2 * s],
-                &c[2 * s..],
-                out,
-            );
-        });
-
-        let mut ffn_c = vec![0f32; t * cl];
-        par_chunks(&mut ffn_c, cl, |r, c| {
-            coefficients(
-                &next[r * s * d..(r + 1) * s * d],
-                &st.hc_ffn,
-                &self.spec,
-                eps,
-                c,
-            );
-        });
-        let mut f_in = vec![0f32; t * d];
-        par_chunks(&mut f_in, d, |r, out| {
-            let mut x = vec![0f32; d];
-            collapse(
-                &next[r * s * d..(r + 1) * s * d],
-                hc::pre(&attn_c[r * cl..(r + 1) * cl], s),
-                &mut x,
-            );
-            rms_row(&x, &st.ffn_norm, eps, out);
-        });
-        let f = st
-            .ffn
-            .forward(
-                &Tensor::from_vec(f_in, (1, t, d), &Device::Cpu)?,
-                super::super::arch::Act::Silu,
-            )?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        let mut out = vec![0f32; t * s * d];
-        par_chunks(&mut out, s * d, |r, o| {
-            let c = &ffn_c[r * cl..(r + 1) * cl];
-            expand(
-                &f[r * d..(r + 1) * d],
-                &next[r * s * d..(r + 1) * s * d],
-                &c[s..2 * s],
-                &c[2 * s..],
-                o,
-            );
-        });
-        for (dst, c) in pre_mix.chunks_exact_mut(s).zip(ffn_c.chunks_exact(cl)) {
-            dst.copy_from_slice(&c[..s]);
-        }
-        *stream = out;
-        Ok(())
+        st.hc.run(
+            &self.spec,
+            self.geo.eps,
+            stream,
+            pre_mix,
+            |h| self.attention(il, h, len),
+            |f| st.ffn.forward(f, super::super::arch::Act::Silu),
+        )
     }
 
     /// The attention of stage `il` over the normed block rows `h`
@@ -861,26 +758,7 @@ fn load_stage(
         }),
     };
     Ok(Stage {
-        hc_attn: load_hc(
-            loader,
-            d,
-            il,
-            spec,
-            name::HC_ATTN_FN,
-            name::HC_ATTN_BASE,
-            name::HC_ATTN_SCALE,
-        )?,
-        hc_ffn: load_hc(
-            loader,
-            d,
-            il,
-            spec,
-            name::HC_FFN_FN,
-            name::HC_FFN_BASE,
-            name::HC_FFN_SCALE,
-        )?,
-        attn_norm: loader.floats(&blk(name::ATTN_NORM), &[d])?,
-        ffn_norm: loader.floats(&blk(name::FFN_NORM), &[d])?,
+        hc: HcLayer::load(loader, d, il, spec)?,
         q_a: loader.matmul(&blk(name::ATTN_Q_A), &[g.q_lora, d])?,
         q_a_norm: loader.floats(&blk(name::ATTN_Q_A_NORM), &[g.q_lora])?,
         q_b: loader.matmul(&blk(name::ATTN_Q_B), &[nh * hd, g.q_lora])?,

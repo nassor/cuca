@@ -11,6 +11,11 @@
 //! consistent with the trunk; the drafters own the weights, the K/V and the
 //! observe and draft passes.
 
+use std::borrow::Cow;
+
+use super::super::err;
+use crate::error::CucaError;
+
 /// The committed pairs and the tail of one drafter.
 pub(super) struct PairLog {
     /// Slots the drafter's K/V cache holds.
@@ -48,5 +53,68 @@ impl PairLog {
     pub(super) fn drop_from(&mut self, first: usize) {
         let keep = self.pairs.partition_point(|&j| j < first);
         self.pairs.truncate(keep);
+    }
+
+    /// `Ok(slot)`, the first free slot, when `m` more pairs fit.
+    pub(super) fn reserve(&self, what: &str, m: usize) -> Result<usize, CucaError> {
+        let slot = self.pairs.len();
+        if slot + m > self.capacity {
+            return Err(err(format!(
+                "the {what} cache holds {} positions, {} do not fit",
+                self.capacity,
+                slot + m
+            )));
+        }
+        Ok(slot)
+    }
+
+    /// Start observing the trunk rows `tokens[i]` at positions `pos + i`
+    /// whose final-norm hidden rows (`d` floats each) are `hidden`: pair
+    /// every row with its successor token, the tail with `tokens[0]` when it
+    /// sits at `pos - 1`, and drop the pairs the new ones replace. Returns
+    /// the first new pair index, the hidden rows and the successor tokens of
+    /// the new pairs; the caller stores them in the slots from
+    /// `pairs.len()`, then calls [`PairLog::finish`].
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for mismatched lengths or a full cache.
+    pub(super) fn begin<'a>(
+        &mut self,
+        what: &str,
+        d: usize,
+        pos: usize,
+        tokens: &'a [u32],
+        hidden: &'a [f32],
+    ) -> Result<(usize, Cow<'a, [f32]>, &'a [u32]), CucaError> {
+        let n = tokens.len();
+        if n == 0 || hidden.len() != n * d {
+            return Err(err(format!(
+                "{what} observe: {n} tokens with {} hidden floats, expected {}",
+                hidden.len(),
+                n * d
+            )));
+        }
+        // Pair `(h[j], t[j + 1])` for `j` from `first`.
+        let (first, rows, ids) = match self.tail.as_ref().filter(|(at, _)| at + 1 == pos) {
+            Some((_, prev)) => {
+                let mut rows = Vec::with_capacity(n * d);
+                rows.extend_from_slice(prev);
+                rows.extend_from_slice(&hidden[..(n - 1) * d]);
+                (pos - 1, Cow::Owned(rows), tokens)
+            }
+            None => (pos, Cow::Borrowed(&hidden[..(n - 1) * d]), &tokens[1..]),
+        };
+        self.drop_from(first);
+        self.reserve(what, ids.len())?;
+        Ok((first, rows, ids))
+    }
+
+    /// Commit the `m` pairs from `first` that [`PairLog::begin`] returned and
+    /// make the last of the `hidden.len() / d` rows the tail.
+    pub(super) fn finish(&mut self, first: usize, m: usize, d: usize, pos: usize, hidden: &[f32]) {
+        let n = hidden.len() / d;
+        self.pairs.extend(first..first + m);
+        self.tail = Some((pos + n - 1, hidden[(n - 1) * d..].to_vec()));
     }
 }
