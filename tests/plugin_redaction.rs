@@ -48,11 +48,7 @@ fn redaction_plugin() -> Arc<RedactionPlugin> {
 
 /// A client pointed at `addr` with `plugins` registered, no API key.
 fn client_at(addr: SocketAddr, plugins: Vec<Arc<dyn CucaPlugin>>) -> CucaClient {
-    let mut builder = common::llamacpp_builder(format!("http://{addr}/v1"));
-    for plugin in plugins {
-        builder = builder.register_plugin(plugin);
-    }
-    builder.build().expect("client build must succeed")
+    common::client_at_with_plugins(format!("http://{addr}/v1"), plugins)
 }
 
 /// A one-message streaming request; the model id is fixed so two captured

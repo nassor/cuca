@@ -1636,11 +1636,7 @@ mod cost_with_memory {
     }
 
     fn client_at(addr: &str, plugins: Vec<Arc<dyn CucaPlugin>>) -> CucaClient {
-        let mut builder = common::llamacpp_builder(addr.to_string());
-        for plugin in plugins {
-            builder = builder.register_plugin(plugin);
-        }
-        builder.build().expect("client build must succeed")
+        common::client_at_with_plugins(addr, plugins)
     }
 
     fn request() -> UnifiedRequest {

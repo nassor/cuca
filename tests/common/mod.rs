@@ -13,7 +13,6 @@
 //! otherwise trip `-D warnings` in CI.
 #![allow(dead_code)]
 
-use std::any::Any;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -215,15 +214,24 @@ pub fn llamacpp_builder(base: impl Into<String>) -> CucaClientBuilder {
         .with_base_url(base)
 }
 
-/// llama.cpp client with the given plugins registered (no API key).
-pub fn client_with_plugins(plugins: Vec<Arc<dyn CucaPlugin>>) -> CucaClient {
-    let mut builder = llamacpp_builder(base_url());
+/// llama.cpp client at `base` with the given plugins registered in order (no
+/// API key).
+pub fn client_at_with_plugins(
+    base: impl Into<String>,
+    plugins: Vec<Arc<dyn CucaPlugin>>,
+) -> CucaClient {
+    let mut builder = llamacpp_builder(base);
     for plugin in plugins {
         builder = builder.register_plugin(plugin);
     }
     builder
         .build()
         .expect("llama.cpp client build must succeed")
+}
+
+/// llama.cpp client with the given plugins registered (no API key).
+pub fn client_with_plugins(plugins: Vec<Arc<dyn CucaPlugin>>) -> CucaClient {
+    client_at_with_plugins(base_url(), plugins)
 }
 
 /// llama.cpp client with no plugins.
@@ -313,16 +321,6 @@ pub async fn spawn_counting_sse_server(
     addr
 }
 
-/// Re-panic with the original message when a helper thread panicked, so
-/// `require_live #true` gates keep their documented panic semantics.
-fn panic_message(payload: Box<dyn Any + Send>, fallback: &str) -> String {
-    payload
-        .downcast_ref::<String>()
-        .cloned()
-        .or_else(|| payload.downcast_ref::<&str>().map(|s| s.to_string()))
-        .unwrap_or_else(|| fallback.to_string())
-}
-
 /// [`require_server`] run on a plain OS thread.
 ///
 /// `server_probe` builds its own tokio runtime and `block_on` panics when a
@@ -331,21 +329,16 @@ fn panic_message(payload: Box<dyn Any + Send>, fallback: &str) -> String {
 /// current-thread flavor. A panic inside the thread (e.g. the
 /// `require_live #true` gate) is re-raised on the calling thread.
 pub fn require_live_server() -> Result<(), String> {
-    match std::thread::spawn(require_server).join() {
-        Ok(result) => result,
-        Err(payload) => panic!(
-            "{}",
-            panic_message(payload, "live server gate thread panicked")
-        ),
-    }
+    std::thread::spawn(require_server)
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 /// [`model_name`] resolved on a plain OS thread (see [`require_live_server`]).
 pub fn live_model() -> String {
-    match std::thread::spawn(model_name).join() {
-        Ok(model) => model,
-        Err(payload) => panic!("{}", panic_message(payload, "live model thread panicked")),
-    }
+    std::thread::spawn(model_name)
+        .join()
+        .unwrap_or_else(|payload| std::panic::resume_unwind(payload))
 }
 
 /// A small, fast request built from an already resolved model id so no server
