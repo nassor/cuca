@@ -4,6 +4,7 @@
 //! recomputing, and the `dflash.*` keys of the DSpark drafter file.
 
 use super::super::cfg_err;
+use super::super::config::Kv;
 use super::super::engram;
 use super::hparams::{Config, EngramConfig};
 use crate::error::CucaError;
@@ -14,46 +15,6 @@ use crate::provider::local::gguf::Value;
 const FILE_TYPE_MXFP4_MOE: u32 = 38;
 /// `LLAMA_EXPERT_GATING_FUNC_SQRTSOFTPLUS`.
 const GATING_SQRTSOFTPLUS: u32 = 4;
-
-/// Ordered key/value pairs under one architecture prefix.
-struct Kv {
-    prefix: &'static str,
-    items: Vec<(String, Value)>,
-}
-
-impl Kv {
-    fn new(prefix: &'static str) -> Self {
-        Self {
-            prefix,
-            items: Vec::new(),
-        }
-    }
-
-    fn raw(&mut self, key: &str, value: Value) {
-        match self.items.iter_mut().find(|(k, _)| k == key) {
-            Some(slot) => slot.1 = value,
-            None => self.items.push((key.to_string(), value)),
-        }
-    }
-
-    fn put(&mut self, key: &str, value: Value) {
-        self.raw(&format!("{}.{key}", self.prefix), value);
-    }
-
-    fn u32(&mut self, key: &str, v: usize) -> Result<(), CucaError> {
-        let v = u32::try_from(v).map_err(|_| cfg_err(format!("{key}: {v} does not fit u32")))?;
-        self.put(key, Value::U32(v));
-        Ok(())
-    }
-
-    fn f32(&mut self, key: &str, v: f64) {
-        self.put(key, Value::F32(v as f32));
-    }
-
-    fn array(&mut self, key: &str, values: impl IntoIterator<Item = Value>) {
-        self.put(key, Value::Array(values.into_iter().collect()));
-    }
-}
 
 /// Keys the backbone and the drafter share: the attention, the routed-expert
 /// and the hyper-connection hyperparameters.
@@ -75,7 +36,7 @@ fn common(kv: &mut Kv, cfg: &Config, n_block: usize) -> Result<(), CucaError> {
     kv.u32("expert_feed_forward_length", cfg.moe_ff)?;
     kv.u32("expert_gating_func", GATING_SQRTSOFTPLUS as usize)?;
     kv.f32("expert_weights_scale", cfg.routed_scale);
-    kv.put("expert_weights_norm", Value::Bool(cfg.norm_topk));
+    kv.bool("expert_weights_norm", cfg.norm_topk);
     let clamp = |_| Value::F32(cfg.swiglu_limit as f32);
     kv.array("swiglu_clamp_exp", (0..n_block).map(clamp));
     kv.array("swiglu_clamp_shexp", (0..n_block).map(clamp));
@@ -136,11 +97,8 @@ fn engram_keys(
         "ple.head_vocab_sizes",
         primes.iter().flatten().flatten().map(|&p| Value::U64(p)),
     );
-    kv.put("engram.pad_token_id", Value::U32(e.pad_token));
-    kv.put(
-        "engram.token_map",
-        Value::Array(token_map.into_iter().map(Value::I32).collect()),
-    );
+    kv.arch_key("engram.pad_token_id", Value::U32(e.pad_token));
+    kv.array("engram.token_map", token_map.into_iter().map(Value::I32));
     Ok(())
 }
 
@@ -164,7 +122,7 @@ pub(super) fn main_kv(
     kv.raw("general.name", Value::String(name.to_string()));
     kv.u32("block_count", cfg.n_layer)?;
     common(&mut kv, cfg, cfg.n_layer)?;
-    kv.put("rope.scaling.type", Value::String("yarn".into()));
+    kv.arch_key("rope.scaling.type", Value::String("yarn".into()));
     kv.f32("rope.scaling.factor", cfg.yarn.factor);
     kv.u32(
         "rope.scaling.original_context_length",
@@ -183,7 +141,7 @@ pub(super) fn main_kv(
     kv.u32("attention.indexer.key_length", cfg.index_dim)?;
     kv.u32("attention.indexer.top_k", cfg.index_topk)?;
     if let Some(c) = &cfg.candidate {
-        kv.put(
+        kv.arch_key(
             "attention.indexer.candidate_source_layer",
             Value::I32(c.layer as i32),
         );
@@ -234,11 +192,11 @@ pub(super) fn drafter_kv(
     kv.u32("expert_count", d.n_expert)?;
     kv.u32("expert_used_count", d.n_used)?;
     kv.array("attention.compress_ratios", (0..n).map(|_| Value::I32(0)));
-    kv.put("hyper_connection.single_pass", Value::Bool(true));
+    kv.bool("hyper_connection.single_pass", true);
     kv.u32("block_size", d.block_size)?;
     kv.array("target_layers", d.targets.iter().map(|&t| Value::I32(t)));
-    kv.put("sample_from_anchor", Value::Bool(true));
-    kv.put("has_confidence_head", Value::Bool(true));
+    kv.bool("sample_from_anchor", true);
+    kv.bool("has_confidence_head", true);
     kv.raw("tokenizer.ggml.mask_token_id", Value::U32(d.noise_token));
     kv.raw("general.quantization_version", Value::U32(2));
     kv.raw("general.file_type", Value::U32(file_type(quant)));

@@ -225,34 +225,34 @@ fn as_usize(v: &Json) -> Option<usize> {
 }
 
 /// Ordered GGUF key/value pairs under one architecture prefix.
-struct Kv {
+pub(super) struct Kv {
     prefix: &'static str,
-    items: Vec<(String, Value)>,
+    pub(super) items: Vec<(String, Value)>,
 }
 
 impl Kv {
-    fn new(arch: ConvArch) -> Self {
+    pub(super) fn new(prefix: &'static str) -> Self {
         Self {
-            prefix: arch.gguf_name(),
+            prefix,
             items: Vec::new(),
         }
     }
 
     /// Set a full key, replacing an earlier value (the converter's later
     /// override of an earlier write).
-    fn raw(&mut self, key: &str, value: Value) {
+    pub(super) fn raw(&mut self, key: &str, value: Value) {
         match self.items.iter_mut().find(|(k, _)| k == key) {
             Some(slot) => slot.1 = value,
             None => self.items.push((key.to_string(), value)),
         }
     }
 
-    fn arch_key(&mut self, key: &str, value: Value) {
+    pub(super) fn arch_key(&mut self, key: &str, value: Value) {
         let full = format!("{}.{key}", self.prefix);
         self.raw(&full, value);
     }
 
-    fn u32(&mut self, key: &str, v: usize) -> Result<(), CucaError> {
+    pub(super) fn u32(&mut self, key: &str, v: usize) -> Result<(), CucaError> {
         let v = u32::try_from(v).map_err(|_| cfg_err(format!("{key}: {v} does not fit u32")))?;
         self.arch_key(key, Value::U32(v));
         Ok(())
@@ -263,7 +263,7 @@ impl Kv {
         v.map_or(Ok(()), |v| self.u32(key, v))
     }
 
-    fn f32(&mut self, key: &str, v: f64) {
+    pub(super) fn f32(&mut self, key: &str, v: f64) {
         self.arch_key(key, Value::F32(v as f32));
     }
 
@@ -274,8 +274,12 @@ impl Kv {
         }
     }
 
-    fn bool(&mut self, key: &str, v: bool) {
+    pub(super) fn bool(&mut self, key: &str, v: bool) {
         self.arch_key(key, Value::Bool(v));
+    }
+
+    pub(super) fn array(&mut self, key: &str, values: impl IntoIterator<Item = Value>) {
+        self.arch_key(key, Value::Array(values.into_iter().collect()));
     }
 
     fn i32s(&mut self, key: &str, v: &[i64]) {
@@ -988,7 +992,7 @@ pub(crate) fn build(
     n_mtp: usize,
 ) -> Result<ModelMeta, CucaError> {
     guard(arch, hp)?;
-    let mut kv = Kv::new(arch);
+    let mut kv = Kv::new(arch.gguf_name());
     kv.raw(
         "general.architecture",
         Value::String(arch.gguf_name().into()),
