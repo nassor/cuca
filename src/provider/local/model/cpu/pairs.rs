@@ -16,6 +16,10 @@ use std::borrow::Cow;
 use super::super::err;
 use crate::error::CucaError;
 
+/// The pairs one observe pass adds: the first pair index, their hidden rows
+/// and their successor tokens.
+type NewPairs<'a> = (usize, Cow<'a, [f32]>, &'a [u32]);
+
 /// The committed pairs and the tail of one drafter.
 pub(super) struct PairLog {
     /// Slots the drafter's K/V cache holds.
@@ -86,7 +90,7 @@ impl PairLog {
         pos: usize,
         tokens: &'a [u32],
         hidden: &'a [f32],
-    ) -> Result<(usize, Cow<'a, [f32]>, &'a [u32]), CucaError> {
+    ) -> Result<NewPairs<'a>, CucaError> {
         let n = tokens.len();
         if n == 0 || hidden.len() != n * d {
             return Err(err(format!(
