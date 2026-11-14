@@ -1614,22 +1614,6 @@ impl fmt::Debug for LocalModelConfig {
     }
 }
 
-/// What a loaded engine hands back to `load`: the pieces the request path
-/// needs without touching the engine thread.
-struct Loaded {
-    tokenizer: Arc<Tokenizer>,
-    template: ChatTemplate,
-    format: ChatFormat,
-    context_length: usize,
-    kv_cache_bytes: u64,
-    file_bytes: u64,
-    tiers: Option<Arc<model::tier::TierShared>>,
-    engram: Option<Arc<model::engram_io::EngramCounters>>,
-    serving: Arc<engine::ServingCounters>,
-    sampling: SamplingConfig,
-    layer_split: Option<(usize, usize)>,
-}
-
 /// State shared by every clone of a [`LocalModel`].
 struct LocalModelInner {
     /// Queue into the engine thread; dropping the last sender ends it.
@@ -2058,7 +2042,7 @@ impl LocalModel {
             + 'static,
     {
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<engine::Job>(JOB_QUEUE);
-        let (ready_tx, ready_rx) = oneshot::channel::<Result<Loaded, CucaError>>();
+        let (ready_tx, ready_rx) = oneshot::channel::<Result<Self, CucaError>>();
         std::thread::Builder::new()
             .name("cuca-local-engine".to_string())
             .spawn(move || {
@@ -2081,20 +2065,24 @@ impl LocalModel {
                 };
                 let mut engine = match opened {
                     Ok((engine, tokenizer, template, format)) => {
-                        let loaded = Loaded {
-                            context_length: engine.context_length(),
-                            kv_cache_bytes: engine.kv_cache_bytes(),
-                            file_bytes: engine.file_bytes(),
-                            tiers: engine.expert_tiers(),
-                            engram: engine.engram_counters(),
-                            serving: engine.serving_counters(),
-                            sampling: engine.sampling().config(),
-                            layer_split: engine.layer_split(),
-                            tokenizer,
-                            template,
-                            format,
+                        let model = LocalModel {
+                            inner: Arc::new(LocalModelInner {
+                                jobs: jobs_tx,
+                                context_length: engine.context_length(),
+                                kv_cache_bytes: engine.kv_cache_bytes(),
+                                file_bytes: engine.file_bytes(),
+                                sampling: engine.sampling().config(),
+                                draft_stats,
+                                serving: engine.serving_counters(),
+                                tiers: engine.expert_tiers(),
+                                engram: engine.engram_counters(),
+                                layer_split: engine.layer_split(),
+                                tokenizer,
+                                template,
+                                format,
+                            }),
                         };
-                        if ready_tx.send(Ok(loaded)).is_err() {
+                        if ready_tx.send(Ok(model)).is_err() {
                             return;
                         }
                         engine
@@ -2110,30 +2098,12 @@ impl LocalModel {
                 message: format!("failed to start the local engine thread: {e}"),
             })?;
 
-        match ready_rx.await {
-            Ok(Ok(loaded)) => Ok(LocalModel {
-                inner: Arc::new(LocalModelInner {
-                    jobs: jobs_tx,
-                    tokenizer: loaded.tokenizer,
-                    template: loaded.template,
-                    format: loaded.format,
-                    context_length: loaded.context_length,
-                    kv_cache_bytes: loaded.kv_cache_bytes,
-                    file_bytes: loaded.file_bytes,
-                    sampling: loaded.sampling,
-                    draft_stats,
-                    serving: loaded.serving,
-                    tiers: loaded.tiers,
-                    engram: loaded.engram,
-                    layer_split: loaded.layer_split,
-                }),
-            }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(CucaError::provider(
+        ready_rx.await.unwrap_or_else(|_| {
+            Err(CucaError::provider(
                 ProviderEndpoint::Local,
                 "local engine thread exited during load",
-            )),
-        }
+            ))
+        })
     }
 }
 
@@ -2357,7 +2327,7 @@ fn ensure_file(
         file,
         sha256,
         path,
-        hf_token(config).as_deref(),
+        hf_token(config),
         config.on_download_progress.as_ref(),
     ))
 }
@@ -2414,7 +2384,7 @@ fn resolve_role_path(
                     repo,
                     revision,
                     &cache_dir,
-                    hf_token(config).as_deref(),
+                    hf_token(config),
                     config.on_download_progress.as_ref(),
                 ))
             })
@@ -2477,7 +2447,7 @@ fn resolve_hugging_face(
         repo,
         revision,
         &wanted,
-        hf_token(config).as_deref(),
+        hf_token(config),
         config.on_download_progress.as_ref(),
     ))
 }
@@ -2600,8 +2570,8 @@ fn resolve_chat_template(config: &LocalModelConfig) -> Result<Option<String>, Cu
 
 /// The Hugging Face token; an empty one (what `"${HF_TOKEN:-}"` yields when the
 /// variable is unset) means anonymous access.
-fn hf_token(config: &LocalModelConfig) -> Option<String> {
-    config.hf_token.clone().filter(|t| !t.is_empty())
+fn hf_token(config: &LocalModelConfig) -> Option<&str> {
+    config.hf_token.as_deref().filter(|t| !t.is_empty())
 }
 
 /// The block stream of one local request: the receiving end of the channel the
