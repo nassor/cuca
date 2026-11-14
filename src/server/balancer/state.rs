@@ -3,7 +3,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use super::config::BalancerConfig;
 use super::routing::{Candidate, Decision, Router, UpstreamView, load_score};
@@ -120,9 +120,7 @@ impl BalancerState {
             metrics: BalancerMetrics::default(),
             system,
             started: Instant::now(),
-            started_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            started_unix_ms: crate::server::sysmon::now_ms(),
             node_id: format!("{host}:{}", listen.port()),
             stats_streams: AtomicUsize::new(0),
         }

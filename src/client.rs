@@ -725,43 +725,6 @@ impl CucaClient {
             }
             None => None,
         };
-        #[cfg(all(
-            feature = "service-prompt-cache",
-            not(any(
-                feature = "provider-openai",
-                feature = "provider-anthropic",
-                feature = "provider-deepseek",
-                feature = "provider-gemini",
-                feature = "provider-llamacpp",
-                feature = "provider-vllm",
-                feature = "provider-lmstudio",
-                feature = "provider-local",
-            ))
-        ))]
-        let _ = &cache_write;
-        #[cfg(not(any(
-            feature = "provider-openai",
-            feature = "provider-anthropic",
-            feature = "provider-deepseek",
-            feature = "provider-gemini",
-            feature = "provider-llamacpp",
-            feature = "provider-vllm",
-            feature = "provider-lmstudio",
-            feature = "provider-local",
-        )))]
-        return Err(match &self.selected_provider {
-            ProviderEndpoint::LlamaCpp => CucaError::ProviderNotEnabled("provider-llamacpp"),
-            ProviderEndpoint::Anthropic => CucaError::ProviderNotEnabled("provider-anthropic"),
-            ProviderEndpoint::DeepSeek => CucaError::ProviderNotEnabled("provider-deepseek"),
-            ProviderEndpoint::GoogleGemini => CucaError::ProviderNotEnabled("provider-gemini"),
-            ProviderEndpoint::OpenAi => CucaError::ProviderNotEnabled("provider-openai"),
-            ProviderEndpoint::Vllm => CucaError::ProviderNotEnabled("provider-vllm"),
-            ProviderEndpoint::LmStudio => CucaError::ProviderNotEnabled("provider-lmstudio"),
-            ProviderEndpoint::Local => CucaError::ProviderNotEnabled("provider-local"),
-            ProviderEndpoint::Custom(_) => {
-                CucaError::Config("custom endpoints require a registered adapter".into())
-            }
-        });
 
         // Orchestrator path: when a speculative orchestrator is
         // attached, the turn is routed through `execute_adaptive_turn` instead
@@ -804,29 +767,9 @@ impl CucaClient {
         // The model name is captured before dispatch: the adapter consumes the
         // request, and the completion hook reports the (possibly plugin-mutated)
         // model that actually ran.
-        #[cfg(any(
-            feature = "provider-openai",
-            feature = "provider-anthropic",
-            feature = "provider-deepseek",
-            feature = "provider-gemini",
-            feature = "provider-llamacpp",
-            feature = "provider-vllm",
-            feature = "provider-lmstudio",
-            feature = "provider-local",
-        ))]
         let model = request.model.clone();
         // The endpoint is matched by reference: ProviderEndpoint is Clone, not
         // Copy, and cloning it for the match would be wasteful.
-        #[cfg(any(
-            feature = "provider-openai",
-            feature = "provider-anthropic",
-            feature = "provider-deepseek",
-            feature = "provider-gemini",
-            feature = "provider-llamacpp",
-            feature = "provider-vllm",
-            feature = "provider-lmstudio",
-            feature = "provider-local",
-        ))]
         let dispatch = match &self.selected_provider {
             #[cfg(feature = "provider-llamacpp")]
             ProviderEndpoint::LlamaCpp => self.dispatch_llamacpp(request).await?,
@@ -882,23 +825,13 @@ impl CucaClient {
                 ));
             }
         };
-        #[cfg(any(
-            feature = "provider-openai",
-            feature = "provider-anthropic",
-            feature = "provider-deepseek",
-            feature = "provider-gemini",
-            feature = "provider-llamacpp",
-            feature = "provider-vllm",
-            feature = "provider-lmstudio",
-            feature = "provider-local",
-        ))]
-        return Ok(self.instrument(
+        Ok(self.instrument(
             model,
             dispatch,
             #[cfg(feature = "service-prompt-cache")]
             cache_write,
             completed,
-        ));
+        ))
     }
 
     /// Wrap a provider stream with the plugin instrumentation: `on_stream_chunk`
@@ -907,16 +840,6 @@ impl CucaClient {
     /// `service-prompt-cache`, when `cache_write` is `Some`) a one-shot cache
     /// write after a fully successful completion, and (when `completed` is
     /// `Some`) the hand-off of the terminal response.
-    #[cfg(any(
-        feature = "provider-openai",
-        feature = "provider-anthropic",
-        feature = "provider-deepseek",
-        feature = "provider-gemini",
-        feature = "provider-llamacpp",
-        feature = "provider-vllm",
-        feature = "provider-lmstudio",
-        feature = "provider-local",
-    ))]
     fn instrument(
         &self,
         model: String,

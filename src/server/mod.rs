@@ -88,7 +88,7 @@ use self::state::ServerState;
 use self::sysmon::SystemSampler;
 
 /// How long open connections get to finish after a shutdown signal.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
 
 /// Resolve when the process is asked to stop: Ctrl-C, or SIGTERM on Unix.
 pub(crate) async fn shutdown_signal() {
@@ -113,7 +113,7 @@ pub(crate) async fn shutdown_signal() {
     }
 }
 
-fn join_error(what: &str, error: &tokio::task::JoinError) -> ServerError {
+pub(crate) fn join_error(what: &str, error: &tokio::task::JoinError) -> ServerError {
     ServerError::Io(format!("{what} task failed: {error}"))
 }
 

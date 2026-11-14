@@ -56,9 +56,6 @@ use self::upstream::{Upstream, spawn_poller};
 use super::error::ServerError;
 use super::sysmon::SystemSampler;
 
-/// How long open connections get to finish after a shutdown signal.
-const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
-
 /// Run the balancer until it is asked to stop (Ctrl-C, SIGTERM).
 ///
 /// Binds `config.listen`, starts one poller per upstream and answers
@@ -134,7 +131,7 @@ pub async fn balance(config: BalancerConfig) -> Result<(), ServerError> {
         joined = &mut server => match joined {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(ServerError::Io(format!("HTTP server failed: {e}"))),
-            Err(e) => Err(ServerError::Io(format!("HTTP server task failed: {e}"))),
+            Err(e) => Err(super::join_error("HTTP server", &e)),
         },
     };
     let _ = stop_tx.send(());
@@ -142,7 +139,7 @@ pub async fn balance(config: BalancerConfig) -> Result<(), ServerError> {
         poller.abort();
     }
     if !server.is_finished()
-        && tokio::time::timeout(SHUTDOWN_GRACE, &mut server)
+        && tokio::time::timeout(super::SHUTDOWN_GRACE, &mut server)
             .await
             .is_err()
     {

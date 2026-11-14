@@ -21,7 +21,7 @@ use serde_json::json;
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
 use crate::provider::openai_compat::openai_compat_stream;
-use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream, send_checked};
 use crate::request::UnifiedRequest;
 use crate::sse::SseStreamParser;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint};
@@ -266,15 +266,7 @@ pub async fn llamacpp_completion_stream(
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
-    let response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await?;
-        return Err(CucaError::Http {
-            status: status.as_u16(),
-            body,
-        });
-    }
+    let response = send_checked(request).await?;
     Ok(ProviderDispatch {
         stream: Box::pin(SseBlockStream::new(
             response.bytes_stream(),

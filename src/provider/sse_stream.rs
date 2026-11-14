@@ -1,5 +1,6 @@
-//! The stream adapter shared by the HTTP providers: reqwest byte stream ->
-//! per-adapter chunk translator -> blocks, one block per poll.
+//! The plumbing shared by the HTTP providers: the checked request send, and the
+//! stream adapter (reqwest byte stream -> per-adapter chunk translator ->
+//! blocks, one block per poll).
 
 use std::collections::VecDeque;
 use std::pin::Pin;
@@ -10,6 +11,23 @@ use tokio_stream::Stream;
 
 use crate::error::CucaError;
 use crate::types::MessageContentBlock;
+
+/// Send `request`; a non-2xx response becomes [`CucaError::Http`] carrying its
+/// body.
+pub(crate) async fn send_checked(
+    request: reqwest::RequestBuilder,
+) -> Result<reqwest::Response, CucaError> {
+    let response = request.send().await?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await?;
+        return Err(CucaError::Http {
+            status: status.as_u16(),
+            body,
+        });
+    }
+    Ok(response)
+}
 
 /// One adapter's SSE parser and block translator, fed a byte chunk at a time.
 pub(crate) trait ChunkTranslator {

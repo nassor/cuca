@@ -4,7 +4,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use tracing::Span;
 
@@ -67,9 +67,7 @@ impl ServerState {
             metrics: ServerMetrics::default(),
             system,
             started: Instant::now(),
-            started_unix_ms: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            started_unix_ms: super::sysmon::now_ms(),
             node_id: format!("{host}:{}", listen.port()),
             stats_streams: AtomicUsize::new(0),
         }

@@ -201,16 +201,6 @@ impl From<std::io::Error> for PluginError {
     }
 }
 
-#[cfg(any(
-    feature = "provider-openai",
-    feature = "provider-anthropic",
-    feature = "provider-deepseek",
-    feature = "provider-gemini",
-    feature = "provider-llamacpp",
-    feature = "provider-vllm",
-    feature = "provider-lmstudio",
-    feature = "provider-local",
-))]
 impl From<reqwest::Error> for CucaError {
     fn from(e: reqwest::Error) -> Self {
         CucaError::Transport {
@@ -380,16 +370,6 @@ mod tests {
         }
     }
 
-    #[cfg(any(
-        feature = "provider-openai",
-        feature = "provider-anthropic",
-        feature = "provider-deepseek",
-        feature = "provider-gemini",
-        feature = "provider-llamacpp",
-        feature = "provider-vllm",
-        feature = "provider-lmstudio",
-        feature = "provider-local",
-    ))]
     /// `From<reqwest::Error>` maps into `CucaError::Transport` without network.
     #[test]
     fn from_reqwest_error() {

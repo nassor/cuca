@@ -33,7 +33,7 @@ use std::collections::VecDeque;
 
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
-use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream, send_checked};
 use crate::request::{ThinkingEffort, ThinkingParams, UnifiedRequest};
 use crate::sse::SseStreamParser;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint};
@@ -364,20 +364,12 @@ pub async fn gemini_stream(
         base_url.trim_end_matches('/'),
         req.model
     );
-    let response = http
-        .post(&url)
-        .header("x-goog-api-key", api_key)
-        .json(&build_generate_content_body(&req)?)
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await?;
-        return Err(CucaError::Http {
-            status: status.as_u16(),
-            body,
-        });
-    }
+    let response = send_checked(
+        http.post(&url)
+            .header("x-goog-api-key", api_key)
+            .json(&build_generate_content_body(&req)?),
+    )
+    .await?;
     Ok(ProviderDispatch {
         stream: Box::pin(SseBlockStream::new(
             response.bytes_stream(),

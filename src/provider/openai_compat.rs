@@ -47,7 +47,7 @@ use std::collections::{HashMap, VecDeque, hash_map::Entry};
 
 use crate::client::{ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
-use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream, send_checked};
 use crate::request::{ThinkingEffort, ThinkingParams, TokenUsage, UnifiedRequest};
 use crate::sse::SseStreamParser;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
@@ -645,15 +645,7 @@ pub async fn openai_compat_stream(
     if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
-    let response = request.send().await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await?;
-        return Err(CucaError::Http {
-            status: status.as_u16(),
-            body,
-        });
-    }
+    let response = send_checked(request).await?;
     let metadata = ResponseMetadataHandle::empty();
     Ok(ProviderDispatch {
         stream: Box::pin(SseBlockStream::new(

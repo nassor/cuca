@@ -36,7 +36,7 @@ use sha2::{Digest, Sha256};
 use crate::client::CucaClient;
 use crate::client::{ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
-use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream, send_checked};
 use crate::request::{
     PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage, ThinkingEffort, ThinkingParams,
     UnifiedRequest,
@@ -233,19 +233,7 @@ pub async fn exchange_code(
         ("client_id", cfg.client_id.as_str()),
         ("redirect_uri", redirect_uri),
     ];
-    let response = reqwest::Client::new()
-        .post(&cfg.token_url)
-        .form(&params)
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await?;
-        return Err(CucaError::Http {
-            status: status.as_u16(),
-            body,
-        });
-    }
+    let response = send_checked(reqwest::Client::new().post(&cfg.token_url).form(&params)).await?;
     let value: serde_json::Value = response.json().await?;
     value
         .get("access_token")
@@ -912,20 +900,12 @@ pub async fn anthropic_stream(
 ) -> Result<ProviderDispatch, CucaError> {
     let url = format!("{}/messages", base_url.trim_end_matches('/'));
     let body = build_anthropic_request(&req)?;
-    let response = http
-        .post(&url)
-        .headers(headers(auth, prompt_cache_betas(&req))?)
-        .json(&body)
-        .send()
-        .await?;
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().await?;
-        return Err(CucaError::Http {
-            status: status.as_u16(),
-            body,
-        });
-    }
+    let response = send_checked(
+        http.post(&url)
+            .headers(headers(auth, prompt_cache_betas(&req))?)
+            .json(&body),
+    )
+    .await?;
     let metadata = ResponseMetadataHandle::empty();
     Ok(ProviderDispatch {
         stream: Box::pin(SseBlockStream::new(
