@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 246" width="660" height="246" role="img" aria-labelledby="title desc">
+  <title id="title">One turn through the client for LLM APIs.</title>
+  <desc id="desc">Your app builds a UnifiedRequest. Each registered plugin's on_request hook sees it, then the provider adapter turns it into the vendor's request and sends it over HTTP to one of seven LLM APIs. The reply comes back as server-sent events. The SSE parser reads them from one reused buffer, the adapter turns them into typed MessageContentBlock values, and each block passes every plugin's on_stream_chunk hook before it reaches your app.</desc>
+  <style>
+    .frame { fill: #fafafa; stroke: #e4e4e7; }
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
+    .t-title { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px; font-weight: 600; fill: #09090b; }
+    .t-lbl { font-size: 12px; fill: #09090b; }
+    .t-ax { font-size: 10px; }
+    .t-mid { text-anchor: middle; }
+    .t-data { fill: #b65b0c; }
+    .t-ctl { fill: #0a7166; }
+    .t-bnd { fill: #7030c6; }
+    .blk { fill: #ffffff; stroke: #d4d4d8; stroke-width: 1; }
+    .blk-data { stroke: #b65b0c; }
+    .blk-ctl { stroke: #0a7166; }
+    .blk-bnd { stroke: #7030c6; }
+    .arw { fill: none; stroke: #71717a; stroke-width: 1.5; }
+    .arw-data { stroke: #b65b0c; }
+    .arw-ctl { stroke: #0a7166; }
+    .arw-bnd { stroke: #7030c6; stroke-dasharray: 5 4; }
+    .head { fill: #71717a; }
+    .head-data { fill: #b65b0c; }
+    .head-ctl { fill: #0a7166; }
+    .head-bnd { fill: #7030c6; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #111114; stroke: #2a2a30; }
+      text { fill: #a1a1aa; }
+      .t-title, .t-lbl { fill: #fafafa; }
+      .t-data { fill: #fba337; }
+      .t-ctl { fill: #29c7b2; }
+      .t-bnd { fill: #bb8df6; }
+      .blk { fill: #1b1b1f; stroke: #35353b; }
+      .blk-data { stroke: #fba337; }
+      .blk-ctl { stroke: #29c7b2; }
+      .blk-bnd { stroke: #bb8df6; }
+      .arw { stroke: #a1a1aa; }
+      .arw-data { stroke: #fba337; }
+      .arw-ctl { stroke: #29c7b2; }
+      .arw-bnd { stroke: #bb8df6; }
+      .head { fill: #a1a1aa; }
+      .head-data { fill: #fba337; }
+      .head-ctl { fill: #29c7b2; }
+      .head-bnd { fill: #bb8df6; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-data" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-data" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-ctl" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-ctl" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-bnd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-bnd" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+  </defs>
+  <rect class="frame" x="0.5" y="0.5" width="659" height="245" rx="12"/>
+  <text class="t-title" x="20" y="32">Client for LLM APIs</text>
+  <rect class="blk" x="20" y="52" width="120" height="150" rx="6"/>
+  <text class="t-lbl t-mid" x="80" y="124">your app</text>
+  <rect class="blk blk-ctl" x="170" y="52" width="120" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="230" y="73">plugins</text>
+  <text class="t-mid" x="230" y="90">on_request</text>
+  <rect class="blk blk-bnd" x="320" y="52" width="130" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-bnd" x="385" y="73">provider adapter</text>
+  <text class="t-mid" x="385" y="90">vendor request</text>
+  <rect class="blk blk-bnd" x="500" y="52" width="140" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-bnd" x="570" y="73">LLM API</text>
+  <text class="t-mid" x="570" y="90">one of seven</text>
+  <path class="arw" d="M142 77 H166" marker-end="url(#a)"/>
+  <path class="arw" d="M292 77 H316" marker-end="url(#a)"/>
+  <path class="arw arw-bnd" d="M452 77 H496" marker-end="url(#a-bnd)"/>
+  <text class="t-mid t-bnd" x="475" y="69">HTTP</text>
+  <path class="arw arw-bnd" d="M570 104 V138" marker-end="url(#a-bnd)"/>
+  <text class="t-bnd" x="580" y="125">SSE</text>
+  <rect class="blk blk-data" x="500" y="142" width="140" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="570" y="163">SSE parser</text>
+  <text class="t-mid" x="570" y="180">one reused buffer</text>
+  <rect class="blk blk-data" x="320" y="142" width="130" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="385" y="163">typed blocks</text>
+  <text class="t-mid" x="385" y="180">MessageContentBlock</text>
+  <rect class="blk blk-ctl" x="170" y="142" width="120" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="230" y="163">plugins</text>
+  <text class="t-mid" x="230" y="180">on_stream_chunk</text>
+  <path class="arw arw-data" d="M498 167 H454" marker-end="url(#a-data)"/>
+  <path class="arw arw-data" d="M318 167 H294" marker-end="url(#a-data)"/>
+  <path class="arw arw-data" d="M168 167 H144" marker-end="url(#a-data)"/>
+  <text class="t-ax" x="20" y="228">The app sees the same request and block types for every provider.</text>
+</svg>

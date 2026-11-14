@@ -1,0 +1,75 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 250" width="660" height="250" role="img" aria-labelledby="title desc">
+  <title id="title">The local engine running inside your application.</title>
+  <desc id="desc">LocalModel::load reads a model source, a preset name, a GGUF file or a safetensors checkpoint, downloading or converting it once, and starts one engine thread. Your application sends a UnifiedRequest through a CucaClient to that thread. The engine applies the chat template and the tokenizer, runs batched steps over a paged K/V cache on the CPU or a GPU, and parses the output into Text, Thinking and ToolCall blocks that stream back to the application. Everything runs in your process; the network is used only for the download.</desc>
+  <style>
+    .frame { fill: #fafafa; stroke: #e4e4e7; }
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
+    .t-title { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px; font-weight: 600; fill: #09090b; }
+    .t-lbl { font-size: 12px; fill: #09090b; }
+    .t-ax { font-size: 10px; }
+    .t-mid { text-anchor: middle; }
+    .t-data { fill: #b65b0c; }
+    .t-ctl { fill: #0a7166; }
+    .t-bnd { fill: #7030c6; }
+    .blk { fill: #ffffff; stroke: #d4d4d8; stroke-width: 1; }
+    .blk-data { stroke: #b65b0c; }
+    .blk-ctl { stroke: #0a7166; }
+    .blk-bnd { stroke: #7030c6; }
+    .arw { fill: none; stroke: #71717a; stroke-width: 1.5; }
+    .arw-data { stroke: #b65b0c; }
+    .arw-ctl { stroke: #0a7166; }
+    .arw-bnd { stroke: #7030c6; stroke-dasharray: 5 4; }
+    .head { fill: #71717a; }
+    .head-data { fill: #b65b0c; }
+    .head-ctl { fill: #0a7166; }
+    .head-bnd { fill: #7030c6; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #111114; stroke: #2a2a30; }
+      text { fill: #a1a1aa; }
+      .t-title, .t-lbl { fill: #fafafa; }
+      .t-data { fill: #fba337; }
+      .t-ctl { fill: #29c7b2; }
+      .t-bnd { fill: #bb8df6; }
+      .blk { fill: #1b1b1f; stroke: #35353b; }
+      .blk-data { stroke: #fba337; }
+      .blk-ctl { stroke: #29c7b2; }
+      .blk-bnd { stroke: #bb8df6; }
+      .arw { stroke: #a1a1aa; }
+      .arw-data { stroke: #fba337; }
+      .arw-ctl { stroke: #29c7b2; }
+      .arw-bnd { stroke: #bb8df6; }
+      .head { fill: #a1a1aa; }
+      .head-data { fill: #fba337; }
+      .head-ctl { fill: #29c7b2; }
+      .head-bnd { fill: #bb8df6; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-data" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-data" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-ctl" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-ctl" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-bnd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-bnd" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+  </defs>
+  <rect class="frame" x="0.5" y="0.5" width="659" height="249" rx="12"/>
+  <text class="t-title" x="20" y="32">Local engine as a library</text>
+  <rect class="blk" x="20" y="52" width="160" height="50" rx="6"/>
+  <text class="t-lbl t-mid" x="100" y="73">model source</text>
+  <text class="t-mid" x="100" y="90">preset, GGUF, checkpoint</text>
+  <rect class="blk blk-data" x="420" y="52" width="220" height="150" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="530" y="80">engine thread</text>
+  <text class="t-mid" x="530" y="108">chat template, tokenizer</text>
+  <text class="t-mid" x="530" y="128">batched steps, paged K/V</text>
+  <text class="t-mid" x="530" y="148">output parser</text>
+  <text class="t-mid" x="530" y="176">CPU or GPU</text>
+  <path class="arw" d="M182 77 H416" marker-end="url(#a)"/>
+  <text class="t-mid" x="299" y="70">LocalModel::load</text>
+  <text class="t-ax t-mid" x="299" y="92">download or convert once</text>
+  <rect class="blk" x="20" y="142" width="160" height="60" rx="6"/>
+  <text class="t-lbl t-mid" x="100" y="168">your application</text>
+  <text class="t-mid" x="100" y="185">CucaClient</text>
+  <path class="arw arw-data" d="M182 158 H416" marker-end="url(#a-data)"/>
+  <text class="t-mid t-data" x="299" y="151">UnifiedRequest</text>
+  <path class="arw arw-data" d="M418 186 H184" marker-end="url(#a-data)"/>
+  <text class="t-mid t-data" x="299" y="201">Text, Thinking, ToolCall</text>
+  <text class="t-ax" x="20" y="232">The model runs in your process. The network is used only to download it.</text>
+</svg>

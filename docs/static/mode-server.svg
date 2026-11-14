@@ -1,0 +1,79 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 250" width="660" height="250" role="img" aria-labelledby="title desc">
+  <title id="title">The cuca serve model server.</title>
+  <desc id="desc">HTTP clients such as an OpenAI SDK or curl call cuca serve. It answers /v1/chat/completions, /v1/models, /health, /metrics and the stats API at /cuca/v1/stats, and runs each request on one of its models, each a LocalModel on the CPU or a GPU. The terminal UI, cuca tui, or Prometheus reads the stats and the metrics. One KDL file lists the models, up to 16 per server.</desc>
+  <style>
+    .frame { fill: #fafafa; stroke: #e4e4e7; }
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
+    .t-title { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px; font-weight: 600; fill: #09090b; }
+    .t-lbl { font-size: 12px; fill: #09090b; }
+    .t-ax { font-size: 10px; }
+    .t-mid { text-anchor: middle; }
+    .t-data { fill: #b65b0c; }
+    .t-ctl { fill: #0a7166; }
+    .t-bnd { fill: #7030c6; }
+    .blk { fill: #ffffff; stroke: #d4d4d8; stroke-width: 1; }
+    .blk-data { stroke: #b65b0c; }
+    .blk-ctl { stroke: #0a7166; }
+    .blk-bnd { stroke: #7030c6; }
+    .arw { fill: none; stroke: #71717a; stroke-width: 1.5; }
+    .arw-data { stroke: #b65b0c; }
+    .arw-ctl { stroke: #0a7166; }
+    .arw-bnd { stroke: #7030c6; stroke-dasharray: 5 4; }
+    .head { fill: #71717a; }
+    .head-data { fill: #b65b0c; }
+    .head-ctl { fill: #0a7166; }
+    .head-bnd { fill: #7030c6; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #111114; stroke: #2a2a30; }
+      text { fill: #a1a1aa; }
+      .t-title, .t-lbl { fill: #fafafa; }
+      .t-data { fill: #fba337; }
+      .t-ctl { fill: #29c7b2; }
+      .t-bnd { fill: #bb8df6; }
+      .blk { fill: #1b1b1f; stroke: #35353b; }
+      .blk-data { stroke: #fba337; }
+      .blk-ctl { stroke: #29c7b2; }
+      .blk-bnd { stroke: #bb8df6; }
+      .arw { stroke: #a1a1aa; }
+      .arw-data { stroke: #fba337; }
+      .arw-ctl { stroke: #29c7b2; }
+      .arw-bnd { stroke: #bb8df6; }
+      .head { fill: #a1a1aa; }
+      .head-data { fill: #fba337; }
+      .head-ctl { fill: #29c7b2; }
+      .head-bnd { fill: #bb8df6; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-data" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-data" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-ctl" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-ctl" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-bnd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-bnd" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+  </defs>
+  <rect class="frame" x="0.5" y="0.5" width="659" height="249" rx="12"/>
+  <text class="t-title" x="20" y="32">Model server: cuca serve</text>
+  <rect class="blk" x="20" y="52" width="140" height="50" rx="6"/>
+  <text class="t-lbl t-mid" x="90" y="73">HTTP clients</text>
+  <text class="t-mid" x="90" y="90">OpenAI SDK, curl</text>
+  <rect class="blk blk-data" x="200" y="52" width="200" height="150" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="300" y="76">cuca serve</text>
+  <text class="t-mid" x="300" y="102">/v1/chat/completions</text>
+  <text class="t-mid" x="300" y="120">/v1/models</text>
+  <text class="t-mid" x="300" y="138">/health</text>
+  <text class="t-mid" x="300" y="156">/metrics</text>
+  <text class="t-mid" x="300" y="174">/cuca/v1/stats</text>
+  <rect class="blk blk-data" x="450" y="52" width="190" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="545" y="73">model "chat"</text>
+  <text class="t-mid" x="545" y="90">LocalModel on the CPU</text>
+  <rect class="blk blk-data" x="450" y="122" width="190" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="545" y="143">model "code"</text>
+  <text class="t-mid" x="545" y="160">LocalModel on a GPU</text>
+  <path class="arw arw-data" d="M162 77 H196" marker-end="url(#a-data)"/>
+  <path class="arw arw-data" d="M402 77 H446" marker-end="url(#a-data)"/>
+  <path class="arw arw-data" d="M402 147 H446" marker-end="url(#a-data)"/>
+  <rect class="blk blk-ctl" x="20" y="142" width="140" height="60" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="90" y="168">cuca tui</text>
+  <text class="t-mid" x="90" y="185">or Prometheus</text>
+  <path class="arw arw-ctl" d="M198 172 H164" marker-end="url(#a-ctl)"/>
+  <text class="t-ax" x="20" y="232">One KDL file lists the models. One server holds up to 16.</text>
+</svg>

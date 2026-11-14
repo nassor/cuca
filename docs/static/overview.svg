@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 310" width="660" height="310" role="img" aria-labelledby="title desc">
+  <title id="title">Two ways to use CUCA: a client for LLM APIs, and a local engine with three modes.</title>
+  <desc id="desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU or a GPU; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call cuca balance, which forwards each request to a cuca serve instance, which runs the local engine; these are balancer mode and server mode.</desc>
+  <style>
+    .frame { fill: #fafafa; stroke: #e4e4e7; }
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
+    .t-title { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px; font-weight: 600; fill: #09090b; }
+    .t-lbl { font-size: 12px; fill: #09090b; }
+    .t-ax { font-size: 10px; }
+    .t-mid { text-anchor: middle; }
+    .t-data { fill: #b65b0c; }
+    .t-ctl { fill: #0a7166; }
+    .t-bnd { fill: #7030c6; }
+    .blk { fill: #ffffff; stroke: #d4d4d8; stroke-width: 1; }
+    .blk-data { stroke: #b65b0c; }
+    .blk-ctl { stroke: #0a7166; }
+    .blk-bnd { stroke: #7030c6; }
+    .arw { fill: none; stroke: #71717a; stroke-width: 1.5; }
+    .arw-data { stroke: #b65b0c; }
+    .arw-ctl { stroke: #0a7166; }
+    .arw-bnd { stroke: #7030c6; stroke-dasharray: 5 4; }
+    .head { fill: #71717a; }
+    .head-data { fill: #b65b0c; }
+    .head-ctl { fill: #0a7166; }
+    .head-bnd { fill: #7030c6; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #111114; stroke: #2a2a30; }
+      text { fill: #a1a1aa; }
+      .t-title, .t-lbl { fill: #fafafa; }
+      .t-data { fill: #fba337; }
+      .t-ctl { fill: #29c7b2; }
+      .t-bnd { fill: #bb8df6; }
+      .blk { fill: #1b1b1f; stroke: #35353b; }
+      .blk-data { stroke: #fba337; }
+      .blk-ctl { stroke: #29c7b2; }
+      .blk-bnd { stroke: #bb8df6; }
+      .arw { stroke: #a1a1aa; }
+      .arw-data { stroke: #fba337; }
+      .arw-ctl { stroke: #29c7b2; }
+      .arw-bnd { stroke: #bb8df6; }
+      .head { fill: #a1a1aa; }
+      .head-data { fill: #fba337; }
+      .head-ctl { fill: #29c7b2; }
+      .head-bnd { fill: #bb8df6; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-data" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-data" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-ctl" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-ctl" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-bnd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-bnd" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+  </defs>
+  <rect class="frame" x="0.5" y="0.5" width="659" height="309" rx="12"/>
+  <text class="t-title" x="20" y="32">Two ways to use CUCA</text>
+  <rect class="blk" x="20" y="56" width="150" height="56" rx="6"/>
+  <text class="t-lbl t-mid" x="95" y="80">your application</text>
+  <text class="t-mid" x="95" y="97">CucaClient</text>
+  <rect class="blk blk-bnd" x="450" y="48" width="190" height="80" rx="6"/>
+  <text class="t-lbl t-mid t-bnd" x="545" y="70">LLM APIs</text>
+  <text class="t-mid" x="545" y="88">OpenAI, Anthropic,</text>
+  <text class="t-mid" x="545" y="103">Gemini, DeepSeek,</text>
+  <text class="t-mid" x="545" y="118">llama.cpp, vLLM, LM Studio</text>
+  <path class="arw arw-bnd" d="M172 84 H444" marker-end="url(#a-bnd)"/>
+  <text class="t-mid t-bnd" x="308" y="76">HTTP</text>
+  <text class="t-ax t-mid" x="308" y="100">client for LLM APIs</text>
+  <rect class="blk blk-data" x="450" y="152" width="190" height="56" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="545" y="176">local engine</text>
+  <text class="t-mid" x="545" y="193">provider-local, CPU or GPU</text>
+  <path class="arw arw-data" d="M95 114 V180 H444" marker-end="url(#a-data)"/>
+  <text class="t-mid t-data" x="270" y="172">in process</text>
+  <text class="t-ax t-mid" x="270" y="196">library mode</text>
+  <rect class="blk" x="20" y="236" width="150" height="50" rx="6"/>
+  <text class="t-lbl t-mid" x="95" y="257">HTTP clients</text>
+  <text class="t-mid" x="95" y="273">OpenAI API</text>
+  <rect class="blk blk-data" x="196" y="236" width="104" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="248" y="257">cuca balance</text>
+  <text class="t-mid" x="248" y="273">balancer mode</text>
+  <rect class="blk blk-data" x="326" y="236" width="110" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="381" y="257">cuca serve</text>
+  <text class="t-mid" x="381" y="273">server mode</text>
+  <path class="arw arw-data" d="M172 261 H192" marker-end="url(#a-data)"/>
+  <path class="arw arw-data" d="M302 261 H322" marker-end="url(#a-data)"/>
+  <path class="arw arw-data" d="M438 261 H545 V212" marker-end="url(#a-data)"/>
+</svg>
