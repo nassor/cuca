@@ -45,7 +45,7 @@ Rates come from a ring of one-second samples of the engine's counters, 300 per m
 The system part, filled by the sampler described on the [terminal UI](@/server/tui.md#what-each-platform-reports) page, has `cpu` (`usage_pct`, `per_core_pct`, `cores`, `load_avg`, `brand`), `memory` (RAM, swap and the paging rates `swap_in_bytes_per_s` and `swap_out_bytes_per_s`, `None` where the OS reports none), `disks`, `disk_io`, `gpus[]` (`util_pct`, `vram_*`, `process_vram_bytes`, `shared_vram_used_bytes`, `temperature_c`, `power_w`, `source`, each `None` when unknown), `process` and `sampled_at_ms`.
 
 ```text,name=The shape of a snapshot from a CPU server (Windows, Qwen3-0.6B Q8_0), trimmed
-{ "node": { "id": "NASSOR-DESKTOP:18000", "role": "server", "version": "0.7.0", ... },
+{ "node": { "id": "NASSOR-DESKTOP:18000", "role": "server", "version": "0.8.0", ... },
   "models": [ { "name": "qwen3-0.6b-q8_0", "state": "ready", "device": "cpu",
                 "context_length": 8192, "max_sequences": 4,
                 "kv": { "total_blocks": 1024, "bytes": 3758096384, ... },
