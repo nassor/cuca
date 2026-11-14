@@ -805,7 +805,7 @@ impl Hparams {
             .transpose()?;
         let moe_ext = behavior
             .moe_ext
-            .then(|| super::csa::read_moe_ext(md, arch, &k, n_layer))
+            .then(|| super::csa::read_moe_ext(md, arch.name(), &k, n_layer))
             .transpose()?;
 
         let leading_dense = if behavior.mla {

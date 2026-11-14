@@ -185,7 +185,7 @@ fn u64_array(md: &Metadata, key: &str) -> Result<Option<Vec<u64>>, CucaError> {
 }
 
 /// An array of floats.
-pub(crate) fn f32_array(md: &Metadata, key: &str) -> Result<Option<Vec<f32>>, CucaError> {
+fn f32_array(md: &Metadata, key: &str) -> Result<Option<Vec<f32>>, CucaError> {
     array_of(md.get(key), key, "not a float", |v| match v {
         Value::F32(x) => Some(*x),
         Value::F64(x) => Some(*x as f32),
@@ -502,31 +502,27 @@ pub(crate) fn read_engram(
     })
 }
 
-/// `expert_gating_func` of the architecture named `arch`.
-pub(crate) fn read_gating(k: &Keys<'_>, arch: &str) -> Result<Gating, CucaError> {
-    Ok(match k.usize_opt("expert_gating_func")? {
+/// `expert_gating_func` and the SwiGLU clamps of the architecture named
+/// `prefix`.
+pub(crate) fn read_moe_ext(
+    md: &Metadata,
+    prefix: &str,
+    k: &Keys<'_>,
+    n_layer: usize,
+) -> Result<MoeExt, CucaError> {
+    let gating = match k.usize_opt("expert_gating_func")? {
         None | Some(1) => Gating::Softmax,
         Some(2) => Gating::Sigmoid,
         Some(4) => Gating::SqrtSoftplus,
         Some(other) => {
             return Err(meta_err(
-                &format!("{arch}.expert_gating_func"),
+                &format!("{prefix}.expert_gating_func"),
                 format!("gating function {other} is not supported"),
             ));
         }
-    })
-}
-
-/// `expert_gating_func` and the SwiGLU clamps.
-pub(crate) fn read_moe_ext(
-    md: &Metadata,
-    arch: Arch,
-    k: &Keys<'_>,
-    n_layer: usize,
-) -> Result<MoeExt, CucaError> {
-    let gating = read_gating(k, arch.name())?;
+    };
     let per_layer = |key: &str| -> Result<Vec<f32>, CucaError> {
-        let full = format!("{}.{key}", arch.name());
+        let full = format!("{prefix}.{key}");
         match f32_array(md, &full)? {
             Some(v) if v.len() == n_layer => Ok(v),
             Some(v) => Err(meta_err(

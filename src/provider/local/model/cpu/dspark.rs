@@ -54,7 +54,7 @@ use std::sync::Arc;
 use crate::provider::local::gguf;
 
 use super::super::arch::Arch;
-use super::super::csa::{Gating, HyperSpec, f32_array, read_gating, read_hyper};
+use super::super::csa::{HyperSpec, MoeExt, read_hyper, read_moe_ext};
 use super::super::hc::{collapse, dot};
 use super::super::kvquant;
 use super::super::layout::{name, tensor_info};
@@ -101,24 +101,12 @@ struct Geometry {
     n_used: usize,
     norm_weights: bool,
     expert_scale: f32,
-    gating: Gating,
-    clamp: Vec<f32>,
-    clamp_shared: Vec<f32>,
+    moe_ext: MoeExt,
     eps: f32,
     n_stage: usize,
     block_size: usize,
     mask_token: u32,
     features: Vec<usize>,
-}
-
-fn floats(md: &Metadata, key: &str, n: usize) -> Result<Vec<f32>, CucaError> {
-    let Some(v) = f32_array(md, key)? else {
-        return Ok(vec![0.0; n]);
-    };
-    if v.len() != n {
-        return Err(meta_err(key, format!("{} entries for {n} stages", v.len())));
-    }
-    Ok(v)
 }
 
 fn read_geometry(md: &Metadata) -> Result<(Geometry, HyperSpec), CucaError> {
@@ -177,7 +165,6 @@ fn read_geometry(md: &Metadata) -> Result<(Geometry, HyperSpec), CucaError> {
         .and_then(|id| u32::try_from(id).ok())
         .ok_or_else(|| meta_err(mask_key, "missing: the drafter's noise token"))?;
     let shared_ff = k.usize("feed_forward_length")?;
-    let gating = read_gating(&k, PREFIX)?;
     let geo = Geometry {
         n_embd,
         n_head,
@@ -196,9 +183,7 @@ fn read_geometry(md: &Metadata) -> Result<(Geometry, HyperSpec), CucaError> {
         n_used: k.usize("expert_used_count")?,
         norm_weights: k.bool_opt("expert_weights_norm")?.unwrap_or(true),
         expert_scale: k.f64_opt("expert_weights_scale")?.unwrap_or(1.0) as f32,
-        gating,
-        clamp: floats(md, &format!("{PREFIX}.swiglu_clamp_exp"), n_stage)?,
-        clamp_shared: floats(md, &format!("{PREFIX}.swiglu_clamp_shexp"), n_stage)?,
+        moe_ext: read_moe_ext(md, PREFIX, &k, n_stage)?,
         eps: k.f64("attention.layer_norm_rms_epsilon")? as f32,
         n_stage,
         block_size,
@@ -696,10 +681,10 @@ fn load_stage(
             scale: g.expert_scale,
         },
         ext: Some(Box::new(RouterExt {
-            gating: g.gating,
+            gating: g.moe_ext.gating,
             bias: Some(loader.floats(&name::blk_bias(il, name::EXP_PROBS_B), &[g.n_expert])?),
-            clamp: g.clamp[il],
-            clamp_shared: g.clamp_shared[il],
+            clamp: g.moe_ext.clamp[il],
+            clamp_shared: g.moe_ext.clamp_shared[il],
         })),
         router: loader.matmul(&blk(name::FFN_GATE_INP), &[g.n_expert, d])?,
         experts: loader.expert_bank(il, g.n_expert, g.expert_ff, d, false, None)?,
