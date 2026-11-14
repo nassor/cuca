@@ -164,18 +164,11 @@ impl Source<'_> {
     /// Download `file` (no checksum); `Ok(false)` when the repository has no
     /// such file.
     async fn optional(&self, file: &str) -> Result<bool, CucaError> {
-        download::ensure_downloaded_optional(
-            self.client,
-            self.endpoint,
-            self.repo,
-            self.revision,
-            file,
-            None,
-            &download::cached_path(self.cache_dir, self.repo, self.revision, file)?,
-            self.token,
-            self.progress,
-        )
-        .await
+        match self.required(file).await {
+            Ok(()) => Ok(true),
+            Err(CucaError::Http { status: 404, .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
     }
 
     /// Download `file` (no checksum); a missing file is an error.

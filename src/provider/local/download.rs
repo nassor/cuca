@@ -311,35 +311,6 @@ pub(crate) async fn ensure_parts_downloaded(
     first.ok_or_else(|| CucaError::Config("a split GGUF set with no parts".into()))
 }
 
-/// [`ensure_downloaded`] for a file the repository may not have: `Ok(false)`
-/// when the server answers HTTP 404 (nothing is written), `Ok(true)` when
-/// `final_path` holds the file.
-#[expect(
-    clippy::too_many_arguments,
-    reason = "same inputs as ensure_downloaded"
-)]
-pub(crate) async fn ensure_downloaded_optional(
-    client: &reqwest::Client,
-    endpoint: &str,
-    repo: &str,
-    revision: &str,
-    file: &str,
-    sha256: Option<&str>,
-    final_path: &Path,
-    token: Option<&str>,
-    progress: Option<&DownloadProgressCallback>,
-) -> Result<bool, CucaError> {
-    match ensure_downloaded(
-        client, endpoint, repo, revision, file, sha256, final_path, token, progress,
-    )
-    .await
-    {
-        Ok(()) => Ok(true),
-        Err(CucaError::Http { status: 404, .. }) => Ok(false),
-        Err(e) => Err(e),
-    }
-}
-
 /// The download proper, run while holding the lock file.
 async fn download_locked(
     client: &reqwest::Client,
