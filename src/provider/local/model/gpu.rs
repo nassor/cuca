@@ -299,7 +299,10 @@ use std::ops::Range;
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use crate::provider::local::gguf::{self, GgufType};
-use burn::tensor::{AllocationProperty, Bytes, DType, Device, Int, Tensor, TensorData, activation};
+use burn::tensor::{
+    AllocationProperty, Bytes, DType, Device, Int, Shape, Tensor, TensorData, activation,
+};
+use burn_cubecl::{ops::numeric::empty_device_contiguous_dtype, tensor::CubeTensor};
 use candle_core::quantized::GgmlDType;
 
 use super::arch::{Act, Arch};
@@ -701,18 +704,14 @@ struct WeightReader<'a> {
 
 impl<'a> WeightReader<'a> {
     /// A reader of the files of `content` that uploads to `device`.
-    fn open(
-        content: &'a gguf::Content,
-        device: &'a Device,
-        host: Option<HostPlan>,
-    ) -> Result<Self, CucaError> {
-        Ok(Self {
+    fn open(content: &'a gguf::Content, device: &'a Device, host: Option<HostPlan>) -> Self {
+        Self {
             content,
             reader: content.reader(),
             buf: Vec::new(),
             device,
             host,
-        })
+        }
     }
 }
 
@@ -2596,7 +2595,7 @@ impl GpuTransformer {
         let plan = tiers.as_ref().map(|(_, plan)| plan);
         let mut weights: Vec<Weights> = Vec::with_capacity(world);
         for (shard, device) in devices.iter().enumerate() {
-            let mut reader = WeightReader::open(content, device, host.clone())?;
+            let mut reader = WeightReader::open(content, device, host.clone());
             weights.push(Weights::load(
                 &mut reader,
                 &hp,
@@ -3398,7 +3397,7 @@ impl GpuDrafter {
             }
         }
         let (n_embd, n_embd_out) = (hp.n_embd, hp.n_embd_out);
-        let mut reader = WeightReader::open(content, &target.weights[0].device, None)?;
+        let mut reader = WeightReader::open(content, &target.weights[0].device, None);
         let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
         let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
         let net = Weights::load(&mut reader, &hp, Tp::SOLO, context_length, None, 0, None)?;
@@ -5020,6 +5019,11 @@ pub(super) fn read_f32<const D: usize>(
         .map_err(|e| err(format!("reading {what} from the device: {e}")))?;
     data.try_into_vec::<f32>()
         .map_err(|e| err(format!("reading {what} from the device: {e:?}")))
+}
+
+/// An uninitialised contiguous f32 tensor of `shape` on the device of `like`.
+pub(super) fn f32_tensor(like: &CubeTensor, shape: Shape) -> CubeTensor {
+    empty_device_contiguous_dtype(like.client.clone(), like.device.clone(), shape, DType::F32)
 }
 
 /// The widest GPU subgroup ("plane") burn's matmul kernels may be built for:
@@ -9110,7 +9114,7 @@ mod tests {
             let content = content_of(&model);
             let hp = read_hparams(&content).unwrap();
             let device = Device::default();
-            let mut reader = WeightReader::open(&content, &device, None).unwrap();
+            let mut reader = WeightReader::open(&content, &device, None);
             let matrices: Vec<(String, usize, usize)> = content
                 .tensor_infos
                 .iter()

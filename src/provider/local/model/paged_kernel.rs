@@ -49,11 +49,11 @@
 use burn::backend::{TensorMetadata, backend_extension, tensor::FloatTensor, tensor::IntTensor};
 use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
+use super::gpu::f32_tensor;
 use super::paged::BLOCK_SIZE;
 
 /// Most chunks one row's keys are split into.
@@ -243,18 +243,8 @@ impl PagedKernels for CubeBackend {
         // depends on the table width alone.
         let splits = max_blocks.clamp(1, MAX_SPLITS);
         let client = q.client.clone();
-        let part = empty_device_contiguous_dtype(
-            client.clone(),
-            q.device.clone(),
-            Shape::new([rows * n_head * splits * (dv + 2)]),
-            DType::F32,
-        );
-        let out = empty_device_contiguous_dtype(
-            client.clone(),
-            q.device.clone(),
-            Shape::new([rows, n_head, dv]),
-            DType::F32,
-        );
+        let part = f32_tensor(&q, Shape::new([rows * n_head * splits * (dv + 2)]));
+        let out = f32_tensor(&q, Shape::new([rows, n_head, dv]));
         paged_decode_kernel::launch(
             &client,
             CubeCount::Static((n_kv * splits) as u32, rows as u32, 1),

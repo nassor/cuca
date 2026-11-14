@@ -80,11 +80,11 @@
 use burn::backend::{TensorMetadata, backend_extension, tensor::FloatTensor, tensor::IntTensor};
 use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
+use super::gpu::f32_tensor;
 use super::paged::BLOCK_SIZE;
 
 // The kernels spell the block size as a literal.
@@ -896,12 +896,7 @@ impl CsaKernels for CubeBackend {
         let [rows, row_len] = x.shape().dims::<2>();
         let total = rows * row_len;
         let client = x.client.clone();
-        let out = empty_device_contiguous_dtype(
-            client.clone(),
-            x.device.clone(),
-            Shape::new([rows, row_len]),
-            DType::F32,
-        );
+        let out = f32_tensor(&x, Shape::new([rows, row_len]));
         let dim = CubeDim::new(&client, total);
         let count = calculate_cube_count_elemwise(&client, total, dim);
         rope_tail_kernel::launch(
@@ -960,12 +955,7 @@ impl CsaKernels for CubeBackend {
         let right = into_contiguous(right);
         let total = call.rows * call.width;
         let client = kv.client.clone();
-        let out = empty_device_contiguous_dtype(
-            client.clone(),
-            kv.device.clone(),
-            Shape::new([call.rows, call.width]),
-            DType::F32,
-        );
+        let out = f32_tensor(&kv, Shape::new([call.rows, call.width]));
         let dim = CubeDim::new(&client, total);
         let count = calculate_cube_count_elemwise(&client, total, dim);
         pair_pool_kernel::launch(
@@ -1013,20 +1003,10 @@ impl CsaKernels for CubeBackend {
         let cmp_blocks = cmp_tables.shape().dims::<2>()[1];
         let cmp_width = cmp.shape().dims::<2>()[1];
         let client = q.client.clone();
-        let out = empty_device_contiguous_dtype(
-            client.clone(),
-            q.device.clone(),
-            Shape::new([rows, n_head * hd]),
-            DType::F32,
-        );
+        let out = f32_tensor(&q, Shape::new([rows, n_head * hd]));
         let dim = CubeDim::new_1d(LANES as u32);
         if call.split {
-            let part = empty_device_contiguous_dtype(
-                client.clone(),
-                q.device.clone(),
-                Shape::new([rows * n_head * n_chunks * (hd + 2)]),
-                DType::F32,
-            );
+            let part = f32_tensor(&q, Shape::new([rows * n_head * n_chunks * (hd + 2)]));
             csa_split_kernel::launch(
                 &client,
                 CubeCount::Static(groups as u32, rows as u32, n_chunks as u32),

@@ -74,6 +74,7 @@ use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
 use self::kernels::{block_scores_kernel, index_scores_kernel, select_kernel};
 use super::csa::Candidates;
+use super::gpu::f32_tensor;
 use super::paged::BLOCK_SIZE;
 
 /// Most scores one tile of rows holds: 16 Mi floats, 64 MB (one storage
@@ -688,12 +689,7 @@ impl TopkKernels for CubeBackend {
         let cand = into_contiguous(cand);
         let max_blocks = tables.shape().dims::<2>()[1];
         let client = iq.client.clone();
-        let out = empty_device_contiguous_dtype(
-            client.clone(),
-            iq.device.clone(),
-            Shape::new([call.rows, call.width]),
-            DType::F32,
-        );
+        let out = f32_tensor(&iq, Shape::new([call.rows, call.width]));
         assert!(
             call.dim.is_multiple_of(8) && call.heads * call.dim <= MAX_STAGED_QUERY,
             "the indexer kernel needs dim % 8 == 0 and heads * dim <= {MAX_STAGED_QUERY} (got {} x {})",
@@ -742,12 +738,7 @@ impl TopkKernels for CubeBackend {
         let scores = into_contiguous(scores);
         let row_pos = into_contiguous(row_pos);
         let client = scores.client.clone();
-        let out = empty_device_contiguous_dtype(
-            client.clone(),
-            scores.device.clone(),
-            Shape::new([call.rows, call.blocks]),
-            DType::F32,
-        );
+        let out = f32_tensor(&scores, Shape::new([call.rows, call.blocks]));
         let total = call.rows * call.blocks;
         let dim = CubeDim::new(&client, total);
         let count = calculate_cube_count_elemwise(&client, total, dim);

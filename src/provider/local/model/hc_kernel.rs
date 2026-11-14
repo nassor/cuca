@@ -21,8 +21,8 @@
 //!   GB/s whatever the arithmetic, so a call costs about 60 us at the real
 //!   shape however many tokens it holds (up to the tokens one GPU's compute
 //!   units can run at once);
-//! - [`hc_collapse`] / [`stream_mean`]: the `D`-wide sub-block input `sum_s
-//!   w[s] x[s]` (the learned `pre` weights, or `1 / S` each);
+//! - [`hc_collapse`]: the `D`-wide sub-block input `sum_s w[s] x[s]` (the
+//!   learned `pre` weights);
 //! - [`hc_expand`]: the stream after a sub-block, `new[j] = post[j] y +
 //!   sum_a comb[a][j] x[a]`;
 //! - [`stream_repeat`]: `S` copies of a `D`-wide row (a token's embedding
@@ -62,11 +62,11 @@
 use burn::backend::{backend_extension, tensor::FloatTensor};
 use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 
+use super::gpu::f32_tensor;
 use super::hc::coeff_len;
 
 /// Units of the cube of a per-token reduction kernel (a power of two). Fixed,
@@ -312,31 +312,6 @@ fn hc_collapse_kernel(
     }
 }
 
-/// `out[token, i] = sum_a x[token, a, i] * inv` (`hc::collapse` with equal
-/// weights): the mean of the copies, one unit per output element.
-#[cube(launch)]
-fn stream_mean_kernel(
-    x: &Tensor<f32>,
-    out: &mut Tensor<f32>,
-    total: u32,
-    d: u32,
-    inv: f32,
-    #[comptime] s: usize,
-) {
-    let job = ABSOLUTE_POS;
-    if job < usize::cast_from(total) {
-        let dd = usize::cast_from(d);
-        let tok = job / dd;
-        let i = job % dd;
-        let mut acc = f32::cast_from(job - job);
-        #[unroll]
-        for a in 0..s {
-            acc += inv * x[(tok * s + a) * dd + i];
-        }
-        out[job] = acc;
-    }
-}
-
 /// The stream after a sub-block (`hc::expand`): `new[j, i] = post[j] y[i] +
 /// sum_a comb[a][j] x[a, i]`, one unit per (token, `i`) writing the `s`
 /// copies. `coeffs` rows are `cl` wide (`pre | post | comb`).
@@ -525,11 +500,6 @@ pub trait HcKernels: burn::backend::Backend {
         call: HcCall,
     ) -> FloatTensor<Self>;
 
-    /// The mean of the `S` copies of every stream: `[tokens, D]`.
-    #[fusion(dtype = stream, shape = Shape::new([call.tokens, call.shape.dim]))]
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn stream_mean(stream: FloatTensor<Self>, call: HcCall) -> FloatTensor<Self>;
-
     /// The stream after a sub-block: `y` `[tokens, D]` is the block's output,
     /// `stream` its input stream `[tokens, S D]`, `coeffs` the coefficients
     /// of the block's site: `[tokens, S D]`.
@@ -564,10 +534,6 @@ pub trait HcKernels: burn::backend::Backend {
         gate: FloatTensor<Self>,
         call: HcCall,
     ) -> FloatTensor<Self>;
-}
-
-fn f32_tensor(like: &CubeTensor, shape: Shape) -> CubeTensor {
-    empty_device_contiguous_dtype(like.client.clone(), like.device.clone(), shape, DType::F32)
 }
 
 /// Cubes of a per-token reduction kernel: one per token.
@@ -640,29 +606,6 @@ impl HcKernels for CubeBackend {
             d as u32,
             s,
             coeff_len(s),
-        );
-        out
-    }
-
-    fn stream_mean(stream: CubeTensor, call: HcCall) -> CubeTensor {
-        let stream = into_contiguous(stream);
-        let s = call.shape.streams;
-        let d = call.shape.dim;
-        let total = call.tokens * d;
-        let out = f32_tensor(&stream, Shape::new([call.tokens, d]));
-        let client = stream.client.clone();
-        let dim = CubeDim::new(&client, total);
-        let count = calculate_cube_count_elemwise(&client, total, dim);
-        stream_mean_kernel::launch(
-            &client,
-            count,
-            dim,
-            stream.into_tensor_arg(),
-            out.clone().into_tensor_arg(),
-            total as u32,
-            d as u32,
-            1.0 / s as f32,
-            s,
         );
         out
     }
@@ -817,16 +760,6 @@ pub(crate) fn hc_collapse(stream: BTensor<2>, coeffs: BTensor<2>, shape: &HcShap
     BTensor::from_dispatch(<Dispatch as HcKernels>::hc_collapse(
         stream.into_dispatch(),
         coeffs.into_dispatch(),
-        call,
-    ))
-}
-
-/// [`HcKernels::stream_mean`] on tensors: `[t, S * D]` to `[t, D]`.
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn stream_mean(stream: BTensor<2>, shape: &HcShape) -> BTensor<2> {
-    let call = call_of(&stream, shape);
-    BTensor::from_dispatch(<Dispatch as HcKernels>::stream_mean(
-        stream.into_dispatch(),
         call,
     ))
 }
@@ -1082,15 +1015,6 @@ mod tests {
         out
     }
 
-    fn host_mean(site: &Site, x: &[f32]) -> Vec<f32> {
-        let (s, d) = (site.shape.streams, site.shape.dim);
-        let mut out = vec![0f32; x.len() / site.width() * d];
-        for (row, o) in x.chunks_exact(site.width()).zip(out.chunks_exact_mut(d)) {
-            hc::collapse(row, &vec![1.0 / s as f32; s], o);
-        }
-        out
-    }
-
     fn host_expand(site: &Site, y: &[f32], x: &[f32], coeffs: &[f32]) -> Vec<f32> {
         let (s, d, cl) = (site.shape.streams, site.shape.dim, site.cl());
         let mut out = vec![0f32; x.len()];
@@ -1232,16 +1156,6 @@ mod tests {
                 );
                 println!("expand {what}: worst error {worst:.1} eps*scale");
 
-                let got = down(stream_mean(up2(&device, &x, t), &site.shape));
-                let worst = assert_close_scaled(
-                    &format!("mean {what}"),
-                    &got,
-                    &host_mean(&site, &x),
-                    d,
-                    &row_scales(t, &[(&x, site.width())]),
-                );
-                println!("mean {what}: worst error {worst:.1} eps*scale");
-
                 let got = down(stream_repeat(up2(&device, &y, t), &site.shape));
                 let want: Vec<f32> = y
                     .chunks_exact(d)
@@ -1340,7 +1254,6 @@ mod tests {
                 up2(&device, &coeffs, t),
                 &site.shape,
             ));
-            let mean = down(stream_mean(up2(&device, &x, t), &site.shape));
             let repeated = down(stream_repeat(up2(&device, &y, t), &site.shape));
             let gated = down(engram_gate(
                 up2(&device, &x, t),
@@ -1373,8 +1286,6 @@ mod tests {
                     &site.shape,
                 ));
                 assert_same_bits(&format!("expand row {r}"), &alone, &row(&expanded, width));
-                let alone = down(stream_mean(up2(&device, &xr, 1), &site.shape));
-                assert_same_bits(&format!("mean row {r}"), &alone, &row(&mean, d));
                 let alone = down(stream_repeat(up2(&device, &row(&y, d), 1), &site.shape));
                 assert_same_bits(&format!("repeat row {r}"), &alone, &row(&repeated, width));
                 let alone = down(engram_gate(
@@ -1445,7 +1356,6 @@ mod tests {
             cs[0].clone(),
             &site.shape,
         ));
-        let want_mean = down(stream_mean(xs[0].clone(), &site.shape));
         let want_repeat = down(stream_repeat(ys[0].clone(), &site.shape));
         let want_gate = down(engram_gate(
             xs[0].clone(),
@@ -1471,8 +1381,6 @@ mod tests {
                 &site.shape,
             ));
             assert_same_bits(&format!("expand form {f}"), &got, &want_expand);
-            let got = down(stream_mean(xs[f].clone(), &site.shape));
-            assert_same_bits(&format!("mean form {f}"), &got, &want_mean);
             let got = down(stream_repeat(ys[f].clone(), &site.shape));
             assert_same_bits(&format!("repeat form {f}"), &got, &want_repeat);
             let got = down(engram_gate(
@@ -1515,7 +1423,7 @@ mod tests {
                 &site.shape,
             );
             let _ = down(coeffs.clone());
-            let ops: [Op; 6] = [
+            let ops: [Op; 5] = [
                 (
                     "coefficients",
                     Box::new({
@@ -1549,13 +1457,6 @@ mod tests {
                     Box::new({
                         let (y, x, c, shape) = (y.clone(), x.clone(), coeffs.clone(), site.shape);
                         move || hc_expand(y.clone(), x.clone(), c.clone(), &shape)
-                    }),
-                ),
-                (
-                    "stream_mean",
-                    Box::new({
-                        let (x, shape) = (x.clone(), site.shape);
-                        move || stream_mean(x.clone(), &shape)
                     }),
                 ),
                 (

@@ -70,12 +70,12 @@ use std::sync::Arc;
 use burn::backend::{TensorMetadata, backend_extension, tensor::FloatTensor, tensor::IntTensor};
 use burn::cubecl::prelude::*;
 use burn::cubecl::{CubeDim, calculate_cube_count_elemwise};
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use burn_cubecl::kernel::into_contiguous;
-use burn_cubecl::ops::numeric::empty_device_contiguous_dtype;
 use burn_cubecl::{CubeBackend, tensor::CubeTensor};
 use candle_core::quantized::GgmlDType;
 
+use super::gpu::f32_tensor;
 use super::quant::dequant_row;
 use crate::error::CucaError;
 use crate::provider::local::gguf::GgufType;
@@ -1447,10 +1447,6 @@ pub trait MoeKernels: burn::backend::Backend {
         pool: IntTensor<Self>,
         call: DenseCall,
     ) -> FloatTensor<Self>;
-}
-
-fn f32_tensor(like: &CubeTensor, shape: Shape) -> CubeTensor {
-    empty_device_contiguous_dtype(like.client.clone(), like.device.clone(), shape, DType::F32)
 }
 
 /// The router kernel over `logits`; `bias` is read only when it is given.
