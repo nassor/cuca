@@ -8,31 +8,29 @@
 //! prose; 128 new tokens each). Two kinds of drafter:
 //!
 //! - a separate file: a Gemma 4 target with its Gemma 4 assistant,
-//!   `CUCA_LOCAL_DRAFTER_PATH` / `CUCA_LOCAL_DRAFTER` (the `gemma4-e2b-mtp-f16`
-//!   preset); or
-//! - the prediction head inside the target's own file,
-//!   `CUCA_LOCAL_DRAFTER=in-trunk`, with a Qwen 3.5 `*-MTP` file as the target
-//!   (`CUCA_LOCAL_MODEL_PATH`, for example `Qwen3.5-0.8B-Q8_0.gguf` of
-//!   `unsloth/Qwen3.5-0.8B-MTP-GGUF`; the CPU only).
+//!   `drafter "gemma4-e2b-mtp-f16"` (or `drafter file="..."`); or
+//! - the prediction head inside the target's own file, `drafter
+//!   "in-trunk"`, with a Qwen 3.5 `*-MTP` file as the target (`source
+//!   file="Qwen3.5-0.8B-Q8_0.gguf"` of `unsloth/Qwen3.5-0.8B-MTP-GGUF`; the
+//!   CPU only).
 //!
-//! The target comes from `CUCA_LOCAL_MODEL_PATH` / `CUCA_LOCAL_MODEL` (default
-//! preset `gemma4-e2b-q4_0` when `CUCA_LOCAL_DOWNLOAD=1`).
-//! `CUCA_LOCAL_DRAFT_TOKENS` is the `draft_tokens` of the drafter run, or a
-//! comma-separated list (`1,2,3,4`) to run one comparison per value (default
-//! 3).
+//! Both are keys of `local { model { ... } }` in `cuca-test.kdl`, whose
+//! `source` is the target (default preset `gemma4-e2b-q4_0` under `local {
+//! download_default #true }`). `local { draft_tokens 1 2 3 4 }` runs one
+//! comparison per value (default 3).
 //!
-//! `CUCA_LOCAL_ALLOW_MISMATCH` (any value) reports a CPU output that differs
-//! from plain decoding (`identical false`) instead of failing the test.
+//! `local { allow_mismatch #true }` reports a CPU output that differs from
+//! plain decoding (`identical false`) instead of failing the test.
 //!
 //! With the target or the drafter missing the test prints `SKIP` and passes,
-//! unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic. Build for the host
+//! unless `require_live #true` turns the skip into a panic. Build for the host
 //! CPU:
 //!
 //! ```sh
-//! RUSTFLAGS="-C target-cpu=native" CUCA_LOCAL_DOWNLOAD=1 CUCA_LOCAL_DRAFTER=gemma4-e2b-mtp-f16 \
-//!   cargo test --release --features provider-local --test provider_local_mtp -- --nocapture
-//! RUSTFLAGS="-C target-cpu=native" CUCA_LOCAL_MODEL_PATH=Qwen3.5-0.8B-Q8_0.gguf CUCA_LOCAL_DRAFTER=in-trunk \
-//!   CUCA_LOCAL_DRAFT_TOKENS=1,2,3,4 cargo test --release --features provider-local --test provider_local_mtp -- --nocapture
+//! # cuca-test.kdl: local { download_default #true; model { drafter "gemma4-e2b-mtp-f16"; }; }
+//! RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_mtp -- --nocapture
+//! # cuca-test.kdl: local { draft_tokens 1 2 3 4; model { source file="Qwen3.5-0.8B-Q8_0.gguf"; drafter "in-trunk"; }; }
+//! RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_mtp -- --nocapture
 //! ```
 
 #![cfg(feature = "provider-local")]
@@ -69,9 +67,9 @@ async fn drafter_output_equals_plain_greedy_decoding() {
         (local_env::model_source(true), local_env::drafter_source())
     else {
         local_env::skip(
-            "SKIP: set a target (CUCA_LOCAL_MODEL_PATH, CUCA_LOCAL_MODEL or \
-             CUCA_LOCAL_DOWNLOAD=1) and a drafter (CUCA_LOCAL_DRAFTER_PATH, \
-             CUCA_LOCAL_DRAFTER, or CUCA_LOCAL_DRAFTER=in-trunk)",
+            "SKIP: set a target (`local { model { source ... } }` or \
+             `local { download_default #true }`) and a drafter (`drafter ...` \
+             in `local { model { ... } }`) in cuca-test.kdl",
         );
         return;
     };
@@ -86,6 +84,8 @@ async fn drafter_output_equals_plain_greedy_decoding() {
         context_length: Some(2048),
         device,
         convert: local_env::convert(),
+        cache_dir: local_env::cache_dir(),
+        hf_token: local_env::hf_token(),
         ..Default::default()
     })
     .await
@@ -118,6 +118,8 @@ async fn drafter_output_equals_plain_greedy_decoding() {
             context_length: Some(2048),
             device,
             convert: local_env::convert(),
+            cache_dir: local_env::cache_dir(),
+            hf_token: local_env::hf_token(),
             ..Default::default()
         })
         .await
@@ -133,7 +135,7 @@ async fn drafter_output_equals_plain_greedy_decoding() {
             // On the CPU the engine is row-exact, so output must be identical.
             // A GPU's batched rows differ from single steps by float rounding,
             // which can flip a near-tie: report identity there instead of
-            // asserting it. `CUCA_LOCAL_ALLOW_MISMATCH=1` reports it on the
+            // asserting it. `local { allow_mismatch #true }` reports it on the
             // CPU too, for timing a target so large that separate loads of it
             // can differ by a flipped bit.
             if exact && !allow_mismatch {

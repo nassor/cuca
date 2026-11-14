@@ -179,7 +179,7 @@ fn draw_waiting(frame: &mut Frame, area: Rect, data: &Data, ui: &UiState) {
             )));
         }
         lines.push(Line::from(Span::styled(
-            "The stats API is opt-in: start the server with --stats-api.",
+            "The stats API is opt-in: set `stats_api #true` in the server's configuration.",
             Style::new().fg(DIM),
         )));
     }

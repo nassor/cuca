@@ -115,7 +115,7 @@ let client = CucaClient::builder()
 cargo run --example telemetry --features "provider-llamacpp plugin-telemetry"
 ```
 
-It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at another OpenAI-compatible server.
+It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, retarget it at another OpenAI-compatible server.
 
 ```text,name=Expected output
 Meter "cuca_client" on an SdkMeterProvider reading into InMemoryMetricExporter

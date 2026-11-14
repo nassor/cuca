@@ -242,7 +242,7 @@ path = "@/reference/features.md"
 title = "Error types"
 path = "@/reference/errors.md"
 [[extra.nav.items]]
-title = "Environment variables"
+title = "Configuration files"
 path = "@/reference/environment.md"
 [[extra.nav.items]]
 title = "The public API surface"

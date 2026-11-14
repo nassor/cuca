@@ -929,16 +929,16 @@ mod tests {
     }
 
     /// The published drafter against the published target's header (no
-    /// weights are read): `CUCA_LOCAL_MODEL_PATH` (a `mistral4` GGUF) and
-    /// `CUCA_LOCAL_DRAFTER_PATH` (the drafter checkpoint directory). Skips
+    /// weights are read): `local { model { source file="..." } }` (a `mistral4` GGUF) and
+    /// `local { model { drafter dir="..." } }` (the drafter checkpoint directory), both in cuca-test.kdl. Skips
     /// without them.
     #[test]
     fn the_published_drafter_matches_the_published_target_header() {
-        let (Some(model), Some(dir)) = (
-            std::env::var_os("CUCA_LOCAL_MODEL_PATH"),
-            std::env::var_os("CUCA_LOCAL_DRAFTER_PATH"),
-        ) else {
-            eprintln!("SKIP: set CUCA_LOCAL_MODEL_PATH and CUCA_LOCAL_DRAFTER_PATH");
+        let config = crate::test_config::get();
+        let (Some(model), Some(dir)) = (config.local_path(), config.drafter_path()) else {
+            eprintln!(
+                "SKIP: set `local {{ model {{ source file=\"...\"; drafter dir=\"...\" }} }}` in cuca-test.kdl"
+            );
             return;
         };
         let out = std::env::temp_dir().join(format!("cuca-eagle-real-{}.gguf", std::process::id()));

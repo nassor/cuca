@@ -151,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-`examples/replay.rs` records one live turn through a `SessionLogPlugin` over a temp-directory `FileBackend`, drops the client, then replays from a fresh `FileBackend` over the same directory. It also rebuilds the `UnifiedResponse` and replays a fork-point prefix. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` point it at any OpenAI-compatible server.
+`examples/replay.rs` records one live turn through a `SessionLogPlugin` over a temp-directory `FileBackend`, drops the client, then replays from a fresh `FileBackend` over the same directory. It also rebuilds the `UnifiedResponse` and replays a fork-point prefix. It needs a `llama-server` on port 1234 with the demo model loaded; the flags `--base-url` and `--model`, written after `--`, point it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example replay --features "provider-llamacpp service-replay"

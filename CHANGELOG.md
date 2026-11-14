@@ -22,9 +22,9 @@
   on the chat template, the prompt ids and the chat answer; its log-probabilities sit within 0.31 of
   llama.cpp's after 16 tokens, about what llama.cpp moves against itself when its K/V cache is f32
   and flash attention is off (0.15 to 1.87), and the first 6 layers agree to 0.012. It passes the
-  live suite resident and with `tiered:ram=6g`. On a Ryzen 9 9950X3D2 under other load it loads in
+  live suite resident and with 6 GiB of tiered expert RAM. On a Ryzen 9 9950X3D2 under other load it loads in
   about 6 s, decodes at about 10 tokens per second, prefills about 56 tokens per second (llama.cpp
-  on the same machine: 15 and 165), and holds 13.8 GiB resident (7.8 GiB at `tiered:ram=6g`).
+  on the same machine: 15 and 165), and holds 13.8 GiB resident (7.8 GiB with 6 GiB of tiered RAM).
 - `provider-local`: DeepSeek-V4.1 (`deepseek41`, DeepSeek-V4.1-Flash-1017 with FP8 dense and FP4
   expert weights) on the CPU engine and on one GPU. The generic loader reads it
   through `Behavior` flags: hyper-connection residual streams, latent attention with a per-head sink
@@ -44,10 +44,10 @@
   position) and on Vulkan (same top-1 count, KL 1.9e-8), answers `Paris` and `72` to short chat
   prompts on both, and passes eight scenarios of the live suite on the CPU. It decodes at about 0.2
   tokens/s on either engine because the experts stream from disk.
-- `provider-local`: `EngramCache` (`LocalModelConfig::engram`, parsed from `ram=<size>,threads=<n>`)
-  bounds the Engram reader. The table (209 GB at the default Q8_0) stays in the GGUF; `threads`
-  reader threads (1 to 64, default 16) fetch the distinct rows of each pass, and an LRU cache of
-  `ram` bytes (1 MiB to 1 TiB, default 4 GiB, 48 bytes of bookkeeping per row counted) evicts the
+- `provider-local`: `EngramCache` (`LocalModelConfig::engram`: `ram_bytes`, `reader_threads`)
+  bounds the Engram reader. The table (209 GB at the default Q8_0) stays in the GGUF;
+  `reader_threads` reader threads (1 to 64, default 16) fetch the distinct rows of each pass, and an LRU cache of
+  `ram_bytes` bytes (1 MiB to 1 TiB, default 4 GiB, 48 bytes of bookkeeping per row counted) evicts the
   least recently used row at the bound. `LocalModel::engram_stats` returns `EngramStats` (lookups,
   cache hits, disk reads, bytes read, resident rows and bytes, capacity). Both engines prefetch the
   rows of a pass at its entry and of the next prefill chunk, and a model split by `gpu_layers` opens
@@ -82,18 +82,20 @@
   check. The engine's tokenizer stays hand-written.
 - `server` feature and the `cuca` binary (`src/bin/cuca.rs`, `required-features = ["server"]`) with
   `cuca serve`: an OpenAI-compatible HTTP server over `provider-local`, as vLLM and llama.cpp's
-  server speak it. It loads one or more models concurrently (`--model [name=]source`, a preset, a
-  GGUF path or Hugging Face file, a checkpoint, `--config` TOML `[[model]]` tables, global
-  `--device`, `--context-length`, `--batching`, `--experts`, `--gpu-layers`, `--cache-dir`) and serves
+  server speak it. `cuca serve` and `cuca balance` take one option, `--config <FILE>` (default
+  `cuca.kdl`); the file (`examples/configs/cuca.kdl`, `cuca::server::CucaConfig`) has the sections
+  `log` (`format`, `level`), `serve` and `balance`, and an unknown key is an error. `serve` loads
+  one or more `model` nodes concurrently, each a `LocalModelConfig` (a preset, a GGUF path or
+  Hugging Face file, a checkpoint) named by its argument, and serves
   `GET /health` (503 until every model is ready), `/version`, `/v1/models` (with `max_model_len`),
   `POST /v1/chat/completions` (text, reasoning, tools, SSE with `include_usage`, exact usage with
   cached prompt tokens, `finish_reason` `stop`, `length` or `tool_calls`) and `/metrics`.
   Parameters the engine cannot honour (`n` above 1, `logprobs`, penalties, `logit_bias`,
   `response_format`, image parts) are a 400 naming the field; `/v1/completions` is not served.
-  `--api-key` (or `CUCA_API_KEY`) requires a bearer key on every route but `/health`. Every request has an
-  `x-request-id`, a tracing span and an access log line (`--log-format pretty|json`, `--log-level`).
+  `api_key` requires a bearer key on every route but `/health`. Every request has an
+  `x-request-id`, a tracing span and an access log line (`log format="json"`).
   A client disconnect stops the generation. Library entry points are in `cuca::server`
-  (`serve`, `ServerConfig`, `ModelSpec`, `ServerError`).
+  (`serve`, `CucaConfig`, `ServerConfig`, `ModelSpec`, `ServerError`).
 - `cuca balance`: a load balancer over several `cuca serve` instances. Routing policies are
   `prefix-affinity` (default: rendezvous hashing of the model and the prompt prefix, with a fall back
   to the least-loaded upstream above `2 * min_score + 2`), `least-loaded` and `round-robin`. Upstreams
@@ -104,7 +106,7 @@
 - `cuca tui` (`server-tui` feature, `ratatui` and `crossterm`): a live terminal view of a server or a
   balancer with resources, latency percentiles, the ranked reasons for the latency and a model or
   upstream list; Enter drills into an upstream's own view.
-- Stats API (`--stats-api`): `GET /cuca/v1/stats` and `GET /cuca/v1/stats/stream` (SSE, one snapshot per
+- Stats API (`stats_api #true`): `GET /cuca/v1/stats` and `GET /cuca/v1/stats/stream` (SSE, one snapshot per
   second, `?interval_ms=` 250 to 10000) serve a `StatsSnapshot` (`cuca::server::stats`, serde
   types shared by the balancer and the TUI): node identity, per-model engine state, K/V pool, rates,
   memory, windowed latency percentiles, requests, the machine, ranked `Diagnosis` entries with
@@ -127,6 +129,18 @@
 - `ServingStats` gains `max_sequences`, `used_blocks`, `total_blocks`, `prefill_rows`,
   `generated_tokens`, `admissions`, `queue_wait_ns`, `step_ns`, `last_step_ns` and `last_step_rows`,
   all atomics on the engine thread.
+- `config-kdl` feature and the `cuca::config` module: a KDL document becomes a `ConfigValue` tree
+  that any `Deserialize` structure reads (`load_kdl_file`, `load_kdl_str`, `from_kdl_str`,
+  `from_kdl_str_with_vars`), with the field adapters `one_or_many`, `from_str`, `size` (`4g`) and
+  `duration` (`60s`). `${VAR}` and `${VAR:-default}` placeholders resolve against a top-level
+  `variables` block, then the environment. `provider-local` and `server` enable it; it adds the
+  `kdl` dependency.
+- `LocalModelConfig` and every type in it implement `Deserialize`: a KDL file's keys are the field
+  names (`examples/configs/local_model.kdl`). New field `chat_template_file` (a Jinja file;
+  `chat_template` wins over it, it wins over a preset's template) and `Display` for `LocalDevice`.
+- The tests read one gitignored `cuca-test.kdl` at the repository root instead of environment
+  variables (`cuca-test.example.kdl` lists every key). Without the file every live test skips; the
+  llama.cpp suites read it only with `config-kdl` among the `--features`.
 
 ### Changed
 
@@ -144,13 +158,41 @@
 - `provider-local`: the expert loader reads missing experts that are adjacent in the file as one run
   of up to 4 per matrix (layers that store their experts expert after expert; the bytes, counters and
   budgets are the single reads'). Cold expert reads from the SSD rise from 3.41 to 3.50 GB/s.
+- The examples take their settings as flags: `--base-url` (default `http://127.0.0.1:1234/v1`) and
+  `--model` (default `google/gemma-4-e4b`); `speculative` takes `--fast-model` and `--slow-model`,
+  `web_search` also `--search-api-key` and `--search-base-url`, and `local_model` takes `--config`
+  (a `LocalModelConfig` KDL file, `examples/configs/local_model.kdl`), `--prompt`, `--max-tokens`,
+  `--temperature` and `--thinking off`.
+- `LocalModelConfig::cache_dir` set to `None` is the platform cache directory, and `hf_token` set to
+  `None` or an empty string is anonymous access; the library no longer reads `CUCA_CACHE_DIR` or
+  `HF_TOKEN`.
+
+### Removed
+
+- Every environment variable that configured cuca: the library's `CUCA_CACHE_DIR` and `HF_TOKEN`;
+  the `cuca` binary's `CUCA_API_KEY`, `CUCA_UPSTREAM_API_KEY` and `RUST_LOG`; the examples'
+  `CUCA_BASE_URL`, `CUCA_MODEL`, `CUCA_FAST_MODEL`, `CUCA_SLOW_MODEL`, `CUCA_SEARCH_API_KEY` and
+  `CUCA_SEARCH_BASE_URL`; the tests' `CUCA_REQUIRE_LIVE` and every `CUCA_LOCAL_*`, `CUCA_DS41_*`,
+  `CUCA_TOK_*`, `CUCA_CONVERT_PROBE` and `CUCA_MISTRAL4_GGUF`. The only environment read left is a
+  `${VAR}` placeholder a KDL file writes, and the platform cache directory.
+- The compact string forms of the local configuration: `FromStr` for `BatchingConfig`
+  (`seqs=4,kv=16384`), `EngramCache` (`ram=2g,threads=8`) and `ExpertPlacement` (`tiered:ram=4g`),
+  and `LocalModelConfig::set_devices` (`vulkan:0+vulkan:1`; set `device` and `shards`). `FromStr`
+  stays on `ModelSource`, `LocalDevice`, `WeightQuant` and `EngramQuant`.
+- The `cuca serve` and `cuca balance` command line options (`--model`, `--device`, `--context-length`,
+  `--batching`, `--experts`, `--gpu-layers`, `--cache-dir`, `--listen`, `--api-key`, `--stats-api`,
+  `--upstream`, `--upstream-api-key`, `--policy`, `--health-interval-ms`, `--log-format`,
+  `--log-level`) and the TOML `--config` file with its `[[model]]` and `[balancer]` tables. Each is a
+  key of the KDL file, which `--config` now names. `cuca tui` keeps `--url`, `--api-key` and
+  `--interval-ms`.
+- The `toml` dependency and clap's `env` feature.
 
 ### Fixed
 
 - `provider-local-*`: the GPU kernels allocate their outputs contiguously (`empty_device_contiguous_dtype`).
   A HIP tensor pads its rows to the device's pitch, which the kernels' linear indexing ignored;
   on ROCm (Windows, RX 9070 XT) 21 of 37 `model::gpu` tests failed before, and 38 pass after (four of
-  them real-model tests that need `CUCA_LOCAL_DS41_REAL`). `provider-local-rocm` builds and runs on
+  them real-model tests that need `oracle { ds41 { real_dir } }`). `provider-local-rocm` builds and runs on
   Windows with the DLLs of AMD's ROCm 10.1.0 tarball (docs: `ROCm on Windows`, with the install steps
   and the `hipconfig` build caveat); a missing HIP runtime now names `ROCM_PATH`/`HIP_PATH` and
   `HIP_DEVICE_LIB_PATH` in its error.

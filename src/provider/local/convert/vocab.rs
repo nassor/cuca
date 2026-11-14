@@ -1373,7 +1373,7 @@ mod tests {
     }
 
     /// The real DeepSeek-V4.1-Flash-1017 tokenizer files (the reference copy in
-    /// `.omp/local-models/ref/deepseek-v41/`, or `CUCA_DS41_REF_DIR`): the
+    /// `.omp/local-models/ref/deepseek-v41/`, or `oracle { ds41 { tokenizer_ref_dir "..." } }`): the
     /// three-split chain reads as `deepseek-v3` and its probe-text fingerprint is
     /// llama.cpp's `joyai-llm`, which becomes `tokenizer.ggml.pre`; 129,280
     /// entries, BOS 0, EOS 1 (also the padding id, as llama.cpp writes it), no
@@ -1381,8 +1381,11 @@ mod tests {
     /// `SKIP:`.
     #[test]
     fn the_real_deepseek_v41_tokenizer_converts_to_joyai_llm() {
-        let dir = std::env::var_os("CUCA_DS41_REF_DIR")
-            .map(std::path::PathBuf::from)
+        let dir = crate::test_config::get()
+            .oracle
+            .ds41
+            .tokenizer_ref_dir
+            .clone()
             .unwrap_or_else(|| {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
                     .join(".omp/local-models/ref/deepseek-v41")

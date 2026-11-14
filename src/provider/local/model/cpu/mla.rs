@@ -729,14 +729,14 @@ mod tests {
             .unwrap();
         assert!(e.to_string().contains("blk.7."), "{e}");
     }
-    /// Env-gated (`CUCA_MISTRAL4_GGUF`): a published `mistral4` GGUF (only
+    /// Gated on `oracle { mistral4_gguf "..." }` in cuca-test.kdl: a published `mistral4` GGUF (only
     /// its header is read) resolves to the latent geometry the engine
     /// computes, with every layer's tensors present at the shapes the loader
     /// expects.
     #[test]
     fn a_published_header_resolves_to_the_latent_geometry() {
-        let Some(path) = std::env::var_os("CUCA_MISTRAL4_GGUF") else {
-            eprintln!("SKIP: set CUCA_MISTRAL4_GGUF");
+        let Some(path) = crate::test_config::get().oracle.mistral4_gguf.clone() else {
+            eprintln!("SKIP: set `oracle {{ mistral4_gguf \"...\" }}` in cuca-test.kdl");
             return;
         };
         let content = gguf::Content::open(std::path::Path::new(&path)).unwrap();

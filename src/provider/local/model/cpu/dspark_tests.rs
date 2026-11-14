@@ -1,12 +1,12 @@
 //! The DSpark drafter against the torch oracle (`mtp.json`, design §9) and
 //! against its own invariants.
 //!
-//! `CUCA_LOCAL_DS41_REF` names the oracle directory: the drafter of its
+//! `oracle { ds41 { oracle_dir "..." } }` in cuca-test.kdl names the oracle directory: the drafter of its
 //! `target/` checkpoint is converted at `f16` and run as the reference does
 //! (`forward_spec`: the stages are seeded with the main hidden rows of every
 //! prompt position, then the block is drafted from the anchor token at
 //! `start_pos = T - 1`), with the simulated quantization off like
-//! `noquant/`. Without the variable the oracle tests print `SKIP:` and pass.
+//! `noquant/`. Without the key the oracle tests print `SKIP:` and pass.
 
 use std::path::{Path, PathBuf};
 

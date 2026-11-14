@@ -2,21 +2,26 @@
 //! engines this crate does not own: transformers on a tiny release-format
 //! file, and llama.cpp on the real 26B-A4B Q4_0.
 //!
-//! Both tests are gated and print `SKIP:` without their variables:
+//! Both tests are gated and print `SKIP:` without their cuca-test.kdl keys:
 //!
-//! - `CUCA_LOCAL_G4MOE_REF=<dir>`: the output of
+//! - `oracle { g4moe { oracle_dir "<dir>" } }`: the output of
 //!   `.omp/local-models/ref/gemma4moe/make_ref.py --out <dir>`: `tiny-q4.gguf`
 //!   (Q4_0 matrices, Q8_0 embedding, F32 norms, router and scales, the dtypes
 //!   of the real file), `tiny-f32.gguf` (the same weights dequantized) and
 //!   `expected.json` (the logits of every position of three prompts, computed
 //!   by transformers' `Gemma4ForCausalLM` in f32 over the dequantized weights).
-//! - `CUCA_LOCAL_G4MOE_REAL=<GGUF>` and `CUCA_LOCAL_G4MOE_REAL_REF=<json>`: the
+//! - `oracle { g4moe { real "<GGUF>"; real_ref "<json>" } }`: the
 //!   real `gemma-4-26B-A4B-it-Q4_0.gguf` and the output of
 //!   `.omp/local-models/ref/llamacpp/ref_llama.py all` on it (llama.cpp's
 //!   top-20 log-probabilities after each prompt and its greedy continuations).
 //!
+//! ```kdl
+//! // cuca-test.kdl
+//! oracle { g4moe { oracle_dir "<dir>" } }
+//! ```
+//!
 //! ```sh
-//! CUCA_LOCAL_G4MOE_REF=<dir> RUSTFLAGS="-C target-cpu=native" \
+//! RUSTFLAGS="-C target-cpu=native" \
 //!   cargo test --release --lib --features provider-local gemma4_moe_matches -- --nocapture
 //! ```
 
@@ -54,11 +59,13 @@ fn argmax(x: &[f32]) -> u32 {
 }
 
 fn oracle_dir() -> Option<PathBuf> {
-    let dir = std::env::var_os("CUCA_LOCAL_G4MOE_REF").map(PathBuf::from);
+    let dir = crate::test_config::get().oracle.g4moe.oracle_dir.clone();
     match dir {
         Some(d) if d.join("expected.json").is_file() && d.join("tiny-q4.gguf").is_file() => Some(d),
         _ => {
-            skip("set CUCA_LOCAL_G4MOE_REF to the output of make_ref.py (gemma4moe)");
+            skip(
+                "set `oracle { g4moe { oracle_dir \"...\" } }` in cuca-test.kdl to the output of make_ref.py (gemma4moe)",
+            );
             None
         }
     }
@@ -231,12 +238,14 @@ fn gemma4_moe_matches_the_transformers_oracle() {
 
 fn real_files() -> Option<(PathBuf, PathBuf)> {
     match (
-        std::env::var_os("CUCA_LOCAL_G4MOE_REAL").map(PathBuf::from),
-        std::env::var_os("CUCA_LOCAL_G4MOE_REAL_REF").map(PathBuf::from),
+        crate::test_config::get().oracle.g4moe.real.clone(),
+        crate::test_config::get().oracle.g4moe.real_ref.clone(),
     ) {
         (Some(m), Some(r)) if m.is_file() && r.is_file() => Some((m, r)),
         _ => {
-            skip("set CUCA_LOCAL_G4MOE_REAL (the 26B-A4B Q4_0 GGUF) and CUCA_LOCAL_G4MOE_REAL_REF");
+            skip(
+                "set `oracle { g4moe { real \"...\"; real_ref \"...\" } }` in cuca-test.kdl (the 26B-A4B Q4_0 GGUF and its llama.cpp reference)",
+            );
             None
         }
     }
@@ -416,11 +425,14 @@ fn gemma4_moe_published_header_resolves_to_the_dual_branch_geometry() {
     use super::super::layout::{Ffn, LayerLayout};
     use super::super::paged::KvLayout;
 
-    let Some(model) = std::env::var_os("CUCA_LOCAL_G4MOE_REAL")
-        .map(PathBuf::from)
+    let Some(model) = crate::test_config::get()
+        .oracle
+        .g4moe
+        .real
+        .clone()
         .filter(|p| p.is_file())
     else {
-        skip("set CUCA_LOCAL_G4MOE_REAL to the 26B-A4B Q4_0 GGUF");
+        skip("set `oracle { g4moe { real \"...\" } }` in cuca-test.kdl to the 26B-A4B Q4_0 GGUF");
         return;
     };
     let content = Content::open(&model).unwrap();
@@ -487,15 +499,15 @@ fn gemma4_moe_published_header_resolves_to_the_dual_branch_geometry() {
 /// should sit about as far from the exact function as from each other;
 /// llama.cpp ran with its defaults (an f16 K/V cache), the engine keeps f32.
 ///
-/// Gated: `CUCA_LOCAL_G4MOE_TRUNC` (the truncated GGUF) and
-/// `CUCA_LOCAL_G4MOE_TRUNC_REF` (`ref_llama.py logits` output on it).
+/// Gated: `oracle { g4moe { trunc "..." } }` (the truncated GGUF) and
+/// `oracle { g4moe { trunc_ref "..." } }` (`ref_llama.py logits` output on it), both in cuca-test.kdl.
 #[test]
 fn gemma4_moe_truncated_real_file_matches_llama_cpp() {
     let (Some(model), Some(reference)) = (
-        std::env::var_os("CUCA_LOCAL_G4MOE_TRUNC").map(PathBuf::from),
-        std::env::var_os("CUCA_LOCAL_G4MOE_TRUNC_REF").map(PathBuf::from),
+        crate::test_config::get().oracle.g4moe.trunc.clone(),
+        crate::test_config::get().oracle.g4moe.trunc_ref.clone(),
     ) else {
-        skip("set CUCA_LOCAL_G4MOE_TRUNC and CUCA_LOCAL_G4MOE_TRUNC_REF");
+        skip("set `oracle { g4moe { trunc \"...\"; trunc_ref \"...\" } }` in cuca-test.kdl");
         return;
     };
     let reference = json(&reference);

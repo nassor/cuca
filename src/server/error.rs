@@ -46,7 +46,7 @@ impl std::error::Error for ServerError {
 }
 
 impl From<CucaError> for ServerError {
-    /// A configuration error from the local provider (`--device vulkan` in a
+    /// A configuration error from the local provider (`device "vulkan"` in a
     /// build without the feature) is a configuration error of the server.
     fn from(error: CucaError) -> Self {
         Self::Config(error.to_string())

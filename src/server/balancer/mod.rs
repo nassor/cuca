@@ -9,7 +9,7 @@
 //! `/metrics`.
 //!
 //! ```text
-//! cuca balance --upstream http://10.0.0.1:8000 --upstream http://10.0.0.2:8000 --stats-api
+//! cuca balance --config cuca.kdl   # a `balance` section, see `config`
 //! ```
 //!
 //! # Prefix affinity
@@ -48,7 +48,7 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-pub use config::{BalancerArgs, BalancerConfig, MAX_UPSTREAMS};
+pub use config::{BalancerConfig, MAX_UPSTREAMS};
 pub use routing::Policy;
 
 use self::state::BalancerState;

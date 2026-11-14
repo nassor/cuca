@@ -18,7 +18,7 @@ weight = 10
 
 ## Drafters
 
-A drafter proposes tokens that the target model verifies in one batched forward pass, and the output is the target's. Drafting is off by default. `LocalModelConfig::drafter` is an `Option<DrafterSource>`. `DrafterSource::File(ModelSource)` is a separate drafter file, resolved and downloaded like any model source (`ModelSource::into()` converts). `DrafterSource::InTrunk` is the head inside the main model's own GGUF. The engine picks the drafter kind from the `general.architecture` of the drafter file; a `dflash` file that has the key `dflash.hyper_connection.count` is a DSpark drafter, any other `dflash` file a DFlash one.
+A drafter proposes tokens that the target model verifies in one batched forward pass, and the output is the target's. Drafting is off by default. `LocalModelConfig::drafter` is an `Option<DrafterSource>`. `DrafterSource::File(ModelSource)` is a separate drafter file, resolved and downloaded like any model source (`ModelSource::into()` converts). `DrafterSource::InTrunk` is the head inside the main model's own GGUF. In KDL the first is `drafter "gemma4-e2b-mtp-f16"` (a string, or any other form of `source`) and the second `drafter "in-trunk"`; `draft_tokens 5` sets the draft length. The engine picks the drafter kind from the `general.architecture` of the drafter file; a `dflash` file that has the key `dflash.hyper_connection.count` is a DSpark drafter, any other `dflash` file a DFlash one.
 
 | Drafter | Source | Target | Device | K/V cache of its own | Requests |
 |---|---|---|---|---|---|
@@ -176,25 +176,30 @@ The drafter does not pay on this CPU. Measured per round with the round trace at
 
 `tests/provider_local_mtp.rs` loads the target alone and records its greedy outputs, cold and warm, which must agree. It drops that model, waits 5 seconds, then loads the target once per draft length with its drafter and compares greedy output, so a target that fills the machine's memory is never held twice. On the CPU it asserts identical output and token counts and that the drafter ran. On a GPU it reports `identical` without asserting it. It uses `context_length` 2,048 and one device.
 
-- `CUCA_LOCAL_MODEL_PATH`, `CUCA_LOCAL_MODEL` or `CUCA_LOCAL_DOWNLOAD=1` names the target (the default preset `gemma4-e2b-q4_0` needs `CUCA_LOCAL_DOWNLOAD=1`).
-- `CUCA_LOCAL_DRAFTER` is a preset, a checkpoint source `repo:revision` or `in-trunk`; `CUCA_LOCAL_DRAFTER_PATH` is a path.
-- `CUCA_LOCAL_DRAFT_TOKENS` is one `draft_tokens` value or a comma separated list, one comparison each (default 3).
-- `CUCA_LOCAL_DEVICE` is one device, `CUCA_LOCAL_CONVERT_QUANT` the precision of a converted checkpoint, `CUCA_REQUIRE_LIVE=1` turns a skip into a failure.
-- `CUCA_LOCAL_ALLOW_MISMATCH`, set to any value, makes the CPU run report `identical false` and go on instead of failing.
+The suite reads the `local` node of `cuca-test.kdl`:
+
+- `model { source ".." }` or `local { download_default #true }` names the target (the default preset `gemma4-e2b-q4_0` needs `download_default #true`).
+- `model { drafter ".." }` is a preset, a checkpoint source `repo:revision`, `"in-trunk"` or `drafter file=".."` for a path.
+- `draft_tokens` is one value or several, one comparison each (default 3): `draft_tokens 3 7 15`.
+- `model { device ".." }` is one device, `model { convert quant=".." }` the precision of a converted checkpoint, and `require_live #true` at the top level turns a skip into a failure.
+- `allow_mismatch #true` makes the CPU run report `identical false` and go on instead of failing.
+
+```kdl,name=cuca-test.kdl: the DFlash check
+local {
+    model {
+        source "muse-glimmer-30b-q4_0"
+        drafter "muse-glimmer-30b-dflash-q4_0"
+    }
+    draft_tokens 3 7 15
+}
+```
 
 ```bash,name=Linux and macOS: the DFlash check
-export RUSTFLAGS="-C target-cpu=native"
-export CUCA_LOCAL_MODEL="muse-glimmer-30b-q4_0"
-export CUCA_LOCAL_DRAFTER="muse-glimmer-30b-dflash-q4_0"
-export CUCA_LOCAL_DRAFT_TOKENS="3,7,15"
-cargo test --release --features provider-local --test provider_local_mtp -- --nocapture
+RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_mtp -- --nocapture
 ```
 
 ```powershell,name=Windows (PowerShell): the DFlash check
 $env:RUSTFLAGS = "-C target-cpu=native"
-$env:CUCA_LOCAL_MODEL = "muse-glimmer-30b-q4_0"
-$env:CUCA_LOCAL_DRAFTER = "muse-glimmer-30b-dflash-q4_0"
-$env:CUCA_LOCAL_DRAFT_TOKENS = "3,7,15"
 cargo test --release --features provider-local --test provider_local_mtp -- --nocapture
 ```
 
@@ -210,9 +215,9 @@ Unit tests on tiny models, on the CPU unless noted:
 - For each drafter (`drafter_leaves_greedy_output_unchanged`, `in_trunk_head_leaves_greedy_output_unchanged`, `eagle_leaves_greedy_output_unchanged`, `dflash_drafter_leaves_greedy_output_unchanged`): greedy output equals plain decoding. Matching tests cover `max_tokens`, the context limit and reproducible sampling for a seed. The in-trunk head, EAGLE and DFlash also have tests for a warm prefix equal to a cold one and for recovery from a failed request.
 - `plain_rounds_defer_the_upkeep_and_the_next_draft_catches_up` covers lazy upkeep for EAGLE, the Qwen head and DFlash. It forces the governor plain for 0, 1, 3, 10, 30 and 1,000 rounds and then drafts. It asserts greedy output equal to plain, the rows held back while the rounds are plain, no round drafting before the drafter has caught up, a cache after catching up equal bit for bit to the cache of an engine that drafted all along (the K/V of every committed slot; the whole context ring for DFlash), the same proposals and statistics as the same schedule with eager upkeep, and a following request that replays the cached ids from the rows still held.
 - `eagle_deferred_rows_catch_up_to_the_eager_cache`, `the_lag_holds_contiguous_rows_and_trims_from_a_position` and `the_lag_is_bounded_by_rows_and_by_bytes` check at the drafter level that rows handed over round by round and taken in one pass leave the cache that observing them as they came leaves, whatever the chunking and the caps, and that held rows follow truncation, replay at an earlier position and reset.
-- `gpu_drafter_matches_cpu_drafter` compares the GPU Gemma 4 assistant with the CPU one when `CUCA_LOCAL_DEVICE` names a GPU.
-- `dflash_drafter_matches_the_transformers_reference` runs when `CUCA_LOCAL_DFLASH_REF` names a directory of a tiny checkpoint pair and reference rounds (written by `make_tiny_dflash.py`, which is not in the repository). It bounds `max |dlogit|` by `CUCA_LOCAL_REF_TOL` (default 5e-4) and requires equal drafts; the recorded run measured below 2e-4.
+- `gpu_drafter_matches_cpu_drafter` compares the GPU Gemma 4 assistant with the CPU one when the `device` of the `local` model names a GPU.
+- `dflash_drafter_matches_the_transformers_reference` runs when `oracle { dflash_ref ".." }` names a directory of a tiny checkpoint pair and reference rounds (written by `make_tiny_dflash.py`, which is not in the repository). It bounds `max |dlogit|` by `oracle { ref_tol .. }` (default 5e-4) and requires equal drafts; the recorded run measured below 2e-4.
 - For DSpark (CPU, a tiny `deepseek41` target with MXFP4 experts and a tiny DSpark file with MXFP4 or Q8_0 experts): `dspark_drafter_leaves_greedy_output_unchanged` compares greedy output with plain decoding at draft lengths 1, 2, 4, 5 and 16 and checks that no round drafts more than 5. Further tests cover `max_tokens` and the context limit, a warm prefix equal to a cold one, recovery from a failed request, reproducible sampling for a seed, the measured cost model, and the recognition of the file by `dflash.hyper_connection.count`.
-- `dspark_tests.rs` runs when `CUCA_LOCAL_DS41_REF` names the tiny DeepSeek-V4.1 reference directory. It converts that checkpoint's drafter at `f16` and requires the block logits and the confidence within 1e-4 of the reference and the same draft ids, the target's own features within 5e-4 of the reference's hidden rows, and observation in several steps or after a truncation to equal one pass.
+- `dspark_tests.rs` runs when `oracle { ds41 { oracle_dir ".." } }` names the tiny DeepSeek-V4.1 reference directory. It converts that checkpoint's drafter at `f16` and requires the block logits and the confidence within 1e-4 of the reference and the same draft ids, the target's own features within 5e-4 of the reference's hidden rows, and observation in several steps or after a truncation to equal one pass.
 
-With the real DeepSeek-V4.1-Flash-1017 target, DSpark ran once on the CPU, with the converted set at the default precision, `tiered:ram=90g,threads=16` experts and `CUCA_LOCAL_DRAFTER` naming the same checkpoint, from an HDD-class volume (experts streamed at about 0.4 to 0.5 GB/s), in a release build with `-C target-cpu=native`. On `Explain in two sentences what a mixture of experts model is.` with thinking off, temperature 0 and 48 tokens, the speculative output equals plain greedy decoding. 5 of 15 drafted tokens were accepted (33 %) in 7 rounds. It gives no speedup: plain decoding ran at 0.185 tokens/s and the drafter run at 0.172, because both are bound by reading the experts and verifying extra rows reads more of them (87.3 GB against 83.8 GB read). One prompt is one measurement, not an acceptance rate for the model.
+With the real DeepSeek-V4.1-Flash-1017 target, DSpark ran once on the CPU, with the converted set at the default precision, `experts { tiered ram_bytes="90g" loader_threads=16; }` and a `drafter` naming the same checkpoint source, from an HDD-class volume (experts streamed at about 0.4 to 0.5 GB/s), in a release build with `-C target-cpu=native`. On `Explain in two sentences what a mixture of experts model is.` with thinking off, temperature 0 and 48 tokens, the speculative output equals plain greedy decoding. 5 of 15 drafted tokens were accepted (33 %) in 7 rounds. It gives no speedup: plain decoding ran at 0.185 tokens/s and the drafter run at 0.172, because both are bound by reading the experts and verifying extra rows reads more of them (87.3 GB against 83.8 GB read). One prompt is one measurement, not an acceptance rate for the model.

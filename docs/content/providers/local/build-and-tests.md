@@ -36,20 +36,23 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 
 ## Live suites
 
-Every suite runs one real model per invocation on the CPU by default and needs no server. With no model configured, each test prints `SKIP: local model not available: ...` and passes, unless `CUCA_REQUIRE_LIVE=1` turns the skip into a failure. The CI `test` job compiles the suites under the all-features set without CUDA and ROCm, so CI runs no model.
+Every suite runs one real model per invocation on the CPU by default and needs no server. The suites read one gitignored file, `cuca-test.kdl` in the repository root; `cuca-test.example.kdl` is the template with every key. With no file, or no model in it, each test prints `SKIP: local model not available: ...` and passes, unless `require_live #true` turns the skip into a failure. The CI `test` job compiles the suites under the all-features set without CUDA and ROCm, so CI runs no model.
 
-The model and device come from environment variables parsed in `tests/local_env/mod.rs`: `CUCA_LOCAL_MODEL_PATH`, `CUCA_LOCAL_MODEL` or `CUCA_LOCAL_DOWNLOAD=1` for the model, `CUCA_LOCAL_DEVICE` for the device (a GPU needs its feature), `CUCA_LOCAL_ENGRAM` for the Engram cache of a model that has one. `CUCA_LOCAL_MODEL=deepseek-v41-flash-1017` is a name of the test harness only: it selects the `deepseek-ai/DeepSeek-V4.1-Flash-1017` checkpoint, which converts on first use. Every variable, with the files that read it, is on [Environment variables](@/reference/environment.md).
+The model and device are the `local { model { ... } }` node of that file, a `LocalModelConfig` written with its field names and read by `tests/local_env/mod.rs`: `source` for the model (or `local { download_default #true }` for the default preset), `device` and `shards` for the devices (a GPU needs its feature), `engram` for the Engram cache of a model that has one. The other `local` keys are listed in the sections below. The DeepSeek-V4.1 checkpoint is written `source "deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>"`, which converts on first use. Every key is on [Environment variables](@/reference/environment.md).
 
-```bash,name=Linux and macOS: the live matrix on one preset
-CUCA_LOCAL_MODEL=qwen3-0.6b-q8_0 cargo test --release --features provider-local --test provider_local -- --test-threads=1 --nocapture
+```kdl,name=cuca-test.kdl: the live matrix on one preset
+local {
+    model {
+        source "qwen3-0.6b-q8_0"
+    }
+}
 ```
 
-```powershell,name=Windows (PowerShell): the live matrix on one preset
-$env:CUCA_LOCAL_MODEL = "qwen3-0.6b-q8_0"
+```bash,name=Runs the same on all three platforms
 cargo test --release --features provider-local --test provider_local -- --test-threads=1 --nocapture
 ```
 
-On a GPU, set `CUCA_LOCAL_DEVICE` (for example `vulkan`) and build with the matching feature, here `provider-local-vulkan`.
+On a GPU, add `device "vulkan"` to the `model` node and build with the matching feature, here `provider-local-vulkan`.
 
 ### provider_local.rs
 
@@ -61,57 +64,74 @@ The scenario matrix. A scenario applies to a model only when `LocalModel::capabi
 - `tool_call_round_trip` and `tool_result_answer_without_tools`: a `get_weather` call, then an answer from the result, with the tool declared on both requests and with no tool declared on the follow-up.
 - `long_context_needle`: a prompt of 1,000 tokens or more with a code word to retrieve.
 - `prefix_reuse_hits_and_matches_cold`: the warm prefix is read from the cache in whole blocks of 16, an unrelated request reuses less, and a repeat of the second turn reads at least as much and gives the identical greedy output.
-- `perf_long_prompt`: runs only with `CUCA_LOCAL_PERF=1`. A prompt of about 1,100 tokens, three rounds, printing `PERF|model|round|prompt|cached|completion|first|decode tok/s` and asserting nothing; `CUCA_LOCAL_PERF_COLD=1` makes every round miss the prefix cache.
+- `perf_long_prompt`: runs only with `perf #true` in the `local` node. A prompt of about 1,100 tokens, three rounds, printing `PERF|model|round|prompt|cached|completion|first|decode tok/s` and asserting nothing; `perf_cold #true` makes every round miss the prefix cache.
 
-`CUCA_LOCAL_PRINT_REPLIES=1` prints every greedy reply as a `REPLY|...` line in `provider_local.rs`, `provider_local_tiers.rs` and `provider_local_mtp.rs`. The diff of two runs is the regression check for attention or K/V changes. Tool call ids are random, so mask them.
+`print_replies #true` in the `local` node prints every greedy reply as a `REPLY|...` line in `provider_local.rs`, `provider_local_tiers.rs` and `provider_local_mtp.rs`. The diff of two runs is the regression check for attention or K/V changes. Tool call ids are random, so mask them.
 
 ### The other suites
 
-- `tests/provider_local_batch.rs` runs 8 concurrent clients on one model (`CUCA_LOCAL_BATCHING` sets the batching, `seqs=4` by default). On the CPU replies equal the serial ones, steps carry several rows, a second round reads the prefix store, and `BATCH|...` lines report aggregate throughput.
+- `tests/provider_local_batch.rs` runs 8 concurrent clients on one model (the `batching` key of the `model` node sets the batching, `max_sequences=4` by default). On the CPU replies equal the serial ones, steps carry several rows, a second round reads the prefix store, and `BATCH|...` lines report aggregate throughput.
 - `tests/provider_local_mtp.rs` is the drafter check described under [Verified](@/providers/local/drafting.md#verified).
 - `tests/provider_local_tiers.rs` runs a mixture-of-experts model on a tiered placement and compares its greedy replies with a reference placement; see [Run it](@/providers/local/expert-tiers.md#run-it). It prints `TIERS|<phase>|<tok/s>|<stats>`.
-- `tests/provider_local_convert.rs` and the unit test `convert::oracle` check converted checkpoints against the transformers oracle (`CUCA_LOCAL_REF_DIR`; each prints `SKIP:` without it); see [Checkpoint conversion](@/providers/local/checkpoints.md).
+- `tests/provider_local_convert.rs` and the unit test `convert::oracle` check converted checkpoints against the transformers oracle (`oracle { ref_dir ".." }`; each prints `SKIP:` without it); see [Checkpoint conversion](@/providers/local/checkpoints.md).
 
 ### Unit tests
 
-Unit tests live next to the code under the same feature. The tokenizer and chat-template golden tests read cached model files and print `SKIP:` for a missing one. `CUCA_TOK_GGUF` and `CUCA_TOK_CASES` drive the tokenizer corpus test. The GPU unit tests in `model::gpu` run only when `CUCA_LOCAL_DEVICE` names a GPU. Which models and devices the suites covered is on [Local verification](@/providers/local/verification.md).
+Unit tests live next to the code under the same feature and read the same `cuca-test.kdl`. The tokenizer and chat-template golden tests read cached model files and print `SKIP:` for a missing one. `oracle { tok_gguf ".." tok_cases ".." }` drive the tokenizer corpus test. The GPU unit tests in `model::gpu` run only when the `device` of the `local` model names a GPU. Which models and devices the suites covered is on [Local verification](@/providers/local/verification.md).
 
 ### DeepSeek-V4.1 oracle tests
 
-`CUCA_LOCAL_DS41_REF` names the directory of a tiny DeepSeek-V4.1 oracle dump (`tests/local_env/mod.rs` `ds41_ref()`): a release-format checkpoint in `target/`, the exact float tensors and metadata the converter must write in `expected/`, and the torch port's logits. It is the `--out` directory of `.omp/local-models/ref/ds41/make_ref.py`, which lives in the gitignored research tree. The gated tests are the converter oracle in `convert/oracle_ds41.rs` and the engine oracles in `model/cpu/hyper_tests.rs` and `model/cpu/dspark_tests.rs`; each prints `SKIP:` without the variable. Run them from the repository root:
+`oracle { ds41 { oracle_dir ".." } }` names the directory of a tiny DeepSeek-V4.1 oracle dump: a release-format checkpoint in `target/`, the exact float tensors and metadata the converter must write in `expected/`, and the torch port's logits. It is the `--out` directory of `.omp/local-models/ref/ds41/make_ref.py`, which lives in the gitignored research tree. The gated tests are the converter oracle in `convert/oracle_ds41.rs` and the engine oracles in `model/cpu/hyper_tests.rs` and `model/cpu/dspark_tests.rs`; each prints `SKIP:` without the key. Run them from the repository root:
 
-```bash,name=Linux and macOS: the DeepSeek-V4.1 oracle tests
-CUCA_LOCAL_DS41_REF=<oracle dir> cargo test --release --lib --features provider-local -- oracle_ds41 hyper_tests dspark_tests --nocapture
+```kdl,name=cuca-test.kdl: the DeepSeek-V4.1 oracle tests
+oracle {
+    ds41 {
+        oracle_dir "<oracle dir>"
+    }
+}
 ```
 
-```powershell,name=Windows (PowerShell): the DeepSeek-V4.1 oracle tests
-$env:CUCA_LOCAL_DS41_REF = "<oracle dir>"
+```bash,name=Runs the same on all three platforms
 cargo test --release --lib --features provider-local -- oracle_ds41 hyper_tests dspark_tests --nocapture
 ```
 
-- `CUCA_DS41_TOKENIZER_JSON` points the tokenizer golden test and the Engram token-map test at the release `tokenizer.json`, and `CUCA_DS41_REF_DIR` the converter's vocabulary test at the release tokenizer files; each prints `SKIP:` without its files.
-- `model/cpu/real_tests.rs` is gated on `CUCA_LOCAL_DS41_REAL` (the real-weights oracle directory) and `CUCA_CACHE_DIR` (the cache holding the converted set), with `CUCA_LOCAL_DS41_REAL_RAM` for the expert RAM in GiB (default 90 on the CPU, 85 on a GPU). It needs the converted real checkpoint, so it prints `SKIP:` on any machine without it. The `real_model_on_the_gpu_*` tests of `model/gpu.rs` take the same variables on a GPU device, with `CUCA_LOCAL_DS41_REAL_GPU_LAYERS` for a layer offload; `CUCA_LOCAL_DS41_REAL_SPEED=1` enables the speed probes of both engines and `CUCA_LOCAL_DS41_REAL_DUMP=<dir>` writes every position's logits of the oracle checks, and `CUCA_LOCAL_DS41_REAL_PATHS` enables a GPU check through the engine's own paths (see [the environment variables](@/reference/environment.md)).
+- `oracle.ds41.tokenizer_json` points the tokenizer golden test and the Engram token-map test at the release `tokenizer.json`, and `oracle.ds41.tokenizer_ref_dir` the converter's vocabulary test at the release tokenizer files; each prints `SKIP:` without its files.
+- `model/cpu/real_tests.rs` is gated on `oracle.ds41.real_dir` (the real-weights oracle directory) and the top-level `cache_dir` (the cache holding the converted set), with `oracle.ds41.real_ram_gib` for the expert RAM in GiB (default 90 on the CPU, 85 on a GPU). It needs the converted real checkpoint, so it prints `SKIP:` on any machine without it. The `real_model_on_the_gpu_*` tests of `model/gpu.rs` take the same keys on a GPU device, with `real_gpu_layers` for a layer offload; `real_speed #true` enables the speed probes of both engines, `real_dump_dir "<dir>"` writes every position's logits of the oracle checks, and `real_paths #true` enables a GPU check through the engine's own paths. `real_ctx`, `real_seqs`, `real_rows` and `real_qdq` are the other keys of the `ds41` table; each is listed in `cuca-test.example.kdl`.
+
+```kdl,name=cuca-test.kdl: the real DeepSeek-V4.1 logit check on the CPU
+cache_dir "<cache dir>"
+oracle {
+    ds41 {
+        real_dir "<real oracle dir>"
+    }
+}
+```
 
 ```bash,name=Linux and macOS: the real DeepSeek-V4.1 logit check on the CPU
-CUCA_LOCAL_DS41_REAL=<real oracle dir> CUCA_CACHE_DIR=<cache dir> RUSTFLAGS="-C target-cpu=native" cargo test --release --lib --features provider-local real_model -- --nocapture
+RUSTFLAGS="-C target-cpu=native" cargo test --release --lib --features provider-local real_model -- --nocapture
 ```
 
 ```powershell,name=Windows (PowerShell): the real DeepSeek-V4.1 logit check on the CPU
-$env:CUCA_LOCAL_DS41_REAL = "<real oracle dir>"
-$env:CUCA_CACHE_DIR = "<cache dir>"
 $env:RUSTFLAGS = "-C target-cpu=native"
 cargo test --release --lib --features provider-local real_model -- --nocapture
 ```
 
-The live suite runs the real model through the checkpoint alias `deepseek-v41-flash-1017` of `tests/local_env/mod.rs`, which converts the checkpoint once into the cache. Run one test thread, because the model does not fit in memory twice:
+The live suite runs the real model from the checkpoint source `deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>`, which converts the checkpoint once into the cache. Run one test thread, because the model does not fit in memory twice:
+
+```kdl,name=cuca-test.kdl: the live suite on the real DeepSeek-V4.1
+local {
+    model {
+        source "deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>"
+        experts { tiered ram_bytes="90g"; }
+    }
+}
+```
 
 ```bash,name=Linux and macOS: the live suite on the real DeepSeek-V4.1
-CUCA_LOCAL_MODEL=deepseek-v41-flash-1017 CUCA_LOCAL_EXPERTS=tiered:ram=90g RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local -- --test-threads=1 --nocapture
+RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local -- --test-threads=1 --nocapture
 ```
 
 ```powershell,name=Windows (PowerShell): the live suite on the real DeepSeek-V4.1
-$env:CUCA_LOCAL_MODEL = "deepseek-v41-flash-1017"
-$env:CUCA_LOCAL_EXPERTS = "tiered:ram=90g"
 $env:RUSTFLAGS = "-C target-cpu=native"
 cargo test --release --features provider-local --test provider_local -- --test-threads=1 --nocapture
 ```

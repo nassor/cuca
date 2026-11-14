@@ -2,8 +2,8 @@
 //! endpoint.
 //!
 //! One `LocalModel` downloads (once) and loads the model; one client routes a
-//! streams the reply. The default is Gemma 4 E2B Q4_0; the
-//! environment selects any verified preset (Gemma 3/4, Qwen 3/3.5/3.6,
+//! streams the reply. The default is Gemma 4 E2B Q4_0; a KDL configuration
+//! file (`--config`) selects any verified preset (Gemma 3/4, Qwen 3/3.5/3.6,
 //! SmolLM 3, Phi 4 mini, Granite 3.3, OLMo 2, OLMoE, DeepSeek-R1-Distill,
 //! Muse Glimmer, Mistral Small 4) or any other
 //! GGUF file of a supported architecture (see Configuration).
@@ -27,64 +27,75 @@
 //!
 //! ```sh
 //! RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local
-//! CUCA_LOCAL_MODEL=qwen3-0.6b-q8_0 RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local
-//! CUCA_LOCAL_DEVICE=vulkan cargo run --release --example local_model --features provider-local-vulkan
+//! RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local -- --config examples/configs/local_model.kdl --prompt "Say hi"
+//! cargo run --release --example local_model --features provider-local-vulkan -- --config my-vulkan.kdl
 //! ```
 //!
 //! # Configuration
 //!
-//! - `CUCA_LOCAL_MODEL_PATH`: path of an already downloaded GGUF file (any
-//!   supported architecture), or of a Hugging Face checkpoint directory
-//!   (`config.json`, `*.safetensors`, tokenizer files), which is converted to
-//!   a cached GGUF once; skips the download and wins over `CUCA_LOCAL_MODEL`.
-//! - `CUCA_LOCAL_MODEL`: what to download: a preset name from
-//!   `ModelSource::PRESETS` (for example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`,
-//!   `phi4-mini-q4_0`; ASCII case-insensitive), an unverified
-//!   `repo:revision:file` GGUF on Hugging Face, or `repo:revision`, a
-//!   safetensors checkpoint that is downloaded and converted to a GGUF
-//!   once. Default: `gemma4-e2b-q4_0`.
-//! - `CUCA_LOCAL_CONVERT_QUANT`: the weight precision of a converted
-//!   checkpoint, `f16`, `q8_0` (default) or `q4_0`.
-//! - `CUCA_LOCAL_DRAFTER`: a preset name, `in-trunk`, a `repo:revision`
-//!   checkpoint (DeepSeek-V4.1's DSpark stages live in the target's own
-//!   checkpoint: the same `repo:revision` as `CUCA_LOCAL_MODEL` converts to the
-//!   drafter's file next to the model's), or `CUCA_LOCAL_DRAFTER_PATH`, a file
-//!   or a checkpoint directory, enabling self-speculative decoding on the CPU; the acceptance
-//!   counters print at the end. A preset or path is the separate
-//!   multi-token-prediction drafter of a Gemma 4 model (`gemma4-e2b-mtp-f16`);
-//!   `in-trunk` uses the prediction head inside the model's own file, which a
-//!   Qwen 3.5 `*-MTP` GGUF carries (for example
-//!   `unsloth/Qwen3.5-0.8B-MTP-GGUF`; set `CUCA_LOCAL_MODEL_PATH` to it).
-//! - `CUCA_LOCAL_DEVICE`: where the model runs: `cpu` (default), `vulkan`,
-//!   `vulkan:<n>`, `metal`, `cuda[:<n>]` or `rocm[:<n>]` (see `LocalDevice`).
-//!   A GPU needs its feature, e.g. `--features provider-local-vulkan`. A
-//!   `+`-separated list such as `cuda:0+cuda:1` splits the model over those
-//!   GPUs (tensor parallelism, `LocalModelConfig::shards`; a device may
-//!   repeat, e.g. `vulkan:0+vulkan:0`); the line `loaded on ...` lists them.
-//! - `CUCA_LOCAL_GPU_LAYERS`: layer offload (`LocalModelConfig::gpu_layers`,
-//!   llama.cpp's `-ngl`): the last `n` layers run on the GPU device and the
-//!   rest on the CPU, for a model that does not fit the device; the line
-//!   `loaded on ...` prints the split. Not combinable with `+` device lists
-//!   or a drafter.
-//! - `CUCA_LOCAL_EXPERTS`: where a mixture-of-experts model's experts live
-//!   (see `ExpertPlacement`): `resident` (default) or tiered caches such as
-//!   `tiered:ram=600m` (CPU) or `tiered:device=4g,ram=8g` (GPU); the tier
+//! The command line takes the request; everything about the model is a key of
+//! the KDL file, which deserializes straight into `LocalModelConfig` (the keys
+//! are its field names). `examples/configs/local_model.kdl` lists every key,
+//! all but `source` commented out. Without `--config` the default
+//! `LocalModelConfig` applies (Gemma 4 E2B Q4_0 on the CPU).
+//!
+//! - `--config <FILE>`: the KDL file holding the `LocalModelConfig`.
+//! - `--prompt <TEXT>`: the user message, defaults to `Explain CUCA in one
+//!   sentence.`.
+//! - `--thinking off`: disables reasoning (any other value keeps it on).
+//! - `--max-tokens <N>`: the completion limit, default 1024.
+//! - `--temperature <T>`: 0 is greedy; default: the model's own.
+//!
+//! The model keys worth knowing:
+//!
+//! - `source`: what to run: a preset name from `ModelSource::PRESETS` (for
+//!   example `gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`; ASCII
+//!   case-insensitive), `file="<gguf>"` for an already downloaded GGUF file
+//!   (any supported architecture), `dir="<checkpoint>"` for a Hugging Face
+//!   checkpoint directory (`config.json`, `*.safetensors`, tokenizer files)
+//!   that is converted to a cached GGUF once, an unverified
+//!   `"repo:revision:file"` GGUF on Hugging Face, or `"repo:revision"`, a
+//!   safetensors checkpoint that is downloaded and converted to a GGUF once.
+//! - `convert quant="..."`: the weight precision of a converted checkpoint,
+//!   `f16`, `q8_0` (default) or `q4_0`.
+//! - `drafter`: a preset name, `"in-trunk"`, a `"repo:revision"` checkpoint
+//!   (DeepSeek-V4.1's DSpark stages live in the target's own checkpoint: the
+//!   same `repo:revision` as `source` converts to the drafter's file next to
+//!   the model's), or `file="..."`/`dir="..."`, enabling self-speculative
+//!   decoding on the CPU; the acceptance counters print at the end. A preset
+//!   or path is the separate multi-token-prediction drafter of a Gemma 4
+//!   model (`gemma4-e2b-mtp-f16`); `"in-trunk"` uses the prediction head
+//!   inside the model's own file, which a Qwen 3.5 `*-MTP` GGUF carries (for
+//!   example `unsloth/Qwen3.5-0.8B-MTP-GGUF`; set `source file=...` to it).
+//! - `device`: where the model runs: `cpu` (default), `vulkan`, `vulkan:<n>`,
+//!   `metal`, `cuda[:<n>]` or `rocm[:<n>]` (see `LocalDevice`). A GPU needs
+//!   its feature, e.g. `--features provider-local-vulkan`. `shards` lists
+//!   further devices and splits the model over `device` plus those GPUs
+//!   (tensor parallelism; a device may repeat, e.g. `vulkan:0` and
+//!   `shards "vulkan:0"`); the line `loaded on ...` lists them.
+//! - `gpu_layers`: layer offload (llama.cpp's `-ngl`): the last `n` layers
+//!   run on the GPU device and the rest on the CPU, for a model that does not
+//!   fit the device; the line `loaded on ...` prints the split. Not
+//!   combinable with `shards` or a drafter.
+//! - `experts`: where a mixture-of-experts model's experts live (see
+//!   `ExpertPlacement`): `"resident"` (default) or `tiered` caches such as
+//!   `experts { tiered ram_bytes="600m"; }` (CPU) or
+//!   `experts { tiered device_bytes="4g" ram_bytes="8g"; }` (GPU); the tier
 //!   counters print at the end.
-//! - `CUCA_LOCAL_ENGRAM`: the row cache and reader threads of a model with
-//!   Engram tables (see `EngramCache`), e.g. `ram=2g,threads=8`; the cache
-//!   counters print at the end.
-//! - `CUCA_LOCAL_PROMPT`, `CUCA_LOCAL_THINKING` (`off` disables reasoning),
-//!   `CUCA_LOCAL_MAX_TOKENS` (default 1024) and `CUCA_LOCAL_TEMPERATURE` (0 is
-//!   greedy; default: the model's own): the request, for timing runs.
-//! - `CUCA_LOCAL_BATCHING`: how concurrent requests share the engine (see
-//!   `BatchingConfig`): any subset of `seqs=4,kv=16384,step=256,prefix=off`.
-//!   This example sends one request, so it only changes the memory it reserves
-//!   (`kv` sizes the shared K/V pool).
-//! - `CUCA_LOCAL_CHAT_TEMPLATE`: path of a Jinja chat template (`.jinja`) that
-//!   replaces the one in the GGUF (`LocalModelConfig::chat_template`).
-//! - `CUCA_CACHE_DIR`: download cache directory, defaults to the platform cache
+//! - `engram`: the row cache and reader threads of a model with Engram
+//!   tables (see `EngramCache`), e.g. `engram ram_bytes="2g" reader_threads=8`;
+//!   the cache counters print at the end.
+//! - `batching`: how concurrent requests share the engine (see
+//!   `BatchingConfig`), e.g. `batching max_sequences=4 kv_tokens=16384
+//!   max_step_tokens=256 prefix_cache=#false`. This example sends one
+//!   request, so it only changes the memory it reserves (`kv_tokens` sizes
+//!   the shared K/V pool).
+//! - `chat_template_file`: path of a Jinja chat template (`.jinja`) that
+//!   replaces the one in the GGUF (`LocalModelConfig::chat_template_file`).
+//! - `cache_dir`: download cache directory, defaults to the platform cache
 //!   directory.
-//! - `HF_TOKEN`: Hugging Face token, only needed for gated mirrors.
+//! - `hf_token`: Hugging Face token, only needed for gated mirrors; it takes
+//!   a `${NAME:-}` placeholder (see `examples/configs/local_model.kdl`).
 //!
 //! # Output
 //!
@@ -106,82 +117,31 @@
 //! first block.
 
 use std::io::{Write, stdout};
-use std::path::PathBuf;
+use std::path::Path;
 use std::time::Instant;
 
 use cuca::types::MessageContentBlock;
-use cuca::{
-    DownloadProgressCallback, DrafterSource, LocalModel, LocalModelConfig, ModelSource,
-    UnifiedRequest, WeightQuant,
-};
+use cuca::{DownloadProgressCallback, LocalModel, LocalModelConfig, UnifiedRequest};
 use tokio_stream::StreamExt;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Stage 1: load the model. A path in the environment skips the download;
-    // `CUCA_LOCAL_MODEL` picks a preset or `repo:revision:file` to download;
-    // otherwise the default source is the pinned Gemma 4 E2B Q4_0 file. The
-    // callback reports download progress on stderr.
-    let mut config = LocalModelConfig {
-        on_download_progress: Some(DownloadProgressCallback::new(|progress| {
-            eprint!(
-                "\r{} / {:?} bytes",
-                progress.downloaded_bytes, progress.total_bytes
-            );
-        })),
-        ..Default::default()
+    // Stage 1: load the model. Every model setting is a key of the KDL file
+    // named by `--config`; without it the default source is the pinned Gemma 4
+    // E2B Q4_0 file. The callback reports download progress on stderr.
+    let mut config = match arg("config") {
+        Some(file) => cuca::config::load_kdl_file::<LocalModelConfig>(Path::new(&file))?,
+        None => LocalModelConfig::default(),
     };
-    if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        let path = PathBuf::from(path);
-        config.source = if path.is_dir() {
-            ModelSource::Dir(path)
-        } else {
-            ModelSource::File(path)
-        };
-    } else if let Some(name) = env("CUCA_LOCAL_MODEL") {
-        config.source = name.parse()?;
-    }
-    if let Some(path) = std::env::var_os("CUCA_LOCAL_DRAFTER_PATH") {
-        let path = PathBuf::from(path);
-        config.drafter = Some(
-            if path.is_dir() {
-                ModelSource::Dir(path)
-            } else {
-                ModelSource::File(path)
-            }
-            .into(),
+    config.on_download_progress = Some(DownloadProgressCallback::new(|progress| {
+        eprint!(
+            "\r{} / {:?} bytes",
+            progress.downloaded_bytes, progress.total_bytes
         );
-    } else if let Some(name) = env("CUCA_LOCAL_DRAFTER") {
-        config.drafter = Some(if name.eq_ignore_ascii_case("in-trunk") {
-            DrafterSource::InTrunk
-        } else {
-            name.parse::<ModelSource>()?.into()
-        });
-    }
-    if let Some(quant) = env("CUCA_LOCAL_CONVERT_QUANT") {
-        config.convert.quant = quant.parse::<WeightQuant>()?;
-    }
-    if let Some(device) = env("CUCA_LOCAL_DEVICE") {
-        config.set_devices(&device)?;
-    }
-    if let Some(layers) = env("CUCA_LOCAL_GPU_LAYERS") {
-        config.gpu_layers = Some(layers.parse()?);
-    }
-    if let Some(experts) = env("CUCA_LOCAL_EXPERTS") {
-        config.experts = experts.parse()?;
-    }
-    if let Some(engram) = env("CUCA_LOCAL_ENGRAM") {
-        config.engram = engram.parse()?;
-    }
-    if let Some(batching) = env("CUCA_LOCAL_BATCHING") {
-        config.batching = batching.parse()?;
-    }
-    if let Some(path) = env("CUCA_LOCAL_CHAT_TEMPLATE") {
-        config.chat_template = Some(std::fs::read_to_string(&path)?);
-    }
+    }));
     let devices = std::iter::once(config.device)
         .chain(config.shards.iter().copied())
-        .map(|d| format!("{d:?}"))
+        .map(|d| d.to_string())
         .collect::<Vec<_>>()
         .join(" + ");
     let started = Instant::now();
@@ -198,10 +158,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => eprintln!("loaded on {devices}"),
     }
 
-    // Stage 2: build the request. Thinking is on unless `CUCA_LOCAL_THINKING=off`,
+    // Stage 2: build the request. Thinking is on unless `--thinking off`,
     // so a model that reasons streams `Thinking` blocks ahead of the answer.
-    let prompt = env("CUCA_LOCAL_PROMPT").unwrap_or_else(|| "Explain CUCA in one sentence.".into());
-    let max_tokens = match env("CUCA_LOCAL_MAX_TOKENS") {
+    let prompt = arg("prompt").unwrap_or_else(|| "Explain CUCA in one sentence.".into());
+    let max_tokens = match arg("max-tokens") {
         Some(n) => n.parse()?,
         None => 1024,
     };
@@ -209,11 +169,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_system_message("You are concise.")
         .add_user_message(prompt)
         .set_max_tokens(max_tokens);
-    let request = match env("CUCA_LOCAL_TEMPERATURE") {
+    let request = match arg("temperature") {
         Some(t) => request.set_temperature(t.parse()?),
         None => request,
     };
-    let request = if env("CUCA_LOCAL_THINKING").is_some_and(|v| v.eq_ignore_ascii_case("off")) {
+    let request = if arg("thinking").is_some_and(|v| v.eq_ignore_ascii_case("off")) {
         request.disable_thinking()
     } else {
         request.enable_thinking(None)
@@ -284,7 +244,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// A non-empty environment variable.
-fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|value| !value.is_empty())
+/// The value after `--<name>` on the command line.
+fn arg(name: &str) -> Option<String> {
+    let flag = format!("--{name}");
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+    }
+    None
 }

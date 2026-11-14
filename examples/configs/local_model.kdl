@@ -1,0 +1,25 @@
+// A `LocalModelConfig` for the `local_model` example. Run it with:
+//
+//   cargo run --release --example local_model --features provider-local -- --config examples/configs/local_model.kdl --prompt "Say hi"
+//
+// Every key is a field of `cuca::LocalModelConfig`; only `source` is active,
+// the others show the syntax and are commented out.
+
+source "qwen3-0.6b-q8_0"                 // or: source file="/models/x.gguf" | source dir="/ckpt" | source "repo:revision" | source "repo:revision:file"
+// source { checkpoint repo="Qwen/Qwen3-0.6B" revision="c1899de"; }
+// source { hugging_face repo="org/r" revision="abc" file="m.gguf" sha256="..." { part file="..." sha256="..."; template repo="..." revision="..." file="chat_template.jinja"; } }
+// device "vulkan:0"
+// shards "vulkan:1"
+// gpu_layers 20
+// context_length 8192
+// cache_dir "D:/cuca-cache"
+// hf_token "${HF_TOKEN:-}"
+// chat_template_file "templates/x.jinja"
+// sampling temperature=0.7 top_k=40 top_p=0.9 seed=7
+// batching max_sequences=8 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false
+// experts { tiered ram_bytes="4g" device_bytes="6g" loader_threads=8; }   // or: experts "resident" | experts { host layers=4; } | experts { host; }
+// engram ram_bytes="2g" reader_threads=8
+// convert quant="q4_0" engram_quant="q8_0"
+// drafter "in-trunk"                       // or a source in any form above
+// draft_tokens 5
+// shard_dirs "E:/parts" "F:/parts"

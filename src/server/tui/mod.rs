@@ -1,7 +1,7 @@
 //! `cuca tui`: a real-time terminal view of a model server or a load balancer.
 //!
 //! The UI follows the node's stats stream (`GET /cuca/v1/stats/stream`, which
-//! the server serves only with `--stats-api`) and shows resources (CPU, RAM,
+//! the server serves only with `stats_api #true`) and shows resources (CPU, RAM,
 //! disks, GPUs, VRAM), the latency over the sliding window and the ranked
 //! reasons for it, then the models of a server or the upstreams of a
 //! balancer (Enter drills into an upstream's own view).

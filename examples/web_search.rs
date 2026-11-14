@@ -4,7 +4,7 @@
 //! request on a short-lived thread while the stream pauses; the normalized
 //! result comes back as a `ToolResult` and a second turn answers from it. Every
 //! backend the plugin speaks to is a paid API, so the demo needs a key in
-//! `CUCA_SEARCH_API_KEY` and prints one line and exits without one.
+//! `--search-api-key` and prints one line and exits without one.
 //!
 //! # Prerequisites
 //!
@@ -16,7 +16,7 @@
 //! # Run
 //!
 //! ```sh
-//! cargo run --example web_search --features provider-llamacpp,plugin-web-search
+//! cargo run --example web_search --features provider-llamacpp,plugin-web-search -- --search-api-key <KEY>
 //! ```
 //!
 //! # Configuration
@@ -24,11 +24,11 @@
 //! The first two values default to a local llama.cpp server; override them to
 //! target any OpenAI-compatible server:
 //!
-//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
-//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
-//! - `CUCA_SEARCH_API_KEY`: Firecrawl API key. Required; without it the program
+//! - `--base-url <URL>`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `--model <ID>`: upstream model id, defaults to `google/gemma-4-e4b`.
+//! - `--search-api-key <KEY>`: Firecrawl API key. Required; without it the program
 //!   prints one line and exits successfully.
-//! - `CUCA_SEARCH_BASE_URL`: search endpoint override, defaults to
+//! - `--search-base-url <URL>`: search endpoint override, defaults to
 //!   `https://api.firecrawl.dev`.
 //!
 //! # Output
@@ -152,23 +152,22 @@ fn with_result(model: &str, call_id: &str, query: &str, output: &str) -> Unified
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
+    // Base URL and model come from the command line so the example runs
     // against any OpenAI-compatible server; the defaults target a local
-    // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+    // llama.cpp server (see the module docs for the flags).
+    let base_url = arg("base-url").unwrap_or_else(|| "http://127.0.0.1:1234/v1".to_string());
+    let model = arg("model").unwrap_or_else(|| "google/gemma-4-e4b".to_string());
 
     // Every backend the plugin speaks to is a paid search API, so there is no
     // keyless path to demonstrate.
-    let Ok(api_key) = std::env::var("CUCA_SEARCH_API_KEY") else {
-        println!("Set CUCA_SEARCH_API_KEY to a Firecrawl key and run this again.");
+    let Some(api_key) = arg("search-api-key") else {
+        println!("Pass --search-api-key with a Firecrawl key and run this again.");
         return Ok(());
     };
     let config = WebSearchConfig {
         provider: WebSearchProvider::Firecrawl,
         api_key,
-        base_url: std::env::var("CUCA_SEARCH_BASE_URL").ok(),
+        base_url: arg("search-base-url"),
         max_results: 3,
     };
     println!(
@@ -195,7 +194,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(stream) => stream,
         Err(error) => {
             println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
+            println!("Start llama-server there, or pass --base-url, then run this again.");
             return Ok(());
         }
     };
@@ -228,4 +227,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  thinking blocks: {thinking}");
 
     Ok(())
+}
+
+/// The value after `--<name>` on the command line.
+fn arg(name: &str) -> Option<String> {
+    let flag = format!("--{name}");
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+    }
+    None
 }

@@ -1,22 +1,23 @@
-//! Balancer configuration: the command line and an optional `[balancer]` table.
+//! Balancer configuration: the `balance` section of the configuration file
+//! ([`crate::server::CucaConfig`]).
 //!
-//! ```toml
-//! [balancer]
-//! listen = "0.0.0.0:8000"
-//! upstreams = ["http://10.0.0.1:8000", "http://10.0.0.2:8000"]
-//! upstream_api_key = "secret"
-//! policy = "prefix-affinity"
-//! health_interval_ms = 1000
-//! stats_api = true
+//! ```kdl
+//! balance {
+//!     listen "127.0.0.1:8080"
+//!     upstreams "http://10.0.0.1:8000" "http://10.0.0.2:8000"
+//!     upstream_api_key "${API_KEY}"
+//!     api_key "${CLIENT_KEY}"
+//!     policy "prefix-affinity"
+//!     health_interval "1s"
+//!     latency_window "60s"
+//!     stats_api #true
+//! }
 //! ```
-//!
-//! A value on the command line wins over the file.
 
-use std::net::SocketAddr;
-use std::path::Path;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use super::routing::Policy;
 use crate::server::error::ServerError;
@@ -24,12 +25,15 @@ use crate::server::error::ServerError;
 /// Most upstreams one balancer fronts.
 pub const MAX_UPSTREAMS: usize = 256;
 
-/// Everything `balance` needs to start.
-#[derive(Debug, Clone)]
+/// Everything `balance` needs to start: the `balance` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BalancerConfig {
-    /// Address of the HTTP listener.
+    /// Address of the HTTP listener ([`BalancerConfig::DEFAULT_LISTEN`]).
     pub listen: SocketAddr,
-    /// Base URLs of the model servers, at least one.
+    /// Base URLs of the model servers, at least one (several arguments of
+    /// one `upstreams` node).
+    #[serde(deserialize_with = "crate::config::one_or_many")]
     pub upstreams: Vec<String>,
     /// Sent to every upstream as `Authorization: Bearer <key>`.
     pub upstream_api_key: Option<String>,
@@ -37,19 +41,30 @@ pub struct BalancerConfig {
     pub api_key: Option<String>,
     /// Serve the stats API.
     pub stats_api: bool,
-    /// How requests pick an upstream.
+    /// How requests pick an upstream: `prefix-affinity` (the default),
+    /// `least-loaded` or `round-robin`.
     pub policy: Policy,
-    /// The interval between polls of each upstream.
+    /// The interval between polls of each upstream, 100 ms to 60 s (`"1s"`).
+    #[serde(deserialize_with = "crate::config::duration")]
     pub health_interval: Duration,
-    /// The sliding window of the latency figures.
+    /// The sliding window of the latency figures (`"60s"`).
+    #[serde(deserialize_with = "crate::config::duration")]
     pub latency_window: Duration,
+}
+
+impl<'de> Deserialize<'de> for Policy {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        crate::server::config::parsed(deserializer)
+    }
 }
 
 impl BalancerConfig {
     /// The default listen address.
-    pub const DEFAULT_LISTEN: &'static str = "127.0.0.1:8000";
+    pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
     /// The default health interval.
     pub const DEFAULT_HEALTH_INTERVAL: Duration = Duration::from_millis(1000);
+    /// The default latency window.
+    pub const DEFAULT_LATENCY_WINDOW: Duration = Duration::from_secs(60);
 
     /// A configuration for `upstreams` listening on `listen`, the rest
     /// default.
@@ -62,7 +77,7 @@ impl BalancerConfig {
             stats_api: false,
             policy: Policy::default(),
             health_interval: Self::DEFAULT_HEALTH_INTERVAL,
-            latency_window: Duration::from_secs(60),
+            latency_window: Self::DEFAULT_LATENCY_WINDOW,
         }
     }
 
@@ -76,7 +91,7 @@ impl BalancerConfig {
     pub fn resolve_upstreams(&self) -> Result<Vec<(String, String)>, ServerError> {
         if self.upstreams.is_empty() {
             return Err(ServerError::Config(
-                "no upstream: pass --upstream <URL> at least once".into(),
+                "no upstream: list at least one URL in `upstreams`".into(),
             ));
         }
         if self.upstreams.len() > MAX_UPSTREAMS {
@@ -87,7 +102,7 @@ impl BalancerConfig {
         }
         if !(Duration::from_millis(100)..=Duration::from_secs(60)).contains(&self.health_interval) {
             return Err(ServerError::Config(
-                "--health-interval-ms must be between 100 and 60000".into(),
+                "health_interval must be between 100ms and 60s".into(),
             ));
         }
         if self.api_key.as_deref() == Some("") || self.upstream_api_key.as_deref() == Some("") {
@@ -104,6 +119,12 @@ impl BalancerConfig {
             out.push((id, url));
         }
         Ok(out)
+    }
+}
+
+impl Default for BalancerConfig {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_LISTEN, Vec::new())
     }
 }
 
@@ -124,101 +145,20 @@ fn normalize_upstream(raw: &str) -> Result<(String, String), ServerError> {
     Ok((authority.to_string(), url.to_string()))
 }
 
-/// The balancer options a command line carries; unset ones fall to the file,
-/// then to the defaults.
-#[derive(Debug, Clone, Default)]
-pub struct BalancerArgs {
-    /// `--listen`.
-    pub listen: Option<SocketAddr>,
-    /// `--upstream`, repeated.
-    pub upstreams: Vec<String>,
-    /// `--upstream-api-key`.
-    pub upstream_api_key: Option<String>,
-    /// `--api-key`.
-    pub api_key: Option<String>,
-    /// `--stats-api`.
-    pub stats_api: bool,
-    /// `--policy`.
-    pub policy: Option<String>,
-    /// `--health-interval-ms`.
-    pub health_interval_ms: Option<u64>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigFile {
-    balancer: Option<FileBalancer>,
-}
-
-#[derive(Debug, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileBalancer {
-    listen: Option<SocketAddr>,
-    #[serde(default)]
-    upstreams: Vec<String>,
-    upstream_api_key: Option<String>,
-    api_key: Option<String>,
-    stats_api: Option<bool>,
-    policy: Option<String>,
-    health_interval_ms: Option<u64>,
-}
-
-impl BalancerConfig {
-    /// The configuration of a command line, over an optional TOML file with a
-    /// `[balancer]` table: `args` win, the upstreams of both are joined (the
-    /// command line's first).
-    ///
-    /// # Errors
-    ///
-    /// [`ServerError::Config`] for an unreadable or invalid file, an unknown
-    /// policy or an invalid combination.
-    pub fn from_args(args: BalancerArgs, file: Option<&Path>) -> Result<Self, ServerError> {
-        let from_file = match file {
-            None => FileBalancer::default(),
-            Some(path) => {
-                let text = std::fs::read_to_string(path).map_err(|e| {
-                    ServerError::Config(format!("reading `{}`: {e}", path.display()))
-                })?;
-                let parsed: ConfigFile = toml::from_str(&text)
-                    .map_err(|e| ServerError::Config(format!("`{}`: {e}", path.display())))?;
-                parsed.balancer.unwrap_or_default()
-            }
-        };
-        Self::merge(args, from_file)
-    }
-
-    fn merge(args: BalancerArgs, file: FileBalancer) -> Result<Self, ServerError> {
-        let listen = match args.listen.or(file.listen) {
-            Some(addr) => addr,
-            None => Self::DEFAULT_LISTEN
-                .parse()
-                .map_err(|e| ServerError::Config(format!("default listen address: {e}")))?,
-        };
-        let mut upstreams = args.upstreams;
-        upstreams.extend(file.upstreams);
-        let mut config = Self::new(listen, upstreams);
-        config.upstream_api_key = args.upstream_api_key.or(file.upstream_api_key);
-        config.api_key = args.api_key.or(file.api_key);
-        config.stats_api = args.stats_api || file.stats_api.unwrap_or(false);
-        if let Some(policy) = args.policy.or(file.policy) {
-            config.policy = policy.parse()?;
-        }
-        if let Some(ms) = args.health_interval_ms.or(file.health_interval_ms) {
-            config.health_interval = Duration::from_millis(ms);
-        }
-        Ok(config)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::CucaConfig;
 
     fn config(upstreams: &[&str]) -> BalancerConfig {
         BalancerConfig::new(
-            BalancerConfig::DEFAULT_LISTEN.parse().unwrap(),
+            BalancerConfig::DEFAULT_LISTEN,
             upstreams.iter().map(|s| (*s).to_string()).collect(),
         )
+    }
+
+    fn balance(text: &str) -> Result<BalancerConfig, ServerError> {
+        CucaConfig::from_kdl_str(text)?.into_balance()
     }
 
     #[test]
@@ -260,36 +200,23 @@ mod tests {
     }
 
     #[test]
-    fn the_command_line_wins_over_the_file_and_the_upstreams_join() {
-        let file: ConfigFile = toml::from_str(
-            r#"[balancer]
-               listen = "0.0.0.0:9000"
-               upstreams = ["http://file:1"]
-               policy = "round-robin"
-               health_interval_ms = 500
-               stats_api = true"#,
-        )
-        .unwrap();
-        let args = BalancerArgs {
-            upstreams: vec!["http://cli:1".into()],
-            policy: Some("least-loaded".into()),
-            ..BalancerArgs::default()
-        };
-        let c = BalancerConfig::merge(args, file.balancer.unwrap()).unwrap();
-        assert_eq!(c.listen.port(), 9000);
-        assert_eq!(c.upstreams, ["http://cli:1", "http://file:1"]);
-        assert_eq!(c.policy, Policy::LeastLoaded);
-        assert_eq!(c.health_interval, Duration::from_millis(500));
-        assert!(c.stats_api);
-    }
-
-    #[test]
     fn an_unknown_key_or_policy_is_rejected() {
-        assert!(toml::from_str::<ConfigFile>("[balancer]\nupstream = []\n").is_err());
-        let args = BalancerArgs {
-            policy: Some("random".into()),
-            ..BalancerArgs::default()
-        };
-        assert!(BalancerConfig::merge(args, FileBalancer::default()).is_err());
+        let one = balance(r#"balance { upstreams "http://a:1"; policy "least-loaded"; }"#).unwrap();
+        assert_eq!(one.upstreams, ["http://a:1"]);
+        assert_eq!(one.policy, Policy::LeastLoaded);
+        assert_eq!(one.listen, BalancerConfig::DEFAULT_LISTEN);
+
+        let err = balance(r#"balance { upstream "http://a:1"; }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `upstream`"), "{err}");
+        let err = balance(r#"balance { policy "random"; }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown policy `random`"), "{err}");
+        let err = balance("balance { health_interval 1000; }")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected a duration"), "{err}");
     }
 }

@@ -11,7 +11,7 @@ weight = 4
 <dt>In one line</dt>
 <dd><code>cuca tui</code> follows a node's stats stream and shows resources, latency, the ranked reasons for it, and the node's models or upstreams</dd>
 <dt>You need</dt>
-<dd>The <code>server-tui</code> feature, and a <code>cuca serve</code> or <code>cuca balance</code> started with <code>--stats-api</code></dd>
+<dd>The <code>server-tui</code> feature, and a <code>cuca serve</code> or <code>cuca balance</code> with <code>stats_api #true</code> in its configuration</dd>
 <dt>Read this if</dt>
 <dd>You want to see why a server is slow while it runs, or need to know which resource figures a platform reports</dd>
 </dl>
@@ -23,8 +23,10 @@ weight = 4
 | Option | Default | Meaning |
 |---|---|---|
 | `--url` | `http://127.0.0.1:8000` | base URL of the server or balancer |
-| `--api-key` | none; `CUCA_API_KEY` | bearer key, when the node has one |
+| `--api-key` | none | bearer key, when the node has one |
 | `--interval-ms` | `1000` | time between snapshots, at least 100; the node clamps it to 250 to 10000 |
+
+`cuca tui` is a client: it does not read the configuration file and reads no environment variable.
 
 Linux and macOS:
 

@@ -151,7 +151,7 @@ let client = CucaClient::builder()
 cargo run --example cost --features "provider-llamacpp plugin-cost"
 ```
 
-It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at another OpenAI-compatible server.
+It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, retarget it at another OpenAI-compatible server.
 
 ```text,name=Expected output
 Budget: 160 tokens, against a first prompt estimated at 18 tokens

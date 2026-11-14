@@ -106,7 +106,7 @@ println!("{:?}", String::from_utf8_lossy(&result.stdout));
 println!("{:?}", sandbox.last_diagnostic());
 ```
 
-The example needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+The example needs a `llama-server` on port 1234 with the demo model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example sandbox --features "provider-llamacpp plugin-sandbox"

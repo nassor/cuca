@@ -34,6 +34,16 @@ pub mod types;
 /// Client-facing and plugin-facing error types.
 pub mod error;
 
+pub mod config;
+
+// The unit tests of the local engine read `cuca-test.kdl` through the module
+// the integration tests share; it names library items as `cuca::...`.
+#[cfg(all(test, feature = "provider-local"))]
+extern crate self as cuca;
+#[cfg(all(test, feature = "provider-local"))]
+#[path = "../tests/test_config/mod.rs"]
+pub(crate) mod test_config;
+
 pub mod request;
 
 pub mod session;

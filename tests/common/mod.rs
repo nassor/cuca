@@ -2,10 +2,11 @@
 //!
 //! Targets llama-server's OpenAI-compatible route (default
 //! `http://127.0.0.1:1234/v1`, no API key). llama-server's own default port is
-//! 8080, so the suite expects it started with `--port 1234`, or `CUCA_BASE_URL`
-//! pointed at wherever it listens. Server-dependent tests skip when the server
-//! is unreachable unless `CUCA_REQUIRE_LIVE=1` is set, which turns the skip
-//! into a panic.
+//! 8080, so the suite expects it started with `--port 1234`, or
+//! `llamacpp base_url="..."` in `cuca-test.kdl` pointed at wherever it
+//! listens. Server-dependent tests skip when the server is unreachable unless
+//! `require_live #true` is set there, which turns the skip into a panic. A
+//! `cuca-test.kdl` is read only with the `config-kdl` feature on.
 //!
 //! `#![allow(dead_code)]`: each test binary compiles this module standalone, and
 //! no single binary uses every helper, so shared harness helpers would
@@ -24,6 +25,10 @@ use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{CucaClient, CucaClientBuilder, PluginError, UnifiedRequest};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_stream::StreamExt;
+
+/// The `cuca-test.kdl` reader shared with the local-engine suites.
+#[path = "../test_config/mod.rs"]
+pub mod test_config;
 
 /// Live entity-extraction adapter shared by the entity-extraction suite and
 /// the cross-capability combination suite.
@@ -112,13 +117,17 @@ pub fn tool_result_output(blocks: &[MessageContentBlock], call_id: &str) -> Opti
     })
 }
 
-/// The llama-server endpoint the suite targets, unless `CUCA_BASE_URL`
+/// The llama-server endpoint the suite targets, unless `llamacpp base_url`
 /// overrides it.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:1234/v1";
 
-/// Effective base URL: `$CUCA_BASE_URL` or [`DEFAULT_BASE_URL`].
+/// Effective base URL: `llamacpp base_url` or [`DEFAULT_BASE_URL`].
 pub fn base_url() -> String {
-    std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string())
+    test_config::get()
+        .llamacpp
+        .base_url
+        .clone()
+        .unwrap_or_else(|| DEFAULT_BASE_URL.to_string())
 }
 
 /// Probe the server: `GET {base}/models` with a 2s timeout.
@@ -160,32 +169,33 @@ pub fn server_probe() -> Result<Vec<String>, String> {
 }
 
 /// Gate a server-dependent test: Ok(()) to proceed, Err(reason) to skip.
-/// With `CUCA_REQUIRE_LIVE=1` an unreachable server panics instead.
+/// With `require_live #true` an unreachable server panics instead.
 pub fn require_server() -> Result<(), String> {
     match server_probe() {
         Ok(_) => Ok(()),
         Err(reason) => {
-            if std::env::var("CUCA_REQUIRE_LIVE").is_ok_and(|v| v == "1") {
-                panic!("CUCA_REQUIRE_LIVE=1 but llama.cpp is unreachable: {reason}");
+            if test_config::get().require_live {
+                panic!("require_live is set but llama.cpp is unreachable: {reason}");
             }
             Err(reason)
         }
     }
 }
 
-/// Model id under test: `$CUCA_MODEL`, else the first id the server reports.
+/// Model id under test: `llamacpp model`, else the first id the server
+/// reports.
 pub fn model_name() -> String {
-    if let Ok(name) = std::env::var("CUCA_MODEL")
+    if let Some(name) = &test_config::get().llamacpp.model
         && !name.is_empty()
     {
-        return name;
+        return name.clone();
     }
     server_probe()
         .ok()
         .and_then(|ids| ids.into_iter().next())
         .unwrap_or_else(|| {
             panic!(
-                "no model id: set CUCA_MODEL or start llama-server at {}",
+                "no model id: set `llamacpp model=\"...\"` in cuca-test.kdl or start llama-server at {}",
                 base_url()
             )
         })
@@ -304,7 +314,7 @@ pub async fn spawn_counting_sse_server(
 }
 
 /// Re-panic with the original message when a helper thread panicked, so
-/// `CUCA_REQUIRE_LIVE=1` gates keep their documented panic semantics.
+/// `require_live #true` gates keep their documented panic semantics.
 fn panic_message(payload: Box<dyn Any + Send>, fallback: &str) -> String {
     payload
         .downcast_ref::<String>()
@@ -319,7 +329,7 @@ fn panic_message(payload: Box<dyn Any + Send>, fallback: &str) -> String {
 /// runtime is already running, so the gate must never execute inside a
 /// `#[tokio::test]` body; this variant keeps live tests on the default
 /// current-thread flavor. A panic inside the thread (e.g. the
-/// `CUCA_REQUIRE_LIVE=1` gate) is re-raised on the calling thread.
+/// `require_live #true` gate) is re-raised on the calling thread.
 pub fn require_live_server() -> Result<(), String> {
     match std::thread::spawn(require_server).join() {
         Ok(result) => result,

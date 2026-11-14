@@ -206,7 +206,7 @@ fn describe_status(status: StatusCode) -> String {
             format!("HTTP {status}: the server wants an API key (--api-key)")
         }
         StatusCode::NOT_FOUND => {
-            format!("HTTP {status}: stats API not enabled (start the server with --stats-api)")
+            format!("HTTP {status}: stats API not enabled (set `stats_api #true` on the server)")
         }
         _ => format!("HTTP {status}"),
     }

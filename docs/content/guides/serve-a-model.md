@@ -37,23 +37,35 @@ cargo build --release --no-default-features --features server-tui --bin cuca
 
 Result: `target/release/cuca` (`target\release\cuca.exe` on Windows). `server-tui` includes `server`; use `server` alone to leave the terminal UI out.
 
-## Step 2: start the server
+## Step 2: write the configuration and start the server
+
+Create `cuca.kdl` in the repository root. One `serve` section holds the models and the stats API switch:
+
+```kdl,name=cuca.kdl
+serve {
+    stats_api #true
+
+    model {
+        source "qwen3-0.6b-q8_0"
+    }
+}
+```
 
 The first start downloads the preset model (0.6 GB) into the cache directory. Leave the server running.
 
 Linux and macOS:
 
 ```bash
-./target/release/cuca serve --model qwen3-0.6b-q8_0 --stats-api
+./target/release/cuca serve --config cuca.kdl
 ```
 
 Windows (PowerShell):
 
 ```powershell
-.\target\release\cuca.exe serve --model qwen3-0.6b-q8_0 --stats-api
+.\target\release\cuca.exe serve --config cuca.kdl
 ```
 
-Result: log lines end with `model ready` and `every model is ready; serving`. A model already in the cache loads in under a second on the machine this page was checked on. If the bind fails with an access error, another program or a Windows port reservation holds the port; pick another with `--listen 127.0.0.1:18000` and use it below.
+Result: log lines end with `model ready` and `every model is ready; serving`. A model already in the cache loads in under a second on the machine this page was checked on. If the bind fails with an access error, another program or a Windows port reservation holds the port; add `listen "127.0.0.1:18000"` to the `serve` section and use that port below.
 
 ## Step 3: check health and the model list
 

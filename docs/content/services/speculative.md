@@ -147,7 +147,7 @@ let client = CucaClient::builder()
     .build()?;
 ```
 
-`examples/speculative.rs` is the full program. It routes three requests with no network, serves a simple one from the fast tier, triggers a fallback cascade with a reply the default validator refuses, and sends a multi file request straight to the slow tier. Both tiers run through injected `TurnExecutor`s, so every dispatch prints. It needs a `llama-server` on port 1234 serving both tier models. `CUCA_BASE_URL`, `CUCA_FAST_MODEL` and `CUCA_SLOW_MODEL` retarget it.
+`examples/speculative.rs` is the full program. It routes three requests with no network, serves a simple one from the fast tier, triggers a fallback cascade with a reply the default validator refuses, and sends a multi file request straight to the slow tier. Both tiers run through injected `TurnExecutor`s, so every dispatch prints. It needs a `llama-server` on port 1234 serving both tier models. The flags `--base-url`, `--fast-model` and `--slow-model`, written after `--`, retarget it.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example speculative --features "provider-llamacpp service-speculative"

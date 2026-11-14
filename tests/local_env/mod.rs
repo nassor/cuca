@@ -1,63 +1,54 @@
-//! Environment and request plumbing shared by the live `provider-local` tests
+//! Configuration and request plumbing shared by the live `provider-local` tests
 //! (`provider_local.rs`, `provider_local_batch.rs`, `provider_local_mtp.rs`,
 //! `provider_local_tiers.rs`, `provider_local_convert.rs`).
 //!
-//! Every `CUCA_*` variable those tests read is parsed here, so a name or a
-//! default lives in one place; each test file decides which of them it honours
-//! (for example only `provider_local.rs` and `provider_local_tiers.rs` read
-//! `CUCA_LOCAL_EXPERTS` and `CUCA_LOCAL_ENGRAM`). The variables, and the files that use them, are
-//! listed in `AGENTS.md` (Testing & QA). A value that does not parse panics
-//! naming its variable. `examples/local_model.rs` stays self-contained and
+//! Every setting those tests read comes from `cuca-test.kdl` at the repository
+//! root ([`test_config`]; `cuca-test.example.kdl` lists every key): the model
+//! is `local { model { ... } }`, a [`LocalModelConfig`] written with its own
+//! field names, and the other `local` keys steer the suites. Each test file
+//! decides which settings it honours (for example only `provider_local.rs` and
+//! `provider_local_tiers.rs` apply `experts` and `engram`). An invalid file
+//! panics naming the key. `examples/local_model.rs` stays self-contained and
 //! does not use this module.
 //!
 //! `#![allow(dead_code)]`: each test binary compiles this module standalone
 //! and none uses every helper (same reasoning as `tests/common/mod.rs`).
 #![allow(dead_code)]
 
-use std::fmt::{Debug, Display};
+use std::fmt::Debug;
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 
 use cuca::types::{MessageContentBlock, ProviderEndpoint};
 use cuca::{
     BatchingConfig, ConvertConfig, CucaClient, DownloadProgressCallback, DrafterSource,
-    EngramCache, LocalDevice, LocalModel, LocalModelConfig, ModelSource, UnifiedRequest,
-    UnifiedResponse, WeightQuant,
+    EngramCache, ExpertPlacement, LocalDevice, LocalModel, LocalModelConfig, ModelSource,
+    UnifiedRequest, UnifiedResponse,
 };
 use tokio_stream::StreamExt;
+
+/// The `cuca-test.kdl` reader shared with `tests/common`.
+#[path = "../test_config/mod.rs"]
+pub mod test_config;
 
 /// The user turn of the transformers oracle dumps' `chat_a` prompt.
 pub const ORACLE_USER: &str = "What is the capital of France? Answer in one word.";
 
-/// A variable's value; unset, empty and non-Unicode count as unset.
-pub fn env(key: &str) -> Option<String> {
-    std::env::var(key).ok().filter(|s| !s.is_empty())
+/// The `local { model { ... } }` of the test configuration.
+fn model() -> LocalModelConfig {
+    test_config::get().local_model()
 }
 
-/// A variable parsed as `T`; unset or empty is `None`.
-pub fn parsed<T: FromStr>(key: &str) -> Option<T>
-where
-    T::Err: Display,
-{
-    env(key).map(|s| s.parse().unwrap_or_else(|e| panic!("{key}={s:?}: {e}")))
+/// Whether `local { model { ... } }` writes `key`.
+fn has(key: &str) -> bool {
+    test_config::get().local_has(key)
 }
 
-/// Whether a variable is set at all, whatever its value.
-pub fn flag(key: &str) -> bool {
-    std::env::var_os(key).is_some()
-}
-
-/// Whether a variable is exactly `1`.
-fn is_one(key: &str) -> bool {
-    std::env::var(key).as_deref() == Ok("1")
-}
-
-/// `CUCA_REQUIRE_LIVE=1`: a skip becomes a failure.
+/// `require_live #true`: a skip becomes a failure.
 pub fn require_live() -> bool {
-    is_one("CUCA_REQUIRE_LIVE")
+    test_config::get().require_live
 }
 
-/// A test that cannot run here: under `CUCA_REQUIRE_LIVE=1` it panics with
+/// A test that cannot run here: under `require_live` it panics with
 /// `reason`, otherwise it prints `reason` and the test passes.
 pub fn skip(reason: &str) {
     assert!(!require_live(), "{reason}");
@@ -67,27 +58,16 @@ pub fn skip(reason: &str) {
 /// [`skip`] for "no model configured".
 pub fn skip_no_model() {
     skip(
-        "SKIP: local model not available: set CUCA_LOCAL_MODEL_PATH, \
-         CUCA_LOCAL_MODEL or CUCA_LOCAL_DOWNLOAD=1",
+        "SKIP: local model not available: set `local { model { source ... } }` \
+         or `local { download_default #true }` in cuca-test.kdl",
     );
-}
-
-/// A path in the environment: a Hugging Face checkpoint directory (converted,
-/// `CUCA_LOCAL_CONVERT_QUANT`) or a GGUF file.
-pub fn path_source(path: impl Into<PathBuf>) -> ModelSource {
-    let path = path.into();
-    if path.is_dir() {
-        ModelSource::Dir(path)
-    } else {
-        ModelSource::File(path)
-    }
 }
 
 /// Checkpoints (`repo`, `revision`) and the GGUF preset made from the same
 /// weights: the harness reports a converted checkpoint under the preset's name
-/// so the known limits recorded for the preset apply to it. A name that is no
-/// library preset (`deepseek-v41-flash-1017`) also selects its checkpoint as
-/// `CUCA_LOCAL_MODEL`.
+/// so the known limits recorded for the preset apply to it. A checkpoint that
+/// is no library preset (`deepseek-v41-flash-1017`) is written `source
+/// "repo:revision"`.
 pub const CHECKPOINT_PRESETS: &[(&str, &str, &str)] = &[
     (
         "Qwen/Qwen3-0.6B",
@@ -116,96 +96,103 @@ pub const CHECKPOINT_PRESETS: &[(&str, &str, &str)] = &[
     ),
 ];
 
-/// The checkpoint a `CUCA_LOCAL_MODEL` value names in [`CHECKPOINT_PRESETS`]
-/// when it is no library preset.
-pub fn checkpoint_alias(name: &str) -> Option<ModelSource> {
-    if ModelSource::preset(name).is_some() {
-        return None;
-    }
-    CHECKPOINT_PRESETS
-        .iter()
-        .find(|(_, _, alias)| alias.eq_ignore_ascii_case(name.trim()))
-        .map(|(repo, revision, _)| ModelSource::Checkpoint {
-            repo: (*repo).to_string(),
-            revision: (*revision).to_string(),
-        })
-}
-
-/// The model to load, from `CUCA_LOCAL_MODEL_PATH` (wins), else
-/// `CUCA_LOCAL_MODEL`, else (when `download_default`) the default preset under
-/// `CUCA_LOCAL_DOWNLOAD=1`; `None` when none applies.
+/// The model to load: the written `source`, else (when `download_default`)
+/// the default preset under `local { download_default #true }`; `None` when
+/// none applies.
 pub fn model_source(download_default: bool) -> Option<ModelSource> {
-    if let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") {
-        return Some(path_source(path));
+    if has("source") {
+        return Some(model().source);
     }
-    if let Some(alias) = env("CUCA_LOCAL_MODEL").and_then(|name| checkpoint_alias(&name)) {
-        return Some(alias);
-    }
-    if let Some(source) = parsed("CUCA_LOCAL_MODEL") {
-        return Some(source);
-    }
-    (download_default && is_one("CUCA_LOCAL_DOWNLOAD")).then(ModelSource::default_model)
+    (download_default && test_config::get().local.download_default).then(ModelSource::default_model)
 }
 
-/// `CUCA_LOCAL_DEVICE` as written: one device, or a `+`-separated list.
+/// The written `device` and `shards` joined by `+` (`vulkan:0+vulkan:1`), for
+/// reports; `None` without a `device` key.
 pub fn device_list() -> Option<String> {
-    env("CUCA_LOCAL_DEVICE")
+    test_config::get().local_devices().map(|devices| {
+        devices
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("+")
+    })
 }
 
-/// `CUCA_LOCAL_DEVICE` as one device (default CPU).
+/// The written `device` (default CPU).
+///
+/// # Panics
+///
+/// When `shards` are written: the calling suite runs on one device.
 pub fn device() -> LocalDevice {
-    parsed("CUCA_LOCAL_DEVICE").unwrap_or_default()
+    let config = model();
+    assert!(
+        config.shards.is_empty(),
+        "this suite runs on one device: remove `shards` from cuca-test.kdl"
+    );
+    config.device
 }
 
-/// Set `config.device` and `config.shards` from `CUCA_LOCAL_DEVICE`, a
-/// `+`-separated list; unset leaves the CPU.
+/// Copy the written `device` and `shards` into `config`.
 pub fn set_devices(config: &mut LocalModelConfig) {
-    if let Some(devices) = device_list() {
-        config
-            .set_devices(&devices)
-            .unwrap_or_else(|e| panic!("CUCA_LOCAL_DEVICE={devices:?}: {e}"));
-    }
+    let written = model();
+    config.device = written.device;
+    config.shards = written.shards;
 }
 
-/// `CUCA_LOCAL_BATCHING` for `LocalModelConfig::batching` (`BatchingConfig`
-/// syntax, e.g. `seqs=4,kv=16384`).
+/// `batching` when written.
 pub fn batching() -> Option<BatchingConfig> {
-    parsed("CUCA_LOCAL_BATCHING")
+    has("batching").then(|| model().batching)
 }
 
-/// `CUCA_LOCAL_GPU_LAYERS` for `LocalModelConfig::gpu_layers`.
+/// `gpu_layers` when written.
 pub fn gpu_layers() -> Option<usize> {
-    parsed("CUCA_LOCAL_GPU_LAYERS")
+    model().gpu_layers
 }
 
-/// `LocalModelConfig::engram` from `CUCA_LOCAL_ENGRAM` (`EngramCache` syntax,
-/// for example `ram=2g,threads=8`; default: the library default).
+/// `experts` when written.
+pub fn experts() -> Option<ExpertPlacement> {
+    has("experts").then(|| model().experts)
+}
+
+/// `local { experts_ref ... }`: the placement `provider_local_tiers.rs`
+/// compares with (default resident).
+pub fn experts_ref() -> ExpertPlacement {
+    test_config::get()
+        .local
+        .experts_ref
+        .clone()
+        .unwrap_or_default()
+}
+
+/// `engram` (the library default when not written).
 pub fn engram() -> EngramCache {
-    parsed("CUCA_LOCAL_ENGRAM").unwrap_or_default()
+    model().engram
 }
 
-/// `LocalModelConfig::convert` from `CUCA_LOCAL_CONVERT_QUANT` (default q8_0).
+/// `convert` (default `q8_0`).
 pub fn convert() -> ConvertConfig {
-    ConvertConfig {
-        quant: parsed::<WeightQuant>("CUCA_LOCAL_CONVERT_QUANT").unwrap_or_default(),
-        ..ConvertConfig::default()
-    }
+    model().convert
 }
 
-/// `CUCA_LOCAL_DS41_REF`: the directory of the DeepSeek-V4.1 oracle dump (the
-/// tiny release-format checkpoint `target/`, the exact float tensors and
-/// metadata under `expected/`, and the torch port's logits), written by
-/// `.omp/local-models/ref/ds41/make_ref.py`.
-pub fn ds41_ref() -> Option<std::path::PathBuf> {
-    env("CUCA_LOCAL_DS41_REF").map(std::path::PathBuf::from)
+/// The model cache: `local { model { cache_dir ... } }`, else the top-level
+/// `cache_dir`; `None` is the platform cache directory.
+pub fn cache_dir() -> Option<PathBuf> {
+    model().cache_dir
 }
 
-/// The text of the file `CUCA_LOCAL_CHAT_TEMPLATE` names, for
-/// `LocalModelConfig::chat_template`.
+/// `hf_token` when written and not empty.
+pub fn hf_token() -> Option<String> {
+    model().hf_token.filter(|token| !token.is_empty())
+}
+
+/// `chat_template`, else the text of `chat_template_file`.
 pub fn chat_template() -> Option<String> {
-    env("CUCA_LOCAL_CHAT_TEMPLATE").map(|path| {
-        std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("CUCA_LOCAL_CHAT_TEMPLATE={path:?}: {e}"))
+    let config = model();
+    config.chat_template.or_else(|| {
+        config.chat_template_file.map(|path| {
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("chat_template_file {}: {e}", path.display()))
+        })
     })
 }
 
@@ -219,64 +206,47 @@ pub fn download_progress() -> DownloadProgressCallback {
     })
 }
 
-/// The drafter: a file by `CUCA_LOCAL_DRAFTER_PATH` or preset in
-/// `CUCA_LOCAL_DRAFTER`, or the head inside the target's own file
-/// (`CUCA_LOCAL_DRAFTER=in-trunk`).
+/// `drafter`: a file or preset, or the head inside the target's own file
+/// (`drafter "in-trunk"`).
 pub fn drafter_source() -> Option<DrafterSource> {
-    if let Some(path) = std::env::var_os("CUCA_LOCAL_DRAFTER_PATH") {
-        return Some(path_source(path).into());
-    }
-    let name = env("CUCA_LOCAL_DRAFTER")?;
-    if name.eq_ignore_ascii_case("in-trunk") {
-        return Some(DrafterSource::InTrunk);
-    }
-    Some(
-        name.parse::<ModelSource>()
-            .unwrap_or_else(|e| panic!("CUCA_LOCAL_DRAFTER={name:?}: {e}"))
-            .into(),
-    )
+    model().drafter
 }
 
-/// The `draft_tokens` values of `CUCA_LOCAL_DRAFT_TOKENS`, comma-separated
-/// (default `[3]`).
+/// The `local { draft_tokens ... }` values (default `[3]`).
 pub fn draft_token_counts() -> Vec<usize> {
-    let Ok(value) = std::env::var("CUCA_LOCAL_DRAFT_TOKENS") else {
-        return vec![3];
-    };
-    value
-        .split(',')
-        .map(|v| {
-            v.trim()
-                .parse()
-                .unwrap_or_else(|e| panic!("CUCA_LOCAL_DRAFT_TOKENS={value:?}: {e}"))
-        })
-        .collect()
+    let counts = &test_config::get().local.draft_tokens;
+    if counts.is_empty() {
+        vec![3]
+    } else {
+        counts.clone()
+    }
 }
 
-/// `CUCA_LOCAL_ALLOW_MISMATCH`: report a CPU speculative output that differs
-/// from plain decoding instead of failing.
+/// `local { allow_mismatch #true }`: report a CPU speculative output that
+/// differs from plain decoding instead of failing.
 pub fn allow_mismatch() -> bool {
-    flag("CUCA_LOCAL_ALLOW_MISMATCH")
+    test_config::get().local.allow_mismatch
 }
 
-/// `CUCA_LOCAL_PERF`: run the long-prompt speed scenario.
+/// `local { perf #true }`: run the long-prompt speed scenario.
 pub fn perf() -> bool {
-    flag("CUCA_LOCAL_PERF")
+    test_config::get().local.perf
 }
 
-/// `CUCA_LOCAL_PERF_COLD`: no round of the speed scenario hits the prefix cache.
+/// `local { perf_cold #true }`: no round of the speed scenario hits the
+/// prefix cache.
 pub fn perf_cold() -> bool {
-    flag("CUCA_LOCAL_PERF_COLD")
+    test_config::get().local.perf_cold
 }
 
-/// The directory of transformers oracle dumps, `CUCA_LOCAL_REF_DIR`.
+/// The directory of transformers oracle dumps, `oracle { ref_dir ... }`.
 pub fn ref_dir() -> Option<PathBuf> {
-    std::env::var_os("CUCA_LOCAL_REF_DIR").map(PathBuf::from)
+    test_config::get().oracle.ref_dir.clone()
 }
 
-/// `CUCA_LOCAL_CONVERT_ONLY`: only the repositories containing this text.
+/// `oracle { convert_only ... }`: only the repositories containing this text.
 pub fn convert_only() -> Option<String> {
-    std::env::var("CUCA_LOCAL_CONVERT_ONLY").ok()
+    test_config::get().oracle.convert_only.clone()
 }
 
 /// The oracle dumps (`*.json` files) in `dir`; unreadable or unparsable files
@@ -290,10 +260,10 @@ pub fn oracle_dumps(dir: &Path) -> impl Iterator<Item = serde_json::Value> {
         .filter_map(|entry| serde_json::from_str(&std::fs::read_to_string(entry.path()).ok()?).ok())
 }
 
-/// Print `reply` as a `REPLY|...` line when `CUCA_LOCAL_PRINT_REPLIES` is set
+/// Print `reply` as a `REPLY|...` line under `local { print_replies #true }`
 /// (the diff of two runs is the regression check for attention or K/V changes).
 pub fn print_reply(reply: &impl Debug) {
-    if flag("CUCA_LOCAL_PRINT_REPLIES") {
+    if test_config::get().local.print_replies {
         println!("REPLY|{reply:?}");
     }
 }

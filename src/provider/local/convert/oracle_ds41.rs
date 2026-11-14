@@ -1,7 +1,7 @@
 //! The DeepSeek-V4.1 converter against the torch oracle's tiny release-format
 //! checkpoint (`.omp/local-models/ref/ds41/make_ref.py`, design §9.1).
 //!
-//! `CUCA_LOCAL_DS41_REF` names the oracle's output directory: `target/` is the
+//! `oracle { ds41 { oracle_dir "..." } }` in cuca-test.kdl names the oracle's output directory: `target/` is the
 //! checkpoint (FP8 e4m3 on 32x32 `ue8m0` grids, packed FP4 experts, Engram
 //! tables in e4m3 with a scale per 32 columns, bf16/f32 small tensors, a DSpark
 //! drafter, vision tensors to skip), `expected/main.safetensors` and
@@ -10,8 +10,8 @@
 //! name map), `expected/tensors.json` the storage type of each tensor and
 //! `expected/metadata_{main,dspark}.json` every metadata key with its type and
 //! value (the `ple.*` constants from numpy and the reference `engram.py`).
-//! Without the variable (or the directory) each test prints `SKIP:` and passes;
-//! `CUCA_REQUIRE_LIVE=1` makes it fail.
+//! Without the key (or the directory) each test prints `SKIP:` and passes;
+//! `require_live #true` makes it fail.
 //!
 //! At `quant = f16` with a bf16 Engram table every value is exact, so the
 //! converted tensors must equal the oracle's bit for bit; at the default
@@ -32,8 +32,10 @@ use crate::provider::local::{ConvertConfig, EngramQuant, WeightQuant};
 
 /// The oracle directory, or `None` after a `SKIP:` line.
 fn reference() -> Option<PathBuf> {
-    let Some(dir) = std::env::var_os("CUCA_LOCAL_DS41_REF").map(PathBuf::from) else {
-        skip("set CUCA_LOCAL_DS41_REF to the ds41 oracle directory");
+    let Some(dir) = crate::test_config::get().oracle.ds41.oracle_dir.clone() else {
+        skip(
+            "set `oracle { ds41 { oracle_dir \"...\" } }` in cuca-test.kdl to the ds41 oracle directory",
+        );
         return None;
     };
     if !dir.join("target").is_dir() || !dir.join("expected").is_dir() {

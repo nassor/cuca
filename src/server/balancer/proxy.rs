@@ -6,7 +6,7 @@
 //! | `GET /health` | `200` when at least one upstream is healthy, else `503`; lists every upstream |
 //! | `GET /v1/models` | the union of the healthy upstreams' models, each with the upstreams serving it |
 //! | `GET /version`, `GET /metrics` | as on a model server; the metrics are the balancer's |
-//! | `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `--stats-api` (`role: balancer`) |
+//! | `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `stats_api #true` (`role: balancer`) |
 //!
 //! # Proxying
 //!

@@ -36,7 +36,7 @@ Each GPU feature enables `provider-local` and `provider-local-gpu`, the shared G
 
 ## Authentication
 
-There is no API key and no auth header. The one credential is the optional Hugging Face token (`hf_token`, else `HF_TOKEN`), sent as a bearer token on downloads. The pinned preset files download anonymously.
+There is no API key and no auth header. The one credential is the optional Hugging Face token (`hf_token`, anonymous when `None` or empty), sent as a bearer token on downloads. The pinned preset files download anonymously.
 
 ## Entry points
 
@@ -47,7 +47,7 @@ There is no API key and no auth header. The one credential is the optional Huggi
 - `LocalModel::kv_cache_bytes()` returns the K/V block pool size in bytes. `LocalModel::weights_file_bytes()` returns the size of the GGUF the model runs from, every part of a split set added up, and `LocalModel::context_length()` the resolved context length. `LocalModel::serving_stats()` returns the scheduler counters (`ServingStats`).
 - `LocalModel::generate(UnifiedRequest)` runs one request without a client. It returns a `LocalGeneration`, a stream of `Result<MessageContentBlock, CucaError>` that keeps no copy of the blocks and runs no plugin hooks. After the stream ends, `LocalGeneration::report()` returns a `GenerationReport`: the exact `usage`, the prefix reuse as `prompt_cache`, the `finish_reason` (`stop` for the end token or a stop string, `length` when `max_tokens` or the context ran out) and `queue_secs`, the wait from dispatch to first admission. Dropping the `LocalGeneration` stops the request. The [server](@/server/_index.md) serves through this entry point.
 - `LocalModel::draft_stats()` returns the drafter counters. `LocalModel::expert_tier_stats()` and `LocalModel::expert_heat()` return the expert cache counters and the learned heat, `None` unless `LocalModelConfig::experts` is `ExpertPlacement::Tiered`. `LocalModel::engram_stats()` returns the Engram row cache counters (`EngramStats`), `None` unless the model has an Engram table. `LocalModel::layer_split()` returns `(layers on the GPU, layers in all)` under `gpu_layers`, else `None`.
-- `ModelSource::PRESETS`, `ModelSource::preset(name)`, `ModelSource::default_model()` and `ModelSource::hugging_face(repo, revision, file)` describe model sources. `ModelSource`, `LocalDevice`, `ExpertPlacement`, `BatchingConfig`, `WeightQuant`, `EngramQuant` and `EngramCache` implement `FromStr`.
+- `ModelSource::PRESETS`, `ModelSource::preset(name)`, `ModelSource::default_model()` and `ModelSource::hugging_face(repo, revision, file)` describe model sources. `ModelSource`, `LocalDevice`, `WeightQuant` and `EngramQuant` implement `FromStr`. `LocalModelConfig` and every type in it implement `serde::Deserialize`, which is how a KDL file fills them; see [KDL configuration](@/providers/local/configuration.md#kdl-configuration).
 
 <div class="dgm">
 <div class="dgm-scroll">
@@ -131,7 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The reply depends on the model and the sampling seed. `examples/local_model.rs` is the runnable version: it prints download progress on stderr, `Thinking` blocks as they arrive, and `loaded on <device>`. It reads the variables listed under [Environment variables](@/providers/local/configuration.md#environment-variables).
+The reply depends on the model and the sampling seed. `examples/local_model.rs` is the runnable version: it prints download progress on stderr, `Thinking` blocks as they arrive, and `loaded on <device>`. Its flags and the KDL file that fills `LocalModelConfig` are on [KDL configuration](@/providers/local/configuration.md#kdl-configuration).
 
 candle selects its quantized SIMD kernels when it compiles, so build for the host CPU. A generic build is several times slower.
 
@@ -147,14 +147,12 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 cargo run --release --example local_model --features provider-local
 ```
 
-To run another preset, set `CUCA_LOCAL_MODEL` first:
+To run another preset, pass a KDL file with `--config`:
 
-```bash,name=Linux and macOS: choose a preset
-export CUCA_LOCAL_MODEL="qwen3-0.6b-q8_0"
+```kdl,name=qwen.kdl
+source "qwen3-0.6b-q8_0"
 ```
 
-```powershell,name=Windows (PowerShell): choose a preset
-$env:CUCA_LOCAL_MODEL = "qwen3-0.6b-q8_0"
+```bash,name=Runs the same on all three platforms
+cargo run --release --example local_model --features provider-local -- --config qwen.kdl
 ```
-
-PowerShell keeps `$env:` values for the rest of the session; `Remove-Item Env:CUCA_LOCAL_MODEL` clears one.

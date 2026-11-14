@@ -5318,7 +5318,7 @@ fn attend(
 }
 
 /// The opened GPU device the kernel unit tests of the sibling modules run on:
-/// `None` (a `SKIP:` line) unless `CUCA_LOCAL_DEVICE` names a GPU.
+/// `None` (a `SKIP:` line) unless `local { model { device ... } }` in cuca-test.kdl names a GPU.
 #[cfg(test)]
 pub(super) fn kernel_test_device() -> Option<Device> {
     tests::test_device().map(|d| open_device(d).expect("the test device opens"))
@@ -5342,17 +5342,13 @@ mod tests {
         half::f16::from_f32(v).to_bits().to_le_bytes()
     }
 
-    /// The GPU devices under test, from `CUCA_LOCAL_DEVICE`: one device or a
-    /// `+`-separated list (`vulkan:0+vulkan:1`); empty (skip) when unset or
-    /// when the first is `cpu`.
+    /// The GPU devices under test, from `local { model { device ...; shards ... } }`
+    /// in cuca-test.kdl: the device then every shard; empty (skip) when no
+    /// `device` is written or when the first is `cpu`.
     fn test_devices() -> Vec<LocalDevice> {
-        let Ok(list) = std::env::var("CUCA_LOCAL_DEVICE") else {
-            return Vec::new();
-        };
-        let devices: Vec<LocalDevice> = list
-            .split('+')
-            .map(|d| d.trim().parse().expect("CUCA_LOCAL_DEVICE"))
-            .collect();
+        let devices = crate::test_config::get()
+            .local_devices()
+            .unwrap_or_default();
         if devices.first().is_none_or(|d| *d == LocalDevice::Cpu) {
             Vec::new()
         } else {
@@ -5365,7 +5361,9 @@ mod tests {
     pub(super) fn test_device() -> Option<LocalDevice> {
         let device = test_devices().first().copied();
         if device.is_none() {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            println!(
+                "SKIP: set `local {{ model {{ device ... }} }}` in cuca-test.kdl to a GPU device"
+            );
         }
         device
     }
@@ -5668,24 +5666,23 @@ mod tests {
     /// The converted real DeepSeek-V4.1-Flash on the GPU (dense weights and
     /// attention on the device, the experts host-tiered) against the
     /// streaming oracle of the CPU test (`cpu::real_tests`, same gates:
-    /// `CUCA_LOCAL_DS41_REAL`, `CUCA_CACHE_DIR`, `CUCA_LOCAL_DS41_REAL_RAM`
+    /// `oracle { ds41 { real_dir } }`, `cache_dir`, `oracle { ds41 { real_ram_gib } }`
     /// GiB of expert RAM, default 85). Without them it prints `SKIP:`.
     fn real_model_on_the_gpu(mode: &str, qdq: bool) -> Option<f64> {
         use super::super::cpu::real_tests::{prompt_ids, score, setup};
         let device = test_device()?;
         let (dir, model) = setup()?;
         let ids = prompt_ids(&dir);
-        let gib: u64 = std::env::var("CUCA_LOCAL_DS41_REAL_RAM")
-            .ok()
-            .and_then(|v| v.parse().ok())
+        let gib: u64 = crate::test_config::get()
+            .oracle
+            .ds41
+            .real_ram_gib
             .unwrap_or(85);
-        // `CUCA_LOCAL_DS41_REAL_GPU_LAYERS=n` runs the last `n` layers on the
+        // `oracle { ds41 { real_gpu_layers n } }` runs the last `n` layers on the
         // GPU and the rest on the CPU (layer offload), with a 3 GiB device
         // tier for the GPU half's experts; otherwise every layer is on the
         // GPU and the experts are host-tiered.
-        let split: Option<usize> = std::env::var("CUCA_LOCAL_DS41_REAL_GPU_LAYERS")
-            .ok()
-            .and_then(|v| v.parse().ok());
+        let split: Option<usize> = crate::test_config::get().oracle.ds41.real_gpu_layers;
         let experts = ExpertPlacement::Tiered(ExpertTiers {
             ram_bytes: gib << 30,
             device_bytes: if split.is_some() { 3 << 30 } else { 0 },
@@ -5802,33 +5799,33 @@ mod tests {
     }
 
     /// The real model through the paths the engine takes instead of the
-    /// oracle's one exact pass (`CUCA_LOCAL_DS41_REAL_PATHS=1`, same gates as
+    /// oracle's one exact pass (`oracle { ds41 { real_paths #true } }`, same gates as
     /// above): one inexact prefill, then a shorter prefill and the rest one
     /// token per step (the decode kernels), the exact pass again as the
     /// control, and the last position's logits alone, the prompt whole and in
     /// chunks of 4 rows. Each path's every-position logits are scored against
     /// the oracle's dumps; it fails when one disagrees. Quantization is off
-    /// unless `CUCA_LOCAL_DS41_REAL_QDQ` is set; `CUCA_LOCAL_DS41_REAL_CTX`
-    /// (default 64), `_SEQS` (1) and `_ROWS` (the context's call rows) size
+    /// unless `oracle { ds41 { real_qdq #true } }` is set; `real_ctx`
+    /// (default 64), `real_seqs` (1) and `real_rows` (the context's call rows) size
     /// the pools like the engine's.
     #[test]
     fn real_model_on_the_gpu_production_paths_match_the_oracle() {
         use super::super::cpu::real_tests::{prompt_ids, score, setup};
-        if std::env::var_os("CUCA_LOCAL_DS41_REAL_PATHS").is_none() {
+        let real = &crate::test_config::get().oracle.ds41;
+        if !real.real_paths {
             return;
         }
         let (Some(device), Some((dir, model))) = (test_device(), setup()) else {
             return;
         };
         let ids = prompt_ids(&dir);
-        let env =
-            |name: &str| -> Option<usize> { std::env::var(name).ok().and_then(|v| v.parse().ok()) };
-        let ctx = env("CUCA_LOCAL_DS41_REAL_CTX").unwrap_or(64);
-        let qdq = std::env::var_os("CUCA_LOCAL_DS41_REAL_QDQ").is_some();
+        let ctx = real.real_ctx.unwrap_or(64);
+        let qdq = real.real_qdq;
         let mode = if qdq { "on" } else { "off" };
         let sizing = Sizing {
-            max_sequences: env("CUCA_LOCAL_DS41_REAL_SEQS").unwrap_or(1),
-            max_rows: env("CUCA_LOCAL_DS41_REAL_ROWS")
+            max_sequences: real.real_seqs.unwrap_or(1),
+            max_rows: real
+                .real_rows
                 .unwrap_or_else(|| Sizing::single(ctx).max_rows),
             ..Sizing::single(ctx)
         };
@@ -5953,14 +5950,14 @@ mod tests {
     }
 
     /// Speed of the real model on the GPU with its experts in the RAM tier
-    /// (`CUCA_LOCAL_DS41_REAL_SPEED=1`, same gates as above): the prompt cold
+    /// (`oracle { ds41 { real_speed #true } }`, same gates as above): the prompt cold
     /// (every expert read from the file) and again warm, then one decode step
     /// repeated at the same position, which finds its experts in RAM. It
     /// prints `REAL|speed|...` and asserts nothing about the numbers.
     #[test]
     fn real_model_on_the_gpu_speed() {
         use super::super::cpu::real_tests::{prompt_ids, setup};
-        if std::env::var_os("CUCA_LOCAL_DS41_REAL_SPEED").is_none() {
+        if !crate::test_config::get().oracle.ds41.real_speed {
             return;
         }
         let (Some(device), Some((dir, model))) = (test_device(), setup()) else {
@@ -8886,11 +8883,13 @@ mod tests {
     /// dense specs' FFN width 96 is widened to 128, since a shard's FFN
     /// slice must be a multiple of 32 (a property of the tiny dimensions,
     /// not of the rule); the MoE specs' experts (64 wide) split as they are.
-    /// With one device in `CUCA_LOCAL_DEVICE`, both shards live on it.
+    /// With one device in `local { model { device ... } }`, both shards live on it.
     #[test]
     fn gpu_sharded_matches_single_device() {
         let Some(devices) = two_test_devices() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device (`a+b` for two)");
+            println!(
+                "SKIP: set `local {{ model {{ device ...; shards ... }} }}` in cuca-test.kdl to a GPU device (`shards` for the second)"
+            );
             return;
         };
         for (label, options) in [
@@ -9051,7 +9050,9 @@ mod tests {
     #[test]
     fn gpu_all_reduce_adds_in_shard_order() {
         let Some(mut locals) = two_test_devices() else {
-            println!("SKIP: set CUCA_LOCAL_DEVICE to a GPU device");
+            println!(
+                "SKIP: set `local {{ model {{ device ... }} }}` in cuca-test.kdl to a GPU device"
+            );
             return;
         };
         let first = locals[0];

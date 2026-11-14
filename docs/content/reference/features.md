@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Thirty-four opt-in features: eight providers, five <code>provider-local</code> GPU features, twelve plugins, seven services, two server features</dd>
+<dd>Thirty-five opt-in features: eight providers, five <code>provider-local</code> GPU features, twelve plugins, seven services, the <code>config-kdl</code> reader and two server features</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -41,7 +41,7 @@ Eight features: seven HTTP adapters and one in-process engine. Each `dep:` entry
 | `provider-llamacpp` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-vllm` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
 | `provider-lmstudio` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-local` | `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:sysinfo`, `dep:tokio`, `dep:tokenizers`, `dep:unicode-general-category`, `reqwest/rustls`, `serde_json/preserve_order` |
+| `provider-local` | `config-kdl`, `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:sysinfo`, `dep:tokio`, `dep:tokenizers`, `dep:unicode-general-category`, `dep:wide`, `reqwest/rustls`, `serde_json/preserve_order` |
 
 `provider-local` does not use `tokio-stream`: its stream is a plain mpsc receiver. It uses `reqwest` only for the one-time model download, `sysinfo` only for the free-space check of the converter's output volume, and `tokenizers` only for the converter's DeepSeek-V4.1 Engram token map; the engine's own tokenizer is hand-written. `serde_json/preserve_order` keeps JSON maps in the order the caller wrote them, which chat templates see.
 
@@ -97,13 +97,17 @@ Seven features. A service is driven by direct method calls and never implements 
 | `service-vector-store` | `plugin-memory`, `dep:wide` |
 | `service-scheduler` | `dep:tokio`, `dep:tracing` |
 
+## Configuration feature
+
+One feature, `config-kdl = ["dep:kdl"]`. It compiles the KDL reader of `cuca::config`: `from_kdl_str`, `from_kdl_str_with_vars`, `load_kdl_str` and `load_kdl_file`. `provider-local` and `server` enable it, so a build with either has the reader. The `cuca::config` helpers (`one_or_many`, `from_str`, `size`, `duration`, `ConfigValue`) compile in every build. See [Configuration files](@/reference/environment.md).
+
 ## Server features
 
-Two features, described under [Server](@/server/_index.md). Neither is a provider; `server` enables `provider-local`, so it satisfies the provider gate.
+Two features, described under [Server](@/server/_index.md). Neither is a provider; `server` enables `provider-local` and `config-kdl`, so it satisfies the provider gate.
 
 | Feature | Enables |
 |---|---|
-| `server` | `provider-local`, `dep:axum`, `dep:clap`, `dep:tracing`, `dep:tracing-subscriber`, `dep:sysinfo`, `dep:nvml-wrapper`, `dep:wmi`, `dep:winreg`, `dep:toml`, `dep:getrandom`, `dep:tokio-stream`, `tokio/net`, `tokio/rt-multi-thread`, `tokio/signal`, `tokio/io-util` |
+| `server` | `provider-local`, `config-kdl`, `dep:axum`, `dep:clap`, `dep:tracing`, `dep:tracing-subscriber`, `dep:sysinfo`, `dep:nvml-wrapper`, `dep:wmi`, `dep:winreg`, `dep:getrandom`, `dep:tokio-stream`, `tokio/net`, `tokio/rt-multi-thread`, `tokio/signal`, `tokio/io-util` |
 | `server-tui` | `server`, `dep:ratatui`, `dep:crossterm` |
 
 ## Feature edges
@@ -160,13 +164,13 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `burn-cubecl` | `0.22` | `std`, `fusion`, `autotune`; no defaults | `provider-local-gpu` |
 | `cubecl` | `0.11` | `stdlib`; no defaults | `provider-local-gpu` |
 | `axum` | `0.8` | `tokio`, `http1`, `json`, `query`, `matched-path`; no defaults | `server` |
-| `clap` | `4` | `derive`, `env` | `server` |
+| `clap` | `4` | `derive` | `server` |
 | `tracing-subscriber` | `0.3` | `env-filter`, `json` | `server` |
 | `sysinfo` | `0.40` | `system`, `disk`; no defaults | `provider-local` (the converter's free-space check), `server` |
 | `nvml-wrapper` | `0.13` | default | `server` (NVIDIA, loaded at run time) |
 | `wmi` | `0.18` | no defaults | `server`, Windows only (GPU counters) |
 | `winreg` | `0.56` | default | `server`, Windows only (adapter table) |
-| `toml` | `1` | default | `server` (`--config`) |
+| `kdl` | `6.7` | `span`; no defaults | `config-kdl` (the KDL parser with source spans; its own `serde` mapping stays off) |
 | `ratatui` | `0.30` | default | `server-tui` |
 | `crossterm` | `0.29` | default | `server-tui` |
 
@@ -183,7 +187,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 - The Vulkan and Metal backends are Rust (wgpu: SPIR-V, MSL). Every GPU feature still compiles C, because CubeCL's runtime pulls an embedded store (`turso`) that builds C through `cc`.
 - On Windows, a dependency's build script runs the SDK resource compiler (`rc.exe`; `windres` on the GNU target) for the GPU features.
 - `provider-local-cuda` and `provider-local-rocm` pull CubeCL's LLVM backend. Its build script, `tracel-llvm-bundler`, downloads a prebuilt LLVM on the first build (network needed once, then cached) and links it statically.
-- docs.rs builds have no network, so the `[package.metadata.docs.rs]` feature list names every feature except those two: thirty-two of the thirty-four.
+- docs.rs builds have no network, so the `[package.metadata.docs.rs]` feature list names every feature except those two: thirty-three of the thirty-five.
 
 ### Dev dependencies
 
@@ -203,7 +207,7 @@ Five crates compile in every build. They carry the public wire types, the SSE pa
 | `export` | `plugin-memory` or `service-prompt-cache` |
 | `cost_otel` | `plugin-cost` and `plugin-telemetry` |
 
-Every other public module compiles unconditionally: `types`, `error`, `request`, `session`, `sse`, `plugin`, `plugins`, `services`, `client`. The `plugins` and `services` modules are always present. Their submodules are individually gated, so each is empty when none of its features is on. The `provider` module is `pub(crate)`.
+Every other public module compiles unconditionally: `types`, `error`, `config`, `request`, `session`, `sse`, `plugin`, `plugins`, `services`, `client`. The `plugins` and `services` modules are always present. Their submodules are individually gated, so each is empty when none of its features is on. The `provider` module is `pub(crate)`.
 
 ## Crate metadata
 
@@ -267,7 +271,7 @@ Examples live in `examples/<name>.rs`.
 | `local_gpu_llvm` | `cargo check --all-targets --no-default-features --features provider-local-cuda,provider-local-rocm`; the only job that downloads the LLVM bundle |
 | `plugin_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<plugin>`, once per plugin feature (twelve) |
 | `service_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<service>`, once per service feature (seven) |
-| `server_solo` | `cargo check --all-targets --no-default-features --features <feature>`, once for `server` and once for `server-tui`; neither names another provider |
+| `server_solo` | `cargo check --all-targets --no-default-features --features <feature>`, once for `server` and once for `server-tui`, plus the leg `provider-openai,config-kdl`, which checks the KDL reader without `provider-local` |
 | `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, a `crate::services` path, or a `plugins::` path for `prompt_cache`, `entity_extraction`, `replay` or `rate_limit` |
 
 All jobs run on `ubuntu-latest`. `ALL_NO_LLVM` is a top-level `env` entry in `.github/workflows/ci.yml`, the same list as the docs.rs feature set: every feature except `provider-local-cuda` and `provider-local-rocm`. The run steps expand it as `$ALL_NO_LLVM`.

@@ -2765,6 +2765,7 @@ dependencies = [
  "getrandom 0.4.3",
  "half",
  "jsonschema",
+ "kdl",
  "memchr",
  "minijinja",
  "minijinja-contrib",
@@ -2784,7 +2785,6 @@ dependencies = [
  "tokenizers",
  "tokio",
  "tokio-stream",
- "toml 1.1.6+spec-1.1.0",
  "tracing",
  "tracing-subscriber",
  "unicode-general-category",
@@ -4822,6 +4822,17 @@ dependencies = [
  "hashbrown 0.17.1",
  "portable-atomic",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "kdl"
+version = "6.7.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "082ddf81b2acd76fe04412655d17befedfff1837db772f8e74c38050d25ed670"
+dependencies = [
+ "miette",
+ "num-traits",
+ "winnow 0.7.15",
 ]
 
 [[package]]
@@ -10195,6 +10206,9 @@ name = "winnow"
 version = "0.7.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "winnow"

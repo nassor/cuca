@@ -202,7 +202,7 @@ let client = CucaClient::builder()
 cargo run --example redaction --features "provider-llamacpp plugin-redaction"
 ```
 
-It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at another OpenAI-compatible server.
+It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, retarget it at another OpenAI-compatible server.
 
 ```text,name=Expected output
 Policy: 4 rules, match cap 1024 matches per string

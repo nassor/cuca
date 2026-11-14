@@ -122,8 +122,8 @@ cargo test --no-default-features --features provider-openai
 ```
 
 The integration suite is server-dependent and skips what it cannot reach. Its
-feature list, its three environment variables and how to make a skip fail
-loudly are in
+feature list, the `cuca-test.kdl` file that configures it and how to make a
+skip fail loudly are in
 [Run the live integration suite](@/guides/integration-tests.md).
 
 Next page: [The unified request and stream](@/concepts/unified-request.md),

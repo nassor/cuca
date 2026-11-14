@@ -87,7 +87,7 @@ A denial is not an error. It is a `ToolResult` in the stream.
 
 ## Example
 
-`examples/hitl.rs` runs one policy that approves a note bound for the `scratch` notebook and denies the same tool aimed at `audit`. The application executes only the approved call, and the audit log prints both rulings. It needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+`examples/hitl.rs` runs one policy that approves a note bound for the `scratch` notebook and denies the same tool aimed at `audit`. The application executes only the approved call, and the audit log prints both rulings. It needs a `llama-server` on port 1234 with the demo model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
 
 ```rust,name=An approval policy and its registration, from examples/hitl.rs
 struct NotebookPolicy;

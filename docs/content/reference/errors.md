@@ -90,9 +90,9 @@ Unsupported sampling fields, raised when the request body is built, before any n
 
 `provider-local` configuration, raised by `LocalModel::load` and the local dispatch. [Local limits and errors](@/providers/local/limits-and-errors.md#errors) lists the causes:
 
-- `cannot resolve a model cache directory; set LocalModelConfig::cache_dir or CUCA_CACHE_DIR`.
+- `cannot resolve a model cache directory; set LocalModelConfig::cache_dir`.
 - ``invalid model {label} `{value}`: it must be a relative `/`-separated path of plain segments``; `` `{path}` has no parent directory``.
-- `` unknown model `{s}`: expected a preset (...), `repo:revision:file` (a GGUF), or `repo:revision` (a checkpoint)`` and `` unknown local device `{s}`; expected cpu, vulkan[:<n>|:integrated:<n>], metal[...], cuda[:<n>] or rocm[:<n>]``; `` unknown batching `{s}`; expected a comma-separated subset of seqs=<n>,kv=<tokens>,step=<tokens>,prefix=on|off``; `empty device list`.
+- `` unknown model `{s}`: expected a preset (...), `repo:revision:file` (a GGUF), or `repo:revision` (a checkpoint)`` and `` unknown local device `{s}`; expected cpu, vulkan[:<n>|:integrated:<n>], metal[...], cuda[:<n>] or rocm[:<n>]``.
 - ``device {device:?} requires the `{feature}` cargo feature`` for a GPU device compiled out; `device {device:?} is not available`.
 - `context_length must be at least 1`, and `context_length {n} exceeds the model maximum {max}`.
 - `sampling.temperature must be a finite value >= 0, got T`, `sampling.top_p must be a finite value in (0, 1], got P`, and for a request `temperature must be a finite value >= 0, got T` and `top_p must be a finite value in (0, 1], got P`.
@@ -102,7 +102,17 @@ Unsupported sampling fields, raised when the request body is built, before any n
 - `DrafterSource::InTrunk runs on the CPU only, not on {device:?}`, and `draft_tokens must be in 1..=16, got N` when a drafter is set.
 - Expert placement: `experts.loader_threads must be in 1..=64, got N`, `experts: on {device:?} set device_bytes (a device tier) or ram_bytes (host-tiered: the CPU computes the experts from the RAM tier)` for a GPU with both at 0, `experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu`, `experts.ram_bytes must be greater than 0 on LocalDevice::Cpu` and `ExpertPlacement::Host keeps the experts on the CPU for a GPU device; the CPU device already does`.
 - Split GGUF parts and templates: `is not named like a split GGUF part (...) but the source lists N parts`, ``the parts of `{file}` must be [...] in order, got [...]`` and ``chat template `{path}` is not UTF-8``.
-- Engram and conversion: `engram.ram_bytes must be in 1048576..=1099511627776 (1 MiB to 1 TiB), got N`, `engram.reader_threads must be in 1..=64, got N`, ``unknown engram cache `{s}`; expected a comma-separated subset of ram=<size>,threads=<n>``, ``unknown Engram quantization `{s}`; expected q8_0, q4_0 or bf16``, and ``converting {what} writes X GB into `{dir}`, which has Y GB free; ...`` when the output volume of a DeepSeek-V4.1 conversion is too small.
+- Engram and conversion: `engram.ram_bytes must be in 1048576..=1099511627776 (1 MiB to 1 TiB), got N`, `engram.reader_threads must be in 1..=64, got N`, ``unknown Engram quantization `{s}`; expected q8_0, q4_0 or bf16``, and ``converting {what} writes X GB into `{dir}`, which has Y GB free; ...`` when the output volume of a DeepSeek-V4.1 conversion is too small.
+
+With `config-kdl`, the KDL reader raises `CucaError::Config` for a configuration file. Every message that concerns a file opens with its path, for example ``reading `cuca.kdl`: ...``.
+
+- `parsing KDL: <line>:<column>: ...` for a document that is not valid KDL or breaks a mapping rule: a repeated property, `#null`, a type annotation.
+- A `${NAME}` placeholder that is neither declared in `variables` nor set in the environment and has no default; an unclosed `${`; a cyclic declaration.
+- `variables block must be name/string pairs: ...` and a declared name outside `[A-Za-z0-9_]`.
+- `configuration: ...` when the document does not match the struct, with the offending key named for an unknown key.
+- `` expected a byte count such as `4294967296`, `512m` or `4g` `` and `` expected a duration such as `500ms`, `60s`, `5m` or `1h` `` for a `size` or `duration` value.
+
+An unreadable `LocalModelConfig::chat_template_file` raises `CucaError::Io` with ``reading chat template `{path}`: {error}``.
 
 ## `PluginError`
 

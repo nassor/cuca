@@ -229,6 +229,7 @@
 //! Apple M4/M5 Max (the Muse Glimmer assistant's model card).
 
 mod chat;
+mod config_de;
 mod convert;
 mod download;
 mod engine;
@@ -248,6 +249,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_core::Stream;
+use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use self::chat::{ChatFormat, ChatTemplate, chat_prompt};
@@ -724,7 +726,8 @@ const PRESET_TABLE: &[ModelPreset] = &[
 /// other file. A source also parses from a string (`str::parse`): a preset
 /// name (ASCII case-insensitive), `repo:revision:file` (a GGUF) or
 /// `repo:revision` (a checkpoint).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ModelSource {
     /// A file hosted on Hugging Face, downloaded once into the cache and
     /// pinned to an exact `revision`.
@@ -743,6 +746,11 @@ pub enum ModelSource {
         /// (named by `parts`, or derived from `file` and unverified when
         /// `parts` is empty) into the cache and opens the set from the first
         /// part; nothing is merged. `parts[0]` must be `file`.
+        #[serde(
+            default,
+            rename = "part",
+            deserialize_with = "crate::config::one_or_many"
+        )]
         parts: Vec<ModelPart>,
         /// A chat template file that replaces the GGUF's embedded one (see
         /// [`LocalModelConfig::chat_template`], which wins over it);
@@ -775,7 +783,8 @@ pub enum ModelSource {
 
 /// One file of a split GGUF set on Hugging Face, see
 /// [`ModelSource::HuggingFace::parts`](ModelSource).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelPart {
     /// File name inside the repository.
     pub file: String,
@@ -785,7 +794,8 @@ pub struct ModelPart {
 
 /// A chat template file on Hugging Face, see
 /// [`ModelSource::HuggingFace::template`](ModelSource).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelTemplate {
     /// Repository id the file is read from.
     pub repo: String,
@@ -901,7 +911,8 @@ impl std::str::FromStr for ModelSource {
 /// [`LocalModel::sampling`] reports what the load resolved to. A request
 /// `seed` restarts the generator for that request only; the load-time `seed`
 /// restarts it for every request.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct SamplingConfig {
     /// Softmax temperature; `Some(0.0)` selects the greedy argmax.
     pub temperature: Option<f32>,
@@ -1199,7 +1210,8 @@ impl std::str::FromStr for EngramQuant {
 
 /// How a safetensors checkpoint ([`ModelSource::Checkpoint`],
 /// [`ModelSource::Dir`]) is converted to GGUF; ignored for GGUF sources.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ConvertConfig {
     /// Precision of the weight matrices; [`WeightQuant::Q8_0`] by default.
     /// Each precision is converted once and cached next to the others.
@@ -1216,13 +1228,11 @@ pub struct ConvertConfig {
 /// Where a mixture-of-experts model's routed experts live
 /// ([`LocalModelConfig::experts`]); see [`ExpertTiers`].
 ///
-/// Also parses from a string (`str::parse`, ASCII case-insensitive):
-/// `resident`, or `tiered:` followed by comma-separated `ram=<size>`,
-/// `device=<size>` and `threads=<n>` in any order (each at most once), where
-/// `<size>` is a byte count with an optional `k`, `m` or `g` suffix (powers
-/// of 1024): `tiered:ram=4g`, `tiered:device=6g,ram=12g,threads=8`; or
-/// `host` / `host:layers=<n>` ([`ExpertPlacement::Host`]).
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// In KDL: `experts "resident"`, `experts { tiered ram_bytes="4g"
+/// device_bytes="6g" loader_threads=8 }`, `experts { host layers=4 }` or
+/// `experts { host }`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExpertPlacement {
     /// Every expert is loaded at startup and stays in RAM (CPU) or device
     /// memory (GPU): memory is the file size.
@@ -1287,15 +1297,18 @@ pub enum ExpertPlacement {
 /// CPU, to float rounding on a GPU). [`LocalModel::expert_tier_stats`] reports hits, reads and resident
 /// bytes; [`LocalModel::expert_heat`] exports the learned heat, which
 /// `warm_from` feeds back in a later session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExpertTiers {
     /// Bytes of RAM for cached experts. Required on [`LocalDevice::Cpu`]
     /// (at least `n_used` experts per layer); on a GPU device `0` disables
     /// the RAM tier, any other value must hold `n_used` experts per layer.
+    #[serde(deserialize_with = "crate::config::size")]
     pub ram_bytes: u64,
     /// Bytes of device memory for cached experts on a GPU device (required
     /// there, at least `n_used` experts per layer); must be `0` on
     /// [`LocalDevice::Cpu`].
+    #[serde(deserialize_with = "crate::config::size")]
     pub device_bytes: u64,
     /// Disk reader threads, `1..=64` (default 4).
     pub loader_threads: usize,
@@ -1322,90 +1335,6 @@ impl Default for ExpertTiers {
     }
 }
 
-/// The entries of a comma-separated `key=value` list, each key at most once.
-/// `apply` takes each entry in order and returns `None` to reject it; the
-/// result is `None` when an entry has no `=`, repeats a key or is rejected.
-fn parse_pairs(list: &str, mut apply: impl FnMut(&str, &str) -> Option<()>) -> Option<()> {
-    let mut seen = Vec::new();
-    for part in list.split(',') {
-        let (key, value) = part.split_once('=')?;
-        if seen.contains(&key) {
-            return None;
-        }
-        seen.push(key);
-        apply(key, value)?;
-    }
-    Some(())
-}
-
-/// A byte count with an optional `k`, `m` or `g` suffix (powers of 1024).
-fn parse_size(text: &str) -> Option<u64> {
-    let (digits, shift) = match text.as_bytes().last()? {
-        b'k' => (&text[..text.len() - 1], 10),
-        b'm' => (&text[..text.len() - 1], 20),
-        b'g' => (&text[..text.len() - 1], 30),
-        _ => (text, 0),
-    };
-    digits.parse::<u64>().ok()?.checked_mul(1u64 << shift)
-}
-
-impl ExpertPlacement {
-    /// `text` (lowercase) as a placement; `None` when it is not one.
-    fn parse(text: &str) -> Option<Self> {
-        let Some((kind, list)) = text.split_once(':') else {
-            return match text {
-                "resident" => Some(Self::Resident),
-                "host" => Some(Self::Host { layers: None }),
-                _ => None,
-            };
-        };
-        match kind {
-            "host" => {
-                let mut layers = None;
-                parse_pairs(list, |key, value| match key {
-                    "layers" => {
-                        layers = Some(value.parse().ok()?);
-                        Some(())
-                    }
-                    _ => None,
-                })?;
-                Some(Self::Host { layers })
-            }
-            "tiered" => {
-                let mut tiers = ExpertTiers::default();
-                let mut sized = false;
-                parse_pairs(list, |key, value| {
-                    match key {
-                        "ram" => tiers.ram_bytes = parse_size(value)?,
-                        "device" => tiers.device_bytes = parse_size(value)?,
-                        "threads" => tiers.loader_threads = value.parse().ok()?,
-                        _ => return None,
-                    }
-                    sized |= key != "threads";
-                    Some(())
-                })?;
-                sized.then_some(Self::Tiered(tiers))
-            }
-            _ => None,
-        }
-    }
-}
-
-/// Parses `resident`, `host[:layers=<n>]` or `tiered:<key>=<value>,...`; see
-/// [`ExpertPlacement`].
-impl std::str::FromStr for ExpertPlacement {
-    type Err = CucaError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let s = s.trim();
-        Self::parse(&s.to_ascii_lowercase()).ok_or_else(|| {
-            CucaError::Config(format!(
-                "unknown expert placement `{s}`; expected resident, host[:layers=<n>] or tiered:ram=<size>[,device=<size>][,threads=<n>]"
-            ))
-        })
-    }
-}
-
 /// The row cache and the readers of an Engram table
 /// ([`LocalModelConfig::engram`]).
 ///
@@ -1426,14 +1355,13 @@ impl std::str::FromStr for ExpertPlacement {
 ///
 /// The values do not change the model's output, only how fast it runs.
 /// [`LocalModel::engram_stats`] reports the lookups, hits and reads. A model
-/// without an Engram table ignores the setting. Parses from a string
-/// (`str::parse`): `ram=<size>` and `threads=<n>` in any order, each at most
-/// once, `<size>` a byte count with an optional `k`, `m` or `g` suffix
-/// (powers of 1024): `ram=8g,threads=32`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// without an Engram table ignores the setting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct EngramCache {
     /// Bytes of RAM for cached rows, `1 MiB..=1 TiB` (default 4 GiB: about 15
     /// million Q8_0 rows).
+    #[serde(deserialize_with = "crate::config::size")]
     pub ram_bytes: u64,
     /// Disk reader threads, `1..=64` (default 16).
     pub reader_threads: usize,
@@ -1482,47 +1410,30 @@ impl EngramCache {
     }
 }
 
-/// Parses `ram=<size>` and `threads=<n>` (any subset, ASCII
-/// case-insensitive); see [`EngramCache`]. The result is not validated:
-/// [`LocalModel::load`] does that.
-impl std::str::FromStr for EngramCache {
-    type Err = CucaError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let mut cache = Self::default();
-        let lower = s.trim().to_ascii_lowercase();
-        if lower.is_empty() {
-            return Ok(cache);
-        }
-        parse_pairs(&lower, |key, value| {
-            match key {
-                "ram" => cache.ram_bytes = parse_size(value)?,
-                "threads" => cache.reader_threads = value.parse().ok()?,
-                _ => return None,
-            }
-            Some(())
-        })
-        .ok_or_else(|| {
-            CucaError::Config(format!(
-                "unknown engram cache `{s}`; expected a comma-separated subset of ram=<size>,threads=<n>"
-            ))
-        })?;
-        Ok(cache)
-    }
-}
-
 /// Configuration for [`LocalModel::load`].
 ///
-/// `Debug` redacts `hf_token`.
-#[derive(Clone)]
+/// With the `config-kdl` feature (on with `provider-local`) the whole struct
+/// reads from a KDL document through [`crate::config::load_kdl_file`]: each
+/// field is a node of its own name, a nested struct a node with properties or
+/// children, a device, quantization or source a string (`source
+/// "qwen3-0.6b-q8_0"`, `device "vulkan:0"`), a byte count an integer or a
+/// string with a `k`, `m` or `g` suffix. `on_download_progress` has no KDL
+/// form. `Debug` redacts `hf_token`.
+#[derive(Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct LocalModelConfig {
-    /// Where the GGUF file comes from.
+    /// Where the GGUF file comes from. In KDL a string is a preset name,
+    /// `repo:revision:file` or `repo:revision`; a path is written `source
+    /// file="..."` or `source dir="..."`.
+    #[serde(deserialize_with = "config_de::source")]
     pub source: ModelSource,
-    /// Cache directory for downloads; `None` resolves `CUCA_CACHE_DIR`, then
-    /// the platform cache directory.
+    /// Cache directory for downloads and conversions; `None` uses the
+    /// platform cache directory (`%LOCALAPPDATA%\cuca` on Windows,
+    /// `~/Library/Caches/cuca` on macOS, `$XDG_CACHE_HOME/cuca` or
+    /// `~/.cache/cuca` elsewhere).
     pub cache_dir: Option<PathBuf>,
-    /// Hugging Face access token; `None` falls back to the `HF_TOKEN`
-    /// environment variable, then to anonymous access.
+    /// Hugging Face access token for gated or private repositories; `None`
+    /// or an empty string downloads anonymously.
     pub hf_token: Option<String>,
     /// Maximum tokens of prompt plus completion per request. The K/V block
     /// pools hold twice this many positions per full-attention layer group
@@ -1547,12 +1458,19 @@ pub struct LocalModelConfig {
     /// embeds. Everything derived from the template follows the override:
     /// the reasoning markers, the tool-call syntax, the end-of-turn tokens
     /// and the `enable_thinking`/`reasoning_effort` variables. It wins over
-    /// the template a preset pins ([`ModelPreset::template`]). A template
+    /// [`chat_template_file`](Self::chat_template_file) and over the template
+    /// a preset pins ([`ModelPreset::template`]). A template
     /// that does not compile, or fails to render a one-message
     /// conversation, makes [`LocalModel::load`] fail with
-    /// [`CucaError::Config`]. `None` (the default) uses the preset's
-    /// pinned template, else the GGUF's.
+    /// [`CucaError::Config`]. `None` (the default) uses
+    /// `chat_template_file`, else the preset's pinned template, else the
+    /// GGUF's.
     pub chat_template: Option<String>,
+    /// A file holding the Jinja chat template, read at load: the same
+    /// override as [`chat_template`](Self::chat_template), which wins over it.
+    /// A file that cannot be read fails [`LocalModel::load`] with
+    /// [`CucaError::Io`] naming it.
+    pub chat_template_file: Option<PathBuf>,
     /// Where the forward pass runs; [`LocalDevice::Cpu`] by default.
     pub device: LocalDevice,
     /// Optional multi-token-prediction drafter for self-speculative decoding:
@@ -1570,7 +1488,8 @@ pub struct LocalModelConfig {
     /// verification cost, measured on the running device; a run with a fixed
     /// `seed` and a temperature above 0 always drafts exactly `draft_tokens`.
     pub draft_tokens: usize,
-    /// Optional download progress observer.
+    /// Optional download progress observer; no KDL form.
+    #[serde(skip)]
     pub on_download_progress: Option<DownloadProgressCallback>,
     /// Where a mixture-of-experts model's experts live:
     /// [`ExpertPlacement::Resident`] (the default) keeps every expert in
@@ -1598,7 +1517,9 @@ pub struct LocalModelConfig {
     /// and the FFN widths must divide by the device count (a model with
     /// fewer K/V heads than devices, such as Gemma 4 E2B with one, keeps a
     /// copy of each K/V head on every device), a delta-net (hybrid) layer or
-    /// a full-width Q/K norm cannot be split. See [`LocalModelConfig::set_devices`].
+    /// a full-width Q/K norm cannot be split. In KDL: `device "vulkan:0"` and
+    /// `shards "vulkan:1"` (several shards as several arguments).
+    #[serde(deserialize_with = "crate::config::one_or_many")]
     pub shards: Vec<LocalDevice>,
     /// Layer offload (llama.cpp's `-ngl`): run only this many transformer
     /// layers on [`device`](Self::device) and the rest on the CPU, for a
@@ -1633,6 +1554,7 @@ pub struct LocalModelConfig {
     /// converted checkpoint's parts are written next to its model file
     /// (`<cache>/converted/`), so this is for GGUF sets you place yourself
     /// (`ModelSource::File` naming the first part).
+    #[serde(deserialize_with = "crate::config::one_or_many")]
     pub shard_dirs: Vec<PathBuf>,
 }
 
@@ -1645,6 +1567,7 @@ impl Default for LocalModelConfig {
             context_length: None,
             sampling: SamplingConfig::default(),
             chat_template: None,
+            chat_template_file: None,
             device: LocalDevice::Cpu,
             drafter: None,
             draft_tokens: DEFAULT_DRAFT_TOKENS,
@@ -1657,29 +1580,6 @@ impl Default for LocalModelConfig {
             engram: EngramCache::default(),
             shard_dirs: Vec::new(),
         }
-    }
-}
-
-impl LocalModelConfig {
-    /// Set [`device`](Self::device) and [`shards`](Self::shards) from a
-    /// `+`-separated list of devices (the syntax of `CUCA_LOCAL_DEVICE` in the
-    /// tests and the example): `vulkan:0` is one device, `vulkan:0+vulkan:1`
-    /// splits the model over two. The first device is `device`, the rest are
-    /// the shards; each parses as a [`LocalDevice`].
-    ///
-    /// # Errors
-    ///
-    /// [`CucaError::Config`] for an empty list or an entry that is not a
-    /// device; the configuration is left unchanged.
-    pub fn set_devices(&mut self, list: &str) -> Result<(), CucaError> {
-        let mut devices = list.split('+').map(|d| d.trim().parse::<LocalDevice>());
-        let first = devices
-            .next()
-            .ok_or_else(|| CucaError::Config("empty device list".into()))??;
-        let rest = devices.collect::<Result<Vec<_>, _>>()?;
-        self.device = first;
-        self.shards = rest;
-        Ok(())
     }
 }
 
@@ -1698,6 +1598,7 @@ impl fmt::Debug for LocalModelConfig {
                     .as_ref()
                     .map(|t| format!("<{} bytes>", t.len())),
             )
+            .field("chat_template_file", &self.chat_template_file)
             .field("device", &self.device)
             .field("drafter", &self.drafter)
             .field("draft_tokens", &self.draft_tokens)
@@ -1959,10 +1860,9 @@ pub struct ServingStats {
 /// How the engine serves concurrent requests: a step scheduler that runs the
 /// decode rows of several sequences, and chunks of prompts being prefilled,
 /// in one forward pass over one shared K/V block pool (see the local-provider
-/// module docs). `FromStr` parses `seqs=4,kv=16384,step=256,prefix=off` (any
-/// subset; `kv` and `step` in tokens, `prefix` is `on`/`off`), which the
-/// tests and the example read from `CUCA_LOCAL_BATCHING`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// module docs).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BatchingConfig {
     /// Most sequences running at once, `1..=64` (default 4). Each running
     /// sequence of a hybrid model (Qwen 3.5) also holds its own recurrent
@@ -2000,41 +1900,6 @@ impl Default for BatchingConfig {
             max_step_tokens: None,
             prefix_cache: true,
         }
-    }
-}
-
-impl std::str::FromStr for BatchingConfig {
-    type Err = CucaError;
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let bad = || {
-            CucaError::Config(format!(
-                "unknown batching `{s}`; expected a comma-separated subset of seqs=<n>,kv=<tokens>,step=<tokens>,prefix=on|off"
-            ))
-        };
-        let mut config = Self::default();
-        let lower = s.trim().to_ascii_lowercase();
-        if lower.is_empty() {
-            return Ok(config);
-        }
-        parse_pairs(&lower, |key, value| {
-            match key {
-                "seqs" => config.max_sequences = value.parse().ok()?,
-                "kv" => config.kv_tokens = Some(value.parse().ok()?),
-                "step" => config.max_step_tokens = Some(value.parse().ok()?),
-                "prefix" => {
-                    config.prefix_cache = match value {
-                        "on" | "true" | "1" => true,
-                        "off" | "false" | "0" => false,
-                        _ => return None,
-                    }
-                }
-                _ => return None,
-            }
-            Some(())
-        })
-        .ok_or_else(bad)?;
-        Ok(config)
     }
 }
 
@@ -2452,10 +2317,9 @@ fn validate_experts(config: &LocalModelConfig) -> Result<(), CucaError> {
     }
 }
 
-/// The cache directory: [`LocalModelConfig::cache_dir`], else
-/// `CUCA_CACHE_DIR`, else the platform's.
+/// The cache directory: [`LocalModelConfig::cache_dir`], else the platform's.
 fn cache_root(config: &LocalModelConfig) -> Result<PathBuf, CucaError> {
-    download::resolve_cache_dir(config.cache_dir.as_deref(), &|key| std::env::var_os(key))
+    download::resolve_cache_dir(config.cache_dir.as_deref())
 }
 
 /// A private current-thread runtime and HTTP client for one download. Drop
@@ -2694,7 +2558,8 @@ fn convert_cached(
 }
 
 /// The chat template that replaces the GGUF's, if any:
-/// [`LocalModelConfig::chat_template`], else the file the source pins
+/// [`LocalModelConfig::chat_template`], else the text of
+/// [`LocalModelConfig::chat_template_file`], else the file the source pins
 /// ([`ModelSource::HuggingFace::template`](ModelSource), downloaded and
 /// checked against its digest once, like a model file).
 ///
@@ -2702,6 +2567,13 @@ fn convert_cached(
 fn resolve_chat_template(config: &LocalModelConfig) -> Result<Option<String>, CucaError> {
     if let Some(text) = &config.chat_template {
         return Ok(Some(text.clone()));
+    }
+    if let Some(path) = &config.chat_template_file {
+        return std::fs::read_to_string(path)
+            .map(Some)
+            .map_err(|e| CucaError::Io {
+                message: format!("reading chat template `{}`: {e}", path.display()),
+            });
     }
     let ModelSource::HuggingFace {
         template: Some(t), ..
@@ -2726,13 +2598,10 @@ fn resolve_chat_template(config: &LocalModelConfig) -> Result<Option<String>, Cu
         .map_err(|_| invalid(format!("chat template `{}` is not UTF-8", path.display())))
 }
 
-/// The Hugging Face token: the configured one, else `HF_TOKEN`.
+/// The Hugging Face token; an empty one (what `"${HF_TOKEN:-}"` yields when the
+/// variable is unset) means anonymous access.
 fn hf_token(config: &LocalModelConfig) -> Option<String> {
-    config.hf_token.clone().or_else(|| {
-        std::env::var("HF_TOKEN")
-            .ok()
-            .filter(|token| !token.is_empty())
-    })
+    config.hf_token.clone().filter(|t| !t.is_empty())
 }
 
 /// The block stream of one local request: the receiving end of the channel the
@@ -3364,15 +3233,17 @@ mod tests {
     #[test]
     fn validate_accepts_the_boundaries() {
         assert!(validate(&LocalModelConfig::default()).is_ok());
-        for text in [
-            "seqs=1",
-            "seqs=64,step=64",
-            "step=2048",
-            "step=8192",
-            "kv=1",
+        for props in [
+            "max_sequences=1",
+            "max_sequences=64 max_step_tokens=64",
+            "max_step_tokens=2048",
+            "max_step_tokens=8192",
+            "kv_tokens=1",
         ] {
-            let config = config_with(|c| c.batching = text.parse().unwrap());
-            assert!(validate(&config).is_ok(), "{text}");
+            let config =
+                crate::config::load_kdl_str::<LocalModelConfig>(&format!("batching {props}"))
+                    .unwrap();
+            assert!(validate(&config).is_ok(), "{props}");
         }
         // The in-trunk head runs on the CPU.
         for draft_tokens in [1, MAX_DRAFT_TOKENS] {
@@ -3398,98 +3269,6 @@ mod tests {
     }
 
     #[test]
-    fn expert_placement_parses_every_form() {
-        for (text, placement) in [
-            ("resident", ExpertPlacement::Resident),
-            (" Resident ", ExpertPlacement::Resident),
-            ("host", ExpertPlacement::Host { layers: None }),
-            (
-                " HOST:layers=20 ",
-                ExpertPlacement::Host { layers: Some(20) },
-            ),
-            ("tiered:ram=4g", tiers(4 << 30, 0, 4)),
-            ("tiered:ram=1100M", tiers(1100 << 20, 0, 4)),
-            ("tiered:ram=512k,threads=8", tiers(512 << 10, 0, 8)),
-            ("tiered:ram=123", tiers(123, 0, 4)),
-            ("TIERED:device=6g,ram=12g", tiers(12 << 30, 6 << 30, 4)),
-            ("tiered:device=2g,ram=0", tiers(0, 2 << 30, 4)),
-            ("tiered:device=1g", tiers(0, 1 << 30, 4)),
-        ] {
-            assert_eq!(
-                text.parse::<ExpertPlacement>().unwrap(),
-                placement,
-                "{text}"
-            );
-        }
-        for bad in [
-            "",
-            "tiered",
-            "tiered:",
-            "tiered:threads=2",
-            "tiered:ram=4t",
-            "tiered:ram=",
-            "tiered:ram=-1",
-            "tiered:ram=1g,ram=2g",
-            "tiered:ram=1g,disk=2g",
-            "tiered:ram=1g,threads=x",
-            "tiered:ram=99999999999g",
-            "resident:ram=1g",
-            "host:",
-            "host:layers=",
-            "host:layers=x",
-            "host:layers=-1",
-            "host:layers=1,layers=2",
-            "host:ram=1g",
-            "hosted",
-        ] {
-            let err = bad.parse::<ExpertPlacement>().unwrap_err();
-            assert!(
-                matches!(&err, CucaError::Config(m) if m.contains("unknown expert placement")),
-                "{bad}: {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn batching_parses_every_subset() {
-        let batching = |max_sequences, kv_tokens, max_step_tokens, prefix_cache| BatchingConfig {
-            max_sequences,
-            kv_tokens,
-            max_step_tokens,
-            prefix_cache,
-        };
-        assert_eq!(BatchingConfig::default(), batching(4, None, None, true));
-        for (text, expected) in [
-            ("", BatchingConfig::default()),
-            ("seqs=8", batching(8, None, None, true)),
-            (" SEQS=2,kv=16384 ", batching(2, Some(16384), None, true)),
-            (
-                "seqs=4,kv=8192,step=128,prefix=off",
-                batching(4, Some(8192), Some(128), false),
-            ),
-            ("prefix=on,step=64", batching(4, None, Some(64), true)),
-            ("prefix=false", batching(4, None, None, false)),
-        ] {
-            assert_eq!(text.parse::<BatchingConfig>().unwrap(), expected, "{text}");
-        }
-        for bad in [
-            "seqs",
-            "seqs=x",
-            "seqs=-1",
-            "seqs=2,seqs=3",
-            "slots=2",
-            "prefix=maybe",
-            "kv=1k",
-        ] {
-            let err = bad.parse::<BatchingConfig>().unwrap_err();
-            assert!(
-                matches!(&err, CucaError::Config(m) if m.contains("unknown batching")),
-                "{bad}: {err}"
-            );
-        }
-    }
-
-    #[test]
     fn local_device_parses_every_form() {
         use GpuAdapter::{Default as Dflt, Discrete, Integrated};
         for (text, device) in [
@@ -3507,6 +3286,7 @@ mod tests {
             ("rocm:4", LocalDevice::Rocm(4)),
         ] {
             assert_eq!(text.parse::<LocalDevice>().unwrap(), device, "{text}");
+            assert_eq!(device.to_string().parse::<LocalDevice>().unwrap(), device);
         }
         for bad in [
             "",
@@ -3527,37 +3307,235 @@ mod tests {
         }
     }
 
+    /// `text` as a whole [`LocalModelConfig`], through the KDL reader.
+    fn kdl(text: &str) -> Result<LocalModelConfig, String> {
+        crate::config::load_kdl_str::<LocalModelConfig>(text).map_err(|e| e.to_string())
+    }
+
+    /// `Debug` redacts the token and the template text, so they are compared
+    /// on their own.
+    fn assert_same(actual: &LocalModelConfig, expected: &LocalModelConfig) {
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        assert_eq!(actual.hf_token, expected.hf_token);
+        assert_eq!(actual.chat_template, expected.chat_template);
+    }
+
     #[test]
-    fn devices_parse_from_a_plus_separated_list() {
-        let mut config = LocalModelConfig::default();
-        config.set_devices("vulkan:0+vulkan:1").unwrap();
-        assert_eq!(config.device, LocalDevice::Vulkan(GpuAdapter::Discrete(0)));
+    fn a_kdl_document_fills_every_field() {
+        let config = kdl(r#"
+variables {
+    HF_TOKEN "hf_test"
+}
+source "qwen3-0.6b-q8_0"
+device "vulkan:0"
+shards "vulkan:1" "vulkan:integrated:0"
+gpu_layers 20
+context_length 8192
+cache_dir "D:/cuca-cache"
+hf_token "${HF_TOKEN:-}"
+chat_template "{{ messages }}"
+chat_template_file "templates/x.jinja"
+sampling temperature=0.7 top_k=40 top_p=0.9 seed=7
+batching max_sequences=8 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false
+experts {
+    tiered ram_bytes="4g" device_bytes="6g" loader_threads=8
+}
+engram ram_bytes="2g" reader_threads=8
+convert quant="q4_0" engram_quant="bf16"
+drafter "in-trunk"
+draft_tokens 3
+shard_dirs "E:/parts" "F:/parts"
+"#)
+        .unwrap();
+        let expected = LocalModelConfig {
+            source: "qwen3-0.6b-q8_0".parse().unwrap(),
+            device: LocalDevice::Vulkan(GpuAdapter::Discrete(0)),
+            shards: vec![
+                LocalDevice::Vulkan(GpuAdapter::Discrete(1)),
+                LocalDevice::Vulkan(GpuAdapter::Integrated(0)),
+            ],
+            gpu_layers: Some(20),
+            context_length: Some(8192),
+            cache_dir: Some(PathBuf::from("D:/cuca-cache")),
+            hf_token: Some("hf_test".into()),
+            chat_template: Some("{{ messages }}".into()),
+            chat_template_file: Some(PathBuf::from("templates/x.jinja")),
+            sampling: SamplingConfig {
+                temperature: Some(0.7),
+                top_k: Some(40),
+                top_p: Some(0.9),
+                seed: Some(7),
+            },
+            batching: BatchingConfig {
+                max_sequences: 8,
+                kv_tokens: Some(16384),
+                max_step_tokens: Some(256),
+                prefix_cache: false,
+            },
+            experts: tiers(4 << 30, 6 << 30, 8),
+            engram: EngramCache {
+                ram_bytes: 2 << 30,
+                reader_threads: 8,
+            },
+            convert: ConvertConfig {
+                quant: WeightQuant::Q4_0,
+                engram_quant: EngramQuant::Bf16,
+            },
+            drafter: Some(DrafterSource::InTrunk),
+            draft_tokens: 3,
+            shard_dirs: vec![PathBuf::from("E:/parts"), PathBuf::from("F:/parts")],
+            on_download_progress: None,
+        };
+        assert_same(&config, &expected);
+
+        // An empty document is the default configuration.
+        assert_same(&kdl("").unwrap(), &LocalModelConfig::default());
+    }
+
+    #[test]
+    fn every_source_and_expert_form_deserializes() {
+        let source = |text: &str| kdl(text).unwrap().source;
         assert_eq!(
-            config.shards,
-            [LocalDevice::Vulkan(GpuAdapter::Discrete(1))]
+            source(r#"source "QWEN3-0.6B-Q8_0""#),
+            ModelSource::preset("qwen3-0.6b-q8_0").unwrap().source()
         );
-        config.set_devices(" cuda + cuda:1 + CUDA:1 ").unwrap();
         assert_eq!(
-            (config.device, config.shards.clone()),
-            (
-                LocalDevice::Cuda(0),
-                vec![LocalDevice::Cuda(1), LocalDevice::Cuda(1)]
-            )
+            source(r#"source "org/r:abc:m.gguf""#),
+            ModelSource::hugging_face("org/r", "abc", "m.gguf")
         );
-        config.set_devices("cpu").unwrap();
-        assert_eq!((config.device, config.shards.len()), (LocalDevice::Cpu, 0));
-        // A bad entry leaves the configuration alone.
-        config.set_devices("vulkan").unwrap();
-        for bad in ["", "+", "vulkan+", "vulkan+nope", "gpu:0"] {
-            let err = config.set_devices(bad).unwrap_err();
-            assert!(matches!(err, CucaError::Config(_)), "{bad}: {err}");
-            assert_eq!(
-                config.device,
-                LocalDevice::Vulkan(GpuAdapter::Default),
-                "{bad}"
+        let checkpoint = ModelSource::Checkpoint {
+            repo: "Qwen/Qwen3-0.6B".into(),
+            revision: "c1899de".into(),
+        };
+        assert_eq!(source(r#"source "Qwen/Qwen3-0.6B:c1899de""#), checkpoint);
+        assert_eq!(
+            source(r#"source { checkpoint repo="Qwen/Qwen3-0.6B" revision="c1899de"; }"#),
+            checkpoint
+        );
+        assert_eq!(
+            source(r#"source file="/models/x.gguf""#),
+            ModelSource::File("/models/x.gguf".into())
+        );
+        assert_eq!(
+            source(r#"source dir="/ckpt""#),
+            ModelSource::Dir("/ckpt".into())
+        );
+        let split = r#"
+source {
+    hugging_face repo="org/r" revision="abc" file="m-00001-of-00002.gguf" sha256="aa" {
+        part file="m-00001-of-00002.gguf" sha256="aa"
+        part file="m-00002-of-00002.gguf"
+        template repo="org/t" revision="def" file="chat_template.jinja"
+    }
+}
+"#;
+        assert_eq!(
+            source(split),
+            ModelSource::HuggingFace {
+                repo: "org/r".into(),
+                revision: "abc".into(),
+                file: "m-00001-of-00002.gguf".into(),
+                sha256: Some("aa".into()),
+                parts: vec![
+                    ModelPart {
+                        file: "m-00001-of-00002.gguf".into(),
+                        sha256: Some("aa".into()),
+                    },
+                    ModelPart {
+                        file: "m-00002-of-00002.gguf".into(),
+                        sha256: None,
+                    },
+                ],
+                template: Some(Box::new(ModelTemplate {
+                    repo: "org/t".into(),
+                    revision: "def".into(),
+                    file: "chat_template.jinja".into(),
+                    sha256: None,
+                })),
+            }
+        );
+        let err = kdl(r#"source "no-such-preset""#).unwrap_err();
+        assert!(err.contains("unknown model `no-such-preset`"), "{err}");
+
+        let experts = |text: &str| kdl(text).unwrap().experts;
+        assert_eq!(experts(r#"experts "resident""#), ExpertPlacement::Resident);
+        assert_eq!(
+            experts(r#"experts { tiered ram_bytes=123; }"#),
+            tiers(123, 0, 4)
+        );
+        assert_eq!(
+            experts(r#"experts { host layers=4; }"#),
+            ExpertPlacement::Host { layers: Some(4) }
+        );
+        assert_eq!(
+            experts("experts {\n    host\n}"),
+            ExpertPlacement::Host { layers: None }
+        );
+
+        let drafter = |text: &str| kdl(text).unwrap().drafter;
+        assert_eq!(
+            drafter(r#"drafter "In-Trunk""#),
+            Some(DrafterSource::InTrunk)
+        );
+        assert_eq!(
+            drafter(r#"drafter "gemma4-e2b-mtp-f16""#),
+            Some(DrafterSource::File(
+                ModelSource::preset("gemma4-e2b-mtp-f16").unwrap().source()
+            ))
+        );
+        assert_eq!(
+            drafter(r#"drafter file="/d.gguf""#),
+            Some(DrafterSource::File(ModelSource::File("/d.gguf".into())))
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_is_named() {
+        for (text, key) in [
+            (r#"sourc "qwen3-0.6b-q8_0""#, "sourc"),
+            ("batching max_seqs=8", "max_seqs"),
+            (r#"experts { tiered ram="4g"; }"#, "ram"),
+            (r#"source { checkpoint repo="a/b" rev="c"; }"#, "rev"),
+            ("on_download_progress #true", "on_download_progress"),
+        ] {
+            let err = kdl(text).unwrap_err();
+            assert!(
+                err.contains(&format!("unknown field `{key}`")),
+                "{text}: {err}"
             );
-            assert!(config.shards.is_empty(), "{bad}");
         }
+        let err = kdl(r#"device "gpu""#).unwrap_err();
+        assert!(err.contains("unknown local device `gpu`"), "{err}");
+    }
+
+    #[test]
+    fn a_size_takes_an_integer_or_a_suffix() {
+        let ram = |text: &str| kdl(text).map(|c| c.engram.ram_bytes);
+        assert_eq!(ram("engram ram_bytes=1048576"), Ok(1 << 20));
+        assert_eq!(ram(r#"engram ram_bytes="1m""#), Ok(1 << 20));
+        assert_eq!(ram(r#"engram ram_bytes="3G""#), Ok(3 << 30));
+        let err = ram(r#"engram ram_bytes="1t""#).unwrap_err();
+        assert!(err.contains("expected a byte count"), "{err}");
+    }
+
+    #[test]
+    fn the_example_test_config_parses() {
+        let config: crate::test_config::TestConfig =
+            crate::config::load_kdl_str(include_str!("../../../cuca-test.example.kdl")).unwrap();
+        assert_eq!(
+            config.local_model().source,
+            ModelSource::preset("qwen3-0.6b-q8_0").unwrap().source()
+        );
+        assert!(config.local_has("source"));
+        assert_eq!(config.local_devices(), None);
+
+        let example: LocalModelConfig =
+            crate::config::load_kdl_str(include_str!("../../../examples/configs/local_model.kdl"))
+                .unwrap();
+        assert_eq!(
+            example.source,
+            ModelSource::preset("qwen3-0.6b-q8_0").unwrap().source()
+        );
     }
 
     /// The rules that need a GPU device. With the Vulkan backend compiled

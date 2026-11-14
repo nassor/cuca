@@ -2,34 +2,39 @@
 //! f32 reference, for checkpoints too large or too new for the pinned
 //! `oracle` set (a layer-truncated real checkpoint, a tiny synthetic one).
 //!
-//! Gated on `CUCA_LOCAL_REF_CKPT` (the checkpoint directory) or
-//! `CUCA_LOCAL_REF_GGUF` (a GGUF file, loaded as it is: a layer-truncated
+//! Gated on `oracle { ref_ckpt "..." }` in cuca-test.kdl (the checkpoint directory) or
+//! `oracle { ref_gguf "..." }` (a GGUF file, loaded as it is: a layer-truncated
 //! published GGUF whose dequantized weights the reference script loaded too)
-//! and `CUCA_LOCAL_REF_PREFIX` (`<prefix>.json` and `<prefix>.bin`, written by
+//! and `oracle { ref_prefix "..." }` (`<prefix>.json` and `<prefix>.bin`, written by
 //! the reference script: the prompt ids, the compared positions, the greedy
 //! ids and the f32 logits of those positions). Without them the test prints
-//! `SKIP:` and passes, unless `CUCA_REQUIRE_LIVE=1`. The checkpoint is
+//! `SKIP:` and passes, unless `require_live #true`. The checkpoint is
 //! converted to F16 (its BF16 values are exact in F16) and loaded in the
 //! engine's exact dequantized mode, so only float rounding separates the two
-//! sides: `CUCA_LOCAL_REF_TOL` (default `5e-4`) bounds `max |dlogit|`.
+//! sides: `oracle { ref_tol ... }` (default `5e-4`) bounds `max |dlogit|`.
 
 use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::oracle::{convert_dir, env, floats, greedy_continuation, read_gguf, skip, token_ids};
+use super::oracle::{convert_dir, floats, greedy_continuation, read_gguf, skip, token_ids};
 use crate::provider::local::model::cpu::{Hidden, Transformer};
 use crate::provider::local::model::{Want, prefill_chunk};
 
 #[test]
 fn local_checkpoint_matches_the_reference() {
-    let source = env("CUCA_LOCAL_REF_CKPT")
+    let config = &crate::test_config::get().oracle;
+    let source = config
+        .ref_ckpt
+        .clone()
         .map(|dir| (true, dir))
-        .or_else(|| env("CUCA_LOCAL_REF_GGUF").map(|file| (false, file)));
-    let (Some((is_dir, source)), Some(prefix)) = (source, env("CUCA_LOCAL_REF_PREFIX")) else {
-        return skip("set CUCA_LOCAL_REF_CKPT (or CUCA_LOCAL_REF_GGUF) and CUCA_LOCAL_REF_PREFIX");
+        .or_else(|| config.ref_gguf.clone().map(|file| (false, file)));
+    let (Some((is_dir, source)), Some(prefix)) = (source, config.ref_prefix.clone()) else {
+        return skip(
+            "set `oracle { ref_ckpt \"...\" }` (or `ref_gguf`) and `ref_prefix` in cuca-test.kdl",
+        );
     };
-    let tol: f32 = env("CUCA_LOCAL_REF_TOL").map_or(5e-4, |t| t.parse().unwrap());
+    let tol: f32 = config.ref_tol.unwrap_or(5e-4);
     let meta: Value =
         serde_json::from_str(&std::fs::read_to_string(format!("{prefix}.json")).unwrap()).unwrap();
     let prompt = token_ids(&meta["ids"]);
@@ -99,17 +104,17 @@ fn local_checkpoint_matches_the_reference() {
     assert_eq!(out, greedy, "greedy ids");
 }
 
-/// Converts `CUCA_CONVERT_PROBE=<checkpoint dir>|<output file>|<f16|q8_0|q4_0>`
+/// Converts `oracle { convert_probe "<checkpoint dir>|<output file>|<f16|q8_0|q4_0>" }`
 /// to the given path, for diffing against the llama.cpp converter's output
-/// (`.omp/local-models/convert/runcmp.py`). Skips without the variable.
+/// (`.omp/local-models/convert/runcmp.py`). Skips without the key.
 #[test]
 fn convert_probe() {
-    let Some(spec) = env("CUCA_CONVERT_PROBE") else {
+    let Some(spec) = crate::test_config::get().oracle.convert_probe.clone() else {
         return;
     };
     let parts: Vec<&str> = spec.split('|').collect();
     let [dir, out, quant] = parts.as_slice() else {
-        panic!("CUCA_CONVERT_PROBE is `<dir>|<out>|<quant>`");
+        panic!("`oracle {{ convert_probe }}` is `<dir>|<out>|<quant>`");
     };
     let quant: crate::provider::local::WeightQuant = quant.parse().unwrap();
     let checkpoint = super::hf::CheckpointDir::open(std::path::Path::new(dir)).unwrap();

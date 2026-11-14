@@ -9,7 +9,7 @@ weight = 3
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>The llama.cpp test files share one <code>llama-server</code>; server-dependent tests skip when it is unreachable unless you set <code>CUCA_REQUIRE_LIVE=1</code></dd>
+<dd>The llama.cpp test files share one <code>llama-server</code>; server-dependent tests skip when it is unreachable unless <code>cuca-test.kdl</code> sets <code>require_live #true</code></dd>
 <dt>You need</dt>
 <dd><code>llama-server</code> on port 1234 with a model loaded, per <a href="@/quick-start/first-stream.md">Stream a first reply</a> step 2</dd>
 <dt>Read this if</dt>
@@ -50,14 +50,14 @@ Windows (PowerShell), where `curl` is an alias for `Invoke-WebRequest`:
 curl.exe http://127.0.0.1:1234/v1/models
 ```
 
-Result: a JSON list with at least one model `id`. To target another server, set `CUCA_BASE_URL` in step 2.
+Result: a JSON list with at least one model `id`. To target another server, write `llamacpp base_url="..."` in `cuca-test.kdl`; see the end of this page.
 
 ## Step 2: run the whole suite
 
 Name the provider and every plugin and service feature:
 
 ```bash,name=Runs the same on all three platforms
-cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit service-vector-store plugin-redaction service-scheduler" -- --nocapture --test-threads=1
+cargo test --features "provider-llamacpp config-kdl plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit service-vector-store plugin-redaction service-scheduler" -- --nocapture --test-threads=1
 ```
 
 The trailing flags matter for a readable result:
@@ -81,69 +81,64 @@ The reason comes from a probe of `GET {base_url}/models` with a two second timeo
 
 Two files never call the probe: `tests/service_prompt_cache.rs` drives in-process mock SSE servers on ephemeral loopback ports, and `tests/public_exports.rs` constructs types and never dispatches. Every other llama.cpp file has more tests than live gates, so a subset of each runs with no server up.
 
-`tests/provider_local.rs`, `tests/provider_local_batch.rs` and `tests/provider_local_mtp.rs` need no server. They print `SKIP: local model not available: ...` until you select a model. `tests/provider_local_tiers.rs` prints a `SKIP:` line until you select a model and set `CUCA_LOCAL_EXPERTS`, and `tests/provider_local_convert.rs` prints `SKIP: set CUCA_LOCAL_REF_DIR to the oracle dumps` until you set that directory. All five run under `--features provider-local`; the variables are in [Environment variables](@/reference/environment.md).
+`tests/provider_local.rs`, `tests/provider_local_batch.rs` and `tests/provider_local_mtp.rs` need no server. They print ``SKIP: local model not available: set `local { model { source ... } }` or `local { download_default #true }` in cuca-test.kdl`` until you select a model. `tests/provider_local_tiers.rs` prints a `SKIP:` line until you select a model and write `experts { tiered ... }` in it, and `tests/provider_local_convert.rs` prints a `SKIP:` line until you set `oracle { ref_dir ... }`. All five run under `--features provider-local`, which enables `config-kdl`; the keys are in [Configuration files](@/reference/environment.md#the-test-file).
 
 Result: you can tell which tests skipped and why.
 
 ## Step 4: make a skip fail
 
-A silent skip in CI is a test that stopped testing. `CUCA_REQUIRE_LIVE=1` turns the unreachable-server path into a panic:
+A silent skip in CI is a test that stopped testing. `require_live #true` in `cuca-test.kdl` turns the unreachable-server path into a panic:
 
-```text,name=The panic when the variable is set and nothing answers
-CUCA_REQUIRE_LIVE=1 but llama.cpp is unreachable: <reason>
+```kdl,name=cuca-test.kdl
+require_live #true
+llamacpp base_url="http://127.0.0.1:1234/v1"
 ```
 
-Linux and macOS:
-
-```bash
-CUCA_REQUIRE_LIVE=1 cargo test --features "provider-llamacpp plugin-memory" -- --nocapture --test-threads=1
+```text,name=The panic when require_live is set and nothing answers
+require_live is set but llama.cpp is unreachable: <reason>
 ```
 
-Windows (PowerShell), where each assignment is a statement and `;` joins them:
-
-```powershell
-$env:CUCA_REQUIRE_LIVE = "1"; cargo test --features "provider-llamacpp plugin-memory" -- --nocapture --test-threads=1
+```bash,name=Runs the same on all three platforms
+cargo test --features "provider-llamacpp config-kdl plugin-memory" -- --nocapture --test-threads=1
 ```
-
-Only the exact value `1` arms it. Any other value behaves as unset. In PowerShell the variable stays set for the session; clear it with `Remove-Item Env:CUCA_REQUIRE_LIVE`.
 
 Result: with the server stopped, the run fails with the panic above instead of printing `SKIP`.
 
 ## Step 5: run one file
 
-A single-plugin or single-service file is gated on `provider-llamacpp` plus its own feature, so a single-file run names exactly those two:
+A single-plugin or single-service file is gated on `provider-llamacpp` plus its own feature, so a single-file run names exactly those two. Add `config-kdl` whenever `cuca-test.kdl` exists, because the llama.cpp suites read the file only with that feature and panic if the file is present without it:
 
 ```bash,name=Runs the same on all three platforms
-cargo test --test plugin_guardrails --features provider-llamacpp,plugin-guardrails -- --nocapture
+cargo test --test plugin_guardrails --features provider-llamacpp,config-kdl,plugin-guardrails -- --nocapture
 ```
 
 `plugin_combinations.rs` is gated on `provider-llamacpp` alone, and each of its submodules adds its own gate. A run that compiles all of them needs the union of those features:
 
 ```bash,name=Runs the same on all three platforms
-cargo test --test plugin_combinations --features provider-llamacpp,service-entity-extraction,plugin-memory,service-prompt-cache,service-speculative,plugin-session-log,plugin-cost,plugin-telemetry,service-rate-limit,plugin-redaction,service-replay,service-vector-store -- --nocapture
+cargo test --test plugin_combinations --features provider-llamacpp,config-kdl,service-entity-extraction,plugin-memory,service-prompt-cache,service-speculative,plugin-session-log,plugin-cost,plugin-telemetry,service-rate-limit,plugin-redaction,service-replay,service-vector-store -- --nocapture
 ```
 
 A shorter list does not fail. It compiles fewer submodules and reports success for the rest.
 
 Result: the run lists only that file's tests.
 
-## The live suite variables
+## The test file
 
-The llama.cpp suite reads three variables, all in `tests/common/mod.rs`:
+The suites read one file, `cuca-test.kdl`, at the repository root. It is gitignored. `cuca-test.example.kdl`, next to it, lists every key; the llama.cpp suite uses three:
 
-| Variable | Effect | Default |
+| Key | Effect | Default |
 |---|---|---|
-| `CUCA_BASE_URL` | the server base URL, with `/v1` | `http://127.0.0.1:1234/v1` |
-| `CUCA_MODEL` | the model id under test; empty counts as unset | the first id `GET {base_url}/models` reports |
-| `CUCA_REQUIRE_LIVE` | `1` turns an unreachable server into a panic | unset |
+| `llamacpp base_url="..."` | the server base URL, with `/v1` | `http://127.0.0.1:1234/v1` |
+| `llamacpp model="..."` | the model id under test | the first id `GET {base_url}/models` reports |
+| `require_live` | `#true` turns an unreachable server into a panic | `#false` |
 
-With neither `CUCA_MODEL` nor a server answering, the test panics:
+With no model id configured and no server answering, the test panics:
 
 ```text,name=The panic when no model id can be resolved
-no model id: set CUCA_MODEL or start llama-server at http://127.0.0.1:1234/v1
+no model id: set `llamacpp model="..."` in cuca-test.kdl or start llama-server at http://127.0.0.1:1234/v1
 ```
 
-The `provider-local` variables are in [Environment variables](@/reference/environment.md).
+The llama.cpp suites read the file only when `config-kdl` is among the `--features`. With the file present and the feature off, the run panics and says so. The `provider-local` keys are in [Configuration files](@/reference/environment.md#the-test-file).
 
 ## If you are checking one feature builds alone
 

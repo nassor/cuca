@@ -1,53 +1,47 @@
 //! Live, multi-model tests for the in-process `provider-local` engine.
 //!
-//! They run a real model in-process, chosen by the environment:
+//! They run a real model in-process, chosen by `cuca-test.kdl` at the
+//! repository root (`cuca-test.example.kdl` lists every key):
 //!
-//! - `CUCA_LOCAL_MODEL_PATH=<file.gguf or checkpoint directory>` loads an
-//!   existing GGUF file (any supported architecture) or converts a Hugging
-//!   Face checkpoint directory (`ModelSource::Dir`), or
-//! - `CUCA_LOCAL_MODEL=<preset, repo:revision:file or repo:revision>`
-//!   downloads that model into the cache directory (`CUCA_CACHE_DIR`
-//!   overrides it): a name from `ModelSource::PRESETS` (`gemma4-e2b-q4_0`,
-//!   `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`, ...), an unverified
-//!   `repo:revision:file` GGUF, or a safetensors checkpoint
-//!   `repo:revision` that is converted to a cached GGUF once, or a checkpoint
-//!   name of `local_env::CHECKPOINT_PRESETS` that is no library preset
-//!   (`deepseek-v41-flash-1017`: the pinned DeepSeek-V4.1-Flash checkpoint,
-//!   converted once to a split GGUF set in `CUCA_CACHE_DIR`); or
-//! - `CUCA_LOCAL_DOWNLOAD=1` downloads the default preset (Gemma 4 E2B Q4_0).
+//! - `local { model { source ... } }` names the model, in any form a
+//!   `LocalModelConfig` reads: a preset of `ModelSource::PRESETS`
+//!   (`gemma4-e2b-q4_0`, `qwen3-0.6b-q8_0`, `phi4-mini-q4_0`, ...), an
+//!   unverified `repo:revision:file` GGUF, a safetensors checkpoint
+//!   `repo:revision` (converted to a cached GGUF once; DeepSeek-V4.1-Flash is
+//!   `source "deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>"`, converted to a
+//!   split GGUF set), `source file="..."` for a GGUF on disk or `source
+//!   dir="..."` for a checkpoint directory; or
+//! - `local { download_default #true }` downloads the default preset (Gemma 4
+//!   E2B Q4_0).
 //!
-//! `CUCA_LOCAL_CONVERT_QUANT` (`f16`, `q8_0` or `q4_0`, default `q8_0`) sets
-//! the weight precision of a converted checkpoint. A checkpoint that
-//! corresponds to a preset (same repository and revision as the preset's
-//! source weights, see `CHECKPOINT_PRESETS`) is reported under the preset's
-//! name, so the preset's known limits apply to it.
+//! Downloads and conversions go to the top-level `cache_dir` (else the
+//! platform cache directory). `convert quant="f16"` (`f16`, `q8_0` or `q4_0`,
+//! default `q8_0`) sets the weight precision of a converted checkpoint. A
+//! checkpoint that corresponds to a preset (same repository and revision as
+//! the preset's source weights, see `CHECKPOINT_PRESETS`) is reported under
+//! the preset's name, so the preset's known limits apply to it.
 //!
-//! `CUCA_LOCAL_MODEL_PATH` wins when several are set. With none set, every
-//! test prints `SKIP: local model not available: ...` and passes, unless
-//! `CUCA_REQUIRE_LIVE=1` turns the skip into a panic.
+//! With no model configured, every test prints `SKIP: local model not
+//! available: ...` and passes, unless `require_live #true` turns the skip into
+//! a panic.
 //!
-//! `CUCA_LOCAL_CHAT_TEMPLATE=<path to a .jinja file>` sets
-//! `LocalModelConfig::chat_template` (the template replaces the GGUF's).
-//!
-//! `CUCA_LOCAL_DEVICE` selects where the model runs (`LocalDevice` syntax):
-//! `cpu` (the default), `vulkan`, `vulkan:<n>`, `metal`, `cuda[:<n>]` or
-//! `rocm[:<n>]`; a GPU device needs its feature
-//! (`--features provider-local-vulkan`, ...). A `+`-separated list
-//! (`vulkan:0+vulkan:1`, `vulkan:0+vulkan:0`) splits the model over those
-//! devices (`LocalModelConfig::shards`: tensor parallelism; a device may
-//! repeat, which exercises the path on one GPU). `CUCA_LOCAL_GPU_LAYERS=<n>`
-//! sets `LocalModelConfig::gpu_layers` (layer offload: the last `n` layers on
-//! the GPU device, the rest on the CPU; the model's layer split is printed as
-//! `MATRIX|layer_split|...`). `CUCA_LOCAL_EXPERTS` sets
-//! `LocalModelConfig::experts` (`ExpertPlacement` syntax, e.g.
-//! `tiered:ram=4g`; unset = resident), so the whole matrix runs on tiered
-//! experts. `CUCA_LOCAL_ENGRAM` sets `LocalModelConfig::engram` (`EngramCache`
-//! syntax, e.g. `ram=2g,threads=8`; only a model with Engram tables reads
-//! it). Build for the host CPU, since
+//! The suite applies these other keys of `local { model { ... } }`:
+//! `chat_template` or `chat_template_file` (the template replaces the GGUF's);
+//! `device` (`cpu`, the default, `vulkan`, `vulkan:<n>`, `metal`,
+//! `cuda[:<n>]` or `rocm[:<n>]`; a GPU device needs its feature,
+//! `--features provider-local-vulkan`, ...) and `shards` (more devices to
+//! split the model over: tensor parallelism; `device "vulkan:0"` with
+//! `shards "vulkan:0"` exercises the path on one GPU); `gpu_layers` (layer
+//! offload: the last `n` layers on the GPU device, the rest on the CPU; the
+//! model's layer split is printed as `MATRIX|layer_split|...`); `experts`
+//! (e.g. `experts { tiered ram_bytes="4g"; }`, so the whole matrix runs on
+//! tiered experts); `engram` (e.g. `engram ram_bytes="2g" reader_threads=8`;
+//! only a model with Engram tables reads it). Build for the host CPU, since
 //! candle's SIMD kernels are chosen at compile time:
 //!
 //! ```sh
-//! CUCA_LOCAL_MODEL=qwen3-0.6b-q8_0 RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local -- --test-threads=1 --nocapture
+//! # cuca-test.kdl: local { model { source "qwen3-0.6b-q8_0"; }; }
+//! RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local -- --test-threads=1 --nocapture
 //! ```
 //!
 //! # Scenarios and capabilities
@@ -66,7 +60,7 @@
 //!    blocks when reasoning is off or disabled, and exact usage: a
 //!    `max_tokens` cap is met to the token, the prompt counts equal the
 //!    reported prompt-cache read plus write, and, when the HuggingFace oracle
-//!    dump of the model is available (`CUCA_LOCAL_REF_DIR`, the
+//!    dump of the model is available (`oracle { ref_dir ... }`, the
 //!    `.omp/local-models/ref/<id>.json` files) and the oracle's prompt
 //!    contains no date, `prompt_tokens` equals the oracle's count for the same chat turn.
 //! 2. `thinking_precedes_answer` and `thinking_off_has_no_reasoning`.
@@ -224,21 +218,7 @@ fn source_label(source: &ModelSource) -> String {
     }
 }
 
-/// `CUCA_LOCAL_MODEL=deepseek-v41-flash-1017` selects the pinned checkpoint
-/// (converted once to a split GGUF set); a library preset name is never shadowed.
-#[test]
-fn a_checkpoint_name_selects_its_pinned_checkpoint() {
-    assert!(matches!(
-        local_env::checkpoint_alias("deepseek-v41-flash-1017"),
-        Some(ModelSource::Checkpoint { repo, revision })
-            if repo == "deepseek-ai/DeepSeek-V4.1-Flash-1017"
-                && revision == "1bae0e1088993b9b82de08f59de5be5a34e42170"
-    ));
-    assert!(local_env::checkpoint_alias("qwen3-0.6b-q8_0").is_none());
-    assert!(local_env::checkpoint_alias("no-such-model").is_none());
-}
-
-/// What the oracle dump (`CUCA_LOCAL_REF_DIR`) of the GGUF file says about the
+/// What the oracle dump (`oracle { ref_dir ... }`) of the GGUF file says about the
 /// chat turn [`ORACLE_USER`]: its prompt token count, and whether the rendered
 /// prompt contains the date the oracle pinned (2025), which makes the count
 /// depend on today's date.
@@ -301,12 +281,14 @@ async fn loaded() -> Option<Loaded> {
             let source = local_env::model_source(true)?;
             let mut config = LocalModelConfig {
                 source: source.clone(),
-                experts: local_env::parsed("CUCA_LOCAL_EXPERTS").unwrap_or_default(),
+                experts: local_env::experts().unwrap_or_default(),
                 engram: local_env::engram(),
                 convert: local_env::convert(),
                 on_download_progress: Some(local_env::download_progress()),
                 chat_template: local_env::chat_template(),
                 gpu_layers: local_env::gpu_layers(),
+                cache_dir: local_env::cache_dir(),
+                hf_token: local_env::hf_token(),
                 ..Default::default()
             };
             local_env::set_devices(&mut config);
@@ -963,7 +945,7 @@ async fn long_context_needle() {
     passed("long_context_needle");
 }
 
-/// Decode speed after a prompt of about 1,300 tokens (`CUCA_LOCAL_PERF=1`;
+/// Decode speed after a prompt of about 1,300 tokens (`local { perf #true }`;
 /// prints `PERF|...` lines, asserts nothing).
 #[tokio::test]
 async fn perf_long_prompt() {
@@ -972,7 +954,7 @@ async fn perf_long_prompt() {
     }
     live_model!(live, _turn);
     let model = &live.model;
-    // `CUCA_LOCAL_PERF_COLD=1` changes the first words of every round's
+    // `local { perf_cold #true }` changes the first words of every round's
     // prompt, so no round hits the prefix cache: `first` is then a real
     // prefill of the whole prompt (round 0 still includes kernel compilation).
     let cold = local_env::perf_cold();

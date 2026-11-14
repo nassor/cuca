@@ -9,7 +9,7 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Nine always-present modules, two gated modules, and 198 re-exported items at the crate root, grouped by the feature that gates them</dd>
+<dd>Ten always-present modules, two gated modules, and 198 re-exported items at the crate root, grouped by the feature that gates them</dd>
 <dt>You need</dt>
 <dd>Nothing; this page mirrors <code>src/lib.rs</code></dd>
 <dt>Read this if</dt>
@@ -30,10 +30,11 @@ weight = 4
 | `plugin` | `pub` | none | the `CucaPlugin` and `SessionStorePlugin` traits |
 | `plugins` | `pub` | none | plugin implementations, one gated submodule per `plugin-*` feature |
 | `services` | `pub` | none | service implementations, one gated submodule per `service-*` feature |
+| `config` | `pub` | none; the KDL reader needs `config-kdl` | the serde field adapters of the configuration structs and the KDL reader; see [Configuration files](@/reference/environment.md) |
 | `client` | `pub` | none | the builder, the client and the plugin-instrumented stream |
 | `export` | `pub` | `plugin-memory` or `service-prompt-cache` | the versioned `cuca-export` envelope |
 | `cost_otel` | `pub` | `plugin-cost` and `plugin-telemetry` | the cost ledger to OpenTelemetry bridge |
-| `server` | `pub` | `server` | the `cuca serve`, `cuca balance` and `cuca tui` implementations; see [Server](@/server/_index.md) |
+| `server` | `pub` | `server` | the `cuca serve`, `cuca balance` and `cuca tui` implementations, and `CucaConfig`, the structs of the `cuca` KDL file; see [Server](@/server/_index.md) |
 | `provider` | `pub(crate)` | none | the provider adapters; not part of the public surface |
 | `canonical` | `pub(crate)` | `plugin-session-log` or `service-prompt-cache` | canonical JSON encoding for storage records and digest input |
 | `tokenize` | `pub(crate)` | `plugin-memory` or `plugin-cost` | tiktoken encoder resolution |
@@ -61,6 +62,29 @@ Available in every build that compiles. There are 17.
 | `cuca::services::orchestrator` | `PoolTurnExecutor`, which is `pub` but not re-exported at the root |
 
 `LlamaCppConfig` and `OAuthPkceConfig` live in the `pub(crate)` `provider` module and have no public path.
+
+## The config module
+
+`cuca::config` is not re-exported at the crate root.
+
+| Item | Gate | Shape |
+|---|---|---|
+| `ConfigValue` | none | `serde_json::Value`, the tree a KDL document becomes |
+| `one_or_many`, `from_str`, `size`, `duration` | none | `deserialize_with` adapters: a list written once or several times, a `FromStr` string, a byte count (an integer or `512m`, `4g`), a duration (`500ms`, `60s`, `5m`, `1h`) |
+| `from_kdl_str`, `from_kdl_str_with_vars` | `config-kdl` | KDL text to a `ConfigValue`, without or with placeholder substitution |
+| `load_kdl_str`, `load_kdl_file` | `config-kdl` | read a whole configuration into any `DeserializeOwned` type; every error is `CucaError::Config` |
+
+## The server surface
+
+Under `server`, `cuca::server` exports `CucaConfig`, `LogConfig`, `LogFormat`, `ServerConfig`, `ModelSpec`, `BalancerConfig`, `ServerError`, `MAX_MODELS`, `serve`, `balance` and `init_logging`.
+
+| Type | Shape |
+|---|---|
+| `CucaConfig` | fields `log`, `serve`, `balance`; `load`, `from_kdl_str`, `into_serve`, `into_balance`. `Deserialize`, unknown keys rejected |
+| `LogConfig` | `format` (`LogFormat::Pretty` by default or `Json`), `level` (`info` by default) |
+| `ServerConfig` | `listen`, `models`, `api_key`, `stats_api`, `latency_window`; `new`, `validate`, `DEFAULT_LISTEN`, `DEFAULT_LATENCY_WINDOW` |
+| `ModelSpec` | `name`, `config` (a `LocalModelConfig`); `new`, `source_label`, `device_label` |
+| `BalancerConfig` | the `balance` keys: `listen`, `upstreams`, `upstream_api_key`, `api_key`, `policy`, `health_interval`, `latency_window`, `stats_api` |
 
 ## Feature-gated re-exports
 
@@ -131,19 +155,19 @@ Under `provider-local`, the re-exports above are the whole public path: `cuca::p
 | `ModelTemplate`, `PresetTemplate` | a chat template file: `repo`, `revision`, `file` and `sha256` (optional in `ModelTemplate`) |
 | `DrafterSource` | `File(ModelSource)`, `InTrunk`; `From<ModelSource>` |
 | `ConvertConfig`, `WeightQuant`, `EngramQuant` | `ConvertConfig { quant, engram_quant }`; `WeightQuant` is `F16`, `Q8_0` (default) or `Q4_0`, with `name` and `FromStr`; `EngramQuant` is `Q8_0` (default), `Q4_0` or `Bf16`, the storage type of DeepSeek-V4.1's Engram tables (ignored by other architectures), with `name` and `FromStr`. A non-default `engram_quant` adds `-engram-<name>` to the cached file name |
-| `EngramCache` | `ram_bytes` (4 GiB default, 1 MiB to 1 TiB), `reader_threads` (16 default, 1 to 64); `validate`, `FromStr` (`ram=8g,threads=32`) |
-| `BatchingConfig` | `max_sequences` (4), `kv_tokens`, `max_step_tokens`, `prefix_cache` (true); `FromStr` |
-| `ExpertPlacement`, `ExpertTiers` | `Resident` (default), `Tiered(ExpertTiers)`, `Host { layers }`; `FromStr` |
+| `EngramCache` | `ram_bytes` (4 GiB default, 1 MiB to 1 TiB), `reader_threads` (16 default, 1 to 64); `validate` |
+| `BatchingConfig` | `max_sequences` (4), `kv_tokens`, `max_step_tokens`, `prefix_cache` (true) |
+| `ExpertPlacement`, `ExpertTiers` | `Resident` (default), `Tiered(ExpertTiers)`, `Host { layers }` |
 | `SamplingConfig` | `temperature`, `top_k`, `top_p`, `seed`, all `Option`; `DEFAULT_TEMPERATURE` (1.0), `DEFAULT_TOP_K` (64), `DEFAULT_TOP_P` (0.95) |
-| `LocalDevice`, `GpuAdapter` | `Cpu`, `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`, `Cuda(usize)`, `Rocm(usize)`; `Default`, `Discrete(usize)`, `Integrated(usize)`; `required_feature`, `FromStr` |
-| `LocalModelConfig` | fields `source`, `cache_dir`, `hf_token`, `context_length`, `sampling`, `chat_template`, `device`, `drafter`, `draft_tokens`, `on_download_progress`, `experts`, `convert`, `batching`, `shards`, `gpu_layers`, `engram`, `shard_dirs`; `set_devices` |
+| `LocalDevice`, `GpuAdapter` | `Cpu`, `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`, `Cuda(usize)`, `Rocm(usize)`; `Default`, `Discrete(usize)`, `Integrated(usize)`; `required_feature`, `FromStr`, `Display` (the inverse of `FromStr`) |
+| `LocalModelConfig` | fields `source`, `cache_dir`, `hf_token`, `context_length`, `sampling`, `chat_template`, `chat_template_file`, `device`, `drafter`, `draft_tokens`, `on_download_progress`, `experts`, `convert`, `batching`, `shards`, `gpu_layers`, `engram`, `shard_dirs` |
 | `LocalModel` | `load`, `generate`, `capabilities`, `sampling`, `context_length`, `kv_cache_bytes`, `weights_file_bytes`, `layer_split`, `draft_stats`, `serving_stats`, `expert_tier_stats`, `expert_heat`, `engram_stats` |
 | `LocalGeneration`, `GenerationReport` | the stream of one `LocalModel::generate` request, with no client and no plugin hooks, and its `report()`: `usage`, `prompt_cache`, `finish_reason` (`stop` or `length`), `queue_secs` |
 | `LocalCapabilities`, `DraftStats`, `ServingStats`, `ExpertTierStats`, `ExpertHeat` | statistics and capability reports; `DraftStats::acceptance_rate` |
 | `EngramStats` | `lookups`, `cache_hits`, `disk_reads`, `bytes_read`, `resident_rows`, `resident_bytes`, `capacity_rows`; `hit_rate`. `LocalModel::engram_stats` is `None` for a model without an Engram table |
 | `DownloadProgress`, `DownloadProgressCallback` | `downloaded_bytes`, `total_bytes`; `DownloadProgressCallback::new` |
 
-The meaning of each configuration field is on [Local configuration](@/providers/local/configuration.md). `tests/public_exports.rs` does not name any of these types.
+The meaning of each configuration field is on [Local configuration](@/providers/local/configuration.md). Every type above that a `LocalModelConfig` holds implements `Deserialize`, so the KDL keys are the field names; see [Configuration files](@/reference/environment.md#the-model-keys). `tests/public_exports.rs` does not name any of these types.
 
 ## Client surface
 

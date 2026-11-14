@@ -46,25 +46,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The example `examples/local_model.rs` reads the device from `CUCA_LOCAL_DEVICE` and prints `loaded on Vulkan(Default)` on stderr once the model is on the device.
+The example `examples/local_model.rs` reads the device from the `device` key of its `--config` file and prints `loaded on Vulkan(Default)` on stderr once the model is on the device.
 
-```bash,name=Linux and macOS: run the example on a GPU
-export CUCA_LOCAL_DEVICE="vulkan"
-```
-
-```powershell,name=Windows (PowerShell): run the example on a GPU
-$env:CUCA_LOCAL_DEVICE = "vulkan"
+```kdl,name=vulkan.kdl
+device "vulkan"
 ```
 
 ```bash,name=Runs the same on all three platforms
-cargo run --release --example local_model --features provider-local-vulkan
+cargo run --release --example local_model --features provider-local-vulkan -- --config vulkan.kdl
 ```
 
 ## Device selection
 
 `LocalDevice` is `Cpu` (the default), `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`, `Cuda(usize)` or `Rocm(usize)`. `GpuAdapter` is `Default`, `Discrete(usize)` or `Integrated(usize)`. Every variant exists in every build. `LocalDevice::required_feature` returns the cargo feature a device needs, `None` for `Cpu`.
 
-`LocalDevice` parses from text, ASCII case-insensitive:
+`LocalDevice` parses from text, ASCII case-insensitive, and prints back in the same forms (`Display`). In KDL it is the string of the `device` key (`device "vulkan:0"`) and of each `shards` argument:
 
 | Text | Device |
 |---|---|
@@ -79,7 +75,7 @@ Any other text is a `CucaError::Config`: ``unknown local device `...`; expected 
 
 ## Tensor parallelism
 
-`LocalModelConfig::shards` splits one model over several GPUs. The model runs on `1 + shards.len()` devices, `device` being the first. `LocalModelConfig::set_devices("vulkan:0+vulkan:1")` fills both fields from one `+` separated list, which is the text `CUCA_LOCAL_DEVICE` carries in the tests and the example. A device may repeat: `vulkan:0+vulkan:0` splits the model in two on one GPU. That gives no speedup and holds the replicated parts twice, but it runs the whole path.
+`LocalModelConfig::shards` splits one model over several GPUs. The model runs on `1 + shards.len()` devices, `device` being the first. In KDL: `device "vulkan:0"` and `shards "vulkan:1"`, with one string per further device. A device may repeat: `device "vulkan:0"` with `shards "vulkan:0"` splits the model in two on one GPU. That gives no speedup and holds the replicated parts twice, but it runs the whole path.
 
 - Each layer's query heads are split evenly, with the K/V heads they read. A model with fewer K/V heads than devices keeps a copy of each K/V head on every device that needs it (Gemma 4 E2B has one K/V head, so with two devices each holds it whole). The FFN width is split evenly. In a mixture of experts every device holds all experts, each cut to its share of the width, with the router replicated; the shared expert is cut the same way.
 - Each device holds its slice of the weights and its own K/V pools. Norms, embeddings, Gemma 4's per-layer inputs and the RoPE tables are replicated. Only the first device holds the LM head and runs the final norm. `LocalModel::kv_cache_bytes` sums the pools of all devices, which exceeds the single-device number when K/V heads are replicated.
@@ -133,7 +129,7 @@ Dtype handling on the CPU is on [Weight formats](@/providers/local/models.md#wei
 - The window pools take 80 KB per cached position at the real shape (40 layers of 512 floats), for the window and one call's rows of each running sequence plus `kv_tokens - context_length` positions kept for prefix reuse. With the default `kv_tokens` of twice the context that is 2.6 GB at 32k context and 10 GB at 128k; `kv_tokens` equal to the context keeps them at about 0.35 GB per sequence.
 - A tiered model prefills in steps of 4096 rows. The indexer scores them in tiles of at most 64 MB of scores, and a launch of the sparse attention whose partial results would pass 512 MiB (4096 rows at the real shape) takes the fused path, which is slower and gives the same values.
 - Measured on the real checkpoint (RX 9070 XT, 16 GB): 10.0 GB of device memory after the load with host-tiered experts, 12.0 GB at the peak of a chat request, 13.0 GB for a 16-token pass with every position's logits. With `gpu_layers = 20` and a 3 GiB device tier the peak is 10.5 GB. The expert RAM tier (85 GiB in the runs) is host memory.
-- With the set on an NVMe SSD (same card, `tiered:ram=90g,threads=32`, host-tiered): the process peaks at 11.7 GiB of device memory on a chat request and 12.5 GiB on a 1,752-token prompt, with 90 GiB of RSS at most. A first token after a 24-token prompt takes 26.7 s against 15.7 to 17.6 s on the CPU (the first pass of a Vulkan process is slower than later ones: 22 s against 10 s for the 16-token oracle prompt) and decode runs at 1.96 tokens/s; a 1,752-token prompt prefills at 11.8 tokens/s. In a separate 38-token run the first compilation and tuning of the kernels cost about 8 s once per process (7.3 s in the device readbacks of the first prefill pass, 1.2 s in the first one-row pass, against 0.08 s in later one-row passes), which is the likely source of the gap to the CPU's first token. The same request sent again in that process answered after 1.39 s, with its prompt prefix cached. With `gpu_layers = 20` the peak is 10.2 GiB at a 3 GiB device tier and 11.8 GiB at 6 GiB, and decode is 0.94 and 1.08 tokens/s; a device tier of 8 GiB runs out of device memory. Details are on [Local verification and known limits](@/providers/local/verification.md#deepseek-v4-1-real-checkpoint-on-an-ssd).
+- With the set on an NVMe SSD (same card, `experts { tiered ram_bytes="90g" loader_threads=32; }`, host-tiered): the process peaks at 11.7 GiB of device memory on a chat request and 12.5 GiB on a 1,752-token prompt, with 90 GiB of RSS at most. A first token after a 24-token prompt takes 26.7 s against 15.7 to 17.6 s on the CPU (the first pass of a Vulkan process is slower than later ones: 22 s against 10 s for the 16-token oracle prompt) and decode runs at 1.96 tokens/s; a 1,752-token prompt prefills at 11.8 tokens/s. In a separate 38-token run the first compilation and tuning of the kernels cost about 8 s once per process (7.3 s in the device readbacks of the first prefill pass, 1.2 s in the first one-row pass, against 0.08 s in later one-row passes), which is the likely source of the gap to the CPU's first token. The same request sent again in that process answered after 1.39 s, with its prompt prefix cached. With `gpu_layers = 20` the peak is 10.2 GiB at a 3 GiB device tier and 11.8 GiB at 6 GiB, and decode is 0.94 and 1.08 tokens/s; a device tier of 8 GiB runs out of device memory. Details are on [Local verification and known limits](@/providers/local/verification.md#deepseek-v4-1-real-checkpoint-on-an-ssd).
 - Tensor parallelism is rejected (`tensor parallelism: hyper-connection residual streams ...`).
 - `gpu_layers` is accepted only for cuts that keep every cache source with the layers that read it: each layer with compressed attention reads the compressed rows of its cache source layer, the picks of its index source layer and, when it narrows its scoring, the candidate blocks of the candidate source layer. The other values fail with `` gpu_layers N cuts `deepseek41` between layers that share compressed rows or indexer picks; legal values: ... ``. At the real layout (compressed rows owned by layers 2, 8, 14 and 20, layers 24 to 36 narrowing their scoring to the candidates of layer 20) the legal values are 20, 26, 32, 38, 39 and 40 of 40, and 0. The CPU half hands the GPU half the stream and the pre weights.
 - Experts: `ExpertPlacement::Host` and `ExpertPlacement::Tiered` with `device_bytes = 0` (host-tiered: the experts stay in the file behind a RAM tier and the CPU computes the ones a pass needs) keep the attention, the router, the shared experts and the head on the GPU. A device tier works for a model whose experts fit it.
@@ -144,19 +140,16 @@ Dtype handling on the CPU is on [Weight formats](@/providers/local/models.md#wei
 
 - Each layer's K/V pool lives on its layer's device under the same block tables, and so does a hybrid model's recurrent state (a snapshot is the pair of the halves'). The batching scheduler is unchanged.
 - A Gemma 4 layer that reads another layer's K/V from the other side of the boundary gets its source's new rows from the CPU half in the same crossing, into a mirror pool on the device that `kv_cache_bytes` does not count.
-- With tiered experts the CPU layers read the RAM tier and the GPU layers the device tier, which has a RAM tier of its own. The `ram` budget is split by MoE layer count and `device` belongs to the GPU half.
+- With tiered experts the CPU layers read the RAM tier and the GPU layers the device tier, which has a RAM tier of its own. The `ram_bytes` budget is split by MoE layer count and `device_bytes` belongs to the GPU half.
 - It fails with `CucaError::Config` for a CPU device, for `shards` or a `drafter`, and, once the file header is read, for a count above the layer count (`` gpu_layers N exceeds the M layers of `<architecture>` ``).
 
-```bash,name=Linux and macOS: 17 of 35 layers of Gemma 4 E2B on the GPU
-export CUCA_LOCAL_DEVICE="vulkan"
-export CUCA_LOCAL_GPU_LAYERS="17"
-cargo run --release --example local_model --features provider-local-vulkan
+```kdl,name=gemma4-offload.kdl
+device "vulkan"
+gpu_layers 17
 ```
 
-```powershell,name=Windows (PowerShell): 17 of 35 layers of Gemma 4 E2B on the GPU
-$env:CUCA_LOCAL_DEVICE = "vulkan"
-$env:CUCA_LOCAL_GPU_LAYERS = "17"
-cargo run --release --example local_model --features provider-local-vulkan
+```bash,name=Runs the same on all three platforms: 17 of 35 layers of Gemma 4 E2B on the GPU
+cargo run --release --example local_model --features provider-local-vulkan -- --config gemma4-offload.kdl
 ```
 
 ```text,name=Expected line on stderr
@@ -165,7 +158,7 @@ loaded on Vulkan(Default): 17 of 35 layers on the GPU (layers 18 to 34), layers 
 
 ## Host experts
 
-`ExpertPlacement::Host { layers }` (`host`, `host:layers=20`) is llama.cpp's `--cpu-moe` and `--n-cpu-moe`. The routed experts stay in host RAM and the CPU computes them with the CPU engine's expert code, while attention, the router, the shared expert, the norms and the head run on the GPU. Per MoE layer the GPU routes, one readback brings the normed rows and the routing to the host, the CPU runs every selected expert over its own tokens in ascending expert order and sums them, and one upload returns the sum, which the GPU adds to the shared expert.
+`ExpertPlacement::Host { layers }` (`experts { host; }`, `experts { host layers=20; }`) is llama.cpp's `--cpu-moe` and `--n-cpu-moe`. The routed experts stay in host RAM and the CPU computes them with the CPU engine's expert code, while attention, the router, the shared expert, the norms and the head run on the GPU. Per MoE layer the GPU routes, one readback brings the normed rows and the routing to the host, the CPU runs every selected expert over its own tokens in ascending expert order and sums them, and one upload returns the sum, which the GPU adds to the shared expert.
 
 - `layers: None` hosts every MoE layer. `Some(n)` hosts the first `n`, and the other layers keep resident experts on the device.
 - Every hosted expert is read into RAM at load.
@@ -198,30 +191,31 @@ Test-Path "$root\build\lib\llvm\amdgcn\bitcode\ocml.bc"
 
 The download (2.24 GB) took 29 s and the extraction 14 s. `hipInfo` lists `device# 0` as `AMD Radeon(TM) Graphics` (`gfx1036`, the Ryzen's integrated GPU) and `device# 1` as `AMD Radeon RX 9070 XT` (`gfx1201`), and `Test-Path` prints `True`. The DLLs carry the version in their names (`amdhip64_7.dll`, `hiprtc0716.dll`) in this release, and the tarball has no `amdhip64.dll` or `hiprtc.dll`, hence the copies.
 
+```kdl,name=rocm.kdl
+source "qwen3-0.6b-q8_0"
+device "rocm:1"
+```
+
 ```powershell,name=Windows (PowerShell): run on ROCm
 $dll = "C:\TheRock\cuca-dlls"
 $env:PATH = "$dll;" + $env:PATH
 $env:HIP_PATH = $dll
 $env:HIP_DEVICE_LIB_PATH = "C:\TheRock\build\lib\llvm\amdgcn\bitcode"
-$env:CUCA_LOCAL_DEVICE = "rocm:1"
-$env:CUCA_LOCAL_MODEL = "qwen3-0.6b-q8_0"
-$env:CUCA_LOCAL_PROMPT = "Explain in two sentences what a mixture of experts model is."
-$env:CUCA_LOCAL_THINKING = "off"
 $env:RUSTFLAGS = "-C target-cpu=native"
-cargo run --release --no-default-features --features provider-local-rocm --example local_model
+cargo run --release --no-default-features --features provider-local-rocm --example local_model -- --config rocm.kdl --prompt "Explain in two sentences what a mixture of experts model is." --thinking off
 ```
 
-The run prints `loaded on Rocm(1)` and then the reply. The variables are per shell: set them again in a new one.
+The run prints `loaded on Rocm(1)` and then the reply. The `$env:` values are the HIP runtime's own and per shell: set them again in a new one.
 
 - Keep the SDK's own `bin` folder off `PATH`, for the build as well as the run. It holds `hipconfig.exe`, which the build script of `cubecl-hip-sys` runs to pick its bindings by HIP version; that crate (7.14.6085001) bundles bindings up to HIP 7.14.60850 and the tarball reports 7.16.26385, so with the folder on `PATH` the build of `cubecl-hip` fails with 87 errors (unresolved `hipGraph_t`, `hipStream_t`, `hipError_t` and the like). Without `hipconfig` on `PATH` it takes its newest bundled bindings, and the 7.16 DLLs run them: every result below was obtained that way.
 - The DLL folder must be on `PATH`, because `amdhip64.dll` imports `rocm_kpack.dll` from its own folder and the loader does not search there. Without it, or without the libraries, the load fails with `device Rocm(1): 0 such device(s) found`, whose message names `ROCM_PATH`, `HIP_PATH`, the `PATH` requirement and `HIP_DEVICE_LIB_PATH`.
 - HIP numbers the integrated GPU 0 and the RX 9070 XT 1, so the device is `rocm:1`.
 - The `rocm-sdk-core` 10.1.0 wheel (AMD's page gives `python -m pip install --index-url https://stable.repo.amd.com/rocm/whl-next/ "rocm[libraries,device-all]==10.1.0"`; the test machine had it installed in Python's `site-packages`) holds the same files in `_rocm_sdk_core`. The copies and the `PATH` rule are the same, and the runs of the `qwen3-0.6b-q8_0` reply, the `deepseek41` generation and the production-path test below were made with its DLLs; the test suites, the oracle checks and the speed test with the tarball's. The nightly 7.14 wheel of the `gfx120X-all` index also ran the `qwen3-0.6b-q8_0` request with the same reply.
 - Kernels allocate their outputs contiguously. HIP pads the rows of an ordinary tensor to the device's pitch, which the kernels' linear indexing ignores; before that change 21 of the 37 `model::gpu` tests failed with wrong values.
-- `CUCA_LOCAL_DEVICE=rocm:1 cargo test --release --no-default-features --features provider-local-rocm --lib model::gpu -- --test-threads=1` passes 38 tests in 553 s (tarball DLLs); four of them, the real-model tests, return early without `CUCA_LOCAL_DS41_REAL`. `gpu_moe_one_row_experts_match_single_tokens` failed in 2 of 3 runs before its router was changed: the router rows came in groups of identical weights, so eight experts had exactly equal logits, and the last bit of a four-row and a one-row matmul (the kernel an autotune picks differs from run to run) decided which of them took the eighth slot, giving a different expert in the two passes. The rows are now scaled apart and the test passed in 4 of 4 runs.
+- With `device "rocm:1"` in the `local` model of `cuca-test.kdl`, `cargo test --release --no-default-features --features provider-local-rocm --lib model::gpu -- --test-threads=1` passes 38 tests in 553 s (tarball DLLs); four of them, the real-model tests, return early without `oracle.ds41.real_dir`. `gpu_moe_one_row_experts_match_single_tokens` failed in 2 of 3 runs before its router was changed: the router rows came in groups of identical weights, so eight experts had exactly equal logits, and the last bit of a four-row and a one-row matmul (the kernel an autotune picks differs from run to run) decided which of them took the eighth slot, giving a different expert in the two passes. The rows are now scaled apart and the test passed in 4 of 4 runs.
 - `qwen3-0.6b-q8_0`, thinking off, 23 tokens: the reply is byte for byte the Vulkan reply in every run. With the kernels compiled, decode runs at 27 to 29 tokens/s (24.3 on Vulkan).
-- The oracle check of `deepseek41` (`real_model_on_the_gpu_matches_the_streaming_oracle_with_quantization_{off,on}`, host-tiered `ram=85g`, the 16-token prompt): quantizers off, top-1 equal at 15 of 16 positions, smallest top-10 overlap 8, KL 1.78e-7 at the last position, the pass 294 s; on, 13 of 16, overlap 6, KL 5.29e-8, 539 s. `real_model_on_the_gpu_production_paths_match_the_oracle` (`CUCA_LOCAL_DS41_REAL_PATHS=1`) runs the prompt as an inexact prefill, as a shorter prefill then one token per step, exactly, as last-position logits whole and in chunks of 4, with the context, sequence count and step rows of the engine (`CUCA_LOCAL_DS41_REAL_CTX=8192`, `_SEQS=4`, `_ROWS=4096`, `_QDQ=1`): every path passes the oracle's checks and the last-position paths pick the same top-1 token as the exact one.
-- `deepseek41` from `examples/local_model.rs`, host-tiered `tiered:ram=85g,threads=32`, greedy: `What is the capital of France? Answer in one word.` with thinking off answers `Paris` (21 prompt tokens, 1 completion token), and `What is 9 * 8?` with thinking on reasons `We need answer simple. 9*8=72. Need concise.` and answers `72` (42 prompt tokens, 17 completion tokens), as on Vulkan. Peak device memory 10.0 GiB (11.7 GiB on Vulkan).
+- The oracle check of `deepseek41` (`real_model_on_the_gpu_matches_the_streaming_oracle_with_quantization_{off,on}`, host-tiered `ram_bytes="85g"`, the 16-token prompt): quantizers off, top-1 equal at 15 of 16 positions, smallest top-10 overlap 8, KL 1.78e-7 at the last position, the pass 294 s; on, 13 of 16, overlap 6, KL 5.29e-8, 539 s. `real_model_on_the_gpu_production_paths_match_the_oracle` (`real_paths #true`) runs the prompt as an inexact prefill, as a shorter prefill then one token per step, exactly, as last-position logits whole and in chunks of 4, with the context, sequence count and step rows of the engine (`real_ctx 8192`, `real_seqs 4`, `real_rows 4096`, `real_qdq #true`, all in `oracle { ds41 { ... } }`): every path passes the oracle's checks and the last-position paths pick the same top-1 token as the exact one.
+- `deepseek41` from `examples/local_model.rs`, host-tiered `experts { tiered ram_bytes="85g" loader_threads=32; }`, greedy: `What is the capital of France? Answer in one word.` with thinking off answers `Paris` (21 prompt tokens, 1 completion token), and `What is 9 * 8?` with thinking on reasons `We need answer simple. 9*8=72. Need concise.` and answers `72` (42 prompt tokens, 17 completion tokens), as on Vulkan. Peak device memory 10.0 GiB (11.7 GiB on Vulkan).
 - With the experts in the RAM tier (`real_model_on_the_gpu_speed`, the 16-token prompt): ROCm takes 177.1 s for the cold prompt, 1.15 s warm (14.0 tokens/s), 3.45 s for the first decode step and a median of 0.202 s for a warm one (4.94 tokens/s); Vulkan takes 19.7 s, 1.08 s (14.8 tokens/s), 2.04 s and 0.192 s (5.20 tokens/s). Once the kernels are compiled the two backends run at the same speed.
 
 ### Open: the first block of a ROCm process
@@ -242,7 +236,7 @@ Machine: Ryzen 9 9950X3D2, RX 9070 XT with 15.9 GiB, Windows, release build with
 | the same, GPU with `host` experts | 8.6 to 8.8 | 22.3 to 23.9 s (47 to 50 tokens/s) | 6.6 |
 | `qwen3.6-35b-a3b-q4_0`, CPU only | 18.8 to 18.9 | 23.8 to 24.4 s | 0 |
 | the same, GPU with `host` experts | 10.1 to 10.2 | 19.6 to 21.8 s | 5.9 |
-| the same, GPU with `tiered:device=6g,ram=12g` | 10.6 to 10.9 | 12.2 to 14.4 s | 10.6 |
+| the same, GPU with `tiered device_bytes="6g" ram_bytes="12g"` | 10.6 to 10.9 | 12.2 to 14.4 s | 10.6 |
 | `muse-glimmer-30b-q4_0`, CPU only | 3.5 | 79.8 to 83.0 s | 0 |
 | the same, `gpu_layers = 26` of 52 | 5.4 to 5.5 | 48 to 71 s | 13.5 |
 | the same, `gpu_layers = 34` of 52 | 7.3 | 43.2 to 46.7 s | 13.5 |
@@ -270,16 +264,16 @@ The rows for Mistral Small 4, Qwen3.6, and Muse at 26 and 34 layers ran with wei
 
 ## Verified and compile-checked
 
-The GPU unit tests in `src/provider/local/model/gpu.rs` run only when `CUCA_LOCAL_DEVICE` names a GPU (`vulkan`, or `a+b` for two devices); otherwise they print `SKIP: set CUCA_LOCAL_DEVICE to a GPU device`. The live suites run on the device that variable names, the CPU by default. CI has no GPU, so every GPU run is manual, on the development machine: Vulkan on the RX 9070 XT under Windows. The repository records no per commit result for them.
+The GPU unit tests in `src/provider/local/model/gpu.rs` run only when the `device` of the `local` model in `cuca-test.kdl` names a GPU (with `shards` for two devices); otherwise they print a `SKIP:` line naming the key. The live suites run on that device, the CPU by default. CI has no GPU, so every GPU run is manual, on the development machine: Vulkan on the RX 9070 XT under Windows. The repository records no per commit result for them.
 
 Live runs on Vulkan, with the suite `tests/provider_local.rs` unless noted:
 
 - Gemma 4 E2B Q4_0, OLMo 2 1B and Granite 3.3 2B passed every applicable scenario, with the same known limits as on the CPU.
 - Phi 4 mini Q4_K_M passed (9 tests; the reasoning and tool scenarios skip because its template has neither), and so did Gemma 3 1B Q4_0.
-- Qwen3-30B-A3B with `tiered:device=6g,ram=12g`, and Qwen3.6-35B-A3B (`qwen35moe`, hybrid) with `tiered:device=4g,ram=12g` and `tiered:device=6g,ram=12g`, passed every applicable scenario. `tests/provider_local_tiers.rs` reproduced the reference replies for OLMoE 1B-7B, Qwen3-30B-A3B and Qwen3.6-35B-A3B.
+- Qwen3-30B-A3B with `tiered device_bytes="6g" ram_bytes="12g"`, and Qwen3.6-35B-A3B (`qwen35moe`, hybrid) with `tiered device_bytes="4g" ram_bytes="12g"` and `tiered device_bytes="6g" ram_bytes="12g"`, passed every applicable scenario. `tests/provider_local_tiers.rs` reproduced the reference replies for OLMoE 1B-7B, Qwen3-30B-A3B and Qwen3.6-35B-A3B.
 - Muse Glimmer 30B passed with `gpu_layers` of 34, 36 and 38 of 52, with the CPU run's categories (9 tests; thinking off skips for this model). The 16.03 GB file does not fit the card whole.
 - Mistral Small 4 with `host` experts passed with the same categories as the CPU run.
-- Tensor parallelism on `vulkan:0+vulkan:0` gave the single-device replies for Gemma 4 E2B Q4_0 and Qwen3-0.6B Q8_0 (15 of 15 each), at about a third of the speed because of the host-staged sum, and 8 concurrent requests gave the replies of the serial runs.
+- Tensor parallelism with `device "vulkan:0"` and `shards "vulkan:0"` gave the single-device replies for Gemma 4 E2B Q4_0 and Qwen3-0.6B Q8_0 (15 of 15 each), at about a third of the speed because of the host-staged sum, and 8 concurrent requests gave the replies of the serial runs.
 - The Gemma 4 assistant drafter produced output identical to plain decoding; see [Speculative decoding](@/providers/local/drafting.md#verified).
 
 Unit tests on tiny random models:

@@ -85,8 +85,8 @@ fn renders_match_the_reference_jinja_environment() {
 }
 
 /// Catalog models: format detection and an end-to-end render + tokenize check
-/// against the cached GGUFs (`CUCA_LOCAL_CATALOG_DIR`, see the tokenizer golden
-/// docs; gemma4 through `CUCA_LOCAL_MODEL_PATH`). Absent files print `SKIP:`.
+/// against the cached GGUFs (`oracle { catalog_dir "..." }` in cuca-test.kdl, see the tokenizer golden
+/// docs; gemma4 through `local { model { source file="..." } }`). Absent files print `SKIP:`.
 mod real_models {
     use std::path::PathBuf;
 
@@ -173,11 +173,11 @@ mod real_models {
     /// Cached GGUF path of a catalog id, or `None` (after a `SKIP:`).
     fn model_path(id: &str) -> Option<PathBuf> {
         if id == "gemma4" {
-            let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") else {
-                skip("CUCA_LOCAL_MODEL_PATH not set");
+            let Some(path) = crate::test_config::get().local_path() else {
+                skip("set `local { model { source file=\"...\" } }` in cuca-test.kdl");
                 return None;
             };
-            return Some(PathBuf::from(path));
+            return Some(path);
         }
         let fixture: Value =
             serde_json::from_str(include_str!("../testdata/tokenizer_golden.json"))
@@ -430,14 +430,14 @@ mod real_models {
     }
 
     /// Cross-check against the HuggingFace transformers oracle dumps
-    /// (`.omp/local-models/ref/<id>.json`, directory in `CUCA_LOCAL_REF_DIR`):
+    /// (`.omp/local-models/ref/<id>.json`, directory in `oracle { ref_dir "..." }`):
     /// the GGUF template rendered for one user turn (`enable_thinking=False`,
     /// `strftime_now` pinned to 2025-01-15) must equal `chat_template.rendered`
     /// and `encode_prompt` of it the oracle's `chat_a` ids.
     #[test]
     fn render_and_ids_match_the_transformers_oracle() {
-        let Some(dir) = std::env::var_os("CUCA_LOCAL_REF_DIR") else {
-            skip("CUCA_LOCAL_REF_DIR not set");
+        let Some(dir) = crate::test_config::get().oracle.ref_dir.clone() else {
+            skip("set `oracle { ref_dir \"...\" }` in cuca-test.kdl");
             return;
         };
         let user = "What is the capital of France? Answer in one word.";
@@ -493,8 +493,8 @@ mod real_models {
 }
 
 /// Later catalog models: the rendered chat prompt and the token ids of every
-/// oracle prompt equal the transformers oracle's (`CUCA_LOCAL_REF_DIR`,
-/// models from `CUCA_LOCAL_CATALOG_DIR`). Absent files print `SKIP:`.
+/// oracle prompt equal the transformers oracle's (`oracle { ref_dir "..." }`,
+/// models from `oracle { catalog_dir "..." }`). Absent files print `SKIP:`.
 mod later_models {
     use serde_json::Value;
 
@@ -529,8 +529,8 @@ mod later_models {
 
     #[test]
     fn prompts_and_ids_match_the_transformers_oracle() {
-        let Some(refs) = std::env::var_os("CUCA_LOCAL_REF_DIR") else {
-            skip("CUCA_LOCAL_REF_DIR not set");
+        let Some(refs) = crate::test_config::get().oracle.ref_dir.clone() else {
+            skip("set `oracle { ref_dir \"...\" }` in cuca-test.kdl");
             return;
         };
         let Some(dir) = catalog_dir() else {

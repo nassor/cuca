@@ -125,7 +125,7 @@ let memory = MemoryPlugin::new(MemoryConfig::default())?;
 memory.merge_graph(report.delta, MergePolicy::Overwrite)?;
 ```
 
-`examples/entity_extraction.rs` is the full program with an org chart schema. It extracts through a live model, merges the delta, renders the graph into a second request and asks a question only the graph can answer. It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+`examples/entity_extraction.rs` is the full program with an org chart schema. It extracts through a live model, merges the delta, renders the graph into a second request and asks a question only the graph can answer. It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example entity_extraction --features "provider-llamacpp service-entity-extraction"

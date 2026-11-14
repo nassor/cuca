@@ -158,7 +158,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 tokens=9 in_flight=1 waiting=0
 ```
 
-`examples/rate_limit.rs` fans six turns out over one shared limiter sized at one request per 45 seconds. It prints each admission time and `usage()` reading, the peak `in_flight` and `waiting`, and the `retry_after` that `try_acquire` reports once the bucket is empty. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` point it at any OpenAI-compatible server.
+`examples/rate_limit.rs` fans six turns out over one shared limiter sized at one request per 45 seconds. It prints each admission time and `usage()` reading, the peak `in_flight` and `waiting`, and the `retry_after` that `try_acquire` reports once the bucket is empty. It needs a `llama-server` on port 1234 with the demo model loaded; the flags `--base-url` and `--model`, written after `--`, point it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example rate_limit --features "provider-llamacpp service-rate-limit"

@@ -86,13 +86,13 @@ The hook returns no error. Each variant below becomes `ToolResult` output text. 
 
 ## Example
 
-`examples/web_search.rs` searches through Firecrawl. It needs a `llama-server` on port 1234 with the demo model loaded and `CUCA_SEARCH_API_KEY` holding a Firecrawl key; without the key it prints one line and exits. `CUCA_SEARCH_BASE_URL` overrides the backend endpoint. `CUCA_BASE_URL` and `CUCA_MODEL` retarget the model at any OpenAI-compatible server.
+`examples/web_search.rs` searches through Firecrawl. It needs a `llama-server` on port 1234 with the demo model loaded and `--search-api-key <KEY>`, written after `--`, holding a Firecrawl key; without the key it prints one line and exits. `--search-base-url` overrides the backend endpoint. `--base-url` and `--model` retarget the model at any OpenAI-compatible server.
 
 ```rust,name=Configure and register WebSearchPlugin, from examples/web_search.rs
 let config = WebSearchConfig {
     provider: WebSearchProvider::Firecrawl,
     api_key,
-    base_url: std::env::var("CUCA_SEARCH_BASE_URL").ok(),
+    base_url: arg("search-base-url"),
     max_results: 3,
 };
 let web_search = Arc::new(WebSearchPlugin::new(config));
@@ -104,7 +104,7 @@ let client = CucaClient::builder()
 ```
 
 ```bash,name=Runs the same on all three platforms
-cargo run --example web_search --features "provider-llamacpp plugin-web-search"
+cargo run --example web_search --features "provider-llamacpp plugin-web-search" -- --search-api-key <KEY>
 ```
 
 ```text,name=Expected output with an invalid key

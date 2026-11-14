@@ -426,7 +426,7 @@ fn waiting_and_reconnecting_keep_the_last_data() {
     let mut app = App::new("http://127.0.0.1:8000", 1000);
     assert_has(
         &render(&mut app, 120, 40),
-        &["Waiting for http://127.0.0.1:8000", "--stats-api"],
+        &["Waiting for http://127.0.0.1:8000", "stats_api #true"],
     );
 
     let mut app = app_with(server_snapshot());

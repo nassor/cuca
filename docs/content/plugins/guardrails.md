@@ -93,7 +93,7 @@ let client = CucaClient::builder()
     .build()?;
 ```
 
-The example needs a `llama-server` on port 1234 with a tool-calling model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+The example needs a `llama-server` on port 1234 with a tool-calling model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example guardrails --features "provider-llamacpp plugin-guardrails"

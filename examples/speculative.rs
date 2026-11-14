@@ -27,15 +27,15 @@
 //!
 //! # Configuration
 //!
-//! A fast/slow pair needs two model ids, so this demo reads one variable per
-//! tier instead of `CUCA_MODEL`. All three default to a local llama.cpp
+//! A fast/slow pair needs two model ids, so this demo takes one flag per
+//! tier instead of `--model`. All three default to a local llama.cpp
 //! server; override them to target any OpenAI-compatible server:
 //!
-//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
-//! - `CUCA_FAST_MODEL`: fast-tier model id, defaults to `google/gemma-4-e4b`.
-//! - `CUCA_SLOW_MODEL`: slow-tier model id, defaults to `google/gemma-4-12b-qat`.
+//! - `--base-url <URL>`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `--fast-model <ID>`: fast-tier model id, defaults to `google/gemma-4-e4b`.
+//! - `--slow-model <ID>`: slow-tier model id, defaults to `google/gemma-4-12b-qat`.
 //!
-//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_FAST_MODEL=<small-id> CUCA_SLOW_MODEL=<large-id> cargo run --example speculative --features provider-llamacpp,service-speculative`
+//! Example: `cargo run --example speculative --features provider-llamacpp,service-speculative -- --base-url http://127.0.0.1:8000/v1 --fast-model <small-id> --slow-model <large-id>`
 //!
 //! # Output
 //!
@@ -242,15 +242,12 @@ fn requests(model: &str) -> [(&'static str, UnifiedRequest); 3] {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and the two tier models come from the environment so the
+    // Base URL and the two tier models come from the command line so the
     // example runs against any OpenAI-compatible server; the defaults target a
-    // local llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let fast_model =
-        std::env::var("CUCA_FAST_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
-    let slow_model =
-        std::env::var("CUCA_SLOW_MODEL").unwrap_or_else(|_| "google/gemma-4-12b-qat".to_string());
+    // local llama.cpp server (see the module docs for the flags).
+    let base_url = arg("base-url").unwrap_or_else(|| "http://127.0.0.1:1234/v1".to_string());
+    let fast_model = arg("fast-model").unwrap_or_else(|| "google/gemma-4-e4b".to_string());
+    let slow_model = arg("slow-model").unwrap_or_else(|| "google/gemma-4-12b-qat".to_string());
     println!("Pair: fast {fast_model}, slow {slow_model}");
 
     let evaluator = ComplexityEvaluator::default();
@@ -327,7 +324,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (turn, elapsed) = run(orchestrator(60_000), fast_request).await?;
     if let Some(error) = &turn.error {
         println!("\nNo server answered at {base_url}: {error}");
-        println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
+        println!("Start llama-server there, or pass --base-url, then run this again.");
         return Ok(());
     }
     println!("  reply: {}", turn.text);
@@ -394,4 +391,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         pool.len()
     );
     Ok(())
+}
+
+/// The value after `--<name>` on the command line.
+fn arg(name: &str) -> Option<String> {
+    let flag = format!("--{name}");
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+    }
+    None
 }

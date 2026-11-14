@@ -74,22 +74,12 @@ Same as [OpenAI limits](@/providers/openai.md#limits). There is no adapter cap a
 
 ## Example
 
-The smallest streaming turn: the `Vllm` variant against a local server, with no API key. The model id is the one the server reports under `GET {base}/models`.
+The smallest streaming turn: the `Vllm` variant against a local server, with no API key. The model id is the one the server reports under `GET {base}/models`; change `base_url` and `model` to match your server.
 
 ```bash,name=Runs the same on all three platforms
 cargo add cuca --path /path/to/cuca --features provider-vllm
 cargo add tokio --features rt,macros
 cargo add tokio-stream
-```
-
-```bash,name=Linux and macOS: choose the server and model
-export CUCA_BASE_URL="http://127.0.0.1:8000/v1"
-export CUCA_MODEL="google/gemma-4-e4b"
-```
-
-```powershell,name=Windows (PowerShell): choose the server and model
-$env:CUCA_BASE_URL = "http://127.0.0.1:8000/v1"
-$env:CUCA_MODEL = "google/gemma-4-e4b"
 ```
 
 ```rust,name=A first stream through the vLLM adapter
@@ -101,9 +91,8 @@ use tokio_stream::StreamExt;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:8000/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+    let base_url = "http://127.0.0.1:8000/v1";
+    let model = "google/gemma-4-e4b";
 
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::Vllm)

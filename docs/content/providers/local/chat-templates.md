@@ -18,9 +18,10 @@ weight = 8
 
 ## Where the template comes from
 
-The template is the Jinja text of `tokenizer.chat_template`, which a GGUF must carry: a file without it fails the load with ``GGUF metadata `tokenizer.chat_template`: missing``. Two sources replace it, as llama.cpp's `--chat-template-file` and vLLM's `--chat-template` do:
+The template is the Jinja text of `tokenizer.chat_template`, which a GGUF must carry: a file without it fails the load with ``GGUF metadata `tokenizer.chat_template`: missing``. Three sources replace it, as llama.cpp's `--chat-template-file` and vLLM's `--chat-template` do, in this order:
 
-- `LocalModelConfig::chat_template: Option<String>`, the template text. It wins over everything else. The live tests and `examples/local_model.rs` read it from the file `CUCA_LOCAL_CHAT_TEMPLATE` names.
+- `LocalModelConfig::chat_template: Option<String>`, the template text. It wins over everything else.
+- `LocalModelConfig::chat_template_file: Option<PathBuf>`, a file holding the template, read at load; in KDL `chat_template_file "templates/x.jinja"`. A file that cannot be read fails the load with `CucaError::Io` naming it.
 - A template a source pins: `ModelSource::HuggingFace::template`, which a preset sets through `ModelPreset::template`. The file is downloaded once into the cache like a model file (`<cache>/huggingface/<repo>/<revision>/<file>`), verified against its SHA-256, and read at load.
 
 A replacement is used for everything derived from the template: the reasoning markers and whether a request can switch reasoning off, the tool-call syntax, the end-of-turn tokens, and the `enable_thinking`, `reasoning_effort` and `reasoning_strength` variables. The replacement may also be a llama.cpp template name; see [Named templates](#named-templates).

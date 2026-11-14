@@ -142,7 +142,7 @@ println!("{}/{} entries", cache.len()?, cache.capacity());
 let snapshot = client.prompt_cache_snapshot()?;
 ```
 
-`examples/prompt_cache.rs` is the full program. It runs a turn, repeats it to hit the cache, changes one word to miss, then imports the snapshot into a second client whose base URL is a closed port. The hit still answers there, and an uncached turn fails on the connection the hit never opened. It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it.
+`examples/prompt_cache.rs` is the full program. It runs a turn, repeats it to hit the cache, changes one word to miss, then imports the snapshot into a second client whose base URL is a closed port. The hit still answers there, and an uncached turn fails on the connection the hit never opened. It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, retarget it.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example prompt_cache --features "provider-llamacpp service-prompt-cache"

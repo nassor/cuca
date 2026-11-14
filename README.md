@@ -122,7 +122,7 @@ You will start the model on port 1234, create a small crate, and stream one repl
 
 - Enable only the provider features you use. The [Providers](https://nassor.github.io/cuca/providers/) pages list what each one talks to.
 - Any OpenAI-compatible server (Ollama, vLLM, a remote gateway) works with `provider-openai`, a different `with_base_url` and your model name. Ollama serves at `http://localhost:11434/v1`. LM Studio has its own `provider-lmstudio`, which defaults to `http://127.0.0.1:1234/v1`.
-- The `examples/` folder has a runnable demo for the core client, every plugin and every service. All except `local_model` read `CUCA_BASE_URL`, and all except `local_model` and `speculative` read `CUCA_MODEL` (`speculative` reads `CUCA_FAST_MODEL` and `CUCA_SLOW_MODEL`). Each plugin and service page on the site shows the `cargo run` command and its output.
+- The `examples/` folder has a runnable demo for the core client, every plugin and every service. They take `--base-url` and `--model` after `--` (`speculative` takes `--fast-model` and `--slow-model`), and `local_model` takes `--config` with a KDL file. Each plugin and service page on the site shows the `cargo run` command and its output.
 
 ### Run a model with no server
 
@@ -145,13 +145,25 @@ A Hugging Face safetensors checkpoint needs no GGUF: `"Qwen/Qwen3-0.6B:<commit>"
 
 ### Serve a model over HTTP
 
-The `cuca` binary turns the local engine into an OpenAI-compatible server (vLLM and llama.cpp style), with a load balancer for several servers, Prometheus metrics, a stats API and a terminal UI. This command runs the same on Linux, macOS and Windows (PowerShell):
+The `cuca` binary turns the local engine into an OpenAI-compatible server (vLLM and llama.cpp style), with a load balancer for several servers, Prometheus metrics, a stats API and a terminal UI. It reads one KDL file. Save this as `cuca.kdl`:
+
+```kdl
+serve {
+    stats_api #true
+
+    model {
+        source "qwen3-0.6b-q8_0"
+    }
+}
+```
+
+This command runs the same on Linux, macOS and Windows (PowerShell):
 
 ```
-cargo run --release --no-default-features --features server-tui --bin cuca -- serve --model qwen3-0.6b-q8_0 --stats-api
+cargo run --release --no-default-features --features server-tui --bin cuca -- serve --config cuca.kdl
 ```
 
-Then `POST /v1/chat/completions` on `http://127.0.0.1:8000`. The [Server pages](https://nassor.github.io/cuca/server/) cover `serve`, `balance`, `tui`, the metrics and the stats API.
+Then `POST /v1/chat/completions` on `http://127.0.0.1:8000`. The [Server pages](https://nassor.github.io/cuca/server/) cover `serve`, `balance`, `tui`, the metrics and the stats API, and the [configuration reference](https://nassor.github.io/cuca/reference/environment/) covers the file.
 
 ### Run the live tests
 
@@ -161,7 +173,7 @@ With a chat model on `http://127.0.0.1:1234` (a llama.cpp server works), run thi
 cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit service-vector-store plugin-redaction service-scheduler" -- --nocapture --test-threads=1
 ```
 
-Without a reachable server, the tests print `SKIP` and pass. The environment variables are in the [integration tests guide](https://nassor.github.io/cuca/guides/integration-tests/).
+Without a reachable server, the tests print `SKIP` and pass. To target another server or make a skip fail, copy `cuca-test.example.kdl` to `cuca-test.kdl`, edit it, and add `config-kdl` to the features. The keys are in the [configuration reference](https://nassor.github.io/cuca/reference/environment/), the steps in the [integration tests guide](https://nassor.github.io/cuca/guides/integration-tests/).
 
 ## License
 

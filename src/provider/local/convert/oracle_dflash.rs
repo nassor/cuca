@@ -1,11 +1,11 @@
 //! Numerical parity of the DFlash drafter with the transformers reference.
 //!
-//! Gated on `CUCA_LOCAL_DFLASH_REF`, a directory written by
+//! Gated on `oracle { dflash_ref "..." }` in cuca-test.kdl, a directory written by
 //! `.omp/local-models/dflash/make_tiny_dflash.py` (not in the repository):
 //! `target/` (a tiny `MuseGlimmerForConditionalGeneration` checkpoint),
 //! `assistant/` (a tiny `MuseGlimmerAssistantModel` checkpoint) and
 //! `ref.json` + `ref.bin` (the reference rounds). Without it the test prints
-//! `SKIP:` and passes, unless `CUCA_REQUIRE_LIVE=1`.
+//! `SKIP:` and passes, unless `require_live #true`.
 //!
 //! The reference drives transformers' own `DFlashTokenCandidateGenerator`
 //! protocol by hand over several rounds with one `DFlashCache`: the target's
@@ -16,25 +16,25 @@
 //! soft-cap, which is what the engine ranks). Both checkpoints are converted
 //! to F16 (their BF16 values are exact in it) and loaded in the engine's
 //! exact dequantized mode, so only float rounding separates the two sides:
-//! `CUCA_LOCAL_REF_TOL` (default `5e-4`) bounds `max |dlogit|` over every
+//! `oracle { ref_tol ... }` (default `5e-4`) bounds `max |dlogit|` over every
 //! round, and the draft tokens must be equal.
-
-use std::path::PathBuf;
 
 use serde_json::Value;
 
-use super::oracle::{argmax, convert_dir, env, floats, read_gguf, skip, token_ids};
+use super::oracle::{argmax, convert_dir, floats, read_gguf, skip, token_ids};
 use crate::provider::local::model::cpu::dflash::DflashNet;
 use crate::provider::local::model::cpu::{Hidden, Transformer};
 use crate::provider::local::model::{Want, prefill_chunk};
 
 #[test]
 fn dflash_drafter_matches_the_transformers_reference() {
-    let Some(dir) = env("CUCA_LOCAL_DFLASH_REF") else {
-        return skip("set CUCA_LOCAL_DFLASH_REF (see make_tiny_dflash.py)");
+    let config = &crate::test_config::get().oracle;
+    let Some(dir) = config.dflash_ref.clone() else {
+        return skip(
+            "set `oracle { dflash_ref \"...\" }` in cuca-test.kdl (see make_tiny_dflash.py)",
+        );
     };
-    let dir = PathBuf::from(dir);
-    let tol: f32 = env("CUCA_LOCAL_REF_TOL").map_or(5e-4, |t| t.parse().unwrap());
+    let tol: f32 = config.ref_tol.unwrap_or(5e-4);
     let meta: Value =
         serde_json::from_str(&std::fs::read_to_string(dir.join("ref.json")).unwrap()).unwrap();
     let hidden = usize::try_from(meta["hidden"].as_u64().unwrap()).unwrap();

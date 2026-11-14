@@ -103,22 +103,11 @@ The wording is the model's own. A reasoning model also spends time on
 `Thinking` blocks before the first word arrives, and this example drops them, so
 expect a pause before the text starts.
 
-If your model id or port differs from the defaults, the example reads two
-environment variables. It defaults to `http://127.0.0.1:1234/v1` and
-`google/gemma-4-e4b`.
+If your model id or port differs from the defaults, the example takes two
+flags. It defaults to `http://127.0.0.1:1234/v1` and `google/gemma-4-e4b`.
 
-Linux and macOS:
-
-```bash
-CUCA_BASE_URL=http://127.0.0.1:1234/v1 CUCA_MODEL=your-model-id \
-  cargo run --example llamacpp_gemma --features provider-llamacpp
-```
-
-Windows (PowerShell), where environment assignments are separate statements and
-`;` joins them:
-
-```powershell
-$env:CUCA_BASE_URL = "http://127.0.0.1:1234/v1"; $env:CUCA_MODEL = "your-model-id"; cargo run --example llamacpp_gemma --features provider-llamacpp
+```bash,name=Runs the same on all three platforms
+cargo run --example llamacpp_gemma --features provider-llamacpp -- --base-url http://127.0.0.1:1234/v1 --model your-model-id
 ```
 
 If nothing is answering at that base URL, the example says so and exits

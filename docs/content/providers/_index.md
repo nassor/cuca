@@ -105,16 +105,11 @@ configuration error: custom endpoints require a registered adapter
 - `ProviderEndpoint::default()` is `OpenAi`.
 - `UnifiedRequest::new` sets the request's provider to `Custom(String::new())`, and `generate_stream` overwrites it with the client's provider before any hook runs.
 
-## Environment variables
+## Configuration
 
-None of the seven HTTP adapters reads an environment variable. Base URLs, API keys and bearer tokens reach them only through `CucaClientBuilder`. The `CUCA_*` variables that belong to the examples and the test harness are listed in [Environment variables](@/reference/environment.md).
+None of the seven HTTP adapters reads an environment variable. Base URLs, API keys and bearer tokens reach them only through `CucaClientBuilder`. The examples take their base URL and model as flags, and the tests read `cuca-test.kdl`; both are on [Configuration files](@/reference/environment.md).
 
-`provider-local` reads these as fallbacks:
-
-- `HF_TOKEN` when `LocalModelConfig::hf_token` is `None`. An empty value counts as unset.
-- `CUCA_CACHE_DIR` when `LocalModelConfig::cache_dir` is `None`. Without it the cache is `%LOCALAPPDATA%\cuca` (then `%USERPROFILE%\AppData\Local\cuca`) on Windows, `$HOME/Library/Caches/cuca` on macOS, and `$XDG_CACHE_HOME/cuca` (then `$HOME/.cache/cuca`) elsewhere. With none resolvable, loading fails with `CucaError::Config`.
-
-Setting the config fields keeps it from reading either.
+`provider-local` reads no environment variable for its settings either. `LocalModelConfig::hf_token` set to `None` or an empty string means anonymous access. `LocalModelConfig::cache_dir` set to `None` means the platform cache directory: `%LOCALAPPDATA%\cuca` (then `%USERPROFILE%\AppData\Local\cuca`) on Windows, `$HOME/Library/Caches/cuca` on macOS, and `$XDG_CACHE_HOME/cuca` (then `$HOME/.cache/cuca`) elsewhere. With none resolvable, loading fails with `CucaError::Config`. A KDL file fills the same fields; see [Configuration files](@/reference/environment.md#the-model-keys).
 
 ## Related pages
 

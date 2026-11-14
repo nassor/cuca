@@ -12,11 +12,11 @@
 //! ```
 //!
 //! `gguf_path_suffix` is `<repo with / as -->/<revision>/<file>` under the
-//! `huggingface` directory of the model cache: `CUCA_LOCAL_CATALOG_DIR` names
-//! that directory, else it is `<cache dir>/huggingface` with the cache dir
-//! resolved exactly like the downloader does (`CUCA_CACHE_DIR`, then
-//! `%LOCALAPPDATA%\cuca` and friends). A model whose file is absent prints
-//! `SKIP:` and passes, unless `CUCA_REQUIRE_LIVE=1`.
+//! `huggingface` directory of the model cache: `oracle { catalog_dir "..." }` in
+//! cuca-test.kdl names that directory, else it is `<cache dir>/huggingface` with
+//! the cache dir resolved exactly like the downloader does (`cache_dir` in
+//! cuca-test.kdl, then `%LOCALAPPDATA%\cuca` and friends). A model whose file is
+//! absent prints `SKIP:` and passes, unless `require_live #true`.
 //!
 //! Where HuggingFace and llama.cpp semantics legitimately differ, the expected
 //! ids follow llama.cpp, and the fixture is generated so the difference does not
@@ -37,7 +37,7 @@
 //!   random comparison against HuggingFace found every one of its granite
 //!   mismatches (120) to be exactly this case, and none for the other ten models.
 //!
-//! The Gemma 4 test (`CUCA_LOCAL_MODEL_PATH`) keeps its own vectors from the
+//! The Gemma 4 test (`local { model { source file="..." } }`) keeps its own vectors from the
 //! reference tokenizer of google/gemma-4-E2B-it.
 
 use std::collections::HashMap;
@@ -86,17 +86,18 @@ struct ModelCase {
 
 /// The directory that holds `<repo>/<revision>/<file>` model caches.
 pub(crate) fn catalog_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CUCA_LOCAL_CATALOG_DIR") {
-        return Some(PathBuf::from(dir));
+    let config = crate::test_config::get();
+    if let Some(dir) = &config.oracle.catalog_dir {
+        return Some(dir.clone());
     }
-    let cache = resolve_cache_dir(None, &|key| std::env::var_os(key)).ok()?;
+    let cache = resolve_cache_dir(config.cache_dir.as_deref()).ok()?;
     Some(cache.join("huggingface"))
 }
 
-/// Report a missing model: print `SKIP:`, or panic under `CUCA_REQUIRE_LIVE=1`.
+/// Report a missing model: print `SKIP:`, or panic under `require_live #true`.
 pub(crate) fn skip(what: &str) {
     assert!(
-        std::env::var("CUCA_REQUIRE_LIVE").as_deref() != Ok("1"),
+        !crate::test_config::get().require_live,
         "required model unavailable: {what}"
     );
     eprintln!("SKIP: {what}");
@@ -224,11 +225,11 @@ fn golden_prompt_never_doubles_bos() {
 /// (newline-run split) result is the expected one; all current vectors agree.
 #[test]
 fn gemma4_ids_match_reference_tokenizer() {
-    let Some(path) = std::env::var_os("CUCA_LOCAL_MODEL_PATH") else {
-        skip("CUCA_LOCAL_MODEL_PATH not set");
+    let Some(path) = crate::test_config::get().local_path() else {
+        skip("set `local { model { source file=\"...\" } }` in cuca-test.kdl");
         return;
     };
-    let t = Tokenizer::from_gguf(&read_metadata(Path::new(&path))).expect("tokenizer builds");
+    let t = Tokenizer::from_gguf(&read_metadata(&path)).expect("tokenizer builds");
     assert_eq!(t.vocab_size(), 262_144);
     assert_eq!(t.token_id("<bos>"), Some(2));
     assert_eq!(t.token_id("<eos>"), Some(1));
@@ -258,13 +259,13 @@ const GEMMA4: &[(&str, &[u32])] = &[
     ),
 ];
 
-/// A tokenizer corpus against reference ids: `CUCA_TOK_GGUF` names a GGUF
+/// A tokenizer corpus against reference ids: `oracle { tok_gguf "..." }` names a GGUF
 /// (its header is read, so a file cut after the metadata works) and
-/// `CUCA_TOK_CASES` a JSON array of `{"text": .., "ids": [..]}` produced by the
+/// `oracle { tok_cases "..." }` a JSON array of `{"text": .., "ids": [..]}` produced by the
 /// model's reference tokenizer (`encode(text, add_special_tokens=False)` of
 /// HuggingFace `tokenizers`, or `Tekkenizer.encode(text, bos=False,
 /// eos=False)` of `mistral_common`). Without both the test prints `SKIP:` and
-/// passes (`CUCA_REQUIRE_LIVE=1` makes it fail). `CUCA_TOK_MAX_DIFF` (default
+/// passes (`require_live #true` makes it fail). `oracle { tok_max_diff ... }` (default
 /// 0) bounds the accepted mismatches, for a documented llama.cpp-vs-reference
 /// difference.
 ///
@@ -288,11 +289,9 @@ fn tokenizer_corpus_matches_reference_ids() {
         text: String,
         ids: Vec<u32>,
     }
-    let (Some(gguf), Some(cases)) = (
-        std::env::var_os("CUCA_TOK_GGUF"),
-        std::env::var_os("CUCA_TOK_CASES"),
-    ) else {
-        skip("set CUCA_TOK_GGUF and CUCA_TOK_CASES");
+    let oracle = &crate::test_config::get().oracle;
+    let (Some(gguf), Some(cases)) = (oracle.tok_gguf.as_ref(), oracle.tok_cases.as_ref()) else {
+        skip("set `oracle { tok_gguf \"...\" }` and `tok_cases` in cuca-test.kdl");
         return;
     };
     let cases: Vec<Case> =
@@ -310,10 +309,7 @@ fn tokenizer_corpus_matches_reference_ids() {
             &tokenizer.encode(&case.text),
         );
     }
-    let allowed: usize = std::env::var("CUCA_TOK_MAX_DIFF")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let allowed: usize = oracle.tok_max_diff.unwrap_or(0);
     eprintln!("corpus: {} cases, {} differ", cases.len(), failures.len());
     assert!(
         failures.len() <= allowed,
@@ -324,11 +320,14 @@ fn tokenizer_corpus_matches_reference_ids() {
     );
 }
 
-/// DeepSeek-V4.1-Flash-1017's `tokenizer.json`: `CUCA_DS41_TOKENIZER_JSON`, else
+/// DeepSeek-V4.1-Flash-1017's `tokenizer.json`: `oracle { ds41 { tokenizer_json "..." } }` in cuca-test.kdl, else
 /// the reference copy under `.omp/local-models/ref/deepseek-v41/`.
 fn deepseek_v41_tokenizer_json() -> Option<PathBuf> {
-    let path = std::env::var_os("CUCA_DS41_TOKENIZER_JSON")
-        .map(PathBuf::from)
+    let path = crate::test_config::get()
+        .oracle
+        .ds41
+        .tokenizer_json
+        .clone()
         .unwrap_or_else(|| {
             Path::new(env!("CARGO_MANIFEST_DIR"))
                 .join(".omp/local-models/ref/deepseek-v41/tokenizer.json")
@@ -409,7 +408,7 @@ fn deepseek_v41_metadata(tokenizer_json: &serde_json::Value) -> HashMap<String, 
 /// the ids of 45 probe texts and 300 seeded random ones
 /// (`testdata/deepseek_v41_tokenizer.json`), and the decoded text of every probe
 /// without control tokens. Needs the reference `tokenizer.json`; without it the
-/// test prints `SKIP:` and passes (`CUCA_REQUIRE_LIVE=1` makes it fail).
+/// test prints `SKIP:` and passes (`require_live #true` makes it fail).
 #[test]
 fn deepseek_v41_ids_match_reference_tokenizer() {
     #[derive(Deserialize)]
@@ -426,7 +425,9 @@ fn deepseek_v41_ids_match_reference_tokenizer() {
         serde_json::from_str(include_str!("../testdata/deepseek_v41_tokenizer.json"))
             .expect("fixture parses");
     let Some(path) = deepseek_v41_tokenizer_json() else {
-        skip("DeepSeek-V4.1 tokenizer.json (set CUCA_DS41_TOKENIZER_JSON)");
+        skip(
+            "DeepSeek-V4.1 tokenizer.json (set `oracle { ds41 { tokenizer_json \"...\" } }` in cuca-test.kdl)",
+        );
         return;
     };
     let json: serde_json::Value =

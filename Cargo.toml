@@ -48,6 +48,7 @@ features = [
     "service-vector-store",
     "server",
     "server-tui",
+    "config-kdl",
 ]
 
 # The provider gate in lib.rs fails the plain lib build cargo performs for the
@@ -103,7 +104,7 @@ provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
 # no HTTP endpoint, no llama.cpp. reqwest is used only for the one-time model download
 # (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file;
 # sysinfo's disk list answers the converter's free-space preflight.
-provider-local = ["dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:sysinfo", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "dep:wide", "reqwest/rustls", "serde_json/preserve_order"]
+provider-local = ["config-kdl", "dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:sysinfo", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "dep:wide", "reqwest/rustls", "serde_json/preserve_order"]
 # provider-local GPU backends (burn 0.22 / CubeCL). provider-local-gpu is the shared
 # engine; it selects no backend by itself and is enabled by each backend feature.
 # The graphics backends are Rust (wgpu: SPIR-V for vulkan, MSL for metal), but
@@ -183,14 +184,20 @@ service-speculative = ["dep:tokio", "dep:tokio-stream"]
 # src/plugins/memory/mod.rs, so plugin-memory is a hard dependency; wide is the
 # feature-owned SIMD kernel dependency for the retrieval scan.
 service-vector-store = ["plugin-memory", "dep:wide"]
+# config-kdl: the KDL configuration reader (`cuca::config::load_kdl_file`): a KDL
+# document becomes a serde value tree, `${VAR}` placeholders resolved against a
+# top-level `variables` block, then the process environment. The `cuca` binary's
+# file and `LocalModelConfig` deserialize from it; kdl's own `serde` feature is
+# experimental and stays off.
+config-kdl = ["dep:kdl"]
 # server: the `cuca` binary's model server (src/server/): an OpenAI-compatible HTTP API
 # (axum), the stats API, Prometheus metrics and system sampling over the in-process
 # local engine. `sysinfo` (CPU/RAM/disk/process), `nvml-wrapper` (NVIDIA, loaded at run
 # time, absent driver is a soft failure) and `wmi` (Windows GPU counters) feed
-# `server::sysmon`. getrandom makes request ids; toml reads `--config`.
+# `server::sysmon`. getrandom makes request ids; config-kdl reads `--config`.
 server = [
-    "provider-local", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber",
-    "dep:sysinfo", "dep:nvml-wrapper", "dep:wmi", "dep:winreg", "dep:toml", "dep:getrandom", "dep:tokio-stream",
+    "provider-local", "config-kdl", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber",
+    "dep:sysinfo", "dep:nvml-wrapper", "dep:wmi", "dep:winreg", "dep:getrandom", "dep:tokio-stream",
     "tokio/net", "tokio/rt-multi-thread", "tokio/signal", "tokio/io-util",
 ]
 # server-tui: the real-time terminal UI over the stats API (built after the server).
@@ -224,6 +231,8 @@ opentelemetry = { version = "0.32", optional = true }
 # runtime needed), so the telemetry tests stay on the current-thread Tokio flavor.
 opentelemetry_sdk = { version = "0.32", optional = true, features = ["metrics", "testing"] }
 tracing = { version = "0.1", optional = true }
+# config-kdl: the KDL parser with source spans (positioned error messages).
+kdl = { version = "6.7", optional = true, default-features = false, features = ["span"] }
 # wide: portable SIMD, stable-only by construction (`std::simd` is nightly, and
 # this crate pins stable 1.98, forbids `unsafe` and reaches the vector units
 # through it): `f32x8` for the vector store's cosine scan, and the i16 multiply-add
@@ -251,11 +260,10 @@ cubecl = { version = "0.11", optional = true, default-features = false, features
 burn-cubecl = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune"] }
 # server: HTTP framework, CLI, logging and system sampling (see the `server` feature).
 axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1", "json", "query", "matched-path"] }
-clap = { version = "4", optional = true, features = ["derive", "env"] }
+clap = { version = "4", optional = true, features = ["derive"] }
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "json"] }
 sysinfo = { version = "0.40", optional = true, default-features = false, features = ["system", "disk"] }
 nvml-wrapper = { version = "0.13", optional = true }
-toml = { version = "1", optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 

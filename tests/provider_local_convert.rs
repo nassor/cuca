@@ -2,28 +2,29 @@
 //!
 //! For each pinned Hugging Face checkpoint this loads
 //! `ModelSource::Checkpoint { repo, revision }` with `quant = F16`: the files
-//! are downloaded (or found in the cache, `CUCA_CACHE_DIR`), converted to a
+//! are downloaded (or found in the cache, the top-level `cache_dir` of
+//! `cuca-test.kdl`), converted to a
 //! cached GGUF and loaded like any other file. The chat turn of the
 //! transformers oracle's `chat_a` prompt must then give the oracle's first
 //! greedy tokens, and, where the rendered template holds no date, the
 //! oracle's prompt token count.
 //!
-//! Gated on `CUCA_LOCAL_REF_DIR` (the oracle dumps, not in the repository;
-//! `.omp/local-models/ref/`): without it, or without network access for a
-//! checkpoint that is not cached, each check prints `SKIP:` and passes, unless
-//! `CUCA_REQUIRE_LIVE=1` turns that into a failure. The logits, top-k and
-//! relative-L2 comparison with the same oracle runs inside the crate
-//! (`convert::oracle`, a unit test with the same gate and the same variable);
-//! this file checks what the public API can see.
+//! Gated on `oracle { ref_dir ... }` in `cuca-test.kdl` (the oracle dumps, not
+//! in the repository; `.omp/local-models/ref/`): without it, or without
+//! network access for a checkpoint that is not cached, each check prints
+//! `SKIP:` and passes, unless `require_live #true` turns that into a failure.
+//! The logits, top-k and relative-L2 comparison with the same oracle runs
+//! inside the crate (`convert::oracle`, a unit test with the same gate and the
+//! same key); this file checks what the public API can see.
 //!
 //! ```sh
-//! CUCA_LOCAL_REF_DIR=$PWD/.omp/local-models/ref CUCA_REQUIRE_LIVE=1 \
-//!   RUSTFLAGS="-C target-cpu=native" cargo test --release --no-default-features \
+//! # cuca-test.kdl: require_live #true; oracle { ref_dir ".omp/local-models/ref"; }
+//! RUSTFLAGS="-C target-cpu=native" cargo test --release --no-default-features \
 //!   --features provider-local --test provider_local_convert -- --test-threads=1 --nocapture
 //! ```
 //!
-//! `CUCA_LOCAL_CONVERT_ONLY=<substring>` restricts the run to the repositories
-//! containing it.
+//! `oracle { convert_only "<substring>" }` restricts the run to the
+//! repositories containing it.
 //!
 //! # Verifying the converter itself
 //!
@@ -102,7 +103,9 @@ fn common_prefix(a: &str, b: &str) -> usize {
 #[tokio::test]
 async fn converted_checkpoints_answer_like_the_oracle() {
     let Some(ref_dir) = local_env::ref_dir() else {
-        return local_env::skip("SKIP: set CUCA_LOCAL_REF_DIR to the oracle dumps");
+        return local_env::skip(
+            "SKIP: set `oracle { ref_dir ... }` in cuca-test.kdl to the oracle dumps",
+        );
     };
     let only = local_env::convert_only();
     for (repo, revision) in PINNED {
@@ -128,6 +131,8 @@ async fn converted_checkpoints_answer_like_the_oracle() {
                 quant: WeightQuant::F16,
                 ..ConvertConfig::default()
             },
+            cache_dir: local_env::cache_dir(),
+            hf_token: local_env::hf_token(),
             ..Default::default()
         })
         .await

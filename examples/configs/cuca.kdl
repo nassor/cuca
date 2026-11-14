@@ -1,0 +1,40 @@
+// The `cuca` configuration file: `cuca serve --config cuca.kdl` reads the
+// `serve` section, `cuca balance --config cuca.kdl` the `balance` one; both
+// read `log`. Every key is a field of `cuca::server::CucaConfig`, a `model`
+// node holds a `cuca::LocalModelConfig` (see examples/configs/local_model.kdl
+// for every key). Nothing else is read from the environment: a placeholder
+// (dollar sign, then NAME or NAME:-default in braces) resolves against
+// `variables`, then the environment. Placeholders are replaced before the file
+// is parsed, in comments too.
+
+variables {
+    API_KEY "change-me"          // delete the entry to read API_KEY from the environment
+}
+
+log format="pretty" level="info"
+
+serve {
+    listen "127.0.0.1:8000"
+    api_key "${API_KEY}"
+    stats_api #true
+    latency_window "60s"
+
+    model "chat" {
+        source "qwen3-0.6b-q8_0"
+        batching max_sequences=8
+    }
+    model {
+        source file="/models/gemma-4-E4B-it-Q4_0.gguf"
+        device "vulkan:0"
+        gpu_layers 20
+    }
+}
+
+balance {
+    listen "127.0.0.1:8080"
+    upstreams "http://10.0.0.1:8000" "http://10.0.0.2:8000"
+    upstream_api_key "${API_KEY}"
+    policy "prefix-affinity"
+    health_interval "1s"
+    stats_api #true
+}

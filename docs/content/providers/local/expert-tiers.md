@@ -29,13 +29,20 @@ A token routes to `n_used` of a layer's `n_expert` experts, yet the default plac
 | `loader_threads` | `4` | disk reader threads, `1..=64` |
 | `warm_from` | `None` | an `ExpertHeat` from an earlier session; the hottest experts load at startup |
 
-An `ExpertPlacement` also parses from text, ASCII case-insensitive, with `str::parse`:
+In KDL the placement is the `experts` node of a `LocalModelConfig`:
 
-- `resident`, or `tiered:` followed by comma separated `ram=<size>`, `device=<size>` and `threads=<n>` in any order, each at most once, with `ram` or `device` present.
-- `<size>` is a byte count with an optional `k`, `m` or `g` suffix, powers of 1024: `4g` is 4,294,967,296 bytes and `1100m` is 1,153,433,600.
-- `tiered:ram=4g` and `tiered:device=6g,ram=12g,threads=8` are valid. `tiered:threads=8` is not, because it names no tier.
-- `host` and `host:layers=<n>` parse to `ExpertPlacement::Host`, the GPU placement with experts computed on the CPU. It is not a tier; see [Host experts](@/providers/local/gpu.md#host-experts).
-- The parser checks the syntax only. The rules in the table apply at `LocalModel::load`.
+```kdl,name=The forms of experts (write one)
+experts "resident"
+experts { tiered ram_bytes="4g"; }
+experts { tiered ram_bytes="12g" device_bytes="6g" loader_threads=8; }
+experts { host; }
+experts { host layers=4; }
+```
+
+- `ram_bytes` and `device_bytes` are an integer or a string with an optional `k`, `m` or `g` suffix, powers of 1024, ASCII case-insensitive: `"4g"` is 4,294,967,296 bytes and `"1100m"` is 1,153,433,600.
+- `experts { tiered loader_threads=8; }` parses, and `LocalModel::load` rejects it because it names no tier.
+- `host` and `host layers=<n>` are `ExpertPlacement::Host`, the GPU placement with experts computed on the CPU. It is not a tier; see [Host experts](@/providers/local/gpu.md#host-experts).
+- An unknown key inside `experts` is an error naming it. The rules in the table apply at `LocalModel::load`.
 
 ## Slots and the minimum budget
 
@@ -51,12 +58,12 @@ A tier must hold `n_used` experts in every layer, so the minimum budget is `n_us
 
 | Model | Experts per layer, used | MoE layers | `per_expert`, bytes | Minimum, bytes | Slots per layer |
 |---|---|---|---|---|---|
-| `olmoe-1b-7b-q4_0` | 64, 8 | 16 | 56,885,248 | 455,081,984 | `ram=500m`: 9 |
-| `qwen3-30b-a3b-q4_0` | 128, 8 | 48 | 127,991,808 | 1,023,934,464 | `ram=4g`: 33<br>`ram=1100m`: 9 |
-| `qwen3.6-35b-a3b-q4_0` | 256, 8 | 40 | 71,106,560 | 568,852,480 | `ram=600m`: 8<br>`ram=4g`: 60<br>`device=2g`: 30<br>`device=4g`: 60<br>`device=6g`: 90 |
-| `gemma4-26b-a4b-q4_0` | 128, 8 | 30 | 100,362,240 | 802,897,920 | `ram=4g`: 42<br>`ram=6g`: 64<br>`ram=8g`: 85 |
-| `mistral-small-4-119b-q4_0` | 128, 4 | 36 | about 511.7 MB | about 2.05 GB | `ram=8g`: 16<br>`ram=48g`: 100 |
-| `deepseek-ai/DeepSeek-V4.1-Flash-1017` (checkpoint source) | 384, 6 | 40 | 752,025,600 | 4,512,153,600 | `ram=48g`: 68<br>`ram=64g`: 91 |
+| `olmoe-1b-7b-q4_0` | 64, 8 | 16 | 56,885,248 | 455,081,984 | `ram_bytes="500m"`: 9 |
+| `qwen3-30b-a3b-q4_0` | 128, 8 | 48 | 127,991,808 | 1,023,934,464 | `ram_bytes="4g"`: 33<br>`ram_bytes="1100m"`: 9 |
+| `qwen3.6-35b-a3b-q4_0` | 256, 8 | 40 | 71,106,560 | 568,852,480 | `ram_bytes="600m"`: 8<br>`ram_bytes="4g"`: 60<br>`device_bytes="2g"`: 30<br>`device_bytes="4g"`: 60<br>`device_bytes="6g"`: 90 |
+| `gemma4-26b-a4b-q4_0` | 128, 8 | 30 | 100,362,240 | 802,897,920 | `ram_bytes="4g"`: 42<br>`ram_bytes="6g"`: 64<br>`ram_bytes="8g"`: 85 |
+| `mistral-small-4-119b-q4_0` | 128, 4 | 36 | about 511.7 MB | about 2.05 GB | `ram_bytes="8g"`: 16<br>`ram_bytes="48g"`: 100 |
+| `deepseek-ai/DeepSeek-V4.1-Flash-1017` (checkpoint source) | 384, 6 | 40 | 752,025,600 | 4,512,153,600 | `ram_bytes="48g"`: 68<br>`ram_bytes="64g"`: 91 |
 
 - In the Qwen3 models the down matrices are Q4_0 in most layers and Q4_1 in the rest, so `per_expert` is a sum over layers: for Qwen3-30B-A3B, 42 layers of 2,654,208 bytes and 6 of 2,752,512.
 - The shared expert and the router are dense weights and stay resident.
@@ -74,8 +81,8 @@ Every one of the 40 layers of `deepseek41` is a mixture of experts with 384 rout
 - The heat table costs `4 * 40 * 384` = 61,440 bytes.
 - A tiered `deepseek41` model prefills in steps of 4096 rows by default (`BatchingConfig::max_step_tokens`), because a step costs the experts its rows route to and a bigger step shares them among more rows.
 - Each expert read takes its three matrices from the part file of the set that holds them, with positional reads on that file's handle.
-- On the real checkpoint with `tiered:ram=90g,threads=16` (CPU, default-precision set on an HDD-class volume that serves the experts at about 0.4 to 0.5 GB/s), a 16-token pass reads about 32.7 GB of experts cold and takes 13 s warm. A chat request of 42 prompt tokens and 17 generated tokens read 78.2 GB in 4,158 expert reads for 7,592 lookups, because the RAM tier starts cold in every process. Decoding is bound by those reads, at about 5 s per token cold.
-- On an NVMe SSD (random 6 MiB unbuffered reads measure 3.47 GB/s, 4.07 GB/s at 18 MiB) the same model with `tiered:ram=90g,threads=32` reads experts at up to 3.5 GB/s. A chat request of 42 prompt tokens and 17 generated tokens (78.2 GB read) answers after 20.75 s on the CPU, and 200 generated tokens after a 24-token prompt run at 2.1 tokens/s with 84 % RAM hits. A prompt of 2,014 tokens that needs 301 of the 384 experts per layer (226.3 GB read) prefills at 13.7 tokens/s with an average read rate of 1.5 GB/s, so compute still bounds a long prefill. 8 to 64 loader threads differ by less than the run-to-run spread. The measurements are on [Local verification and known limits](@/providers/local/verification.md#deepseek-v4-1-real-checkpoint-on-an-ssd).
+- On the real checkpoint with `experts { tiered ram_bytes="90g" loader_threads=16; }` (CPU, default-precision set on an HDD-class volume that serves the experts at about 0.4 to 0.5 GB/s), a 16-token pass reads about 32.7 GB of experts cold and takes 13 s warm. A chat request of 42 prompt tokens and 17 generated tokens read 78.2 GB in 4,158 expert reads for 7,592 lookups, because the RAM tier starts cold in every process. Decoding is bound by those reads, at about 5 s per token cold.
+- On an NVMe SSD (random 6 MiB unbuffered reads measure 3.47 GB/s, 4.07 GB/s at 18 MiB) the same model with `experts { tiered ram_bytes="90g" loader_threads=32; }` reads experts at up to 3.5 GB/s. A chat request of 42 prompt tokens and 17 generated tokens (78.2 GB read) answers after 20.75 s on the CPU, and 200 generated tokens after a 24-token prompt run at 2.1 tokens/s with 84 % RAM hits. A prompt of 2,014 tokens that needs 301 of the 384 experts per layer (226.3 GB read) prefills at 13.7 tokens/s with an average read rate of 1.5 GB/s, so compute still bounds a long prefill. 8 to 64 loader threads differ by less than the run-to-run spread. The measurements are on [Local verification and known limits](@/providers/local/verification.md#deepseek-v4-1-real-checkpoint-on-an-ssd).
 
 The DSpark drafter's three stages hold 128 experts each in their own file and are not tiered; see [Speculative decoding](@/providers/local/drafting.md#dspark-for-deepseek-v4-1).
 
@@ -148,8 +155,8 @@ Placement decides speed only. An expert is built from the same file bytes as in 
 
 What ran:
 
-- The CPU unit tests `tiered_experts_match_resident_bit_for_bit` and `tiered_fused_experts_match_resident_bit_for_bit`, and on a GPU (when `CUCA_LOCAL_DEVICE` names one) `gpu_tiered_experts_match_gpu_resident`, on tiny models. The tiny `deepseek41` models with MXFP4 experts are among them: `a_warm_start_serves_the_first_pass_from_the_experts_it_loaded` checks a cold and a warm tiered load against the resident logits, and the GPU tiered, host and host-tiered tests run on all three tiny `deepseek41` variants. A gated test, `real_tests.rs`, loads the converted real set with tiered experts when `CUCA_LOCAL_DS41_REAL` is set; the repository records no result of it.
-- `tests/provider_local_tiers.rs`: on the CPU every run of the table below equaled the resident replies (for Mistral Small 4 at `ram=8g`, the `ram=48g` run, which equals them). On Vulkan (RX 9070 XT, Windows) it reproduced the reference replies for OLMoE 1B-7B (`tiered:device=1g,ram=0` against resident), Qwen3-30B-A3B (`tiered:device=6g,ram=12g` cold and warm against `tiered:device=2g,ram=0`) and Qwen3.6-35B-A3B (`tiered:device=4g,ram=12g` and `tiered:device=2g,ram=4g`). The live suite `tests/provider_local.rs` passed all seven scenarios for Qwen3-30B-A3B at `tiered:device=6g,ram=12g`.
+- The CPU unit tests `tiered_experts_match_resident_bit_for_bit` and `tiered_fused_experts_match_resident_bit_for_bit`, and on a GPU (when the `device` of the `local` model in `cuca-test.kdl` names one) `gpu_tiered_experts_match_gpu_resident`, on tiny models. The tiny `deepseek41` models with MXFP4 experts are among them: `a_warm_start_serves_the_first_pass_from_the_experts_it_loaded` checks a cold and a warm tiered load against the resident logits, and the GPU tiered, host and host-tiered tests run on all three tiny `deepseek41` variants. A gated test, `real_tests.rs`, loads the converted real set with tiered experts when `oracle.ds41.real_dir` is set; the repository records no result of it.
+- `tests/provider_local_tiers.rs`: on the CPU every run of the table below equaled the resident replies (for Mistral Small 4 at `ram_bytes="8g"`, the `ram_bytes="48g"` run, which equals them). On Vulkan (RX 9070 XT, Windows) it reproduced the reference replies for OLMoE 1B-7B (`tiered device_bytes="1g" ram_bytes=0` against resident), Qwen3-30B-A3B (`tiered device_bytes="6g" ram_bytes="12g"` cold and warm against `tiered device_bytes="2g" ram_bytes=0`) and Qwen3.6-35B-A3B (`tiered device_bytes="4g" ram_bytes="12g"` and `tiered device_bytes="2g" ram_bytes="4g"`). The live suite `tests/provider_local.rs` passed all seven scenarios for Qwen3-30B-A3B at `tiered device_bytes="6g" ram_bytes="12g"`.
 
 ## Statistics and heat
 
@@ -216,35 +223,35 @@ CPU: Ryzen 9 9950X3D2 with 125 GB of RAM, release build with `RUSTFLAGS="-C targ
 | Model | Placement | Tokens per second | Hit rate |
 |---|---|---|---|
 | `olmoe-1b-7b-q4_0` | resident | 42 | not applicable |
-| `olmoe-1b-7b-q4_0` | `tiered:ram=500m`, 9 of 64 experts per layer | 10.0 cold, 10.1 warm | 0.381 cold, 0.385 warm |
+| `olmoe-1b-7b-q4_0` | `tiered ram_bytes="500m"`, 9 of 64 experts per layer | 10.0 cold, 10.1 warm | 0.381 cold, 0.385 warm |
 | `qwen3-30b-a3b-q4_0` | resident, 17.4 GB of RAM | 12.3 | not applicable |
-| `qwen3-30b-a3b-q4_0` | `tiered:ram=4g`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.641 cold, 0.686 warm |
-| `qwen3-30b-a3b-q4_0` | `tiered:ram=1100m`, 9 of 128 experts per layer | 6.2 cold, 5.3 warm | 0.381 cold, 0.383 warm |
+| `qwen3-30b-a3b-q4_0` | `tiered ram_bytes="4g"`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.641 cold, 0.686 warm |
+| `qwen3-30b-a3b-q4_0` | `tiered ram_bytes="1100m"`, 9 of 128 experts per layer | 6.2 cold, 5.3 warm | 0.381 cold, 0.383 warm |
 | `qwen3.6-35b-a3b-q4_0` | resident, 18.9 GiB peak resident set in this test | 14.7 and 14.9 | not applicable |
-| `qwen3.6-35b-a3b-q4_0` | `tiered:ram=4g`, 60 of 256 experts per layer | 7.4 cold, 7.1 warm | 0.661 cold, 0.708 warm |
-| `qwen3.6-35b-a3b-q4_0` | `tiered:ram=600m`, 8 of 256 experts per layer | 6.3 cold, 6.2 warm | 0.307 cold, 0.308 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered ram_bytes="4g"`, 60 of 256 experts per layer | 7.4 cold, 7.1 warm | 0.661 cold, 0.708 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered ram_bytes="600m"`, 8 of 256 experts per layer | 6.3 cold, 6.2 warm | 0.307 cold, 0.308 warm |
 | `mistral-small-4-119b-q4_0` | resident, 67.7 GB of RAM | 8.7 | not applicable |
-| `mistral-small-4-119b-q4_0` | `tiered:ram=48g`, 100 of 128 experts per layer | 0.8 cold, 2.1 warm | 0.824 cold, 0.958 warm |
-| `mistral-small-4-119b-q4_0` | `tiered:ram=8g`, 16 of 128 experts per layer | 1.1 cold, 1.8 warm | 0.310 cold, 0.337 warm |
+| `mistral-small-4-119b-q4_0` | `tiered ram_bytes="48g"`, 100 of 128 experts per layer | 0.8 cold, 2.1 warm | 0.824 cold, 0.958 warm |
+| `mistral-small-4-119b-q4_0` | `tiered ram_bytes="8g"`, 16 of 128 experts per layer | 1.1 cold, 1.8 warm | 0.310 cold, 0.337 warm |
 
-- Mistral Small 4 is 67.7 GB next to 125 GB of RAM, so only part of the file stayed in the page cache. One expert of all 36 layers is 511.7 MB. The cold run at `ram=48g` read 4,618 experts (65.7 GB) out of 26,205 lookups, and the cold run at `ram=8g` read 18,081 (257 GB).
-- Qwen3.6-35B-A3B: the cold runs read 18,861 experts (33.6 GB) at `ram=4g` and 38,510 (68.5 GB) at `ram=600m`, out of 55,597 lookups, from a file that was in the OS page cache. In a separate run of one 1,024-token reply (`examples/local_model.rs`) the peak resident set was 18.8 GiB with resident experts, 5.95 GiB at `ram=4g` and 2.43 GiB at `ram=600m`. The model loaded in 8.3 s resident against 0.8 s tiered.
-- Gemma 4 26B-A4B (`gemma4-26b-a4b-q4_0`, fused gate/up experts, 12.85 GB of the 14.62 GB file are experts): one reply of 164 tokens with thinking off and greedy sampling (`examples/local_model.rs`, same CPU) printed the same text resident and at `tiered:ram=6g,threads=8` (64 of 128 experts per layer). The file sat on an HDD-class volume but had just been read many times, so it was in the OS page cache and every expert read was a cache hit: the tiered rate is a page-cache-warm figure, not a disk or SSD one, and no cold-disk run was made. Resident it decoded at 10.0 tokens per second with a peak resident set of 13.8 GiB; tiered at 8.8 tokens per second with 7.8 GiB, 41,407 lookups, 37,355 of them RAM hits (0.90) and 4,052 expert reads (13.56 GB). The dense branch of each layer, the router and its scales, the attention and the embedding stay resident whatever the budget (about 1.8 GB).
+- Mistral Small 4 is 67.7 GB next to 125 GB of RAM, so only part of the file stayed in the page cache. One expert of all 36 layers is 511.7 MB. The cold run at `ram_bytes="48g"` read 4,618 experts (65.7 GB) out of 26,205 lookups, and the cold run at `ram_bytes="8g"` read 18,081 (257 GB).
+- Qwen3.6-35B-A3B: the cold runs read 18,861 experts (33.6 GB) at `ram_bytes="4g"` and 38,510 (68.5 GB) at `ram_bytes="600m"`, out of 55,597 lookups, from a file that was in the OS page cache. In a separate run of one 1,024-token reply (`examples/local_model.rs`) the peak resident set was 18.8 GiB with resident experts, 5.95 GiB at `ram_bytes="4g"` and 2.43 GiB at `ram_bytes="600m"`. The model loaded in 8.3 s resident against 0.8 s tiered.
+- Gemma 4 26B-A4B (`gemma4-26b-a4b-q4_0`, fused gate/up experts, 12.85 GB of the 14.62 GB file are experts): one reply of 164 tokens with thinking off and greedy sampling (`examples/local_model.rs`, same CPU) printed the same text resident and at `experts { tiered ram_bytes="6g" loader_threads=8; }` (64 of 128 experts per layer). The file sat on an HDD-class volume but had just been read many times, so it was in the OS page cache and every expert read was a cache hit: the tiered rate is a page-cache-warm figure, not a disk or SSD one, and no cold-disk run was made. Resident it decoded at 10.0 tokens per second with a peak resident set of 13.8 GiB; tiered at 8.8 tokens per second with 7.8 GiB, 41,407 lookups, 37,355 of them RAM hits (0.90) and 4,052 expert reads (13.56 GB). The dense branch of each layer, the router and its scales, the attention and the embedding stay resident whatever the budget (about 1.8 GB).
 
 Vulkan: RX 9070 XT with 15.9 GiB, Windows, release build. The rates include the kernel tuning that each new matrix shape pays on first use, which a short run does not amortize.
 
 | Model | Placement | Tokens per second | Hit rate |
 |---|---|---|---|
 | `olmoe-1b-7b-q4_0` | resident | 8.3 | not applicable |
-| `olmoe-1b-7b-q4_0` | `tiered:device=1g,ram=0` | 5.7 cold, 6.1 warm | 0.575 cold, 0.599 warm |
-| `qwen3-30b-a3b-q4_0` | `tiered:device=2g,ram=0` | 1.9 | 0.501 |
-| `qwen3-30b-a3b-q4_0` | `tiered:device=6g,ram=12g` | 4.9 cold, 6.1 warm | 0.911 cold, 0.983 warm |
-| `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=0` | 1.9 to 2.5 | 0.541 |
-| `qwen3.6-35b-a3b-q4_0` | `tiered:device=2g,ram=4g` | 4.8 cold, 4.8 warm | 0.669 cold, 0.736 warm |
-| `qwen3.6-35b-a3b-q4_0` | `tiered:device=4g,ram=12g` | 6.5 cold, 8.3 warm | 0.863 cold, 0.973 warm |
+| `olmoe-1b-7b-q4_0` | `tiered device_bytes="1g" ram_bytes=0` | 5.7 cold, 6.1 warm | 0.575 cold, 0.599 warm |
+| `qwen3-30b-a3b-q4_0` | `tiered device_bytes="2g" ram_bytes=0` | 1.9 | 0.501 |
+| `qwen3-30b-a3b-q4_0` | `tiered device_bytes="6g" ram_bytes="12g"` | 4.9 cold, 6.1 warm | 0.911 cold, 0.983 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered device_bytes="2g" ram_bytes=0` | 1.9 to 2.5 | 0.541 |
+| `qwen3.6-35b-a3b-q4_0` | `tiered device_bytes="2g" ram_bytes="4g"` | 4.8 cold, 4.8 warm | 0.669 cold, 0.736 warm |
+| `qwen3.6-35b-a3b-q4_0` | `tiered device_bytes="4g" ram_bytes="12g"` | 6.5 cold, 8.3 warm | 0.863 cold, 0.973 warm |
 
-- In the `qwen3.6-35b-a3b-q4_0` run at `device=4g,ram=12g` the cold start read 7,627 experts from the file, 9,939 hits came from the RAM tier and 38,041 from the device tier, out of 55,607 lookups. One 1,024-token reply (`examples/local_model.rs`, `loaded on Vulkan(Default)`) ran at about 9.6 tokens per second with `tiered:device=6g,ram=12g` and 10.1 with `tiered:device=4g,ram=12g`.
-- The desktop held 2.4 to 3.2 GiB of the card during these runs. Dedicated memory of the whole card, desktop included, peaked at 10.5 GiB over the full live suite at `device=4g,ram=12g` and at 14.6 GiB at `device=6g,ram=12g`.
+- In the `qwen3.6-35b-a3b-q4_0` run at `device_bytes="4g" ram_bytes="12g"` the cold start read 7,627 experts from the file, 9,939 hits came from the RAM tier and 38,041 from the device tier, out of 55,607 lookups. One 1,024-token reply (`examples/local_model.rs`, `loaded on Vulkan(Default)`) ran at about 9.6 tokens per second with `tiered device_bytes="6g" ram_bytes="12g"` and 10.1 with `tiered device_bytes="4g" ram_bytes="12g"`.
+- The desktop held 2.4 to 3.2 GiB of the card during these runs. Dedicated memory of the whole card, desktop included, peaked at 10.5 GiB over the full live suite at `device_bytes="4g" ram_bytes="12g"` and at 14.6 GiB at `device_bytes="6g" ram_bytes="12g"`.
 
 ## Errors
 
@@ -257,51 +264,53 @@ Vulkan: RX 9070 XT with 15.9 GiB, Windows, release build. The rates include the 
 
 At load, once the file is open, `LocalModel::load` also fails with `CucaError::Config` for:
 
-- A budget below the minimum: ``expert RAM tier of 524288000 bytes holds 4 experts per layer; this model needs at least 8 (1023934464 bytes)``, from `qwen3-30b-a3b-q4_0` at `ram=500m`. A device tier reads ``expert device tier of ...`` instead.
+- A budget below the minimum: ``expert RAM tier of 524288000 bytes holds 4 experts per layer; this model needs at least 8 (1023934464 bytes)``, from `qwen3-30b-a3b-q4_0` at `ram_bytes="500m"`. A device tier reads ``expert device tier of ...`` instead.
 - `warm_from` of another shape: `experts.warm_from is heat for AxB experts; this model has CxD`, with layers by experts.
 - A model without experts: ``expert tiers need a mixture-of-experts model; `llama` has no experts``.
 
-`str::parse` on an unknown placement returns ``CucaError::Config("unknown expert placement `...`; expected resident, host[:layers=<n>] or tiered:ram=<size>[,device=<size>][,threads=<n>]")``.
+A KDL `experts` node with an unknown key or an unknown placement name is `CucaError::Config` naming it.
 
 An expert read that fails while generating (a truncated file, for example) fails the request with a `CucaError::Provider` item in the stream.
 
 ## Run it
 
-The example reads `CUCA_LOCAL_EXPERTS` and prints the tier counters on stderr after the reply, as a line that starts with `expert tiers: ExpertTierStats {`. `disk_reads` is above 0 once the first token has routed.
+The example reads the `experts` node of the file `--config` names and prints the tier counters on stderr after the reply, as a line that starts with `expert tiers: ExpertTierStats {`. `disk_reads` is above 0 once the first token has routed.
+
+```kdl,name=olmoe-tiered.kdl
+source "olmoe-1b-7b-q4_0"
+experts { tiered ram_bytes="600m"; }
+```
 
 ```bash,name=Linux and macOS: the example with tiered experts
-export RUSTFLAGS="-C target-cpu=native"
-export CUCA_LOCAL_MODEL="olmoe-1b-7b-q4_0"
-export CUCA_LOCAL_EXPERTS="tiered:ram=600m"
-cargo run --release --example local_model --features provider-local
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local -- --config olmoe-tiered.kdl
 ```
 
 ```powershell,name=Windows (PowerShell): the example with tiered experts
 $env:RUSTFLAGS = "-C target-cpu=native"
-$env:CUCA_LOCAL_MODEL = "olmoe-1b-7b-q4_0"
-$env:CUCA_LOCAL_EXPERTS = "tiered:ram=600m"
-cargo run --release --example local_model --features provider-local
+cargo run --release --example local_model --features provider-local -- --config olmoe-tiered.kdl
 ```
 
-The live test `tests/provider_local_tiers.rs` loads the reference placement, then the tiered one cold, then warm from the exported heat. It asserts equal greedy replies (three prompts, 48 tokens), resident bytes within the budgets, and that the warm start saves reads while generating. It drops each model and waits 5 seconds before the next load, so a GPU gives its memory back. It prints `TIERS|reference|...`, `TIERS|cold|...` and `TIERS|warm|...` lines with the tokens per second, the counters and the hit rate. Without a model or without `CUCA_LOCAL_EXPERTS` it prints `SKIP` and passes, `CUCA_REQUIRE_LIVE=1` turns the skip into a failure, and a `CUCA_LOCAL_EXPERTS` that is not tiered fails the test.
+The live test `tests/provider_local_tiers.rs` loads the reference placement, then the tiered one cold, then warm from the exported heat. It asserts equal greedy replies (three prompts, 48 tokens), resident bytes within the budgets, and that the warm start saves reads while generating. It drops each model and waits 5 seconds before the next load, so a GPU gives its memory back. It prints `TIERS|reference|...`, `TIERS|cold|...` and `TIERS|warm|...` lines with the tokens per second, the counters and the hit rate. Without a model or without an `experts` node in the `local` model of `cuca-test.kdl` it prints `SKIP` and passes, `require_live #true` turns the skip into a failure, and an `experts` node that is not tiered fails the test.
+
+```kdl,name=cuca-test.kdl: the tiers test
+local {
+    model {
+        source "olmoe-1b-7b-q4_0"
+        experts { tiered ram_bytes="500m"; }
+    }
+}
+```
 
 ```bash,name=Linux and macOS: the tiers test
-export RUSTFLAGS="-C target-cpu=native"
-export CUCA_LOCAL_MODEL="olmoe-1b-7b-q4_0"
-export CUCA_LOCAL_EXPERTS="tiered:ram=500m"
-cargo test --release --features provider-local --test provider_local_tiers -- --nocapture
+RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_tiers -- --nocapture
 ```
 
 ```powershell,name=Windows (PowerShell): the tiers test
 $env:RUSTFLAGS = "-C target-cpu=native"
-$env:CUCA_LOCAL_MODEL = "olmoe-1b-7b-q4_0"
-$env:CUCA_LOCAL_EXPERTS = "tiered:ram=500m"
 cargo test --release --features provider-local --test provider_local_tiers -- --nocapture
 ```
 
-- `CUCA_LOCAL_EXPERTS_REF` sets the reference placement, `resident` by default. Set it to a small tiered placement when the resident model does not fit the device.
-- `CUCA_LOCAL_DEVICE` selects one device. A GPU run needs its feature and a placement with `device=`, for example `tiered:device=6g,ram=12g` with `--features provider-local-vulkan`.
-- `CUCA_LOCAL_GPU_LAYERS` sets `gpu_layers` for every phase, so the CPU layers use the RAM tier and the GPU layers the device tier.
-- `tests/provider_local.rs` reads `CUCA_LOCAL_EXPERTS` too, so the whole scenario matrix runs on tiered experts. Unset means resident.
-
-Other variables are in [Local configuration](@/providers/local/configuration.md#environment-variables).
+- `local { experts_ref { ... } }` sets the reference placement, `resident` by default. Set it to a small tiered placement, for example `experts_ref { tiered ram_bytes="1g"; }`, when the resident model does not fit the device.
+- `device` of the `local` model selects one device. A GPU run needs its feature and a placement with `device_bytes`, for example `experts { tiered device_bytes="6g" ram_bytes="12g"; }` with `--features provider-local-vulkan`.
+- `gpu_layers` of the `local` model sets `gpu_layers` for every phase, so the CPU layers use the RAM tier and the GPU layers the device tier.
+- `tests/provider_local.rs` reads the `experts` node too, so the whole scenario matrix runs on tiered experts. Without it the experts are resident.

@@ -1,56 +1,168 @@
-//! Server configuration: listener, API key and the models to load.
+//! The `cuca` configuration file: one KDL document whose sections are the
+//! structs below, read by `cuca serve` and `cuca balance` (`--config`, default
+//! `cuca.kdl`). Every key is a field name; a `model` node is a
+//! [`LocalModelConfig`] with the name clients select it by as its argument.
 //!
-//! A model is named by a [`ModelSpec`], which a `--model [name=]source`
-//! argument or a `[[model]]` table of the `--config` file produces. Both
-//! start from the global [`ModelOptions`] defaults (`--device`,
-//! `--context-length`, ...) and a table overrides them per model:
+//! ```kdl
+//! variables {
+//!     API_KEY "change-me"          // delete the entry to read API_KEY from the environment
+//! }
 //!
-//! ```toml
-//! [[model]]
-//! name = "chat"
-//! source = "qwen3-0.6b-q8_0"
-//! batching = "seqs=8"
+//! log format="pretty" level="info"
 //!
-//! [[model]]
-//! source = "/models/gemma-4-E4B-it-Q4_0.gguf"
-//! device = "vulkan"
-//! gpu_layers = 20
+//! serve {
+//!     listen "127.0.0.1:8000"
+//!     api_key "${API_KEY}"
+//!     stats_api #true
+//!     latency_window "60s"
+//!
+//!     model "chat" {
+//!         source "qwen3-0.6b-q8_0"
+//!         batching max_sequences=8
+//!     }
+//!     model {
+//!         source file="/models/gemma-4-E4B-it-Q4_0.gguf"
+//!         device "vulkan:0"
+//!         gpu_layers 20
+//!     }
+//! }
+//!
+//! balance {
+//!     listen "127.0.0.1:8080"
+//!     upstreams "http://10.0.0.1:8000" "http://10.0.0.2:8000"
+//!     upstream_api_key "${API_KEY}"
+//!     policy "prefix-affinity"
+//!     health_interval "1s"
+//!     stats_api #true
+//! }
 //! ```
+//!
+//! `${NAME}` and `${NAME:-default}` placeholders resolve against the
+//! `variables` block, then the process environment ([`crate::config`]); no
+//! other setting is read from the environment. A relative path resolves
+//! against the working directory. `examples/configs/cuca.kdl` is this file.
 
-use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::Path;
+use std::str::FromStr;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::de::Error as _;
+use serde::{Deserialize, Deserializer};
 
+use super::balancer::BalancerConfig;
 use super::error::ServerError;
-use crate::{
-    BatchingConfig, DrafterSource, ExpertPlacement, LocalModelConfig, ModelSource, WeightQuant,
-};
+use super::telemetry::LogConfig;
+use crate::config::ConfigValue;
+use crate::error::CucaError;
+use crate::{LocalModelConfig, ModelSource};
 
 /// Most models one server loads: each holds its weights and K/V pools in
 /// memory, so a longer list is a mistake, not a deployment.
 pub const MAX_MODELS: usize = 16;
 
-/// Everything `serve` needs to start.
-#[derive(Debug, Clone)]
+/// The whole configuration file. `serve` reads the `serve` section,
+/// `balance` the `balance` one; both read `log`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CucaConfig {
+    /// Logging of either command.
+    pub log: LogConfig,
+    /// The model server.
+    pub serve: Option<ServerConfig>,
+    /// The balancer.
+    pub balance: Option<BalancerConfig>,
+}
+
+impl CucaConfig {
+    /// Read the KDL file at `path`.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Config`] naming the file, for an unreadable file, a KDL
+    /// syntax error, an unset `${VAR}` without a default, an unknown key or a
+    /// value of the wrong type.
+    pub fn load(path: &Path) -> Result<Self, ServerError> {
+        crate::config::load_kdl_file(path).map_err(config_error)
+    }
+
+    /// Read a configuration from KDL `text`.
+    ///
+    /// # Errors
+    ///
+    /// As [`CucaConfig::load`], without the file name.
+    pub fn from_kdl_str(text: &str) -> Result<Self, ServerError> {
+        crate::config::load_kdl_str(text).map_err(config_error)
+    }
+
+    /// The `serve` section.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Config`] when the file has none.
+    pub fn into_serve(self) -> Result<ServerConfig, ServerError> {
+        self.serve
+            .ok_or_else(|| ServerError::Config("the configuration has no `serve` section".into()))
+    }
+
+    /// The `balance` section.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Config`] when the file has none.
+    pub fn into_balance(self) -> Result<BalancerConfig, ServerError> {
+        self.balance
+            .ok_or_else(|| ServerError::Config("the configuration has no `balance` section".into()))
+    }
+}
+
+/// A configuration error of the library as the server's, without a second
+/// `configuration error:` prefix.
+fn config_error(error: CucaError) -> ServerError {
+    match error {
+        CucaError::Config(message) => ServerError::Config(message),
+        other => other.into(),
+    }
+}
+
+/// A string parsed with `T`'s `FromStr`, whose error is a [`ServerError`]:
+/// the KDL form of [`LogFormat`](super::LogFormat) and the balancer's
+/// [`Policy`](super::balancer::routing::Policy).
+pub(crate) fn parsed<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr<Err = ServerError>,
+{
+    let text = String::deserialize(deserializer)?;
+    text.parse().map_err(|e| match e {
+        ServerError::Config(message) => D::Error::custom(message),
+        other => D::Error::custom(other),
+    })
+}
+
+/// Everything `serve` needs to start: the `serve` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
-    /// Address of the HTTP listener.
+    /// Address of the HTTP listener ([`ServerConfig::DEFAULT_LISTEN`]).
     pub listen: SocketAddr,
-    /// The models to load, at least one, with unique names.
+    /// The models to load, at least one, with unique names: one `model` node
+    /// each.
+    #[serde(rename = "model", deserialize_with = "crate::config::one_or_many")]
     pub models: Vec<ModelSpec>,
     /// When set, every route except `GET /health` needs
     /// `Authorization: Bearer <key>` (vLLM's `--api-key`).
     pub api_key: Option<String>,
     /// Serve the stats API (`/cuca/v1/stats`, `/cuca/v1/stats/stream`).
     pub stats_api: bool,
-    /// The sliding window of the latency figures.
+    /// The sliding window of the latency figures (`"60s"`).
+    #[serde(deserialize_with = "crate::config::duration")]
     pub latency_window: Duration,
 }
 
 impl ServerConfig {
-    /// vLLM's default port.
-    pub const DEFAULT_LISTEN: &'static str = "127.0.0.1:8000";
+    /// vLLM's default port on the loopback interface.
+    pub const DEFAULT_LISTEN: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 8000);
     /// Default [`ServerConfig::latency_window`].
     pub const DEFAULT_LATENCY_WINDOW: Duration = Duration::from_secs(60);
 
@@ -74,7 +186,7 @@ impl ServerConfig {
     pub fn validate(&self) -> Result<(), ServerError> {
         if self.models.is_empty() {
             return Err(ServerError::Config(
-                "no model to serve: pass --model <[name=]source> or --config <file.toml>".into(),
+                "no model to serve: add a `model` node to the `serve` section".into(),
             ));
         }
         if self.models.len() > MAX_MODELS {
@@ -98,371 +210,229 @@ impl ServerConfig {
             }
         }
         if self.api_key.as_deref() == Some("") {
-            return Err(ServerError::Config("--api-key is empty".into()));
+            return Err(ServerError::Config("api_key is empty".into()));
         }
         Ok(())
     }
 }
 
-/// One model to load and the name clients select it by.
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self::new(Self::DEFAULT_LISTEN, Vec::new())
+    }
+}
+
+/// One model to load and the name clients select it by: a `model` node,
+/// `model "name" { source "..."; ... }`, whose children are the
+/// [`LocalModelConfig`].
 #[derive(Debug, Clone)]
 pub struct ModelSpec {
     /// The `model` value of requests and the id in `GET /v1/models`.
     pub name: String,
-    /// The source as the user wrote it, for logs and the stats API.
-    pub source_label: String,
-    /// The device string as the user wrote it (`cpu` when none), for the
-    /// stats API.
-    pub device_label: String,
     /// What [`LocalModel::load`](crate::LocalModel::load) receives (the
     /// server adds the download-progress callback).
     pub config: LocalModelConfig,
 }
 
-/// The per-model options a `--model` argument inherits from the command line
-/// and a `[[model]]` table can override. Every field is optional; `None`
-/// keeps the engine's default.
-#[derive(Debug, Clone, Default)]
-pub struct ModelOptions {
-    /// `+`-separated device list (`cpu`, `vulkan:0`, `cuda:0+cuda:1`).
-    pub device: Option<String>,
-    /// Maximum prompt plus completion tokens.
-    pub context_length: Option<usize>,
-    /// A `BatchingConfig` string (`seqs=8,kv=16384`).
-    pub batching: Option<String>,
-    /// An `ExpertPlacement` string (`resident`, `tiered:ram=4g`, `host`).
-    pub experts: Option<String>,
-    /// Layers on the GPU (`-ngl`).
-    pub gpu_layers: Option<usize>,
-    /// Model cache directory.
-    pub cache_dir: Option<PathBuf>,
-    /// A Jinja chat template file replacing the model's own.
-    pub chat_template_file: Option<PathBuf>,
-    /// Checkpoint conversion precision (`f16`, `q8_0`, `q4_0`).
-    pub quant: Option<String>,
-    /// A drafter: `in-trunk` or a model source.
-    pub drafter: Option<String>,
-    /// Tokens drafted per round (1 to 16).
-    pub draft_tokens: Option<usize>,
-}
-
-impl ModelOptions {
-    /// These options, with `self`'s set fields winning over `defaults`.
-    fn over(&self, defaults: &Self) -> Self {
-        Self {
-            device: self.device.clone().or_else(|| defaults.device.clone()),
-            context_length: self.context_length.or(defaults.context_length),
-            batching: self.batching.clone().or_else(|| defaults.batching.clone()),
-            experts: self.experts.clone().or_else(|| defaults.experts.clone()),
-            gpu_layers: self.gpu_layers.or(defaults.gpu_layers),
-            cache_dir: self
-                .cache_dir
-                .clone()
-                .or_else(|| defaults.cache_dir.clone()),
-            chat_template_file: self
-                .chat_template_file
-                .clone()
-                .or_else(|| defaults.chat_template_file.clone()),
-            quant: self.quant.clone().or_else(|| defaults.quant.clone()),
-            drafter: self.drafter.clone().or_else(|| defaults.drafter.clone()),
-            draft_tokens: self.draft_tokens.or(defaults.draft_tokens),
-        }
-    }
-
-    /// Apply the options to a configuration for `source`.
-    fn apply(&self, source: ModelSource) -> Result<(LocalModelConfig, String), ServerError> {
-        let mut config = LocalModelConfig {
-            source,
-            ..LocalModelConfig::default()
-        };
-        let device_label = match &self.device {
-            Some(list) => {
-                config.set_devices(list)?;
-                list.trim().to_string()
-            }
-            None => "cpu".to_string(),
-        };
-        config.context_length = self.context_length;
-        if let Some(text) = &self.batching {
-            config.batching = text.parse::<BatchingConfig>()?;
-        }
-        if let Some(text) = &self.experts {
-            config.experts = text.parse::<ExpertPlacement>()?;
-        }
-        config.gpu_layers = self.gpu_layers;
-        config.cache_dir.clone_from(&self.cache_dir);
-        if let Some(path) = &self.chat_template_file {
-            config.chat_template = Some(std::fs::read_to_string(path).map_err(|e| {
-                ServerError::Config(format!("reading chat template `{}`: {e}", path.display()))
-            })?);
-        }
-        if let Some(text) = &self.quant {
-            config.convert.quant = text.parse::<WeightQuant>()?;
-        }
-        if let Some(text) = &self.drafter {
-            config.drafter = Some(if text.trim().eq_ignore_ascii_case("in-trunk") {
-                DrafterSource::InTrunk
-            } else {
-                DrafterSource::File(parse_source(text)?.0)
-            });
-        }
-        if let Some(n) = self.draft_tokens {
-            config.draft_tokens = n;
-        }
-        Ok((config, device_label))
-    }
-}
-
-/// The `[[model]]` tables of a `--config` file.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ConfigFile {
-    #[serde(default)]
-    model: Vec<FileModel>,
-}
-
-/// One `[[model]]` table: the source, an optional name and the overrides.
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FileModel {
-    name: Option<String>,
-    source: String,
-    device: Option<String>,
-    context_length: Option<usize>,
-    batching: Option<String>,
-    experts: Option<String>,
-    gpu_layers: Option<usize>,
-    cache_dir: Option<PathBuf>,
-    chat_template_file: Option<PathBuf>,
-    quant: Option<String>,
-    drafter: Option<String>,
-    draft_tokens: Option<usize>,
-}
-
-impl FileModel {
-    fn options(&self) -> ModelOptions {
-        ModelOptions {
-            device: self.device.clone(),
-            context_length: self.context_length,
-            batching: self.batching.clone(),
-            experts: self.experts.clone(),
-            gpu_layers: self.gpu_layers,
-            cache_dir: self.cache_dir.clone(),
-            chat_template_file: self.chat_template_file.clone(),
-            quant: self.quant.clone(),
-            drafter: self.drafter.clone(),
-            draft_tokens: self.draft_tokens,
-        }
-    }
-}
-
 impl ModelSpec {
-    /// Parse a `--model` argument: `[name=]source` where `source` is a preset
-    /// name, `repo:revision:file` (a GGUF on Hugging Face), `repo:revision`
-    /// (a safetensors checkpoint) or a filesystem path (a GGUF file, or a
-    /// checkpoint directory). The name defaults to the preset name, the file
-    /// stem or the repository name. `defaults` are the global options.
-    ///
-    /// # Errors
-    ///
-    /// [`ServerError::Config`] for an unknown source or an invalid option.
-    pub fn from_arg(arg: &str, defaults: &ModelOptions) -> Result<Self, ServerError> {
-        let (name, source) = match arg.split_once('=') {
-            Some((name, source)) => (Some(name.trim().to_string()), source),
-            None => (None, arg),
-        };
-        Self::build(name, source, defaults)
+    /// A model called `name`, or when `None` by its source: the preset name,
+    /// the file stem of a Hugging Face file or a local file, the repository
+    /// name of a checkpoint, the directory name of a checkpoint directory.
+    pub fn new(name: Option<String>, config: LocalModelConfig) -> Self {
+        let name = name.unwrap_or_else(|| default_name(&config.source));
+        Self { name, config }
     }
 
-    fn build(
-        name: Option<String>,
-        source: &str,
-        options: &ModelOptions,
-    ) -> Result<Self, ServerError> {
-        let (source, default_name) = parse_source(source)?;
-        let source_label = source_label(&source);
-        let (config, device_label) = options.apply(source)?;
-        Ok(Self {
-            name: name.unwrap_or(default_name),
-            source_label,
-            device_label,
-            config,
-        })
+    /// The source as a short label for logs and the stats API.
+    pub fn source_label(&self) -> String {
+        match &self.config.source {
+            ModelSource::HuggingFace {
+                repo,
+                revision,
+                file,
+                ..
+            } => {
+                let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
+                format!("{repo}:{short}:{file}")
+            }
+            ModelSource::File(path) | ModelSource::Dir(path) => path.display().to_string(),
+            ModelSource::Checkpoint { repo, revision } => {
+                let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
+                format!("{repo}:{short}")
+            }
+        }
+    }
+
+    /// The device, then each shard, joined by `+` (`vulkan:0+vulkan:1`).
+    pub fn device_label(&self) -> String {
+        std::iter::once(&self.config.device)
+            .chain(&self.config.shards)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("+")
     }
 }
 
-/// Every model a command line names: the `--model` arguments in order, then
-/// the `[[model]]` tables of `--config`, all over the global `defaults`.
-///
-/// # Errors
-///
-/// [`ServerError::Config`] from [`ModelSpec::from_arg`] or
-/// [`load_config_file`].
-pub fn collect_models(
-    args: &[String],
-    config_file: Option<&Path>,
-    defaults: &ModelOptions,
-) -> Result<Vec<ModelSpec>, ServerError> {
-    let mut models = args
-        .iter()
-        .map(|arg| ModelSpec::from_arg(arg, defaults))
-        .collect::<Result<Vec<_>, _>>()?;
-    if let Some(path) = config_file {
-        models.extend(load_config_file(path, defaults)?);
+/// The name a model without one goes by; see [`ModelSpec::new`].
+fn default_name(source: &ModelSource) -> String {
+    if let Some(preset) = ModelSource::PRESETS.iter().find(|p| p.source() == *source) {
+        return preset.name.to_string();
     }
-    Ok(models)
-}
-
-/// The models of a TOML `--config` file, each over the `defaults`.
-///
-/// # Errors
-///
-/// [`ServerError::Config`] when the file cannot be read, is not valid TOML,
-/// has an unknown key, or a model is invalid.
-pub fn load_config_file(
-    path: &Path,
-    defaults: &ModelOptions,
-) -> Result<Vec<ModelSpec>, ServerError> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| ServerError::Config(format!("reading `{}`: {e}", path.display())))?;
-    parse_config(&text, defaults)
-        .map_err(|e| ServerError::Config(format!("`{}`: {e}", path.display())))
-}
-
-/// [`load_config_file`] over the text of the file.
-fn parse_config(text: &str, defaults: &ModelOptions) -> Result<Vec<ModelSpec>, ServerError> {
-    let file: ConfigFile = toml::from_str(text).map_err(|e| ServerError::Config(e.to_string()))?;
-    file.model
-        .iter()
-        .map(|m| ModelSpec::build(m.name.clone(), &m.source, &m.options().over(defaults)))
-        .collect()
-}
-
-/// A [`ModelSource`] from user text, and the model name it implies.
-fn parse_source(text: &str) -> Result<(ModelSource, String), ServerError> {
-    let text = text.trim();
-    if let Some(preset) = ModelSource::preset(text) {
-        return Ok((preset.source(), preset.name.to_string()));
-    }
-    let path = Path::new(text);
-    if path.is_file() {
-        return Ok((ModelSource::File(path.to_path_buf()), file_stem(path)));
-    }
-    if path.is_dir() {
-        let name = path
-            .file_name()
-            .map_or_else(|| text.to_string(), |n| n.to_string_lossy().into_owned());
-        return Ok((ModelSource::Dir(path.to_path_buf()), name));
-    }
-    let source: ModelSource = text.parse().map_err(|e| {
-        ServerError::Config(format!(
-            "model source `{text}` is neither an existing path nor a known source ({e})"
-        ))
-    })?;
-    let name = match &source {
-        ModelSource::HuggingFace { file, .. } => file_stem(Path::new(file)),
-        ModelSource::Checkpoint { repo, .. } => repo.rsplit('/').next().unwrap_or(repo).to_string(),
-        ModelSource::File(path) | ModelSource::Dir(path) => file_stem(path),
+    let stem = |path: &Path| {
+        path.file_stem()
+            .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
     };
-    Ok((source, name))
-}
-
-fn file_stem(path: &Path) -> String {
-    path.file_stem()
-        .map_or_else(String::new, |s| s.to_string_lossy().into_owned())
-}
-
-/// The source as a short label for logs and the stats API.
-fn source_label(source: &ModelSource) -> String {
     match source {
-        ModelSource::HuggingFace {
-            repo,
-            revision,
-            file,
-            ..
-        } => {
-            let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
-            format!("{repo}:{short}:{file}")
-        }
-        ModelSource::File(path) | ModelSource::Dir(path) => path.display().to_string(),
-        ModelSource::Checkpoint { repo, revision } => {
-            let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
-            format!("{repo}:{short}")
-        }
+        ModelSource::HuggingFace { file, .. } => stem(Path::new(file)),
+        ModelSource::Checkpoint { repo, .. } => repo.rsplit('/').next().unwrap_or(repo).to_string(),
+        ModelSource::File(path) => stem(path),
+        ModelSource::Dir(path) => path.file_name().map_or_else(
+            || path.display().to_string(),
+            |n| n.to_string_lossy().into_owned(),
+        ),
+    }
+}
+
+/// A `model` node: a table whose `id` (the node's argument) is the name and
+/// whose other keys are a [`LocalModelConfig`]. Written by hand because
+/// `flatten` cannot be combined with `deny_unknown_fields`.
+impl<'de> Deserialize<'de> for ModelSpec {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let ConfigValue::Object(mut table) = ConfigValue::deserialize(deserializer)? else {
+            return Err(D::Error::custom(
+                "write `model \"name\" { source \"...\" }`",
+            ));
+        };
+        let name = match table.remove("id") {
+            None => None,
+            Some(ConfigValue::String(name)) => Some(name),
+            Some(other) => {
+                return Err(D::Error::custom(format!(
+                    "a model's name must be a string, got {other}"
+                )));
+            }
+        };
+        let label = name.clone().or_else(|| {
+            table
+                .get("source")
+                .map(|s| s.as_str().map_or_else(|| s.to_string(), str::to_string))
+        });
+        let config = LocalModelConfig::deserialize(ConfigValue::Object(table)).map_err(|e| {
+            D::Error::custom(match &label {
+                Some(label) => format!("model `{label}`: {e}"),
+                None => format!("model: {e}"),
+            })
+        })?;
+        Ok(Self::new(name, config))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::server::balancer::routing::Policy;
 
-    fn spec(arg: &str) -> ModelSpec {
-        ModelSpec::from_arg(arg, &ModelOptions::default()).unwrap()
+    fn spec(name: &str) -> ModelSpec {
+        ModelSpec::new(
+            Some(name.to_string()),
+            LocalModelConfig {
+                source: "qwen3-0.6b-q8_0".parse().unwrap(),
+                ..Default::default()
+            },
+        )
+    }
+
+    fn serve(text: &str) -> Result<ServerConfig, ServerError> {
+        CucaConfig::from_kdl_str(text)?.into_serve()
     }
 
     #[test]
-    fn a_preset_names_itself_and_an_explicit_name_wins() {
-        assert_eq!(spec("qwen3-0.6b-q8_0").name, "qwen3-0.6b-q8_0");
-        assert_eq!(spec("small=qwen3-0.6b-q8_0").name, "small");
+    fn the_shipped_example_parses() {
+        let config =
+            CucaConfig::from_kdl_str(include_str!("../../examples/configs/cuca.kdl")).unwrap();
+        let balance = config.balance.clone().unwrap();
+        let serve = config.into_serve().unwrap();
+        serve.validate().unwrap();
+        let names: Vec<&str> = serve.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, ["chat", "gemma-4-E4B-it-Q4_0"]);
+        assert_eq!(serve.api_key.as_deref(), Some("change-me"));
+        assert_eq!(serve.models[0].config.batching.max_sequences, 8);
+        assert_eq!(serve.models[1].config.gpu_layers, Some(20));
+        assert_eq!(balance.policy, Policy::PrefixAffinity);
+        assert_eq!(balance.health_interval, Duration::from_secs(1));
+        assert_eq!(balance.upstream_api_key.as_deref(), Some("change-me"));
+        assert_eq!(balance.resolve_upstreams().unwrap().len(), 2);
     }
 
     #[test]
-    fn a_hugging_face_file_is_named_by_its_stem_and_a_checkpoint_by_its_repo() {
-        let gguf = spec("org/repo:abcdef0123456789:model-Q4_0.gguf");
-        assert_eq!(gguf.name, "model-Q4_0");
-        assert_eq!(gguf.source_label, "org/repo:abcdef01:model-Q4_0.gguf");
-        assert_eq!(spec("org/Repo:main").name, "Repo");
+    fn a_model_is_named_by_its_argument_else_by_its_source() {
+        let config = serve(
+            r#"
+serve {
+    model "small" { source "qwen3-0.6b-q8_0"; }
+    model { source "qwen3-0.6b-q8_0"; }
+    model { source "org/repo:abcdef0123456789:model-Q4_0.gguf"; }
+    model { source "org/Repo:main"; }
+    model { source dir="/ckpt/Qwen3-0.6B"; }
+}
+"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = config.models.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "small",
+                "qwen3-0.6b-q8_0",
+                "model-Q4_0",
+                "Repo",
+                "Qwen3-0.6B"
+            ]
+        );
+        assert_eq!(
+            config.models[2].source_label(),
+            "org/repo:abcdef01:model-Q4_0.gguf"
+        );
+        // One `model` node is a list of one.
+        let one = serve(r#"serve { model "m" { source "qwen3-0.6b-q8_0"; }; }"#).unwrap();
+        assert_eq!(one.models.len(), 1);
     }
 
     #[test]
-    fn an_unknown_source_is_a_config_error_naming_it() {
-        let err = ModelSpec::from_arg("nonsense", &ModelOptions::default()).unwrap_err();
-        assert!(err.to_string().contains("nonsense"), "{err}");
+    fn an_unknown_key_is_rejected_naming_the_model() {
+        let err = serve(r#"serve { model "chat" { source "qwen3-0.6b-q8_0"; context 4; }; }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model `chat`"), "{err}");
+        assert!(err.contains("unknown field `context`"), "{err}");
+        let err = serve(r#"serve { model "qwen3-0.6b-q8_0"; }"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("model \"name\" { source"), "{err}");
+        let err = CucaConfig::from_kdl_str("serv { }")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("unknown field `serv`"), "{err}");
+        let err = CucaConfig::from_kdl_str("")
+            .unwrap()
+            .into_serve()
+            .unwrap_err();
+        assert!(err.to_string().contains("no `serve` section"), "{err}");
     }
 
     #[test]
-    fn a_table_overrides_the_global_defaults_field_by_field() {
-        let defaults = ModelOptions {
-            context_length: Some(2048),
-            batching: Some("seqs=2".into()),
-            ..ModelOptions::default()
-        };
-        let toml = r#"
-            [[model]]
-            source = "qwen3-0.6b-q8_0"
-            batching = "seqs=8"
-
-            [[model]]
-            name = "other"
-            source = "phi4-mini-q4_0"
-        "#;
-        let models = parse_config(toml, &defaults).unwrap();
-        assert_eq!(models[0].config.context_length, Some(2048));
-        assert_eq!(models[0].config.batching.max_sequences, 8);
-        assert_eq!(models[1].name, "other");
-        assert_eq!(models[1].config.batching.max_sequences, 2);
-    }
-
-    #[test]
-    fn an_unknown_key_in_the_config_file_is_rejected() {
-        let toml = "[[model]]\nsource = \"qwen3-0.6b-q8_0\"\ncontext = 4\n";
-        assert!(parse_config(toml, &ModelOptions::default()).is_err());
-    }
-
-    #[test]
-    fn the_device_list_sets_the_device_and_the_shards() {
-        let options = ModelOptions {
-            device: Some("vulkan:0+vulkan:1".into()),
-            ..ModelOptions::default()
-        };
-        let model = ModelSpec::from_arg("qwen3-0.6b-q8_0", &options).unwrap();
-        assert_eq!(model.config.shards.len(), 1);
-        assert_eq!(model.device_label, "vulkan:0+vulkan:1");
+    fn the_device_label_joins_device_and_shards() {
+        let config = serve(
+            r#"serve { model "m" { source "qwen3-0.6b-q8_0"; device "vulkan:0"; shards "vulkan:1"; }; }"#,
+        )
+        .unwrap();
+        assert_eq!(config.models[0].device_label(), "vulkan:0+vulkan:1");
+        assert_eq!(spec("cpu").device_label(), "cpu");
     }
 
     #[test]
     fn validate_rejects_no_models_and_duplicate_names() {
-        let listen = ServerConfig::DEFAULT_LISTEN.parse().unwrap();
+        let listen = ServerConfig::DEFAULT_LISTEN;
         assert!(ServerConfig::new(listen, vec![]).validate().is_err());
         let one = spec("qwen3-0.6b-q8_0");
         let config = ServerConfig::new(listen, vec![one.clone(), one]);

@@ -113,22 +113,12 @@ A malformed frame or an error frame ends the stream after the error.
 
 ## Example
 
-The stream below uses the chat route against a server on port 1234. Setting `CUCA_BASE_URL` and `CUCA_MODEL` is optional.
+The stream below uses the chat route against a server on port 1234. Change `base_url` and `model` to match your server.
 
 ```bash,name=Runs the same on all three platforms
 cargo add cuca --path /path/to/cuca --features provider-llamacpp
 cargo add tokio --features rt,macros
 cargo add tokio-stream
-```
-
-```bash,name=Linux and macOS: choose the server and model
-export CUCA_BASE_URL="http://127.0.0.1:1234/v1"
-export CUCA_MODEL="google/gemma-4-e4b"
-```
-
-```powershell,name=Windows (PowerShell): choose the server and model
-$env:CUCA_BASE_URL = "http://127.0.0.1:1234/v1"
-$env:CUCA_MODEL = "google/gemma-4-e4b"
 ```
 
 ```rust,name=A first stream through the llama.cpp adapter
@@ -140,9 +130,8 @@ use tokio_stream::StreamExt;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+    let base_url = "http://127.0.0.1:1234/v1";
+    let model = "google/gemma-4-e4b";
 
     let client = CucaClient::builder()
         .with_provider(ProviderEndpoint::LlamaCpp)

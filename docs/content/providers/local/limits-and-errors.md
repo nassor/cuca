@@ -63,7 +63,7 @@ A model with an Engram table (`deepseek41`) never loads it. Each token position 
 | `ram_bytes` | 4 GiB | 1 MiB to 1 TiB | `CucaError::Config`: `engram.ram_bytes must be in 1048576..=1099511627776 (1 MiB to 1 TiB), got N` |
 | `reader_threads` | 16 | 1 to 64 | `CucaError::Config`: `engram.reader_threads must be in 1..=64, got N` |
 
-The text form is `ram=<size>,threads=<n>`, any subset, ASCII case-insensitive, `<size>` a byte count with an optional `k`, `m` or `g` suffix (powers of 1024). Another text is `CucaError::Config`: ``unknown engram cache `...`; expected a comma-separated subset of ram=<size>,threads=<n>``. `LocalModel::load` checks both values before any thread starts.
+In KDL: `engram ram_bytes="8g" reader_threads=32`, any subset; `ram_bytes` is an integer or a string with an optional `k`, `m` or `g` suffix (powers of 1024), ASCII case-insensitive. A string that is no size is `CucaError::Config`: ``expected a byte count such as `4294967296`, `512m` or `4g` ``. `LocalModel::load` checks both values before any thread starts.
 
 - The reader threads fetch the distinct rows a forward pass needs, sorted by file offset and with positional reads, and merge neighbouring rows into one read. The rows of the next prefill chunk are requested while a chunk runs.
 - The cache is an LRU of the rows as the file stores them. Each row counts its bytes plus 48 bytes of bookkeeping against `ram_bytes`, so the default 4 GiB holds 13,421,772 Q8_0 rows (320 bytes each). Its storage is allocated in segments as it fills.
@@ -85,7 +85,7 @@ The text form is `ram=<size>,threads=<n>`, any subset, ASCII case-insensitive, `
 
 `EngramStats::hit_rate()` is `cache_hits / lookups`, `None` before the first lookup.
 
-What ran: on tiny `deepseek41` models, `a_second_pass_over_the_same_prompt_reads_fewer_engram_rows_with_equal_output`, `a_prefetch_of_the_next_chunk_reads_no_row_twice_and_changes_no_bit` and `the_engram_cache_bounds_are_checked_at_load` on the CPU, and `gpu_engram_prefetch_reads_each_row_once_and_changes_no_bit` on a GPU. The unit tests of `engram_io.rs` cover the eviction, the bounds and the counters. On the real table, one chat request on the CPU (`ram=4g,threads=16`, 42 prompt tokens and 17 generated tokens, Q8_0 table on an HDD-class volume) counted 2,816 lookups and 64 hits. A single short request repeats few n-grams, so this measures the reader, not the benefit of a warm cache; no run measured the cache over a long conversation.
+What ran: on tiny `deepseek41` models, `a_second_pass_over_the_same_prompt_reads_fewer_engram_rows_with_equal_output`, `a_prefetch_of_the_next_chunk_reads_no_row_twice_and_changes_no_bit` and `the_engram_cache_bounds_are_checked_at_load` on the CPU, and `gpu_engram_prefetch_reads_each_row_once_and_changes_no_bit` on a GPU. The unit tests of `engram_io.rs` cover the eviction, the bounds and the counters. On the real table, one chat request on the CPU (`engram ram_bytes="4g" reader_threads=16`, 42 prompt tokens and 17 generated tokens, Q8_0 table on an HDD-class volume) counted 2,816 lookups and 64 hits. A single short request repeats few n-grams, so this measures the reader, not the benefit of a warm cache; no run measured the cache over a long conversation.
 
 ## Rejected combinations
 
@@ -127,10 +127,10 @@ What ran: on tiny `deepseek41` models, `a_second_pass_over_the_same_prompt_reads
   - `batching.kv_tokens must be at least context_length + 16 (N), got M`.
   - The combinations marked `header` above, an expert budget below the model's `n_used` experts per layer, `warm_from` heat of another shape ([Tiered expert placement](@/providers/local/expert-tiers.md#errors)), and `DrafterSource::InTrunk` on a mixture of experts file ([Speculative decoding](@/providers/local/drafting.md#qwen-3-5-head)).
   - A repo, revision or file with an empty, `.`, `..` or `:` segment, a backslash or a leading `/`.
-  - No resolvable cache directory: set `cache_dir` or `CUCA_CACHE_DIR`.
+  - No resolvable cache directory with `cache_dir` unset: set `cache_dir`.
   - A `chat_template` override that does not compile or does not render a one-message conversation (`chat_template override does not compile: ...`, `chat_template override does not render: ...`).
   - A checkpoint conversion (`ModelSource::Checkpoint`, `ModelSource::Dir`) that cannot run, naming the cause: ``checkpoint has no tensor `<name>` ``, a tensor of a type or shape the converter does not read, or a checkpoint tensor no rule accounts for. A DeepSeek-V4.1 conversion also checks the free space of the output volume before it writes anything and fails with `converting <what> writes N GB into <dir>, which has M GB free; free K GB more, choose another cache directory, or convert with a smaller precision (...)`. A DSpark conversion of a checkpoint without the `dspark_*` configuration fails with ``the checkpoint has no DSpark drafter (num_nextn_predict_layers and dspark_* in config.json)``.
-- `CucaError::Io` for a missing or unreadable model file, or when the engine thread cannot start.
+- `CucaError::Io` for a missing or unreadable model file, an unreadable `chat_template_file`, or when the engine thread cannot start.
 - `CucaError::Transport` for a download that fails, stalls for 60 seconds, ends short of the reported size, or gets an unusable range response.
 - `CucaError::Http` for a non-2xx download response, with the first 512 characters of the body.
 - `CucaError::Provider` for the model file and the engine:
@@ -142,7 +142,7 @@ What ran: on tiny `deepseek41` models, `a_second_pass_over_the_same_prompt_reads
   - A GPU that cannot be opened: `device <device>: <wgpu error>` for Vulkan and Metal, `device Cuda(N): K such device(s) found (missing driver or GPU?)` for CUDA and ROCm, or `local engine failed to initialize: <message>` when the backend panics during setup.
   - The engine thread exits during load: `local engine thread exited during load`.
 
-The parsers behind the environment variables return `CucaError::Config` for text they do not know: `ModelSource::from_str` (the message lists the preset names), `LocalDevice::from_str`, `ExpertPlacement::from_str`, `BatchingConfig::from_str` and `WeightQuant::from_str`.
+A KDL configuration file that does not parse returns `CucaError::Config`: an unknown key (the message names it), a value of the wrong type, a `${VAR}` placeholder with no value, or a string a scalar parser does not know. Those parsers are `ModelSource::from_str` (the message lists the preset names), `LocalDevice::from_str`, `WeightQuant::from_str` and `EngramQuant::from_str`; a byte count is an integer or a string such as `512m`.
 
 `CucaClientBuilder::build` and `generate_stream` return:
 

@@ -58,7 +58,7 @@ The server is an application layer over [`provider-local`](@/providers/local/_in
 
 ## Pages
 
-- [Model server](@/server/model-server.md): the `serve` command, its options and config file, the routes and the OpenAI wire format.
+- [Model server](@/server/model-server.md): the `serve` command, its configuration file, the routes and the OpenAI wire format.
 - [Balancer](@/server/balancer.md): the `balance` command, routing policies, prefix affinity, health checks and retries.
 - [Stats API and metrics](@/server/stats-and-metrics.md): the JSON snapshot, every Prometheus series, the latency diagnosis and the logs.
 - [Terminal UI](@/server/tui.md): the `tui` command, its panels and keys, and which resource figures each platform reports.
@@ -82,7 +82,7 @@ The CPU kernels select their instructions at compile time, so a CPU server wants
 ## What was verified
 
 - Run on Windows with the CPU engine and Qwen3-0.6B Q8_0 (release build, `target-cpu=native`): `serve` (non-streaming and streaming chat, tool calls, two concurrent streams, a client disconnect, a prompt over the context length), `balance` over two servers (prefix affinity, concurrent spread, an upstream killed mid-run), `/metrics` and the stats API.
-- Run on Windows on a Vulkan GPU (Radeon RX 9070 XT, `server-tui,provider-local-vulkan` release build) with the same model: streaming and four concurrent requests through `cuca serve --device vulkan`. The stats showed `device: vulkan`, a 3.5 GiB K/V pool and 0.6 GB of weights, this process's VRAM at 5.1 GiB through WMI, GPU utilization of 43% under load, and about 150 tokens per second over four concurrent requests once the kernels were compiled. The first request on a GPU takes about 10 seconds while kernels compile.
+- Run on Windows on a Vulkan GPU (Radeon RX 9070 XT, `server-tui,provider-local-vulkan` release build) with the same model: streaming and four concurrent requests through `cuca serve` with `device "vulkan"` in the model node. The stats showed `device: vulkan`, a 3.5 GiB K/V pool and 0.6 GB of weights, this process's VRAM at 5.1 GiB through WMI, GPU utilization of 43% under load, and about 150 tokens per second over four concurrent requests once the kernels were compiled. The first request on a GPU takes about 10 seconds while kernels compile.
 - The terminal UI was exercised live in a Windows ConPTY against a server and a balancer: both views, the keys, a reconnect after the node restarted, and the terminal restored on exit. Tests also draw it on ratatui's test backend.
 - Covered by unit and in-process tests: the wire mapping, the routing rules, the diagnosis rules, and the balancer against mock upstreams.
 - Compile-checked only: the Linux and macOS system samplers, other GPU backends through the server (Metal, CUDA, ROCm), and NVML.

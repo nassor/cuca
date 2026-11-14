@@ -94,7 +94,7 @@ A `collect_subagent` call with no string `subagent_id` fails the stream with `Pl
 
 ## Example
 
-`examples/subagent.rs` runs a parent turn that spawns a child, waits for its result, then runs a second parent turn that collects the summary. It needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+`examples/subagent.rs` runs a parent turn that spawns a child, waits for its result, then runs a second parent turn that collects the summary. It needs a `llama-server` on port 1234 with the demo model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
 
 ```rust,name=Register SubagentPlugin, from examples/subagent.rs
 // LiveRunner implements SubagentRunner; it is defined in examples/subagent.rs.

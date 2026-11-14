@@ -1,16 +1,17 @@
 //! Live test of the in-process engine's continuous batching: several clients
 //! on one [`LocalModel`] at once.
 //!
-//! The model comes from the environment like `provider_local.rs`
-//! (`CUCA_LOCAL_MODEL_PATH`, `CUCA_LOCAL_MODEL` or `CUCA_LOCAL_DOWNLOAD=1`;
-//! `CUCA_LOCAL_DEVICE`, also a `+`-separated list that splits the model over
-//! several devices; `CUCA_REQUIRE_LIVE=1` turns a skip into a failure),
-//! and `CUCA_LOCAL_BATCHING` sets `LocalModelConfig::batching` (`BatchingConfig`
-//! syntax, e.g. `seqs=4,kv=16384`; `seqs=4` when unset, so the 8 clients
-//! below queue behind 4 slots).
+//! The model comes from `cuca-test.kdl` like `provider_local.rs`
+//! (`local { model { source ... } }` or `local { download_default #true }`;
+//! `device` and `shards`, which split the model over several devices;
+//! `require_live #true` turns a skip into a failure), and `batching` in
+//! `local { model { ... } }` sets `LocalModelConfig::batching` (e.g.
+//! `batching max_sequences=4 kv_tokens=16384`; 4 sequences when unset, so the
+//! 8 clients below queue behind 4 slots).
 //!
 //! ```sh
-//! CUCA_LOCAL_MODEL=qwen3-0.6b-q8_0 CUCA_REQUIRE_LIVE=1 RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_batch -- --test-threads=1 --nocapture
+//! # cuca-test.kdl: require_live #true; local { model { source "qwen3-0.6b-q8_0"; }; }
+//! RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_batch -- --test-threads=1 --nocapture
 //! ```
 //!
 //! Every request is greedy. The scenarios:
@@ -57,6 +58,8 @@ async fn loaded() -> Option<(LocalModel, String)> {
                 chat_template: local_env::chat_template(),
                 gpu_layers: local_env::gpu_layers(),
                 engram: local_env::engram(),
+                cache_dir: local_env::cache_dir(),
+                hf_token: local_env::hf_token(),
                 ..Default::default()
             };
             local_env::set_devices(&mut config);

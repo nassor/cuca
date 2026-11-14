@@ -268,7 +268,7 @@ CUCA recall: 2 offloaded turn(s), best first
 2. [0.5443] Noted: the deploy token is in vault slot 7.
 ```
 
-`examples/vector_store.rs` runs the same order against a live model in four stages: one turn over a scripted eight-message history, `MemoryPlugin::compress` out of band, a recall for the same question, then `inject` plus a second turn that answers from the recall alone. It needs a `llama-server` on port 1234 with the demo model loaded; `CUCA_BASE_URL` and `CUCA_MODEL` point it at any OpenAI-compatible server.
+`examples/vector_store.rs` runs the same order against a live model in four stages: one turn over a scripted eight-message history, `MemoryPlugin::compress` out of band, a recall for the same question, then `inject` plus a second turn that answers from the recall alone. It needs a `llama-server` on port 1234 with the demo model loaded; the flags `--base-url` and `--model`, written after `--`, point it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example vector_store --features "provider-llamacpp service-vector-store"

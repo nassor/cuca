@@ -8,7 +8,7 @@
 //! | `GET /v1/models` | the ready models, with vLLM's `max_model_len` |
 //! | `POST /v1/chat/completions` | non-streaming JSON or SSE (`stream: true`) |
 //! | `GET /metrics` | Prometheus text |
-//! | `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `--stats-api` |
+//! | `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `stats_api #true` |
 //!
 //! Bounds: request bodies are limited to [`MAX_BODY_BYTES`]; at most
 //! [`MAX_STATS_STREAMS`] stats streams are open at once; a chat stream
@@ -684,7 +684,8 @@ mod tests {
     use std::net::SocketAddr;
 
     use super::*;
-    use crate::server::config::{ModelOptions, ModelSpec, ServerConfig};
+    use crate::LocalModelConfig;
+    use crate::server::config::{ModelSpec, ServerConfig};
     use crate::server::registry::ModelRegistry;
     use crate::server::sysmon::SystemSampler;
 
@@ -694,8 +695,13 @@ mod tests {
         let specs: Vec<ModelSpec> = names
             .iter()
             .map(|n| {
-                ModelSpec::from_arg(&format!("{n}=qwen3-0.6b-q8_0"), &ModelOptions::default())
-                    .unwrap()
+                ModelSpec::new(
+                    Some(n.to_string()),
+                    LocalModelConfig {
+                        source: "qwen3-0.6b-q8_0".parse().unwrap(),
+                        ..Default::default()
+                    },
+                )
             })
             .collect();
         let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), specs.clone());

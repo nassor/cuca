@@ -133,7 +133,7 @@ let branch = memory_log.fork_session("demo", &point)?;
 cargo run --example session_log --features "provider-llamacpp plugin-session-log"
 ```
 
-It needs a `llama-server` on port 1234. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at another OpenAI-compatible server.
+It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, retarget it at another OpenAI-compatible server.
 
 ```text,name=Expected output
 Session "demo", two backends recording the same turns

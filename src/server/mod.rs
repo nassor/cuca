@@ -10,9 +10,11 @@
 //!   server or a balancer that follows the stats stream.
 //!
 //! ```text
-//! cuca serve --model qwen3-0.6b-q8_0 --stats-api
+//! cuca serve --config cuca.kdl    # a `serve` section with `stats_api #true`
 //! curl localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}]}'
 //! ```
+//!
+//! Both commands read one KDL file ([`CucaConfig`], module [`config`]).
 //!
 //! # What it serves
 //!
@@ -31,7 +33,7 @@
 //!   waiting, K/V usage, prefix hits, preemptions, steps, rows) and the
 //!   machine's CPU, memory, disk and GPU gauges ([`sysmon`]).
 //! * `GET /cuca/v1/stats` and `/cuca/v1/stats/stream` (opt-in with
-//!   `--stats-api`): one [`stats::StatsSnapshot`] as JSON, or one per second
+//!   `stats_api #true`): one [`stats::StatsSnapshot`] as JSON, or one per second
 //!   as server-sent events: per-model engine rates, windowed latency
 //!   percentiles ([`latency`]), the machine, and a ranked list of reasons the
 //!   latency is what it is ([`diagnosis`]). The types in [`stats`] are the
@@ -76,12 +78,10 @@ use std::time::Duration;
 
 use tokio::sync::oneshot;
 
-pub use balancer::{BalancerArgs, BalancerConfig, balance};
-pub use config::{
-    MAX_MODELS, ModelOptions, ModelSpec, ServerConfig, collect_models, load_config_file,
-};
+pub use balancer::{BalancerConfig, balance};
+pub use config::{CucaConfig, MAX_MODELS, ModelSpec, ServerConfig};
 pub use error::ServerError;
-pub use telemetry::{LogFormat, init as init_logging};
+pub use telemetry::{LogConfig, LogFormat, init as init_logging};
 
 use self::registry::ModelRegistry;
 use self::state::ServerState;

@@ -1,9 +1,9 @@
 //! Numerical parity of converted checkpoints with the transformers oracle.
 //!
-//! Gated on `CUCA_LOCAL_REF_DIR` (the oracle dumps `ref/*.json`, see the
+//! Gated on `oracle { ref_dir "..." }` in cuca-test.kdl (the oracle dumps `ref/*.json`, see the
 //! repository's `.omp/local-models/ref/README.md`; they are not in the
 //! repository) and on the network or a seeded cache: without them the test
-//! prints `SKIP:` and passes, unless `CUCA_REQUIRE_LIVE=1` turns that into a
+//! prints `SKIP:` and passes, unless `require_live #true` turns that into a
 //! failure. For each pinned checkpoint it converts to F16 (the closest to the
 //! oracle's f32 weights), loads the result on the CPU, runs the oracle's
 //! prompt ids and compares the last-position logits and the greedy
@@ -60,14 +60,9 @@ const PINNED: &[(&str, &str)] = &[
 
 // Scaffolding shared with `oracle_dflash` and `oracle_local`.
 
-/// A set, non-empty environment variable.
-pub(super) fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
-/// Report a skipped live test; with `CUCA_REQUIRE_LIVE=1` it fails instead.
+/// Report a skipped live test; with `require_live #true` it fails instead.
 pub(super) fn skip(reason: &str) {
-    if env("CUCA_REQUIRE_LIVE").as_deref() == Some("1") {
+    if crate::test_config::get().require_live {
         panic!("{reason}");
     }
     println!("SKIP: {reason}");
@@ -78,6 +73,8 @@ pub(super) fn skip(reason: &str) {
 pub(super) fn f16_config(source: ModelSource) -> LocalModelConfig {
     LocalModelConfig {
         source,
+        hf_token: crate::test_config::get().local_model().hf_token,
+        cache_dir: crate::test_config::get().cache_dir.clone(),
         convert: ConvertConfig {
             quant: WeightQuant::F16,
             ..ConvertConfig::default()
@@ -181,10 +178,10 @@ fn ids(v: &Value) -> Vec<u32> {
 
 #[test]
 fn converted_checkpoints_match_the_transformers_oracle() {
-    let Some(ref_dir) = std::env::var_os("CUCA_LOCAL_REF_DIR").map(PathBuf::from) else {
-        return skip("set CUCA_LOCAL_REF_DIR to the oracle dumps");
+    let Some(ref_dir) = crate::test_config::get().oracle.ref_dir.clone() else {
+        return skip("set `oracle { ref_dir \"...\" }` in cuca-test.kdl to the oracle dumps");
     };
-    let only = std::env::var("CUCA_LOCAL_CONVERT_ONLY").ok();
+    let only = crate::test_config::get().oracle.convert_only.clone();
     let mut checked = 0;
     for (repo, revision) in PINNED {
         if only.as_ref().is_some_and(|o| !repo.contains(o.as_str())) {

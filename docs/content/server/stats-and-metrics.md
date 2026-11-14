@@ -11,7 +11,7 @@ weight = 3
 <dt>In one line</dt>
 <dd>One JSON snapshot per node (<code>/cuca/v1/stats</code>), a Prometheus endpoint (<code>/metrics</code>), a ranked list of reasons for the current latency, and one log line per request</dd>
 <dt>You need</dt>
-<dd>A running <code>cuca serve</code> or <code>cuca balance</code>. The stats routes need <code>--stats-api</code>; <code>/metrics</code> is always on</dd>
+<dd>A running <code>cuca serve</code> or <code>cuca balance</code>. The stats routes need <code>stats_api #true</code> in the configuration; <code>/metrics</code> is always on</dd>
 <dt>Read this if</dt>
 <dd>You are building a dashboard or an alert, reading the TUI's figures, or deciding which threshold a diagnosis uses</dd>
 </dl>
@@ -166,7 +166,7 @@ The system metrics above follow.
 
 ## Logs
 
-Logs go to standard output through `tracing`. `--log-format json` writes one JSON object per line. `--log-level` takes precedence over `RUST_LOG`.
+Logs go to standard output through `tracing`. The `log` section of the configuration file sets them: `format` is `pretty` (default) or `json`, which writes one JSON object per line, and `level` is a level or a filter such as `info,cuca=debug` (default `info`). Both commands read it. `cuca tui` has no log section.
 
 Every request gets an `x-request-id` (an incoming one is kept) and an `http` span. The `cuca::access` target carries two kinds of line:
 

@@ -99,7 +99,7 @@ At call time the hook returns no error. Each variant below becomes `ToolResult` 
 
 ## Example
 
-`examples/skills.rs` writes a `SKILL.md` and one `references/factors.md` into a temporary directory and loads them with `SkillsPlugin::from_dir`. It takes three turns: the model calls `skill` and gets the instructions back, then calls `skill_read` for the bundled file, then answers. The directory is removed when the program ends. It needs a `llama-server` on port 1234 with the demo model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` retarget it at any OpenAI-compatible server.
+`examples/skills.rs` writes a `SKILL.md` and one `references/factors.md` into a temporary directory and loads them with `SkillsPlugin::from_dir`. It takes three turns: the model calls `skill` and gets the instructions back, then calls `skill_read` for the bundled file, then answers. The directory is removed when the program ends. It needs a `llama-server` on port 1234 with the demo model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
 
 ```text,name=The SKILL.md the example writes
 ---

@@ -215,7 +215,7 @@ impl Upstream {
 
     fn poll_succeeded(&self, models: Vec<UpstreamModel>, stats: Option<StatsOutcome>) {
         let mut h = self.health();
-        // An upstream restarted with `--stats-api` must be probed again.
+        // An upstream restarted with `stats_api #true` must be probed again.
         if h.down_since.is_some() || h.ejected {
             h.has_stats_api = None;
         }

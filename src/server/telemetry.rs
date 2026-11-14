@@ -2,10 +2,13 @@
 //!
 //! The server's own events carry the request id, model, token counts and
 //! timings as fields (`cuca::access` is the per-request line), so the JSON
-//! format is directly ingestible by a log pipeline.
+//! format is directly ingestible by a log pipeline. The `log` node of the
+//! configuration file ([`LogConfig`]) sets the format and the filter; no
+//! environment variable is read.
 
 use std::str::FromStr;
 
+use serde::{Deserialize, Deserializer};
 use tracing_subscriber::EnvFilter;
 
 use super::error::ServerError;
@@ -34,22 +37,42 @@ impl FromStr for LogFormat {
     }
 }
 
-/// Install the global subscriber. `level` (a level or a full filter such as
-/// `info,cuca=debug`) wins over the `RUST_LOG` environment variable, which
-/// wins over the default `info`.
+impl<'de> Deserialize<'de> for LogFormat {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        super::config::parsed(deserializer)
+    }
+}
+
+/// The `log` node: `log format="json" level="info,cuca=debug"`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LogConfig {
+    /// `pretty` (the default) or `json`.
+    pub format: LogFormat,
+    /// A level or a full filter such as `info,cuca=debug` (default `info`).
+    pub level: String,
+}
+
+impl Default for LogConfig {
+    fn default() -> Self {
+        Self {
+            format: LogFormat::Pretty,
+            level: "info".into(),
+        }
+    }
+}
+
+/// Install the global subscriber with `config`'s format and filter.
 ///
 /// # Errors
 ///
 /// [`ServerError::Config`] for a filter that does not parse or a subscriber
 /// already installed.
-pub fn init(format: LogFormat, level: Option<&str>) -> Result<(), ServerError> {
-    let filter = match level {
-        Some(level) => EnvFilter::try_new(level),
-        None => EnvFilter::try_from_default_env().or_else(|_| EnvFilter::try_new("info")),
-    }
-    .map_err(|e| ServerError::Config(format!("invalid log filter: {e}")))?;
+pub fn init(config: &LogConfig) -> Result<(), ServerError> {
+    let filter = EnvFilter::try_new(&config.level)
+        .map_err(|e| ServerError::Config(format!("invalid log level: {e}")))?;
     let builder = tracing_subscriber::fmt().with_env_filter(filter);
-    let installed = match format {
+    let installed = match config.format {
         LogFormat::Pretty => builder.try_init(),
         LogFormat::Json => builder.json().try_init(),
     };

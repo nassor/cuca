@@ -1,7 +1,7 @@
 //! Model cache resolution and the resumable, verified Hugging Face download.
 //!
-//! [`resolve_cache_dir`] picks the cache root (explicit setting, `CUCA_CACHE_DIR`,
-//! then the platform cache directory) and [`cached_path`] maps a repository
+//! [`resolve_cache_dir`] picks the cache root (explicit setting, then the
+//! platform cache directory) and [`cached_path`] maps a repository
 //! file to `<cache>/huggingface/<repo>/<revision>/<file>`, rejecting path
 //! traversal. [`ensure_downloaded`] fetches
 //! `{endpoint}/{repo}/resolve/{revision}/{file}` into `<final>.partial`:
@@ -51,23 +51,22 @@ fn env_nonempty(env: &dyn Fn(&str) -> Option<OsString>, key: &str) -> Option<OsS
     env(key).filter(|v| !v.is_empty())
 }
 
-/// Resolve the model cache root.
-///
-/// Precedence (first wins): `explicit`; `CUCA_CACHE_DIR` as given; on Windows
-/// `%LOCALAPPDATA%\cuca`, else `%USERPROFILE%\AppData\Local\cuca`; on macOS
-/// `$HOME/Library/Caches/cuca`; elsewhere `$XDG_CACHE_HOME/cuca`, else
-/// `$HOME/.cache/cuca`. Empty environment values count as unset. `env` reads
-/// environment variables, so tests can inject a fake one.
-pub(crate) fn resolve_cache_dir(
-    explicit: Option<&Path>,
-    env: &dyn Fn(&str) -> Option<OsString>,
-) -> Result<PathBuf, CucaError> {
-    if let Some(dir) = explicit {
-        return Ok(dir.to_path_buf());
+/// Resolve the model cache root: `explicit`
+/// ([`LocalModelConfig::cache_dir`](super::LocalModelConfig::cache_dir)),
+/// else [`platform_cache_dir`] over the process environment.
+pub(crate) fn resolve_cache_dir(explicit: Option<&Path>) -> Result<PathBuf, CucaError> {
+    match explicit {
+        Some(dir) => Ok(dir.to_path_buf()),
+        None => platform_cache_dir(&|key| std::env::var_os(key)),
     }
-    if let Some(dir) = env_nonempty(env, "CUCA_CACHE_DIR") {
-        return Ok(PathBuf::from(dir));
-    }
+}
+
+/// The platform's cache directory, as the operating system publishes it: on
+/// Windows `%LOCALAPPDATA%\cuca`, else `%USERPROFILE%\AppData\Local\cuca`; on
+/// macOS `$HOME/Library/Caches/cuca`; elsewhere `$XDG_CACHE_HOME/cuca`, else
+/// `$HOME/.cache/cuca`. Empty values count as unset. `env` reads the
+/// variables, so tests can inject a fake environment.
+fn platform_cache_dir(env: &dyn Fn(&str) -> Option<OsString>) -> Result<PathBuf, CucaError> {
     let platform = if cfg!(windows) {
         env_nonempty(env, "LOCALAPPDATA")
             .map(|d| PathBuf::from(d).join("cuca"))
@@ -87,8 +86,7 @@ pub(crate) fn resolve_cache_dir(
     };
     platform.ok_or_else(|| {
         CucaError::Config(
-            "cannot resolve a model cache directory; set LocalModelConfig::cache_dir or CUCA_CACHE_DIR"
-                .into(),
+            "cannot resolve a model cache directory; set LocalModelConfig::cache_dir".into(),
         )
     })
 }
@@ -501,22 +499,8 @@ mod tests {
 
     #[test]
     fn explicit_cache_dir_wins() {
-        let env = fake_env(&[
-            ("CUCA_CACHE_DIR", "/env"),
-            ("HOME", "/home/u"),
-            ("LOCALAPPDATA", "C:/l"),
-        ]);
-        let dir = resolve_cache_dir(Some(Path::new("/explicit")), &env).expect("resolves");
+        let dir = resolve_cache_dir(Some(Path::new("/explicit"))).expect("resolves");
         assert_eq!(dir, PathBuf::from("/explicit"));
-    }
-
-    #[test]
-    fn env_override_is_used_as_is() {
-        let env = fake_env(&[("CUCA_CACHE_DIR", "/env/cache"), ("HOME", "/home/u")]);
-        assert_eq!(
-            resolve_cache_dir(None, &env).expect("resolves"),
-            PathBuf::from("/env/cache")
-        );
     }
 
     #[test]
@@ -524,12 +508,12 @@ mod tests {
         if cfg!(windows) {
             let env = fake_env(&[("LOCALAPPDATA", "C:/Local"), ("USERPROFILE", "C:/Users/u")]);
             assert_eq!(
-                resolve_cache_dir(None, &env).expect("resolves"),
+                platform_cache_dir(&env).expect("resolves"),
                 PathBuf::from("C:/Local").join("cuca")
             );
             let env = fake_env(&[("USERPROFILE", "C:/Users/u")]);
             assert_eq!(
-                resolve_cache_dir(None, &env).expect("resolves"),
+                platform_cache_dir(&env).expect("resolves"),
                 PathBuf::from("C:/Users/u")
                     .join("AppData")
                     .join("Local")
@@ -538,7 +522,7 @@ mod tests {
         } else if cfg!(target_os = "macos") {
             let env = fake_env(&[("HOME", "/Users/u"), ("XDG_CACHE_HOME", "/xdg")]);
             assert_eq!(
-                resolve_cache_dir(None, &env).expect("resolves"),
+                platform_cache_dir(&env).expect("resolves"),
                 PathBuf::from("/Users/u")
                     .join("Library")
                     .join("Caches")
@@ -547,12 +531,12 @@ mod tests {
         } else {
             let env = fake_env(&[("XDG_CACHE_HOME", "/xdg"), ("HOME", "/home/u")]);
             assert_eq!(
-                resolve_cache_dir(None, &env).expect("resolves"),
+                platform_cache_dir(&env).expect("resolves"),
                 PathBuf::from("/xdg").join("cuca")
             );
             let env = fake_env(&[("HOME", "/home/u")]);
             assert_eq!(
-                resolve_cache_dir(None, &env).expect("resolves"),
+                platform_cache_dir(&env).expect("resolves"),
                 PathBuf::from("/home/u").join(".cache").join("cuca")
             );
         }
@@ -560,9 +544,9 @@ mod tests {
 
     #[test]
     fn unresolvable_cache_dir_is_a_config_error() {
-        let env = fake_env(&[("CUCA_CACHE_DIR", "")]);
-        let err = resolve_cache_dir(None, &env).expect_err("nothing to resolve from");
-        assert!(matches!(&err, CucaError::Config(m) if m.contains("CUCA_CACHE_DIR")));
+        let env = fake_env(&[("HOME", ""), ("LOCALAPPDATA", "")]);
+        let err = platform_cache_dir(&env).expect_err("nothing to resolve from");
+        assert!(matches!(&err, CucaError::Config(m) if m.contains("cache_dir")));
     }
 
     #[test]

@@ -2,16 +2,21 @@
 //! real-weights streaming oracle (`.omp/local-models/ref/deepseek-v41-real`,
 //! see its README).
 //!
-//! Gated: `CUCA_LOCAL_DS41_REAL` names the oracle directory and
-//! `CUCA_CACHE_DIR` the cache holding the converted set
+//! Gated: `oracle { ds41 { real_dir "..." } }` names the oracle directory and
+//! the top-level `cache_dir "..."` the cache holding the converted set
 //! (`converted/deepseek-ai--DeepSeek-V4.1-Flash-1017/<revision>/`); without
 //! them the test prints `SKIP:` and passes. It loads the 298 GB backbone with
-//! tiered experts (`CUCA_LOCAL_DS41_REAL_RAM`, default 90 GiB of expert RAM), so
+//! tiered experts (`oracle { ds41 { real_ram_gib ... } }`, default 90 GiB of expert RAM), so
 //! run it in release mode:
 //!
+//! ```kdl
+//! // cuca-test.kdl
+//! cache_dir "<cache dir>"
+//! oracle { ds41 { real_dir "<oracle dir>" } }
+//! ```
+//!
 //! ```sh
-//! CUCA_LOCAL_DS41_REAL=<oracle dir> CUCA_CACHE_DIR=<cache dir> \
-//!   RUSTFLAGS="-C target-cpu=native" cargo test --release --lib --features provider-local \
+//! RUSTFLAGS="-C target-cpu=native" cargo test --release --lib --features provider-local \
 //!   real_model -- --nocapture
 //! ```
 //!
@@ -39,10 +44,12 @@ const PARIS: usize = 51119;
 
 pub(in crate::provider::local::model) fn setup() -> Option<(PathBuf, PathBuf)> {
     let (Some(dir), Some(cache)) = (
-        std::env::var_os("CUCA_LOCAL_DS41_REAL").map(PathBuf::from),
-        std::env::var_os("CUCA_CACHE_DIR").map(PathBuf::from),
+        crate::test_config::get().oracle.ds41.real_dir.clone(),
+        crate::test_config::get().cache_dir.clone(),
     ) else {
-        skip("set CUCA_LOCAL_DS41_REAL (oracle dir) and CUCA_CACHE_DIR (converted set)");
+        skip(
+            "set `oracle { ds41 { real_dir \"...\" } }` (oracle dir) and `cache_dir` (converted set) in cuca-test.kdl",
+        );
         return None;
     };
     let model = cache
@@ -65,9 +72,10 @@ pub(in crate::provider::local::model) fn json(path: &Path) -> serde_json::Value 
 }
 
 fn load(model: &Path) -> Transformer {
-    let gib: u64 = std::env::var("CUCA_LOCAL_DS41_REAL_RAM")
-        .ok()
-        .and_then(|v| v.parse().ok())
+    let gib: u64 = crate::test_config::get()
+        .oracle
+        .ds41
+        .real_ram_gib
         .unwrap_or(90);
     let content = Content::open(model).unwrap();
     let experts = ExpertPlacement::Tiered(ExpertTiers {
@@ -170,16 +178,12 @@ pub(in crate::provider::local::model) fn score(
     chaotic: bool,
 ) -> f64 {
     assert_eq!(logits.len(), ids.len() * v);
-    // `CUCA_LOCAL_DS41_REAL_DUMP=<dir>` writes every position's logits, for
+    // `oracle { ds41 { real_dump_dir "<dir>" } }` writes every position's logits, for
     // comparing two engines with each other.
-    if let Some(out) = std::env::var_os("CUCA_LOCAL_DS41_REAL_DUMP") {
+    if let Some(out) = &crate::test_config::get().oracle.ds41.real_dump_dir {
         let engine = timing.split('|').next().unwrap_or("engine");
         let bytes: Vec<u8> = logits.iter().flat_map(|x| x.to_le_bytes()).collect();
-        std::fs::write(
-            PathBuf::from(out).join(format!("{engine}_{mode}.f32")),
-            bytes,
-        )
-        .unwrap();
+        std::fs::write(out.join(format!("{engine}_{mode}.f32")), bytes).unwrap();
     }
     let want = json(&dir.join(format!("topk_{mode}.json")));
     let (mut top1_equal, mut worst, mut overlap_min) = (0, 0f32, 10);
@@ -275,12 +279,12 @@ fn real_model_matches_the_streaming_oracle_with_quantization_on() {
     assert!(kl < 5e-2, "KL {kl:.3e}");
 }
 
-/// Speed with the experts in the RAM tier (`CUCA_LOCAL_DS41_REAL_SPEED=1`):
+/// Speed with the experts in the RAM tier (`oracle { ds41 { real_speed #true } }`):
 /// the prompt cold and warm, then one decode step repeated at the same
 /// position. Prints `REAL|speed|cpu|...`; asserts nothing about the numbers.
 #[test]
 fn real_model_speed() {
-    if std::env::var_os("CUCA_LOCAL_DS41_REAL_SPEED").is_none() {
+    if !crate::test_config::get().oracle.ds41.real_speed {
         return;
     }
     let Some((dir, model)) = setup() else { return };

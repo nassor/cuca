@@ -743,15 +743,17 @@ mod tests {
         assert!(compressed_token_map(&synthetic_tokenizer(), 5).is_err());
     }
 
-    /// The reference tokenizer: `CUCA_DS41_TOKENIZER_JSON`, else the research copy.
+    /// The reference tokenizer: `oracle { ds41 { tokenizer_json "..." } }` in cuca-test.kdl, else the research copy.
     fn real_tokenizer_path() -> PathBuf {
-        std::env::var_os("CUCA_DS41_TOKENIZER_JSON").map_or_else(
-            || {
+        crate::test_config::get()
+            .oracle
+            .ds41
+            .tokenizer_json
+            .clone()
+            .unwrap_or_else(|| {
                 PathBuf::from(env!("CARGO_MANIFEST_DIR"))
                     .join(".omp/local-models/ref/deepseek-v41/tokenizer.json")
-            },
-            PathBuf::from,
-        )
+            })
     }
 
     #[test]

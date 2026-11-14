@@ -107,7 +107,7 @@ The service never retries a failed call, and it has no 429 or `Retry-After` feed
 
 ## Example
 
-The program needs a `llama-server` or LM Studio on port 1234 with a model loaded. `CUCA_BASE_URL` and `CUCA_MODEL` point it at any OpenAI-compatible server. It builds a registry and a dispatcher over one backend, sends three calls of three priorities, and prints the `recent` list of the snapshot.
+The program needs a `llama-server` or LM Studio on port 1234 with a model loaded. The flags `--base-url` and `--model`, written after `--`, point it at any OpenAI-compatible server. It builds a registry and a dispatcher over one backend, sends three calls of three priorities, and prints the `recent` list of the snapshot.
 
 ```bash,name=Linux and macOS
 cargo run --example scheduler --features provider-llamacpp,service-scheduler

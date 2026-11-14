@@ -1,6 +1,6 @@
 +++
 title = "Model server"
-description = "cuca serve: command line, config file, routes, the OpenAI chat completions wire format, errors, authentication and bounds."
+description = "cuca serve: the configuration file, routes, the OpenAI chat completions wire format, errors, authentication and bounds."
 template = "page.html"
 weight = 1
 +++
@@ -18,74 +18,87 @@ weight = 1
 
 ## Command line
 
-`cuca serve --model <[name=]source> [options]`. Models load concurrently at startup. Until every model is ready, `/health` answers 503 and chat requests get a 503 `model_loading` error. A model that fails to load stops the server with exit status 1.
-
-| Option | Default | Meaning |
-|---|---|---|
-| `--listen <addr>` | `127.0.0.1:8000` | address of the HTTP listener |
-| `--model <[name=]source>` | none; at least one model is required here or in `--config` | repeatable; see below |
-| `--config <file>` | none | TOML file of `[[model]]` tables |
-| `--device <list>` | `cpu` | `cpu`, `vulkan[:n]`, `metal`, `cuda[:n]`, `rocm[:n]`; join with `+` to split one model over GPUs |
-| `--context-length <n>` | the smaller of 8192 and the model's maximum | tokens of prompt plus completion per request |
-| `--batching <spec>` | `seqs=4` | any of `seqs=4,kv=16384,step=256,prefix=off` |
-| `--experts <spec>` | `resident` | `resident`, `tiered:ram=4g,device=6g,threads=4` or `host[:layers=n]` |
-| `--gpu-layers <n>` | all | layers on the GPU, the rest on the CPU |
-| `--cache-dir <dir>` | `CUCA_CACHE_DIR`, then the platform cache directory | where models download and convert |
-| `--api-key <key>` | none; `CUCA_API_KEY` | bearer key required on every route except `/health` |
-| `--stats-api` | off | serve `/cuca/v1/stats` and `/cuca/v1/stats/stream` |
-| `--log-format <f>` | `pretty` | `pretty` or `json` |
-| `--log-level <filter>` | `RUST_LOG`, else `info` | a level or `target=level,...` |
-
-The device, batching and expert strings are the ones [`LocalModelConfig`](@/providers/local/configuration.md) parses. A device whose Cargo feature is off fails the load with a configuration error.
+`cuca serve [--config <FILE>]`. The one option is `--config` (`-c`), the KDL file, default `cuca.kdl` in the working directory. Every other setting is a key of that file. Models load concurrently at startup. Until every model is ready, `/health` answers 503 and chat requests get a 503 `model_loading` error. A model that fails to load stops the server with exit status 1.
 
 Linux and macOS:
 
-```bash,name=One CPU model, stats API on
-cuca serve --model qwen3-0.6b-q8_0 --stats-api
+```bash,name=Serve the models of cuca.kdl
+cuca serve --config cuca.kdl
 ```
 
 Windows (PowerShell):
 
-```powershell,name=One CPU model, stats API on
-cuca.exe serve --model qwen3-0.6b-q8_0 --stats-api
+```powershell,name=Serve the models of cuca.kdl
+cuca.exe serve --config cuca.kdl
 ```
+
+A missing or invalid file stops the command with exit status 1 and a message that names the file and the key. An unknown key is an error.
+
+## Configuration file
+
+The `serve` section holds the server's keys and one `model` node per model. The `log` section applies to every command; see [logs](@/server/stats-and-metrics.md#logs). The whole file, including the `balance` section, is `examples/configs/cuca.kdl` in the repository; the syntax is on [Configuration files](@/reference/environment.md).
+
+```kdl,name=Two models, the second on a GPU
+variables {
+    API_KEY "change-me"
+}
+
+log format="pretty" level="info"
+
+serve {
+    listen "127.0.0.1:8000"
+    api_key "${API_KEY}"
+    stats_api #true
+    latency_window "60s"
+
+    model "chat" {
+        source "qwen3-0.6b-q8_0"
+        batching max_sequences=8
+    }
+    model {
+        source file="/models/gemma-4-E4B-it-Q4_0.gguf"
+        device "vulkan:0"
+        gpu_layers 20
+    }
+}
+```
+
+| `serve` key | Default | Meaning |
+|---|---|---|
+| `listen` | `127.0.0.1:8000` | address of the HTTP listener |
+| `api_key` | none | bearer key required on every route except `/health`; an empty key is an error |
+| `stats_api` | `#false` | serve `/cuca/v1/stats` and `/cuca/v1/stats/stream` |
+| `latency_window` | `"60s"` | the sliding window of the latency figures |
+| `model` | none; at least one | one node per model, at most 16; see below |
+
+A `model` node holds a [`LocalModelConfig`](@/providers/local/configuration.md): its keys are the field names. The common ones:
+
+| `model` key | Default | Meaning |
+|---|---|---|
+| `source` | required | what to load; see below |
+| `device` | `"cpu"` | `"cpu"`, `"vulkan:0"`, `"metal"`, `"cuda:0"`, `"rocm:0"` |
+| `shards` | none | further devices that split one model: `shards "vulkan:1"` |
+| `context_length` | the smaller of 8192 and the model's maximum | tokens of prompt plus completion per request |
+| `batching` | `max_sequences=4` | `max_sequences=4 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false` |
+| `experts` | `"resident"` | `"resident"`, `{ tiered ram_bytes="4g" device_bytes="6g" loader_threads=4 }` or `{ host layers=4 }` |
+| `gpu_layers` | all | layers on the GPU, the rest on the CPU |
+| `cache_dir` | the platform cache directory | where models download and convert |
+| `chat_template_file` | the model's template | a Jinja file that replaces the template |
+| `convert` | `quant="q8_0"` | checkpoint conversion: `quant` is `f16`, `q8_0` or `q4_0` |
+| `drafter`, `draft_tokens` | none | `"in-trunk"` or a source for a drafter file; tokens drafted per round, 1 to 16 |
+
+A device whose Cargo feature is off fails the load with a configuration error. The other keys (`sampling`, `engram`, `hf_token`, `shard_dirs`, `chat_template`) are listed on [Configuration files](@/reference/environment.md#the-model-keys).
 
 ## Model sources and names
 
-`--model` takes `[name=]source`. A source is one of:
+The argument of `model` is the name clients pass as `model`. The `source` is one of:
 
-- a preset name from [`ModelSource::PRESETS`](@/providers/local/model-sources.md), such as `qwen3-0.6b-q8_0`;
-- `repo:revision:file`, a GGUF on Hugging Face;
-- `repo:revision`, a safetensors checkpoint, converted once to a cached GGUF;
-- a path to a GGUF file, or to a checkpoint directory.
+- a preset name from [`ModelSource::PRESETS`](@/providers/local/model-sources.md), such as `source "qwen3-0.6b-q8_0"`;
+- `source "repo:revision:file"`, a GGUF on Hugging Face;
+- `source "repo:revision"`, a safetensors checkpoint, converted once to a cached GGUF;
+- `source file="/models/x.gguf"`, a GGUF file, or `source dir="/ckpt"`, a checkpoint directory.
 
-The name clients pass as `model` defaults to the preset name, the file stem, or the repository name. Names are unique and at most 16 models load per server.
-
-## Config file
-
-`--config` reads `[[model]]` tables. Command line options are the defaults for every table, and a key in a table overrides them for that model. Models named with `--model` come first. An unknown key is an error.
-
-| Key | Meaning |
-|---|---|
-| `source` | required; as for `--model` |
-| `name` | the model name |
-| `device`, `context_length`, `batching`, `experts`, `gpu_layers`, `cache_dir` | as the command line options |
-| `chat_template_file` | a Jinja file that replaces the model's template |
-| `quant` | checkpoint conversion precision: `f16`, `q8_0` or `q4_0` |
-| `drafter` | `in-trunk`, or a source for a drafter file |
-| `draft_tokens` | tokens drafted per round, 1 to 16 |
-
-```toml,name=Two models, the second on a GPU
-[[model]]
-name = "chat"
-source = "qwen3-0.6b-q8_0"
-batching = "seqs=8"
-
-[[model]]
-source = "/models/gemma-4-E4B-it-Q4_0.gguf"
-device = "vulkan"
-gpu_layers = 20
-```
+Without an argument the name is the preset name, else the file stem, the checkpoint's repository name or the directory name. Names are unique and at most 16 models load per server.
 
 ## Routes
 
@@ -96,7 +109,7 @@ gpu_layers = 20
 | `GET /v1/models` | the ready models: `id`, `object`, `created`, `owned_by` (`cuca`) and `max_model_len` |
 | `POST /v1/chat/completions` | a chat completion, or an SSE stream with `"stream": true` |
 | `GET /metrics` | Prometheus text, see [Stats API and metrics](@/server/stats-and-metrics.md) |
-| `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `--stats-api` |
+| `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `stats_api #true` |
 
 `/v1/completions` is not served: the engine has no raw prompt entry, and every request goes through the model's chat template.
 
@@ -149,7 +162,7 @@ Errors are `{"error":{"message","type","param","code"}}`.
 
 ## Authentication
 
-With `--api-key`, every route except `/health` needs `Authorization: Bearer <key>`; the comparison is constant time. A rejected request gets 401 and `WWW-Authenticate: Bearer`. `/health` stays open so probes work.
+With `api_key` set in the `serve` section, every route except `/health` needs `Authorization: Bearer <key>`; the comparison is constant time. A rejected request gets 401 and `WWW-Authenticate: Bearer`. `/health` stays open so probes work.
 
 ## Bounds
 

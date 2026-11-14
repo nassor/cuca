@@ -1767,9 +1767,9 @@ mod tests {
 
     #[test]
     fn batching_resolves_against_the_context_length() {
-        let config = |text: &str| LocalModelConfig {
-            batching: text.parse().unwrap(),
-            ..LocalModelConfig::default()
+        // `props` are the properties of a KDL `batching` node.
+        let config = |props: &str| {
+            crate::config::load_kdl_str::<LocalModelConfig>(&format!("batching {props}")).unwrap()
         };
         let (batching, sizing) = resolve_batching(&config(""), 1000, false).unwrap();
         assert_eq!(
@@ -1785,20 +1785,25 @@ mod tests {
         assert_eq!(sizing.max_sequences, 4);
         // An explicit pool rounds up to blocks and holds at least a context
         // and a block.
-        let (_, sizing) = resolve_batching(&config("kv=1016"), 1000, false).unwrap();
+        let (_, sizing) = resolve_batching(&config("kv_tokens=1016"), 1000, false).unwrap();
         assert_eq!(sizing.kv_tokens, 1024);
-        let err = resolve_batching(&config("kv=1015"), 1000, false).unwrap_err();
+        let err = resolve_batching(&config("kv_tokens=1015"), 1000, false).unwrap_err();
         assert!(
             matches!(&err, CucaError::Config(m) if m.contains("kv_tokens")),
             "{err}"
         );
         // A very long context shrinks the prefill chunk below the sequences.
-        let (batching, _) = resolve_batching(&config("seqs=64"), 131_072, false).unwrap();
+        let (batching, _) = resolve_batching(&config("max_sequences=64"), 131_072, false).unwrap();
         assert_eq!(batching.max_step_tokens, 64);
         // The in-trunk head serves one sequence.
-        let (batching, sizing) = resolve_batching(&config("seqs=8"), 1000, true).unwrap();
+        let (batching, sizing) = resolve_batching(&config("max_sequences=8"), 1000, true).unwrap();
         assert_eq!((batching.max_sequences, sizing.max_sequences), (1, 1));
-        let (batching, _) = resolve_batching(&config("prefix=off,step=32"), 1000, false).unwrap();
+        let (batching, _) = resolve_batching(
+            &config("prefix_cache=#false max_step_tokens=32"),
+            1000,
+            false,
+        )
+        .unwrap();
         assert_eq!(
             (batching.max_step_tokens, batching.prefix_cache),
             (32, false)
@@ -2973,7 +2978,10 @@ mod tests {
         assert!(!file_drafter_observes("gemma4-assistant"));
         let config = LocalModelConfig {
             context_length: Some(32),
-            batching: "seqs=4".parse().unwrap(),
+            batching: super::super::BatchingConfig {
+                max_sequences: 4,
+                ..Default::default()
+            },
             draft_tokens: 4,
             ..LocalModelConfig::default()
         };

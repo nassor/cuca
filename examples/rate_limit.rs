@@ -24,10 +24,10 @@
 //! Both values default to a local llama.cpp server; override them to target
 //! any OpenAI-compatible server:
 //!
-//! - `CUCA_BASE_URL`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
-//! - `CUCA_MODEL`: upstream model id, defaults to `google/gemma-4-e4b`.
+//! - `--base-url <URL>`: server base URL, defaults to `http://127.0.0.1:1234/v1`.
+//! - `--model <ID>`: upstream model id, defaults to `google/gemma-4-e4b`.
 //!
-//! Example: `CUCA_BASE_URL=http://127.0.0.1:8000/v1 CUCA_MODEL=<server-model-id> cargo run --example rate_limit --features provider-llamacpp,service-rate-limit`
+//! Example: `cargo run --example rate_limit --features provider-llamacpp,service-rate-limit -- --base-url http://127.0.0.1:8000/v1 --model <server-model-id>`
 //!
 //! # Output
 //!
@@ -109,12 +109,11 @@ fn request(model: &str, turn: usize) -> UnifiedRequest {
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Base URL and model come from the environment so the example runs
+    // Base URL and model come from the command line so the example runs
     // against any OpenAI-compatible server; the defaults target a local
     // llama.cpp server (see the module docs for the override recipe).
-    let base_url =
-        std::env::var("CUCA_BASE_URL").unwrap_or_else(|_| "http://127.0.0.1:1234/v1".to_string());
-    let model = std::env::var("CUCA_MODEL").unwrap_or_else(|_| "google/gemma-4-e4b".to_string());
+    let base_url = arg("base-url").unwrap_or_else(|| "http://127.0.0.1:1234/v1".to_string());
+    let model = arg("model").unwrap_or_else(|| "google/gemma-4-e4b".to_string());
 
     // Stage 1: the bounds. Every one of them is validated at construction, so
     // a zero rate or a zero cap fails here instead of being clamped.
@@ -152,7 +151,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Ok(stream) => stream,
         Err(error) => {
             println!("\nNo server answered at {base_url}: {error}");
-            println!("Start llama-server there, or set CUCA_BASE_URL, then run this again.");
+            println!("Start llama-server there, or pass --base-url, then run this again.");
             return Ok(());
         }
     };
@@ -289,4 +288,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     print_usage("after the demo", &limiter);
     Ok(())
+}
+
+/// The value after `--<name>` on the command line.
+fn arg(name: &str) -> Option<String> {
+    let flag = format!("--{name}");
+    let mut args = std::env::args().skip(1);
+    while let Some(a) = args.next() {
+        if a == flag {
+            return args.next();
+        }
+    }
+    None
 }

@@ -34,6 +34,20 @@ weight = 4
 
 Anything else fails with `` unknown model `…`: expected a preset (…), `repo:revision:file` (a GGUF), or `repo:revision` (a checkpoint) `` and the list of preset names.
 
+In KDL the same string is the value of `source`, and the other variants are properties or children:
+
+```kdl,name=The forms of source (write one)
+source "qwen3-0.6b-q8_0"
+source "repo:revision:file"
+source "repo:revision"
+source file="/models/x.gguf"
+source dir="/ckpt"
+source { checkpoint repo="Qwen/Qwen3-0.6B" revision="c1899de"; }
+source { hugging_face repo="org/r" revision="abc" file="m.gguf" sha256="..." { part file="..." sha256="..."; template repo="..." revision="..." file="chat_template.jinja"; } }
+```
+
+A string never names a path: write a file as `file=` and a directory as `dir=`. A checkpoint that is no preset is a `repo:revision` string, for example `source "deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>"`.
+
 A file of an architecture the engine does not know, or a tokenizer it does not implement, fails to load with a `CucaError::Provider` naming the cause; see [Local models and formats](@/providers/local/models.md#loading-a-gguf-that-is-not-a-preset).
 
 ## Presets
@@ -86,8 +100,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 A Hugging Face source is downloaded once from `https://huggingface.co/{repo}/resolve/{revision}/{file}` into the cache directory.
 
-- The cache root is `LocalModelConfig::cache_dir`, else `CUCA_CACHE_DIR`, else the platform directory. Empty environment values count as unset.
-- The platform directory is `%LOCALAPPDATA%\cuca` on Windows (else `%USERPROFILE%\AppData\Local\cuca`), `$HOME/Library/Caches/cuca` on macOS, and `$XDG_CACHE_HOME/cuca` on Linux (else `$HOME/.cache/cuca`).
+- The cache root is `LocalModelConfig::cache_dir` (KDL `cache_dir "D:/cuca-cache"`); `None` is the platform directory. The library reads no cache variable.
+- The platform directory is `%LOCALAPPDATA%\cuca` on Windows (else `%USERPROFILE%\AppData\Local\cuca`), `$HOME/Library/Caches/cuca` on macOS, and `$XDG_CACHE_HOME/cuca` on Linux (else `$HOME/.cache/cuca`). Empty environment values count as unset.
 - The file lands at `<cache>/huggingface/<repo with / as -->/<revision>/<file>`.
 - An interrupted download resumes from the `<file>.partial` file with an HTTP `Range` request, and restarts from byte 0 once per call if the server ignores or rejects the range.
 - The SHA-256 is computed while streaming, covering any resumed bytes. A mismatch deletes the partial file and fails the load.
@@ -95,7 +109,7 @@ A Hugging Face source is downloaded once from `https://huggingface.co/{repo}/res
 - An exclusive lock file, `<file>.lock`, serializes concurrent loaders in this process or another. The empty file stays in the cache: deleting it after unlock would race with a process still blocked on it.
 - Memory use during the download is bounded by a 1 MiB write buffer and one network chunk. A download fails when no chunk arrives for 60 seconds.
 - `LocalModelConfig::on_download_progress` takes a `DownloadProgressCallback` that receives `DownloadProgress { downloaded_bytes, total_bytes }` at the start, about every mebibyte and at the end. `total_bytes` is `None` when the server reports no size. The callback runs on the engine thread during `load`, so keep it cheap. A checkpoint conversion reports tensors converted out of the tensor count in the same fields; a DeepSeek-V4.1 conversion reports bytes written out of the bytes to write.
-- `hf_token`, or `HF_TOKEN` when it is `None`, is sent as a bearer token. The pinned preset files download anonymously.
+- `hf_token` is sent as a bearer token; `None` or an empty string downloads anonymously, as do the pinned preset files. A KDL file can take it from the environment with `hf_token "${HF_TOKEN:-}"`; see [KDL configuration](@/providers/local/configuration.md#kdl-configuration).
 - The download uses a private HTTP client and runtime with a 30 second connect timeout, separate from the `CucaClient` one.
 
 ## Split GGUF files

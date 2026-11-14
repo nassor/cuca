@@ -9,26 +9,29 @@
 //! with the same kernels, on the same weight bytes. Each run prints
 //! `TIERS|<phase>|<tok/s>|<stats>`.
 //!
-//! - `CUCA_LOCAL_MODEL_PATH` / `CUCA_LOCAL_MODEL`: the model (a preset such as
-//!   `olmoe-1b-7b-q4_0`, `qwen3-30b-a3b-q4_0`, `qwen3.6-35b-a3b-q4_0`).
-//! - `CUCA_LOCAL_EXPERTS`: the tiered placement under test (`ExpertPlacement`
-//!   syntax, e.g. `tiered:ram=4g`, or `tiered:device=6g,ram=12g` on a GPU).
-//! - `CUCA_LOCAL_EXPERTS_REF`: the reference placement (default
-//!   `resident`); set it to a small tiered placement when the resident model
-//!   does not fit the device.
-//! - `CUCA_LOCAL_ENGRAM`: `LocalModelConfig::engram` (`EngramCache` syntax,
-//!   e.g. `ram=2g,threads=8`) for a model with Engram tables; its counters
-//!   print with the tier counters.
-//! - `CUCA_LOCAL_DEVICE`: `LocalDevice` syntax; a GPU needs its feature.
-//! - `CUCA_LOCAL_GPU_LAYERS`: `LocalModelConfig::gpu_layers` (layer offload:
-//!   the last `n` layers on the GPU, the rest on the CPU with the RAM tier).
+//! The keys of `cuca-test.kdl` it reads, in `local { model { ... } }`:
 //!
-//! Without a model or `CUCA_LOCAL_EXPERTS` the test prints `SKIP` and passes,
-//! unless `CUCA_REQUIRE_LIVE=1` turns the skip into a panic.
+//! - `source`: the model (a preset such as `olmoe-1b-7b-q4_0`,
+//!   `qwen3-30b-a3b-q4_0`, `qwen3.6-35b-a3b-q4_0`).
+//! - `experts`: the tiered placement under test (e.g. `experts { tiered
+//!   ram_bytes="4g"; }`, or `device_bytes="6g" ram_bytes="12g"` on a GPU).
+//! - `engram`: `LocalModelConfig::engram` (e.g. `engram ram_bytes="2g"
+//!   reader_threads=8`) for a model with Engram tables; its counters print
+//!   with the tier counters.
+//! - `device`: a GPU needs its feature; no `shards`.
+//! - `gpu_layers`: layer offload (the last `n` layers on the GPU, the rest
+//!   on the CPU with the RAM tier).
+//!
+//! and `local { experts_ref ... }`, the reference placement (default
+//! `"resident"`; a small tiered placement when the resident model does not
+//! fit the device).
+//!
+//! Without a model or a tiered `experts` the test prints `SKIP` and passes,
+//! unless `require_live #true` turns the skip into a panic.
 //!
 //! ```sh
-//! RUSTFLAGS="-C target-cpu=native" CUCA_LOCAL_MODEL=olmoe-1b-7b-q4_0 CUCA_LOCAL_EXPERTS=tiered:ram=500m \
-//!   cargo test --release --features provider-local --test provider_local_tiers -- --nocapture
+//! # cuca-test.kdl: local { model { source "olmoe-1b-7b-q4_0"; experts { tiered ram_bytes="500m"; }; }; }
+//! RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_tiers -- --nocapture
 //! ```
 
 #![cfg(feature = "provider-local")]
@@ -82,6 +85,8 @@ async fn phase(
         experts,
         engram: local_env::engram(),
         convert: local_env::convert(),
+        cache_dir: local_env::cache_dir(),
+        hf_token: local_env::hf_token(),
         ..Default::default()
     })
     .await
@@ -123,17 +128,18 @@ fn release(model: LocalModel) {
 async fn tiered_experts_reproduce_the_reference_replies() {
     let Some(source) = local_env::model_source(false) else {
         return local_env::skip(
-            "SKIP: set CUCA_LOCAL_MODEL_PATH or CUCA_LOCAL_MODEL to a MoE model",
+            "SKIP: set `local { model { source ... } }` in cuca-test.kdl to a MoE model",
         );
     };
-    let Some(tested) = local_env::parsed::<ExpertPlacement>("CUCA_LOCAL_EXPERTS") else {
-        return local_env::skip("SKIP: set CUCA_LOCAL_EXPERTS to a tiered placement");
+    let Some(tested) = local_env::experts() else {
+        return local_env::skip(
+            "SKIP: set a tiered `experts` in `local { model { ... } }` of cuca-test.kdl",
+        );
     };
     let ExpertPlacement::Tiered(tiers) = tested.clone() else {
-        panic!("CUCA_LOCAL_EXPERTS must be a tiered placement");
+        panic!("`experts` in cuca-test.kdl must be a tiered placement");
     };
-    let reference =
-        local_env::parsed::<ExpertPlacement>("CUCA_LOCAL_EXPERTS_REF").unwrap_or_default();
+    let reference = local_env::experts_ref();
     let device = local_env::device();
 
     let (want, _, model) = phase("reference", &source, device, reference).await;

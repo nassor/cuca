@@ -1,11 +1,11 @@
 //! The hyper-connection engine against the torch oracle (design §9, L1).
 //!
-//! `CUCA_LOCAL_DS41_REF` names the oracle directory (`make_ref.py`): the tiny
+//! `oracle { ds41 { oracle_dir "..." } }` in cuca-test.kdl names the oracle directory (`make_ref.py`): the tiny
 //! release-format checkpoint in `target/` is converted here at `f16` (every
 //! tensor, the MXFP4 experts included, dequantized exactly) and the CPU
 //! engine's logits are compared with the dumps of the reference run with the
 //! simulated quantization switched off (`noquant/`), which is the arithmetic
-//! this engine implements. Without the variable each test prints `SKIP:` and
+//! this engine implements. Without the key each test prints `SKIP:` and
 //! passes.
 
 use std::path::{Path, PathBuf};
@@ -23,8 +23,10 @@ use super::*;
 
 /// The oracle directory, or `None` after a `SKIP:` line.
 pub(in super::super) fn oracle_root() -> Option<PathBuf> {
-    let Some(dir) = std::env::var_os("CUCA_LOCAL_DS41_REF").map(PathBuf::from) else {
-        skip("set CUCA_LOCAL_DS41_REF to the ds41 oracle directory");
+    let Some(dir) = crate::test_config::get().oracle.ds41.oracle_dir.clone() else {
+        skip(
+            "set `oracle { ds41 { oracle_dir \"...\" } }` in cuca-test.kdl to the ds41 oracle directory",
+        );
         return None;
     };
     if !dir.join("target").is_dir() || !dir.join("noquant").is_dir() {

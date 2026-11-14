@@ -78,8 +78,8 @@ impl ModelSlot {
     fn new(spec: &ModelSpec) -> Self {
         Self {
             name: Arc::from(spec.name.as_str()),
-            source: spec.source_label.clone(),
-            device: spec.device_label.clone(),
+            source: spec.source_label(),
+            device: spec.device_label(),
             metrics: ModelMetrics::default(),
             status: RwLock::new(SlotStatus::Loading),
             progress: LoadProgress::default(),
@@ -267,14 +267,19 @@ async fn load_one(slot: Arc<ModelSlot>, spec: ModelSpec) -> Result<(), ServerErr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::config::ModelOptions;
+    use crate::LocalModelConfig;
 
     fn registry(names: &[&str]) -> Arc<ModelRegistry> {
         let specs: Vec<ModelSpec> = names
             .iter()
             .map(|n| {
-                ModelSpec::from_arg(&format!("{n}=qwen3-0.6b-q8_0"), &ModelOptions::default())
-                    .unwrap()
+                ModelSpec::new(
+                    Some(n.to_string()),
+                    LocalModelConfig {
+                        source: "qwen3-0.6b-q8_0".parse().unwrap(),
+                        ..Default::default()
+                    },
+                )
             })
             .collect();
         ModelRegistry::pending(&specs)

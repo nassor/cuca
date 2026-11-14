@@ -106,22 +106,11 @@ Result: `build()` returns `Ok(client)`.
 
 ## Step 4: verify with a bundled example
 
-The examples read `CUCA_BASE_URL` and `CUCA_MODEL`, so they check any OpenAI-compatible endpoint. They always use the llama.cpp chat route, which appends `/v1` to a base URL that does not end in it. A server that mounts `/chat/completions` somewhere other than `/v1` cannot be checked this way; run your own client from step 3 instead.
+The examples take `--base-url` and `--model`, so they check any OpenAI-compatible endpoint. They always use the llama.cpp chat route, which appends `/v1` to a base URL that does not end in it. A server that mounts `/chat/completions` somewhere other than `/v1` cannot be checked this way; run your own client from step 3 instead.
 
-Linux and macOS:
-
-```bash
-CUCA_BASE_URL=http://10.0.0.7:8000/v1 CUCA_MODEL=your-model-id \
-  cargo run --example llamacpp_gemma --features provider-llamacpp
+```bash,name=Runs the same on all three platforms
+cargo run --example llamacpp_gemma --features provider-llamacpp -- --base-url http://10.0.0.7:8000/v1 --model your-model-id
 ```
-
-Windows (PowerShell), where each assignment is a statement and `;` joins them:
-
-```powershell
-$env:CUCA_BASE_URL = "http://10.0.0.7:8000/v1"; $env:CUCA_MODEL = "your-model-id"; cargo run --example llamacpp_gemma --features provider-llamacpp
-```
-
-The `$env:` assignments last for the PowerShell session. Clear them with `Remove-Item Env:CUCA_BASE_URL, Env:CUCA_MODEL`.
 
 Result: the reply text prints on stdout. That means the endpoint, the model id and the protocol agree. A reasoning model prints nothing while it thinks, because the example prints `Text` blocks only.
 
@@ -130,7 +119,7 @@ If `generate_stream` fails, the example prints `No server answered at <base URL>
 - `HTTP error <status>: <body>` means a server answered and refused; the body carries its reason.
 - `transport failure: ...` means nothing answered at that address.
 
-The two variables affect the examples and the test harness only. A client you write passes its base URL to the builder; the variables are listed in [Environment variables](@/reference/environment.md).
+The two flags affect the examples only. A client you write passes its base URL to the builder; see [Configuration files](@/reference/environment.md#example-flags).
 
 ## If you used ProviderEndpoint::Custom
 
