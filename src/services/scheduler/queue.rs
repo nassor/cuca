@@ -760,10 +760,7 @@ pub(crate) fn lowers_the_worst(loads: &[Load], source: usize, target: usize) -> 
     if loads[target].calls == 0 {
         return loads[source].calls > 0;
     }
-    let start = |load: &Load, calls: usize| -> u128 {
-        u128::try_from(calls).unwrap_or(u128::MAX) * u128::from(load.pace_ms)
-            / u128::from(load.level.max(1))
-    };
+    let start = |load: &Load, calls: usize| Load { calls, ..*load }.start_ms();
     let worst_now = loads.iter().map(|load| load.start_ms()).max().unwrap_or(0);
     let worst_after = loads
         .iter()
@@ -1085,6 +1082,11 @@ impl Pace {
     }
 }
 
+/// A duration in whole milliseconds, saturating.
+fn millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
 impl Scheduler {
     /// A scheduler for `backend` under `config`, starting at one call at a
     /// time, a member of `pool` once [`SchedulerPool::insert`] adds it.
@@ -1254,11 +1256,8 @@ impl Scheduler {
     /// [`SchedulerError::InputsChanged`] when the call's task went stale
     /// while it waited.
     pub async fn await_placement(self: &Arc<Self>, id: u64) -> Result<CallSlot, SchedulerError> {
-        let pool = Arc::clone(&self.pool);
         let mut pending = PendingCall {
             scheduler: Arc::clone(self),
-            pool: Arc::clone(&pool),
-            changes: Arc::clone(&self.changes),
             id,
             armed: true,
         };
@@ -1277,7 +1276,7 @@ impl Scheduler {
                 },
                 Some(MemberPlacement::Waiting) => Placement::Waiting,
                 Some(MemberPlacement::Stale) => Placement::Stale,
-                None => pool.place(id),
+                None => self.pool.place(id),
             };
             match placement {
                 Placement::Running { home, level } => {
@@ -1309,7 +1308,6 @@ impl Scheduler {
         let paused = self.gate.paused();
         let state = self.lock();
         let level = state.tuner.level();
-        let millis = |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
         let shown = state
             .queue
             .running
@@ -1386,7 +1384,7 @@ impl Scheduler {
         let backlog = state.queue.waiting.len() + state.queue.running.len();
         state.tuner.poll(now, backlog, paused);
         let reserved_held = state.reserved_hold_until.is_some_and(|until| now < until);
-        if state.reserved_hold_until.is_some_and(|until| now >= until) {
+        if !reserved_held {
             state.reserved_hold_until = None;
         }
         let stale = |waiter: &Waiter| {
@@ -1433,10 +1431,7 @@ impl Scheduler {
     pub fn hold_reserved_for(&self, duration: Duration) {
         let now = self.clock.now();
         let until = now + duration;
-        {
-            let mut state = self.lock();
-            state.reserved_hold_until = Some(until);
-        }
+        self.lock().reserved_hold_until = Some(until);
         let wake = Arc::clone(&self.wake);
         tokio::spawn(async move {
             tokio::time::sleep(duration).await;
@@ -1463,8 +1458,6 @@ impl Scheduler {
             let Some(runner) = state.queue.complete(id) else {
                 return;
             };
-            let millis =
-                |duration: Duration| u64::try_from(duration.as_millis()).unwrap_or(u64::MAX);
             let run = now.saturating_duration_since(runner.started);
             // CONTEXT: only a call that answered says how fast this backend
             // is; a refusal is instant and a timeout measures the deadline,
@@ -1532,8 +1525,6 @@ impl Scheduler {
 /// whichever member holds it.
 struct PendingCall {
     scheduler: Arc<Scheduler>,
-    pool: Arc<SchedulerPool>,
-    changes: Arc<watch::Sender<u64>>,
     id: u64,
     armed: bool,
 }
@@ -1543,10 +1534,8 @@ impl Drop for PendingCall {
         if !self.armed {
             return;
         }
-        let abandoned = self.scheduler.abandon(self.id).is_some() || self.pool.abandon(self.id);
-        if abandoned {
-            self.changes
-                .send_modify(|version| *version = version.wrapping_add(1));
+        if self.scheduler.abandon(self.id).is_some() || self.scheduler.pool.abandon(self.id) {
+            self.scheduler.changed();
         }
     }
 }

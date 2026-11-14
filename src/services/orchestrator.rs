@@ -381,10 +381,9 @@ fn is_path_like(token: &str) -> bool {
         "toml", "json", "yaml", "yml", "md", "txt", "html", "css", "sql", "lock", "mod", "lua",
         "zig", "php", "cs", "ex", "exs", "vue", "svelte",
     ];
-    match token.rsplit_once('.') {
-        Some((_, ext)) => KNOWN_EXTENSIONS.contains(&ext),
-        None => false,
-    }
+    token
+        .rsplit_once('.')
+        .is_some_and(|(_, ext)| KNOWN_EXTENSIONS.contains(&ext))
 }
 
 /// Validates a speculative draft block from the fast tier.
@@ -531,23 +530,20 @@ fn pool_executors(
     base_url: &str,
     api_key: Option<&str>,
 ) -> (Arc<dyn TurnExecutor>, Arc<dyn TurnExecutor>) {
-    let fast = Arc::new(PoolTurnExecutor {
-        tier: "fast",
-        provider: config.fast_provider.clone(),
-        model_id: config.fast_model_id.clone(),
-        base_url: base_url.to_string(),
-        api_key: api_key.map(str::to_owned),
-        pool: Arc::clone(pool),
-    });
-    let slow = Arc::new(PoolTurnExecutor {
-        tier: "slow",
-        provider: config.slow_provider.clone(),
-        model_id: config.slow_model_id.clone(),
-        base_url: base_url.to_string(),
-        api_key: api_key.map(str::to_owned),
-        pool: Arc::clone(pool),
-    });
-    (fast, slow)
+    let tier = |tier, provider: &ProviderEndpoint, model_id: &str| -> Arc<dyn TurnExecutor> {
+        Arc::new(PoolTurnExecutor {
+            tier,
+            provider: provider.clone(),
+            model_id: model_id.to_owned(),
+            base_url: base_url.to_string(),
+            api_key: api_key.map(str::to_owned),
+            pool: Arc::clone(pool),
+        })
+    };
+    (
+        tier("fast", &config.fast_provider, &config.fast_model_id),
+        tier("slow", &config.slow_provider, &config.slow_model_id),
+    )
 }
 
 /// Lazily-resolved wrapper around a spawned tier turn.
@@ -620,20 +616,7 @@ impl ModelOrchestrator {
     /// [`Self::with_endpoint`].
     pub fn new(config: SwappableModelPair, pool: Arc<ClientPool>) -> Self {
         let (fast, slow) = pool_executors(&config, &pool, "", None);
-        Self {
-            config,
-            client_pool: pool,
-            evaluator: ComplexityEvaluator::default(),
-            validator: Arc::new(JsonToolDraftValidator),
-            fast_executor: fast,
-            slow_executor: slow,
-            base_url: String::new(),
-            api_key: None,
-            #[cfg(feature = "plugin-session-log")]
-            session_store: None,
-            #[cfg(feature = "plugin-session-log")]
-            session_id: None,
-        }
+        Self::with_executors(config, pool, fast, slow)
     }
 
     /// Build an orchestrator with injected tier executors (test seam).
@@ -733,14 +716,13 @@ impl ModelOrchestrator {
         // the original request stays the fast tier's input.
         let working_request = request.clone();
         let fast_stream = self.fast_executor.execute(request)?;
-        let started = Instant::now();
         Ok(Box::pin(OrchestratorStream {
-            state: OrchestratorState::Drafting {
+            turn: Some(ActiveTurn {
                 inner: fast_stream,
-                started,
+                draft_started: Some(Instant::now()),
                 working_request,
                 fallback_attempts_left: FALLBACK_ATTEMPTS,
-            },
+            }),
             config: self.config.clone(),
             validator: Arc::clone(&self.validator),
             slow_executor: Arc::clone(&self.slow_executor),
@@ -757,23 +739,15 @@ impl ModelOrchestrator {
 // the request.
 const FALLBACK_ATTEMPTS: u32 = 2;
 
-/// State of the [`OrchestratorStream`] state machine.
-enum OrchestratorState {
-    /// The fast tier is still producing the speculative draft.
-    Drafting {
-        inner: AgentResponseStream,
-        started: Instant,
-        working_request: UnifiedRequest,
-        fallback_attempts_left: u32,
-    },
-    /// A fallback or latency swap is serving from the slow tier.
-    Slow {
-        inner: AgentResponseStream,
-        working_request: UnifiedRequest,
-        fallback_attempts_left: u32,
-    },
-    /// The stream has ended (clean finish, or after surfacing an error).
-    Done,
+/// The tier currently serving a turn: the fast tier drafting, or (after a
+/// fallback or latency swap) the slow tier.
+struct ActiveTurn {
+    inner: AgentResponseStream,
+    /// When the fast tier began drafting; `None` once the slow tier serves,
+    /// which is also what turns the latency guard off.
+    draft_started: Option<Instant>,
+    working_request: UnifiedRequest,
+    fallback_attempts_left: u32,
 }
 
 /// Stream wrapper implementing the draft-validation and fallback logic.
@@ -781,7 +755,9 @@ enum OrchestratorState {
 /// See the module docs for the pipeline stages, the latency swap boundary, and
 /// the fallback cascade bounds.
 struct OrchestratorStream {
-    state: OrchestratorState,
+    /// `None` once the stream has ended (clean finish, or after surfacing an
+    /// error).
+    turn: Option<ActiveTurn>,
     config: SwappableModelPair,
     validator: Arc<dyn DraftValidator>,
     slow_executor: Arc<dyn TurnExecutor>,
@@ -823,157 +799,77 @@ impl Stream for OrchestratorStream {
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         loop {
-            // Take the state out so a transition can move its fields into a
-            // new state without fighting the borrow checker; `Done` is the
-            // placeholder while the new state is being computed.
-            let state = std::mem::replace(&mut this.state, OrchestratorState::Done);
-            match state {
-                OrchestratorState::Done => return Poll::Ready(None),
-                OrchestratorState::Drafting {
-                    mut inner,
-                    started,
-                    mut working_request,
-                    mut fallback_attempts_left,
-                } => match inner.as_mut().poll_next(cx) {
-                    Poll::Pending => {
-                        // Latency guard: the fast tier is quiet. Once the
-                        // threshold is exceeded the swap happens at this
-                        // natural poll boundary; blocks already yielded stay
-                        // delivered.
-                        if started.elapsed().as_millis() as u64 > this.config.latency_threshold_ms {
-                            this.record_swap("latency_threshold");
-                            match this.slow_executor.execute(working_request.clone()) {
+            // Take the turn out so a transition can move its fields without
+            // fighting the borrow checker; `None` is the placeholder while
+            // the next turn is being computed.
+            let Some(mut turn) = this.turn.take() else {
+                return Poll::Ready(None);
+            };
+            match turn.inner.as_mut().poll_next(cx) {
+                Poll::Pending => {
+                    // Latency guard: the fast tier is quiet. Once the
+                    // threshold is exceeded the swap happens at this
+                    // natural poll boundary; blocks already yielded stay
+                    // delivered.
+                    if let Some(started) = turn.draft_started
+                        && started.elapsed().as_millis() as u64 > this.config.latency_threshold_ms
+                    {
+                        this.record_swap("latency_threshold");
+                        match this.slow_executor.execute(turn.working_request.clone()) {
+                            Ok(slow) => {
+                                turn.inner = slow;
+                                turn.draft_started = None;
+                                this.turn = Some(turn);
+                                continue;
+                            }
+                            Err(e) => return Poll::Ready(Some(Err(e))),
+                        }
+                    }
+                    this.turn = Some(turn);
+                    return Poll::Pending;
+                }
+                Poll::Ready(Some(Ok(block))) => match this.validator.validate(&block) {
+                    Ok(()) => {
+                        this.turn = Some(turn);
+                        return Poll::Ready(Some(Ok(block)));
+                    }
+                    Err(reason) => {
+                        if turn.fallback_attempts_left > 0 && this.config.fallback_on_tool_error {
+                            turn.working_request
+                                .messages
+                                .push(rejection_message(&block, &reason));
+                            this.record_swap("fallback_validation");
+                            turn.fallback_attempts_left -= 1;
+                            match this.slow_executor.execute(turn.working_request.clone()) {
                                 Ok(slow) => {
-                                    this.state = OrchestratorState::Slow {
-                                        inner: slow,
-                                        working_request,
-                                        fallback_attempts_left,
-                                    };
+                                    turn.inner = slow;
+                                    turn.draft_started = None;
+                                    this.turn = Some(turn);
                                     continue;
                                 }
                                 Err(e) => return Poll::Ready(Some(Err(e))),
                             }
                         }
-                        this.state = OrchestratorState::Drafting {
-                            inner,
-                            started,
-                            working_request,
-                            fallback_attempts_left,
+                        // No fallback configured, or the cascade budget is
+                        // exhausted: surface the last rejection as a
+                        // provider error.
+                        let provider = if turn.draft_started.is_some() {
+                            &this.config.fast_provider
+                        } else {
+                            &this.config.slow_provider
                         };
-                        return Poll::Pending;
+                        return Poll::Ready(Some(Err(CucaError::Provider {
+                            provider: provider.clone(),
+                            message: reason,
+                        })));
                     }
-                    Poll::Ready(Some(Ok(block))) => {
-                        match this.validator.validate(&block) {
-                            Ok(()) => {
-                                this.state = OrchestratorState::Drafting {
-                                    inner,
-                                    started,
-                                    working_request,
-                                    fallback_attempts_left,
-                                };
-                                return Poll::Ready(Some(Ok(block)));
-                            }
-                            Err(reason) => {
-                                if fallback_attempts_left > 0 && this.config.fallback_on_tool_error
-                                {
-                                    working_request
-                                        .messages
-                                        .push(rejection_message(&block, &reason));
-                                    this.record_swap("fallback_validation");
-                                    fallback_attempts_left -= 1;
-                                    match this.slow_executor.execute(working_request.clone()) {
-                                        Ok(slow) => {
-                                            this.state = OrchestratorState::Slow {
-                                                inner: slow,
-                                                working_request,
-                                                fallback_attempts_left,
-                                            };
-                                            continue;
-                                        }
-                                        Err(e) => return Poll::Ready(Some(Err(e))),
-                                    }
-                                } else {
-                                    // No fallback configured, or the cascade
-                                    // budget is exhausted: surface the last
-                                    // rejection as a provider error.
-                                    return Poll::Ready(Some(Err(CucaError::Provider {
-                                        provider: this.config.fast_provider.clone(),
-                                        message: reason,
-                                    })));
-                                }
-                            }
-                        }
-                    }
-                    Poll::Ready(Some(Err(e))) => {
-                        this.state = OrchestratorState::Drafting {
-                            inner,
-                            started,
-                            working_request,
-                            fallback_attempts_left,
-                        };
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    // The fast tier finished cleanly: nothing left to do.
-                    Poll::Ready(None) => return Poll::Ready(None),
                 },
-                OrchestratorState::Slow {
-                    mut inner,
-                    mut working_request,
-                    mut fallback_attempts_left,
-                } => match inner.as_mut().poll_next(cx) {
-                    Poll::Pending => {
-                        this.state = OrchestratorState::Slow {
-                            inner,
-                            working_request,
-                            fallback_attempts_left,
-                        };
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Some(Ok(block))) => match this.validator.validate(&block) {
-                        Ok(()) => {
-                            this.state = OrchestratorState::Slow {
-                                inner,
-                                working_request,
-                                fallback_attempts_left,
-                            };
-                            return Poll::Ready(Some(Ok(block)));
-                        }
-                        Err(reason) => {
-                            if fallback_attempts_left > 0 && this.config.fallback_on_tool_error {
-                                working_request
-                                    .messages
-                                    .push(rejection_message(&block, &reason));
-                                this.record_swap("fallback_validation");
-                                fallback_attempts_left -= 1;
-                                match this.slow_executor.execute(working_request.clone()) {
-                                    Ok(slow) => {
-                                        this.state = OrchestratorState::Slow {
-                                            inner: slow,
-                                            working_request,
-                                            fallback_attempts_left,
-                                        };
-                                        continue;
-                                    }
-                                    Err(e) => return Poll::Ready(Some(Err(e))),
-                                }
-                            } else {
-                                return Poll::Ready(Some(Err(CucaError::Provider {
-                                    provider: this.config.slow_provider.clone(),
-                                    message: reason,
-                                })));
-                            }
-                        }
-                    },
-                    Poll::Ready(Some(Err(e))) => {
-                        this.state = OrchestratorState::Slow {
-                            inner,
-                            working_request,
-                            fallback_attempts_left,
-                        };
-                        return Poll::Ready(Some(Err(e)));
-                    }
-                    Poll::Ready(None) => return Poll::Ready(None),
-                },
+                Poll::Ready(Some(Err(e))) => {
+                    this.turn = Some(turn);
+                    return Poll::Ready(Some(Err(e)));
+                }
+                // The serving tier finished cleanly: nothing left to do.
+                Poll::Ready(None) => return Poll::Ready(None),
             }
         }
     }
