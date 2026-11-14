@@ -5,7 +5,7 @@
 //! as `choices[0].delta.{content,reasoning_content,tool_calls}` and terminated
 //! by `data: [DONE]`. They differ only in default base URL and in whether an
 //! API key is sent, so one adapter serves all of them; each provider adds a
-//! thin `dispatch_*` method that builds an [`OpenAiCompatConfig`].
+//! thin `dispatch_*` method that calls [`openai_compat_stream`].
 //!
 //! # Tool-call accumulation design
 //!
@@ -44,31 +44,13 @@
 ))]
 
 use std::collections::{HashMap, VecDeque, hash_map::Entry};
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use bytes::Bytes;
-use tokio_stream::Stream;
 
 use crate::client::{ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
 use crate::request::{ThinkingEffort, ThinkingParams, TokenUsage, UnifiedRequest};
 use crate::sse::SseStreamParser;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint, UnifiedMessage};
-
-/// Configuration for one OpenAI-compatible endpoint.
-///
-/// The union of what every compatible provider needs; the per-provider
-/// defaults (base URL, key presence) are chosen by each `dispatch_*` method.
-pub struct OpenAiCompatConfig {
-    /// Base URL including the API-version suffix, e.g. `https://api.openai.com/v1`.
-    pub base_url: String,
-    /// Optional bearer token; the `Authorization: Bearer` header is only sent
-    /// when this is `Some` (local servers like LM Studio need none).
-    pub api_key: Option<String>,
-    /// The upstream model identifier.
-    pub model: String,
-}
 
 /// Build the `/chat/completions` request body for a [`UnifiedRequest`].
 ///
@@ -654,17 +636,13 @@ pub fn translate_sse(
 /// responses surface as [`CucaError::Http`] with the captured body.
 pub async fn openai_compat_stream(
     http: &reqwest::Client,
-    config: &OpenAiCompatConfig,
+    base_url: &str,
+    api_key: Option<&str>,
     req: UnifiedRequest,
 ) -> Result<ProviderDispatch, CucaError> {
-    let url = format!("{}/chat/completions", config.base_url.trim_end_matches('/'));
-    // The config carries the effective model: each dispatch fills it from the
-    // request (or a provider default), and the body is built from that single
-    // source of truth.
-    let mut req = req;
-    req.model = config.model.clone();
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
     let mut request = http.post(&url).json(&build_chat_completion_body(&req)?);
-    if let Some(api_key) = &config.api_key {
+    if let Some(api_key) = api_key {
         request = request.bearer_auth(api_key);
     }
     let response = request.send().await?;
@@ -678,90 +656,53 @@ pub async fn openai_compat_stream(
     }
     let metadata = ResponseMetadataHandle::empty();
     Ok(ProviderDispatch {
-        stream: Box::pin(OpenAiCompatStream {
-            inner: Box::pin(response.bytes_stream()),
-            parser: SseStreamParser::new(),
-            translator: ChatCompletionTranslator::new(),
-            buffer: VecDeque::new(),
-            ended: false,
-            metadata: metadata.clone(),
-        }),
+        stream: Box::pin(SseBlockStream::new(
+            response.bytes_stream(),
+            OpenAiCompatChunks {
+                parser: SseStreamParser::new(),
+                translator: ChatCompletionTranslator::new(),
+                metadata: metadata.clone(),
+            },
+        )),
         metadata,
     })
 }
 
-/// Stream adapter: reqwest byte stream -> SSE parser -> block translator.
-///
-/// Yields at most one block per poll; `data: [DONE]` (or the byte stream
+/// The OpenAI-compatible chunk translator: `data: [DONE]` (or the byte stream
 /// ending) terminates the stream after any tool calls flushed into the
 /// translator's pending queue are emitted.
-struct OpenAiCompatStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+struct OpenAiCompatChunks {
     parser: SseStreamParser,
     translator: ChatCompletionTranslator,
-    /// Blocks awaiting emission within the current chunk.
-    buffer: VecDeque<MessageContentBlock>,
-    /// True once `[DONE]` was seen or the byte stream ended; the stream then
-    /// emits only what is left in `buffer`/`pending`.
-    ended: bool,
     /// Publishes the reported token usage to the dispatch caller.
     metadata: ResponseMetadataHandle,
 }
 
-impl Stream for OpenAiCompatStream {
-    type Item = Result<MessageContentBlock, CucaError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        loop {
-            if let Some(block) = this.buffer.pop_front() {
-                return Poll::Ready(Some(Ok(block)));
-            }
-            if this.ended {
-                return Poll::Ready(None);
-            }
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    match translate_sse(&mut this.parser, &mut this.translator, &bytes) {
-                        Ok(blocks) => {
-                            for block in blocks.into_iter().flatten() {
-                                this.buffer.push_back(block);
-                            }
-                            // A `usage` frame becomes response metadata,
-                            // never a content block.
-                            if let Some(usage) = this.translator.take_usage() {
-                                this.metadata.set_token_usage(usage);
-                            }
-                            if this.translator.done {
-                                // [DONE] ended the frame stream; emit any tool
-                                // calls it flushed into pending, then stop.
-                                this.ended = true;
-                                this.buffer.extend(this.translator.pending.drain(..));
-                            }
-                        }
-                        Err(e) => {
-                            // A malformed frame poisons the stream: report it
-                            // once and stop reading further chunks.
-                            this.ended = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    this.ended = true;
-                    return Poll::Ready(Some(Err(CucaError::Transport {
-                        message: e.to_string(),
-                    })));
-                }
-                Poll::Ready(None) => {
-                    // Byte stream ended without [DONE]: emit whatever was
-                    // flushed (e.g. by finish_reason), then end.
-                    this.ended = true;
-                    this.buffer.extend(this.translator.pending.drain(..));
-                }
-                Poll::Pending => return Poll::Pending,
-            }
+impl ChunkTranslator for OpenAiCompatChunks {
+    fn chunk(
+        &mut self,
+        bytes: &[u8],
+        out: &mut VecDeque<MessageContentBlock>,
+    ) -> Result<bool, CucaError> {
+        out.extend(
+            translate_sse(&mut self.parser, &mut self.translator, bytes)?
+                .into_iter()
+                .flatten(),
+        );
+        // A `usage` frame becomes response metadata, never a content block.
+        if let Some(usage) = self.translator.take_usage() {
+            self.metadata.set_token_usage(usage);
         }
+        if self.translator.done {
+            // [DONE] ended the frame stream; emit any tool calls it flushed
+            // into pending, then stop.
+            self.finish(out);
+        }
+        Ok(self.translator.done)
+    }
+
+    fn finish(&mut self, out: &mut VecDeque<MessageContentBlock>) {
+        out.extend(self.translator.pending.drain(..));
     }
 }
 

@@ -19,6 +19,7 @@ use super::diagnosis::{Thresholds, UpstreamSignal, diagnose, relabel};
 use super::routing::{Policy, load_score};
 use super::state::BalancerState;
 use super::upstream::UpstreamModel;
+use crate::server::collector::ratio;
 use crate::server::stats::{
     KvStats, ModelMemory, ModelState, ModelStats, NodeInfo, NodeRole, RequestStats, StatsSnapshot,
     TokensPerSecond, UpstreamStats,
@@ -34,14 +35,6 @@ pub struct UpstreamInput {
     pub models: Vec<UpstreamModel>,
     /// Its latest stats snapshot, when fresh.
     pub snapshot: Option<Arc<StatsSnapshot>>,
-}
-
-fn ratio(numerator: f64, denominator: f64) -> f64 {
-    if denominator > 0.0 {
-        numerator / denominator
-    } else {
-        0.0
-    }
 }
 
 /// The models of all upstreams as one list, sorted by name. A model served

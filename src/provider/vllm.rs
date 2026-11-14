@@ -11,23 +11,8 @@
 
 use crate::client::{CucaClient, ProviderDispatch};
 use crate::error::CucaError;
-use crate::provider::openai_compat::{OpenAiCompatConfig, openai_compat_stream};
+use crate::provider::openai_compat::openai_compat_stream;
 use crate::request::UnifiedRequest;
-
-/// Resolve the effective base URL for a vLLM dispatch.
-///
-/// An empty builder `base_url` falls back to vLLM's default
-/// (`http://127.0.0.1:8000/v1`); any configured value passes through
-/// unchanged. The default carries the `/v1` suffix because
-/// [`openai_compat_stream`] appends `/chat/completions` to the base URL, so
-/// the full request path becomes `/v1/chat/completions`.
-pub(crate) fn resolve_base_url(client_base: &str) -> String {
-    if client_base.is_empty() {
-        "http://127.0.0.1:8000/v1".into()
-    } else {
-        client_base.to_string()
-    }
-}
 
 #[cfg(feature = "provider-vllm")]
 impl CucaClient {
@@ -41,39 +26,24 @@ impl CucaClient {
         &self,
         req: UnifiedRequest,
     ) -> Result<ProviderDispatch, CucaError> {
-        let cfg = OpenAiCompatConfig {
-            base_url: resolve_base_url(self.base_url()),
-            api_key: self.api_key().map(str::to_string),
-            model: req.model.clone(),
-        };
-        openai_compat_stream(self.http_client(), &cfg, req).await
+        openai_compat_stream(
+            self.http_client(),
+            self.base_url_or("http://127.0.0.1:8000/v1"),
+            self.api_key(),
+            req,
+        )
+        .await
     }
 }
 
 #[cfg(all(test, feature = "provider-vllm"))]
 mod tests {
-    use super::resolve_base_url;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::StreamExt;
 
     use crate::provider::openai_compat::{ChatCompletionTranslator, translate_sse};
     use crate::sse::SseStreamParser;
     use crate::types::{MessageContentBlock, ProviderEndpoint};
-
-    /// Empty builder base URL resolves to the vLLM default.
-    #[test]
-    fn empty_base_resolves_to_vllm_default() {
-        assert_eq!(resolve_base_url(""), "http://127.0.0.1:8000/v1");
-    }
-
-    /// A configured base URL is respected verbatim (override wins).
-    #[test]
-    fn configured_base_is_respected() {
-        assert_eq!(
-            resolve_base_url("http://127.0.0.1:9999/v1"),
-            "http://127.0.0.1:9999/v1"
-        );
-    }
 
     /// Reuse proof: `translate_sse` over vLLM-shaped `data:` frames yields
     /// `Text`/`ToolCall` blocks through the shared adapter.

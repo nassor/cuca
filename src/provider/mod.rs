@@ -59,6 +59,18 @@ pub(crate) mod llamacpp;
 #[cfg(feature = "provider-local")]
 pub(crate) mod local;
 
+/// The byte-stream-to-blocks adapter every HTTP provider's stream is built on.
+#[cfg(any(
+    feature = "provider-openai",
+    feature = "provider-anthropic",
+    feature = "provider-vllm",
+    feature = "provider-lmstudio",
+    feature = "provider-deepseek",
+    feature = "provider-gemini",
+    feature = "provider-llamacpp",
+))]
+pub(crate) mod sse_stream;
+
 /// Wire key names for the per-request sampling fields of one adapter.
 #[cfg(any(
     feature = "provider-openai",
@@ -106,5 +118,46 @@ pub(crate) fn insert_sampling(
     if !req.stop.is_empty() {
         let stop = req.stop.iter().cloned().map(Value::String).collect();
         body.insert(keys.stop.to_string(), Value::Array(stop));
+    }
+}
+
+/// The client's base URL, or `default` when the builder set none.
+#[cfg(any(
+    feature = "provider-openai",
+    feature = "provider-anthropic",
+    feature = "provider-vllm",
+    feature = "provider-lmstudio",
+    feature = "provider-deepseek",
+    feature = "provider-gemini",
+))]
+impl crate::client::CucaClient {
+    pub(crate) fn base_url_or<'a>(&'a self, default: &'a str) -> &'a str {
+        if self.base_url().is_empty() {
+            default
+        } else {
+            self.base_url()
+        }
+    }
+}
+
+#[cfg(all(test, feature = "provider-openai"))]
+mod tests {
+    use crate::client::CucaClient;
+    use crate::types::ProviderEndpoint;
+
+    #[test]
+    fn base_url_or_falls_back_only_when_unset() {
+        let client = |url: &str| {
+            CucaClient::builder()
+                .with_provider(ProviderEndpoint::OpenAi)
+                .with_base_url(url)
+                .build()
+                .unwrap()
+        };
+        assert_eq!(client("").base_url_or("http://d/v1"), "http://d/v1");
+        assert_eq!(
+            client("http://x/v1").base_url_or("http://d/v1"),
+            "http://x/v1"
+        );
     }
 }

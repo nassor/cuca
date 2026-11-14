@@ -19,7 +19,7 @@
 use crate::client::{CucaClient, ProviderDispatch};
 use crate::error::CucaError;
 use crate::provider::anthropic::{AnthropicAuth, anthropic_stream, build_anthropic_request};
-use crate::provider::openai_compat::{OpenAiCompatConfig, openai_compat_stream};
+use crate::provider::openai_compat::openai_compat_stream;
 use crate::request::{PromptCacheDirective, UnifiedRequest};
 
 /// Map a Claude-style model id to its DeepSeek counterpart for the bridge.
@@ -91,13 +91,9 @@ impl CucaClient {
         &self,
         req: UnifiedRequest,
     ) -> Result<ProviderDispatch, CucaError> {
-        let base = if self.base_url().is_empty() {
-            "https://api.deepseek.com/v1".to_string()
-        } else {
-            self.base_url().to_string()
-        };
+        let base = self.base_url_or("https://api.deepseek.com/v1");
 
-        if is_anthropic_bridge(&base) {
+        if is_anthropic_bridge(base) {
             let key = self
                 .api_key()
                 .ok_or_else(|| {
@@ -107,18 +103,9 @@ impl CucaClient {
             let auth = AnthropicAuth::ApiKey(key);
             // The bridge URL is used as-is: no `/v1` suffix logic.
             let bridged = bridge_unified_request(req);
-            anthropic_stream(self.http_client(), &base, &auth, bridged).await
+            anthropic_stream(self.http_client(), base, &auth, bridged).await
         } else {
-            openai_compat_stream(
-                self.http_client(),
-                &OpenAiCompatConfig {
-                    base_url: base,
-                    api_key: self.api_key().map(str::to_string),
-                    model: req.model.clone(),
-                },
-                req,
-            )
-            .await
+            openai_compat_stream(self.http_client(), base, self.api_key(), req).await
         }
     }
 }

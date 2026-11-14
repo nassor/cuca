@@ -30,14 +30,10 @@
 //! `x-goog-api-key` header (OAuth for GCP service accounts is not implemented).
 
 use std::collections::VecDeque;
-use std::pin::Pin;
-use std::task::{Context, Poll};
-
-use bytes::Bytes;
-use tokio_stream::Stream;
 
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
 use crate::request::{ThinkingEffort, ThinkingParams, UnifiedRequest};
 use crate::sse::SseStreamParser;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint};
@@ -383,70 +379,31 @@ pub async fn gemini_stream(
         });
     }
     Ok(ProviderDispatch {
-        stream: Box::pin(GeminiStream {
-            inner: Box::pin(response.bytes_stream()),
-            parser: SseStreamParser::new(),
-            translator: GeminiTranslator,
-            buffer: VecDeque::new(),
-            ended: false,
-        }),
+        stream: Box::pin(SseBlockStream::new(
+            response.bytes_stream(),
+            GeminiChunks {
+                parser: SseStreamParser::new(),
+                translator: GeminiTranslator,
+            },
+        )),
         metadata: ResponseMetadataHandle::empty(),
     })
 }
 
-/// Stream adapter: reqwest byte stream -> SSE parser -> block translator.
-///
-/// Yields at most one block per poll; the byte stream ending terminates the
-/// stream once the current chunk's blocks are drained.
-struct GeminiStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+/// The Gemini chunk translator: the byte stream ending terminates the stream.
+struct GeminiChunks {
     parser: SseStreamParser,
     translator: GeminiTranslator,
-    /// Blocks awaiting emission within the current chunk.
-    buffer: VecDeque<MessageContentBlock>,
-    /// True once the byte stream ended; the stream then emits nothing more.
-    ended: bool,
 }
 
-impl Stream for GeminiStream {
-    type Item = Result<MessageContentBlock, CucaError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        loop {
-            if let Some(block) = this.buffer.pop_front() {
-                return Poll::Ready(Some(Ok(block)));
-            }
-            if this.ended {
-                return Poll::Ready(None);
-            }
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    match translate_sse(&mut this.parser, &this.translator, &bytes) {
-                        Ok(blocks) => {
-                            this.buffer.extend(blocks);
-                        }
-                        Err(e) => {
-                            // A malformed frame poisons the stream: report it
-                            // once and stop reading further chunks.
-                            this.ended = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    this.ended = true;
-                    return Poll::Ready(Some(Err(CucaError::Transport {
-                        message: e.to_string(),
-                    })));
-                }
-                Poll::Ready(None) => {
-                    this.ended = true;
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+impl ChunkTranslator for GeminiChunks {
+    fn chunk(
+        &mut self,
+        bytes: &[u8],
+        out: &mut VecDeque<MessageContentBlock>,
+    ) -> Result<bool, CucaError> {
+        out.extend(translate_sse(&mut self.parser, &self.translator, bytes)?);
+        Ok(false)
     }
 }
 
@@ -465,11 +422,7 @@ impl CucaClient {
         let api_key = self
             .api_key()
             .ok_or_else(|| CucaError::Config("gemini requires an api key".into()))?;
-        let base_url = if self.base_url().is_empty() {
-            "https://generativelanguage.googleapis.com"
-        } else {
-            self.base_url()
-        };
+        let base_url = self.base_url_or("https://generativelanguage.googleapis.com");
         gemini_stream(self.http_client(), base_url, api_key, req).await
     }
 }

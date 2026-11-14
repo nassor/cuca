@@ -15,16 +15,13 @@
 //! route.
 
 use std::collections::VecDeque;
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
-use bytes::Bytes;
 use serde_json::json;
-use tokio_stream::Stream;
 
 use crate::client::{CucaClient, ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
-use crate::provider::openai_compat::{OpenAiCompatConfig, openai_compat_stream};
+use crate::provider::openai_compat::openai_compat_stream;
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
 use crate::request::UnifiedRequest;
 use crate::sse::SseStreamParser;
 use crate::types::{MessageContentBlock, MessageRole, ProviderEndpoint};
@@ -279,74 +276,37 @@ pub async fn llamacpp_completion_stream(
         });
     }
     Ok(ProviderDispatch {
-        stream: Box::pin(CompletionStream {
-            inner: Box::pin(response.bytes_stream()),
-            parser: SseStreamParser::new(),
-            translator: CompletionTranslator,
-            buffer: VecDeque::new(),
-            ended: false,
-        }),
+        stream: Box::pin(SseBlockStream::new(
+            response.bytes_stream(),
+            CompletionChunks {
+                parser: SseStreamParser::new(),
+                translator: CompletionTranslator,
+            },
+        )),
         metadata: ResponseMetadataHandle::empty(),
     })
 }
 
-/// Stream adapter for the native route: reqwest byte stream -> SSE parser ->
-/// [`CompletionTranslator`].
-///
-/// Yields at most one block per poll; the stream ends when the byte stream
-/// ends. llama.cpp's final `{"content": "", "stop": true}` frames translate to
-/// `None` and are skipped, so the stream ends naturally right after them.
-struct CompletionStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+/// The native-route chunk translator: [`CompletionTranslator`] over each
+/// chunk. llama.cpp's final `{"content": "", "stop": true}` frames translate
+/// to `None` and are skipped, so the stream ends naturally right after them.
+struct CompletionChunks {
     parser: SseStreamParser,
     translator: CompletionTranslator,
-    /// Blocks awaiting emission within the current chunk.
-    buffer: VecDeque<MessageContentBlock>,
-    /// True once the byte stream ended; only `buffer` leftovers are emitted.
-    ended: bool,
 }
 
-impl Stream for CompletionStream {
-    type Item = Result<MessageContentBlock, CucaError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        loop {
-            if let Some(block) = this.buffer.pop_front() {
-                return Poll::Ready(Some(Ok(block)));
-            }
-            if this.ended {
-                return Poll::Ready(None);
-            }
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    match translate_sse(&mut this.parser, &this.translator, &bytes) {
-                        Ok(blocks) => {
-                            for block in blocks.into_iter().flatten() {
-                                this.buffer.push_back(block);
-                            }
-                        }
-                        Err(e) => {
-                            // A malformed frame poisons the stream: report it
-                            // once and stop reading further chunks.
-                            this.ended = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    this.ended = true;
-                    return Poll::Ready(Some(Err(CucaError::Transport {
-                        message: e.to_string(),
-                    })));
-                }
-                Poll::Ready(None) => {
-                    this.ended = true;
-                    return Poll::Ready(None);
-                }
-                Poll::Pending => return Poll::Pending,
-            }
-        }
+impl ChunkTranslator for CompletionChunks {
+    fn chunk(
+        &mut self,
+        bytes: &[u8],
+        out: &mut VecDeque<MessageContentBlock>,
+    ) -> Result<bool, CucaError> {
+        out.extend(
+            translate_sse(&mut self.parser, &self.translator, bytes)?
+                .into_iter()
+                .flatten(),
+        );
+        Ok(false)
     }
 }
 
@@ -392,12 +352,9 @@ impl CucaClient {
                 } else {
                     format!("{base}/v1")
                 };
-                let config = OpenAiCompatConfig {
-                    base_url: base,
-                    api_key,
-                    model: cfg.model,
-                };
-                openai_compat_stream(self.http_client(), &config, req).await
+                let mut req = req;
+                req.model = cfg.model;
+                openai_compat_stream(self.http_client(), &base, api_key.as_deref(), req).await
             }
             LlamaRoute::Completion => {
                 llamacpp_completion_stream(self.http_client(), &base, api_key.as_deref(), req, &cfg)

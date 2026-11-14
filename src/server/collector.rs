@@ -153,7 +153,7 @@ struct Rates {
     tier: Option<(f64, f64, Option<f64>)>,
 }
 
-fn ratio(numerator: f64, denominator: f64) -> f64 {
+pub(crate) fn ratio(numerator: f64, denominator: f64) -> f64 {
     if denominator > 0.0 {
         numerator / denominator
     } else {

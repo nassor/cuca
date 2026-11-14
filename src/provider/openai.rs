@@ -7,7 +7,7 @@
 
 use crate::client::{CucaClient, ProviderDispatch};
 use crate::error::CucaError;
-use crate::provider::openai_compat::{OpenAiCompatConfig, openai_compat_stream};
+use crate::provider::openai_compat::openai_compat_stream;
 use crate::request::UnifiedRequest;
 
 #[cfg(feature = "provider-openai")]
@@ -21,16 +21,13 @@ impl CucaClient {
         &self,
         req: UnifiedRequest,
     ) -> Result<ProviderDispatch, CucaError> {
-        let cfg = OpenAiCompatConfig {
-            base_url: if self.base_url().is_empty() {
-                "https://api.openai.com/v1".into()
-            } else {
-                self.base_url().to_string()
-            },
-            api_key: self.api_key().map(str::to_string),
-            model: req.model.clone(),
-        };
-        openai_compat_stream(self.http_client(), &cfg, req).await
+        openai_compat_stream(
+            self.http_client(),
+            self.base_url_or("https://api.openai.com/v1"),
+            self.api_key(),
+            req,
+        )
+        .await
     }
 }
 

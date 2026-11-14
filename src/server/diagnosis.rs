@@ -162,7 +162,7 @@ pub fn diagnose(
     out
 }
 
-fn entry(
+pub(crate) fn entry(
     severity: Severity,
     cause: Cause,
     model: Option<&str>,

@@ -5,8 +5,6 @@
 //! evidence. The balancer's snapshot lists these first, then each upstream's
 //! own diagnoses re-labelled with the upstream ([`relabel`]).
 
-use std::collections::BTreeMap;
-
 use crate::server::stats::{Cause, Diagnosis, Severity};
 
 /// What the rules know about one upstream.
@@ -58,10 +56,6 @@ impl Default for Thresholds {
     }
 }
 
-fn round(v: f64) -> f64 {
-    (v * 1000.0).round() / 1000.0
-}
-
 fn entry(
     severity: Severity,
     cause: Cause,
@@ -70,15 +64,8 @@ fn entry(
     evidence: &[(&str, f64)],
 ) -> Diagnosis {
     Diagnosis {
-        severity,
-        cause,
-        model: None,
         upstream: upstream.map(str::to_string),
-        message,
-        evidence: evidence
-            .iter()
-            .map(|&(k, v)| (k.to_string(), round(v)))
-            .collect::<BTreeMap<_, _>>(),
+        ..crate::server::diagnosis::entry(severity, cause, None, message, evidence)
     }
 }
 

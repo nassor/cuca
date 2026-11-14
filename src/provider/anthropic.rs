@@ -21,25 +21,22 @@
 #![cfg(any(feature = "provider-anthropic", feature = "provider-deepseek",))]
 
 use std::collections::{HashSet, VecDeque};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 
 #[cfg(feature = "provider-anthropic")]
 use base64::Engine;
 #[cfg(feature = "provider-anthropic")]
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use bytes::Bytes;
 #[cfg(feature = "provider-anthropic")]
 use getrandom::fill;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 #[cfg(feature = "provider-anthropic")]
 use sha2::{Digest, Sha256};
-use tokio_stream::Stream;
 
 #[cfg(feature = "provider-anthropic")]
 use crate::client::CucaClient;
 use crate::client::{ProviderDispatch, ResponseMetadataHandle};
 use crate::error::CucaError;
+use crate::provider::sse_stream::{ChunkTranslator, SseBlockStream};
 use crate::request::{
     PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage, ThinkingEffort, ThinkingParams,
     UnifiedRequest,
@@ -931,86 +928,43 @@ pub async fn anthropic_stream(
     }
     let metadata = ResponseMetadataHandle::empty();
     Ok(ProviderDispatch {
-        stream: Box::pin(AnthropicStream {
-            inner: Box::pin(response.bytes_stream()),
-            parser: SseStreamParser::new(),
-            translator: AnthropicTranslator::new(),
-            buffer: VecDeque::new(),
-            ended: false,
-            metadata: metadata.clone(),
-        }),
+        stream: Box::pin(SseBlockStream::new(
+            response.bytes_stream(),
+            AnthropicChunks {
+                parser: SseStreamParser::new(),
+                translator: AnthropicTranslator::new(),
+                metadata: metadata.clone(),
+            },
+        )),
         metadata,
     })
 }
 
-/// Stream adapter: reqwest byte stream -> SSE parser -> block translator.
-///
-/// Yields at most one block per poll; `message_stop` (or the byte stream
-/// ending) terminates the stream once the current chunk's blocks are drained.
-struct AnthropicStream {
-    inner: Pin<Box<dyn Stream<Item = Result<Bytes, reqwest::Error>> + Send>>,
+/// The Anthropic chunk translator: `message_stop` (or the byte stream ending)
+/// terminates the stream once the current chunk's blocks are drained.
+struct AnthropicChunks {
     parser: SseStreamParser,
     translator: AnthropicTranslator,
-    /// Blocks awaiting emission within the current chunk.
-    buffer: VecDeque<MessageContentBlock>,
-    /// True once `message_stop` was seen or the byte stream ended.
-    ended: bool,
     /// Publishes normalized prompt-cache usage to the dispatch caller.
     metadata: ResponseMetadataHandle,
 }
 
-impl Stream for AnthropicStream {
-    type Item = Result<MessageContentBlock, CucaError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        loop {
-            if let Some(block) = this.buffer.pop_front() {
-                return Poll::Ready(Some(Ok(block)));
-            }
-            if this.ended {
-                return Poll::Ready(None);
-            }
-            match this.inner.as_mut().poll_next(cx) {
-                Poll::Ready(Some(Ok(bytes))) => {
-                    match translate_sse(&mut this.parser, &mut this.translator, &bytes) {
-                        Ok(blocks) => {
-                            for block in blocks.into_iter().flatten() {
-                                this.buffer.push_back(block);
-                            }
-                            // `message_start` usage becomes response
-                            // metadata, never a content block.
-                            if let Some(usage) = this.translator.take_prompt_cache_usage() {
-                                this.metadata.set_prompt_cache_usage(usage);
-                            }
-                            if this.translator.done {
-                                // message_stop ended the frame stream; emit
-                                // what this chunk produced, then stop.
-                                this.ended = true;
-                            }
-                        }
-                        Err(e) => {
-                            // A malformed frame or provider error poisons the
-                            // stream: report it once and stop reading.
-                            this.ended = true;
-                            return Poll::Ready(Some(Err(e)));
-                        }
-                    }
-                }
-                Poll::Ready(Some(Err(e))) => {
-                    this.ended = true;
-                    return Poll::Ready(Some(Err(CucaError::Transport {
-                        message: e.to_string(),
-                    })));
-                }
-                Poll::Ready(None) => {
-                    // Byte stream ended without message_stop: emit whatever
-                    // the last chunk produced, then end.
-                    this.ended = true;
-                }
-                Poll::Pending => return Poll::Pending,
-            }
+impl ChunkTranslator for AnthropicChunks {
+    fn chunk(
+        &mut self,
+        bytes: &[u8],
+        out: &mut VecDeque<MessageContentBlock>,
+    ) -> Result<bool, CucaError> {
+        out.extend(
+            translate_sse(&mut self.parser, &mut self.translator, bytes)?
+                .into_iter()
+                .flatten(),
+        );
+        // `message_start` usage becomes response metadata, never a content block.
+        if let Some(usage) = self.translator.take_prompt_cache_usage() {
+            self.metadata.set_prompt_cache_usage(usage);
         }
+        Ok(self.translator.done)
     }
 }
 
@@ -1026,11 +980,7 @@ impl CucaClient {
         &self,
         req: UnifiedRequest,
     ) -> Result<ProviderDispatch, CucaError> {
-        let base = if self.base_url().is_empty() {
-            "https://api.anthropic.com/v1".to_string()
-        } else {
-            self.base_url().to_string()
-        };
+        let base = self.base_url_or("https://api.anthropic.com/v1");
         let auth = match (self.bearer_token(), self.api_key()) {
             (Some(token), _) => AnthropicAuth::Bearer(token.to_string()),
             (None, Some(key)) => AnthropicAuth::ApiKey(key.to_string()),
@@ -1040,7 +990,7 @@ impl CucaClient {
                 ));
             }
         };
-        anthropic_stream(self.http_client(), &base, &auth, req).await
+        anthropic_stream(self.http_client(), base, &auth, req).await
     }
 }
 
