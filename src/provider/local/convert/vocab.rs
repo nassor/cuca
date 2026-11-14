@@ -73,6 +73,13 @@ fn truthy(s: &Option<String>) -> bool {
     s.as_deref().is_some_and(|s| !s.is_empty())
 }
 
+/// Set `key` in the tokenizer config when there is one.
+fn set_token(cfg: &mut Option<Map<String, Json>>, key: &str, value: &str) {
+    if let Some(c) = cfg {
+        c.insert(key.into(), Json::String(value.into()));
+    }
+}
+
 /// The array under `key`, empty when absent or not an array.
 fn array<'a>(v: &'a Json, key: &str) -> &'a [Json] {
     v.get(key)
@@ -265,21 +272,11 @@ impl Special {
             let mut eos = get(&cfg, "eos_token");
             let sep = get(&cfg, "sep_token");
             if !truthy(&bos) && truthy(&cls) && cfg.is_some() {
-                if let Some(c) = cfg.as_mut() {
-                    c.insert(
-                        "bos_token".into(),
-                        Json::String(cls.clone().unwrap_or_default()),
-                    );
-                }
+                set_token(&mut cfg, "bos_token", cls.as_deref().unwrap_or_default());
                 bos = cls.clone();
             }
             if !truthy(&eos) && truthy(&sep) && cfg.is_some() {
-                if let Some(c) = cfg.as_mut() {
-                    c.insert(
-                        "eos_token".into(),
-                        Json::String(sep.clone().unwrap_or_default()),
-                    );
-                }
+                set_token(&mut cfg, "eos_token", sep.as_deref().unwrap_or_default());
                 eos = sep.clone();
             }
             if let Some(post) = tok
@@ -388,15 +385,11 @@ impl Special {
                     *bos = Some(f.clone());
                 } else if Some(f) != bos.as_ref() && Some(f) != cls.as_ref() {
                     if !truthy(bos) {
-                        if let Some(c) = cfg.as_mut() {
-                            c.insert("bos_token".into(), Json::String(f.clone()));
-                        }
+                        set_token(cfg, "bos_token", f);
                         *bos = Some(f.clone());
                     }
                     if !truthy(cls) {
-                        if let Some(c) = cfg.as_mut() {
-                            c.insert("cls_token".into(), Json::String(f.clone()));
-                        }
+                        set_token(cfg, "cls_token", f);
                         *cls = Some(f.clone());
                     }
                 }
@@ -410,24 +403,12 @@ impl Special {
                 } else if Some(l) != eos.as_ref() {
                     if !self.types.iter().any(|t| t == "eot") {
                         self.types.push("eot".into());
-                        if let Some(c) = cfg.as_mut() {
-                            c.insert(
-                                "eot_token".into(),
-                                Json::String(eos.clone().unwrap_or_default()),
-                            );
-                        }
+                        set_token(cfg, "eot_token", eos.as_deref().unwrap_or_default());
                     } else if !self.types.iter().any(|t| t == "eom") {
                         self.types.push("eom".into());
-                        if let Some(c) = cfg.as_mut() {
-                            c.insert(
-                                "eom_token".into(),
-                                Json::String(eos.clone().unwrap_or_default()),
-                            );
-                        }
+                        set_token(cfg, "eom_token", eos.as_deref().unwrap_or_default());
                     }
-                    if let Some(c) = cfg.as_mut() {
-                        c.insert("eos_token".into(), Json::String(l.clone()));
-                    }
+                    set_token(cfg, "eos_token", l);
                     *eos = Some(l.clone());
                 }
                 self.set_add("eos", Some(l) == eos.as_ref(), true);
@@ -465,14 +446,8 @@ impl Special {
                         add_sep = true;
                     }
                     self.set_add("sep", add_sep, true);
-                    if add_sep
-                        && !truthy(sep)
-                        && let Some(c) = cfg.as_mut()
-                    {
-                        c.insert(
-                            "sep_token".into(),
-                            Json::String(eos.clone().unwrap_or_default()),
-                        );
+                    if add_sep && !truthy(sep) {
+                        set_token(cfg, "sep_token", eos.as_deref().unwrap_or_default());
                     }
                 }
             }
