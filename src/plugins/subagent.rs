@@ -227,10 +227,11 @@ impl SubagentPlugin {
             });
         }
         // Prepare the worktree synchronously so the child runs in a ready cwd.
-        let worktree_path = match &spec.worktree {
-            Some(config) => Some(Self::prepare_worktree(config)?),
-            None => None,
-        };
+        let worktree_path = spec
+            .worktree
+            .as_ref()
+            .map(Self::prepare_worktree)
+            .transpose()?;
         // Register the reply receiver before anything is spawned, so a full
         // registry refuses the spawn instead of leaking a running child.
         let (tx, rx) = mpsc::channel();
@@ -388,10 +389,9 @@ impl CucaPlugin for SubagentPlugin {
                         schema: "collect_subagent.arguments".into(),
                         message: "missing string field `subagent_id`".into(),
                     })?;
-                let output = match self.collect(&subagent_id) {
-                    Ok(result) => result.summary,
-                    Err(err) => err.to_string(),
-                };
+                let output = self
+                    .collect(&subagent_id)
+                    .map_or_else(|err| err.to_string(), |result| result.summary);
                 *chunk = MessageContentBlock::ToolResult {
                     tool_call_id: std::mem::take(id),
                     output,

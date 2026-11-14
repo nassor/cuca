@@ -335,6 +335,19 @@ impl McpPlugin {
     /// returned, including [`PluginError::NotSupported`] for a result this
     /// adapter cannot represent (input-required or task results).
     pub async fn call_tool(&self, name: &str, arguments: Value) -> Result<String, PluginError> {
+        let reply_rx = self.send_request(name, arguments)?;
+        tokio::task::spawn_blocking(move || reply_rx.recv())
+            .await
+            .map_err(|_| PluginError::Internal("mcp reply wait task failed".into()))?
+            .map_err(|_| PluginError::Internal("mcp worker dropped the reply channel".into()))?
+    }
+
+    /// Queue one tool call on the worker and return its reply channel.
+    fn send_request(
+        &self,
+        name: &str,
+        arguments: Value,
+    ) -> Result<mpsc::Receiver<Result<String, PluginError>>, PluginError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         let request = ToolRequest {
             name: name.to_owned(),
@@ -344,10 +357,7 @@ impl McpPlugin {
         self.worker
             .send(request)
             .map_err(|_| PluginError::Internal("mcp worker task exited".into()))?;
-        tokio::task::spawn_blocking(move || reply_rx.recv())
-            .await
-            .map_err(|_| PluginError::Internal("mcp reply wait task failed".into()))?
-            .map_err(|_| PluginError::Internal("mcp worker dropped the reply channel".into()))?
+        Ok(reply_rx)
     }
 
     /// Execute one tool call from the synchronous stream hook.
@@ -359,16 +369,7 @@ impl McpPlugin {
     /// `poll_next` (std blocking carries no tokio runtime guard; see module
     /// docs). The stream pipeline pauses for the duration.
     fn call_tool_sync(&self, name: &str, arguments: Value) -> Result<String, PluginError> {
-        let (reply_tx, reply_rx) = mpsc::channel();
-        let request = ToolRequest {
-            name: name.to_owned(),
-            arguments,
-            reply: reply_tx,
-        };
-        self.worker
-            .send(request)
-            .map_err(|_| PluginError::Internal("mcp worker task exited".into()))?;
-        reply_rx
+        self.send_request(name, arguments)?
             .recv()
             .map_err(|_| PluginError::Internal("mcp worker dropped the reply channel".into()))?
     }
@@ -415,10 +416,9 @@ impl CucaPlugin for McpPlugin {
         // overwritten on the next line, so the borrowed block's fields are
         // dead. Cloning `arguments` deep-copied the whole tool-call JSON tree
         // on every intercepted chunk.
-        let output = match self.call_tool_sync(name, std::mem::take(arguments)) {
-            Ok(output) => output,
-            Err(err) => err.to_string(),
-        };
+        let output = self
+            .call_tool_sync(name, std::mem::take(arguments))
+            .unwrap_or_else(|err| err.to_string());
         *chunk = MessageContentBlock::ToolResult {
             tool_call_id: std::mem::take(id),
             output,
@@ -527,10 +527,10 @@ async fn execute_tool_call(
             });
         }
     };
-    let request = match arguments {
-        Some(map) => CallToolRequestParams::new(name.clone()).with_arguments(map),
-        None => CallToolRequestParams::new(name.clone()),
-    };
+    let mut request = CallToolRequestParams::new(name.clone());
+    if let Some(map) = arguments {
+        request = request.with_arguments(map);
+    }
     let response = running
         .call_tool_once(request)
         .await

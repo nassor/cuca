@@ -92,7 +92,7 @@ impl JsonGuardrailPlugin {
                 schema: path.display().to_string(),
                 message: format!("failed to parse schema document: {e}"),
             })?;
-        Self::compile(schemas, 3)
+        Self::with_schemas(schemas, 3)
     }
 
     /// Programmatic schema registration without a file (tests, in-code config).
@@ -105,18 +105,6 @@ impl JsonGuardrailPlugin {
     /// Returns [`PluginError::Validation`] if any embedded schema fails to
     /// compile.
     pub fn with_schemas(
-        schemas: HashMap<String, serde_json::Value>,
-        max_attempts: u32,
-    ) -> Result<Self, PluginError> {
-        Self::compile(schemas, max_attempts)
-    }
-
-    /// Compiles the schema map into validators and assembles the plugin.
-    ///
-    /// `max_attempts` bounds the retry loop: [`Self::new`] supplies a sensible
-    /// default of 3 for the file-loading path, while [`Self::with_schemas`]
-    /// lets callers pass an explicit limit.
-    fn compile(
         schemas: HashMap<String, serde_json::Value>,
         max_attempts: u32,
     ) -> Result<Self, PluginError> {
@@ -263,16 +251,12 @@ impl CucaPlugin for JsonGuardrailPlugin {
                 Ok(())
             }
             MessageContentBlock::Text(text) if text.trim_start().starts_with('{') => {
-                match serde_json::from_str::<serde_json::Value>(text) {
-                    Ok(value) => match self.validate("response", &value) {
-                        Ok(()) => Ok(()),
-                        Err(issues) => {
-                            *text = serde_json::json!({ "error": "schema_validation_failed", "tool": "response", "issues": issues }).to_string();
-                            Ok(())
-                        }
-                    },
-                    Err(_) => Ok(()),
+                if let Ok(value) = serde_json::from_str::<serde_json::Value>(text)
+                    && let Err(issues) = self.validate("response", &value)
+                {
+                    *text = serde_json::json!({ "error": "schema_validation_failed", "tool": "response", "issues": issues }).to_string();
                 }
+                Ok(())
             }
             _ => Ok(()),
         }

@@ -461,20 +461,13 @@ struct RequestCharge {
 }
 
 /// Private ledger state.
+#[derive(Default)]
 struct CostLedger {
     totals: CostTotals,
     per_model: HashMap<String, CostEntry>,
 }
 
 impl CostLedger {
-    /// An empty ledger.
-    fn new() -> Self {
-        Self {
-            totals: CostTotals::default(),
-            per_model: HashMap::new(),
-        }
-    }
-
     /// The key `model` charges to, and whether it folded into the reserved
     /// overflow bucket because `max_tracked` distinct models are already
     /// tracked.
@@ -538,13 +531,10 @@ impl CostLedger {
             .untokenized_image_blocks
             .saturating_sub(charge.image_blocks);
         let (key, _) = self.key_for(model, max_tracked);
-        let emptied = match self.per_model.get_mut(key) {
-            Some(bucket) => {
-                bucket.sub(&charge.entry);
-                *bucket == CostEntry::default()
-            }
-            None => false,
-        };
+        let emptied = self.per_model.get_mut(key).is_some_and(|bucket| {
+            bucket.sub(&charge.entry);
+            *bucket == CostEntry::default()
+        });
         if emptied {
             self.per_model.remove(key);
         }
@@ -647,7 +637,7 @@ impl CostPlugin {
         Ok(Self {
             config,
             encoder: Mutex::new(encoder),
-            ledger: Mutex::new(CostLedger::new()),
+            ledger: Mutex::new(CostLedger::default()),
         })
     }
 
@@ -735,31 +725,17 @@ impl CostPlugin {
         for msg in &req.messages {
             estimate.tokens = estimate.tokens.saturating_add(count(role_prefix(msg.role)));
             for block in &msg.content {
-                match block {
-                    MessageContentBlock::Text(text) => {
-                        estimate.tokens = estimate.tokens.saturating_add(count(text));
-                    }
-                    MessageContentBlock::Thinking { reasoning, .. } => {
-                        estimate.tokens = estimate.tokens.saturating_add(count(reasoning));
-                    }
-                    MessageContentBlock::ToolCall {
-                        name, arguments, ..
-                    } => {
-                        let args = serialize_json(arguments, "tool call arguments")?;
-                        estimate.tokens = estimate
-                            .tokens
-                            .saturating_add(count(name))
-                            .saturating_add(count(&args));
-                    }
-                    MessageContentBlock::ToolResult { output, .. } => {
-                        estimate.tokens = estimate.tokens.saturating_add(count(output));
-                    }
+                let tokens = match block {
+                    MessageContentBlock::ToolResult { output, .. } => count(output),
                     // Providers bill images by tile and dimension, which no
                     // text tokenizer reproduces; the counter is the signal.
                     MessageContentBlock::ImageBase64 { .. } => {
                         estimate.image_blocks = estimate.image_blocks.saturating_add(1);
+                        0
                     }
-                }
+                    _ => generated_tokens(block, &count)?,
+                };
+                estimate.tokens = estimate.tokens.saturating_add(tokens);
             }
         }
         // Tool schemas are prompt tokens the provider bills for.
@@ -782,28 +758,9 @@ impl CostPlugin {
     fn estimate_completion(&self, content: &[MessageContentBlock]) -> Result<u64, PluginError> {
         let encoder = self.encoder()?;
         let count = |text: &str| encoder.encode_ordinary(text).len() as u64;
-        let mut tokens = 0u64;
-        for block in content {
-            match block {
-                MessageContentBlock::Text(text) => {
-                    tokens = tokens.saturating_add(count(text));
-                }
-                MessageContentBlock::Thinking { reasoning, .. } => {
-                    tokens = tokens.saturating_add(count(reasoning));
-                }
-                MessageContentBlock::ToolCall {
-                    name, arguments, ..
-                } => {
-                    let args = serialize_json(arguments, "tool call arguments")?;
-                    tokens = tokens
-                        .saturating_add(count(name))
-                        .saturating_add(count(&args));
-                }
-                MessageContentBlock::ToolResult { .. }
-                | MessageContentBlock::ImageBase64 { .. } => {}
-            }
-        }
-        Ok(tokens)
+        content.iter().try_fold(0u64, |tokens, block| {
+            Ok(tokens.saturating_add(generated_tokens(block, &count)?))
+        })
     }
 }
 
@@ -812,6 +769,22 @@ impl CostPlugin {
 struct PromptEstimate {
     tokens: u64,
     image_blocks: u64,
+}
+
+/// Tokens of a `Text`, `Thinking.reasoning`, or `ToolCall` name plus arguments
+/// block; `ToolResult` and `ImageBase64` carry no generated tokens.
+fn generated_tokens(
+    block: &MessageContentBlock,
+    count: &impl Fn(&str) -> u64,
+) -> Result<u64, PluginError> {
+    Ok(match block {
+        MessageContentBlock::Text(text) => count(text),
+        MessageContentBlock::Thinking { reasoning, .. } => count(reasoning),
+        MessageContentBlock::ToolCall {
+            name, arguments, ..
+        } => count(name).saturating_add(count(&serialize_json(arguments, "tool call arguments")?)),
+        MessageContentBlock::ToolResult { .. } | MessageContentBlock::ImageBase64 { .. } => 0,
+    })
 }
 
 /// Role prefix encoded ahead of a message's blocks.

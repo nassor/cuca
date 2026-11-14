@@ -272,7 +272,7 @@ impl SandboxPlugin {
         }
 
         let stdout = std::mem::take(&mut store.data_mut().stdout);
-        let memory_bytes_used = memory.map(|m| m.data_size(&store)).unwrap_or(0);
+        let memory_bytes_used = memory.map_or(0, |m| m.data_size(&store));
         if let Ok(mut last) = self.last.lock() {
             *last = Some((execution_time_ms, memory_bytes_used));
         }
@@ -415,10 +415,10 @@ impl CucaPlugin for SandboxPlugin {
                 })?
                 .as_bytes(),
         };
-        let output = match self.run(&wasm, input) {
-            Ok(result) => String::from_utf8_lossy(&result.stdout).into_owned(),
-            Err(err) => err.to_string(),
-        };
+        let output = self.run(&wasm, input).map_or_else(
+            |err| err.to_string(),
+            |result| String::from_utf8_lossy(&result.stdout).into_owned(),
+        );
         // `id` is moved, not cloned: `*chunk` is overwritten by this very
         // assignment, so the borrowed block's id is dead.
         *chunk = MessageContentBlock::ToolResult {

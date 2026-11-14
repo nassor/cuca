@@ -191,59 +191,28 @@ impl WebSearchPlugin {
             schema: "web_search response".to_string(),
             message: format!("malformed JSON response: {e}"),
         })?;
-        let results = match self.config.provider {
-            WebSearchProvider::Firecrawl => value
-                .get("data")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|item| {
-                    Some(SearchResult {
-                        title: item.get("title")?.as_str()?.to_string(),
-                        url: item.get("url")?.as_str()?.to_string(),
-                        snippet: item
-                            .get("description")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                })
-                .collect(),
-            WebSearchProvider::Tavily => value
-                .get("results")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|item| {
-                    Some(SearchResult {
-                        title: item.get("title")?.as_str()?.to_string(),
-                        url: item.get("url")?.as_str()?.to_string(),
-                        snippet: item
-                            .get("content")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                })
-                .collect(),
-            WebSearchProvider::DeepSeekWebSearch => value
-                .get("results")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|item| {
-                    Some(SearchResult {
-                        title: item.get("title")?.as_str()?.to_string(),
-                        url: item.get("url")?.as_str()?.to_string(),
-                        snippet: item
-                            .get("snippet")
-                            .and_then(Value::as_str)
-                            .unwrap_or("")
-                            .to_string(),
-                    })
-                })
-                .collect(),
+        let (array_key, snippet_key) = match self.config.provider {
+            WebSearchProvider::Firecrawl => ("data", "description"),
+            WebSearchProvider::Tavily => ("results", "content"),
+            WebSearchProvider::DeepSeekWebSearch => ("results", "snippet"),
         };
+        let results = value
+            .get(array_key)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| {
+                Some(SearchResult {
+                    title: item.get("title")?.as_str()?.to_string(),
+                    url: item.get("url")?.as_str()?.to_string(),
+                    snippet: item
+                        .get(snippet_key)
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string(),
+                })
+            })
+            .collect();
         Ok(results)
     }
 
@@ -336,65 +305,69 @@ impl WebSearchPlugin {
         ))
     }
 
-    /// Run a search synchronously on a short-lived dedicated thread.
-    ///
-    /// Spawns one OS thread, builds a current-thread tokio runtime on it, and
-    /// runs [`Self::search`] inside that runtime, returning the result over a
-    /// std mpsc channel. The thread is dropped when the call completes, so no
-    /// persistent state or runtime-guard hazard exists; the pipeline pauses for
-    /// the search latency (see module docs).
+    /// Run a search synchronously on a short-lived dedicated thread (see
+    /// [`run_on_thread`] and the module docs).
     fn search_sync(&self, query: &str) -> Result<Vec<SearchResult>, PluginError> {
         let plugin = self.clone();
         let query = query.to_string();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| PluginError::Internal(format!("failed to build runtime: {e}")))
-                .and_then(|rt| rt.block_on(plugin.search(&query)));
-            // The receiver may be dropped if the caller bails; ignore send
-            // failure here: the caller handles a missing result.
-            let _ = tx.send(result);
-        });
-        match handle.join() {
-            Ok(()) => rx.recv().unwrap_or_else(|_| {
-                Err(PluginError::Internal(
-                    "search worker thread failed to return a result".to_string(),
-                ))
-            }),
-            Err(_) => Err(PluginError::Internal(
-                "search worker thread panicked".to_string(),
-            )),
-        }
+        run_on_thread("search", move || async move { plugin.search(&query).await })
     }
 
     /// Run page extraction synchronously on a short-lived dedicated thread.
-    ///
-    /// Same per-call thread bridge as [`Self::search_sync`]; see its docs.
     fn extract_sync(&self, url: &str) -> Result<String, PluginError> {
         let plugin = self.clone();
         let url = url.to_string();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let handle = std::thread::spawn(move || {
-            let result = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| PluginError::Internal(format!("failed to build runtime: {e}")))
-                .and_then(|rt| rt.block_on(plugin.extract_page(&url)));
-            let _ = tx.send(result);
-        });
-        match handle.join() {
-            Ok(()) => rx.recv().unwrap_or_else(|_| {
-                Err(PluginError::Internal(
-                    "extract worker thread failed to return a result".to_string(),
-                ))
-            }),
-            Err(_) => Err(PluginError::Internal(
-                "extract worker thread panicked".to_string(),
-            )),
-        }
+        run_on_thread(
+            "extract",
+            move || async move { plugin.extract_page(&url).await },
+        )
     }
+}
+
+/// Run the future built by `make` to completion on a short-lived dedicated OS
+/// thread with its own current-thread tokio runtime, returning the result over
+/// a std mpsc channel. The thread is dropped when the call completes, so no
+/// persistent state or runtime-guard hazard exists; the pipeline pauses for
+/// the call latency (see module docs).
+fn run_on_thread<T, F, Fut>(what: &str, make: F) -> Result<T, PluginError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, PluginError>>,
+{
+    let (tx, rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let result = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|e| PluginError::Internal(format!("failed to build runtime: {e}")))
+            .and_then(|rt| rt.block_on(make()));
+        // The receiver may be dropped if the caller bails; ignore send
+        // failure here: the caller handles a missing result.
+        let _ = tx.send(result);
+    });
+    match handle.join() {
+        Ok(()) => rx.recv().unwrap_or_else(|_| {
+            Err(PluginError::Internal(format!(
+                "{what} worker thread failed to return a result"
+            )))
+        }),
+        Err(_) => Err(PluginError::Internal(format!(
+            "{what} worker thread panicked"
+        ))),
+    }
+}
+
+/// Validate that tool `arguments` carry a non-blank string `key`.
+fn required_arg(arguments: &Value, tool: &str, key: &str) -> Result<String, PluginError> {
+    let value = arguments.get(key).and_then(Value::as_str).unwrap_or("");
+    if value.trim().is_empty() {
+        return Err(PluginError::Validation {
+            schema: tool.to_string(),
+            message: format!("{tool} requires a non-empty string `{key}` argument"),
+        });
+    }
+    Ok(value.to_string())
 }
 
 /// Validate the `web_search` tool arguments and extract the required `query`.
@@ -402,14 +375,7 @@ impl WebSearchPlugin {
 /// A missing, non-string, or blank `query` yields [`PluginError::Validation`].
 /// Testable seam for the stream hook's argument validation (no network).
 pub(crate) fn parse_web_search_args(arguments: &Value) -> Result<String, PluginError> {
-    let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
-    if query.trim().is_empty() {
-        return Err(PluginError::Validation {
-            schema: "web_search".to_string(),
-            message: "web_search requires a non-empty string `query` argument".to_string(),
-        });
-    }
-    Ok(query.to_string())
+    required_arg(arguments, "web_search", "query")
 }
 
 /// Validate the `web_extract` tool arguments and extract the required `url`.
@@ -417,14 +383,7 @@ pub(crate) fn parse_web_search_args(arguments: &Value) -> Result<String, PluginE
 /// A missing, non-string, or blank `url` yields [`PluginError::Validation`].
 /// Testable seam for the stream hook's argument validation (no network).
 pub(crate) fn parse_web_extract_args(arguments: &Value) -> Result<String, PluginError> {
-    let url = arguments.get("url").and_then(Value::as_str).unwrap_or("");
-    if url.trim().is_empty() {
-        return Err(PluginError::Validation {
-            schema: "web_extract".to_string(),
-            message: "web_extract requires a non-empty string `url` argument".to_string(),
-        });
-    }
-    Ok(url.to_string())
+    required_arg(arguments, "web_extract", "url")
 }
 
 /// Serialize a set of results into the JSON array string used as a
@@ -451,14 +410,11 @@ impl CucaPlugin for WebSearchPlugin {
         } = chunk
         {
             let output = match name.as_str() {
-                "web_search" => match parse_web_search_args(arguments) {
-                    Ok(query) => self.search_sync(&query).map(format_results),
-                    Err(e) => Err(e),
-                },
-                "web_extract" => match parse_web_extract_args(arguments) {
-                    Ok(url) => self.extract_sync(&url),
-                    Err(e) => Err(e),
-                },
+                "web_search" => parse_web_search_args(arguments)
+                    .and_then(|query| self.search_sync(&query).map(format_results)),
+                "web_extract" => {
+                    parse_web_extract_args(arguments).and_then(|url| self.extract_sync(&url))
+                }
                 // Unknown tools are not this plugin's responsibility; leave
                 // the block untouched.
                 _ => return Ok(()),

@@ -83,13 +83,7 @@ impl Skill {
             .map_err(|e| PluginError::Io(format!("failed to read {}: {e}", skill_md.display())))?;
         let mut lines = text.lines();
         // Frontmatter must start at the very first line of the file.
-        let Some(first) = lines.next() else {
-            return Err(PluginError::Io(format!(
-                "{} has no frontmatter: expected a leading `---` line",
-                skill_md.display()
-            )));
-        };
-        if first.trim_end() != "---" {
+        if lines.next().is_none_or(|first| first.trim_end() != "---") {
             return Err(PluginError::Io(format!(
                 "{} has no frontmatter: expected a leading `---` line",
                 skill_md.display()
@@ -125,24 +119,20 @@ impl Skill {
                 skill_md.display()
             )));
         }
-        let name = match name {
-            Some(n) if !n.trim().is_empty() => n,
-            _ => {
-                return Err(PluginError::Io(format!(
-                    "{} is missing a required non-blank `name:` frontmatter key",
-                    skill_md.display()
-                )));
-            }
-        };
-        let description = match description {
-            Some(d) if !d.trim().is_empty() => d,
-            _ => {
-                return Err(PluginError::Io(format!(
+        let name = name.filter(|n| !n.trim().is_empty()).ok_or_else(|| {
+            PluginError::Io(format!(
+                "{} is missing a required non-blank `name:` frontmatter key",
+                skill_md.display()
+            ))
+        })?;
+        let description = description
+            .filter(|d| !d.trim().is_empty())
+            .ok_or_else(|| {
+                PluginError::Io(format!(
                     "{} is missing a required non-blank `description:` frontmatter key",
                     skill_md.display()
-                )));
-            }
-        };
+                ))
+            })?;
         let mut references = BTreeMap::new();
         let references_dir = dir.join("references");
         if references_dir.is_dir() {
@@ -340,10 +330,8 @@ impl SkillsPlugin {
 
     /// Deduplicate by name (later entries win) and sort by name.
     fn dedup_sorted(skills: Vec<Skill>) -> Vec<Skill> {
-        let mut by_name: BTreeMap<String, Skill> = BTreeMap::new();
-        for skill in skills {
-            by_name.insert(skill.name.clone(), skill);
-        }
+        let by_name: BTreeMap<String, Skill> =
+            skills.into_iter().map(|s| (s.name.clone(), s)).collect();
         by_name.into_values().collect()
     }
 }
@@ -353,14 +341,19 @@ impl SkillsPlugin {
 /// A missing, non-string, or blank `name` yields [`PluginError::Validation`].
 /// Testable seam for the stream hook's argument validation.
 pub(crate) fn parse_skill_args(arguments: &Value) -> Result<String, PluginError> {
-    let name = arguments.get("name").and_then(Value::as_str).unwrap_or("");
-    if name.trim().is_empty() {
+    required_query(arguments, "skill", "name")
+}
+
+/// Validate that tool `arguments` carry a non-blank string `key`.
+fn required_query(arguments: &Value, tool: &str, key: &str) -> Result<String, PluginError> {
+    let value = arguments.get(key).and_then(Value::as_str).unwrap_or("");
+    if value.trim().is_empty() {
         return Err(PluginError::Validation {
-            schema: "skill".to_string(),
-            message: "skill requires a non-empty string `name` argument".to_string(),
+            schema: tool.to_string(),
+            message: format!("{tool} requires a non-empty string `{key}` argument"),
         });
     }
-    Ok(name.to_string())
+    Ok(value.to_string())
 }
 
 /// Validate the `skill_read` tool arguments and extract `skill` and `file`.
@@ -387,14 +380,7 @@ pub(crate) fn parse_skill_read_args(arguments: &Value) -> Result<(String, String
 /// [`PluginError::Validation`]. Testable seam for the stream hook's argument
 /// validation.
 pub(crate) fn parse_skill_search_args(arguments: &Value) -> Result<String, PluginError> {
-    let query = arguments.get("query").and_then(Value::as_str).unwrap_or("");
-    if query.trim().is_empty() {
-        return Err(PluginError::Validation {
-            schema: "skill_search".to_string(),
-            message: "skill_search requires a non-empty string `query` argument".to_string(),
-        });
-    }
-    Ok(query.to_string())
+    required_query(arguments, "skill_search", "query")
 }
 
 /// Serialize a skill into the JSON object string used as a
@@ -477,36 +463,27 @@ impl CucaPlugin for SkillsPlugin {
         } = chunk
         {
             let output = match name.as_str() {
-                "skill" => match parse_skill_args(arguments) {
-                    Ok(skill_name) => match self.skill(&skill_name) {
-                        Some(skill) => Ok(format_skill(skill)),
-                        None => Err(PluginError::Internal(format!(
+                "skill" => parse_skill_args(arguments).and_then(|skill_name| {
+                    self.skill(&skill_name).map(format_skill).ok_or_else(|| {
+                        PluginError::Internal(format!(
                             "unknown skill `{skill_name}`; use `skill_search` to find an applicable skill"
-                        ))),
-                    },
-                    Err(e) => Err(e),
-                },
-                "skill_read" => match parse_skill_read_args(arguments) {
-                    Ok((skill_name, file)) => match self.read_reference(&skill_name, &file) {
-                        Some(content) => Ok(content.to_string()),
-                        None => {
-                            let detail = if self.skill(&skill_name).is_none() {
+                        ))
+                    })
+                }),
+                "skill_read" => parse_skill_read_args(arguments).and_then(|(skill_name, file)| {
+                    self.read_reference(&skill_name, &file)
+                        .map(str::to_string)
+                        .ok_or_else(|| {
+                            PluginError::Internal(if self.skill(&skill_name).is_none() {
                                 format!("unknown skill `{skill_name}`")
                             } else {
                                 format!("skill `{skill_name}` has no reference file `{file}`")
-                            };
-                            Err(PluginError::Internal(detail))
-                        }
-                    },
-                    Err(e) => Err(e),
-                },
-                "skill_search" => match parse_skill_search_args(arguments) {
-                    Ok(query) => {
-                        let results = self.search(&query, self.config.max_search_results);
-                        Ok(format_skill_list(&results))
-                    }
-                    Err(e) => Err(e),
-                },
+                            })
+                        })
+                }),
+                "skill_search" => parse_skill_search_args(arguments).map(|query| {
+                    format_skill_list(&self.search(&query, self.config.max_search_results))
+                }),
                 // Unknown tools are not this plugin's responsibility; leave
                 // the block untouched.
                 _ => return Ok(()),

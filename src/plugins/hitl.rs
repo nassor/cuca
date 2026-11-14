@@ -76,40 +76,14 @@ impl Risk {
 ///
 /// Unknown tools default to [`Risk::Low`] so the plugin never blocks an
 /// unrecognized read path; this is a conservative choice tuned to not break
-/// model-native read tools. The keyword table below is a simple, tunable
-/// `match`-free list: extend it to tighten or relax the policy.
+/// model-native read tools. The keyword table in `classify_action` is a
+/// simple, tunable list: extend it to tighten or relax the policy.
 pub fn classify_tool_call(name: &str) -> Risk {
-    // Allocation-free: this runs for every streamed `ToolCall` block, and the
-    // vast majority are low-risk.
-    const HIGH_KEYWORDS: [&str; 20] = [
-        "shell",
-        "exec",
-        "bash",
-        "run_command",
-        "terminal",
-        "write",
-        "edit",
-        "delete",
-        "remove",
-        "rm_",
-        "mv_",
-        "move",
-        "create_file",
-        "http_post",
-        "http_put",
-        "http_delete",
-        "api_write",
-        "post_",
-        "put_",
-        "delete_",
-    ];
-    if HIGH_KEYWORDS
-        .iter()
-        .any(|k| contains_ignore_ascii_case(name, k))
-    {
-        return Risk::High;
+    if classify_action(name).is_some() {
+        Risk::High
+    } else {
+        Risk::Low
     }
-    Risk::Low
 }
 
 /// A pending approval request describing one high-risk tool call.
@@ -364,10 +338,9 @@ impl CucaPlugin for HitlPlugin {
         else {
             return Ok(());
         };
-        if classify_tool_call(name) == Risk::Low {
+        let Some(action) = classify_action(name) else {
             return Ok(());
-        }
-        let action = classify_action(name).unwrap_or("tool_execution");
+        };
         let detail = format!("{name} {}", truncated_json(arguments));
         let req = ApprovalRequest {
             tool_call_id: id.clone(),

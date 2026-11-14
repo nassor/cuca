@@ -204,14 +204,7 @@ pub struct MemoryGraph {
 impl MemoryGraph {
     /// Empty graph; allocates no heap (all six collections have capacity 0).
     pub fn new() -> Self {
-        Self {
-            nodes: HashMap::new(),
-            relationships: HashMap::new(),
-            outgoing: HashMap::new(),
-            incoming: HashMap::new(),
-            outgoing_positions: HashMap::new(),
-            incoming_positions: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Empty graph with reserved capacity for `nodes` nodes and
@@ -270,17 +263,8 @@ impl MemoryGraph {
                 rel.id, rel.to
             )));
         }
-        let id = rel.id.clone();
-        self.remove_relationship(&id);
-        let from = rel.from.clone();
-        let to = rel.to.clone();
-        self.relationships.insert(id.clone(), rel);
-        let outgoing = self.outgoing.entry(from).or_default();
-        self.outgoing_positions.insert(id.clone(), outgoing.len());
-        outgoing.push(id.clone());
-        let incoming = self.incoming.entry(to).or_default();
-        self.incoming_positions.insert(id.clone(), incoming.len());
-        incoming.push(id);
+        self.remove_relationship(&rel.id);
+        self.index_relationship(rel);
         Ok(())
     }
 
@@ -445,34 +429,10 @@ impl MemoryGraph {
             return false;
         };
         if let Some(list) = self.outgoing.get_mut(&rel.from) {
-            let index = self
-                .outgoing_positions
-                .get(id)
-                .copied()
-                .filter(|&index| list.get(index).is_some_and(|rid| rid == id))
-                .or_else(|| list.iter().position(|rid| rid == id));
-            if let Some(index) = index {
-                self.outgoing_positions.remove(id);
-                let moved_id = list.swap_remove(index);
-                if moved_id != id {
-                    self.outgoing_positions.insert(moved_id, index);
-                }
-            }
+            unlink(list, &mut self.outgoing_positions, id);
         }
         if let Some(list) = self.incoming.get_mut(&rel.to) {
-            let index = self
-                .incoming_positions
-                .get(id)
-                .copied()
-                .filter(|&index| list.get(index).is_some_and(|rid| rid == id))
-                .or_else(|| list.iter().position(|rid| rid == id));
-            if let Some(index) = index {
-                self.incoming_positions.remove(id);
-                let moved_id = list.swap_remove(index);
-                if moved_id != id {
-                    self.incoming_positions.insert(moved_id, index);
-                }
-            }
+            unlink(list, &mut self.incoming_positions, id);
         }
         true
     }
@@ -481,43 +441,7 @@ impl MemoryGraph {
     /// (parallel relationships between the same pair collapse to one entry).
     /// A missing node yields an empty Vec.
     pub fn neighbors(&self, id: &str, direction: GraphDirection) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        match direction {
-            GraphDirection::Outgoing => {
-                if let Some(rels) = self.outgoing.get(id) {
-                    for rid in rels {
-                        if let Some(rel) = self.relationships.get(rid) {
-                            out.push(rel.to.clone());
-                        }
-                    }
-                }
-            }
-            GraphDirection::Incoming => {
-                if let Some(rels) = self.incoming.get(id) {
-                    for rid in rels {
-                        if let Some(rel) = self.relationships.get(rid) {
-                            out.push(rel.from.clone());
-                        }
-                    }
-                }
-            }
-            GraphDirection::Any => {
-                if let Some(rels) = self.outgoing.get(id) {
-                    for rid in rels {
-                        if let Some(rel) = self.relationships.get(rid) {
-                            out.push(rel.to.clone());
-                        }
-                    }
-                }
-                if let Some(rels) = self.incoming.get(id) {
-                    for rid in rels {
-                        if let Some(rel) = self.relationships.get(rid) {
-                            out.push(rel.from.clone());
-                        }
-                    }
-                }
-            }
-        }
+        let mut out: Vec<String> = self.adjacent(id, direction).cloned().collect();
         out.sort_unstable();
         out.dedup();
         out
@@ -541,16 +465,12 @@ impl MemoryGraph {
         while !frontier.is_empty() {
             let mut next: Vec<&str> = Vec::new();
             for node in &frontier {
-                if let Some(rels) = self.outgoing.get(*node) {
-                    for rid in rels {
-                        if let Some(rel) = self.relationships.get(rid) {
-                            if rel.to == to {
-                                return true;
-                            }
-                            if visited.insert(rel.to.as_str()) {
-                                next.push(rel.to.as_str());
-                            }
-                        }
+                for next_id in self.adjacent(node, GraphDirection::Outgoing) {
+                    if next_id.as_str() == to {
+                        return true;
+                    }
+                    if visited.insert(next_id.as_str()) {
+                        next.push(next_id.as_str());
                     }
                 }
             }
@@ -582,24 +502,9 @@ impl MemoryGraph {
         for _ in 0..max_depth {
             let mut next: Vec<&str> = Vec::new();
             for node in &frontier {
-                let mut enqueue = |rels: Option<&Vec<String>>, incoming: bool| {
-                    if let Some(rels) = rels {
-                        for rid in rels {
-                            if let Some(rel) = self.relationships.get(rid) {
-                                let neighbor = if incoming { &rel.from } else { &rel.to };
-                                if visited.insert(neighbor.as_str()) {
-                                    next.push(neighbor.as_str());
-                                }
-                            }
-                        }
-                    }
-                };
-                match direction {
-                    GraphDirection::Outgoing => enqueue(self.outgoing.get(*node), false),
-                    GraphDirection::Incoming => enqueue(self.incoming.get(*node), true),
-                    GraphDirection::Any => {
-                        enqueue(self.outgoing.get(*node), false);
-                        enqueue(self.incoming.get(*node), true);
+                for neighbor in self.adjacent(node, direction) {
+                    if visited.insert(neighbor.as_str()) {
+                        next.push(neighbor.as_str());
                     }
                 }
             }
@@ -630,20 +535,11 @@ impl MemoryGraph {
         for _ in 0..max_depth {
             let mut next: Vec<&str> = Vec::new();
             for node in &frontier {
-                let mut enqueue = |rels: Option<&Vec<String>>, incoming: bool| {
-                    if let Some(rels) = rels {
-                        for rid in rels {
-                            if let Some(rel) = self.relationships.get(rid) {
-                                let neighbor = if incoming { &rel.from } else { &rel.to };
-                                if ids.insert(neighbor.as_str()) {
-                                    next.push(neighbor.as_str());
-                                }
-                            }
-                        }
+                for neighbor in self.adjacent(node, GraphDirection::Any) {
+                    if ids.insert(neighbor.as_str()) {
+                        next.push(neighbor.as_str());
                     }
-                };
-                enqueue(self.outgoing.get(*node), false);
-                enqueue(self.incoming.get(*node), true);
+                }
             }
             frontier = next;
         }
@@ -655,28 +551,14 @@ impl MemoryGraph {
                 out.nodes.insert(id.to_string(), node.clone());
             }
         }
-        let mut rel_ids: Vec<&String> = self
+        let mut rels: Vec<&GraphRelationship> = self
             .relationships
-            .keys()
-            .filter(|rid| {
-                let rel = &self.relationships[*rid];
-                ids.contains(rel.from.as_str()) && ids.contains(rel.to.as_str())
-            })
+            .values()
+            .filter(|rel| ids.contains(rel.from.as_str()) && ids.contains(rel.to.as_str()))
             .collect();
-        rel_ids.sort();
-        for rid in rel_ids {
-            if let Some(rel) = self.relationships.get(rid) {
-                let id = rid.clone();
-                let from = rel.from.clone();
-                let to = rel.to.clone();
-                out.relationships.insert(id.clone(), rel.clone());
-                let outgoing = out.outgoing.entry(from).or_default();
-                out.outgoing_positions.insert(id.clone(), outgoing.len());
-                outgoing.push(id.clone());
-                let incoming = out.incoming.entry(to).or_default();
-                out.incoming_positions.insert(id.clone(), incoming.len());
-                incoming.push(id);
-            }
+        rels.sort_unstable_by(|a, b| a.id.cmp(&b.id));
+        for rel in rels {
+            out.index_relationship(rel.clone());
         }
         out
     }
@@ -763,31 +645,52 @@ impl MemoryGraph {
         // Pass 2b: relationships, moved in. Endpoints exist by invariant 1
         // plus the node union never dropping ids.
         for (orig_id, mut rel) in other.relationships {
-            let final_id = match rename.get(&orig_id) {
-                Some(new_id) => {
-                    rel.id = new_id.clone();
-                    report.relationships_renamed += 1;
-                    rel.id.clone()
-                }
-                None => {
-                    report.relationships_added += 1;
-                    orig_id
-                }
-            };
-            let from = rel.from.clone();
-            let to = rel.to.clone();
-            self.relationships.insert(final_id.clone(), rel);
-            let outgoing = self.outgoing.entry(from).or_default();
-            self.outgoing_positions
-                .insert(final_id.clone(), outgoing.len());
-            outgoing.push(final_id.clone());
-            let incoming = self.incoming.entry(to).or_default();
-            self.incoming_positions
-                .insert(final_id.clone(), incoming.len());
-            incoming.push(final_id);
+            if let Some(new_id) = rename.get(&orig_id) {
+                rel.id = new_id.clone();
+                report.relationships_renamed += 1;
+            } else {
+                report.relationships_added += 1;
+            }
+            self.index_relationship(rel);
         }
 
         report
+    }
+
+    /// Store `rel` and append it to both adjacency indexes (endpoints must
+    /// exist and `rel.id` must not be indexed yet).
+    fn index_relationship(&mut self, rel: GraphRelationship) {
+        let id = rel.id.clone();
+        let outgoing = self.outgoing.entry(rel.from.clone()).or_default();
+        self.outgoing_positions.insert(id.clone(), outgoing.len());
+        outgoing.push(id.clone());
+        let incoming = self.incoming.entry(rel.to.clone()).or_default();
+        self.incoming_positions.insert(id.clone(), incoming.len());
+        incoming.push(id);
+        self.relationships.insert(rel.id.clone(), rel);
+    }
+
+    /// Neighbor ids reached from `id` in `direction`, one per incident
+    /// relationship (outgoing first, then incoming; unsorted, may repeat).
+    fn adjacent<'a>(
+        &'a self,
+        id: &str,
+        direction: GraphDirection,
+    ) -> impl Iterator<Item = &'a String> {
+        let outgoing = (direction != GraphDirection::Incoming)
+            .then(|| self.outgoing.get(id))
+            .flatten();
+        let incoming = (direction != GraphDirection::Outgoing)
+            .then(|| self.incoming.get(id))
+            .flatten();
+        let rels = move |list: Option<&'a Vec<String>>| {
+            list.into_iter()
+                .flatten()
+                .filter_map(move |rid| self.relationships.get(rid))
+        };
+        rels(outgoing)
+            .map(|rel| &rel.to)
+            .chain(rels(incoming).map(|rel| &rel.from))
     }
 
     /// Deterministic, compact, LLM-readable listing of the graph.
@@ -879,6 +782,23 @@ impl MemoryGraph {
 /// serializes); the fallback exists only to honor the no-panic rule.
 fn props_json(props: &serde_json::Map<String, serde_json::Value>) -> String {
     serde_json::to_string(props).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Remove `id` from one adjacency `list` (swap-remove), keeping `positions`
+/// in step.
+fn unlink(list: &mut Vec<String>, positions: &mut HashMap<String, usize>, id: &str) {
+    let index = positions
+        .get(id)
+        .copied()
+        .filter(|&index| list.get(index).is_some_and(|rid| rid == id))
+        .or_else(|| list.iter().position(|rid| rid == id));
+    if let Some(index) = index {
+        positions.remove(id);
+        let moved_id = list.swap_remove(index);
+        if moved_id != id {
+            positions.insert(moved_id, index);
+        }
+    }
 }
 
 fn bounded_sorted_ids<'a>(

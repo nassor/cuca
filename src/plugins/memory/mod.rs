@@ -408,15 +408,10 @@ impl MemoryPlugin {
         summarizer: Arc<dyn Summarizer>,
         store: Arc<dyn VectorStore>,
     ) -> Result<Self, PluginError> {
-        config.validate()?;
-        let encoder = crate::tokenize::load_encoder(&config.encoder_name)?;
-        Ok(Self {
-            config,
-            summarizer: Some(summarizer),
-            store: Some(store),
-            encoder: Mutex::new(encoder),
-            graph: Mutex::new(MemoryGraph::new()),
-        })
+        let mut plugin = Self::new(config)?;
+        plugin.summarizer = Some(summarizer);
+        plugin.store = Some(store);
+        Ok(plugin)
     }
 
     /// Approximate token count of a message list.
@@ -763,20 +758,8 @@ impl MemoryPlugin {
         if idxs.is_empty() {
             return Ok(None);
         }
-        let drop_set: HashSet<usize> = idxs.into_iter().collect();
-        let closed = pairing_close(messages, &drop_set);
-        let mut closed_idxs: Vec<usize> = closed.into_iter().collect();
-        closed_idxs.sort_unstable();
-        // Take the closed turns by value: `Vec::remove` already yields the
-        // owned message, so cloning first would allocate every offloaded
-        // message twice. Back-to-front removal keeps the ascending indices
-        // valid; the reverse restores the oldest-first order the store wants.
-        let mut turns: Vec<UnifiedMessage> = closed_idxs
-            .iter()
-            .rev()
-            .map(|&i| messages.remove(i))
-            .collect();
-        turns.reverse();
+        let closed_idxs = closed_sorted(messages, idxs);
+        let turns = take_indices(messages, &closed_idxs);
         if let Err(error) = store.store_turns(SESSION_HINT, &turns) {
             // Offload stays all-or-nothing: a failed store must not drop
             // history, so the turns go back at their original indices
@@ -803,20 +786,10 @@ impl MemoryPlugin {
         if idxs.is_empty() {
             return Ok(None);
         }
-        let drop_set: HashSet<usize> = idxs.into_iter().collect();
-        let closed = pairing_close(messages, &drop_set);
-        let mut closed_idxs: Vec<usize> = closed.into_iter().collect();
-        closed_idxs.sort_unstable();
-        // Same ownership transfer as `strategy_offload`: the summarizer only
-        // borrows the turns, and they are being removed anyway, so cloning
-        // them would allocate each message twice. `summarize` is infallible,
-        // so no rollback is needed here.
-        let mut turns: Vec<UnifiedMessage> = closed_idxs
-            .iter()
-            .rev()
-            .map(|&i| messages.remove(i))
-            .collect();
-        turns.reverse();
+        let closed_idxs = closed_sorted(messages, idxs);
+        // Same ownership transfer as `strategy_offload`; `summarize` is
+        // infallible, so no rollback is needed here.
+        let turns = take_indices(messages, &closed_idxs);
         let summary = summarizer.summarize(&turns);
         messages.insert(closed_idxs[0], UnifiedMessage::user(summary));
         Ok(Some(CompressionAction::Summarized))
@@ -857,11 +830,7 @@ impl MemoryPlugin {
                 }
             }
         }
-        Ok(if blanked {
-            Some(CompressionAction::DeduplicatedFileReads)
-        } else {
-            None
-        })
+        Ok(blanked.then_some(CompressionAction::DeduplicatedFileReads))
     }
 
     /// Blank old tool-result outputs, keeping the newest `keep_pairs` pairs.
@@ -879,11 +848,7 @@ impl MemoryPlugin {
         for &(msg_idx, block_idx) in units.iter().take(keep_from) {
             blanked |= blank_result(messages, (msg_idx, block_idx));
         }
-        Ok(if blanked {
-            Some(CompressionAction::ClearedToolResults)
-        } else {
-            None
-        })
+        Ok(blanked.then_some(CompressionAction::ClearedToolResults))
     }
 
     /// Head/tail-truncate any single block whose token count exceeds the cap.
@@ -896,47 +861,32 @@ impl MemoryPlugin {
             .encoder
             .lock()
             .map_err(|e| PluginError::Internal(format!("tiktoken encoder lock poisoned: {e}")))?;
+        let clamp = |s: &mut String| {
+            let over = encoder.encode_ordinary(s).len() as u32 > max_part_tokens;
+            if over {
+                *s = clamp_oversized(s);
+            }
+            over
+        };
         let mut clamped = false;
         for msg in messages.iter_mut() {
             for block in &mut msg.content {
-                match block {
-                    MessageContentBlock::Text(t) => {
-                        if encoder.encode_ordinary(t).len() as u32 > max_part_tokens {
-                            *t = clamp_oversized(t);
-                            clamped = true;
-                        }
-                    }
-                    MessageContentBlock::ToolResult { output, .. } => {
-                        if encoder.encode_ordinary(output).len() as u32 > max_part_tokens {
-                            *output = clamp_oversized(output);
-                            clamped = true;
-                        }
-                    }
-                    MessageContentBlock::Thinking { reasoning, .. } => {
-                        if encoder.encode_ordinary(reasoning).len() as u32 > max_part_tokens {
-                            *reasoning = clamp_oversized(reasoning);
-                            clamped = true;
-                        }
-                    }
-                    MessageContentBlock::ToolCall { arguments, .. } => {
-                        // Only stringified JSON arguments; object-valued
-                        // arguments are small by construction and untouched.
-                        if let serde_json::Value::String(s) = arguments
-                            && encoder.encode_ordinary(s).len() as u32 > max_part_tokens
-                        {
-                            *s = clamp_oversized(s);
-                            clamped = true;
-                        }
-                    }
-                    MessageContentBlock::ImageBase64 { .. } => {}
-                }
+                clamped |= match block {
+                    MessageContentBlock::Text(t) => clamp(t),
+                    MessageContentBlock::ToolResult { output, .. } => clamp(output),
+                    MessageContentBlock::Thinking { reasoning, .. } => clamp(reasoning),
+                    // Only stringified JSON arguments; object-valued
+                    // arguments are small by construction and untouched.
+                    MessageContentBlock::ToolCall {
+                        arguments: serde_json::Value::String(s),
+                        ..
+                    } => clamp(s),
+                    MessageContentBlock::ToolCall { .. }
+                    | MessageContentBlock::ImageBase64 { .. } => false,
+                };
             }
         }
-        Ok(if clamped {
-            Some(CompressionAction::ClampedParts)
-        } else {
-            None
-        })
+        Ok(clamped.then_some(CompressionAction::ClampedParts))
     }
 
     /// Trim the message list to a sliding-window tail.
@@ -961,9 +911,7 @@ impl MemoryPlugin {
             }
             drop_set.insert(i);
         }
-        let closed = pairing_close(messages, &drop_set);
-        let mut closed_idxs: Vec<usize> = closed.into_iter().collect();
-        closed_idxs.sort_unstable();
+        let closed_idxs = closed_sorted(messages, drop_set);
         remove_indices(messages, &closed_idxs);
         Ok(Some(CompressionAction::Slid))
     }
@@ -1007,10 +955,7 @@ impl MemoryPlugin {
         if idxs.is_empty() {
             return Ok(None);
         }
-        let drop_set: HashSet<usize> = idxs.into_iter().collect();
-        let closed = pairing_close(messages, &drop_set);
-        let mut closed_idxs: Vec<usize> = closed.into_iter().collect();
-        closed_idxs.sort_unstable();
+        let closed_idxs = closed_sorted(messages, idxs);
         remove_indices(messages, &closed_idxs);
         Ok(Some(CompressionAction::DroppedTurns))
     }
@@ -1200,6 +1145,25 @@ fn pairing_close(messages: &[UnifiedMessage], drop_set: &HashSet<usize>) -> Hash
         }
     }
     closed
+}
+
+/// Pairing-closure of `idxs` as ascending indices.
+fn closed_sorted(messages: &[UnifiedMessage], idxs: impl IntoIterator<Item = usize>) -> Vec<usize> {
+    let drop_set: HashSet<usize> = idxs.into_iter().collect();
+    let mut closed: Vec<usize> = pairing_close(messages, &drop_set).into_iter().collect();
+    closed.sort_unstable();
+    closed
+}
+
+/// Remove the messages at ascending `idxs` by value, returned oldest first.
+///
+/// `Vec::remove` already yields the owned message, so nothing is cloned.
+/// Back-to-front removal keeps the ascending indices valid; the reverse
+/// restores oldest-first order.
+fn take_indices(messages: &mut Vec<UnifiedMessage>, idxs: &[usize]) -> Vec<UnifiedMessage> {
+    let mut taken: Vec<UnifiedMessage> = idxs.iter().rev().map(|&i| messages.remove(i)).collect();
+    taken.reverse();
+    taken
 }
 
 /// One blankable tool result in message order: `(message index, block index)`.

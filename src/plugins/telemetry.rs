@@ -24,15 +24,6 @@ use crate::types::MessageContentBlock;
 /// as `Arc<dyn CucaPlugin>` across `await` points in the client pipeline.
 #[cfg(feature = "plugin-telemetry")]
 pub struct OpenTelemetryPlugin {
-    /// Meter the three instruments below were built from.
-    ///
-    /// Retained so the plugin owns the meter handle for its whole lifetime;
-    /// the hooks only touch the instruments.
-    #[expect(
-        dead_code,
-        reason = "retained handle; the hooks read the instruments, never the meter"
-    )]
-    meter: opentelemetry::metrics::Meter,
     /// Monotonic counter of dispatched unified LLM requests.
     request_counter: opentelemetry::metrics::Counter<u64>,
     /// Latency distribution of LLM execution turns.
@@ -61,7 +52,6 @@ impl OpenTelemetryPlugin {
             .with_description("Total streaming tokens processed across sessions")
             .build();
         Self {
-            meter,
             request_counter,
             latency_histogram,
             token_counter,
