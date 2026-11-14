@@ -21,7 +21,7 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::Json;
@@ -35,7 +35,7 @@ use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::StreamExt;
@@ -423,25 +423,29 @@ async fn stats(State(state): State<Arc<ServerState>>) -> Json<Value> {
 }
 
 #[derive(Deserialize)]
-struct StreamQuery {
+pub(crate) struct StreamQuery {
     interval_ms: Option<u64>,
 }
 
 /// Decrements the open-streams count when the stream ends.
-struct StreamSlot(Arc<ServerState>);
+struct StreamSlot<S>(Arc<S>, fn(&S) -> &AtomicUsize);
 
-impl Drop for StreamSlot {
+impl<S> Drop for StreamSlot<S> {
     fn drop(&mut self) {
-        self.0.stats_streams.fetch_sub(1, Ordering::Relaxed);
+        (self.1)(&self.0).fetch_sub(1, Ordering::Relaxed);
     }
 }
 
-async fn stats_stream(
-    State(state): State<Arc<ServerState>>,
-    Query(query): Query<StreamQuery>,
+/// The server-sent stream of `snapshot(&state)` every `query.interval_ms`,
+/// counted in `open(&state)` and refused beyond [`MAX_STATS_STREAMS`] streams.
+pub(crate) fn stats_events<S: Send + Sync + 'static, T: Serialize + 'static>(
+    state: Arc<S>,
+    open: fn(&S) -> &AtomicUsize,
+    query: &StreamQuery,
+    snapshot: fn(&S) -> T,
 ) -> Result<Response, ApiError> {
-    if state.stats_streams.fetch_add(1, Ordering::Relaxed) >= MAX_STATS_STREAMS {
-        state.stats_streams.fetch_sub(1, Ordering::Relaxed);
+    if open(&state).fetch_add(1, Ordering::Relaxed) >= MAX_STATS_STREAMS {
+        open(&state).fetch_sub(1, Ordering::Relaxed);
         return Err(ApiError::new(
             StatusCode::TOO_MANY_REQUESTS,
             "rate_limit_error",
@@ -449,20 +453,41 @@ async fn stats_stream(
             format!("at most {MAX_STATS_STREAMS} stats streams at once"),
         ));
     }
-    let slot = StreamSlot(Arc::clone(&state));
+    let slot = StreamSlot(Arc::clone(&state), open);
     let interval_ms = query.interval_ms.unwrap_or(1000).clamp(250, 10_000);
     let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let events = IntervalStream::new(interval).map(move |_| {
         let _open = &slot;
         let event = Event::default()
-            .json_data(collector::snapshot(&state))
+            .json_data(snapshot(&state))
             .unwrap_or_else(|_| Event::default().comment("snapshot could not be serialized"));
         Ok::<_, Infallible>(event)
     });
     Ok(Sse::new(events)
         .keep_alive(KeepAlive::default())
         .into_response())
+}
+
+async fn stats_stream(
+    State(state): State<Arc<ServerState>>,
+    Query(query): Query<StreamQuery>,
+) -> Result<Response, ApiError> {
+    stats_events(state, |s| &s.stats_streams, &query, collector::snapshot)
+}
+
+/// The error for a request body that could not be read.
+pub(crate) fn body_rejection(rejection: BytesRejection) -> ApiError {
+    if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        ApiError::new(
+            rejection.status(),
+            "invalid_request_error",
+            "request_too_large",
+            format!("the request body exceeds {MAX_BODY_BYTES} bytes"),
+        )
+    } else {
+        ApiError::invalid_request(rejection.body_text())
+    }
 }
 
 /// A chat request after parsing and model selection.
@@ -476,19 +501,7 @@ struct Prepared {
 
 /// Parse the body, select the model, and map the request.
 fn prepare(state: &ServerState, body: Result<Bytes, BytesRejection>) -> Result<Prepared, ApiError> {
-    let body = body.map_err(|rejection| {
-        let status = rejection.status();
-        if status == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::new(
-                status,
-                "invalid_request_error",
-                "request_too_large",
-                format!("the request body exceeds {MAX_BODY_BYTES} bytes"),
-            )
-        } else {
-            ApiError::invalid_request(rejection.body_text())
-        }
-    })?;
+    let body = body.map_err(body_rejection)?;
     let parsed: ChatCompletionRequest = serde_json::from_slice(&body)
         .map_err(|e| ApiError::invalid_request(format!("invalid request body: {e}")))?;
     let slot = state

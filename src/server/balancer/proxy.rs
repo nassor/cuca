@@ -26,12 +26,11 @@
 //! traffic (counters, histograms and the bounded latency rings).
 
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use axum::Json;
 use axum::Router;
@@ -41,14 +40,11 @@ use axum::extract::{DefaultBodyLimit, Extension, Query, Request, State};
 use axum::http::header::{ACCEPT, CONTENT_TYPE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
-use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use futures_core::Stream;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio_stream::StreamExt;
-use tokio_stream::wrappers::IntervalStream;
 use tracing::Span;
 
 use super::metrics as balancer_metrics;
@@ -56,7 +52,9 @@ use super::routing::{Decision, NoCandidate, prefix_key, resolve_model};
 use super::snapshot;
 use super::state::{BalancerState, as_views, decision_slot};
 use super::upstream::{Upstream, short_error};
-use crate::server::http::{ApiError, RequestCtx, bearer_matches, trace_request};
+use crate::server::http::{
+    ApiError, RequestCtx, StreamQuery, bearer_matches, body_rejection, stats_events, trace_request,
+};
 use crate::server::latency::{Outcome, RequestRecord};
 
 /// Largest accepted request body.
@@ -225,47 +223,11 @@ async fn stats(State(state): State<Arc<BalancerState>>) -> Json<Value> {
     Json(serde_json::to_value(snapshot::build(&state)).unwrap_or(Value::Null))
 }
 
-#[derive(Deserialize)]
-struct StreamQuery {
-    interval_ms: Option<u64>,
-}
-
-/// Decrements the open-streams count when the stream ends.
-struct StreamSlot(Arc<BalancerState>);
-
-impl Drop for StreamSlot {
-    fn drop(&mut self) {
-        self.0.stats_streams.fetch_sub(1, Ordering::Relaxed);
-    }
-}
-
 async fn stats_stream(
     State(state): State<Arc<BalancerState>>,
     Query(query): Query<StreamQuery>,
 ) -> Result<Response, ApiError> {
-    if state.stats_streams.fetch_add(1, Ordering::Relaxed) >= MAX_STATS_STREAMS {
-        state.stats_streams.fetch_sub(1, Ordering::Relaxed);
-        return Err(ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "rate_limit_error",
-            "too_many_streams",
-            format!("at most {MAX_STATS_STREAMS} stats streams at once"),
-        ));
-    }
-    let slot = StreamSlot(Arc::clone(&state));
-    let interval_ms = query.interval_ms.unwrap_or(1000).clamp(250, 10_000);
-    let mut interval = tokio::time::interval(Duration::from_millis(interval_ms));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let events = IntervalStream::new(interval).map(move |_| {
-        let _open = &slot;
-        let event = Event::default()
-            .json_data(snapshot::build(&state))
-            .unwrap_or_else(|_| Event::default().comment("snapshot could not be serialized"));
-        Ok::<_, Infallible>(event)
-    });
-    Ok(Sse::new(events)
-        .keep_alive(KeepAlive::default())
-        .into_response())
+    stats_events(state, |s| &s.stats_streams, &query, snapshot::build)
 }
 
 /// What the balancer reads of a chat body.
@@ -300,18 +262,7 @@ struct Routed {
 }
 
 fn route(state: &BalancerState, body: Result<Bytes, BytesRejection>) -> Result<Routed, ApiError> {
-    let body = body.map_err(|rejection| {
-        if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::new(
-                rejection.status(),
-                "invalid_request_error",
-                "request_too_large",
-                format!("the request body exceeds {MAX_BODY_BYTES} bytes"),
-            )
-        } else {
-            ApiError::invalid_request(rejection.body_text())
-        }
-    })?;
+    let body = body.map_err(body_rejection)?;
     let peek: Peek = serde_json::from_slice(&body)
         .map_err(|e| ApiError::invalid_request(format!("invalid request body: {e}")))?;
     let owned = state.views();
