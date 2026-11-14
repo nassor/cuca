@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.8.0 - 2026-11-14
 
 ### Added
 
@@ -166,6 +166,10 @@
 - `LocalModelConfig::cache_dir` set to `None` is the platform cache directory, and `hf_token` set to
   `None` or an empty string is anonymous access; the library no longer reads `CUCA_CACHE_DIR` or
   `HF_TOKEN`.
+- Internal simplification across the crate (shared SSE stream loop and HTTP error handling for the
+  providers, shared server and balancer helpers, de-duplicated plugin, engine and converter code);
+  no public API, numeric or file-format change. A converter that fails to rename its output now also
+  removes the partial file.
 
 ### Removed
 
