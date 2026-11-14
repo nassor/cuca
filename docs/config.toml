@@ -1,6 +1,6 @@
 base_url = "https://nassor.github.io/cuca"
 title = "CUCA Documentation"
-description = "An asynchronous Rust client for LLM backends: one unified request, one typed block stream, eight provider adapters, twelve plugins and seven services."
+description = "A Rust crate for language models: a client for seven LLM APIs, and a local engine that runs a model in your program, as an OpenAI-compatible server, or behind a load balancer."
 default_language = "en"
 compile_sass = false
 build_search_index = false

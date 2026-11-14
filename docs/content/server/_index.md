@@ -18,7 +18,7 @@ kicker = "Reference"
 <dd>You want vLLM or llama.cpp style endpoints backed by the cuca engine, or the latency, resource and metric names a dashboard can read.</dd>
 </dl>
 
-The server is an application layer over [`provider-local`](@/providers/local/_index.md). It loads one or more GGUF or checkpoint models with `LocalModel::load` and answers `POST /v1/chat/completions` the way vLLM and llama.cpp's server do. One binary, `cuca`, carries three subcommands.
+The server is an application layer over [`provider-local`](@/providers/local/_index.md), and it holds two of the local engine's three modes: `cuca serve` is server mode and `cuca balance` is balancer mode. `serve` loads one or more GGUF or checkpoint models with `LocalModel::load` and answers `POST /v1/chat/completions` the way vLLM and llama.cpp's server do. One binary, `cuca`, carries three subcommands.
 
 <div class="dgm">
 <div class="dgm-scroll">

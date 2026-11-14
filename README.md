@@ -10,25 +10,109 @@
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.98%2B-orange)](https://www.rust-lang.org)
 
-CUCA is an asynchronous Rust library for talking to LLM backends. One `UnifiedRequest` goes in, and one `AgentResponseStream` of typed blocks (`Text`, `Thinking`, `ToolCall` and others) comes out, whichever provider answers. The streaming parser reuses one buffer and copies a frame only when it emits an event.
+CUCA is a Rust crate for language models, used in two ways:
 
-## What you get
+- A client for LLM APIs. One request type and one stream of typed replies work with OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM and LM Studio.
+- A local engine, `provider-local`, that runs the model itself on your CPU or GPU. It runs in three modes: as a library inside your program, as an OpenAI-compatible server (`cuca serve`), and as a load balancer over several servers (`cuca balance`).
 
-Nothing is compiled by default. You pick Cargo features, and the build fails until you pick at least one provider. The full list is on the [features page](https://nassor.github.io/cuca/reference/features/).
+<img src="docs/static/overview.svg" alt="Your application sends requests either over HTTP to an LLM API, or to the local engine in its own process. HTTP clients reach the same engine through cuca balance and cuca serve." width="660">
 
-- [Providers](https://nassor.github.io/cuca/providers/): `provider-openai` (also Ollama and other OpenAI-compatible servers), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm` and `provider-lmstudio` over HTTP, and `provider-local`, which runs a GGUF model inside your process.
+Nothing compiles by default: you pick Cargo features, and the build fails until at least one provider is on. The [features page](https://nassor.github.io/cuca/reference/features/) lists them all.
+
+## Client for LLM APIs
+
+<img src="docs/static/mode-client.svg" alt="Your app's request passes the plugins' on_request hooks and the provider adapter, goes over HTTP to the LLM API, and comes back as server-sent events that the SSE parser turns into typed blocks, which pass the plugins' on_stream_chunk hooks on the way to your app." width="660">
+
+You build a `UnifiedRequest`, and `CucaClient::generate_stream` returns a stream of `MessageContentBlock` values (`Text`, `Thinking`, `ToolCall` and others), whichever provider answers. The SSE parser reuses one buffer and copies a frame only when it emits an event. The [Quick start](#quick-start) streams a first reply.
+
+- [Providers](https://nassor.github.io/cuca/providers/): `provider-openai` (also Ollama and any OpenAI-compatible server), `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm` and `provider-lmstudio`.
 - [Plugins](https://nassor.github.io/cuca/plugins/) watch the request and the stream: MCP, WASM sandbox, memory, guardrails, subagents, human approval, web search, skills, telemetry, session log, cost accounting and redaction.
 - [Services](https://nassor.github.io/cuca/services/) are called directly: prompt cache, entity extraction, session replay, speculative fast/slow routing, rate limiting, a vector store and a call scheduler.
-- Thinking: one effort level, `minimal` to `xhigh`, maps onto each provider's native reasoning control. Providers without one ignore it.
-- Sampling: `temperature`, `max_tokens`, `top_p`, `top_k`, `seed` and `stop` are fields of the request. An adapter whose backend has no equivalent returns `CucaError::Config` instead of dropping the value.
+- The request carries one thinking effort, `minimal` to `xhigh`, mapped onto each provider's reasoning control and ignored by providers without one. It also carries the sampling fields `temperature`, `max_tokens`, `top_p`, `top_k`, `seed` and `stop`; a field the backend has no equivalent for returns `CucaError::Config`.
 
-Start with the [Quick start](#quick-start) below, or read the [documentation site](https://nassor.github.io/cuca/).
+## Local engine
+
+`provider-local` runs a GGUF model in Rust, with no llama.cpp and no FFI written by cuca: candle on the CPU, burn and CubeCL on a GPU through the `provider-local-vulkan`, `-metal`, `-cuda` or `-rocm` feature. It reads the architecture from the file and supports 20, among them Gemma 4, Qwen 3.5, Mistral Small 4 and DeepSeek-V4.1. A preset name downloads a pinned file, and a Hugging Face safetensors checkpoint is converted once to a cached GGUF. See [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) and [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/).
+
+### Library mode
+
+<img src="docs/static/mode-library.svg" alt="LocalModel::load reads a preset, a GGUF file or a checkpoint and starts an engine thread in your process. Your application sends a UnifiedRequest to it through a CucaClient and receives Text, Thinking and ToolCall blocks." width="660">
+
+The model runs inside your program, through the same `CucaClient` as the HTTP providers. With `cuca` added with `--features provider-local`, plus `tokio` and `futures-util`:
+
+```rust
+use cuca::types::{MessageContentBlock, ProviderEndpoint};
+use cuca::{CucaClient, LocalModel, LocalModelConfig, UnifiedRequest};
+use futures_util::StreamExt;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Downloads the default model, Gemma 4 E2B Q4_0 (2.84 GB), on first use.
+    let model = LocalModel::load(LocalModelConfig::default()).await?;
+    let client = CucaClient::builder()
+        .with_provider(ProviderEndpoint::Local)
+        .with_local_model(model)
+        .build()?;
+
+    let request = UnifiedRequest::new("local").add_user_message("Explain CUCA in one sentence.");
+    let mut stream = client.generate_stream(request).await?;
+    while let Some(block) = stream.next().await {
+        if let MessageContentBlock::Text(text) = block? {
+            print!("{text}");
+        }
+    }
+    Ok(())
+}
+```
+
+The [Local page](https://nassor.github.io/cuca/providers/local/) covers the presets, the GPU features and the build flags.
+
+### Server mode
+
+<img src="docs/static/mode-server.svg" alt="HTTP clients call cuca serve, which answers the OpenAI chat route, the model list, health, metrics and a stats API, and runs each request on one of its local models. cuca tui or Prometheus reads the stats and metrics." width="660">
+
+`cuca serve` answers `POST /v1/chat/completions` the way vLLM and llama.cpp's server do, with Prometheus metrics and a stats API. It reads one KDL file. Save this as `cuca.kdl`:
+
+```kdl
+serve {
+    stats_api #true
+
+    model {
+        source "qwen3-0.6b-q8_0"
+    }
+}
+```
+
+Start it from the repository root; this command runs the same on Linux, macOS and Windows (PowerShell):
+
+```
+cargo run --release --no-default-features --features server --bin cuca -- serve --config cuca.kdl
+```
+
+The server listens on `http://127.0.0.1:8000`. The [Serve a model over HTTP](https://nassor.github.io/cuca/guides/serve-a-model/) guide sends a first chat completion and opens the terminal UI.
+
+### Balancer mode
+
+<img src="docs/static/mode-balancer.svg" alt="HTTP clients call cuca balance, which sends each request to one of three cuca serve instances and polls each one's health, models and stats." width="660">
+
+`cuca balance` spreads chat requests over several `cuca serve` instances and streams each answer back unchanged. Its default policy keeps a conversation on the server that already caches its prompt prefix. It reads the `balance` section of the same file:
+
+```kdl
+balance {
+    listen "127.0.0.1:8080"
+    upstreams "http://10.0.0.1:8000" "http://10.0.0.2:8000"
+}
+```
+
+```
+cargo run --release --no-default-features --features server --bin cuca -- balance --config cuca.kdl
+```
+
+The [Balancer page](https://nassor.github.io/cuca/server/balancer/) covers the policies, health checks and retries.
 
 ## Quick start
 
-Prerequisites: Rust 1.98 or newer, a checkout of this repository, and `llama-server` from llama.cpp with a Gemma 4 E4B GGUF file. About 15 minutes end to end.
-
-You will start the model on port 1234, create a small crate, and stream one reply into your terminal. Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShell).
+This streams a reply from a model served by llama.cpp through the client. Prerequisites: Rust 1.98 or newer, a checkout of this repository, and `llama-server` from llama.cpp with a Gemma 4 E4B GGUF file. About 15 minutes end to end. Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShell).
 
 1. Start the model server in its own terminal and leave it running. Replace `/path/to/model.gguf` with your GGUF file. The `google/gemma-4-e4b` repository on Hugging Face holds safetensors, so `llama-server -hf` cannot load it.
 
@@ -61,17 +145,15 @@ You will start the model on port 1234, create a small crate, and stream one repl
 
    You see ``Creating binary (application) `cuca-demo` package``.
 
-3. Add CUCA from your checkout with the llama.cpp provider enabled. Replace `/path/to/cuca` with the path of this repository.
+3. Add CUCA from your checkout with the llama.cpp provider. Replace `/path/to/cuca` with the path of this repository.
 
    ```
    cargo add cuca --path /path/to/cuca --features provider-llamacpp
    ```
 
-   You see `Adding cuca (local) to dependencies`, followed by the feature list, with `+ provider-llamacpp` enabled and every other feature listed as disabled.
+   You see `Adding cuca (local) to dependencies`, then the feature list with `+ provider-llamacpp` enabled.
 
-   The llama.cpp adapter defaults to `http://127.0.0.1:8080`, so the demo below sets the base URL to port 1234. No API key is needed.
-
-4. Add the async runtime and stream extension trait used by the demo.
+4. Add the async runtime and the stream extension trait.
 
    ```
    cargo add tokio --features macros,rt-multi-thread
@@ -80,7 +162,7 @@ You will start the model on port 1234, create a small crate, and stream one repl
 
    Each command prints `Adding <name> v<version> to dependencies`.
 
-5. Replace `src/main.rs` with the demo below.
+5. Replace `src/main.rs` with the demo below. The llama.cpp adapter defaults to `http://127.0.0.1:8080`, so the demo sets port 1234. No API key is needed.
 
    ```rust
    use cuca::types::{MessageContentBlock, ProviderEndpoint};
@@ -108,64 +190,17 @@ You will start the model on port 1234, create a small crate, and stream one repl
    }
    ```
 
-   The program builds a client pointed at the local llama.cpp server, streams the model's reply, and prints each text chunk as it arrives.
-
 6. Run the demo.
 
    ```
    cargo run
    ```
 
-   You see Gemma 4 E4B's reply stream to your terminal, one chunk at a time; the process exits once the stream ends. A reasoning model pauses before the first word: the demo prints `Text` blocks and drops `Thinking` ones, so nothing appears until the reasoning is done.
+   Gemma 4 E4B's reply streams to your terminal and the process exits when it ends. The demo prints `Text` blocks and drops `Thinking` ones, so a reasoning model shows nothing until its reasoning is done.
 
-## After the first run
+Next: any OpenAI-compatible server (Ollama at `http://localhost:11434/v1`, vLLM, a remote gateway) works with `provider-openai`, a different `with_base_url` and your model name. The `examples/` folder has a runnable demo for the client, every plugin and every service; most take `--base-url` and `--model` after `--`.
 
-- Enable only the provider features you use. The [Providers](https://nassor.github.io/cuca/providers/) pages list what each one talks to.
-- Any OpenAI-compatible server (Ollama, vLLM, a remote gateway) works with `provider-openai`, a different `with_base_url` and your model name. Ollama serves at `http://localhost:11434/v1`. LM Studio has its own `provider-lmstudio`, which defaults to `http://127.0.0.1:1234/v1`.
-- The `examples/` folder has a runnable demo for the core client, every plugin and every service. They take `--base-url` and `--model` after `--` (`speculative` takes `--fast-model` and `--slow-model`), and `local_model` takes `--config` with a KDL file. Each plugin and service page on the site shows the `cargo run` command and its output.
-
-### Run a model with no server
-
-`provider-local` runs a GGUF model inside your process, on the CPU unless a GPU feature (`provider-local-vulkan`, `-metal`, `-cuda` or `-rocm`) and a device are set. It downloads the default model, Gemma 4 E2B Q4_0 (2.84 GB), on first use. Inside an async function:
-
-```rust
-use cuca::types::ProviderEndpoint;
-use cuca::{CucaClient, LocalModel, LocalModelConfig};
-
-let model = LocalModel::load(LocalModelConfig::default()).await?;
-let client = CucaClient::builder()
-    .with_provider(ProviderEndpoint::Local)
-    .with_local_model(model)
-    .build()?;
-```
-
-`generate_stream` then works as in the Quick start. The [Local page](https://nassor.github.io/cuca/providers/local/) has the full example, the presets, the GPU features and the build command. [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) lists the supported architectures.
-
-A Hugging Face safetensors checkpoint needs no GGUF: `"Qwen/Qwen3-0.6B:<commit>".parse::<ModelSource>()?`, or `ModelSource::Dir` for a local directory, is converted once to a cached GGUF in pure Rust and loaded like any other file. See [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/#checkpoints).
-
-### Serve a model over HTTP
-
-The `cuca` binary turns the local engine into an OpenAI-compatible server (vLLM and llama.cpp style), with a load balancer for several servers, Prometheus metrics, a stats API and a terminal UI. It reads one KDL file. Save this as `cuca.kdl`:
-
-```kdl
-serve {
-    stats_api #true
-
-    model {
-        source "qwen3-0.6b-q8_0"
-    }
-}
-```
-
-This command runs the same on Linux, macOS and Windows (PowerShell):
-
-```
-cargo run --release --no-default-features --features server-tui --bin cuca -- serve --config cuca.kdl
-```
-
-Then `POST /v1/chat/completions` on `http://127.0.0.1:8000`. The [Server pages](https://nassor.github.io/cuca/server/) cover `serve`, `balance`, `tui`, the metrics and the stats API, and the [configuration reference](https://nassor.github.io/cuca/reference/environment/) covers the file.
-
-### Run the live tests
+## Run the live tests
 
 With a chat model on `http://127.0.0.1:1234` (a llama.cpp server works), run this on Linux, macOS and Windows (PowerShell):
 
@@ -173,7 +208,7 @@ With a chat model on `http://127.0.0.1:1234` (a llama.cpp server works), run thi
 cargo test --features "provider-llamacpp plugin-mcp plugin-sandbox plugin-memory service-entity-extraction plugin-guardrails plugin-subagent plugin-hitl plugin-web-search plugin-skills plugin-telemetry service-speculative plugin-session-log service-replay service-prompt-cache plugin-cost service-rate-limit service-vector-store plugin-redaction service-scheduler" -- --nocapture --test-threads=1
 ```
 
-Without a reachable server, the tests print `SKIP` and pass. To target another server or make a skip fail, copy `cuca-test.example.kdl` to `cuca-test.kdl`, edit it, and add `config-kdl` to the features. The keys are in the [configuration reference](https://nassor.github.io/cuca/reference/environment/), the steps in the [integration tests guide](https://nassor.github.io/cuca/guides/integration-tests/).
+Without a reachable server, the tests print `SKIP` and pass. To target another server or make a skip fail, copy `cuca-test.example.kdl` to `cuca-test.kdl`, edit it, and add `config-kdl` to the features. The [integration tests guide](https://nassor.github.io/cuca/guides/integration-tests/) has the steps.
 
 ## License
 

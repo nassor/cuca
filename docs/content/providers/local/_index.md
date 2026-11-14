@@ -18,7 +18,7 @@ kicker = "Reference"
 <dd>You are routing requests through <code>ProviderEndpoint::Local</code>, or you want a model that needs no external service.</dd>
 </dl>
 
-`LocalModel::load` resolves the GGUF file, loads the weights, the tokenizer and the chat template, and starts one engine thread. `CucaClientBuilder::with_local_model` attaches the model to a client built for `ProviderEndpoint::Local`. The engine is pure Rust: no llama.cpp and no FFI written by cuca.
+`LocalModel::load` resolves the GGUF file, loads the weights, the tokenizer and the chat template, and starts one engine thread. `CucaClientBuilder::with_local_model` attaches the model to a client built for `ProviderEndpoint::Local`. This is the engine's library mode; the [server](@/server/_index.md) runs the same engine in server and balancer mode. The engine is pure Rust: no llama.cpp and no FFI written by cuca.
 
 ## Endpoint
 
