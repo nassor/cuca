@@ -271,12 +271,11 @@ pub(crate) fn write_atomically(
         return Ok(());
     }
     let partial = download::with_suffix(out, ".partial");
-    if let Err(e) = build(&partial) {
+    let built = build(&partial).and_then(|()| std::fs::rename(&partial, out).map_err(Into::into));
+    if built.is_err() {
         let _ = std::fs::remove_file(&partial);
-        return Err(e);
     }
-    std::fs::rename(&partial, out)?;
-    Ok(())
+    built
 }
 
 /// Stream the GGUF file `partial`: the metadata `kv`, then every plan's
