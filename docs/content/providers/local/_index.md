@@ -1,6 +1,6 @@
 +++
 title = "Local (in-process)"
-description = "The provider-local adapter: a GGUF language model runs inside your process on the CPU or a GPU, with no server and no HTTP endpoint."
+description = "The provider-local adapter: a GGUF language model runs inside your process on the CPU, a GPU or both, with no server and no HTTP endpoint."
 template = "section.html"
 sort_by = "weight"
 weight = 8
@@ -11,14 +11,16 @@ kicker = "Reference"
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Runs a GGUF language model of a supported architecture (see <a href="@/providers/local/models.md">Local models and formats</a>) on the CPU or a GPU inside your process, with no server and no HTTP endpoint.</dd>
+<dd>Runs a GGUF language model of a supported architecture (see <a href="@/providers/local/models.md">Local models and formats</a>) on the CPU, a GPU or both inside your process, with no server and no HTTP endpoint.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature for the CPU, or <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> for a GPU. A GGUF file, a safetensors checkpoint, or disk for the one-time download (0.29 GB to 67.71 GB across the main-model presets, 2.84 GB for the default; a converted DeepSeek-V4.1 is about 507 GB, see <a href="@/providers/local/checkpoints.md#deepseek-v4-1">Local checkpoint conversion</a>). Memory of about the file size plus the K/V cache, or less for a mixture-of-experts model on <a href="@/providers/local/expert-tiers.md">tiered expert placement</a>.</dd>
+<dd>The <code>provider-local</code> feature for the CPU, or <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> for a GPU. A GGUF file, a safetensors checkpoint, or disk for the one-time download (0.29 GB to 67.71 GB across the main-model presets, 2.84 GB for the default; a converted DeepSeek-V4.1 is about 507 GB, see <a href="@/providers/local/checkpoints.md#deepseek-v4-1">Local checkpoint conversion</a>). Memory of about the file size plus the K/V cache, split between RAM and VRAM as <a href="@/providers/local/placement.md">Hybrid placement</a> describes, or less for a mixture-of-experts model on <a href="@/providers/local/expert-tiers.md">tiered expert placement</a>.</dd>
 <dt>Read this if</dt>
 <dd>You are routing requests through <code>ProviderEndpoint::Local</code>, or you want a model that needs no external service.</dd>
 </dl>
 
 `LocalModel::load` resolves the GGUF file, loads the weights, the tokenizer and the chat template, and starts one engine thread. `CucaClientBuilder::with_local_model` attaches the model to a client built for `ProviderEndpoint::Local`. This is the engine's library mode; the [server](@/server/_index.md) runs the same engine in server and balancer mode. The engine is pure Rust: no llama.cpp and no FFI written by cuca.
+
+A model need not fit one memory. `gpu_layers` splits the layers between the GPU and the CPU, `experts { host; }` computes a mixture of experts' experts on the CPU, and `experts { tiered ... }` leaves them in the file on disk behind RAM and VRAM caches. [Hybrid placement](@/providers/local/placement.md) maps every combination to VRAM, RAM and the SSD.
 
 ## Endpoint
 

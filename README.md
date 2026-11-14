@@ -13,7 +13,7 @@
 CUCA is a Rust crate for language models, used in two ways:
 
 - A client for LLM APIs. One request type and one stream of typed replies work with OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM and LM Studio.
-- A local engine, `provider-local`, that runs the model itself on your CPU or GPU. It runs in three modes: as a library inside your program, as an OpenAI-compatible server (`cuca serve`), and as a load balancer over several servers (`cuca balance`).
+- A local engine, `provider-local`, that runs the model itself on your CPU, your GPU or both, and spreads a model larger than either memory over VRAM, RAM and the SSD. It runs in three modes: as a library inside your program, as an OpenAI-compatible server (`cuca serve`), and as a load balancer over several servers (`cuca balance`).
 
 <img src="docs/static/overview.svg" alt="Your application sends requests either over HTTP to an LLM API, or to the local engine in its own process. HTTP clients reach the same engine through cuca balance and cuca serve." width="660">
 
@@ -33,6 +33,31 @@ You build a `UnifiedRequest`, and `CucaClient::generate_stream` returns a stream
 ## Local engine
 
 `provider-local` runs a GGUF model in Rust, with no llama.cpp and no FFI written by cuca: candle on the CPU, burn and CubeCL on a GPU through the `provider-local-vulkan`, `-metal`, `-cuda` or `-rocm` feature. It reads the architecture from the file and supports 20, among them Gemma 4, Qwen 3.5, Mistral Small 4 and DeepSeek-V4.1. A preset name downloads a pinned file, and a Hugging Face safetensors checkpoint is converted once to a cached GGUF. See [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) and [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/).
+
+### VRAM, RAM and SSD
+
+<img src="docs/static/hybrid-placement.svg" alt="The GPU computes from VRAM and the CPU from RAM, while the GGUF file stays on the SSD. VRAM holds the last gpu_layers layers, attention, the router, the head and the expert device tier; RAM holds the first layers, the embeddings, host experts, the expert RAM tier and the Engram row cache; reader threads fill RAM from the file and uploads fill VRAM from RAM." width="660">
+
+A model does not have to fit one memory. The GGUF file stays on the SSD, and four keys choose which parts move into RAM or VRAM, and whether the CPU or the GPU computes them:
+
+- `gpu_layers` runs the last layers on the GPU and the first ones on the CPU, as llama.cpp's `-ngl` does.
+- `experts { host; }` keeps a mixture of experts' routed experts in RAM for the CPU, while attention, the router and the head run on the GPU.
+- `experts { tiered ... }` leaves the experts in the file and caches the hottest ones in RAM (`ram_bytes`) and VRAM (`device_bytes`). Output equals a resident load's, bit for bit on the CPU and to float rounding on a GPU.
+- `engram` bounds the RAM cache of DeepSeek-V4.1's Engram table, which also stays in the file.
+
+Qwen3.6-35B-A3B is a 20.84 GB file; on a 16 GB GPU it runs with 4 GiB of experts in VRAM, 12 GiB in RAM and the rest read from the SSD on demand. Save this as `moe.kdl` and run it from the repository root; the command runs the same on Linux, macOS and Windows (PowerShell):
+
+```kdl
+source "qwen3.6-35b-a3b-q4_0"
+device "vulkan"
+experts { tiered device_bytes="4g" ram_bytes="12g"; }
+```
+
+```
+cargo run --release --example local_model --features provider-local-vulkan -- --config moe.kdl
+```
+
+The same keys go in a `model` node of `cuca serve`'s file, and in library mode they are the fields of `LocalModelConfig`. On an RX 9070 XT (16 GB) with 125 GB of RAM, Muse Glimmer 30B (16.27 GB) decodes at 8.3 tokens/s with 38 of 52 layers on the GPU, against 3.5 on the CPU alone. DeepSeek-V4.1, a 507 GB converted set, runs from an NVMe SSD behind 90 GiB of expert cache in RAM: 2.15 tokens/s on the CPU alone, 1.96 with attention on the GPU in 12.5 GiB of VRAM. [Hybrid placement](https://nassor.github.io/cuca/providers/local/placement/) lists every combination and its measurements.
 
 ### Library mode
 

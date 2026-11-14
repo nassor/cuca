@@ -23,10 +23,18 @@ serve {
         source "qwen3-0.6b-q8_0"
         batching max_sequences=8
     }
+    // Layer offload: the last 20 layers on the GPU, the first ones on the CPU.
     model {
         source file="/models/gemma-4-E4B-it-Q4_0.gguf"
         device "vulkan:0"
         gpu_layers 20
+    }
+    // A mixture of experts larger than the GPU: 4 GiB of experts in VRAM,
+    // 12 GiB in RAM, the rest read from the GGUF file on demand.
+    model "moe" {
+        source "qwen3.6-35b-a3b-q4_0"
+        device "vulkan:0"
+        experts { tiered device_bytes="4g" ram_bytes="12g"; }
     }
 }
 

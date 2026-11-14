@@ -38,7 +38,7 @@ A missing or invalid file stops the command with exit status 1 and a message tha
 
 The `serve` section holds the server's keys and one `model` node per model. The `log` section applies to every command; see [logs](@/server/stats-and-metrics.md#logs). The whole file, including the `balance` section, is `examples/configs/cuca.kdl` in the repository; the syntax is on [Configuration files](@/reference/environment.md).
 
-```kdl,name=Two models, the second on a GPU
+```kdl,name=Three models: one on the CPU, one split between the GPU and the CPU, one mixture of experts over VRAM, RAM and the SSD
 variables {
     API_KEY "change-me"
 }
@@ -55,10 +55,18 @@ serve {
         source "qwen3-0.6b-q8_0"
         batching max_sequences=8
     }
+    // Layer offload: the last 20 layers on the GPU, the first ones on the CPU.
     model {
         source file="/models/gemma-4-E4B-it-Q4_0.gguf"
         device "vulkan:0"
         gpu_layers 20
+    }
+    // A mixture of experts larger than the GPU: 4 GiB of experts in VRAM,
+    // 12 GiB in RAM, the rest read from the GGUF file on demand.
+    model "moe" {
+        source "qwen3.6-35b-a3b-q4_0"
+        device "vulkan:0"
+        experts { tiered device_bytes="4g" ram_bytes="12g"; }
     }
 }
 ```
@@ -81,7 +89,7 @@ A `model` node holds a [`LocalModelConfig`](@/providers/local/configuration.md):
 | `context_length` | the smaller of 8192 and the model's maximum | tokens of prompt plus completion per request |
 | `batching` | `max_sequences=4` | `max_sequences=4 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false` |
 | `experts` | `"resident"` | `"resident"`, `{ tiered ram_bytes="4g" device_bytes="6g" loader_threads=4 }` or `{ host layers=4 }` |
-| `gpu_layers` | all | layers on the GPU, the rest on the CPU |
+| `gpu_layers` | all | layers on the GPU, the rest on the CPU; see [Hybrid placement](@/providers/local/placement.md) |
 | `cache_dir` | the platform cache directory | where models download and convert |
 | `chat_template_file` | the model's template | a Jinja file that replaces the template |
 | `convert` | `quant="q8_0"` | checkpoint conversion: `quant` is `f16`, `q8_0` or `q4_0` |

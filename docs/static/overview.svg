@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 310" width="660" height="310" role="img" aria-labelledby="title desc">
   <title id="title">Two ways to use CUCA: a client for LLM APIs, and a local engine with three modes.</title>
-  <desc id="desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU or a GPU; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call cuca balance, which forwards each request to a cuca serve instance, which runs the local engine; these are balancer mode and server mode.</desc>
+  <desc id="desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU, a GPU or both; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call cuca balance, which forwards each request to a cuca serve instance, which runs the local engine; these are balancer mode and server mode.</desc>
   <style>
     .frame { fill: #fafafa; stroke: #e4e4e7; }
     text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
@@ -65,7 +65,7 @@
   <text class="t-ax t-mid" x="308" y="100">client for LLM APIs</text>
   <rect class="blk blk-data" x="450" y="152" width="190" height="56" rx="6"/>
   <text class="t-lbl t-mid t-data" x="545" y="176">local engine</text>
-  <text class="t-mid" x="545" y="193">provider-local, CPU or GPU</text>
+  <text class="t-mid" x="545" y="193">provider-local, CPU and GPU</text>
   <path class="arw arw-data" d="M95 114 V180 H444" marker-end="url(#a-data)"/>
   <text class="t-mid t-data" x="270" y="172">in process</text>
   <text class="t-ax t-mid" x="270" y="196">library mode</text>

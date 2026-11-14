@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 250" width="660" height="250" role="img" aria-labelledby="title desc">
   <title id="title">The local engine running inside your application.</title>
-  <desc id="desc">LocalModel::load reads a model source, a preset name, a GGUF file or a safetensors checkpoint, downloading or converting it once, and starts one engine thread. Your application sends a UnifiedRequest through a CucaClient to that thread. The engine applies the chat template and the tokenizer, runs batched steps over a paged K/V cache on the CPU or a GPU, and parses the output into Text, Thinking and ToolCall blocks that stream back to the application. Everything runs in your process; the network is used only for the download.</desc>
+  <desc id="desc">LocalModel::load reads a model source, a preset name, a GGUF file or a safetensors checkpoint, downloading or converting it once, and starts one engine thread. Your application sends a UnifiedRequest through a CucaClient to that thread. The engine applies the chat template and the tokenizer, runs batched steps over a paged K/V cache, and parses the output into Text, Thinking and ToolCall blocks that stream back to the application. It computes on the GPU from VRAM, on the CPU from RAM, or on both, and reads mixture-of-experts weights from the SSD on demand. Everything runs in your process; the network is used only for the download.</desc>
   <style>
     .frame { fill: #fafafa; stroke: #e4e4e7; }
     text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
@@ -57,10 +57,11 @@
   <text class="t-mid" x="100" y="90">preset, GGUF, checkpoint</text>
   <rect class="blk blk-data" x="420" y="52" width="220" height="150" rx="6"/>
   <text class="t-lbl t-mid t-data" x="530" y="80">engine thread</text>
-  <text class="t-mid" x="530" y="108">chat template, tokenizer</text>
-  <text class="t-mid" x="530" y="128">batched steps, paged K/V</text>
-  <text class="t-mid" x="530" y="148">output parser</text>
-  <text class="t-mid" x="530" y="176">CPU or GPU</text>
+  <text class="t-mid" x="530" y="104">chat template, tokenizer</text>
+  <text class="t-mid" x="530" y="122">batched steps, paged K/V</text>
+  <text class="t-mid" x="530" y="140">output parser</text>
+  <text class="t-mid t-data" x="530" y="166">GPU + VRAM, CPU + RAM</text>
+  <text class="t-mid t-data" x="530" y="184">experts from the SSD</text>
   <path class="arw" d="M182 77 H416" marker-end="url(#a)"/>
   <text class="t-mid" x="299" y="70">LocalModel::load</text>
   <text class="t-ax t-mid" x="299" y="92">download or convert once</text>

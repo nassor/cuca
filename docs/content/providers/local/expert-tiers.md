@@ -2,7 +2,7 @@
 title = "Tiered expert placement"
 description = "LocalModelConfig::experts runs a mixture-of-experts model with its experts in the GGUF file and a bounded RAM and device cache, with the same output as a resident load."
 template = "page.html"
-weight = 12
+weight = 13
 +++
 
 # Tiered expert placement
@@ -16,7 +16,7 @@ weight = 12
 <dd>A mixture-of-experts model is larger than the RAM or device memory you want to spend on it, or you need the cache counters and the heat export.</dd>
 </dl>
 
-A token routes to `n_used` of a layer's `n_expert` experts, yet the default placement, `ExpertPlacement::Resident`, loads every expert at startup, so memory is the file size. Tiered placement keeps the dense weights (attention, norms, routers, embeddings, head) resident and leaves the experts in the file. Qwen3-30B-A3B is 17.38 GB, of which the expert tensors are 16.38 GB.
+A token routes to `n_used` of a layer's `n_expert` experts, yet the default placement, `ExpertPlacement::Resident`, loads every expert at startup, so memory is the file size. Tiered placement keeps the dense weights (attention, norms, routers, embeddings, head) resident and leaves the experts in the file. Qwen3-30B-A3B is 17.38 GB, of which the expert tensors are 16.38 GB. How the tiers combine with `gpu_layers` and host experts is on [Hybrid placement](@/providers/local/placement.md).
 
 ## Configuration
 

@@ -23,3 +23,30 @@ source "qwen3-0.6b-q8_0"                 // or: source file="/models/x.gguf" | s
 // drafter "in-trunk"                       // or a source in any form above
 // draft_tokens 5
 // shard_dirs "E:/parts" "F:/parts"
+
+// Hybrid placement: a model larger than the GPU or RAM spreads over VRAM, RAM
+// and the GGUF file on the SSD. To use a recipe, replace the active `source`
+// above with its keys.
+//
+// Dense model, 38 of 52 layers on the GPU and the first 14 on the CPU:
+//   source "muse-glimmer-30b-q4_0"
+//   device "vulkan"
+//   gpu_layers 38
+//
+// Mixture of experts on the GPU, 4 GiB of experts in VRAM, 12 GiB in RAM and
+// the rest read from the file on demand:
+//   source "qwen3.6-35b-a3b-q4_0"
+//   device "vulkan"
+//   experts { tiered device_bytes="4g" ram_bytes="12g"; }
+//
+// Attention on the GPU, every routed expert in RAM and computed by the CPU:
+//   source "mistral-small-4-119b-q4_0"
+//   device "vulkan"
+//   experts { host; }
+//
+// Attention on the GPU, experts on the SSD behind an 85 GiB RAM tier that the
+// CPU computes from (host-tiered), the Engram rows behind a 4 GiB cache:
+//   source "deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>"
+//   device "vulkan"
+//   experts { tiered ram_bytes="85g" loader_threads=32; }
+//   engram ram_bytes="4g" reader_threads=16

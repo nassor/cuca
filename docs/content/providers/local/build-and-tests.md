@@ -2,7 +2,7 @@
 title = "Build requirements and tests"
 description = "The dependencies provider-local owns, the C compiler and download needs of each feature, and the live test suites with their commands."
 template = "page.html"
-weight = 13
+weight = 14
 +++
 
 # Build requirements and tests

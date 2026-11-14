@@ -330,6 +330,7 @@ impl<'de> Deserialize<'de> for ModelSpec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ExpertPlacement;
     use crate::server::balancer::routing::Policy;
 
     fn spec(name: &str) -> ModelSpec {
@@ -354,10 +355,14 @@ mod tests {
         let serve = config.into_serve().unwrap();
         serve.validate().unwrap();
         let names: Vec<&str> = serve.models.iter().map(|m| m.name.as_str()).collect();
-        assert_eq!(names, ["chat", "gemma-4-E4B-it-Q4_0"]);
+        assert_eq!(names, ["chat", "gemma-4-E4B-it-Q4_0", "moe"]);
         assert_eq!(serve.api_key.as_deref(), Some("change-me"));
         assert_eq!(serve.models[0].config.batching.max_sequences, 8);
         assert_eq!(serve.models[1].config.gpu_layers, Some(20));
+        let ExpertPlacement::Tiered(tiers) = &serve.models[2].config.experts else {
+            panic!("the moe model has tiered experts");
+        };
+        assert_eq!((tiers.device_bytes, tiers.ram_bytes), (4 << 30, 12 << 30));
         assert_eq!(balance.policy, Policy::PrefixAffinity);
         assert_eq!(balance.health_interval, Duration::from_secs(1));
         assert_eq!(balance.upstream_api_key.as_deref(), Some("change-me"));

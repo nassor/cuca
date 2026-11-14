@@ -2,7 +2,7 @@
 title = "Local engine on a GPU"
 description = "LocalDevice, the GPU cargo features, tensor parallelism, layer offload, host experts, device memory, measured speed and what ran on which backend."
 template = "page.html"
-weight = 11
+weight = 12
 +++
 
 # Local engine on a GPU
@@ -18,7 +18,7 @@ weight = 11
 
 ## Devices and GPU features
 
-The model runs on the CPU unless `LocalModelConfig::device` selects a GPU. A GPU device runs the forward pass through burn 0.22 and CubeCL, and the engine thread owns the device. Every supported architecture runs through the GPU forward pass except the Gemma 4 mixture of experts (26B-A4B), which runs on the CPU engine only: a GPU load of it fails with a `CucaError::Provider`. The in-trunk head, the EAGLE drafter, the DFlash drafter and the DSpark drafter are CPU only; the Gemma 4 assistant runs on the GPU.
+The model runs on the CPU unless `LocalModelConfig::device` selects a GPU. A GPU device runs the forward pass through burn 0.22 and CubeCL, and the engine thread owns the device. Every supported architecture runs through the GPU forward pass except the Gemma 4 mixture of experts (26B-A4B), which runs on the CPU engine only: a GPU load of it fails with a `CucaError::Provider`. The in-trunk head, the EAGLE drafter, the DFlash drafter and the DSpark drafter are CPU only; the Gemma 4 assistant runs on the GPU. A model larger than the card splits between the GPU and the CPU through [layer offload](#layer-offload-gpu-layers), [host experts](#host-experts) or [tiered experts](@/providers/local/expert-tiers.md); [Hybrid placement](@/providers/local/placement.md) compares them.
 
 | Feature | Backend | Extra build needs |
 |---|---|---|

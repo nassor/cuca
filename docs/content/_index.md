@@ -25,7 +25,7 @@ kicker = "Compact Universal Client for Agents"
 <div class="dgm-scroll">
 <svg viewBox="10 12 660 290" role="img" aria-labelledby="use-title use-desc">
   <title id="use-title">Two ways to use CUCA: a client for LLM APIs, and a local engine with three modes</title>
-  <desc id="use-desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU or a GPU; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call cuca balance, which forwards each request to a cuca serve instance, which runs the local engine; these are balancer mode and server mode.</desc>
+  <desc id="use-desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU, a GPU or both; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call cuca balance, which forwards each request to a cuca serve instance, which runs the local engine; these are balancer mode and server mode.</desc>
   <defs>
     <marker id="use-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -46,7 +46,7 @@ kicker = "Compact Universal Client for Agents"
   <text class="t-ax t-mid" x="308" y="100">client for LLM APIs</text>
   <rect class="blk blk-data" x="450" y="152" width="190" height="56" rx="6"/>
   <text class="t-lbl t-mid t-data" x="545" y="176">local engine</text>
-  <text class="t-sm t-mid" x="545" y="193">provider-local, CPU or GPU</text>
+  <text class="t-sm t-mid" x="545" y="193">provider-local, CPU and GPU</text>
   <path class="arw arw-data" d="M95 114 V180 H444" marker-end="url(#use-arrow)"/>
   <text class="t-sm t-mid t-data" x="270" y="172">in process</text>
   <text class="t-ax t-mid" x="270" y="196">library mode</text>
@@ -73,7 +73,7 @@ One `UnifiedRequest` goes to OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLL
 
 ### Local engine
 
-`provider-local` runs a GGUF model in Rust on the CPU or a GPU. It has three modes:
+`provider-local` runs a GGUF model in Rust on the CPU, a GPU or both. One model can span VRAM, RAM and the SSD: layers split between the GPU and the CPU, and a mixture of experts keeps its experts on disk behind RAM and VRAM caches. See [Hybrid placement](@/providers/local/placement.md). It has three modes:
 
 - Library mode: the model runs inside your program behind the same `CucaClient`. See [Local (in-process)](@/providers/local/_index.md).
 - Server mode: `cuca serve` answers OpenAI-compatible chat requests over HTTP, with metrics and a stats API. See [Serve a model over HTTP](@/guides/serve-a-model.md) and [Model server](@/server/model-server.md).

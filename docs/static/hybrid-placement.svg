@@ -1,0 +1,94 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 340" width="660" height="340" role="img" aria-labelledby="title desc">
+  <title id="title">One local model spread over VRAM, RAM and the disk, computed by the GPU and the CPU.</title>
+  <desc id="desc">Two processors sit above two memories: the GPU above VRAM and the CPU above RAM. The GGUF file on the SSD sits beside them with no processor. VRAM holds the last gpu_layers layers, attention, the router and the head, the expert device tier, and the K/V of the GPU layers. RAM holds the first layers and the embeddings, host experts, the expert RAM tier, the Engram row cache, and the K/V of the CPU layers. The file holds every tensor, the experts no tier holds, the Engram table, and split parts on any volume. Reader threads read from the file into RAM, and uploads move experts from RAM to VRAM. The hidden state crosses between the GPU and the CPU at the gpu_layers cut and for host experts. The keys device, gpu_layers, experts and engram choose where each part lives.</desc>
+  <style>
+    .frame { fill: #fafafa; stroke: #e4e4e7; }
+    text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
+    .t-title { font-family: system-ui, -apple-system, "Segoe UI", sans-serif; font-size: 15px; font-weight: 600; fill: #09090b; }
+    .t-lbl { font-size: 12px; fill: #09090b; }
+    .t-ax { font-size: 10px; }
+    .t-mid { text-anchor: middle; }
+    .t-data { fill: #b65b0c; }
+    .t-ctl { fill: #0a7166; }
+    .t-bnd { fill: #7030c6; }
+    .blk { fill: #ffffff; stroke: #d4d4d8; stroke-width: 1; }
+    .blk-data { stroke: #b65b0c; }
+    .blk-ctl { stroke: #0a7166; }
+    .blk-bnd { stroke: #7030c6; }
+    .arw { fill: none; stroke: #71717a; stroke-width: 1.5; }
+    .arw-data { stroke: #b65b0c; }
+    .arw-ctl { stroke: #0a7166; }
+    .arw-bnd { stroke: #7030c6; stroke-dasharray: 5 4; }
+    .head { fill: #71717a; }
+    .head-data { fill: #b65b0c; }
+    .head-ctl { fill: #0a7166; }
+    .head-bnd { fill: #7030c6; }
+    @media (prefers-color-scheme: dark) {
+      .frame { fill: #111114; stroke: #2a2a30; }
+      text { fill: #a1a1aa; }
+      .t-title, .t-lbl { fill: #fafafa; }
+      .t-data { fill: #fba337; }
+      .t-ctl { fill: #29c7b2; }
+      .t-bnd { fill: #bb8df6; }
+      .blk { fill: #1b1b1f; stroke: #35353b; }
+      .blk-data { stroke: #fba337; }
+      .blk-ctl { stroke: #29c7b2; }
+      .blk-bnd { stroke: #bb8df6; }
+      .arw { stroke: #a1a1aa; }
+      .arw-data { stroke: #fba337; }
+      .arw-ctl { stroke: #29c7b2; }
+      .arw-bnd { stroke: #bb8df6; }
+      .head { fill: #a1a1aa; }
+      .head-data { fill: #fba337; }
+      .head-ctl { fill: #29c7b2; }
+      .head-bnd { fill: #bb8df6; }
+    }
+  </style>
+  <defs>
+    <marker id="a" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-data" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-data" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-ctl" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-ctl" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+    <marker id="a-bnd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-bnd" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
+  </defs>
+  <rect class="frame" x="0.5" y="0.5" width="659" height="339" rx="12"/>
+  <text class="t-title" x="20" y="32">One model over VRAM, RAM and the SSD</text>
+  <rect class="blk blk-ctl" x="20" y="52" width="170" height="44" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="105" y="71">GPU</text>
+  <text class="t-mid" x="105" y="87">Vulkan, Metal, CUDA, ROCm</text>
+  <rect class="blk blk-ctl" x="245" y="52" width="170" height="44" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="330" y="71">CPU</text>
+  <text class="t-mid" x="330" y="87">the default device</text>
+  <path class="arw arw-data" d="M192 68 H241" marker-end="url(#a-data)"/>
+  <path class="arw arw-data" d="M243 80 H194" marker-end="url(#a-data)"/>
+  <text class="t-ax t-mid t-data" x="217" y="114">hidden state</text>
+  <path class="arw" d="M105 98 V124" marker-end="url(#a)"/>
+  <path class="arw" d="M330 98 V124" marker-end="url(#a)"/>
+  <rect class="blk blk-data" x="20" y="128" width="170" height="146" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="105" y="150">VRAM</text>
+  <text class="t-ax t-mid" x="105" y="166">device memory</text>
+  <text class="t-mid" x="105" y="190">last gpu_layers layers</text>
+  <text class="t-mid" x="105" y="207">attention, router, head</text>
+  <text class="t-mid" x="105" y="224">expert device tier</text>
+  <text class="t-mid" x="105" y="241">K/V of the GPU layers</text>
+  <rect class="blk blk-data" x="245" y="128" width="170" height="146" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="330" y="150">RAM</text>
+  <text class="t-ax t-mid" x="330" y="166">host memory</text>
+  <text class="t-mid" x="330" y="190">first layers, embeddings</text>
+  <text class="t-mid" x="330" y="207">host experts</text>
+  <text class="t-mid" x="330" y="224">expert RAM tier</text>
+  <text class="t-mid" x="330" y="241">Engram row cache</text>
+  <text class="t-mid" x="330" y="258">K/V of the CPU layers</text>
+  <rect class="blk" x="470" y="128" width="170" height="146" rx="6"/>
+  <text class="t-lbl t-mid" x="555" y="150">SSD</text>
+  <text class="t-ax t-mid" x="555" y="166">the GGUF file</text>
+  <text class="t-mid" x="555" y="190">every tensor</text>
+  <text class="t-mid" x="555" y="207">experts no tier holds</text>
+  <text class="t-mid" x="555" y="224">Engram table</text>
+  <text class="t-mid" x="555" y="241">split parts, any volume</text>
+  <path class="arw arw-data" d="M468 200 H419" marker-end="url(#a-data)"/>
+  <text class="t-ax t-mid t-data" x="442" y="192">reads</text>
+  <path class="arw arw-data" d="M243 200 H194" marker-end="url(#a-data)"/>
+  <text class="t-ax t-mid t-data" x="217" y="192">uploads</text>
+  <text class="t-ax" x="20" y="304">device, gpu_layers, experts and engram choose where each part lives.</text>
+  <text class="t-ax" x="20" y="322">A part in VRAM runs on the GPU; a layer or a host expert in RAM runs on the CPU.</text>
+</svg>

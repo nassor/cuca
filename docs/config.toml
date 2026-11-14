@@ -122,6 +122,9 @@ path = "@/providers/local/verification.md"
 title = "Speculative decoding"
 path = "@/providers/local/drafting.md"
 [[extra.nav.items.children]]
+title = "Hybrid placement"
+path = "@/providers/local/placement.md"
+[[extra.nav.items.children]]
 title = "Local engine on a GPU"
 path = "@/providers/local/gpu.md"
 [[extra.nav.items.children]]
