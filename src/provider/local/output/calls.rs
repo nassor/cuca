@@ -241,9 +241,7 @@ impl<'a> ValueParser<'a> {
             return Err(format!("empty value at byte {}", self.pos));
         }
         self.pos += end;
-        if is_json_number(word)
-            && let Ok(number) = serde_json::from_str::<Number>(word)
-        {
+        if let Ok(number) = serde_json::from_str::<Number>(word) {
             return Ok(Value::Number(number));
         }
         Ok(match word {
@@ -253,43 +251,6 @@ impl<'a> ValueParser<'a> {
             other => Value::String(other.to_string()),
         })
     }
-}
-
-/// Whether `word` matches `-?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?` in full.
-fn is_json_number(word: &str) -> bool {
-    let b = word.as_bytes();
-    let digits = |mut i: usize| {
-        let start = i;
-        while i < b.len() && b[i].is_ascii_digit() {
-            i += 1;
-        }
-        (i, i > start)
-    };
-    let mut i = usize::from(b.first() == Some(&b'-'));
-    match b.get(i) {
-        Some(b'0') => i += 1,
-        Some(b'1'..=b'9') => i = digits(i).0,
-        _ => return false,
-    }
-    if b.get(i) == Some(&b'.') {
-        let (next, any) = digits(i + 1);
-        if !any {
-            return false;
-        }
-        i = next;
-    }
-    if matches!(b.get(i), Some(b'e' | b'E')) {
-        i += 1;
-        if matches!(b.get(i), Some(b'+' | b'-')) {
-            i += 1;
-        }
-        let (next, any) = digits(i);
-        if !any {
-            return false;
-        }
-        i = next;
-    }
-    i == b.len()
 }
 
 /// Parse a JSON tool-call body: one object or a list of objects, each

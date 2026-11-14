@@ -54,9 +54,10 @@ use self::calls::{
     parse_args_call, parse_dsml_calls, parse_json_calls, parse_tool_call, parse_xml_call,
 };
 use super::chat::{ChatFormat, ToolSyntax};
+use super::model::err as local_err;
 use super::tokenizer::Tokenizer;
 use crate::error::CucaError;
-use crate::types::{MessageContentBlock, ProviderEndpoint};
+use crate::types::MessageContentBlock;
 
 /// What recognising a marker does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -248,7 +249,7 @@ impl OutputParser {
         }
         let was_reasoning = self.in_reasoning();
         if self.format.is_marker(id) {
-            self.flush_pending(next_call_id, out);
+            self.drain_pending(true, next_call_id, out);
             self.feed_text(tok.token_text(id), next_call_id, out);
         } else {
             let before = self.pending.len();
@@ -262,7 +263,7 @@ impl OutputParser {
                 self.pending
                     .extend_from_slice(tok.token_text(id).as_bytes());
             }
-            self.drain_pending(next_call_id, out);
+            self.drain_pending(false, next_call_id, out);
         }
         if was_reasoning || self.in_reasoning() {
             self.reasoning_tokens = self.reasoning_tokens.saturating_add(1);
@@ -281,7 +282,7 @@ impl OutputParser {
             atem.finish(next_call_id, out);
             return;
         }
-        self.flush_pending(next_call_id, out);
+        self.drain_pending(true, next_call_id, out);
         let held = std::mem::take(&mut self.hold);
         match std::mem::replace(&mut self.state, State::Content) {
             State::Content => self.emit_content(held, out),
@@ -306,51 +307,20 @@ impl OutputParser {
         matches!(self.state, State::Header(_) | State::Thinking)
     }
 
-    /// Route all complete UTF-8 in `pending`, keeping an incomplete tail; an
-    /// invalid sequence becomes U+FFFD.
+    /// Route all complete UTF-8 in `pending` (all of it, lossily, when
+    /// `flush`), keeping an incomplete tail otherwise; an invalid sequence
+    /// becomes U+FFFD.
     fn drain_pending(
         &mut self,
+        flush: bool,
         next_call_id: &mut dyn FnMut() -> String,
         out: &mut Vec<Result<MessageContentBlock, CucaError>>,
     ) {
-        while !self.pending.is_empty() {
-            let error = match std::str::from_utf8(&self.pending) {
-                Ok(text) => {
-                    self.hold.push_str(text);
-                    self.pending.clear();
-                    self.process_hold(next_call_id, out);
-                    return;
-                }
-                Err(e) => e,
-            };
-            let valid = error.valid_up_to();
-            if valid > 0 {
-                self.hold
-                    .push_str(&String::from_utf8_lossy(&self.pending[..valid]));
-                self.pending.drain(..valid);
-                self.process_hold(next_call_id, out);
-            }
-            let Some(invalid) = error.error_len() else {
-                // An incomplete character: wait for the rest of it.
-                return;
-            };
-            self.pending.drain(..invalid);
-            self.feed_text("\u{FFFD}", next_call_id, out);
-        }
-    }
-
-    /// Route every pending byte, an incomplete tail included, as lossy text.
-    fn flush_pending(
-        &mut self,
-        next_call_id: &mut dyn FnMut() -> String,
-        out: &mut Vec<Result<MessageContentBlock, CucaError>>,
-    ) {
-        self.drain_pending(next_call_id, out);
-        if !self.pending.is_empty() {
-            self.hold.push_str(&String::from_utf8_lossy(&self.pending));
-            self.pending.clear();
-            self.process_hold(next_call_id, out);
-        }
+        let mut pending = std::mem::take(&mut self.pending);
+        drain_utf8(&mut pending, flush, |text| {
+            self.feed_text(text, next_call_id, out);
+        });
+        self.pending = pending;
     }
 
     /// The markers to look for in the current state.
@@ -585,12 +555,45 @@ impl OutputParser {
                     }));
                 }
             }
-            Err(_) => out.push(Err(CucaError::provider(
-                ProviderEndpoint::Local,
-                format!("malformed tool call: {body}"),
-            ))),
+            Err(_) => out.push(Err(local_err(format!("malformed tool call: {body}")))),
         }
     }
+}
+
+/// Hand `pending` to `sink` as text and remove it: every complete UTF-8
+/// run, an invalid sequence as U+FFFD, and the incomplete tail (lossily)
+/// when `flush`; otherwise the tail stays in `pending` for the rest of its
+/// character.
+fn drain_utf8(pending: &mut Vec<u8>, flush: bool, mut sink: impl FnMut(&str)) {
+    let mut done = 0;
+    while done < pending.len() {
+        let rest = &pending[done..];
+        let error = match std::str::from_utf8(rest) {
+            Ok(text) => {
+                sink(text);
+                done = pending.len();
+                break;
+            }
+            Err(e) => e,
+        };
+        let valid = error.valid_up_to();
+        if valid > 0 {
+            sink(&String::from_utf8_lossy(&rest[..valid]));
+            done += valid;
+        }
+        match error.error_len() {
+            Some(n) => {
+                done += n;
+                sink("\u{FFFD}");
+            }
+            None if flush => {
+                sink(&String::from_utf8_lossy(&pending[done..]));
+                done = pending.len();
+            }
+            None => break,
+        }
+    }
+    pending.drain(..done);
 }
 
 /// An `OpenTool` marker.

@@ -19,9 +19,11 @@
 use serde_json::{Map, Value};
 
 use super::super::chat::{Atem, ChatFormat};
+use super::super::model::err as local_err;
 use super::super::tokenizer::Tokenizer;
+use super::drain_utf8;
 use crate::error::CucaError;
-use crate::types::{MessageContentBlock, ProviderEndpoint};
+use crate::types::MessageContentBlock;
 
 const FUNCTION_CALLS_OPEN: &str = "<atem:function_calls>";
 const FUNCTION_CALLS_CLOSE: &str = "</atem:function_calls>";
@@ -164,49 +166,18 @@ impl AtemParser {
                     }));
                 }
             }
-            Err(_) => out.push(Err(CucaError::provider(
-                ProviderEndpoint::Local,
-                format!("malformed tool call: {body}"),
-            ))),
+            Err(_) => out.push(Err(local_err(format!("malformed tool call: {body}")))),
         }
     }
 
     /// Route all complete UTF-8 in `pending` (all of it, lossily, when
-    /// `flush`), keeping an incomplete tail otherwise. An invalid sequence
-    /// becomes U+FFFD.
+    /// `flush`), keeping an incomplete tail otherwise.
     fn drain(&mut self, flush: bool, out: &mut Out) {
-        let mut done = 0;
-        while done < self.pending.len() {
-            let rest = &self.pending[done..];
-            let error = match std::str::from_utf8(rest) {
-                Ok(text) => {
-                    Self::route(&mut self.state, text, out);
-                    done = self.pending.len();
-                    break;
-                }
-                Err(e) => e,
-            };
-            let valid = error.valid_up_to();
-            Self::route(
-                &mut self.state,
-                &String::from_utf8_lossy(&rest[..valid]),
-                out,
-            );
-            done += valid;
-            match error.error_len() {
-                Some(n) => {
-                    done += n;
-                    Self::route(&mut self.state, "\u{FFFD}", out);
-                }
-                None if flush => {
-                    let text = String::from_utf8_lossy(&self.pending[done..]);
-                    Self::route(&mut self.state, &text, out);
-                    done = self.pending.len();
-                }
-                None => break,
-            }
-        }
-        self.pending.drain(..done);
+        let mut pending = std::mem::take(&mut self.pending);
+        drain_utf8(&mut pending, flush, |text| {
+            Self::route(&mut self.state, text, out);
+        });
+        self.pending = pending;
     }
 
     /// Hand text to the current message.
