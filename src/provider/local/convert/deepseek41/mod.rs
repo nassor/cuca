@@ -279,37 +279,28 @@ pub(crate) fn convert_drafter(
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<PathBuf, CucaError> {
     let out = drafter_path(out);
-    let out = out.as_path();
-    let _lock = download::lock_file(out)?;
-    if out.exists() {
-        return Ok(out.to_path_buf());
-    }
-    let prepared = prepare(ck, convert, Role::Drafter)?;
-    let items = prepared.plan.part(Part::Backbone);
-    let total = prepared.plan.bytes(Part::Backbone);
-    preflight(
-        out.parent().unwrap_or(Path::new(".")),
-        total + HEADER_SLACK,
-        "the DeepSeek-V4.1 DSpark drafter",
-    )?;
-    let partial = download::with_suffix(out, ".partial");
-    let mut done = 0u64;
-    report(progress, 0, total);
-    let result = write_part(
-        &partial,
-        &prepared.kv,
-        &items,
-        &prepared.shards,
-        &mut done,
-        total,
-        progress,
-    )
-    .and_then(|()| std::fs::rename(&partial, out).map_err(CucaError::from));
-    if let Err(e) = result {
-        let _ = std::fs::remove_file(&partial);
-        return Err(e);
-    }
-    Ok(out.to_path_buf())
+    super::write_atomically(&out, |partial| {
+        let prepared = prepare(ck, convert, Role::Drafter)?;
+        let items = prepared.plan.part(Part::Backbone);
+        let total = prepared.plan.bytes(Part::Backbone);
+        preflight(
+            out.parent().unwrap_or(Path::new(".")),
+            total + HEADER_SLACK,
+            "the DeepSeek-V4.1 DSpark drafter",
+        )?;
+        let mut done = 0u64;
+        report(progress, 0, total);
+        write_part(
+            partial,
+            &prepared.kv,
+            &items,
+            &prepared.shards,
+            &mut done,
+            total,
+            progress,
+        )
+    })?;
+    Ok(out)
 }
 
 /// Whether `config` is a DeepSeek-V4.1 checkpoint.

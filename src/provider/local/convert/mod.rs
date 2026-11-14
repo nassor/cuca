@@ -265,16 +265,7 @@ pub(crate) fn write_atomically(
     out: &Path,
     build: impl FnOnce(&Path) -> Result<(), CucaError>,
 ) -> Result<(), CucaError> {
-    let lock = download::lock_file(out)?;
-    build_locked(&lock, out, build)
-}
-
-/// [`write_atomically`] for a caller that already holds `out`'s lock.
-pub(crate) fn build_locked(
-    _lock: &download::FileLock,
-    out: &Path,
-    build: impl FnOnce(&Path) -> Result<(), CucaError>,
-) -> Result<(), CucaError> {
+    let _lock = download::lock_file(out)?;
     // Another loader may have built the file while this one waited.
     if out.exists() {
         return Ok(());
