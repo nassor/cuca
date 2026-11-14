@@ -936,81 +936,67 @@ struct CacheWriteSeam {
     request: UnifiedRequest,
 }
 
+impl PluginStream {
+    /// Run the local-tool executors and the per-chunk hooks over one block,
+    /// then account for it in the response. An error means the block is
+    /// neither accumulated nor token-counted; polling continues.
+    fn process(
+        &mut self,
+        mut chunk: MessageContentBlock,
+    ) -> Result<MessageContentBlock, CucaError> {
+        if let MessageContentBlock::ToolCall { id, .. } = &chunk {
+            for plugin in self.plugins.iter() {
+                if let Some(replacement) = plugin.execute_local_tool(&chunk)? {
+                    let valid_replacement = matches!(
+                        &replacement,
+                        MessageContentBlock::ToolResult { tool_call_id, .. }
+                            if tool_call_id == id
+                    );
+                    if !valid_replacement {
+                        return Err(CucaError::Plugin(PluginError::Validation {
+                            schema: "local tool result".into(),
+                            message: "local tool executor must return a ToolResult for the input ToolCall id".into(),
+                        }));
+                    }
+                    chunk = replacement;
+                    break;
+                }
+            }
+        }
+
+        // First plugin failure wins.
+        for plugin in self.plugins.iter() {
+            plugin.on_stream_chunk(&mut chunk)?;
+        }
+        self.response.content.push(chunk.clone());
+        // Fallback accounting, replaced at the end when the provider
+        // reports usage: one per text/reasoning/tool-call block;
+        // images and tool results carry no generated tokens.
+        match &chunk {
+            MessageContentBlock::Text(_)
+            | MessageContentBlock::Thinking { .. }
+            | MessageContentBlock::ToolCall { .. } => {
+                self.response.completion_tokens += 1;
+            }
+            MessageContentBlock::ImageBase64 { .. } | MessageContentBlock::ToolResult { .. } => {}
+        }
+        Ok(chunk)
+    }
+}
+
 impl Stream for PluginStream {
     type Item = Result<MessageContentBlock, CucaError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = &mut *self;
         match this.inner.as_mut().poll_next(cx) {
-            Poll::Ready(Some(Ok(mut chunk))) => {
-                if let MessageContentBlock::ToolCall { id, .. } = &chunk {
-                    for plugin in this.plugins.iter() {
-                        match plugin.execute_local_tool(&chunk) {
-                            Ok(Some(replacement)) => {
-                                let valid_replacement = matches!(
-                                    &replacement,
-                                    MessageContentBlock::ToolResult { tool_call_id, .. }
-                                        if tool_call_id == id
-                                );
-                                if !valid_replacement {
-                                    #[cfg(feature = "service-prompt-cache")]
-                                    {
-                                        this.saw_error = true;
-                                    }
-                                    return Poll::Ready(Some(Err(CucaError::Plugin(
-                                        PluginError::Validation {
-                                            schema: "local tool result".into(),
-                                            message: "local tool executor must return a ToolResult for the input ToolCall id".into(),
-                                        },
-                                    ))));
-                                }
-                                chunk = replacement;
-                                break;
-                            }
-                            Ok(None) => {}
-                            Err(e) => {
-                                #[cfg(feature = "service-prompt-cache")]
-                                {
-                                    this.saw_error = true;
-                                }
-                                return Poll::Ready(Some(Err(CucaError::Plugin(e))));
-                            }
-                        }
-                    }
-                }
-
-                for plugin in this.plugins.iter() {
-                    if let Err(e) = plugin.on_stream_chunk(&mut chunk) {
-                        // First plugin failure wins; the failed block is neither
-                        // accumulated nor token-counted, and polling continues.
-                        #[cfg(feature = "service-prompt-cache")]
-                        {
-                            this.saw_error = true;
-                        }
-                        return Poll::Ready(Some(Err(CucaError::Plugin(e))));
-                    }
-                }
-                this.response.content.push(chunk.clone());
-                // Fallback accounting, replaced at the end when the provider
-                // reports usage: one per text/reasoning/tool-call block;
-                // images and tool results carry no generated tokens.
-                match &chunk {
-                    MessageContentBlock::Text(_)
-                    | MessageContentBlock::Thinking { .. }
-                    | MessageContentBlock::ToolCall { .. } => {
-                        this.response.completion_tokens += 1;
-                    }
-                    MessageContentBlock::ImageBase64 { .. }
-                    | MessageContentBlock::ToolResult { .. } => {}
-                }
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            Poll::Ready(Some(Err(e))) => {
+            Poll::Ready(Some(item)) => {
+                let item = item.and_then(|chunk| this.process(chunk));
                 #[cfg(feature = "service-prompt-cache")]
-                {
+                if item.is_err() {
                     this.saw_error = true;
                 }
-                Poll::Ready(Some(Err(e)))
+                Poll::Ready(Some(item))
             }
             Poll::Ready(None) => {
                 if !this.done {
