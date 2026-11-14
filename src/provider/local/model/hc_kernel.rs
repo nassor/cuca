@@ -1111,8 +1111,8 @@ mod tests {
         }
     }
 
-    /// Collapse, expand, the stream mean and repeat agree with the host
-    /// functions, fed the host's coefficients.
+    /// Collapse, expand and repeat agree with the host functions, fed the
+    /// host's coefficients.
     #[test]
     fn collapse_expand_mean_and_repeat_match_the_host() {
         let Some(device) = kernel_test_device() else {
