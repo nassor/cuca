@@ -7958,6 +7958,7 @@ mod tests {
             [GgmlDType::Q4_1, GgmlDType::Q4_1, GgmlDType::Q4_1],
             [GgmlDType::Q8_0, GgmlDType::Q8_0, GgmlDType::F32],
             [GgmlDType::Q5_0, GgmlDType::F16, GgmlDType::Q4_0],
+            [GgmlDType::Q5_1, GgmlDType::Q5_0, GgmlDType::Q5_1],
         ];
         for dtypes in formats {
             let layout = SlotLayout::new(n_embd, ff, dtypes).unwrap();
@@ -8121,13 +8122,7 @@ mod tests {
                         &c,
                     );
                     let resident = read_f32(mk::sum(scratch, &c), "out").unwrap();
-                    // A dtype the kernels hold requantized to Q8_0 (Q5_0 here) is
-                    // off by the requantization step.
-                    let tol = if dtypes[0] == GgmlDType::Q5_0 {
-                        4e-2
-                    } else {
-                        2e-3
-                    };
+                    let tol = 2e-3;
                     for (i, (g, e)) in resident.iter().zip(&want).enumerate() {
                         assert!(
                             (g - e).abs() <= tol * (1.0 + e.abs()),

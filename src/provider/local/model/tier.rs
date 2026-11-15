@@ -342,22 +342,6 @@ impl ExpertSlice {
         Ok((gate, up))
     }
 
-    /// The candle type of the experts' blocks.
-    ///
-    /// # Errors
-    ///
-    /// A type candle's block layouts do not cover (MXFP4 has its own kernels,
-    /// not a candle type).
-    #[cfg(feature = "provider-local-gpu")]
-    pub(crate) fn ggml(&self) -> Result<candle_core::quantized::GgmlDType, CucaError> {
-        self.dtype.ggml().ok_or_else(|| {
-            err(format!(
-                "experts of type {} cannot run on this engine",
-                self.dtype.name()
-            ))
-        })
-    }
-
     /// The file of the set that holds the experts.
     pub(crate) fn file(&self) -> usize {
         self.file
