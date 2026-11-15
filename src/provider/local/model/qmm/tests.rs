@@ -243,57 +243,81 @@ fn the_kernel_equals_the_scalar_definition_bit_for_bit() {
 /// (quants, scales and minima, bit for bit), on random blocks.
 #[test]
 fn decode_equals_halves() {
-    fn check<F: Format>(name: &str, ty: GgufType) {
-        let bytes = random_bytes(ty, 64, F::VALUES * 4, 7);
-        for (i, block) in F::blocks(&bytes).iter().enumerate() {
-            let mut e = [Entry::default(); MAX_ENTRIES];
-            F::entries(block, &mut e[..F::ENTRIES]);
-            let mut quants = [Quants::default(); MAX_ENTRIES];
-            let mut scales = [0f32; MAX_ENTRIES];
-            let mut mins = [[0f32; 2]; MAX_ENTRIES];
-            let per = F::VALUES / QK;
-            F::decode(
-                block,
-                &mut Dst {
-                    quants: &mut quants[..F::ENTRIES],
-                    scales: &mut scales[..F::ENTRIES],
-                    mins: if F::MIN != MIN_NONE {
-                        &mut mins[..per]
-                    } else {
-                        &mut []
-                    },
-                },
-            );
-            for (t, en) in e[..F::ENTRIES].iter().enumerate() {
-                assert_eq!(
-                    quants[t].to_array(),
-                    interleave(&en.halves).to_array(),
-                    "{name} block {i} entry {t}: quants"
-                );
-                assert_eq!(
-                    scales[t].to_bits(),
-                    en.scale.to_bits(),
-                    "{name} block {i} entry {t}: scale"
-                );
-                if F::MIN != MIN_NONE {
-                    let want = if F::MIN == MIN_Q8_1 {
-                        [en.mins[0], 0.0]
-                    } else {
-                        en.mins
-                    };
-                    let got = mins[t];
-                    assert_eq!(
-                        [got[0].to_bits(), got[1].to_bits()],
-                        [want[0].to_bits(), want[1].to_bits()],
-                        "{name} block {i} entry {t}: minima"
-                    );
-                }
-            }
-        }
-    }
     for ty in types() {
         let kind = Kind::of(ty).unwrap();
-        with_format!(kind, F => check::<F>(&ty.name(), ty));
+        with_format!(kind, F => check_decode::<F>(&ty.name(), ty, 64));
+    }
+}
+
+/// The grid I-quants and the ternary types decode through table lookups and
+/// bit fields: thousands of random blocks reach every grid index, sign byte,
+/// high-bit combination and ternary byte, and still equal the scalar entries.
+#[test]
+fn grid_and_ternary_decodes_equal_the_entries_over_whole_tables() {
+    for ty in [
+        GgufType::Iq2Xxs,
+        GgufType::Iq2Xs,
+        GgufType::Iq2S,
+        GgufType::Iq3Xxs,
+        GgufType::Iq3S,
+        GgufType::Iq1S,
+        GgufType::Iq1M,
+        GgufType::Tq1_0,
+        GgufType::Tq2_0,
+    ] {
+        let kind = Kind::of(ty).unwrap();
+        with_format!(kind, F => check_decode::<F>(&ty.name(), ty, 4096));
+    }
+}
+
+/// [`Format::decode`] equals [`Format::entries`] on `rows` rows of four random
+/// blocks.
+fn check_decode<F: Format>(name: &str, ty: GgufType, rows: usize) {
+    let bytes = random_bytes(ty, rows, F::VALUES * 4, 7);
+    for (i, block) in F::blocks(&bytes).iter().enumerate() {
+        let mut e = [Entry::default(); MAX_ENTRIES];
+        F::entries(block, &mut e[..F::ENTRIES]);
+        let mut quants = [Quants::default(); MAX_ENTRIES];
+        let mut scales = [0f32; MAX_ENTRIES];
+        let mut mins = [[0f32; 2]; MAX_ENTRIES];
+        let per = F::VALUES / QK;
+        F::decode(
+            block,
+            &mut Dst {
+                quants: &mut quants[..F::ENTRIES],
+                scales: &mut scales[..F::ENTRIES],
+                mins: if F::MIN != MIN_NONE {
+                    &mut mins[..per]
+                } else {
+                    &mut []
+                },
+            },
+        );
+        for (t, en) in e[..F::ENTRIES].iter().enumerate() {
+            assert_eq!(
+                quants[t].to_array(),
+                interleave(&en.halves).to_array(),
+                "{name} block {i} entry {t}: quants"
+            );
+            assert_eq!(
+                scales[t].to_bits(),
+                en.scale.to_bits(),
+                "{name} block {i} entry {t}: scale"
+            );
+            if F::MIN != MIN_NONE {
+                let want = if F::MIN == MIN_Q8_1 {
+                    [en.mins[0], 0.0]
+                } else {
+                    en.mins
+                };
+                let got = mins[t];
+                assert_eq!(
+                    [got[0].to_bits(), got[1].to_bits()],
+                    [want[0].to_bits(), want[1].to_bits()],
+                    "{name} block {i} entry {t}: minima"
+                );
+            }
+        }
     }
 }
 

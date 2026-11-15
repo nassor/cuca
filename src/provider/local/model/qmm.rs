@@ -58,11 +58,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use candle_core::utils::barrier_pool;
 use half::f16;
-use wide::{f32x4, f32x16, i8x16, i8x32, i16x16, i16x32, u8x32};
+use wide::{f32x4, f32x16, i8x16, i8x32, i16x16, i16x32, u8x32, u32x8, u64x4};
 
 use super::pool::for_each;
 use super::quant::block::{MAX_BLOCK, Unpacked};
-use super::quant::iq_tables::{KVALUES_FP4, KVALUES_IQ4NL};
+use super::quant::iq_tables::{
+    IQ1S_GRID, IQ2S_GRID, IQ2XS_GRID, IQ2XXS_GRID, IQ3S_GRID, IQ3XXS_GRID, KSIGNS_IQ2XS,
+    KVALUES_FP4, KVALUES_IQ4NL,
+};
 use super::quant::{iquants as iq, kquants as kq};
 use crate::provider::local::gguf::GgufType;
 
@@ -608,31 +611,31 @@ superblock!(
 superblock!(
     /// IQ2_XXS: 8 sub-blocks of 32 values from a grid, with a sign set and a
     /// 4-bit scale each.
-    Iq2Xxs, iq::IQ2_XXS_BYTES, iq::unpack_iq2_xxs, min: MIN_NONE, values: 256, sub: 1
+    Iq2Xxs, iq::IQ2_XXS_BYTES, iq::unpack_iq2_xxs, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq2xxs
 );
 superblock!(
     /// IQ2_XS: 16 sub-blocks of 16 values from a larger grid.
-    Iq2Xs, iq::IQ2_XS_BYTES, iq::unpack_iq2_xs, min: MIN_NONE, values: 256, sub: 1
+    Iq2Xs, iq::IQ2_XS_BYTES, iq::unpack_iq2_xs, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq2xs
 );
 superblock!(
     /// IQ2_S: IQ2_XS with explicit sign bytes.
-    Iq2S, iq::IQ2_S_BYTES, iq::unpack_iq2_s, min: MIN_NONE, values: 256, sub: 1
+    Iq2S, iq::IQ2_S_BYTES, iq::unpack_iq2_s, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq2s
 );
 superblock!(
     /// IQ3_XXS: 8 sub-blocks of 32 values from a grid of 4.
-    Iq3Xxs, iq::IQ3_XXS_BYTES, iq::unpack_iq3_xxs, min: MIN_NONE, values: 256, sub: 1
+    Iq3Xxs, iq::IQ3_XXS_BYTES, iq::unpack_iq3_xxs, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq3xxs
 );
 superblock!(
     /// IQ3_S: IQ3_XXS with explicit sign bytes.
-    Iq3S, iq::IQ3_S_BYTES, iq::unpack_iq3_s, min: MIN_NONE, values: 256, sub: 1
+    Iq3S, iq::IQ3_S_BYTES, iq::unpack_iq3_s, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq3s
 );
 superblock!(
     /// IQ1_S: ternary grid points with a delta, 8 sub-blocks of 32 values.
-    Iq1S, iq::IQ1_S_BYTES, iq::unpack_iq1_s, min: MIN_NONE, values: 256, sub: 1
+    Iq1S, iq::IQ1_S_BYTES, iq::unpack_iq1_s, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq1s
 );
 superblock!(
     /// IQ1_M: IQ1_S with a delta per 16 values.
-    Iq1M, iq::IQ1_M_BYTES, iq::unpack_iq1_m, min: MIN_NONE, values: 256, sub: 1
+    Iq1M, iq::IQ1_M_BYTES, iq::unpack_iq1_m, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq1m
 );
 superblock!(
     /// IQ4_XS: 8 sub-blocks of 32 values through the IQ4_NL table.
@@ -640,11 +643,11 @@ superblock!(
 );
 superblock!(
     /// TQ1_0: 256 ternary values, five per byte.
-    Tq1_0, iq::TQ1_0_BYTES, iq::unpack_tq1_0, min: MIN_NONE, values: 256, sub: 1
+    Tq1_0, iq::TQ1_0_BYTES, iq::unpack_tq1_0, min: MIN_NONE, values: 256, sub: 1, decode: decode_tq1_0
 );
 superblock!(
     /// TQ2_0: 256 ternary values, two bits each.
-    Tq2_0, iq::TQ2_0_BYTES, iq::unpack_tq2_0, min: MIN_NONE, values: 256, sub: 1
+    Tq2_0, iq::TQ2_0_BYTES, iq::unpack_tq2_0, min: MIN_NONE, values: 256, sub: 1, decode: decode_tq2_0
 );
 superblock!(
     /// NVFP4: 64 E2M1 values as four sub-blocks of 16 with a UE4M3 scale each.
@@ -848,6 +851,320 @@ fn decode_iq4xs(b: &[u8; iq::IQ4_XS_BYTES], dst: &mut Dst) {
         let table = IQ4NL_TABLE.swizzle_half_relaxed(nibble_pairs(&b[8 + 16 * ib..24 + 16 * ib]));
         dst.quants[ib] = Quants::from_i8x32(table) * Quants::splat(ls);
         dst.scales[ib] = d;
+    }
+}
+
+/// Byte `j` of entry `s` is `0xFF` where bit `j` of `s` is set: the mask that
+/// negates the grid values a sign byte flags.
+const SIGN_BYTES: [u64; 256] = {
+    let mut t = [0u64; 256];
+    let mut s = 0;
+    while s < 256 {
+        let mut j = 0;
+        while j < 8 {
+            if (s >> j) & 1 != 0 {
+                t[s] |= 0xFF << (8 * j);
+            }
+            j += 1;
+        }
+        s += 1;
+    }
+    t
+};
+
+/// Four 8-byte groups (elements `8 * g` on) as 32 bytes in the group order 0,
+/// 2, 1, 3, so that each 128-bit half holds the groups [`element_order`] pairs.
+#[inline(always)]
+fn join_groups(groups: [u64; 4]) -> i8x32 {
+    let [g0, g1, g2, g3] = groups;
+    i8x32::from_ne_bytes(u64x4::new([g0, g2, g1, g3]).to_ne_bytes())
+}
+
+/// Byte `i` of a half of [`join_groups`]' output that goes to byte `i` of the
+/// same half in [`Quants`]' layout (element `l` in byte `2 * l`, element `l +
+/// 16` in byte `2 * l + 1`): a byte shuffle within each 128-bit half.
+const PAIR_BYTES: i8x32 = {
+    let mut at = [0i8; QK];
+    let mut i = 0;
+    while i < QK {
+        at[i] = (i % 16 / 2 + 8 * (i % 2)) as i8;
+        i += 1;
+    }
+    i8x32::new(at)
+};
+
+/// 32 values of [`join_groups`] as [`Quants`].
+#[inline(always)]
+fn element_order(values: i8x32) -> Quants {
+    Quants::from_i8x32(values.swizzle_half_relaxed(PAIR_BYTES))
+}
+
+/// [`SIGN_BYTES`] of ggml's `ksigns_iq2xs` (a 7-bit index to its sign byte):
+/// the mask of IQ2_XXS, IQ2_XS and IQ3_XXS in one lookup.
+const KSIGN_MASKS: [u64; 128] = {
+    let mut t = [0u64; 128];
+    let mut i = 0;
+    while i < 128 {
+        t[i] = SIGN_BYTES[KSIGNS_IQ2XS[i] as usize];
+        i += 1;
+    }
+    t
+};
+
+/// A grid of 32 signed values ([`join_groups`] order), negated where `mask`
+/// bytes are `0xFF`, as [`Quants`] (unscaled).
+#[inline(always)]
+fn signed(grid: i8x32, mask: i8x32) -> Quants {
+    element_order((grid ^ mask) - mask)
+}
+
+/// Eight grid words of 4 values as 32 bytes in [`join_groups`] order.
+#[inline(always)]
+fn join_words(w: [u32; 8]) -> i8x32 {
+    i8x32::from_ne_bytes(u32x8::new([w[0], w[1], w[4], w[5], w[2], w[3], w[6], w[7]]).to_ne_bytes())
+}
+
+/// Byte `k` of [`join_groups`]' output belongs to the group whose sign byte is
+/// byte `SIGN_OF[k]` of the word that holds the four.
+const SIGN_OF: i8x32 = {
+    let mut at = [0i8; QK];
+    let mut k = 0;
+    while k < QK {
+        at[k] = [0, 2, 1, 3][k / 8];
+        k += 1;
+    }
+    i8x32::new(at)
+};
+
+/// Bit `k % 8` as a byte: the sign bit of value `k` within its group.
+const SIGN_BIT: i8x32 = {
+    let mut at = [0i8; QK];
+    let mut k = 0;
+    while k < QK {
+        at[k] = (1u8 << (k % 8)) as i8;
+        k += 1;
+    }
+    i8x32::new(at)
+};
+
+/// The mask ([`signed`]) of four sign bytes (little-endian in `signs`), one per
+/// group of 8 values, bit `j` flagging value `j`.
+#[inline(always)]
+fn sign_masks(signs: u32) -> i8x32 {
+    let bytes = i8x32::from_ne_bytes(u32x8::splat(signs).to_ne_bytes());
+    (bytes.swizzle_half_relaxed(SIGN_OF) & SIGN_BIT).simd_eq(SIGN_BIT)
+}
+
+/// The scale of an entry with one per 16 values from a 4-bit pair `sc`: `2 *
+/// nibble + 1` for each half (IQ2_XS, IQ2_S).
+#[inline(always)]
+fn nibble_pair_scale(sc: u8) -> Quants {
+    pair_scale(i16::from(2 * (sc & 0x0F) + 1), i16::from(2 * (sc >> 4) + 1))
+}
+
+/// [`Format::decode`] of IQ2_XXS.
+#[inline(always)]
+fn decode_iq2xxs(b: &[u8; iq::IQ2_XXS_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 0) * 0.125;
+    for ib in 0..8 {
+        let qs = &b[2 + 8 * ib..10 + 8 * ib];
+        let aux = u32::from_le_bytes([qs[4], qs[5], qs[6], qs[7]]);
+        let groups = std::array::from_fn(|l| IQ2XXS_GRID[usize::from(qs[l])]);
+        let masks = std::array::from_fn(|l| KSIGN_MASKS[((aux >> (7 * l)) & 127) as usize]);
+        let sc = 2 * (aux >> 28) as i16 + 1;
+        dst.quants[ib] = signed(join_groups(groups), join_groups(masks)) * Quants::splat(sc);
+        dst.scales[ib] = d;
+    }
+}
+
+/// [`Format::decode`] of IQ2_XS.
+#[inline(always)]
+fn decode_iq2xs(b: &[u8; iq::IQ2_XS_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 0) * 0.125;
+    let (qs, scales) = b[2..].split_at(64);
+    for ib in 0..8 {
+        let v: [usize; 4] = std::array::from_fn(|l| {
+            usize::from(u16::from_le_bytes([
+                qs[8 * ib + 2 * l],
+                qs[8 * ib + 2 * l + 1],
+            ]))
+        });
+        let groups = v.map(|v| IQ2XS_GRID[v & 511]);
+        let masks = v.map(|v| KSIGN_MASKS[v >> 9]);
+        dst.quants[ib] =
+            signed(join_groups(groups), join_groups(masks)) * nibble_pair_scale(scales[ib]);
+        dst.scales[ib] = d;
+    }
+}
+
+/// [`Format::decode`] of IQ2_S.
+#[inline(always)]
+fn decode_iq2s(b: &[u8; iq::IQ2_S_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 0) * 0.125;
+    let (qs, rest) = b[2..].split_at(32);
+    let (signs, rest) = rest.split_at(32);
+    let (qh, scales) = rest.split_at(8);
+    for ib in 0..8 {
+        let high = usize::from(qh[ib]);
+        let groups = std::array::from_fn(|l| {
+            IQ2S_GRID[usize::from(qs[4 * ib + l]) | ((high << (8 - 2 * l)) & 0x300)]
+        });
+        let signs = u32::from_le_bytes(std::array::from_fn(|l| signs[4 * ib + l]));
+        dst.quants[ib] =
+            signed(join_groups(groups), sign_masks(signs)) * nibble_pair_scale(scales[ib]);
+        dst.scales[ib] = d;
+    }
+}
+
+/// [`Format::decode`] of IQ3_XXS.
+#[inline(always)]
+fn decode_iq3xxs(b: &[u8; iq::IQ3_XXS_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 0) * 0.25;
+    let (qs, sas) = b[2..].split_at(64);
+    for ib in 0..8 {
+        let q = &qs[8 * ib..8 * ib + 8];
+        let aux = u32::from_le_bytes([
+            sas[4 * ib],
+            sas[4 * ib + 1],
+            sas[4 * ib + 2],
+            sas[4 * ib + 3],
+        ]);
+        let words = std::array::from_fn(|i| IQ3XXS_GRID[usize::from(q[i])]);
+        let masks = std::array::from_fn(|l| KSIGN_MASKS[((aux >> (7 * l)) & 127) as usize]);
+        let sc = 2 * (aux >> 28) as i16 + 1;
+        dst.quants[ib] = signed(join_words(words), join_groups(masks)) * Quants::splat(sc);
+        dst.scales[ib] = d;
+    }
+}
+
+/// [`Format::decode`] of IQ3_S.
+#[inline(always)]
+fn decode_iq3s(b: &[u8; iq::IQ3_S_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 0);
+    let (qs, rest) = b[2..].split_at(64);
+    let (qh, rest) = rest.split_at(8);
+    let (signs, scales) = rest.split_at(32);
+    for ib in 0..8 {
+        let q = &qs[8 * ib..8 * ib + 8];
+        let high = usize::from(qh[ib]);
+        let words =
+            std::array::from_fn(|i| IQ3S_GRID[usize::from(q[i]) | ((high << (8 - i)) & 256)]);
+        let signs = u32::from_le_bytes(std::array::from_fn(|l| signs[4 * ib + l]));
+        let sc = 1 + 2 * i16::from((scales[ib / 2] >> (4 * (ib % 2))) & 0x0F);
+        dst.quants[ib] = signed(join_words(words), sign_masks(signs)) * Quants::splat(sc);
+        dst.scales[ib] = d;
+    }
+}
+
+/// [`Format::decode`] of IQ1_S: the grid values times 8 plus or minus 1, times
+/// the 3-bit scale `2 * s + 1`.
+#[inline(always)]
+fn decode_iq1s(b: &[u8; iq::IQ1_S_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 0) * 0.125;
+    let (qs, qh) = b[2..].split_at(32);
+    for ib in 0..8 {
+        let high = u16::from_le_bytes([qh[2 * ib], qh[2 * ib + 1]]);
+        let groups = std::array::from_fn(|l| {
+            IQ1S_GRID[usize::from(qs[4 * ib + l]) | (usize::from((high >> (3 * l)) & 7) << 8)]
+        });
+        let sc = 2 * ((high >> 12) & 7) as i16 + 1;
+        let delta = if high & 0x8000 != 0 { -sc } else { sc };
+        dst.quants[ib] =
+            element_order(join_groups(groups)) * Quants::splat(8 * sc) + Quants::splat(delta);
+        dst.scales[ib] = d;
+    }
+}
+
+/// [`Format::decode`] of IQ1_M: IQ1_S with a delta sign per group of 8 and a
+/// scale per 16 values.
+#[inline(always)]
+fn decode_iq1m(b: &[u8; iq::IQ1_M_BYTES], dst: &mut Dst) {
+    let (qs, rest) = b.split_at(32);
+    let (qh, scales) = rest.split_at(16);
+    let words: [u16; 4] =
+        std::array::from_fn(|i| u16::from_le_bytes([scales[2 * i], scales[2 * i + 1]]));
+    let bits = (words[0] >> 12)
+        | ((words[1] >> 8) & 0x00F0)
+        | ((words[2] >> 4) & 0x0F00)
+        | (words[3] & 0xF000);
+    let d = f16::from_bits(bits).to_f32() * 0.125;
+    for ib in 0..8 {
+        let word = words[ib / 2];
+        let (lo, hi) = (
+            2 * ((word >> (6 * (ib % 2))) & 7) as i16 + 1,
+            2 * ((word >> (6 * (ib % 2) + 3)) & 7) as i16 + 1,
+        );
+        let group = |l: usize| {
+            let high = qh[2 * ib + l / 2];
+            let even = l.is_multiple_of(2);
+            let shift = if even { 8 } else { 4 };
+            let idx = usize::from(qs[4 * ib + l]) | ((usize::from(high) << shift) & 0x700);
+            let negative = high & if even { 0x08 } else { 0x80 } != 0;
+            (
+                IQ1S_GRID[idx],
+                if negative {
+                    u64::MAX
+                } else {
+                    0x0101_0101_0101_0101
+                },
+            )
+        };
+        let picked: [(u64, u64); 4] = std::array::from_fn(group);
+        let grid = element_order(join_groups(picked.map(|p| p.0)));
+        let deltas = element_order(join_groups(picked.map(|p| p.1)));
+        dst.quants[ib] = (grid * Quants::splat(8) + deltas) * pair_scale(lo, hi);
+        dst.scales[ib] = d;
+    }
+}
+
+/// `3^n`, the multiplier of digit `n` of a TQ1_0 byte.
+const POW3: [i16; 6] = [1, 3, 9, 27, 81, 243];
+
+/// The ternary digit `n` (0 to 2, before the minus 1) of the TQ1_0 bytes `q`
+/// (`0..=255` per lane): `((q * 3^n mod 256) * 3) >> 8`.
+#[inline(always)]
+fn trit(q: i16x16, n: usize) -> i16x16 {
+    (((q * i16x16::splat(POW3[n])) & i16x16::splat(0xFF)) * i16x16::splat(3)) >> 8u32
+}
+
+/// [`Format::decode`] of TQ1_0: entries 0 to 4 are the five digits of the
+/// first 32 bytes, entries 5 and 6 pairs of digits of the next 16, entry 7 the
+/// fifth digit of those and the four digits of the last 4 bytes.
+#[inline(always)]
+fn decode_tq1_0(b: &[u8; iq::TQ1_0_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 52);
+    let one = Quants::splat(1);
+    let (a, c) = (bytes16(&b[..16]), bytes16(&b[16..32]));
+    for n in 0..5 {
+        dst.quants[n] = pair_lanes(trit(a, n), trit(c, n)) - one;
+    }
+    let x = bytes16(&b[32..48]);
+    for k in 0..2 {
+        dst.quants[5 + k] = pair_lanes(trit(x, 2 * k), trit(x, 2 * k + 1)) - one;
+    }
+    let tail = i16x16::new(std::array::from_fn(|l| {
+        let q = (i32::from(b[48 + l % 4]) * i32::from(POW3[l / 4])) & 0xFF;
+        ((q * 3) >> 8) as i16
+    }));
+    dst.quants[7] = pair_lanes(trit(x, 4), tail) - one;
+    dst.scales[..8].fill(d);
+}
+
+/// [`Format::decode`] of TQ2_0: entry `4c + l` is bits `2 * l` of the 32 bytes
+/// `32 * c` on, minus 1.
+#[inline(always)]
+fn decode_tq2_0(b: &[u8; iq::TQ2_0_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 64);
+    let three = i16x16::splat(3);
+    for c in 0..2 {
+        let q = &b[32 * c..32 * c + 32];
+        let (a, e) = (bytes16(&q[..16]), bytes16(&q[16..]));
+        for l in 0..4 {
+            let shift = 2 * l as u32;
+            dst.quants[4 * c + l] =
+                pair_lanes((a >> shift) & three, (e >> shift) & three) - Quants::splat(1);
+            dst.scales[4 * c + l] = d;
+        }
     }
 }
 
