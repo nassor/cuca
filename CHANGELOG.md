@@ -55,6 +55,13 @@
 - This repository's dev profile keeps no debug info for dependencies and line tables for cuca,
   and links with `rust-lld` on Windows (`.cargo/config.toml`). Neither applies to dependents.
 
+### Fixed
+
+- `plugin-session-log`: on Windows, `FileBackend` writes a forked session (`s:fork:...`) to its
+  own file. The `:` in the id made Windows write the branch into an NTFS alternate data stream
+  that replay could not open; reserved characters and `%` are now written as `%XX` in the file
+  name on Windows only.
+
 ## 0.8.1 - 2026-11-14
 
 ### Changed

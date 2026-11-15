@@ -673,7 +673,10 @@ impl std::ops::IndexMut<usize> for ScratchFlavor<'_> {
 /// whose only file is a legacy `{session_id}.jsonl` is reported as
 /// [`PluginError::Validation`], never replayed as empty. Session ids containing
 /// path separators (`/` or `\`) are rejected with [`PluginError::Validation`]
-/// rather than silently mapping into a subdirectory.
+/// rather than silently mapping into a subdirectory. On Windows, characters a
+/// file name cannot hold (`< > : " | ? *`, control characters) and `%` are
+/// written as `%XX`, so fork ids (`s:fork:...`) do not land in an NTFS
+/// alternate data stream; elsewhere the id is the file stem unchanged.
 ///
 /// Trajectory growth is bounded by disk, not process memory. The one in-process
 /// buffer is the framing scratch: it is capped at 64 KiB of retained capacity
@@ -713,7 +716,34 @@ impl FileBackend {
 
     /// Resolve a session id to its record file path.
     fn path(&self, session_id: &str) -> std::path::PathBuf {
-        self.dir.join(format!("{session_id}.cslog"))
+        self.dir
+            .join(format!("{}.cslog", Self::file_stem(session_id)))
+    }
+
+    /// The file stem of a session id: the id itself, with the characters a
+    /// Windows file name cannot hold written as `%XX` on Windows.
+    #[cfg(windows)]
+    fn file_stem(id: &str) -> std::borrow::Cow<'_, str> {
+        use std::fmt::Write as _;
+        let reserved = |c: char| c < ' ' || "<>:\"|?*%".contains(c);
+        if !id.contains(reserved) {
+            return std::borrow::Cow::Borrowed(id);
+        }
+        let mut out = String::with_capacity(id.len() + 8);
+        for c in id.chars() {
+            if reserved(c) {
+                let _ = write!(out, "%{:02X}", c as u32);
+            } else {
+                out.push(c);
+            }
+        }
+        std::borrow::Cow::Owned(out)
+    }
+
+    /// The file stem of a session id: the id itself.
+    #[cfg(not(windows))]
+    fn file_stem(id: &str) -> &str {
+        id
     }
 
     /// Reject ids that would escape the directory or cross into subdirectories.
@@ -829,7 +859,9 @@ impl SessionBackend for FileBackend {
         let mut bytes = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let legacy = self.dir.join(format!("{session_id}.jsonl"));
+                let legacy = self
+                    .dir
+                    .join(format!("{}.jsonl", Self::file_stem(session_id)));
                 if legacy.exists() {
                     return Err(PluginError::Validation {
                         schema: "cslog".to_string(),
