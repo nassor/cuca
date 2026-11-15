@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Thirty-five opt-in features: eight providers, five local GPU features, twelve plugins, seven services, the <code>config-kdl</code> reader and two server features</dd>
+<dd>Thirty-six opt-in features: eight providers, five local GPU features, twelve plugins, seven services, the <code>config-kdl</code> reader, the <code>sysmon</code> sampler and two server features</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
@@ -125,9 +125,9 @@ Eight features: seven HTTP adapters and one in-process engine. [Providers](@/pro
 | `provider-llamacpp` | `llama-server` | `reqwest`, `tokio-stream` |
 | `provider-vllm` | vLLM | `reqwest`, `tokio-stream` |
 | `provider-lmstudio` | LM Studio | `reqwest`, `tokio-stream` |
-| `provider-local` | Inference inside your process on the CPU, from a GGUF file or a Hugging Face safetensors checkpoint, no HTTP and no llama.cpp | `config-kdl`, `candle-core`, `candle-nn`, `half`, `minijinja`, `minijinja-contrib`, `reqwest`, `sha2`, `sysinfo`, `tokio`, `tokenizers`, `unicode-general-category`, `wide` |
+| `provider-local` | Inference inside your process on the CPU, from a GGUF file or a Hugging Face safetensors checkpoint, no HTTP and no llama.cpp | `config-kdl`, `candle-core`, `candle-nn`, `half`, `minijinja`, `minijinja-contrib`, `reqwest`, `rustls`, `sha2`, `fs4`, `tokio`, `tokenizers`, `unicode-general-category`, `wide` |
 
-Every `reqwest` entry turns on its `rustls` TLS backend, so no feature needs OpenSSL. `provider-local` uses `reqwest` only to download model files, `sha2` to check them, and `sysinfo` to check free disk space when it converts a checkpoint.
+Every `reqwest` entry turns on its `rustls` TLS backend with `ring` as the crypto provider, so no feature needs OpenSSL or CMake. `cuca::tls::ensure_crypto_provider` installs `ring` as the process default before cuca builds a client; an application that builds its own `reqwest` client first, without a TLS feature of its own, calls it at startup. `provider-local` uses `reqwest` only to download model files, `sha2` to check them, and `fs4` to check free disk space when it converts a checkpoint.
 
 ## Local GPU features
 
@@ -182,17 +182,18 @@ Seven features. A service is a type you call yourself; it never implements `Cuca
 | Feature | What it is for | Pulls in |
 |---|---|---|
 | `config-kdl` | read a settings file in KDL: `from_kdl_str`, `from_kdl_str_with_vars`, `load_kdl_str`, `load_kdl_file` | `kdl` |
-| `server` | the `cuca` binary: `cuca serve` and `cuca balance`; an OpenAI-compatible HTTP API, stats and metrics | `provider-local`, `config-kdl`, `axum`, `clap`, `tracing`, `tracing-subscriber`, `sysinfo`, `nvml-wrapper`, `getrandom`, `tokio-stream`; on Windows also `wmi` and `winreg` |
+| `sysmon` | `cuca::sysmon::SystemSampler`, a background thread that samples CPU, RAM, swap, disks, GPUs and this process; no HTTP and no model engine | `sysinfo`, `nvml-wrapper`, `tracing`; on Windows also `wmi` and `winreg` |
+| `server` | the `cuca` binary: `cuca serve` and `cuca balance`; an OpenAI-compatible HTTP API, stats and metrics | `provider-local`, `config-kdl`, `sysmon`, `axum`, `clap`, `tracing`, `tracing-subscriber`, `sysinfo`, `getrandom`, `tokio-stream` |
 | `server-tui` | `cuca tui`, a live terminal dashboard | `server`, `ratatui`, `crossterm` |
 
 The `cuca::config` helpers `one_or_many`, `from_str`, `size`, `duration` and `ConfigValue` compile in every build. [Configuration files](@/reference/environment.md) describes the KDL reader. [Server](@/server/_index.md) describes the binary.
 
 ## Build notes
 
-- `provider-local` compiles some C code, so it needs a C compiler. Every GPU feature also compiles C.
+- `provider-local` and every HTTP feature compile `ring`, which has C and assembly parts, so they need a C compiler. Every GPU feature also compiles C.
 - On Windows, the GPU features run the SDK resource compiler (`rc.exe`, or `windres` on the GNU target) in a build script.
 - `provider-local-cuda` and `provider-local-rocm` download a prebuilt LLVM on the first build, so they need network access once. The download is cached. `provider-local-vulkan` and `provider-local-metal` need no download.
-- docs.rs builds have no network, so the docs.rs feature list names every feature except those two: thirty-three of the thirty-five.
+- docs.rs builds have no network, so the docs.rs feature list names every feature except those two: thirty-four of the thirty-six.
 - Publishing and CI use the same list, `ALL_NO_LLVM`. Do not build with `--all-features`; on Windows it fails to link.
 - `provider-local` turns on `serde_json/preserve_order`, so JSON maps keep the order the caller wrote them. Chat templates see that order.
 
@@ -202,7 +203,9 @@ The `cuca::config` helpers `one_or_many`, `from_str`, `size`, `duration` and `Co
 |---|---|
 | `export` | `plugin-memory` or `service-prompt-cache` |
 | `cost_otel` | `plugin-cost` and `plugin-telemetry` |
+| `sysmon` | `sysmon` (also turned on by `server`) |
 | `server` | `server` |
+| `tls` | any HTTP provider, `provider-local` or `plugin-web-search`, so every build that compiles |
 
 Every other public module compiles in every build. `plugins` and `services` always exist, and each of their submodules is empty unless its feature is on. See [The public API surface](@/reference/public-api.md).
 

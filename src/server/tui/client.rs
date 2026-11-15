@@ -61,7 +61,7 @@ pub fn spawn(
     options: &TuiOptions,
 ) -> Result<(mpsc::Receiver<Update>, JoinHandle<()>), ServerError> {
     let url = stream_url(&options.url, options.interval_ms)?;
-    let client = Client::builder()
+    let client = crate::tls::http_client_builder()
         .connect_timeout(Duration::from_secs(5))
         .build()
         .map_err(|error| ServerError::Config(format!("HTTP client: {error}")))?;

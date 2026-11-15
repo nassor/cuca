@@ -459,7 +459,11 @@ mod short_error_tests {
             let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             format!("http://{}/health", l.local_addr().unwrap())
         };
-        let error = reqwest::Client::new().get(&dead).send().await.unwrap_err();
+        let error = crate::tls::http_client()
+            .get(&dead)
+            .send()
+            .await
+            .unwrap_err();
         assert_eq!(short_error(&error), "connection refused");
         assert!(!short_error(&error).contains("http"));
     }

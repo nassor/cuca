@@ -13,9 +13,10 @@ use ratatui::widgets::Paragraph;
 use super::widgets::{
     ACCENT, DIM, OK, Trend, WARN, fit, gauge_row, level, panel, ratio, spark, usage_color,
 };
-use crate::server::stats::{GpuStats, ModelState, ModelStats, SystemSnapshot};
+use crate::server::stats::{ModelState, ModelStats};
 use crate::server::tui::format;
 use crate::server::tui::history::History;
+use crate::sysmon::{GpuStats, SystemSnapshot};
 
 /// What one panel row shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

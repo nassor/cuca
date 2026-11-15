@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 
 use super::MAX_GPUS;
 use super::parse::parse_ioreg;
-use crate::server::stats::GpuStats;
+use super::stats::GpuStats;
 
 /// `ioreg` is a subprocess: run it at most this often, reuse the last result between.
 const IOREG_INTERVAL: Duration = Duration::from_secs(2);

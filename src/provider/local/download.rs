@@ -710,7 +710,9 @@ mod tests {
     }
 
     fn client() -> reqwest::Client {
-        reqwest::Client::builder().build().expect("client builds")
+        crate::tls::http_client_builder()
+            .build()
+            .expect("client builds")
     }
 
     async fn fetch(

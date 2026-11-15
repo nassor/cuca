@@ -169,7 +169,7 @@ mod tests {
         let mut history = History::new();
         history.push(&StatsSnapshot::default());
         let mut with_gpu = StatsSnapshot::default();
-        with_gpu.system.gpus = vec![crate::server::stats::GpuStats {
+        with_gpu.system.gpus = vec![crate::sysmon::GpuStats {
             util_pct: Some(50.0),
             ..Default::default()
         }];

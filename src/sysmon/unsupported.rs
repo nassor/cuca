@@ -1,6 +1,6 @@
 //! GPU probe for platforms without a GPU source: reports no GPUs.
 
-use crate::server::stats::GpuStats;
+use super::stats::GpuStats;
 
 pub(super) struct GpuProbe;
 

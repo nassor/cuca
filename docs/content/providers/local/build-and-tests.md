@@ -24,7 +24,7 @@ weight = 13
 | `provider-local-vulkan`<br>`provider-local-metal` | a C compiler; on Windows also the SDK resource compiler `rc.exe` (`windres` on the GNU target) |
 | `provider-local-cuda`<br>`provider-local-rocm` | the same as Vulkan and Metal, and network access on the first build to download a prebuilt LLVM |
 
-- `provider-local` needs a C compiler because its dependency tree builds the C crate `onig_sys`. The engine, the tokenizer and the chat templates are Rust.
+- `provider-local` needs a C compiler because its dependency tree builds `ring`, the TLS crypto provider of the download client, which has C and assembly parts. The engine, the tokenizer and the chat templates are Rust.
 - Every GPU feature also needs a C compiler, because the GPU runtime pulls in a store that builds C code. On Windows a dependency's build script runs `rc.exe`.
 - `provider-local-cuda` and `provider-local-rocm` download and link a prebuilt LLVM on the first build. `provider-local-rocm` builds on Linux and on Windows.
 - Do not build with `--all-features`. On Windows it fails to link. The feature set to use instead is on [The feature matrix](@/reference/features.md).

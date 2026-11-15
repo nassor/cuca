@@ -114,10 +114,10 @@ impl WebSearchPlugin {
     /// Build a plugin for the given configuration with a fresh
     /// [`reqwest::Client`].
     pub fn new(config: WebSearchConfig) -> Self {
-        let http = reqwest::Client::builder()
+        let http = crate::tls::http_client_builder()
             .timeout(std::time::Duration::from_secs(30))
             .build()
-            .unwrap_or_else(|_| reqwest::Client::new());
+            .unwrap_or_else(|_| crate::tls::http_client());
         WebSearchPlugin { config, http }
     }
 

@@ -1,4 +1,5 @@
-//! System sampler: CPU, memory, disk and GPU figures for the stats API and the TUI.
+//! System sampler (feature `sysmon`): CPU, memory, disk and GPU figures; the
+//! server's stats API and TUI read it.
 //!
 //! [`SystemSampler::start`] spawns one background thread (`cuca-sysmon`) that
 //! probes the machine every `interval` and publishes a [`SystemSnapshot`];
@@ -17,7 +18,7 @@
 //! | GPU, Linux | `sysfs` (`/sys/class/drm/card*/device`, hwmon) for amdgpu, i915 and xe, `/proc/self/fdinfo` for this process's VRAM; NVIDIA through NVML, loaded at run time |
 //! | GPU, macOS | `ioreg -r -d 1 -c IOAccelerator`, at most every two seconds |
 //!
-//! Each [`GpuStats::source`](crate::server::stats::GpuStats::source) names what produced that entry. A probe that fails
+//! Each [`GpuStats::source`] names what produced that entry. A probe that fails
 //! leaves its fields `None` and never stops the sampler.
 //!
 //! # Rates
@@ -40,8 +41,6 @@ use std::sync::{Arc, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::server::stats::{MemoryStats, SystemSnapshot};
-
 mod host;
 #[cfg(target_os = "linux")]
 mod linux;
@@ -52,10 +51,13 @@ mod macos;
     expect(dead_code, reason = "each platform uses only its own parsers")
 )]
 mod parse;
+mod stats;
 #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
 mod unsupported;
 #[cfg(windows)]
 mod windows;
+
+pub use stats::{CpuStats, DiskIo, DiskStats, GpuStats, MemoryStats, ProcessStats, SystemSnapshot};
 
 use host::HostProbe;
 #[cfg(target_os = "linux")]

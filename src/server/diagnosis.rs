@@ -13,7 +13,8 @@
 use std::collections::BTreeMap;
 
 use super::latency::WindowSummary;
-use super::stats::{Cause, Diagnosis, ModelState, ModelStats, Severity, SystemSnapshot};
+use super::stats::{Cause, Diagnosis, ModelState, ModelStats, Severity};
+use crate::sysmon::SystemSnapshot;
 
 const MIB: f64 = 1024.0 * 1024.0;
 
@@ -665,9 +666,8 @@ fn disk_reads(ctx: &Ctx<'_>, out: &mut Vec<Diagnosis>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::stats::{
-        ExpertTierRates, GpuStats, KvStats, LatencyStats, Quantiles, RequestStats,
-    };
+    use crate::server::stats::{ExpertTierRates, KvStats, LatencyStats, Quantiles, RequestStats};
+    use crate::sysmon::GpuStats;
 
     /// A busy, healthy model: nothing fires for it.
     fn model() -> ModelStats {

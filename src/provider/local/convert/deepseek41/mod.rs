@@ -22,7 +22,7 @@
 //! before part 1, so the existence of part 1 marks a finished conversion
 //! ([`finished_set`], [`super::converted`]). The conversion reports bytes written
 //! and bytes to write through the progress callback. Before it writes anything it
-//! compares the free space of the output volume (`sysinfo`'s disk list) with the
+//! compares the free space of the output volume (`fs4::available_space`) with the
 //! bytes to write and fails with [`CucaError::Config`] naming the sizes; a platform
 //! that cannot report free space skips the check.
 //!
@@ -131,16 +131,7 @@ fn prepare(ck: &CheckpointDir, convert: ConvertConfig, role: Role) -> Result<Pre
 
 /// Free bytes of the volume holding `dir`, if the platform can tell.
 fn available_space(dir: &Path) -> Option<u64> {
-    let canonical = dir.canonicalize().ok()?;
-    let text = canonical.to_string_lossy();
-    // Windows' `\\?\C:\...` form does not match a disk's `C:\` mount point.
-    let plain = PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(&text));
-    let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
-    disks
-        .iter()
-        .filter(|d| plain.starts_with(d.mount_point()))
-        .max_by_key(|d| d.mount_point().as_os_str().len())
-        .map(sysinfo::Disk::available_space)
+    fs4::available_space(dir).ok()
 }
 
 /// Fail before writing when `dir` cannot hold `need` bytes.

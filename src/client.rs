@@ -449,7 +449,7 @@ impl CucaClientBuilder {
                 feature = "provider-vllm",
                 feature = "provider-lmstudio",
             ))]
-            http_client: reqwest::Client::new(),
+            http_client: crate::tls::http_client(),
             #[cfg(feature = "provider-llamacpp")]
             llamacpp_config: self.llamacpp_config,
             #[cfg(feature = "provider-local")]

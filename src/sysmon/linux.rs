@@ -14,7 +14,7 @@ use super::parse::{
     parse_drm_fdinfo, parse_kernel_page_size, parse_sysfs_hex, parse_sysfs_u64,
     parse_uevent_pci_id, parse_vmstat_swap, vendor_name,
 };
-use crate::server::stats::GpuStats;
+use super::stats::GpuStats;
 
 const DRM_DIR: &str = "/sys/class/drm";
 const NVIDIA_VENDOR_ID: u32 = 0x10de;

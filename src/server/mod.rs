@@ -31,7 +31,7 @@
 //!   by status, time-to-first-token, inter-token, end-to-end and queue
 //!   histograms, token counters, the engine's gauges and counters (running,
 //!   waiting, K/V usage, prefix hits, preemptions, steps, rows) and the
-//!   machine's CPU, memory, disk and GPU gauges ([`sysmon`]).
+//!   machine's CPU, memory, disk and GPU gauges ([`crate::sysmon`]).
 //! * `GET /cuca/v1/stats` and `/cuca/v1/stats/stream` (opt-in with
 //!   `stats_api #true`): one [`stats::StatsSnapshot`] as JSON, or one per second
 //!   as server-sent events: per-model engine rates, windowed latency
@@ -68,7 +68,6 @@ pub mod openai;
 pub mod registry;
 pub mod state;
 pub mod stats;
-pub mod sysmon;
 pub mod telemetry;
 #[cfg(feature = "server-tui")]
 pub mod tui;
@@ -85,7 +84,7 @@ pub use telemetry::{LogConfig, LogFormat, init as init_logging};
 
 use self::registry::ModelRegistry;
 use self::state::ServerState;
-use self::sysmon::SystemSampler;
+use crate::sysmon::SystemSampler;
 
 /// How long open connections get to finish after a shutdown signal.
 pub(crate) const SHUTDOWN_GRACE: Duration = Duration::from_secs(5);

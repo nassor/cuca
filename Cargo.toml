@@ -46,6 +46,7 @@ features = [
     "service-scheduler",
     "service-speculative",
     "service-vector-store",
+    "sysmon",
     "server",
     "server-tui",
     "config-kdl",
@@ -58,10 +59,10 @@ doctest = false
 
 # Dependency/feature split:
 # - provider-local does not use tokio-stream (its stream is a plain mpsc receiver).
-#   candle-core/candle-nn 0.11: candle-core hard-depends on tokenizers[onig], so the
-#   tree builds C (onig_sys); the engine code itself is pure Rust. tokenizers is also a
-#   direct optional dep for the converter's Engram token-map normalizers only (the
-#   engine's tokenizer stays hand-written). Not used directly:
+#   candle-core/candle-nn 0.11: candle-core depends on tokenizers[fancy-regex]; the
+#   engine code is pure Rust. tokenizers is also a direct optional dep for the
+#   converter's Engram token-map normalizers only (the engine's tokenizer stays
+#   hand-written), with the same pure-Rust regex engine. Not used directly:
 #   candle-transformers, hf-hub, memmap2, rayon, rand.
 #   serde_json/preserve_order: chat templates see JSON maps in the order the caller wrote
 #   them (DeepSeek V4.1 writes tool-call parameters and tool schemas in that order).
@@ -73,9 +74,9 @@ doctest = false
 # - Cross-feature sharing is intentional: base64 (provider-anthropic + plugin-sandbox),
 #   tracing (plugin-guardrails + plugin-telemetry + plugin-redaction), tiktoken-rs
 #   (plugin-memory + plugin-cost), sha2 (provider-anthropic + service-prompt-cache +
-#   provider-local), and reqwest/rustls (providers + plugin-web-search + provider-local).
-#   reqwest is built with default-features = false; HTTPS users explicitly enable its
-#   rustls backend.
+#   provider-local), and reqwest/rustls-no-provider + rustls (providers + plugin-web-search +
+#   provider-local). reqwest is built with default-features = false; HTTPS users explicitly
+#   enable its rustls backend, with ring as the crypto provider (src/tls.rs).
 # - opentelemetry_sdk is optional under plugin-telemetry (used only by that plugin's tests).
 # - jsonschema is built with default-features = false: guardrails.rs only compiles inline
 #   (in-document) schemas via validator_for/iter_errors and needs no $ref retrieval
@@ -93,18 +94,18 @@ doctest = false
 [features]
 default = []
 # Explicit model provider adapters. At least one is required by lib.rs.
-provider-openai = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
-provider-anthropic = ["dep:reqwest", "dep:tokio-stream", "dep:sha2", "dep:getrandom", "dep:base64", "reqwest/rustls"]
-provider-gemini = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
-provider-deepseek = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
-provider-llamacpp = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
-provider-vllm = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
-provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls"]
+provider-openai = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls-no-provider", "dep:rustls"]
+provider-anthropic = ["dep:reqwest", "dep:tokio-stream", "dep:sha2", "dep:getrandom", "dep:base64", "reqwest/rustls-no-provider", "dep:rustls"]
+provider-gemini = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls-no-provider", "dep:rustls"]
+provider-deepseek = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls-no-provider", "dep:rustls"]
+provider-llamacpp = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls-no-provider", "dep:rustls"]
+provider-vllm = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls-no-provider", "dep:rustls"]
+provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls-no-provider", "dep:rustls"]
 # provider-local: in-process GGUF language-model inference on CPU or GPU (src/provider/local/). Pure Rust:
 # no HTTP endpoint, no llama.cpp. reqwest is used only for the one-time model download
 # (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file;
-# sysinfo's disk list answers the converter's free-space preflight.
-provider-local = ["config-kdl", "dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:sysinfo", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "dep:wide", "reqwest/rustls", "serde_json/preserve_order"]
+# fs4 answers the converter's free-space preflight.
+provider-local = ["config-kdl", "dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:fs4", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "dep:wide", "reqwest/rustls-no-provider", "dep:rustls", "serde_json/preserve_order"]
 # provider-local GPU backends (burn 0.22 / CubeCL). provider-local-gpu is the shared
 # engine; it selects no backend by itself and is enabled by each backend feature.
 # The graphics backends are Rust (wgpu: SPIR-V for vulkan, MSL for metal), but
@@ -131,8 +132,9 @@ plugin-guardrails = ["dep:jsonschema", "dep:tracing"]
 plugin-subagent = ["dep:tokio"]
 plugin-hitl = ["dep:tokio"]
 # Self-contained HTTPS: reqwest is built with default-features = false, so this feature
-# enables the TLS backend itself (no provider feature needed for HTTPS web search).
-plugin-web-search = ["dep:reqwest", "dep:tokio", "reqwest/rustls"]
+# enables the TLS backend and its ring provider itself (no provider feature needed for
+# HTTPS web search).
+plugin-web-search = ["dep:reqwest", "dep:tokio", "reqwest/rustls-no-provider", "dep:rustls"]
 # Reusable agent skills: SKILL.md instructions + skill/skill_read/skill_search tools (agentskills.io).
 plugin-skills = []
 plugin-telemetry = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:tracing"]
@@ -190,14 +192,17 @@ service-vector-store = ["plugin-memory", "dep:wide"]
 # file and `LocalModelConfig` deserialize from it; kdl's own `serde` feature is
 # experimental and stays off.
 config-kdl = ["dep:kdl"]
+# sysmon: the background system sampler (`cuca::sysmon::SystemSampler`): CPU, RAM,
+# swap, disks, GPUs and this process. sysinfo, NVML (loaded at run time), WMI and
+# the registry on Windows; `tracing` for probe failures. No HTTP, no model engine.
+sysmon = ["dep:sysinfo", "dep:nvml-wrapper", "dep:wmi", "dep:winreg", "dep:tracing"]
 # server: the `cuca` binary's model server (src/server/): an OpenAI-compatible HTTP API
-# (axum), the stats API, Prometheus metrics and system sampling over the in-process
-# local engine. `sysinfo` (CPU/RAM/disk/process), `nvml-wrapper` (NVIDIA, loaded at run
-# time, absent driver is a soft failure) and `wmi` (Windows GPU counters) feed
-# `server::sysmon`. getrandom makes request ids; config-kdl reads `--config`.
+# (axum), the stats API and Prometheus metrics over the in-process local engine, with
+# `sysmon` for the machine's figures. `sysinfo` names the host in the node id;
+# getrandom makes request ids; config-kdl reads `--config`.
 server = [
-    "provider-local", "config-kdl", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber",
-    "dep:sysinfo", "dep:nvml-wrapper", "dep:wmi", "dep:winreg", "dep:getrandom", "dep:tokio-stream",
+    "provider-local", "config-kdl", "sysmon", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber",
+    "dep:sysinfo", "dep:getrandom", "dep:tokio-stream",
     "tokio/net", "tokio/rt-multi-thread", "tokio/signal", "tokio/io-util",
 ]
 # server-tui: the real-time terminal UI over the stats API (built after the server).
@@ -210,6 +215,10 @@ memchr = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 reqwest = { version = "0.13", optional = true, default-features = false, features = ["json", "stream", "form"] }
+# TLS crypto provider: ring. reqwest's `rustls` feature would compile aws-lc-sys (C, cmake,
+# NASM), the slowest unit of every HTTP build; `src/tls.rs` installs ring as the process
+# default when none is set.
+rustls = { version = "0.23", optional = true, default-features = false, features = ["ring", "std"] }
 tokio = { version = "1", optional = true, default-features = false, features = ["rt", "time", "macros", "sync", "process"] }
 tokio-stream = { version = "0.1", optional = true }
 # Optional (dep:) dependencies, compiled only when their feature is enabled.
@@ -222,7 +231,11 @@ postcard = { version = "1", optional = true, default-features = false, features 
 # (`transport-streamable-http-client-reqwest`) transports are opt-in features
 # (see the header note above).
 rmcp = { version = "3.10", optional = true, features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
-wasmtime = { version = "50", optional = true }
+# Only the core-module runtime is used (Engine, Module, Store, Linker, fuel,
+# epochs, StoreLimits). Off: cache (zstd-sys), component model, wit-parser,
+# compile-time-builtins, async fibers, profiling (ittapi), coredump,
+# debug-builtins, addr2line, demangle, pooling allocator.
+wasmtime = { version = "50", optional = true, default-features = false, features = ["runtime", "cranelift", "std", "gc", "gc-drc", "gc-null", "gc-copying", "threads", "parallel-compilation", "backtrace"] }
 tiktoken-rs = { version = "0.12", optional = true }
 jsonschema = { version = "0.61", optional = true, default-features = false }
 opentelemetry = { version = "0.33", optional = true }
@@ -254,8 +267,9 @@ minijinja-contrib = { version = "3.1", optional = true, features = ["pycompat"] 
 unicode-general-category = { version = "1", optional = true }
 # provider-local converter: the Hugging Face normalizers (NFKC, NFD, StripAccents,
 # Lowercase, Replace, Strip) that DeepSeek-V4.1's Engram token map is defined by.
-# candle-core already compiles this crate with the same features.
-tokenizers = { version = "0.23", optional = true, default-features = false, features = ["onig"] }
+# fancy-regex is the engine candle-core already selects; `onig` would add a C build
+# (onig_sys). The normalizers' two regexes behave the same under both.
+tokenizers = { version = "0.23", optional = true, default-features = false, features = ["fancy-regex"] }
 # provider-local-gpu: burn (CubeCL) runs the forward pass on a GPU. burn's `default`
 # features enable `optim`/`autodiff`, which inference never uses; the backend itself is
 # chosen by the provider-local-{vulkan,metal,cuda,rocm} features.
@@ -267,6 +281,9 @@ axum = { version = "0.8", optional = true, default-features = false, features = 
 clap = { version = "4", optional = true, features = ["derive"] }
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "json"] }
 sysinfo = { version = "0.40", optional = true, default-features = false, features = ["system", "disk"] }
+# provider-local converter: free space of the output volume (std has no API for it
+# and the crate forbids `unsafe`).
+fs4 = { version = "1.1", optional = true }
 nvml-wrapper = { version = "0.13", optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
@@ -485,3 +502,12 @@ required-features = ["provider-openai", "service-vector-store"]
 name = "cuca"
 path = "src/bin/cuca.rs"
 required-features = ["server"]
+
+# This repository's own builds only: cargo ignores a dependency's profiles.
+# Dependencies carry no debug info (target/debug was 122 GB, a debug libcuca
+# rlib 570 MB); cuca keeps file and line for panics and backtraces.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

@@ -5,9 +5,8 @@
 //! add up the upstreams' own snapshots; latency, requests and diagnosis stay
 //! the balancer's.
 
-use crate::server::stats::{
-    CpuStats, DiskIo, DiskStats, GpuStats, MemoryStats, StatsSnapshot, SystemSnapshot,
-};
+use crate::server::stats::StatsSnapshot;
+use crate::sysmon::{CpuStats, DiskIo, DiskStats, GpuStats, MemoryStats, SystemSnapshot};
 
 /// A sum where an unreported side counts as nothing, and two unreported
 /// sides stay unreported.

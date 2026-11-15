@@ -700,7 +700,7 @@ mod tests {
     use crate::LocalModelConfig;
     use crate::server::config::{ModelSpec, ServerConfig};
     use crate::server::registry::ModelRegistry;
-    use crate::server::sysmon::SystemSampler;
+    use crate::sysmon::SystemSampler;
 
     /// A server over models that never finish loading, listening on a free
     /// port; returns its base URL.
@@ -736,7 +736,7 @@ mod tests {
     }
 
     async fn get(url: &str, key: Option<&str>) -> reqwest::Response {
-        let mut req = reqwest::Client::new().get(url);
+        let mut req = crate::tls::http_client().get(url);
         if let Some(key) = key {
             req = req.bearer_auth(key);
         }
@@ -744,7 +744,7 @@ mod tests {
     }
 
     async fn post_chat(base: &str, body: &str) -> reqwest::Response {
-        reqwest::Client::new()
+        crate::tls::http_client()
             .post(format!("{base}/v1/chat/completions"))
             .header("content-type", "application/json")
             .body(body.to_string())
@@ -788,7 +788,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_id_is_honoured_or_made() {
         let base = serve(&["m"], None).await;
-        let r = reqwest::Client::new()
+        let r = crate::tls::http_client()
             .get(format!("{base}/version"))
             .header("x-request-id", "abc-123")
             .send()

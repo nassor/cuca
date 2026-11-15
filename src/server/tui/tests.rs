@@ -10,9 +10,11 @@ use super::app::{App, Pane};
 use super::client::{Connection, Update};
 use super::ui;
 use crate::server::stats::{
-    Cause, CpuStats, Diagnosis, DiskIo, DiskStats, GpuStats, KvStats, LatencyStats, MemoryStats,
-    ModelMemory, ModelState, ModelStats, NodeInfo, NodeRole, ProcessStats, Quantiles, RequestStats,
-    Severity, StatsSnapshot, SystemSnapshot, TokensPerSecond, UpstreamStats,
+    Cause, Diagnosis, KvStats, LatencyStats, ModelMemory, ModelState, ModelStats, NodeInfo,
+    NodeRole, Quantiles, RequestStats, Severity, StatsSnapshot, TokensPerSecond, UpstreamStats,
+};
+use crate::sysmon::{
+    CpuStats, DiskIo, DiskStats, GpuStats, MemoryStats, ProcessStats, SystemSnapshot,
 };
 
 const GIB: u64 = 1 << 30;

@@ -34,6 +34,8 @@ weight = 4
 | `client` | nothing | the builder, the client and the plugin-instrumented stream |
 | `export` | `plugin-memory` or `service-prompt-cache` | the versioned `cuca-export` envelope |
 | `cost_otel` | `plugin-cost` and `plugin-telemetry` | the cost ledger to OpenTelemetry bridge |
+| `tls` | any HTTP provider, `provider-local` or `plugin-web-search` | `ensure_crypto_provider`, which installs `ring` as the process-default rustls provider unless one is set |
+| `sysmon` | `sysmon` (`server` turns it on) | `SystemSampler` and its snapshot types `SystemSnapshot`, `CpuStats`, `MemoryStats`, `DiskStats`, `DiskIo`, `GpuStats`, `ProcessStats` |
 | `server` | `server` | `cuca serve`, `cuca balance` and `cuca tui`, and `CucaConfig`; see [Server](@/server/_index.md) |
 
 The provider adapters are in a private module. Use them through `ProviderEndpoint` and `CucaClientBuilder`.

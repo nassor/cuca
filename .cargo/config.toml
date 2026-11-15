@@ -1,0 +1,4 @@
+# LLVM's lld-link, shipped with the toolchain: every test, example and bin
+# links the whole dependency tree, and link.exe's PDB merge is the slow part.
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld.exe"

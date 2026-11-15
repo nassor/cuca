@@ -14,6 +14,27 @@
   weights may differ in the last bits from 0.8.1, because candle's x86-64 Q4_K kernel changed.
 - `provider-local`: chat templates render with minijinja 3 without its `serde` feature; JSON
   numbers convert natively and the `tojson` filter keeps serde_json's number layout.
+- Faster builds for cuca and the crates that depend on it:
+  - TLS uses rustls with the `ring` crypto provider instead of `aws-lc-rs`, so no build compiles
+    `aws-lc-sys` (C, CMake, NASM) any more. reqwest is built with `rustls-no-provider`; the new
+    `cuca::tls::ensure_crypto_provider` installs `ring` as the process default unless one is set,
+    and cuca calls it before it builds any client. **Breaking for consumers** that build their own
+    `reqwest::Client` without enabling a reqwest TLS feature themselves: call
+    `cuca::tls::ensure_crypto_provider()` first, or reqwest panics with "No rustls crypto provider
+    is configured".
+  - `provider-local` no longer depends on `sysinfo`: the converter's free-space check uses `fs4`.
+    `tokenizers` uses its pure-Rust `fancy-regex` engine, the one candle selects, so `onig_sys` is
+    no longer compiled.
+  - `plugin-sandbox` builds wasmtime without its default features: only the core-module runtime
+    with Cranelift, GC and threads; no cache, component model, async fibers or profiling.
+- **Breaking**: the system sampler moved out of `server` into the new `sysmon` feature.
+  `cuca::server::sysmon::SystemSampler` is now `cuca::sysmon::SystemSampler`, and `SystemSnapshot`,
+  `CpuStats`, `MemoryStats`, `DiskStats`, `DiskIo`, `GpuStats` and `ProcessStats` moved from
+  `cuca::server::stats` to `cuca::sysmon`. `server` turns `sysmon` on; a consumer that wants only the
+  sampler enables `sysmon` and no longer compiles axum, clap or the local engine. The stats API's
+  JSON is unchanged.
+- This repository's dev profile keeps no debug info for dependencies and line tables for cuca,
+  and links with `rust-lld` on Windows (`.cargo/config.toml`). Neither applies to dependents.
 
 ## 0.8.1 - 2026-11-14
 

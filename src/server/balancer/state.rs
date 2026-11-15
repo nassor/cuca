@@ -10,7 +10,7 @@ use super::routing::{Candidate, Decision, Router, UpstreamView, load_score};
 use super::upstream::Upstream;
 use crate::server::latency::{LatencyTracker, MAX_RECORDS};
 use crate::server::metrics::{E2E_BUCKETS, Histogram, StatusCounters, TTFT_BUCKETS};
-use crate::server::sysmon::SystemSampler;
+use crate::sysmon::SystemSampler;
 
 /// The balancer's own counters.
 #[derive(Debug)]
@@ -120,7 +120,7 @@ impl BalancerState {
             metrics: BalancerMetrics::default(),
             system,
             started: Instant::now(),
-            started_unix_ms: crate::server::sysmon::now_ms(),
+            started_unix_ms: crate::sysmon::now_ms(),
             node_id: format!("{host}:{}", listen.port()),
             stats_streams: AtomicUsize::new(0),
         }

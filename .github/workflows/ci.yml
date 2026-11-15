@@ -11,7 +11,7 @@ concurrency:
 # list is the docs.rs feature set in Cargo.toml. Matrix values reference it as
 # $ALL_NO_LLVM, which the run step's shell expands.
 env:
-  ALL_NO_LLVM: "provider-openai,provider-anthropic,provider-gemini,provider-deepseek,provider-llamacpp,provider-vllm,provider-lmstudio,provider-local,provider-local-gpu,provider-local-vulkan,provider-local-metal,plugin-mcp,plugin-sandbox,plugin-memory,plugin-guardrails,plugin-subagent,plugin-hitl,plugin-web-search,plugin-skills,plugin-telemetry,plugin-session-log,plugin-redaction,plugin-cost,service-entity-extraction,service-prompt-cache,service-rate-limit,service-replay,service-scheduler,service-speculative,service-vector-store,server,server-tui,config-kdl"
+  ALL_NO_LLVM: "provider-openai,provider-anthropic,provider-gemini,provider-deepseek,provider-llamacpp,provider-vllm,provider-lmstudio,provider-local,provider-local-gpu,provider-local-vulkan,provider-local-metal,plugin-mcp,plugin-sandbox,plugin-memory,plugin-guardrails,plugin-subagent,plugin-hitl,plugin-web-search,plugin-skills,plugin-telemetry,plugin-session-log,plugin-redaction,plugin-cost,service-entity-extraction,service-prompt-cache,service-rate-limit,service-replay,service-scheduler,service-speculative,service-vector-store,sysmon,server,server-tui,config-kdl"
 jobs:
   fmt:
     runs-on: ubuntu-latest
@@ -112,8 +112,8 @@ jobs:
   server_solo:
     # The `cuca` binary and the server module alone: `server` enables
     # provider-local itself, so no other provider is named. The
-    # `provider-openai,config-kdl` leg checks the KDL reader without
-    # provider-local.
+    # `provider-openai,config-kdl` leg checks the KDL reader and the
+    # `provider-openai,sysmon` leg the system sampler without provider-local.
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -121,6 +121,7 @@ jobs:
           - server
           - server-tui
           - provider-openai,config-kdl
+          - provider-openai,sysmon
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -23,8 +23,9 @@ use super::registry::{ModelSlot, SlotStatus};
 use super::state::ServerState;
 use super::stats::{
     ExpertTierRates, KvStats, ModelMemory, ModelState, ModelStats, NodeInfo, NodeRole,
-    RequestStats, StatsSnapshot, SystemSnapshot, TokensPerSecond,
+    RequestStats, StatsSnapshot, TokensPerSecond,
 };
+use crate::sysmon::SystemSnapshot;
 use crate::{ExpertTierStats, ServingStats};
 
 /// Samples kept per ring: five minutes at one per second.

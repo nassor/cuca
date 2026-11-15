@@ -13,8 +13,8 @@ use super::config::ServerConfig;
 use super::latency::{LatencyTracker, MAX_RECORDS, Outcome, RequestRecord};
 use super::metrics::ServerMetrics;
 use super::registry::{ModelRegistry, ModelSlot};
-use super::sysmon::SystemSampler;
 use crate::GenerationReport;
+use crate::sysmon::SystemSampler;
 
 /// A producer wait shorter than this is a scheduling blip, not a slow client.
 const MIN_STALL: Duration = Duration::from_millis(2);
@@ -67,7 +67,7 @@ impl ServerState {
             metrics: ServerMetrics::default(),
             system,
             started: Instant::now(),
-            started_unix_ms: super::sysmon::now_ms(),
+            started_unix_ms: crate::sysmon::now_ms(),
             node_id: format!("{host}:{}", listen.port()),
             stats_streams: AtomicUsize::new(0),
         }

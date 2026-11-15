@@ -9,8 +9,9 @@
 use std::fmt::{Display, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use super::stats::{ModelState, SystemSnapshot};
+use super::stats::ModelState;
 use crate::ServingStats;
+use crate::sysmon::SystemSnapshot;
 
 /// Buckets of time-to-first-token histograms, seconds (vLLM's).
 pub const TTFT_BUCKETS: &[f64] = &[
@@ -678,7 +679,7 @@ pub(crate) fn render_system(x: &mut Exposition, s: &SystemSnapshot) {
     let per_gpu = |x: &mut Exposition,
                    name: &str,
                    help: &str,
-                   value: &dyn Fn(&super::stats::GpuStats) -> Option<f64>| {
+                   value: &dyn Fn(&crate::sysmon::GpuStats) -> Option<f64>| {
         x.family(name, "gauge", help);
         for g in &s.gpus {
             if let Some(v) = value(g) {

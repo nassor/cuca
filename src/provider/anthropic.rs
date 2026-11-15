@@ -233,7 +233,8 @@ pub async fn exchange_code(
         ("client_id", cfg.client_id.as_str()),
         ("redirect_uri", redirect_uri),
     ];
-    let response = send_checked(reqwest::Client::new().post(&cfg.token_url).form(&params)).await?;
+    let response =
+        send_checked(crate::tls::http_client().post(&cfg.token_url).form(&params)).await?;
     let value: serde_json::Value = response.json().await?;
     value
         .get("access_token")

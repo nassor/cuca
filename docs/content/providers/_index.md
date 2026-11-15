@@ -126,7 +126,7 @@ These notes apply to every adapter above:
 
 - The default base URL applies when the client's base URL is empty. Set another with `CucaClientBuilder::with_base_url`.
 - Each provider page has the same sections: what you need, the endpoint, the request and stream translation, thinking, errors and limits.
-- Every HTTP feature enables `reqwest` with its `rustls` backend and `tokio-stream`. `provider-anthropic` also enables `sha2`, `getrandom` and `base64`.
+- Every HTTP feature enables `reqwest` with its `rustls` backend, `rustls` with the `ring` crypto provider, and `tokio-stream`. `provider-anthropic` also enables `sha2`, `getrandom` and `base64`.
 - [The feature matrix](@/reference/features.md) maps every feature to its dependencies.
 
 ## Wire formats
@@ -173,7 +173,7 @@ Gemini nests all four fields under `generationConfig`, for example `generationCo
 - `ProviderEndpoint::Local` selects it, and `CucaClientBuilder::with_local_model` attaches the model. `build` fails when the selected provider is `Local` and no model is attached.
 - The CPU is the default device. `provider-local-vulkan`, `provider-local-metal`, `provider-local-cuda` and `provider-local-rocm` add a GPU engine that `LocalModelConfig::device` selects.
 - It does not use `tokio-stream`. It uses `reqwest` only for the one-time model download.
-- The engine is pure Rust. The `candle` dependency tree builds one C crate, `onig_sys`.
+- The engine is pure Rust. The one C crate in its dependency tree is `ring`, the TLS crypto provider of the download client.
 
 See [Local (in-process)](@/providers/local/_index.md) for a first run, [Choose a model](@/providers/local/models.md) for the supported architectures and presets, and [Configuration](@/providers/local/configuration.md) for every setting.
 

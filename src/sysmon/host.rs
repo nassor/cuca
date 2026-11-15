@@ -8,9 +8,7 @@ use sysinfo::{
 };
 
 use super::MAX_DISKS;
-use crate::server::stats::{
-    CpuStats, DiskIo, DiskStats, MemoryStats, ProcessStats, SystemSnapshot,
-};
+use super::stats::{CpuStats, DiskIo, DiskStats, MemoryStats, ProcessStats, SystemSnapshot};
 
 /// Disks are re-listed with their kind (SSD/HDD) every this many ticks.
 const KIND_REFRESH_TICKS: u32 = 30;

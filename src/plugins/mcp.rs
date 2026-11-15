@@ -236,6 +236,8 @@ impl McpPlugin {
             }
             McpTransport::StreamableHttp { url } => {
                 Self::connect_inner(move || async move {
+                    // rmcp builds its own reqwest client inside the transport.
+                    crate::tls::ensure_crypto_provider();
                     Ok(StreamableHttpClientTransport::from_uri(url))
                 })
                 .await

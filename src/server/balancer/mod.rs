@@ -54,7 +54,7 @@ pub use routing::Policy;
 use self::state::BalancerState;
 use self::upstream::{Upstream, spawn_poller};
 use super::error::ServerError;
-use super::sysmon::SystemSampler;
+use crate::sysmon::SystemSampler;
 
 /// Run the balancer until it is asked to stop (Ctrl-C, SIGTERM).
 ///
@@ -74,7 +74,7 @@ pub async fn balance(config: BalancerConfig) -> Result<(), ServerError> {
     let addr = listener
         .local_addr()
         .map_err(|e| ServerError::Io(format!("cannot read the bound address: {e}")))?;
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .connect_timeout(Duration::from_secs(3))
         .redirect(reqwest::redirect::Policy::none())
         .build()

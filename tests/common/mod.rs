@@ -138,6 +138,7 @@ pub fn server_probe() -> Result<Vec<String>, String> {
         .build()
         .map_err(|e| format!("failed to build probe runtime: {e}"))?;
     rt.block_on(async {
+        cuca::tls::ensure_crypto_provider();
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(2))
             .build()

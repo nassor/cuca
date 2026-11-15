@@ -9,7 +9,7 @@ use wmi::WMIConnection;
 
 use super::MAX_GPUS;
 use super::parse::{parse_gpu_instance, vendor_name};
-use crate::server::stats::GpuStats;
+use super::stats::GpuStats;
 
 /// Ticks between WMI reconnection attempts after a failed connect.
 const WMI_RETRY_TICKS: u32 = 15;

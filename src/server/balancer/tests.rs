@@ -25,7 +25,7 @@ use super::routing::Policy;
 use super::state::BalancerState;
 use super::upstream::{Upstream, spawn_poller};
 use crate::server::stats::{ModelStats, StatsSnapshot};
-use crate::server::sysmon::SystemSampler;
+use crate::sysmon::SystemSampler;
 
 /// A fake model server.
 #[derive(Clone)]
@@ -205,7 +205,7 @@ async fn balancer(polled: &[String], options: Options) -> Harness {
     config.upstream_api_key = options.upstream_key.map(str::to_string);
     config.stats_api = options.stats_api;
     let resolved = config.resolve_upstreams().unwrap();
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .connect_timeout(Duration::from_secs(1))
         .build()
         .unwrap();
@@ -242,7 +242,7 @@ async fn balancer(polled: &[String], options: Options) -> Harness {
     Harness {
         base: format!("http://{addr}"),
         state,
-        client: reqwest::Client::new(),
+        client: crate::tls::http_client(),
     }
 }
 

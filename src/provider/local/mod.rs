@@ -3,9 +3,8 @@
 //! The engine is pure Rust: candle 0.11 on the CPU (the default), or burn
 //! 0.22 (CubeCL) on a GPU selected with [`LocalModelConfig::device`] and a
 //! `provider-local-{vulkan,metal,cuda,rocm}` feature. No llama.cpp, no FFI
-//! written by this crate, and no HTTP endpoint. (candle's dependency tree
-//! compiles a C crate, `onig_sys`, via `tokenizers`, and CubeCL's compiles
-//! `simsimd` and `aegis`; cuca calls none of them. The CUDA and ROCm
+//! written by this crate, and no HTTP endpoint. (CubeCL's dependency tree
+//! compiles `simsimd` and `aegis`; cuca calls neither. The CUDA and ROCm
 //! backends link a prebuilt LLVM.) The model runs inside the
 //! application and is consumed through the library API only.
 //!
@@ -2298,7 +2297,7 @@ fn download_runtime() -> Result<(tokio::runtime::Runtime, reqwest::Client), Cuca
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .build()?;
     Ok((runtime, client))

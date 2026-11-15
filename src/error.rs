@@ -373,7 +373,7 @@ mod tests {
     /// `From<reqwest::Error>` maps into `CucaError::Transport` without network.
     #[test]
     fn from_reqwest_error() {
-        let re = reqwest::Client::builder()
+        let re = crate::tls::http_client_builder()
             .user_agent("bad\nvalue")
             .build()
             .expect_err("an invalid User-Agent header must fail to build");
