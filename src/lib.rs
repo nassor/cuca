@@ -65,7 +65,6 @@ pub mod client;
 /// Provider adapter layer: per-provider dispatch implementations.
 pub(crate) mod provider;
 
-/// TLS crypto provider (ring) for every reqwest client the crate builds.
 #[cfg(any(
     feature = "provider-openai",
     feature = "provider-anthropic",
@@ -79,7 +78,6 @@ pub(crate) mod provider;
 ))]
 pub mod tls;
 
-/// Background system sampler (feature `sysmon`).
 #[cfg(feature = "sysmon")]
 pub mod sysmon;
 
