@@ -2,6 +2,21 @@
 //! ([`dequant_row`]), the token-embedding table held quantized
 //! ([`TokenEmbedding`]) and tensors read row by row from the GGUF file
 //! ([`RowTable`]).
+//!
+//! The block decoders live in the submodules, ported from llama.cpp bit for
+//! bit: [`kquants`] (Q2_K to Q8_K), [`iquants`] (IQ1_S to IQ4_XS, TQ1_0,
+//! TQ2_0, MXFP4, NVFP4) and the grids of [`iq_tables`]. [`block::Unpacked`]
+//! and the `unpack_*` functions give the same blocks as integers for the
+//! row-batched kernels; see `block.rs` for the contract and the folding
+//! bounds.
+
+pub(crate) mod block;
+pub(crate) mod iq_tables;
+pub(crate) mod iquants;
+pub(crate) mod kquants;
+
+#[cfg(test)]
+mod format_tests;
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -18,10 +33,16 @@ use crate::provider::local::gguf::{self, GgufType};
 /// Dequantize one row of a tensor into `out`, multiplying every element by
 /// `scale`.
 ///
-/// F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, IQ4_NL, MXFP4 and I8 are
-/// decoded in place, with no allocation. Every other dtype candle reads (the
-/// K-quants and Q8_1) goes through candle's own dequantizer, which allocates
-/// per call. A type the engine does not know is an error.
+/// Every type but Q8_1 is decoded in place, with no allocation: F32, F16,
+/// BF16, the legacy blocks (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0), the K-quants, the
+/// I-quants, TQ1_0, TQ2_0, IQ4_NL, MXFP4, NVFP4 and I8. Q8_1 goes through
+/// candle's own dequantizer, which allocates per call. A type the engine does
+/// not know is an error.
+///
+/// With a `scale` of 1.0 the result is llama.cpp's `dequantize_row_*` bit for
+/// bit. The legacy blocks, IQ4_NL and MXFP4 fold `scale` into the block's
+/// f32 scale before the quants are multiplied; every other type multiplies
+/// llama.cpp's result by `scale`.
 ///
 /// `bytes` holds the row's blocks and must be exactly `out.len() /
 /// block_size` blocks of `type_size` bytes (for example 18 bytes per 32
@@ -44,14 +65,14 @@ pub(crate) fn dequant_row(
                 if ty == GgufType::Iq4Nl {
                     let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32() * scale;
                     for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[2..18]) {
-                        *lo = f32::from(IQ4_NL_VALUES[usize::from(q & 0x0F)]) * d;
-                        *hi = f32::from(IQ4_NL_VALUES[usize::from(q >> 4)]) * d;
+                        *lo = f32::from(iq_tables::KVALUES_IQ4NL[usize::from(q & 0x0F)]) * d;
+                        *hi = f32::from(iq_tables::KVALUES_IQ4NL[usize::from(q >> 4)]) * d;
                     }
                 } else {
                     let d = e8m0_half(b[0]) * scale;
                     for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[1..17]) {
-                        *lo = f32::from(MXFP4_VALUES[usize::from(q & 0x0F)]) * d;
-                        *hi = f32::from(MXFP4_VALUES[usize::from(q >> 4)]) * d;
+                        *lo = f32::from(iq_tables::KVALUES_FP4[usize::from(q & 0x0F)]) * d;
+                        *hi = f32::from(iq_tables::KVALUES_FP4[usize::from(q >> 4)]) * d;
                     }
                 }
             }
@@ -65,17 +86,12 @@ pub(crate) fn dequant_row(
             Ok(())
         }
         GgufType::Unknown(id) => Err(err(format!("cannot dequantize ggml type {id}"))),
+        ty => {
+            check_row(ty, bytes, out)?;
+            dequant_blocks_of(ty, bytes, scale, out)
+        }
     }
 }
-
-/// IQ4_NL's 16-entry code table (llama.cpp `kvalues_iq4nl`).
-const IQ4_NL_VALUES: [i8; 16] = [
-    -127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113,
-];
-
-/// MXFP4's E2M1 table, doubled (llama.cpp `kvalues_mxfp4`): the block scale
-/// [`e8m0_half`] carries the other half.
-const MXFP4_VALUES: [i8; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
 
 /// `2^(e - 128)`, the E8M0 scale byte `e` as ggml's `GGML_E8M0_TO_FP32_HALF`
 /// (exact in f32, including the two denormal exponents).
@@ -196,8 +212,16 @@ fn dequant_ggml_row(
                 }
             }
         }
-        other => {
-            let values = gguf::qtensor_from_bytes(other, &[out.len()], bytes, &Device::Cpu)
+        GgmlDType::Q2K
+        | GgmlDType::Q3K
+        | GgmlDType::Q4K
+        | GgmlDType::Q5K
+        | GgmlDType::Q6K
+        | GgmlDType::Q8K => dequant_blocks_of(GgufType::Ggml(dtype), bytes, scale, out)?,
+        // Q8_1 is an activation format: no GGUF file stores it and no kernel
+        // reads it, so it keeps candle's allocating dequantizer.
+        GgmlDType::Q8_1 => {
+            let values = gguf::qtensor_from_bytes(dtype, &[out.len()], bytes, &Device::Cpu)
                 .and_then(|t| t.dequantize(&Device::Cpu))
                 .and_then(|t| t.to_vec1::<f32>())
                 .map_err(candle_err)?;
@@ -205,6 +229,108 @@ fn dequant_ggml_row(
                 *o = v * scale;
             }
         }
+    }
+    Ok(())
+}
+
+/// Decode every `B`-byte block of `bytes` into the `N`-value blocks of `out`
+/// with `decode`, then multiply each block by `scale` (skipped at 1.0, which
+/// would not change a bit). A trailing partial block of either is ignored;
+/// the callers have checked the lengths.
+fn decode_blocks<const B: usize, const N: usize>(
+    bytes: &[u8],
+    scale: f32,
+    out: &mut [f32],
+    decode: impl Fn(&[u8; B], &mut [f32; N]),
+) {
+    let (blocks, _) = bytes.as_chunks::<B>();
+    let (outs, _) = out.as_chunks_mut::<N>();
+    for (b, o) in blocks.iter().zip(outs) {
+        decode(b, o);
+        if scale != 1.0 {
+            for v in o {
+                *v *= scale;
+            }
+        }
+    }
+}
+
+/// [`dequant_row`] for the K-quants and the types decoded by [`iquants`]; the
+/// row has been checked against the type's block geometry.
+fn dequant_blocks_of(
+    ty: GgufType,
+    bytes: &[u8],
+    scale: f32,
+    out: &mut [f32],
+) -> Result<(), CucaError> {
+    use self::{iquants as iq, kquants as kq};
+    match ty {
+        GgufType::Ggml(GgmlDType::Q2K) => decode_blocks(bytes, scale, out, kq::dequant_q2_k),
+        GgufType::Ggml(GgmlDType::Q3K) => decode_blocks(bytes, scale, out, kq::dequant_q3_k),
+        GgufType::Ggml(GgmlDType::Q4K) => decode_blocks(bytes, scale, out, kq::dequant_q4_k),
+        GgufType::Ggml(GgmlDType::Q5K) => decode_blocks(bytes, scale, out, kq::dequant_q5_k),
+        GgufType::Ggml(GgmlDType::Q6K) => decode_blocks(bytes, scale, out, kq::dequant_q6_k),
+        GgufType::Ggml(GgmlDType::Q8K) => decode_blocks(bytes, scale, out, kq::dequant_q8_k),
+        GgufType::Iq2Xxs => decode_blocks(bytes, scale, out, iq::dequant_iq2_xxs),
+        GgufType::Iq2Xs => decode_blocks(bytes, scale, out, iq::dequant_iq2_xs),
+        GgufType::Iq2S => decode_blocks(bytes, scale, out, iq::dequant_iq2_s),
+        GgufType::Iq3Xxs => decode_blocks(bytes, scale, out, iq::dequant_iq3_xxs),
+        GgufType::Iq3S => decode_blocks(bytes, scale, out, iq::dequant_iq3_s),
+        GgufType::Iq1S => decode_blocks(bytes, scale, out, iq::dequant_iq1_s),
+        GgufType::Iq1M => decode_blocks(bytes, scale, out, iq::dequant_iq1_m),
+        GgufType::Iq4Xs => decode_blocks(bytes, scale, out, iq::dequant_iq4_xs),
+        GgufType::Tq1_0 => decode_blocks(bytes, scale, out, iq::dequant_tq1_0),
+        GgufType::Tq2_0 => decode_blocks(bytes, scale, out, iq::dequant_tq2_0),
+        GgufType::Nvfp4 => decode_blocks(bytes, scale, out, iq::dequant_nvfp4),
+        other => return Err(err(format!("{} has no block decoder", other.name()))),
+    }
+    Ok(())
+}
+
+/// `bytes` as one `B`-byte block of `ty`.
+fn one_block<const B: usize>(ty: GgufType, bytes: &[u8]) -> Result<&[u8; B], CucaError> {
+    <&[u8; B]>::try_from(bytes).map_err(|_| {
+        err(format!(
+            "a {} block is {B} bytes, not {}",
+            ty.name(),
+            bytes.len()
+        ))
+    })
+}
+
+/// Unpack the one block `bytes` of type `ty` into integers (see
+/// [`block::Unpacked`]): K-quants, I-quants, TQ1_0, TQ2_0, IQ4_NL, MXFP4 and
+/// NVFP4. The legacy blocks and the float types are not unpacked: the
+/// row-batched kernel of `qmm.rs` reads them directly.
+#[allow(dead_code)] // the entry point of the kernel phase; only the tests call it so far
+pub(crate) fn unpack_block(
+    ty: impl Into<GgufType>,
+    bytes: &[u8],
+    out: &mut block::Unpacked,
+) -> Result<(), CucaError> {
+    use self::{iquants as iq, kquants as kq};
+    let ty = ty.into();
+    match ty {
+        GgufType::Ggml(GgmlDType::Q2K) => kq::unpack_q2_k(one_block(ty, bytes)?, out),
+        GgufType::Ggml(GgmlDType::Q3K) => kq::unpack_q3_k(one_block(ty, bytes)?, out),
+        GgufType::Ggml(GgmlDType::Q4K) => kq::unpack_q4_k(one_block(ty, bytes)?, out),
+        GgufType::Ggml(GgmlDType::Q5K) => kq::unpack_q5_k(one_block(ty, bytes)?, out),
+        GgufType::Ggml(GgmlDType::Q6K) => kq::unpack_q6_k(one_block(ty, bytes)?, out),
+        GgufType::Ggml(GgmlDType::Q8K) => kq::unpack_q8_k(one_block(ty, bytes)?, out),
+        GgufType::Iq2Xxs => iq::unpack_iq2_xxs(one_block(ty, bytes)?, out),
+        GgufType::Iq2Xs => iq::unpack_iq2_xs(one_block(ty, bytes)?, out),
+        GgufType::Iq2S => iq::unpack_iq2_s(one_block(ty, bytes)?, out),
+        GgufType::Iq3Xxs => iq::unpack_iq3_xxs(one_block(ty, bytes)?, out),
+        GgufType::Iq3S => iq::unpack_iq3_s(one_block(ty, bytes)?, out),
+        GgufType::Iq1S => iq::unpack_iq1_s(one_block(ty, bytes)?, out),
+        GgufType::Iq1M => iq::unpack_iq1_m(one_block(ty, bytes)?, out),
+        GgufType::Iq4Nl => iq::unpack_iq4_nl(one_block(ty, bytes)?, out),
+        GgufType::Iq4Xs => iq::unpack_iq4_xs(one_block(ty, bytes)?, out),
+        GgufType::Tq1_0 => iq::unpack_tq1_0(one_block(ty, bytes)?, out),
+        GgufType::Tq2_0 => iq::unpack_tq2_0(one_block(ty, bytes)?, out),
+        GgufType::Mxfp4 => iq::unpack_mxfp4(one_block(ty, bytes)?, out),
+        GgufType::Nvfp4 => iq::unpack_nvfp4(one_block(ty, bytes)?, out),
+        other => return Err(err(format!("{} has no integer unpacker", other.name()))),
     }
     Ok(())
 }
@@ -540,8 +666,8 @@ mod tests {
     }
 
     /// Every dtype candle can quantize to must dequantize a row exactly as
-    /// candle's own dequantizer does: the legacy and float paths are decoded
-    /// here, the K-quants are delegated.
+    /// candle's own dequantizer does: the K-quants are an independent port of
+    /// ggml's decoders here, against candle's.
     #[test]
     fn dequant_row_matches_candle_for_every_dtype() {
         let row: Vec<f32> = (0..512)

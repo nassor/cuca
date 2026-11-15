@@ -1496,8 +1496,8 @@ mod tests {
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
     }
 
-    /// A GGUF header declaring one tensor of type 16 (an IQ type the engine
-    /// does not know): the header opens, and the tensor that is asked for
+    /// A GGUF header declaring one tensor of type 31 (a removed repacked
+    /// type the engine does not know): the header opens, and the tensor that is asked for
     /// names its type instead of the whole file failing to parse.
     #[test]
     fn an_unknown_tensor_dtype_opens_and_names_the_tensor_on_use() {
@@ -1509,7 +1509,7 @@ mod tests {
         bytes.push(b'x');
         bytes.extend(1u32.to_le_bytes()); // dimensions
         bytes.extend(32u64.to_le_bytes());
-        bytes.extend(16u32.to_le_bytes()); // IQ2_XXS
+        bytes.extend(31u32.to_le_bytes()); // removed Q4_0_4_4
         bytes.extend(0u64.to_le_bytes()); // offset
         bytes.resize(bytes.len().next_multiple_of(32) + 64, 0);
         let path = std::env::temp_dir().join(format!("cuca-iq4-{}.gguf", std::process::id()));
@@ -1517,7 +1517,7 @@ mod tests {
 
         let content = open_gguf(&path, &[]).unwrap();
         let msg = content.reader().bytes("x").unwrap_err().to_string();
-        assert!(msg.contains("`x`") && msg.contains("ggml type 16"), "{msg}");
+        assert!(msg.contains("`x`") && msg.contains("ggml type 31"), "{msg}");
         let config = LocalModelConfig::default();
         let result = Engine::open(&path, None, Arc::default(), &config, None);
         let _ = std::fs::remove_file(&path);
