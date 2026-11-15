@@ -1,7 +1,7 @@
 /target*
+Cargo.lock
 /smoke*
 /.agents
-/graphify*
 /.omp
 /docs/public
 # The local test configuration; cuca-test.example.kdl is the template.
