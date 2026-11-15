@@ -2698,7 +2698,7 @@ pub(crate) mod tests {
     }
 
     /// Every block format the engine keeps native on the device (the file's
-    /// bits per weight): K-quants, I-quants, ternary and NVFP4.
+    /// bits per weight): Q5_0, Q5_1, K-quants, I-quants, ternary and NVFP4.
     const NATIVE: [GgufType; 20] = [
         GgufType::Ggml(GgmlDType::Q5_0),
         GgufType::Ggml(GgmlDType::Q5_1),
@@ -2724,7 +2724,7 @@ pub(crate) mod tests {
 
     /// No native format is requantized, and a matrix keeps the file's size
     /// (the 4-byte word padding of the block formats aside: at most 3 bytes
-    /// per block, under 0.1 bit per value).
+    /// per block, 0.5 bit per value for Q5_0's 22-byte block).
     #[test]
     fn native_formats_keep_the_files_bits_per_weight() {
         let (rows, cols) = (24usize, 1536usize);
