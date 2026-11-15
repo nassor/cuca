@@ -107,14 +107,12 @@ Other load errors are on [Limits and errors](@/providers/local/limits-and-errors
 
 How a weight is stored decides how much VRAM it takes.
 
-- Q4_0, Q4_1 and Q8_0 weights stay quantized (stored with fewer bits per weight). One copy sits in VRAM.
-- K-quants (Q2_K to Q6_K, the formats behind files such as Q4_K_M), Q5_0, Q5_1 and Q8_1 become Q8_0 at load, about 1 byte per weight. A 3.8 billion parameter Q4_K_M file needs about 4 GB of VRAM. The extra rounding error is smaller than the error the file already carries.
+- Quantized weights stay in the file's own blocks: the legacy formats, the K-quants behind files such as Q4_K_M, the I-quants, ternary and FP4 formats. One copy sits in VRAM, about the file size. Only Q8_1 becomes Q8_0 at load. See [Weight formats](@/providers/local/models.md#weight-formats).
 - F32, F16 and BF16 weights are held as f32, so an F16 or BF16 model takes twice its file size.
-- MXFP4 experts keep their file format.
-- The K/V cache (the attention memory of past tokens, see [How it works](@/providers/local/how-it-works.md)) lives in VRAM as f32. By default it holds `context_length` plus at most 4,096 positions (12,288 at an 8,192 context), where the CPU holds twice `context_length`: VRAM is the scarcer memory.
+- The K/V cache (the attention memory of past tokens, see [How it works](@/providers/local/how-it-works.md)) lives in VRAM as f32. By default it holds `context_length` plus at most 4,096 positions (12,288 at an 8,192 context), where the CPU holds twice `context_length`: VRAM is the scarcer memory. The [presets table](@/providers/local/models.md#the-presets) gives each preset's cache on both, and [When to change kv_tokens](@/providers/local/configuration.md#when-to-change-kv-tokens) says when to set it yourself.
 - Dropping the last clone of a `LocalModel` returns its VRAM to the driver, so another model can load in the same process.
 - Every new batch size compiles kernels once per process, so the first request of each size is slower.
-- If the model does not fit, the load or the first request can fail when VRAM runs out. The error text comes from the GPU backend. Use `gpu_layers` or expert placement from [Fit a large model](@/providers/local/placement.md).
+- If the model does not fit, the load fails with `the device failed while the model loaded (most likely out of memory: ...)`. Lower `context_length` or `batching kv_tokens`, or use `gpu_layers` or expert placement from [Fit a large model](@/providers/local/placement.md).
 
 ## Several GPUs
 
@@ -234,7 +232,7 @@ Method: a prompt of about 1,100 tokens and 96 generated tokens, prefix cache off
 |---|---|---|---|
 | `gemma4-e2b-q4_0` | GPU | 48 to 57 | 1 to 4 s |
 | `gemma4-e2b-q4_0` | CPU | 27.5 | 11 s |
-| `phi4-mini-q4_k_m` | GPU (K-quant weights become Q8_0) | 52 to 59 | 2 to 4 s |
+| `phi4-mini-q4_k_m` | GPU (measured when K-quant weights became Q8_0 at load) | 52 to 59 | 2 to 4 s |
 | `phi4-mini-q4_k_m` | CPU | 19.6 | 10 s |
 | `muse-glimmer-30b-q4_0` (16 GB file, bigger than the card) | CPU | 3.5 | 81 s |
 | `muse-glimmer-30b-q4_0` | GPU, `gpu_layers 38` of 52 | 8.3 | 39 s |

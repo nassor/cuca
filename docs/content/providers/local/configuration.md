@@ -205,7 +205,7 @@ The fields are optional so that "set" and "default" differ: `top_k: Some(64)` be
 | Field | Default | Sets |
 |---|---|---|
 | `max_sequences` | 4 | requests that run at once, 1 to 64 |
-| `kv_tokens` | twice `context_length`; on a GPU `context_length` plus at most 4,096 | positions in the shared K/V pool |
+| `kv_tokens` | CPU: twice `context_length`<br>GPU: `context_length` plus at most 4,096 | positions in the shared K/V pool |
 | `max_step_tokens` | the prefill chunk | rows of one forward step across all requests |
 | `prefix_cache` | `true` | keep the K/V of finished requests for later prompts |
 
@@ -214,6 +214,22 @@ The fields are optional so that "set" and "default" differ: `top_k: Some(64)` be
 - `prefix_cache: false` registers nothing in the prefix store, so every prompt prefills in full.
 - A drafter that reads every position of its sequence (the in-trunk head, EAGLE, DFlash and DSpark) forces `max_sequences` to 1. A Gemma 4 assistant drafts only while one request runs alone.
 - `LocalModel::serving_stats()` returns a `ServingStats` snapshot. The gauges are `running`, `waiting`, `max_sequences`, `free_blocks`, `cached_blocks`, `used_blocks`, `total_blocks` and `snapshot_bytes`. The totals since load are `prefix_hit_tokens`, `preemptions`, `steps`, `batched_rows`, `prefill_rows`, `generated_tokens`, `admissions`, `queue_wait_ns` and `step_ns`, and `last_step_ns` and `last_step_rows` describe the last pass. Reading them never waits for a step. Subtract two snapshots to get a rate.
+
+### When to change kv_tokens
+
+The pool holds the K/V of every running request plus the prompts of finished requests, kept for reuse. One request of the full `context_length` always fits. The pool's size never changes how fast a token is computed; a pool that runs short only makes the engine redo work. A GPU starts smaller than the CPU because device memory is the tighter limit: on a 16 GB card the CPU default would add 0.8 GB to the 2.42 GB pool of `qwen3-30b-a3b-iq2_xxs`, more than is left beside its weights.
+
+Read two counters of `serving_stats()` while the model serves your real traffic:
+
+- `preemptions` grows: several long requests ran at once and did not fit, so the youngest one was paused and reads its prompt again later. Raise `kv_tokens`, or lower `max_sequences`.
+- `prefix_hit_tokens` grows little although prompts repeat (the same system prompt, tools or conversation sent again): their cached K/V was evicted for other prompts. Raise `kv_tokens`.
+
+Lower `kv_tokens` or `context_length` when a GPU load fails with `the device failed while the model loaded (most likely out of memory: ...)`, or when RAM is short. A K/V cache costs the same per position on every device; the per-preset figures for both defaults are in the [presets table](@/providers/local/models.md#the-presets).
+
+```kdl,name=Pin the pool to the CPU default on a GPU
+device "vulkan"
+batching kv_tokens=16384
+```
 
 ## Engram cache
 

@@ -11,7 +11,7 @@ weight = 2
 <dt>In one line</dt>
 <dd>Put a preset name in <code>source</code> and the model downloads on first use. Any other GGUF file or safetensors checkpoint of a supported architecture loads too.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature, disk for the download, and RAM (or VRAM on a GPU) for the model. The Memory column below says how much.</dd>
+<dd>The <code>provider-local</code> feature, disk for the download, and RAM (or VRAM on a GPU) for the model. The presets table below gives each file's size and its K/V cache on the CPU and on a GPU.</dd>
 <dt>Read this if</dt>
 <dd>You are choosing a model, or loading a model that is not a preset.</dd>
 </dl>
@@ -57,43 +57,44 @@ Start from the memory you can spare. A model needs about its file size plus a K/
 
 `ModelSource::PRESETS` has 30 models and 2 drafters. Each is pinned to one repository commit and one SHA-256, so every download is the same file. A name is ASCII case-insensitive.
 
-- Download is the file size.
-- Memory is the file plus the K/V cache at the default `context_length` of 8,192 positions with 4 parallel requests. Lower `context_length` to shrink the cache. A mixture of experts with tiered experts needs less.
+- Download is the file size in GB.
+- K/V is the cache in GB at the default settings, on the CPU and on a GPU: the default `context_length` of 8,192 positions (4,096 for OLMo 2 and OLMoE) and 4 parallel requests. The pool holds twice the context on the CPU and the context plus 4,096 positions on a GPU, so a GPU keeps fewer finished prompts cached; see [When to change kv_tokens](@/providers/local/configuration.md#when-to-change-kv-tokens). `LocalModel::kv_cache_bytes` reports the cache of a loaded model.
+- A model needs about its download plus its K/V cache. Lower `context_length` to shrink the cache. A mixture of experts with tiered experts needs less.
 - Thinking is `yes` when a request can switch reasoning on or off, `always` when the model reasons on every request, and `no` when it has no reasoning mode.
 - Tools is `yes` when the model can call tools you declare. Details on calls and reasoning are on [Requests, thinking and tool calls](@/providers/local/requests.md).
 
-| Preset | Family | Download | Memory | Thinking | Tools |
+| Preset | Family | Download | K/V CPU / GPU | Thinking | Tools |
 |---|---|---|---|---|---|
-| `gemma4-e2b-q4_0` (default) | Gemma 4 E2B | 2.84 GB | 3.3 GB | yes | yes |
-| `gemma4-e2b-q8_0` | Gemma 4 E2B | 4.97 GB | 5.5 GB | yes | yes |
-| `gemma4-e2b-q4_k_m` | Gemma 4 E2B | 3.11 GB | 3.6 GB | yes | yes |
-| `gemma4-e2b-iq4_xs` | Gemma 4 E2B | 2.98 GB | 3.5 GB | yes | yes |
-| `gemma4-e4b-q4_0` | Gemma 4 E4B | 4.59 GB | 6.1 GB | yes | yes |
-| `gemma4-e4b-q8_0` | Gemma 4 E4B | 8.03 GB | 9.5 GB | yes | yes |
-| `gemma4-26b-a4b-q4_0` | Gemma 4 26B-A4B | 14.62 GB | 20.8 GB | yes | yes |
-| `gemma3-270m-q8_0` | Gemma 3 270M | 0.29 GB | 0.7 GB | no | no |
-| `gemma3-1b-q4_0` | Gemma 3 1B | 0.72 GB | 1.4 GB | no | no |
-| `qwen3-0.6b-q8_0` | Qwen 3 0.6B | 0.64 GB | 4.4 GB | yes | yes |
-| `qwen3-0.6b-q4_k_m` | Qwen 3 0.6B | 0.40 GB | 4.2 GB | yes | yes |
-| `qwen3-0.6b-iq4_xs` | Qwen 3 0.6B | 0.37 GB | 4.1 GB | yes | yes |
-| `qwen3-1.7b-q8_0` | Qwen 3 1.7B | 1.83 GB | 5.6 GB | yes | yes |
-| `qwen3-30b-a3b-q4_0` | Qwen 3 30B-A3B | 17.38 GB | 20.6 GB | yes | yes |
-| `qwen3-30b-a3b-q4_k_m` | Qwen 3 30B-A3B | 18.56 GB | 21.8 GB | yes | yes |
-| `qwen3-30b-a3b-iq2_xxs` | Qwen 3 30B-A3B, 2-bit | 10.36 GB | 13.6 GB | yes | yes |
-| `qwen3.5-0.8b-q8_0` | Qwen 3.5 0.8B | 0.83 GB | 1.3 GB | yes | yes |
-| `qwen3.6-35b-a3b-q4_0` | Qwen 3.6 35B-A3B | 20.84 GB | 21.6 GB | yes | yes |
-| `r1-distill-qwen-1.5b-q4_0` | DeepSeek-R1 distill, Qwen 1.5B | 1.07 GB | 2.0 GB | always | no |
-| `r1-distill-llama-8b-q4_0` | DeepSeek-R1 distill, Llama 8B | 4.68 GB | 9.0 GB | always | no |
-| `smollm3-3b-q4_0` | SmolLM 3 3B | 1.81 GB | 4.2 GB | yes | yes |
-| `phi4-mini-q4_0` | Phi 4 mini | 2.33 GB | 6.6 GB | no | no |
-| `phi4-mini-q4_k_m` | Phi 4 mini | 2.49 GB | 6.8 GB | no | no |
-| `granite3.3-2b-q4_0` | Granite 3.3 2B | 1.45 GB | 4.1 GB | yes | yes |
-| `olmo2-1b-q4_0` | OLMo 2 1B | 0.89 GB | 3.0 GB | no | no |
-| `olmoe-1b-7b-q4_0` | OLMoE 1B-7B | 3.93 GB | 6.1 GB | no | no |
-| `muse-glimmer-30b-q4_0` | Muse Glimmer 30B | 16.27 GB | 18.0 GB | always | yes |
-| `ministral3-3b-instruct-q4_0` | Ministral 3 3B Instruct | 2.05 GB | 5.5 GB | no | yes |
-| `ministral3-3b-reasoning-q4_0` | Ministral 3 3B Reasoning | 2.05 GB | 5.5 GB | always | yes |
-| `mistral-small-4-119b-q4_0` | Mistral Small 4 119B | 67.71 GB | 68.5 GB | yes | yes |
+| `gemma4-e2b-q4_0` (default) | Gemma 4 E2B | 2.84 | 0.48 / 0.33 | yes | yes |
+| `gemma4-e2b-q8_0` | Gemma 4 E2B | 4.97 | 0.48 / 0.33 | yes | yes |
+| `gemma4-e2b-q4_k_m` | Gemma 4 E2B | 3.11 | 0.48 / 0.33 | yes | yes |
+| `gemma4-e2b-iq4_xs` | Gemma 4 E2B | 2.98 | 0.48 / 0.33 | yes | yes |
+| `gemma4-e4b-q4_0` | Gemma 4 E4B | 4.59 | 1.47 / 1.00 | yes | yes |
+| `gemma4-e4b-q8_0` | Gemma 4 E4B | 8.03 | 1.47 / 1.00 | yes | yes |
+| `gemma4-26b-a4b-q4_0` | Gemma 4 26B-A4B | 14.62 | 6.18 / CPU only | yes | yes |
+| `gemma3-270m-q8_0` | Gemma 3 270M | 0.29 | 0.45 / 0.30 | no | no |
+| `gemma3-1b-q4_0` | Gemma 3 1B | 0.72 | 0.65 / 0.43 | no | no |
+| `qwen3-0.6b-q8_0` | Qwen 3 0.6B | 0.64 | 3.76 / 2.82 | yes | yes |
+| `qwen3-0.6b-q4_k_m` | Qwen 3 0.6B | 0.40 | 3.76 / 2.82 | yes | yes |
+| `qwen3-0.6b-iq4_xs` | Qwen 3 0.6B | 0.37 | 3.76 / 2.82 | yes | yes |
+| `qwen3-1.7b-q8_0` | Qwen 3 1.7B | 1.83 | 3.76 / 2.82 | yes | yes |
+| `qwen3-30b-a3b-q4_0` | Qwen 3 30B-A3B | 17.38 | 3.22 / 2.42 | yes | yes |
+| `qwen3-30b-a3b-q4_k_m` | Qwen 3 30B-A3B | 18.56 | 3.22 / 2.42 | yes | yes |
+| `qwen3-30b-a3b-iq2_xxs` | Qwen 3 30B-A3B, 2-bit | 10.36 | 3.22 / 2.42 | yes | yes |
+| `qwen3.5-0.8b-q8_0` | Qwen 3.5 0.8B | 0.83 | 0.40 / 0.30 | yes | yes |
+| `qwen3.6-35b-a3b-q4_0` | Qwen 3.6 35B-A3B | 20.84 | 0.67 / 0.50 | yes | yes |
+| `r1-distill-qwen-1.5b-q4_0` | DeepSeek-R1 distill, Qwen 1.5B | 1.07 | 0.94 / 0.70 | always | no |
+| `r1-distill-llama-8b-q4_0` | DeepSeek-R1 distill, Llama 8B | 4.68 | 4.29 / 3.22 | always | no |
+| `smollm3-3b-q4_0` | SmolLM 3 3B | 1.81 | 2.42 / 1.81 | yes | yes |
+| `phi4-mini-q4_0` | Phi 4 mini | 2.33 | 4.29 / 3.22 | no | no |
+| `phi4-mini-q4_k_m` | Phi 4 mini | 2.49 | 4.29 / 3.22 | no | no |
+| `granite3.3-2b-q4_0` | Granite 3.3 2B | 1.45 | 2.68 / 2.01 | yes | yes |
+| `olmo2-1b-q4_0` | OLMo 2 1B | 0.89 | 2.15 / 2.15 | no | no |
+| `olmoe-1b-7b-q4_0` | OLMoE 1B-7B | 3.93 | 2.15 / 2.15 | no | no |
+| `muse-glimmer-30b-q4_0` | Muse Glimmer 30B | 16.27 | 1.74 / 1.31 | always | yes |
+| `ministral3-3b-instruct-q4_0` | Ministral 3 3B Instruct | 2.05 | 3.49 / 2.62 | no | yes |
+| `ministral3-3b-reasoning-q4_0` | Ministral 3 3B Reasoning | 2.05 | 3.49 / 2.62 | always | yes |
+| `mistral-small-4-119b-q4_0` | Mistral Small 4 119B | 67.71 | 0.75 / 0.57 | yes | yes |
 
 The number after `q` is the bits per weight. This is quantization: Q4_0 keeps each weight in about 4 bits and Q8_0 in about 8, so a Q4_0 file is roughly half the size of its Q8_0 sibling and a little less accurate.
 
