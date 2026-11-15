@@ -205,7 +205,7 @@ The fields are optional so that "set" and "default" differ: `top_k: Some(64)` be
 | Field | Default | Sets |
 |---|---|---|
 | `max_sequences` | 4 | requests that run at once, 1 to 64 |
-| `kv_tokens` | twice `context_length` | positions in the shared K/V pool |
+| `kv_tokens` | twice `context_length`; on a GPU `context_length` plus at most 4,096 | positions in the shared K/V pool |
 | `max_step_tokens` | the prefill chunk | rows of one forward step across all requests |
 | `prefix_cache` | `true` | keep the K/V of finished requests for later prompts |
 

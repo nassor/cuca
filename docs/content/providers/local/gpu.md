@@ -111,7 +111,7 @@ How a weight is stored decides how much VRAM it takes.
 - K-quants (Q2_K to Q6_K, the formats behind files such as Q4_K_M), Q5_0, Q5_1 and Q8_1 become Q8_0 at load, about 1 byte per weight. A 3.8 billion parameter Q4_K_M file needs about 4 GB of VRAM. The extra rounding error is smaller than the error the file already carries.
 - F32, F16 and BF16 weights are held as f32, so an F16 or BF16 model takes twice its file size.
 - MXFP4 experts keep their file format.
-- The K/V cache (the attention memory of past tokens, see [How it works](@/providers/local/how-it-works.md)) lives in VRAM as f32. By default it holds twice `context_length` positions.
+- The K/V cache (the attention memory of past tokens, see [How it works](@/providers/local/how-it-works.md)) lives in VRAM as f32. By default it holds `context_length` plus at most 4,096 positions (12,288 at an 8,192 context), where the CPU holds twice `context_length`: VRAM is the scarcer memory.
 - Dropping the last clone of a `LocalModel` returns its VRAM to the driver, so another model can load in the same process.
 - Every new batch size compiles kernels once per process, so the first request of each size is slower.
 - If the model does not fit, the load or the first request can fail when VRAM runs out. The error text comes from the GPU backend. Use `gpu_layers` or expert placement from [Fit a large model](@/providers/local/placement.md).
