@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 
 use super::config::BalancerConfig;
-use super::routing::{Candidate, Decision, Router, UpstreamView, load_score};
+use super::routing::{Candidate, Decision, Router, UpstreamView, load_score, weighted_score};
 use super::upstream::Upstream;
 use crate::server::latency::{LatencyTracker, MAX_RECORDS};
 use crate::server::metrics::{E2E_BUCKETS, Histogram, StatusCounters, TTFT_BUCKETS};
@@ -151,22 +151,38 @@ impl BalancerState {
     }
 
     /// The healthy upstreams of `model` that are not in `exclude`, with their
-    /// load scores, in configuration order.
+    /// load scores weighted by their speeds ([`weighted_score`]), in
+    /// configuration order.
     pub fn candidates<'a>(&'a self, model: &str, exclude: &[usize]) -> Vec<Candidate<'a>> {
         let now = Instant::now();
-        self.upstreams
+        let scored: Vec<(Candidate<'a>, Option<f64>)> = self
+            .upstreams
             .iter()
             .enumerate()
             .filter(|(i, u)| !exclude.contains(i) && self.is_healthy(u, now))
             .filter(|(_, u)| u.models().iter().any(|m| m == model))
-            .map(|(index, u)| Candidate {
-                index,
-                id: &u.id,
-                score: load_score(
-                    u.in_flight.load(std::sync::atomic::Ordering::Relaxed),
-                    u.snapshot(self.snapshot_max_age()).as_deref(),
-                    model,
-                ),
+            .map(|(index, u)| {
+                let candidate = Candidate {
+                    index,
+                    id: &u.id,
+                    score: load_score(
+                        u.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+                        u.snapshot(self.snapshot_max_age()).as_deref(),
+                        model,
+                    ),
+                };
+                (candidate, u.speed(model))
+            })
+            .collect();
+        let fastest = scored
+            .iter()
+            .filter_map(|(_, speed)| *speed)
+            .reduce(f64::max);
+        scored
+            .into_iter()
+            .map(|(mut candidate, speed)| {
+                candidate.score = weighted_score(candidate.score, speed, fastest);
+                candidate
             })
             .collect()
     }

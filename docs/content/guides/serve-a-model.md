@@ -9,7 +9,7 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Build <code>cuca</code> with the <code>server</code> feature, run <code>cuca serve</code>, and call it with curl or any OpenAI client</dd>
+<dd>Build <code>cuca</code> with the <code>server</code> feature, run <code>cuca run</code> on a file with a <code>serve</code> section, and call it with curl or any OpenAI client</dd>
 <dt>You need</dt>
 <dd>Rust 1.98 or newer, a checkout of this repository, a C compiler (the <code>provider-local</code> build needs one), and about 0.7 GB of free disk and RAM for the model used here</dd>
 <dt>Read this if</dt>
@@ -50,11 +50,11 @@ serve {
 The first start downloads the model (0.6 GB) into the cache folder. Start the server and leave it running:
 
 ```bash,name=Linux and macOS
-./target/release/cuca serve --config cuca.kdl
+./target/release/cuca run --config cuca.kdl
 ```
 
 ```powershell,name=Windows (PowerShell)
-.\target\release\cuca.exe serve --config cuca.kdl
+.\target\release\cuca.exe run --config cuca.kdl
 ```
 
 Result: the log ends with `model ready` and `every model is ready; serving`.
@@ -133,4 +133,4 @@ Run the terminal UI in a third terminal. Repeat step 5 to see the load.
 
 Result: panels for CPU, memory and GPUs, the latency percentiles, the reasons for the latency, and a row for `qwen3-0.6b-q8_0`. `q` quits.
 
-Next page: [Model server](@/server/model-server.md) lists every option and the exact wire format, and [Balancer](@/server/balancer.md) spreads traffic over several servers.
+Next page: [Model server](@/server/model-server.md) lists every option and the exact wire format, and [Balancer](@/server/balancer.md) spreads traffic over several model servers.

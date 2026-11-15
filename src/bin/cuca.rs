@@ -1,14 +1,15 @@
-//! The `cuca` command: `cuca serve` runs an OpenAI-compatible model server over
-//! the in-process local engine, `cuca balance` balances several of them. Both
-//! read one KDL file (`--config`, default `cuca.kdl`; see
-//! `cuca::server::config`). This file only parses arguments; the server is
-//! `cuca::server`.
+//! The `cuca` command: `cuca run` starts what one KDL file holds (`--config`,
+//! default `cuca.kdl`; see `cuca::server::config`): a `serve` section is an
+//! OpenAI-compatible model server over the in-process local engine, a
+//! `balance` section a load balancer over several of them, and a file with
+//! both runs both in one process. This file only parses arguments; the
+//! server is `cuca::server`.
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
-use cuca::server::{CucaConfig, ServerError, balance, init_logging, serve};
+use cuca::server::{CucaConfig, ServerError, init_logging, run};
 
 #[derive(Debug, Parser)]
 #[command(name = "cuca", version, about = "cuca: an in-process LLM server")]
@@ -19,14 +20,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Serve the models of the file's `serve` section over an
-    /// OpenAI-compatible HTTP API (vLLM and llama.cpp compatible).
-    Serve(ConfigArgs),
-
-    /// Balance chat requests over the `cuca serve` instances of the file's
-    /// `balance` section, with prefix-cache affinity, passive and active
-    /// health checks and a stats API of its own.
-    Balance(ConfigArgs),
+    /// Start the file's sections: `serve` loads models behind an
+    /// OpenAI-compatible HTTP API, `balance` spreads chat requests over
+    /// model servers with prefix-cache affinity and health checks, and with
+    /// both the balancer also routes to the local models (two listeners).
+    Run(RunArgs),
 
     /// Watch a running server or balancer in the terminal: resources,
     /// latency and the reasons for it (needs `stats_api #true` on the node).
@@ -34,9 +32,9 @@ enum Command {
     Tui(TuiArgs),
 }
 
-/// Options of `cuca serve` and `cuca balance`.
+/// Options of `cuca run`.
 #[derive(Debug, Args)]
-struct ConfigArgs {
+struct RunArgs {
     /// The KDL configuration file.
     #[arg(long, short = 'c', value_name = "FILE", default_value = "cuca.kdl")]
     config: PathBuf,
@@ -60,25 +58,21 @@ struct TuiArgs {
     interval_ms: u64,
 }
 
-/// Runs `cuca serve`.
-async fn run_serve(args: ConfigArgs) -> Result<(), ServerError> {
-    let config = CucaConfig::load(&args.config)?;
-    init_logging(&config.log)?;
-    serve(config.into_serve()?).await
-}
-
-/// Runs `cuca balance`.
-async fn run_balance(args: ConfigArgs) -> Result<(), ServerError> {
-    let config = CucaConfig::load(&args.config)?;
-    init_logging(&config.log)?;
-    balance(config.into_balance()?).await
+/// Runs `cuca run`.
+async fn run_node(args: RunArgs) -> Result<(), ServerError> {
+    let CucaConfig {
+        log,
+        serve,
+        balance,
+    } = CucaConfig::load(&args.config)?;
+    init_logging(&log)?;
+    run(serve, balance).await
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     let outcome = match Cli::parse().command {
-        Command::Serve(args) => run_serve(args).await,
-        Command::Balance(args) => run_balance(args).await,
+        Command::Run(args) => run_node(args).await,
         #[cfg(feature = "server-tui")]
         Command::Tui(args) => {
             cuca::server::tui::run(cuca::server::tui::TuiOptions {

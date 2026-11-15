@@ -43,7 +43,7 @@ CUCA does two jobs:
 <div class="dgm-scroll">
 <svg viewBox="10 12 660 290" role="img" aria-labelledby="use-title use-desc">
   <title id="use-title">Two ways to use CUCA: a client for LLM APIs, and a local engine with three modes</title>
-  <desc id="use-desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU, a GPU or both; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call cuca balance, which forwards each request to a cuca serve instance, which runs the local engine; these are balancer mode and server mode.</desc>
+  <desc id="use-desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU, a GPU or both; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call the balancer, which forwards each request to a model server, which runs the local engine; these are balancer mode and server mode, the balance and serve sections of a cuca run file.</desc>
   <defs>
     <marker id="use-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -72,17 +72,17 @@ CUCA does two jobs:
   <text class="t-lbl t-mid" x="95" y="257">HTTP clients</text>
   <text class="t-sm t-mid" x="95" y="273">OpenAI API</text>
   <rect class="blk blk-data" x="196" y="236" width="104" height="50" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="248" y="257">cuca balance</text>
+  <text class="t-lbl t-mid t-data" x="248" y="257">balance</text>
   <text class="t-sm t-mid" x="248" y="273">balancer mode</text>
   <rect class="blk blk-data" x="326" y="236" width="110" height="50" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="381" y="257">cuca serve</text>
+  <text class="t-lbl t-mid t-data" x="381" y="257">serve</text>
   <text class="t-sm t-mid" x="381" y="273">server mode</text>
   <path class="arw arw-data" d="M172 261 H192" marker-end="url(#use-arrow)"/>
   <path class="arw arw-data" d="M302 261 H322" marker-end="url(#use-arrow)"/>
   <path class="arw arw-data" d="M438 261 H545 V212" marker-end="url(#use-arrow)"/>
 </svg>
 </div>
-<p class="dgm-cap"><b>One engine, three ways to reach it.</b> Your program calls it in process. Any OpenAI client reaches it through <code>cuca serve</code>, alone or behind <code>cuca balance</code>.</p>
+<p class="dgm-cap"><b>One engine, three ways to reach it.</b> Your program calls it in process. Any OpenAI client reaches it through a model server, alone or behind the balancer. Both are sections of one <code>cuca run</code> file.</p>
 </div>
 
 ### Call an LLM API
@@ -98,8 +98,8 @@ Two optional extras sit around the request. Plugins watch every request and ever
 The local engine has three modes:
 
 - Library mode: the model runs inside your program, behind the same `CucaClient`. See [Local (in-process)](@/local/_index.md).
-- Server mode: `cuca serve` answers OpenAI-compatible chat requests over HTTP, with metrics and a stats API. See [Serve a model over HTTP](@/guides/serve-a-model.md) and [Model server](@/server/model-server.md).
-- Balancer mode: `cuca balance` spreads requests over several `cuca serve` instances. See [Balancer](@/server/balancer.md).
+- Server mode: `cuca run` with a `serve` section answers OpenAI-compatible chat requests over HTTP, with metrics and a stats API. See [Serve a model over HTTP](@/guides/serve-a-model.md) and [Model server](@/server/model-server.md).
+- Balancer mode: `cuca run` with a `balance` section spreads requests over several model servers. See [Balancer](@/server/balancer.md).
 
 ## One turn through the client
 
@@ -177,7 +177,7 @@ CUCA requires one provider-* feature; enable the adapter for the backend you use
 - [Plugins](@/plugins/_index.md): twelve capabilities that watch the request and the stream.
 - [Services](@/services/_index.md): seven capabilities you call directly.
 - [How-to guides](@/guides/other-openai-server.md): point the client at another server, write a plugin, serve a model, run the live tests.
-- [Server](@/server/_index.md): `cuca serve`, `cuca balance` and `cuca tui`.
+- [Server](@/server/_index.md): `cuca run` and `cuca tui`.
 - [Reference](@/reference/features.md): the feature matrix, error types, configuration files and the public API.
 - Rustdoc holds signatures, field docs and generic bounds for each item.
 

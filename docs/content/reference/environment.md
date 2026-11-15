@@ -33,7 +33,7 @@ KDL is a small text format for settings. A line is a node with a name, then valu
   <text class="t-title" x="6" y="20">Settings and who reads them</text>
   <rect class="blk blk-ctl" x="6" y="40" width="190" height="50" rx="6"/>
   <text class="t-lbl t-ctl" x="18" y="62">cuca.kdl</text>
-  <text class="t-sm" x="18" y="78">cuca serve, cuca balance</text>
+  <text class="t-sm" x="18" y="78">cuca run</text>
   <rect class="blk blk-ctl" x="6" y="104" width="190" height="50" rx="6"/>
   <text class="t-lbl t-ctl" x="18" y="126">cuca-test.kdl</text>
   <text class="t-sm" x="18" y="142">live tests</text>
@@ -119,7 +119,7 @@ serve {
 
 ## The cuca.kdl file
 
-`cuca serve` and `cuca balance` take one option, `--config <FILE>` (`-c`), default `cuca.kdl`. Relative paths inside the file resolve against the working directory. The file has three sections, all optional, and unknown keys are rejected. `examples/configs/cuca.kdl` in the repository is a full example:
+`cuca run` takes one option, `--config <FILE>` (`-c`), default `cuca.kdl`, and starts the sections the file has: `serve`, `balance`, or both. Relative paths inside the file resolve against the working directory. The file has three sections, all optional, and unknown keys are rejected. `examples/configs/cuca.kdl` in the repository is a full example:
 
 ```kdl,name=examples/configs/cuca.kdl
 variables {

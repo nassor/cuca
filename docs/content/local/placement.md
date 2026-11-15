@@ -242,9 +242,9 @@ cargo run --release --example local_model --features provider-local -- --config 
 
 Placement changes speed, not the answer. On the CPU, tiered experts give the resident load's output bit for bit. A placement that uses a GPU agrees with the one-GPU model to float rounding.
 
-## Use a placement in `cuca serve` and Rust
+## Use a placement in a model server and Rust
 
-`cuca serve` takes the same keys in a `model` node:
+The `serve` section of a `cuca run` file takes the same keys in a `model` node:
 
 ```kdl,name=cuca.kdl
 serve {

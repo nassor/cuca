@@ -26,7 +26,7 @@ use super::stats::{
     RequestStats, StatsSnapshot, TokensPerSecond,
 };
 use crate::sysmon::SystemSnapshot;
-use crate::{ExpertTierStats, ServingStats};
+use crate::{DraftStats, ExpertTierStats, ServingStats};
 
 /// Samples kept per ring: five minutes at one per second.
 pub const RING: usize = 300;
@@ -48,6 +48,7 @@ struct ModelSample {
     at: Instant,
     serving: ServingStats,
     tier: Option<ExpertTierStats>,
+    draft: DraftStats,
 }
 
 struct SystemSample {
@@ -88,6 +89,7 @@ impl StatsCollector {
                     at: now,
                     serving: loaded.model.serving_stats(),
                     tier: loaded.model.expert_tier_stats(),
+                    draft: loaded.model.draft_stats(),
                 })
             })
             .collect();
@@ -152,6 +154,7 @@ struct Rates {
     preemptions_per_min: f64,
     step_trend: Option<(f64, f64)>,
     tier: Option<(f64, f64, Option<f64>)>,
+    draft_acceptance: Option<f64>,
 }
 
 pub(crate) fn ratio(numerator: f64, denominator: f64) -> f64 {
@@ -216,6 +219,10 @@ fn rates_of(ring: &VecDeque<ModelSample>) -> Rates {
                 ))
             }
             _ => None,
+        },
+        draft_acceptance: {
+            let drafted = d(newest.draft.drafted, base.draft.drafted);
+            (drafted > 0.0).then(|| d(newest.draft.accepted, base.draft.accepted) / drafted)
         },
     }
 }
@@ -297,6 +304,7 @@ fn model_stats(
             rate_per_s: ratio(window.finished as f64, span_s),
         },
         latency: window.latency,
+        drafter: slot.drafter.clone(),
         ..ModelStats::default()
     };
     let loaded = match slot.status() {
@@ -353,6 +361,9 @@ fn model_stats(
             device_resident_bytes: tier.device_resident_bytes,
         }
     });
+    if let Some(drafter) = &mut stats.drafter {
+        drafter.acceptance_ratio = rates.draft_acceptance;
+    }
     (stats, rates.step_trend)
 }
 
@@ -437,6 +448,7 @@ mod tests {
             at,
             serving,
             tier: None,
+            draft: DraftStats::default(),
         }
     }
 
@@ -480,6 +492,25 @@ mod tests {
         assert_eq!(rates_of(&r).prefix_hit_ratio, Some(0.75));
         let idle = ring(12, |_, _| {});
         assert_eq!(rates_of(&idle).prefix_hit_ratio, None);
+    }
+
+    #[test]
+    fn the_draft_acceptance_is_accepted_over_drafted_in_the_window() {
+        let t0 = Instant::now();
+        let drafting: VecDeque<ModelSample> = (0..=30u64)
+            .map(|i| {
+                let mut s = sample(t0 + Duration::from_secs(i), |_| {});
+                s.draft = DraftStats {
+                    rounds: 2 * i,
+                    drafted: 10 * i,
+                    accepted: 6 * i,
+                };
+                s
+            })
+            .collect();
+        assert_eq!(rates_of(&drafting).draft_acceptance, Some(0.6));
+        let plain = ring(30, |i, s| s.generated_tokens = 10 * i);
+        assert_eq!(rates_of(&plain).draft_acceptance, None);
     }
 
     #[test]

@@ -24,7 +24,7 @@ use super::proxy;
 use super::routing::Policy;
 use super::state::BalancerState;
 use super::upstream::{Upstream, spawn_poller};
-use crate::server::stats::{ModelStats, StatsSnapshot};
+use crate::server::stats::{DrafterStats, LatencyStats, ModelStats, Quantiles, StatsSnapshot};
 use crate::sysmon::SystemSampler;
 
 /// A fake model server.
@@ -620,6 +620,90 @@ async fn the_stats_snapshot_is_a_balancer_view_with_nested_upstream_snapshots() 
     );
     assert!(metrics.contains("cuca_balancer_decisions_total{decision=\"affinity\"}"));
     assert!(metrics.contains("cuca_balancer_request_ttft_seconds_count{upstream="));
+}
+
+#[tokio::test]
+async fn a_busy_drafter_upstream_is_passed_over_for_an_idle_one() {
+    let busy_drafter = StatsSnapshot {
+        models: vec![ModelStats {
+            name: "m".into(),
+            state: crate::server::stats::ModelState::Ready,
+            max_sequences: 4,
+            running: 1,
+            drafter: Some(DrafterStats::default()),
+            ..ModelStats::default()
+        }],
+        ..StatsSnapshot::default()
+    };
+    let mut with_stats = Mock::new("a", &["m"]);
+    with_stats.stats = Some(serde_json::to_value(&busy_drafter).unwrap());
+    let (ua, a) = with_stats.spawn().await;
+    let (ub, b) = Mock::new("b", &["m"]).spawn().await;
+    let h = balancer(&[ua, ub], Options::default()).await;
+    h.until("both healthy and a's snapshot", |s| {
+        s.healthy_count() == 2 && s.upstreams[0].snapshot(Duration::from_secs(5)).is_some()
+    })
+    .await;
+    for i in 0..20 {
+        h.chat(body("m", &format!("conversation {i}"))).await;
+    }
+    assert_eq!(
+        (
+            a.hits.load(Ordering::Relaxed),
+            b.hits.load(Ordering::Relaxed)
+        ),
+        (0, 20)
+    );
+}
+
+#[tokio::test]
+async fn least_loaded_prefers_the_faster_upstream() {
+    let with_itl = |name: &'static str, mean: f64| {
+        let snapshot = StatsSnapshot {
+            models: vec![ModelStats {
+                name: "m".into(),
+                state: crate::server::stats::ModelState::Ready,
+                max_sequences: 4,
+                latency: LatencyStats {
+                    itl: Quantiles {
+                        mean,
+                        count: 5,
+                        ..Quantiles::default()
+                    },
+                    ..LatencyStats::default()
+                },
+                ..ModelStats::default()
+            }],
+            ..StatsSnapshot::default()
+        };
+        let mut mock = Mock::new(name, &["m"]);
+        mock.stats = Some(serde_json::to_value(&snapshot).unwrap());
+        mock
+    };
+    let (ua, a) = with_itl("a", 0.1).spawn().await;
+    let (ub, b) = with_itl("b", 0.01).spawn().await;
+    let h = balancer(
+        &[ua, ub],
+        Options {
+            policy: Policy::LeastLoaded,
+            ..Options::default()
+        },
+    )
+    .await;
+    h.until("both speeds known", |s| {
+        s.healthy_count() == 2 && s.upstreams.iter().all(|u| u.speed("m").is_some())
+    })
+    .await;
+    for _ in 0..10 {
+        h.chat(body("m", "the very same prompt")).await;
+    }
+    assert_eq!(
+        (
+            a.hits.load(Ordering::Relaxed),
+            b.hits.load(Ordering::Relaxed)
+        ),
+        (0, 10)
+    );
 }
 
 #[tokio::test]

@@ -18,6 +18,7 @@ use super::config::ModelSpec;
 use super::error::ServerError;
 use super::metrics::ModelMetrics;
 use super::openai::unix_secs;
+use super::stats::DrafterStats;
 use crate::{DownloadProgressCallback, LocalCapabilities, LocalModel};
 
 /// A model that finished loading, with the figures the server reports.
@@ -68,6 +69,8 @@ pub struct ModelSlot {
     pub source: String,
     /// The device it runs on.
     pub device: String,
+    /// The configured drafter; `acceptance_ratio` is always `None` here.
+    pub drafter: Option<DrafterStats>,
     /// Its counters and histograms.
     pub metrics: ModelMetrics,
     status: RwLock<SlotStatus>,
@@ -80,6 +83,11 @@ impl ModelSlot {
             name: Arc::from(spec.name.as_str()),
             source: spec.source_label(),
             device: spec.device_label(),
+            drafter: spec.drafter_label().map(|source| DrafterStats {
+                source,
+                draft_tokens: spec.config.draft_tokens as u64,
+                acceptance_ratio: None,
+            }),
             metrics: ModelMetrics::default(),
             status: RwLock::new(SlotStatus::Loading),
             progress: LoadProgress::default(),

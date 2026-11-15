@@ -124,7 +124,7 @@ Converting a checkpoint to GGUF is bounded too. It streams one tensor at a time.
 
 ## The server
 
-`cuca serve` and `cuca balance` keep every structure that grows with traffic at a fixed size. The tables are on [Stats API and metrics](@/server/stats-and-metrics.md) and [Balancer](@/server/balancer.md).
+A model server and the balancer keep every structure that grows with traffic at a fixed size. The tables are on [Stats API and metrics](@/server/stats-and-metrics.md) and [Balancer](@/server/balancer.md).
 
 - Latency window: 60 s and 4,096 records (balancer: 1,024 per upstream). At the cap the oldest record drops. Read it with `latency` in the stats snapshot.
 - Sample rings: 300 one-second samples per model and for the machine. At the cap the oldest sample drops. Read it with the `StatsSnapshot` rates.

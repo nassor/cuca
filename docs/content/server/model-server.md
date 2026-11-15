@@ -1,6 +1,6 @@
 +++
 title = "Model server"
-description = "cuca serve: start it, call it, and the configuration file, routes, OpenAI chat wire format, errors, authentication and limits."
+description = "The model server: start it with cuca run, call it, and the configuration file, routes, OpenAI chat wire format, errors, authentication and limits."
 template = "page.html"
 weight = 1
 +++
@@ -9,7 +9,7 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>cuca serve</code> loads local models and answers an OpenAI-compatible HTTP API with <code>/health</code>, <code>/v1/models</code>, <code>/v1/chat/completions</code>, <code>/metrics</code> and an opt-in stats API</dd>
+<dd><code>cuca run</code> on a file with a <code>serve</code> section loads local models and answers an OpenAI-compatible HTTP API with <code>/health</code>, <code>/v1/models</code>, <code>/v1/chat/completions</code>, <code>/metrics</code> and an opt-in stats API</dd>
 <dt>You need</dt>
 <dd>The <code>cuca</code> binary built with the <code>server</code> feature (see <a href="@/server/_index.md">Server</a>), and a model: a preset name, a GGUF file, a Hugging Face GGUF file or safetensors checkpoint, or a checkpoint directory</dd>
 <dt>Read this if</dt>
@@ -35,11 +35,11 @@ serve {
 2. Start the server. The first start downloads the model into the cache folder. Leave this terminal open.
 
 ```bash,name=Linux and macOS
-cuca serve --config cuca.kdl
+cuca run --config cuca.kdl
 ```
 
 ```powershell,name=Windows (PowerShell)
-cuca.exe serve --config cuca.kdl
+cuca.exe run --config cuca.kdl
 ```
 
 The log ends with `every model is ready; serving`.
@@ -82,7 +82,7 @@ For a streamed reply and the terminal UI, follow [Serve a model over HTTP](@/gui
 <div class="dgm">
 <div class="dgm-scroll">
 <svg viewBox="0 0 660 150" role="img" aria-labelledby="msv-title msv-desc">
-  <title id="msv-title">What cuca serve does with one chat request</title>
+  <title id="msv-title">What a model server does with one chat request</title>
   <desc id="msv-desc">A client sends a chat request over HTTP. The server checks the API key, finds the named model, and puts the request in that model's engine queue. The engine runs it in a batch with other requests and streams tokens back as server-sent events.</desc>
   <defs>
     <marker id="msv-arrow" viewBox="0 0 8 8" refX="7" refY="4"
@@ -119,7 +119,7 @@ For a streamed reply and the terminal UI, follow [Serve a model over HTTP](@/gui
 
 ## Command line
 
-`cuca serve [--config <FILE>]`. The one option is `--config` (`-c`), the KDL file, which defaults to `cuca.kdl` in the working directory. KDL is a small configuration language; every other setting is a key of that file.
+`cuca run [--config <FILE>]`, on a file with a `serve` section. The one option is `--config` (`-c`), the KDL file, which defaults to `cuca.kdl` in the working directory. KDL is a small configuration language; every other setting is a key of that file. A file with a `balance` section as well also starts the balancer; see [Balancer](@/server/balancer.md#serve-and-balance-in-one-process).
 
 - Models load at the same time when the server starts.
 - Until every model is ready, `/health` answers 503 and chat requests get a 503 `model_loading` error.
@@ -128,7 +128,7 @@ For a streamed reply and the terminal UI, follow [Serve a model over HTTP](@/gui
 
 ## Configuration file
 
-The `serve` section holds the server's keys and one `model` node per model. The `log` section applies to every command; see [logs](@/server/stats-and-metrics.md#logs). The whole file, including the `balance` section, is `examples/configs/cuca.kdl` in the repository. The syntax is on [Configuration files](@/reference/environment.md).
+The `serve` section holds the server's keys and one `model` node per model. The `log` section applies to every section; see [logs](@/server/stats-and-metrics.md#logs). The whole file, including the `balance` section, is `examples/configs/cuca.kdl` in the repository. The syntax is on [Configuration files](@/reference/environment.md).
 
 ```kdl,name=Three models: CPU, GPU plus CPU, and a mixture of experts over VRAM, RAM and the SSD
 variables {

@@ -25,7 +25,7 @@ use crate::server::error::ServerError;
 /// Most upstreams one balancer fronts.
 pub const MAX_UPSTREAMS: usize = 256;
 
-/// Everything `balance` needs to start: the `balance` section.
+/// The `balance` section: the balancer.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct BalancerConfig {
@@ -120,6 +120,19 @@ impl BalancerConfig {
         }
         Ok(out)
     }
+
+    /// Put the model server at `addr` first among the upstreams, unless a
+    /// listed URL already names that `host:port`.
+    pub fn add_local_upstream(&mut self, addr: SocketAddr) {
+        let id = addr.to_string();
+        let listed = self
+            .upstreams
+            .iter()
+            .any(|raw| normalize_upstream(raw).is_ok_and(|(other, _)| other == id));
+        if !listed {
+            self.upstreams.insert(0, format!("http://{addr}"));
+        }
+    }
 }
 
 impl Default for BalancerConfig {
@@ -158,7 +171,9 @@ mod tests {
     }
 
     fn balance(text: &str) -> Result<BalancerConfig, ServerError> {
-        CucaConfig::from_kdl_str(text)?.into_balance()
+        Ok(CucaConfig::from_kdl_str(text)?
+            .balance
+            .expect("a `balance` section"))
     }
 
     #[test]

@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- A file with both a `serve` and a `balance` section runs both in one process on two listeners.
+  The local server becomes the balancer's first upstream (on the loopback address when it binds
+  every interface); `balance.upstreams` adds other machines' servers and may be omitted. Such a
+  file is refused for a `serve.listen` with port 0, one address for both listeners, and a
+  `balance.upstream_api_key` that differs from `serve.api_key`. When either side stops, the
+  other shuts down. `BalancerConfig::add_local_upstream` is the library half.
+- Stats API: a model with a drafter reports `drafter` (`source`, `draft_tokens`, and the window's
+  `acceptance_ratio`). `ModelSpec::drafter_label` gives the source label.
+- Balancer: an upstream whose snapshot shows a drafter for the model and that already has a
+  request adds 2 to its load score, since a second request switches speculation off. Candidates
+  are weighted by speed (`1 / latency.itl.mean` from each upstream's snapshot): a slower one
+  scores `(score + 1) * fastest / speed - 1`.
+
+### Changed
+
+- **Breaking:** `cuca serve` and `cuca balance` are replaced by `cuca run --config <FILE>`, which
+  starts the sections the file has: `serve`, `balance`, or both. `cuca tui` is unchanged. A file
+  with neither section is an error.
+- **Breaking:** the library's `cuca::server::serve`, `cuca::server::balance`,
+  `CucaConfig::into_serve` and `CucaConfig::into_balance` are replaced by
+  `cuca::server::run(Option<ServerConfig>, Option<BalancerConfig>)`; read the sections from the
+  public `CucaConfig` fields.
+
 ## 0.9.0 - 2026-11-15
 
 ### Added

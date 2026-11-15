@@ -1,4 +1,6 @@
-//! `cuca balance`: a load balancer in front of `cuca serve` instances.
+//! The `balance` section of `cuca run`: a load balancer in front of model
+//! servers (other machines' `serve` sections, and the local one when the
+//! file has both).
 //!
 //! It speaks the same OpenAI-compatible API, routes each
 //! `POST /v1/chat/completions` to one upstream and streams the answer back
@@ -9,7 +11,7 @@
 //! `/metrics`.
 //!
 //! ```text
-//! cuca balance --config cuca.kdl   # a `balance` section, see `config`
+//! cuca run --config cuca.kdl   # a `balance` section, see `config`
 //! ```
 //!
 //! # Prefix affinity
@@ -56,17 +58,14 @@ use self::upstream::{Upstream, spawn_poller};
 use super::error::ServerError;
 use crate::sysmon::SystemSampler;
 
-/// Run the balancer until it is asked to stop (Ctrl-C, SIGTERM).
+/// The balancer until `shutdown` resolves (see [`run`](super::run)).
 ///
 /// Binds `config.listen`, starts one poller per upstream and answers
 /// immediately: `/health` is 503 until an upstream has answered.
-///
-/// # Errors
-///
-/// [`ServerError::Config`] for an invalid configuration,
-/// [`ServerError::Io`] when the address cannot be bound or the HTTP server
-/// fails.
-pub async fn balance(config: BalancerConfig) -> Result<(), ServerError> {
+pub(crate) async fn balance_until(
+    config: BalancerConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ServerError> {
     let resolved = config.resolve_upstreams()?;
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -123,8 +122,9 @@ pub async fn balance(config: BalancerConfig) -> Result<(), ServerError> {
             })
             .await
     });
+    tokio::pin!(shutdown);
     let result = tokio::select! {
-        () = super::shutdown_signal() => {
+        () = &mut shutdown => {
             tracing::info!("shutdown signal received");
             Ok(())
         }

@@ -1,6 +1,7 @@
-// The `cuca` configuration file: `cuca serve --config cuca.kdl` reads the
-// `serve` section, `cuca balance --config cuca.kdl` the `balance` one; both
-// read `log`. Every key is a field of `cuca::server::CucaConfig`, a `model`
+// The `cuca` configuration file, read by `cuca run --config cuca.kdl`. A
+// `serve` section starts a model server, a `balance` section a balancer, and
+// with both (as here) the balancer also routes to the local server. `log`
+// applies to both. Every key is a field of `cuca::server::CucaConfig`, a `model`
 // node holds a `cuca::LocalModelConfig` (see examples/configs/local_model.kdl
 // for every key). Nothing else is read from the environment: a placeholder
 // (dollar sign, then NAME or NAME:-default in braces) resolves against

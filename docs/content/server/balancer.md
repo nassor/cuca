@@ -1,6 +1,6 @@
 +++
 title = "Balancer"
-description = "cuca balance: start it in front of several servers, then the routing policies, prefix affinity, health checks, retries and routes."
+description = "The balancer: start it with cuca run, in front of several model servers, then the routing policies, prefix affinity, health checks, retries and routes."
 template = "page.html"
 weight = 2
 +++
@@ -9,9 +9,9 @@ weight = 2
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>cuca balance</code> sends each chat request to one of several <code>cuca serve</code> instances, keeps a conversation on the instance that already cached its prompt, and streams the answer back unchanged</dd>
+<dd>The balancer, started by <code>cuca run</code> on a file with a <code>balance</code> section, sends each chat request to one of several model servers, keeps a conversation on the server that already cached its prompt, and streams the answer back unchanged</dd>
 <dt>You need</dt>
-<dd>The <code>cuca</code> binary with the <code>server</code> feature, and the base URLs of two or more running <code>cuca serve</code> instances. They need <code>stats_api #true</code> for load-aware routing</dd>
+<dd>The <code>cuca</code> binary with the <code>server</code> feature, and the base URLs of two or more running model servers. They need <code>stats_api #true</code> for load-aware routing</dd>
 <dt>Read this if</dt>
 <dd>One engine does not carry your traffic, or you need the routing, health and retry rules exactly</dd>
 </dl>
@@ -45,18 +45,18 @@ balance {
 }
 ```
 
-2. Start the two servers and the balancer, each in its own terminal. Start the balancer once both servers log `every model is ready; serving`.
+2. Start the two model servers and the balancer, each in its own terminal. Start the balancer once both model servers log `every model is ready; serving`.
 
 ```bash,name=Linux and macOS
-cuca serve --config a.kdl
-cuca serve --config b.kdl
-cuca balance --config balancer.kdl
+cuca run --config a.kdl
+cuca run --config b.kdl
+cuca run --config balancer.kdl
 ```
 
 ```powershell,name=Windows (PowerShell)
-cuca.exe serve --config a.kdl
-cuca.exe serve --config b.kdl
-cuca.exe balance --config balancer.kdl
+cuca.exe run --config a.kdl
+cuca.exe run --config b.kdl
+cuca.exe run --config balancer.kdl
 ```
 
 3. Ask the balancer for its health.
@@ -77,7 +77,7 @@ curl.exe http://127.0.0.1:8080/health
 
 ## Command line
 
-`cuca balance [--config <FILE>]`. The one option is `--config` (`-c`), the KDL file, which defaults to `cuca.kdl`. Every other setting is a key of the `balance` section. The `log` section applies as for `serve`.
+`cuca run [--config <FILE>]`, on a file that holds only a `balance` section. The one option is `--config` (`-c`), the KDL file, which defaults to `cuca.kdl`. Every other setting is a key of the `balance` section. The `log` section applies as in any file. A `balance` section on its own needs at least one URL in `upstreams`; beside a `serve` section it may omit them.
 
 A missing or invalid file stops the command with exit status 1 and a message that names the file and the key. An unknown key or an unknown policy is an error.
 
@@ -99,7 +99,7 @@ balance {
 | `balance` key | Default | Meaning |
 |---|---|---|
 | `listen` | `127.0.0.1:8000` | address of the HTTP listener |
-| `upstreams` | none; at least one | base URLs of the servers, `http://host:port` or `https://...`; one node with several arguments, or several nodes; 256 at most |
+| `upstreams` | none; at least one unless the file has a `serve` section | base URLs of the model servers, `http://host:port` or `https://...`; one node with several arguments, or several nodes; 256 at most |
 | `upstream_api_key` | none | sent to every upstream as `Authorization: Bearer <key>` |
 | `api_key` | none | bearer key clients must send on every route except `/health` |
 | `stats_api` | `#false` | serve the stats API with `role: balancer` |
@@ -108,6 +108,28 @@ balance {
 | `latency_window` | `"60s"` | the sliding window of the latency figures |
 
 The file is `examples/configs/cuca.kdl` in the repository. The syntax is on [Configuration files](@/reference/environment.md).
+
+## Serve and balance in one process
+
+A file with both a `serve` and a `balance` section runs both under one `cuca run`, in one process, on two listeners. The balancer's first upstream is the local model server's `listen` address, with `127.0.0.1` or `[::1]` in place of an address that binds every interface. A URL in `upstreams` that already names that `host:port` is not added twice. Without `upstreams`, the local model server is the only upstream. A file with neither section fails with "the configuration has neither a `serve` nor a `balance` section".
+
+```kdl,name=One machine of a cluster
+serve {
+    listen "0.0.0.0:8000"
+    stats_api #true
+    model "chat" { source "qwen3-0.6b-q8_0" }
+}
+
+balance {
+    listen "0.0.0.0:8080"
+    upstreams "http://10.0.0.2:8000" "http://10.0.0.3:8000"
+    stats_api #true
+}
+```
+
+Every machine runs `cuca run`, and each `upstreams` list names the other machines' `serve` ports, never a balancer's, so a request is forwarded at most once.
+
+`cuca run` refuses to start when `serve.listen` has port 0, when both sections listen on the same address, or when `balance.upstream_api_key` differs from `serve.api_key`. Ctrl-C or SIGTERM stops both listeners. When either one stops on its own, for example because a model failed to load, the other shuts down too and the command exits with status 1.
 
 ## How a request is routed
 
@@ -181,6 +203,11 @@ The candidates are the healthy upstreams whose last `/v1/models` lists the model
 
 Each candidate has a load score: the requests the balancer has outstanding to it, plus the requests it reports waiting for that model, plus its running fraction of `max_sequences`. The last term stays below one request and breaks ties. Without a snapshot only the first term counts.
 
+Two rules adjust the score when the upstream has the stats API:
+
+- A busy drafter. An engine with a [drafter](@/local/drafting.md) speculates only while one request runs alone, so a second request switches speculation off for both. When the upstream's snapshot shows a drafter for the model and the score is above zero, 2 is added. Prefix affinity then passes a busy drafter upstream over while another candidate is idle.
+- Speed. The balancer remembers each upstream's speed for a model as `1 / latency.itl.mean` from its snapshot, and keeps it while the latency window is empty. A candidate slower than the fastest scores `(score + 1) * fastest / speed - 1`, so an idle upstream at a third of the fastest speed scores 2. An upstream with no finished request yet counts as the fastest.
+
 | Policy | Picks |
 |---|---|
 | `least-loaded` | the lowest score. Equal scores take turns. |
@@ -235,10 +262,12 @@ Other routes are not proxied. `/v1/completions` is absent for the reason given o
 ## Limits
 
 - At most 256 upstreams.
-- Per upstream: one stats snapshot, one model list, a latency ring of 1,024 records, and fixed counters and histograms.
+- Per upstream: one stats snapshot, one model list, one speed per model it lists, a latency ring of 1,024 records, and fixed counters and histograms.
 - A request body is held only while the request is routed and retried. Response bodies are never buffered, except a 503 that will be retried.
 - At most 64 stats streams are open at once.
 
 ## What was tested
 
-Two `cuca serve` instances with `stats_api #true` (Qwen3-0.6B Q8_0, CPU, Windows) behind one balancer. A streamed completion went through. A repeated conversation prefix reached the same upstream, and the second request had `cached_tokens` above zero. Eight concurrent distinct requests split four and four. With one upstream killed, requests kept succeeding on the other and the stats reported `upstream_down`. The other policies, the affinity fallback and the API keys are covered by automated tests with mock upstreams, not by a live run.
+Two model servers with `stats_api #true` (Qwen3-0.6B Q8_0, CPU, Windows) behind one balancer. A streamed completion went through. A repeated conversation prefix reached the same upstream, and the second request had `cached_tokens` above zero. Eight concurrent distinct requests split four and four. With one upstream killed, requests kept succeeding on the other and the stats reported `upstream_down`. The other policies, the affinity fallback, the drafter and speed rules and the API keys are covered by automated tests with mock upstreams, not by a live run.
+
+`cuca run` with one model (Qwen3-0.6B Q8_0, CPU, Windows) and no `upstreams`: the balancer port answered a chat completion from the local model, and Ctrl-C stopped both listeners with exit status 0. With Gemma 4 E2B Q4_K_M and its MTP drafter, the server's snapshot reported the drafter with `draft_tokens` 5 and an `acceptance_ratio` of 0.86 after two requests.

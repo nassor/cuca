@@ -11,7 +11,7 @@ weight = 3
 <dt>In one line</dt>
 <dd>One JSON snapshot per node (<code>/cuca/v1/stats</code>), a Prometheus endpoint (<code>/metrics</code>), a ranked list of reasons for the current latency, and one log line per request</dd>
 <dt>You need</dt>
-<dd>A running <code>cuca serve</code> or <code>cuca balance</code>. The stats routes need <code>stats_api #true</code> in the configuration. <code>/metrics</code> is always on</dd>
+<dd>A running <code>cuca run</code> with a <code>serve</code> or <code>balance</code> section. The stats routes need <code>stats_api #true</code> in the configuration. <code>/metrics</code> is always on</dd>
 <dt>Read this if</dt>
 <dd>You are building a dashboard or an alert, reading the terminal UI's figures, or want to know which threshold a diagnosis uses</dd>
 </dl>
@@ -128,6 +128,7 @@ A model entry has:
 - Window figures: `prefix_hit_ratio`, `preemptions_per_min`, `tokens_per_s` (`prompt` counts tokens the engine computed, `generation` all generated tokens), `steps_per_s`, `rows_per_s`, `mean_rows_per_step`, `prefill_row_share`, `mean_step_ms`, `mean_queue_ms`. `last_step_ms` is the last forward pass.
 - `memory`: `weights_bytes` (the size of the model file it runs from), `kv_bytes`, `device`.
 - `expert_tiers` (tiered experts only): `disk_reads_per_s`, `read_bytes_per_s`, `hit_ratio`, `ram_resident_bytes`, `device_resident_bytes`.
+- `drafter` (models with a drafter only): `source` (`in-trunk` or the drafter file), `draft_tokens`, and `acceptance_ratio`, the share of drafted tokens the model accepted over the window. The ratio is `null` when the window has no drafts: the model is idle, or several requests run and speculation is off.
 - `requests` and `latency` for that model.
 
 Rates come from a ring of one-second samples of the engine's counters, 300 per model (five minutes). A rate is the difference between the newest sample and the oldest one within the last 10 seconds. `preemptions_per_min` uses the last 60 seconds. The latency figures come from the finished requests of the sliding window: 60 seconds and at most 4,096 requests.
@@ -152,7 +153,7 @@ A balancer sets `role` to `balancer`. `upstreams[]` has one entry per upstream:
 The rest of a balancer snapshot:
 
 - `latency.ttft` is the time to the first body byte. `latency.itl` is the mean gap between SSE events as they pass through, measured from the first content event to the last. It approximates the engine's per-token gap: a chunk may carry several events, and plain JSON replies have none.
-- `models` is the union over the healthy upstreams. Counts and rates are summed, and means are weighted by the rate they describe.
+- `models` is the union over the healthy upstreams. Counts and rates are summed, and means are weighted by the rate they describe. `drafter` stays `null` there, since each upstream configures its own: read it in the upstream's `snapshot`.
 - `latency` and `requests` are the balancer's, and `system` is the balancer host's.
 - `diagnosis` holds the balancer's causes followed by each healthy upstream's own, tagged with `upstream`.
 
@@ -283,7 +284,7 @@ Logs go to standard output through `tracing`. The `log` section of the configura
 | `format` | `pretty`, or `json` for one JSON object per line | `pretty` |
 | `level` | a level, or a filter such as `info,cuca=debug` | `info` |
 
-`serve` and `balance` both read it. `cuca tui` has no log section.
+`cuca run` reads it, for every section the file has. `cuca tui` has no log section.
 
 Every request gets an `x-request-id` (an incoming one is kept) and an `http` span. The `cuca::access` target carries two kinds of line:
 

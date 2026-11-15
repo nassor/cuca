@@ -36,7 +36,7 @@ weight = 4
 | `cost_otel` | `plugin-cost` and `plugin-telemetry` | the cost ledger to OpenTelemetry bridge |
 | `tls` | any HTTP provider, `provider-local` or `plugin-web-search` | `ensure_crypto_provider`, which installs `ring` as the process-default rustls provider unless one is set |
 | `sysmon` | `sysmon` (`server` turns it on) | `SystemSampler` and its snapshot types `SystemSnapshot`, `CpuStats`, `MemoryStats`, `DiskStats`, `DiskIo`, `GpuStats`, `ProcessStats` |
-| `server` | `server` | `cuca serve`, `cuca balance` and `cuca tui`, and `CucaConfig`; see [Server](@/server/_index.md) |
+| `server` | `server` | `cuca run` and `cuca tui`, and `CucaConfig`; see [Server](@/server/_index.md) |
 
 The provider adapters are in a private module. Use them through `ProviderEndpoint` and `CucaClientBuilder`.
 
@@ -196,15 +196,15 @@ A backend that cannot honor a field fails the request with `CucaError::Config`. 
 
 ## Server types
 
-With `server`, `cuca::server` exports `CucaConfig`, `LogConfig`, `LogFormat`, `ServerConfig`, `ModelSpec`, `BalancerConfig`, `ServerError`, `MAX_MODELS` (16), `serve`, `balance` and `init_logging`.
+With `server`, `cuca::server` exports `CucaConfig`, `LogConfig`, `LogFormat`, `ServerConfig`, `ModelSpec`, `BalancerConfig`, `ServerError`, `MAX_MODELS` (16), `run` and `init_logging`. `run` takes an optional `ServerConfig` and an optional `BalancerConfig` and starts what it is given.
 
 | Type | What it holds |
 |---|---|
-| `CucaConfig` | fields `log`, `serve`, `balance`; methods `load`, `from_kdl_str`, `into_serve`, `into_balance`; unknown keys are rejected |
+| `CucaConfig` | fields `log`, `serve`, `balance`; methods `load` and `from_kdl_str`; unknown keys are rejected |
 | `LogConfig` | `format` (`LogFormat::Pretty` by default, or `Json`) and `level` (`info` by default) |
 | `ServerConfig` | `listen`, `models`, `api_key`, `stats_api`, `latency_window`; `new`, `validate`, `DEFAULT_LISTEN`, `DEFAULT_LATENCY_WINDOW` |
-| `ModelSpec` | `name` and `config` (a `LocalModelConfig`); `new`, `source_label`, `device_label` |
-| `BalancerConfig` | `listen`, `upstreams`, `upstream_api_key`, `api_key`, `policy`, `health_interval`, `latency_window`, `stats_api` |
+| `ModelSpec` | `name` and `config` (a `LocalModelConfig`); `new`, `source_label`, `drafter_label`, `device_label` |
+| `BalancerConfig` | `listen`, `upstreams`, `upstream_api_key`, `api_key`, `policy`, `health_interval`, `latency_window`, `stats_api`; `add_local_upstream` |
 
 ## Local model types
 

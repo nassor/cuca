@@ -13,9 +13,9 @@
 CUCA is a Rust crate for language models, used in two ways:
 
 - A client for LLM APIs. One request type and one stream of typed replies work with OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM and LM Studio.
-- A local engine, `provider-local`, that runs the model itself on your CPU, your GPU or both, and spreads a model larger than either memory over VRAM, RAM and the SSD. It runs in three modes: as a library inside your program, as an OpenAI-compatible server (`cuca serve`), and as a load balancer over several servers (`cuca balance`).
+- A local engine, `provider-local`, that runs the model itself on your CPU, your GPU or both, and spreads a model larger than either memory over VRAM, RAM and the SSD. It runs in three modes: as a library inside your program, as an OpenAI-compatible server, and as a load balancer over several servers. `cuca run` starts the server, the balancer or both, as its configuration file says.
 
-<img src="docs/static/overview.svg" alt="Your application sends requests either over HTTP to an LLM API, or to the local engine in its own process. HTTP clients reach the same engine through cuca balance and cuca serve." width="660">
+<img src="docs/static/overview.svg" alt="Your application sends requests either over HTTP to an LLM API, or to the local engine in its own process. HTTP clients reach the same engine through a balancer and a model server." width="660">
 
 Nothing compiles by default: you pick Cargo features, and the build fails until at least one provider is on. The [features page](https://nassor.github.io/cuca/reference/features/) lists them all.
 
@@ -57,7 +57,7 @@ experts { tiered device_bytes="4g" ram_bytes="12g"; }
 cargo run --release --example local_model --features provider-local-vulkan -- --config moe.kdl
 ```
 
-The same keys go in a `model` node of `cuca serve`'s file, and in library mode they are the fields of `LocalModelConfig`. On an RX 9070 XT (16 GB) with 125 GB of RAM, Muse Glimmer 30B (16.27 GB) decodes at 8.3 tokens/s with 38 of 52 layers on the GPU, against 3.5 on the CPU alone. DeepSeek-V4.1, a 507 GB converted set, runs from an NVMe SSD behind 90 GiB of expert cache in RAM: 2.15 tokens/s on the CPU alone, 1.96 with attention on the GPU in 12.5 GiB of VRAM. [Fit a large model](https://nassor.github.io/cuca/local/placement/) explains each option, and [Run DeepSeek-V4.1](https://nassor.github.io/cuca/local/deepseek-v41/) walks through the largest model.
+The same keys go in a `model` node of the server's `serve` section, and in library mode they are the fields of `LocalModelConfig`. On an RX 9070 XT (16 GB) with 125 GB of RAM, Muse Glimmer 30B (16.27 GB) decodes at 8.3 tokens/s with 38 of 52 layers on the GPU, against 3.5 on the CPU alone. DeepSeek-V4.1, a 507 GB converted set, runs from an NVMe SSD behind 90 GiB of expert cache in RAM: 2.15 tokens/s on the CPU alone, 1.96 with attention on the GPU in 12.5 GiB of VRAM. [Fit a large model](https://nassor.github.io/cuca/local/placement/) explains each option, and [Run DeepSeek-V4.1](https://nassor.github.io/cuca/local/deepseek-v41/) walks through the largest model.
 
 ### Library mode
 
@@ -94,9 +94,9 @@ The [Local page](https://nassor.github.io/cuca/local/) covers the presets, the G
 
 ### Server mode
 
-<img src="docs/static/mode-server.svg" alt="HTTP clients call cuca serve, which answers the OpenAI chat route, the model list, health, metrics and a stats API, and runs each request on one of its local models. cuca tui or Prometheus reads the stats and metrics." width="660">
+<img src="docs/static/mode-server.svg" alt="HTTP clients call the model server, which answers the OpenAI chat route, the model list, health, metrics and a stats API, and runs each request on one of its local models. cuca tui or Prometheus reads the stats and metrics." width="660">
 
-`cuca serve` answers `POST /v1/chat/completions` the way vLLM and llama.cpp's server do, with Prometheus metrics and a stats API. It reads one KDL file. Save this as `cuca.kdl`:
+A `serve` section answers `POST /v1/chat/completions` the way vLLM and llama.cpp's server do, with Prometheus metrics and a stats API. `cuca run` reads one KDL file. Save this as `cuca.kdl`:
 
 ```kdl
 serve {
@@ -111,16 +111,16 @@ serve {
 Start it from the repository root; this command runs the same on Linux, macOS and Windows (PowerShell):
 
 ```
-cargo run --release --no-default-features --features server --bin cuca -- serve --config cuca.kdl
+cargo run --release --no-default-features --features server --bin cuca -- run --config cuca.kdl
 ```
 
 The server listens on `http://127.0.0.1:8000`. The [Serve a model over HTTP](https://nassor.github.io/cuca/guides/serve-a-model/) guide sends a first chat completion and opens the terminal UI.
 
 ### Balancer mode
 
-<img src="docs/static/mode-balancer.svg" alt="HTTP clients call cuca balance, which sends each request to one of three cuca serve instances and polls each one's health, models and stats." width="660">
+<img src="docs/static/mode-balancer.svg" alt="HTTP clients call the balancer, which sends each request to one of three model servers and polls each one's health, models and stats." width="660">
 
-`cuca balance` spreads chat requests over several `cuca serve` instances and streams each answer back unchanged. Its default policy keeps a conversation on the server that already caches its prompt prefix. It reads the `balance` section of the same file:
+A `balance` section spreads chat requests over several model servers and streams each answer back unchanged. Its default policy keeps a conversation on the server that already caches its prompt prefix:
 
 ```kdl
 balance {
@@ -129,11 +129,7 @@ balance {
 }
 ```
 
-```
-cargo run --release --no-default-features --features server --bin cuca -- balance --config cuca.kdl
-```
-
-The [Balancer page](https://nassor.github.io/cuca/server/balancer/) covers the policies, health checks and retries.
+The same `cuca run --config cuca.kdl` starts it. A file with both sections runs the server and the balancer in one process, and the balancer then routes to the local models as well as to the listed servers. The [Balancer page](https://nassor.github.io/cuca/server/balancer/) covers the policies, health checks and retries.
 
 ## Quick start
 

@@ -9,9 +9,9 @@
 //! byte, ejects it at once until the next successful poll. A dead upstream is
 //! polled with a growing delay, up to [`MAX_BACKOFF`].
 //!
-//! Bounds: one snapshot, one model list and one 1,024-record latency ring per
-//! upstream; the number of upstreams is capped at
-//! [`MAX_UPSTREAMS`](super::config::MAX_UPSTREAMS).
+//! Bounds: one snapshot, one model list, one speed per listed model and one
+//! 1,024-record latency ring per upstream; the number of upstreams is capped
+//! at [`MAX_UPSTREAMS`](super::config::MAX_UPSTREAMS).
 
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex, PoisonError};
@@ -98,6 +98,10 @@ struct Health {
     /// `Some(false)` once the upstream answered 404 to the stats route.
     has_stats_api: Option<bool>,
     snapshot: Option<(Instant, Arc<StatsSnapshot>)>,
+    /// Tokens per second of one sequence per model: the inverse of the last
+    /// windowed mean inter-token latency the upstream reported with requests
+    /// in it. Bounded by the upstream's model list.
+    speeds: Vec<(String, f64)>,
 }
 
 /// One upstream and everything the balancer tracks about it.
@@ -213,6 +217,16 @@ impl Upstream {
             .map(|(at, s)| (at.elapsed(), Arc::clone(s)))
     }
 
+    /// The generation speed of one sequence of `model`, tokens per second,
+    /// once the upstream has reported a windowed inter-token latency for it.
+    pub fn speed(&self, model: &str) -> Option<f64> {
+        self.health()
+            .speeds
+            .iter()
+            .find(|(name, _)| name == model)
+            .map(|&(_, speed)| speed)
+    }
+
     fn poll_succeeded(&self, models: Vec<UpstreamModel>, stats: Option<StatsOutcome>) {
         let mut h = self.health();
         // An upstream restarted with `stats_api #true` must be probed again.
@@ -233,6 +247,17 @@ impl Upstream {
         match stats {
             Some(StatsOutcome::Snapshot(s)) => {
                 h.has_stats_api = Some(true);
+                for m in &s.models {
+                    let itl = &m.latency.itl;
+                    if itl.count == 0 || itl.mean <= 0.0 {
+                        continue;
+                    }
+                    let speed = 1.0 / itl.mean;
+                    match h.speeds.iter_mut().find(|(name, _)| *name == m.name) {
+                        Some(entry) => entry.1 = speed,
+                        None => h.speeds.push((m.name.clone(), speed)),
+                    }
+                }
                 h.snapshot = Some((Instant::now(), Arc::new(*s)));
             }
             Some(StatsOutcome::Absent) => {
@@ -241,6 +266,9 @@ impl Upstream {
             }
             None => {}
         }
+        let models = Arc::clone(&h.models);
+        h.speeds
+            .retain(|(name, _)| models.iter().any(|m| m == name));
     }
 
     /// Make the upstream look healthy serving `models`, for an hour, without
@@ -446,6 +474,43 @@ mod tests {
         u.poll_succeeded(vec![], Some(StatsOutcome::Absent));
         assert!(u.lacks_stats_api());
         assert!(u.snapshot(Duration::from_secs(5)).is_none());
+    }
+
+    #[test]
+    fn the_speed_is_the_inverse_mean_itl_kept_while_the_window_is_empty() {
+        use crate::server::stats::{LatencyStats, ModelStats, Quantiles};
+        let u = upstream();
+        let model = UpstreamModel {
+            id: "m".into(),
+            ..UpstreamModel::default()
+        };
+        let snapshot = |mean, count| {
+            StatsOutcome::Snapshot(Box::new(StatsSnapshot {
+                models: vec![ModelStats {
+                    name: "m".into(),
+                    latency: LatencyStats {
+                        itl: Quantiles {
+                            mean,
+                            count,
+                            ..Quantiles::default()
+                        },
+                        ..LatencyStats::default()
+                    },
+                    ..ModelStats::default()
+                }],
+                ..StatsSnapshot::default()
+            }))
+        };
+        u.poll_succeeded(vec![model.clone()], Some(snapshot(0.05, 3)));
+        assert_eq!(u.speed("m"), Some(20.0));
+        u.poll_succeeded(vec![model], Some(snapshot(0.0, 0)));
+        assert_eq!(u.speed("m"), Some(20.0), "an empty window keeps it");
+        let other = UpstreamModel {
+            id: "other".into(),
+            ..UpstreamModel::default()
+        };
+        u.poll_succeeded(vec![other], None);
+        assert_eq!(u.speed("m"), None, "a model no longer listed drops it");
     }
 }
 

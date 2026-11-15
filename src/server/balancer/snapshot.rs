@@ -41,7 +41,8 @@ pub struct UpstreamInput {
 /// by a healthy upstream is `Ready`, one only known from unhealthy upstreams
 /// `Failed`. Counts and rates are summed over the healthy upstreams whose
 /// snapshot lists the model; means are weighted by the rates they describe;
-/// latency and request rates are left for the caller to fill in.
+/// latency and request rates are left for the caller to fill in. A drafter
+/// is per upstream: read it in the upstream's nested snapshot.
 pub fn union_models(inputs: &[UpstreamInput]) -> Vec<ModelStats> {
     let mut names: BTreeMap<&str, (bool, u64)> = BTreeMap::new();
     for input in inputs {

@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 250" width="660" height="250" role="img" aria-labelledby="title desc">
-  <title id="title">The cuca balance load balancer in front of three model servers.</title>
-  <desc id="desc">HTTP clients that speak the OpenAI API call cuca balance. The balancer picks one of three cuca serve instances for each request, by prefix affinity, least load or round robin, and streams the answer back. It polls /health, /v1/models and the stats API at /cuca/v1/stats of each server, every second by default.</desc>
+  <title id="title">The balancer in front of three model servers.</title>
+  <desc id="desc">HTTP clients that speak the OpenAI API call the balancer, the balance section of a cuca run file. The balancer picks one of three model servers for each request, by prefix affinity, least load or round robin, and streams the answer back. It polls /health, /v1/models and the stats API at /cuca/v1/stats of each server, every second by default.</desc>
   <style>
     .frame { fill: #fafafa; stroke: #e4e4e7; }
     text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
@@ -51,22 +51,22 @@
     <marker id="a-bnd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-bnd" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
   </defs>
   <rect class="frame" x="0.5" y="0.5" width="659" height="249" rx="12"/>
-  <text class="t-title" x="20" y="32">Load balancer: cuca balance</text>
+  <text class="t-title" x="20" y="32">Load balancer: the balance section</text>
   <rect class="blk" x="20" y="102" width="130" height="50" rx="6"/>
   <text class="t-lbl t-mid" x="85" y="123">HTTP clients</text>
   <text class="t-mid" x="85" y="140">OpenAI API</text>
   <rect class="blk blk-data" x="190" y="92" width="190" height="70" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="285" y="116">cuca balance</text>
+  <text class="t-lbl t-mid t-data" x="285" y="116">balance</text>
   <text class="t-mid" x="285" y="134">prefix-affinity,</text>
   <text class="t-mid" x="285" y="150">least-loaded or round-robin</text>
   <rect class="blk blk-data" x="450" y="48" width="190" height="46" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="545" y="67">cuca serve</text>
+  <text class="t-lbl t-mid t-data" x="545" y="67">serve</text>
   <text class="t-mid" x="545" y="84">http://10.0.0.1:8000</text>
   <rect class="blk blk-data" x="450" y="104" width="190" height="46" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="545" y="123">cuca serve</text>
+  <text class="t-lbl t-mid t-data" x="545" y="123">serve</text>
   <text class="t-mid" x="545" y="140">http://10.0.0.2:8000</text>
   <rect class="blk blk-data" x="450" y="160" width="190" height="46" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="545" y="179">cuca serve</text>
+  <text class="t-lbl t-mid t-data" x="545" y="179">serve</text>
   <text class="t-mid" x="545" y="196">http://10.0.0.3:8000</text>
   <path class="arw arw-data" d="M152 127 H186" marker-end="url(#a-data)"/>
   <path class="arw arw-data" d="M382 118 L446 73" marker-end="url(#a-data)"/>

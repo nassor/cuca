@@ -1,20 +1,19 @@
 //! The `cuca` command's implementation (feature `server`, which enables
 //! `provider-local`; add `provider-local-vulkan` and friends for a GPU):
 //!
-//! * `cuca serve` ([`serve`]): an OpenAI-compatible HTTP server over the
-//!   in-process local engine, described below.
-//! * `cuca balance` ([`balance`], module [`balancer`]): a load balancer over
-//!   several servers with prefix-affinity routing, health checks and a stats
-//!   API of its own.
+//! * `cuca run` ([`run`]): runs what the KDL file ([`CucaConfig`], module
+//!   [`config`]) holds. A `serve` section is an OpenAI-compatible HTTP server
+//!   over the in-process local engine, described below. A `balance` section
+//!   is a load balancer over several servers (module [`balancer`]) with
+//!   prefix-affinity routing, health checks and a stats API of its own. With
+//!   both, the balancer also routes to the local models.
 //! * `cuca tui` (feature `server-tui`, module `tui`): a terminal view of a
 //!   server or a balancer that follows the stats stream.
 //!
 //! ```text
-//! cuca serve --config cuca.kdl    # a `serve` section with `stats_api #true`
+//! cuca run --config cuca.kdl      # a `serve` section with `stats_api #true`
 //! curl localhost:8000/v1/chat/completions -d '{"messages":[{"role":"user","content":"hi"}]}'
 //! ```
-//!
-//! Both commands read one KDL file ([`CucaConfig`], module [`config`]).
 //!
 //! # What it serves
 //!
@@ -72,12 +71,13 @@ pub mod telemetry;
 #[cfg(feature = "server-tui")]
 pub mod tui;
 
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
-pub use balancer::{BalancerConfig, balance};
+pub use balancer::BalancerConfig;
 pub use config::{CucaConfig, MAX_MODELS, ModelSpec, ServerConfig};
 pub use error::ServerError;
 pub use telemetry::{LogConfig, LogFormat, init as init_logging};
@@ -116,19 +116,15 @@ pub(crate) fn join_error(what: &str, error: &tokio::task::JoinError) -> ServerEr
     ServerError::Io(format!("{what} task failed: {error}"))
 }
 
-/// Run the server until it is asked to stop (Ctrl-C, SIGTERM) or a model
-/// fails to load.
+/// The model server until `shutdown` resolves or a model fails to load.
 ///
 /// Binds `config.listen` first (so a port in use fails at once), loads the
 /// models concurrently while already answering `/health` with 503, and shuts
 /// down gracefully: open responses get a five second grace period to finish.
-///
-/// # Errors
-///
-/// [`ServerError::Config`] for an invalid configuration,
-/// [`ServerError::Io`] when the address cannot be bound or the HTTP server
-/// fails, [`ServerError::ModelLoad`] when a model fails to load.
-pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
+async fn serve_until(
+    config: ServerConfig,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), ServerError> {
     config.validate()?;
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
@@ -166,7 +162,6 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
             .await
     });
 
-    let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
     let mut loading = true;
     let result = loop {
@@ -204,4 +199,222 @@ pub async fn serve(config: ServerConfig) -> Result<(), ServerError> {
         server.abort();
     }
     result
+}
+
+/// Make `balance` route to the `serve` section of the same process: its
+/// listener, on the loopback address when it binds every interface, becomes
+/// the first upstream. Validates both sections, so nothing starts on an
+/// invalid file.
+fn colocate(serve: &ServerConfig, balance: &mut BalancerConfig) -> Result<(), ServerError> {
+    if serve.listen.port() == 0 {
+        return Err(ServerError::Config(
+            "a `serve` section beside a `balance` one needs a fixed port in `serve.listen`: the balancer routes to it".into(),
+        ));
+    }
+    if serve.listen == balance.listen {
+        return Err(ServerError::Config(format!(
+            "`serve.listen` and `balance.listen` are both {}: give the balancer another port",
+            serve.listen
+        )));
+    }
+    if serve.api_key != balance.upstream_api_key {
+        return Err(ServerError::Config(
+            "`serve.api_key` and `balance.upstream_api_key` differ: the balancer could not reach the local server".into(),
+        ));
+    }
+    let ip = match serve.listen.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    balance.add_local_upstream(SocketAddr::new(ip, serve.listen.port()));
+    serve.validate()?;
+    balance.resolve_upstreams()?;
+    Ok(())
+}
+
+/// Run the sections of the configuration until a shutdown signal (Ctrl-C,
+/// SIGTERM):
+///
+/// * `serve` alone: the model server, which also stops when a model fails
+///   to load. It binds `serve.listen` first (a port in use fails at once),
+///   loads the models concurrently while answering `/health` with 503, and
+///   gives open responses five seconds to finish on shutdown.
+/// * `balance` alone: a balancer over `balance.upstreams`; `/health` is 503
+///   until an upstream has answered.
+/// * both: the two on their own listeners, the server's `listen` address
+///   (the loopback address when it binds every interface) first among the
+///   balancer's upstreams. When either stops, the other is shut down
+///   gracefully and the first error is returned. A cluster runs `cuca run`
+///   on every machine, and each machine's `balance.upstreams` lists the
+///   other machines' `serve` addresses, never a balancer's, so a request is
+///   forwarded at most once.
+///
+/// The `log` section is not applied here: call [`init_logging`].
+///
+/// # Errors
+///
+/// [`ServerError::Config`] without either section, for an invalid section,
+/// and with both sections for a `serve.listen` with port 0, the same address
+/// for both listeners, or a `balance.upstream_api_key` that differs from
+/// `serve.api_key`; [`ServerError::Io`] when an address cannot be bound or
+/// an HTTP server fails; [`ServerError::ModelLoad`] when a model fails to
+/// load.
+pub async fn run(
+    serve: Option<ServerConfig>,
+    balance: Option<BalancerConfig>,
+) -> Result<(), ServerError> {
+    match (serve, balance) {
+        (None, None) => Err(ServerError::Config(
+            "the configuration has neither a `serve` nor a `balance` section".into(),
+        )),
+        (Some(serve), None) => serve_until(serve, shutdown_signal()).await,
+        (None, Some(balance)) => balancer::balance_until(balance, shutdown_signal()).await,
+        (Some(serve), Some(mut balance)) => {
+            colocate(&serve, &mut balance)?;
+            serve_and_balance(serve, balance).await
+        }
+    }
+}
+
+/// Both sections of [`run`], each stopping the other when it ends.
+async fn serve_and_balance(
+    serve: ServerConfig,
+    balance: BalancerConfig,
+) -> Result<(), ServerError> {
+    let (stop_tx, stop_rx) = watch::channel(false);
+    let stopped = |mut rx: watch::Receiver<bool>| async move {
+        let _ = rx.wait_for(|stop| *stop).await;
+    };
+    let serve_fut = serve_until(serve, stopped(stop_rx.clone()));
+    let balance_fut = balancer::balance_until(balance, stopped(stop_rx));
+    tokio::pin!(serve_fut, balance_fut);
+    tokio::select! {
+        () = shutdown_signal() => {
+            let _ = stop_tx.send(true);
+            let (served, balanced) = tokio::join!(serve_fut, balance_fut);
+            served.and(balanced)
+        }
+        served = &mut serve_fut => {
+            let _ = stop_tx.send(true);
+            served.and(balance_fut.await)
+        }
+        balanced = &mut balance_fut => {
+            let _ = stop_tx.send(true);
+            balanced.and(serve_fut.await)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{LocalModelConfig, ModelSource};
+
+    fn serve_at(listen: &str) -> ServerConfig {
+        let model = ModelSpec::new(
+            Some("m".into()),
+            LocalModelConfig {
+                source: "qwen3-0.6b-q8_0".parse().unwrap(),
+                ..Default::default()
+            },
+        );
+        ServerConfig::new(listen.parse().unwrap(), vec![model])
+    }
+
+    fn balance_at(listen: &str, upstreams: &[&str]) -> BalancerConfig {
+        BalancerConfig::new(
+            listen.parse().unwrap(),
+            upstreams.iter().map(|u| (*u).to_string()).collect(),
+        )
+    }
+
+    #[test]
+    fn colocate_puts_the_local_server_first_once() {
+        let serve = serve_at("0.0.0.0:8000");
+        let mut balance = balance_at("0.0.0.0:8080", &["http://10.0.0.2:8000"]);
+        colocate(&serve, &mut balance).unwrap();
+        assert_eq!(
+            balance.upstreams,
+            ["http://127.0.0.1:8000", "http://10.0.0.2:8000"]
+        );
+        let mut listed = balance_at("0.0.0.0:8080", &["http://127.0.0.1:8000/"]);
+        colocate(&serve, &mut listed).unwrap();
+        assert_eq!(listed.upstreams, ["http://127.0.0.1:8000/"]);
+        let mut v6 = balance_at("[::]:8080", &[]);
+        colocate(&serve_at("[::]:8000"), &mut v6).unwrap();
+        assert_eq!(v6.upstreams, ["http://[::1]:8000"]);
+    }
+
+    #[test]
+    fn colocate_rejects_what_the_balancer_could_not_reach() {
+        let message = |serve: &ServerConfig, balance: &mut BalancerConfig| {
+            colocate(serve, balance).unwrap_err().to_string()
+        };
+        let err = message(
+            &serve_at("127.0.0.1:0"),
+            &mut balance_at("127.0.0.1:8080", &[]),
+        );
+        assert!(
+            err.contains("needs a fixed port in `serve.listen`"),
+            "{err}"
+        );
+        let err = message(
+            &serve_at("127.0.0.1:8000"),
+            &mut balance_at("127.0.0.1:8000", &[]),
+        );
+        assert!(err.contains("are both 127.0.0.1:8000"), "{err}");
+        let mut keyed = serve_at("127.0.0.1:8000");
+        keyed.api_key = Some("k".into());
+        let err = message(&keyed, &mut balance_at("127.0.0.1:8080", &[]));
+        assert!(err.contains("`balance.upstream_api_key` differ"), "{err}");
+    }
+
+    /// A model source that fails to load at once, with no network.
+    fn failing_serve() -> ServerConfig {
+        let dir = std::env::temp_dir().join(format!("cuca-run-test-{}", std::process::id()));
+        let mut serve = serve_at("127.0.0.1:1");
+        serve.models[0].config.source = ModelSource::File(dir.join("missing.gguf"));
+        serve.listen.set_port({
+            let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        });
+        serve
+    }
+
+    async fn run_briefly(
+        serve: Option<ServerConfig>,
+        balance: Option<BalancerConfig>,
+    ) -> Result<(), ServerError> {
+        tokio::time::timeout(Duration::from_secs(30), run(serve, balance))
+            .await
+            .expect("run stops on its own")
+    }
+
+    #[tokio::test]
+    async fn run_starts_what_the_configuration_holds() {
+        let err = run_briefly(None, None).await.unwrap_err().to_string();
+        assert!(err.contains("neither a `serve` nor a `balance`"), "{err}");
+        match run_briefly(Some(failing_serve()), None).await {
+            Err(ServerError::ModelLoad { model, .. }) => assert_eq!(model, "m"),
+            other => panic!("`serve` alone runs the server, got {other:?}"),
+        }
+        let err = run_briefly(None, Some(balance_at("127.0.0.1:0", &[])))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no upstream"),
+            "`balance` alone needs upstreams: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_that_fails_to_load_stops_the_balancer_too() {
+        let balance = balance_at("127.0.0.1:0", &[]);
+        match run_briefly(Some(failing_serve()), Some(balance)).await {
+            Err(ServerError::ModelLoad { model, .. }) => assert_eq!(model, "m"),
+            other => panic!("expected a model load error, got {other:?}"),
+        }
+    }
 }

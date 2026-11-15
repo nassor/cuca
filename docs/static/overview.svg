@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 310" width="660" height="310" role="img" aria-labelledby="title desc">
   <title id="title">Two ways to use CUCA: a client for LLM APIs, and a local engine with three modes.</title>
-  <desc id="desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU, a GPU or both; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call cuca balance, which forwards each request to a cuca serve instance, which runs the local engine; these are balancer mode and server mode.</desc>
+  <desc id="desc">Top row: your application holds a CucaClient, which sends requests over HTTP to an LLM API: OpenAI, Anthropic, Gemini, DeepSeek, llama.cpp, vLLM or LM Studio. Middle row: the same application can instead run the local engine, provider-local, in its own process on the CPU, a GPU or both; this is library mode. Bottom row: HTTP clients that speak the OpenAI API call the balancer, which forwards each request to a model server, which runs the local engine; these are balancer mode and server mode, the balance and serve sections of a cuca run file.</desc>
   <style>
     .frame { fill: #fafafa; stroke: #e4e4e7; }
     text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
@@ -73,10 +73,10 @@
   <text class="t-lbl t-mid" x="95" y="257">HTTP clients</text>
   <text class="t-mid" x="95" y="273">OpenAI API</text>
   <rect class="blk blk-data" x="196" y="236" width="104" height="50" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="248" y="257">cuca balance</text>
+  <text class="t-lbl t-mid t-data" x="248" y="257">balance</text>
   <text class="t-mid" x="248" y="273">balancer mode</text>
   <rect class="blk blk-data" x="326" y="236" width="110" height="50" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="381" y="257">cuca serve</text>
+  <text class="t-lbl t-mid t-data" x="381" y="257">serve</text>
   <text class="t-mid" x="381" y="273">server mode</text>
   <path class="arw arw-data" d="M172 261 H192" marker-end="url(#a-data)"/>
   <path class="arw arw-data" d="M302 261 H322" marker-end="url(#a-data)"/>

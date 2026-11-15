@@ -1,7 +1,8 @@
 //! The `cuca` configuration file: one KDL document whose sections are the
-//! structs below, read by `cuca serve` and `cuca balance` (`--config`, default
-//! `cuca.kdl`). Every key is a field name; a `model` node is a
-//! [`LocalModelConfig`] with the name clients select it by as its argument.
+//! structs below, read by `cuca run` (`--config`, default `cuca.kdl`), which
+//! starts the sections the file has. Every key is a field name; a `model`
+//! node is a [`LocalModelConfig`] with the name clients select it by as its
+//! argument.
 //!
 //! ```kdl
 //! variables {
@@ -55,18 +56,19 @@ use super::error::ServerError;
 use super::telemetry::LogConfig;
 use crate::config::ConfigValue;
 use crate::error::CucaError;
-use crate::{LocalModelConfig, ModelSource};
+use crate::{DrafterSource, LocalModelConfig, ModelSource};
 
 /// Most models one server loads: each holds its weights and K/V pools in
 /// memory, so a longer list is a mistake, not a deployment.
 pub const MAX_MODELS: usize = 16;
 
-/// The whole configuration file. `serve` reads the `serve` section,
-/// `balance` the `balance` one; both read `log`.
+/// The whole configuration file. [`run`](super::run) starts the model server
+/// when `serve` is present, the balancer when `balance` is, and both in one
+/// process when both are; the binary applies `log` first.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CucaConfig {
-    /// Logging of either command.
+    /// Logging.
     pub log: LogConfig,
     /// The model server.
     pub serve: Option<ServerConfig>,
@@ -94,26 +96,6 @@ impl CucaConfig {
     pub fn from_kdl_str(text: &str) -> Result<Self, ServerError> {
         crate::config::load_kdl_str(text).map_err(config_error)
     }
-
-    /// The `serve` section.
-    ///
-    /// # Errors
-    ///
-    /// [`ServerError::Config`] when the file has none.
-    pub fn into_serve(self) -> Result<ServerConfig, ServerError> {
-        self.serve
-            .ok_or_else(|| ServerError::Config("the configuration has no `serve` section".into()))
-    }
-
-    /// The `balance` section.
-    ///
-    /// # Errors
-    ///
-    /// [`ServerError::Config`] when the file has none.
-    pub fn into_balance(self) -> Result<BalancerConfig, ServerError> {
-        self.balance
-            .ok_or_else(|| ServerError::Config("the configuration has no `balance` section".into()))
-    }
 }
 
 /// A configuration error of the library as the server's, without a second
@@ -140,7 +122,7 @@ where
     })
 }
 
-/// Everything `serve` needs to start: the `serve` section.
+/// The `serve` section: the model server.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
@@ -245,22 +227,16 @@ impl ModelSpec {
 
     /// The source as a short label for logs and the stats API.
     pub fn source_label(&self) -> String {
-        match &self.config.source {
-            ModelSource::HuggingFace {
-                repo,
-                revision,
-                file,
-                ..
-            } => {
-                let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
-                format!("{repo}:{short}:{file}")
-            }
-            ModelSource::File(path) | ModelSource::Dir(path) => path.display().to_string(),
-            ModelSource::Checkpoint { repo, revision } => {
-                let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
-                format!("{repo}:{short}")
-            }
-        }
+        source_label(&self.config.source)
+    }
+
+    /// The drafter as a short label: `in-trunk`, or the drafter file's
+    /// source label; `None` without a drafter.
+    pub fn drafter_label(&self) -> Option<String> {
+        self.config.drafter.as_ref().map(|drafter| match drafter {
+            DrafterSource::InTrunk => "in-trunk".to_string(),
+            DrafterSource::File(source) => source_label(source),
+        })
     }
 
     /// The device, then each shard, joined by `+` (`vulkan:0+vulkan:1`).
@@ -270,6 +246,26 @@ impl ModelSpec {
             .map(ToString::to_string)
             .collect::<Vec<_>>()
             .join("+")
+    }
+}
+
+/// A source as a short label: revisions cut to 8 characters.
+fn source_label(source: &ModelSource) -> String {
+    match source {
+        ModelSource::HuggingFace {
+            repo,
+            revision,
+            file,
+            ..
+        } => {
+            let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
+            format!("{repo}:{short}:{file}")
+        }
+        ModelSource::File(path) | ModelSource::Dir(path) => path.display().to_string(),
+        ModelSource::Checkpoint { repo, revision } => {
+            let short = revision.get(..revision.len().min(8)).unwrap_or(revision);
+            format!("{repo}:{short}")
+        }
     }
 }
 
@@ -344,7 +340,9 @@ mod tests {
     }
 
     fn serve(text: &str) -> Result<ServerConfig, ServerError> {
-        CucaConfig::from_kdl_str(text)?.into_serve()
+        Ok(CucaConfig::from_kdl_str(text)?
+            .serve
+            .expect("a `serve` section"))
     }
 
     #[test]
@@ -352,7 +350,7 @@ mod tests {
         let config =
             CucaConfig::from_kdl_str(include_str!("../../examples/configs/cuca.kdl")).unwrap();
         let balance = config.balance.clone().unwrap();
-        let serve = config.into_serve().unwrap();
+        let serve = config.serve.unwrap();
         serve.validate().unwrap();
         let names: Vec<&str> = serve.models.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["chat", "gemma-4-E4B-it-Q4_0", "moe"]);
@@ -418,11 +416,6 @@ serve {
             .unwrap_err()
             .to_string();
         assert!(err.contains("unknown field `serv`"), "{err}");
-        let err = CucaConfig::from_kdl_str("")
-            .unwrap()
-            .into_serve()
-            .unwrap_err();
-        assert!(err.to_string().contains("no `serve` section"), "{err}");
     }
 
     #[test]
@@ -433,6 +426,18 @@ serve {
         .unwrap();
         assert_eq!(config.models[0].device_label(), "vulkan:0+vulkan:1");
         assert_eq!(spec("cpu").device_label(), "cpu");
+    }
+
+    #[test]
+    fn the_drafter_label_names_the_drafter() {
+        let config =
+            serve(r#"serve { model "m" { source "qwen3-0.6b-q8_0"; drafter "in-trunk"; }; }"#)
+                .unwrap();
+        assert_eq!(
+            config.models[0].drafter_label().as_deref(),
+            Some("in-trunk")
+        );
+        assert_eq!(spec("m").drafter_label(), None);
     }
 
     #[test]

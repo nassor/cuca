@@ -1,4 +1,4 @@
-//! The error type of `cuca serve`.
+//! The error type of `cuca run`.
 
 use std::fmt;
 

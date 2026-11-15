@@ -11,7 +11,7 @@ weight = 4
 <dt>In one line</dt>
 <dd><code>cuca tui</code> follows a node's stats stream and shows resources, latency, the ranked reasons for it, and the node's models or upstreams</dd>
 <dt>You need</dt>
-<dd>The <code>server-tui</code> feature, and a <code>cuca serve</code> or <code>cuca balance</code> with <code>stats_api #true</code> in its configuration</dd>
+<dd>The <code>server-tui</code> feature, and a <code>cuca run</code> with a <code>serve</code> or <code>balance</code> section and <code>stats_api #true</code> in its configuration</dd>
 <dt>Read this if</dt>
 <dd>You want to see why a server is slow while it runs, or need to know which resource figures a platform reports</dd>
 </dl>

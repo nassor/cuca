@@ -21,7 +21,7 @@ use crate::sysmon::SystemSnapshot;
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NodeRole {
-    /// A model server (`cuca serve`).
+    /// A model server (a `serve` section).
     #[default]
     Server,
     /// A load balancer in front of model servers.
@@ -118,6 +118,21 @@ pub struct ExpertTierRates {
     pub ram_resident_bytes: u64,
     /// Bytes of experts the device tier holds.
     pub device_resident_bytes: u64,
+}
+
+/// The speculative-decoding drafter of a model.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DrafterStats {
+    /// `in-trunk`, or the drafter file's source (a preset's
+    /// `repo:revision:file`, a path).
+    pub source: String,
+    /// Most tokens drafted per verification round.
+    pub draft_tokens: u64,
+    /// Fraction of drafted tokens the target accepted over the sampling
+    /// window (`None` without drafts in it: the model is idle, or several
+    /// requests run and speculation is off).
+    pub acceptance_ratio: Option<f64>,
 }
 
 /// Percentiles of one latency over the sliding window, in seconds. `count`
@@ -222,6 +237,8 @@ pub struct ModelStats {
     pub memory: ModelMemory,
     /// Tiered-expert counters (`None` unless the model streams experts).
     pub expert_tiers: Option<ExpertTierRates>,
+    /// The drafter (`None` without one).
+    pub drafter: Option<DrafterStats>,
     /// Request counters of this model.
     pub requests: RequestStats,
     /// Latencies of this model's requests over the window.

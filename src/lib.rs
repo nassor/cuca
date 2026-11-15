@@ -11,10 +11,11 @@
 //! module [`services`]) are driven by direct method calls and never implement
 //! [`CucaPlugin`](plugin::CucaPlugin).
 //!
-//! With the `server` feature, the `server` module and the `cuca` binary serve
-//! the in-process local engine over an OpenAI-compatible HTTP API (`cuca
-//! serve`), balance several such servers (`cuca balance`) and, with
-//! `server-tui`, show either live in a terminal (`cuca tui`).
+//! With the `server` feature, the `server` module and the `cuca` binary
+//! (`cuca run`) serve the in-process local engine over an OpenAI-compatible
+//! HTTP API, balance several such servers, or both, as the configuration
+//! file says, and, with `server-tui`, show either live in a terminal
+//! (`cuca tui`).
 
 #![forbid(unsafe_code)]
 #[cfg(not(any(

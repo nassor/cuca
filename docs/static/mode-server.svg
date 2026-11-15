@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 660 250" width="660" height="250" role="img" aria-labelledby="title desc">
-  <title id="title">The cuca serve model server.</title>
-  <desc id="desc">HTTP clients such as an OpenAI SDK or curl call cuca serve. It answers /v1/chat/completions, /v1/models, /health, /metrics and the stats API at /cuca/v1/stats, and runs each request on one of its models, each a LocalModel on the CPU or a GPU. The terminal UI, cuca tui, or Prometheus reads the stats and the metrics. One KDL file lists the models, up to 16 per server.</desc>
+  <title id="title">The model server.</title>
+  <desc id="desc">HTTP clients such as an OpenAI SDK or curl call the model server, the serve section of a cuca run file. It answers /v1/chat/completions, /v1/models, /health, /metrics and the stats API at /cuca/v1/stats, and runs each request on one of its models, each a LocalModel on the CPU or a GPU. The terminal UI, cuca tui, or Prometheus reads the stats and the metrics. One KDL file lists the models, up to 16 per server.</desc>
   <style>
     .frame { fill: #fafafa; stroke: #e4e4e7; }
     text { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 10.5px; fill: #71717a; }
@@ -51,12 +51,12 @@
     <marker id="a-bnd" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto"><path class="head-bnd" d="M0 0.6 L7 4 L0 7.4 z"/></marker>
   </defs>
   <rect class="frame" x="0.5" y="0.5" width="659" height="249" rx="12"/>
-  <text class="t-title" x="20" y="32">Model server: cuca serve</text>
+  <text class="t-title" x="20" y="32">Model server: the serve section</text>
   <rect class="blk" x="20" y="52" width="140" height="50" rx="6"/>
   <text class="t-lbl t-mid" x="90" y="73">HTTP clients</text>
   <text class="t-mid" x="90" y="90">OpenAI SDK, curl</text>
   <rect class="blk blk-data" x="200" y="52" width="200" height="150" rx="6"/>
-  <text class="t-lbl t-mid t-data" x="300" y="76">cuca serve</text>
+  <text class="t-lbl t-mid t-data" x="300" y="76">serve</text>
   <text class="t-mid" x="300" y="102">/v1/chat/completions</text>
   <text class="t-mid" x="300" y="120">/v1/models</text>
   <text class="t-mid" x="300" y="138">/health</text>

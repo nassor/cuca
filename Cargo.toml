@@ -497,7 +497,7 @@ name = "vector_store"
 harness = false
 required-features = ["provider-openai", "service-vector-store"]
 
-# The `cuca` binary: the model server (`cuca serve`).
+# The `cuca` binary: `cuca run` (model server, balancer or both) and `cuca tui`.
 [[bin]]
 name = "cuca"
 path = "src/bin/cuca.rs"
