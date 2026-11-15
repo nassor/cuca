@@ -10,8 +10,8 @@
 //! Invariants to preserve:
 //!
 //! - Row independence: every weight kind computes a row from that row alone
-//!   (the row-batched kernel by construction, candle's quantized kernel per
-//!   row, float weights and attention per row under [`RowExact`]). With
+//!   (every quantized weight on the row-batched kernel by construction, float
+//!   weights and attention per row under [`RowExact`]). With
 //!   `Batch::exact` a row is bit-equal to the single-token step at its
 //!   position, whatever else is in the batch. Quantized matmuls round their
 //!   activations to Q8_0, so a ~1e-7 float-gemm difference between batch
@@ -125,55 +125,39 @@ impl Drop for RowExact {
     }
 }
 
-/// A matmul weight: candle's, or the row-batched kernel's; [`RowExact`]
-/// applies to its float weights, and candle's quantized weights always run
-/// one activation row at a time.
+/// A matmul weight: a float matrix on candle's matmul (to which [`RowExact`]
+/// applies), or a quantized one on the row-batched kernel.
 enum QMatMul {
-    Candle(CandleMatMul),
-    /// A Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0 weight read once for all activation
-    /// rows (see [`qmm`](super::qmm)).
+    /// A float matrix, always `CandleMatMul::Tensor`: no quantized weight runs
+    /// on candle's kernel.
+    Float(CandleMatMul),
+    /// A weight of any quantized dtype read once for all activation rows (see
+    /// [`qmm`](super::qmm)).
     RowBatched(QmmWeight),
 }
 
 impl QMatMul {
     fn tensor(t: Tensor) -> Self {
-        Self::Candle(CandleMatMul::Tensor(t))
+        Self::Float(CandleMatMul::Tensor(t))
     }
 
-    fn from_arc(qt: Arc<QTensor>) -> candle_core::Result<Self> {
-        CandleMatMul::from_arc(qt).map(Self::Candle)
-    }
-
-    /// The row-batched kernel over `qt` when it serves its dtype and shape,
-    /// else candle's matmul.
-    fn from_arc_row_batched(qt: Arc<QTensor>) -> candle_core::Result<Self> {
-        match QmmWeight::new(&qt) {
-            Some(w) => Ok(Self::RowBatched(w)),
-            None => Self::from_arc(qt),
-        }
-    }
-
-    /// `x * w^T`. A quantized weight on candle's kernel runs one activation
-    /// row at a time, always: candle picks its quantized kernel by row count
-    /// (on x86-64 a Q6_K product of one row takes the compact kernel and of
-    /// several the repacked one; on AArch64 Q4_K, Q5_K and Q6_K switch between
-    /// a one-row and a four-row-tile kernel), so a row's bits would depend on
-    /// the batch and the prefill chunking.
+    /// `x * w^T`. A quantized weight is row-independent by construction (the
+    /// row-batched kernel gives a row the same bits whatever the batch), so it
+    /// needs no per-row split; a float one runs per row under [`RowExact`].
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let m = match self {
-            Self::Candle(m) => m,
-            // Row-independent by construction: no per-row split needed.
+            Self::Float(m) => m,
             Self::RowBatched(w) => return row_batched(w, x, w.n()),
         };
-        if matches!(m, CandleMatMul::QTensor(_)) || ROW_EXACT.get() {
+        if ROW_EXACT.get() {
             return forward_per_row(m, x);
         }
         m.forward(x)
     }
 
     /// [`QMatMul::forward`] keeping only the first `rows` outputs (the first
-    /// `rows` weight rows). The row-batched kernel computes just those; any
-    /// other weight computes the whole product and drops the rest.
+    /// `rows` weight rows). The row-batched kernel computes just those; a
+    /// float weight computes the whole product and drops the rest.
     fn forward_rows(&self, x: &Tensor, rows: usize) -> candle_core::Result<Tensor> {
         if let Self::RowBatched(w) = self {
             return row_batched(w, x, rows.min(w.n()));
@@ -185,51 +169,6 @@ impl QMatMul {
             y.narrow(D::Minus1, 0, rows)
         }
     }
-
-    /// A copy for a drafter that ranks several rows through this weight at
-    /// once (a block of draft rows through the LM head): candle's per-row
-    /// kernel, which serves the K-quants, reads the whole weight once per row,
-    /// while the row-batched kernel reads it once for all rows. The copy is
-    /// [`requantize_q8_0`] of the weight, `None` when the weight is already
-    /// served by the row-batched kernel or is a float tensor. A proposal only
-    /// picks tokens the target verifies, so the half-Q8_0-step rounding it adds
-    /// to the logits cannot change the output.
-    fn proposal_copy(&self) -> candle_core::Result<Option<Self>> {
-        let Self::Candle(CandleMatMul::QTensor(qt)) = self else {
-            return Ok(None);
-        };
-        let q = requantize_q8_0(qt)?;
-        Self::from_arc_row_batched(Arc::new(q)).map(Some)
-    }
-}
-
-/// Rows of a matrix [`requantize_q8_0`] converts at a time: bounds the f32
-/// copy it holds to `REQUANTIZE_ROWS * cols * 4` bytes.
-const REQUANTIZE_ROWS: usize = 4096;
-
-/// The 2-D quantized `qt` as Q8_0, converted `REQUANTIZE_ROWS` rows at a time
-/// (a whole f32 copy of an LM head would take several GB).
-fn requantize_q8_0(qt: &QTensor) -> candle_core::Result<QTensor> {
-    let (rows, cols) = qt.shape().dims2()?;
-    let (dtype, q8) = (qt.dtype(), GgmlDType::Q8_0);
-    if !cols.is_multiple_of(q8.block_size()) || !cols.is_multiple_of(dtype.block_size()) {
-        candle_core::bail!(
-            "a row of {cols} values is not a whole number of {dtype:?} or Q8_0 blocks"
-        );
-    }
-    let from_bytes = |dtype: GgmlDType, rows: usize, bytes: &[u8]| {
-        gguf::qtensor_from_bytes(dtype, &[rows, cols], bytes, &Device::Cpu)
-    };
-    let row_bytes = cols / dtype.block_size() * dtype.type_size();
-    let bytes = qt.data()?;
-    let mut out = Vec::with_capacity(rows * (cols / q8.block_size() * q8.type_size()));
-    for first in (0..rows).step_by(REQUANTIZE_ROWS) {
-        let n = REQUANTIZE_ROWS.min(rows - first);
-        let part = from_bytes(dtype, n, &bytes[first * row_bytes..(first + n) * row_bytes])?;
-        let q = QTensor::quantize(&part.dequantize(&Device::Cpu)?, q8)?;
-        out.extend_from_slice(&q.data()?);
-    }
-    from_bytes(q8, rows, &out)
 }
 
 /// `m.forward(x)` computed one row of `x` at a time.
@@ -449,7 +388,7 @@ pub(crate) struct HostExperts {
 impl HostExperts {
     /// Read every expert of MoE layer `il` from the file at `path` (index
     /// `content`) into RAM; `dequantize` holds the matmul weights as f32
-    /// (the exact reference of the tests: candle's quantized matmul rounds
+    /// (the exact reference of the tests: a quantized matmul rounds
     /// the activations to Q8_0).
     ///
     /// # Errors
@@ -758,7 +697,7 @@ struct Loader<'a> {
     content: &'a gguf::Content,
     reader: gguf::TensorReader<'a>,
     /// Hold matmul weights as dequantized f32 instead of quantized (test
-    /// reference only: candle's quantized matmul rounds activations to Q8_0).
+    /// reference only: a quantized matmul rounds activations to Q8_0).
     dequantize: bool,
     /// Store float matrices (columns a multiple of 32) as Q8_0 (a drafter's:
     /// it only proposes tokens, so its rounding cannot change the output, and
@@ -771,43 +710,49 @@ impl Loader<'_> {
         self.content.tensor_infos.contains_key(tensor_name)
     }
 
-    fn qtensor(&mut self, tensor_name: &str, shape: &[usize]) -> Result<QTensor, CucaError> {
-        let qt = self
-            .reader
-            .tensor(tensor_name, &Device::Cpu)
-            .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
-        if qt.shape().dims() != shape {
+    /// Tensor `tensor_name` as the file stores it: its type and its bytes,
+    /// after checking the shape.
+    fn raw(
+        &mut self,
+        tensor_name: &str,
+        shape: &[usize],
+    ) -> Result<(GgufType, Vec<u8>), CucaError> {
+        let info = tensor_info(self.content, tensor_name)?;
+        if info.shape.dims() != shape {
             return Err(err(format!(
                 "tensor `{tensor_name}`: expected shape {shape:?}, found {:?}",
-                qt.shape().dims()
+                info.shape.dims()
             )));
         }
-        Ok(qt)
+        let bytes = self
+            .reader
+            .bytes(tensor_name)
+            .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
+        Ok((info.dtype, bytes))
     }
 
     fn matmul(&mut self, tensor_name: &str, shape: &[usize]) -> Result<QMatMul, CucaError> {
-        let qt = Arc::new(self.qtensor(tensor_name, shape)?);
-        self.to_matmul(qt, tensor_name)
+        let (dtype, bytes) = self.raw(tensor_name, shape)?;
+        self.to_matmul(dtype, Arc::from(bytes), shape, tensor_name)
     }
 
-    fn to_matmul(&self, qt: Arc<QTensor>, tensor_name: &str) -> Result<QMatMul, CucaError> {
+    /// The matmul weight over `bytes`, a `shape` tensor of type `dtype`.
+    fn to_matmul(
+        &self,
+        dtype: GgufType,
+        bytes: Arc<[u8]>,
+        shape: &[usize],
+        tensor_name: &str,
+    ) -> Result<QMatMul, CucaError> {
         let float = matches!(
-            qt.dtype(),
-            GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32
+            dtype,
+            GgufType::Ggml(GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32)
         );
-        let matmul = if self.dequantize {
-            qt.dequantize(&Device::Cpu).map(QMatMul::tensor)
-        } else if self.requantize && float && qt.shape().dims().last().is_some_and(|c| c % 32 == 0)
-        {
-            qt.dequantize(&Device::Cpu)
-                .and_then(|t| QTensor::quantize(&t, GgmlDType::Q8_0))
-                .and_then(|q| QMatMul::from_arc_row_batched(Arc::new(q)))
-        } else {
-            // Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 go through the row-batched
-            // kernel (every row independent of its batch, each weight read
-            // once per pass); everything else, the K-quants included,
-            // through candle's per-row kernel (also row independent).
-            QMatMul::from_arc_row_batched(qt)
+        let matmul = match shape {
+            &[rows, cols] if !self.dequantize && self.requantize && float && cols % 32 == 0 => {
+                q8_0_matmul(dtype, &bytes, rows, cols)
+            }
+            _ => matmul_from_bytes(dtype, bytes, shape, self.dequantize),
         };
         matmul.map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
     }
@@ -831,17 +776,16 @@ impl Loader<'_> {
     }
 
     fn vector(&mut self, tensor_name: &str, len: usize) -> Result<Tensor, CucaError> {
-        self.qtensor(tensor_name, &[len])?
-            .dequantize(&Device::Cpu)
+        let values = self.floats(tensor_name, &[len])?;
+        Tensor::from_vec(values, len, &Device::Cpu)
             .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
     }
 
     /// The values of the (float or quantized) tensor `tensor_name`, whose
     /// shape must be `shape`, as row-major f32.
     fn floats(&mut self, tensor_name: &str, shape: &[usize]) -> Result<Vec<f32>, CucaError> {
-        self.qtensor(tensor_name, shape)?
-            .dequantize(&Device::Cpu)
-            .and_then(|t| t.flatten_all()?.to_vec1::<f32>())
+        let (dtype, bytes) = self.raw(tensor_name, shape)?;
+        dequantize_bytes(dtype, &bytes, shape)
             .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
     }
 
@@ -915,16 +859,12 @@ impl Loader<'_> {
             for (part, weights) in parts.iter().zip(&mut out) {
                 let at = (part.offset(0) - first.offset(0)) as usize;
                 let bytes = &chunk[at..at + part.file_bytes];
-                let matmul = if part.dtype == GgufType::Mxfp4 {
-                    mxfp4_matmul(part, bytes, self.dequantize)
-                } else {
-                    expert_qtensor(part, bytes)
-                        .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))
-                        .and_then(|qt| self.to_matmul(Arc::new(qt), tensor_name))
-                        .map_err(|e| candle_core::Error::msg(e.to_string()))
-                }
-                .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?;
-                weights.push(matmul);
+                weights.push(self.to_matmul(
+                    part.dtype,
+                    Arc::from(bytes),
+                    &[part.rows, part.cols],
+                    tensor_name,
+                )?);
             }
         }
         Ok(out)
@@ -968,45 +908,78 @@ impl Loader<'_> {
     }
 }
 
-/// One MXFP4 expert matrix of `slice` from its file bytes: candle has no type
-/// for it, so the row-batched kernel reads the blocks itself (`dequantize`:
-/// an f32 matrix, the exact reference of the tests).
-fn mxfp4_matmul(
-    slice: &ExpertSlice,
-    bytes: &[u8],
+/// The values of a tensor of type `dtype` and shape `shape` as row-major f32,
+/// decoded row by row ([`dequant_row`]; a row is the last dimension).
+fn dequantize_bytes(dtype: GgufType, bytes: &[u8], shape: &[usize]) -> Result<Vec<f32>, CucaError> {
+    let cols = shape.last().copied().unwrap_or(1);
+    let Some(row_bytes) = dtype.byte_len(cols).filter(|&b| b > 0) else {
+        return Err(err(format!(
+            "a row of {cols} values is not a whole number of {} blocks",
+            dtype.name()
+        )));
+    };
+    let mut out = vec![0f32; shape.iter().product()];
+    for (src, dst) in bytes
+        .chunks_exact(row_bytes)
+        .zip(out.chunks_exact_mut(cols))
+    {
+        dequant_row(dtype, src, 1.0, dst)?;
+    }
+    Ok(out)
+}
+
+/// The matmul weight over `bytes`, a `shape` tensor of type `dtype`: the
+/// row-batched kernel over the blocks as stored for a quantized dtype, an f32
+/// matrix for a float dtype or with `dequantize` (the exact reference of the
+/// tests).
+fn matmul_from_bytes(
+    dtype: GgufType,
+    bytes: Arc<[u8]>,
+    shape: &[usize],
     dequantize: bool,
 ) -> candle_core::Result<QMatMul> {
-    if dequantize {
-        let row_bytes = slice.file_bytes / slice.rows;
-        let mut values = vec![0f32; slice.rows * slice.cols];
-        for (src, dst) in bytes
-            .chunks_exact(row_bytes)
-            .zip(values.chunks_exact_mut(slice.cols))
-        {
-            dequant_row(GgufType::Mxfp4, src, 1.0, dst)
-                .map_err(|e| candle_core::Error::msg(e.to_string()))?;
-        }
-        return Tensor::from_vec(values, (slice.rows, slice.cols), &Device::Cpu)
-            .map(QMatMul::tensor);
+    let float = matches!(
+        dtype,
+        GgufType::Ggml(GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::F32)
+    );
+    if float || dequantize {
+        let values = dequantize_bytes(dtype, &bytes, shape)
+            .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+        return Tensor::from_vec(values, shape, &Device::Cpu).map(QMatMul::tensor);
     }
-    QmmWeight::mxfp4(Arc::from(bytes), slice.rows, slice.cols)
+    let &[rows, cols] = shape else {
+        candle_core::bail!(
+            "a {} tensor of shape {shape:?} is not a matrix",
+            dtype.name()
+        );
+    };
+    QmmWeight::from_raw(dtype, bytes, rows, cols)
         .map(QMatMul::RowBatched)
         .ok_or_else(|| {
             candle_core::Error::msg(format!(
-                "an MXFP4 matrix of {} x {} does not fit {} bytes",
-                slice.rows,
-                slice.cols,
-                bytes.len()
+                "a {} matrix of {rows} x {cols} is not a type the row-batched kernel serves, or does not fit its bytes",
+                dtype.name()
             ))
         })
 }
 
-/// One expert's `[rows, cols]` matrix of `slice` from its file bytes.
-fn expert_qtensor(slice: &ExpertSlice, bytes: &[u8]) -> candle_core::Result<QTensor> {
-    let dtype = slice
-        .ggml()
-        .map_err(|e| candle_core::Error::Msg(e.to_string()))?;
-    gguf::qtensor_from_bytes(dtype, &[slice.rows, slice.cols], bytes, &Device::Cpu)
+/// The float matrix `bytes` (`rows` x `cols`, `cols` a multiple of 32) as a
+/// Q8_0 weight of the row-batched kernel: a drafter's matrices, which only
+/// propose tokens, so a quarter of the bytes are read per step.
+fn q8_0_matmul(
+    dtype: GgufType,
+    bytes: &[u8],
+    rows: usize,
+    cols: usize,
+) -> candle_core::Result<QMatMul> {
+    let values = dequantize_bytes(dtype, bytes, &[rows, cols])
+        .map_err(|e| candle_core::Error::msg(e.to_string()))?;
+    let dense = Tensor::from_vec(values, (rows, cols), &Device::Cpu)?;
+    let q = QTensor::quantize(&dense, GgmlDType::Q8_0)?;
+    let data: Arc<[u8]> = Arc::from(&*q.data()?);
+    QmmWeight::from_raw(GgmlDType::Q8_0, data, rows, cols)
+        .map(QMatMul::RowBatched)
+        .ok_or_else(|| candle_core::Error::msg("a Q8_0 copy does not fit the kernel"))
 }
 
 /// Build one expert of `layer` from its three matrices' file bytes, as the
@@ -1018,11 +991,12 @@ fn build_cpu_expert(
     down: &[u8],
 ) -> Result<CpuExpert, CucaError> {
     let one = |slice: &ExpertSlice, bytes: &[u8], part: &str| {
-        if slice.dtype == GgufType::Mxfp4 {
-            mxfp4_matmul(slice, bytes, false)
-        } else {
-            expert_qtensor(slice, bytes).and_then(|qt| QMatMul::from_arc_row_batched(Arc::new(qt)))
-        }
+        matmul_from_bytes(
+            slice.dtype,
+            Arc::from(bytes),
+            &[slice.rows, slice.cols],
+            false,
+        )
         .map_err(|e| err(format!("tensor `{}`: {e}", name::blk(layer.il, part))))
     };
     Ok(CpuExpert {
@@ -1555,18 +1529,25 @@ impl Transformer {
             .dims()
             .first()
             .ok_or_else(|| err(format!("tensor `{}`: scalar", name::TOKEN_EMBD)))?;
-        let embd = Arc::new(loader.qtensor(name::TOKEN_EMBD, &[vocab, n_embd])?);
+        let embd_shape = [vocab, n_embd];
+        let (embd_type, embd_bytes) = loader.raw(name::TOKEN_EMBD, &embd_shape)?;
+        let embd: Arc<[u8]> = Arc::from(embd_bytes);
         let embed = if drafter {
             None
         } else {
-            Some(TokenEmbedding::new(Arc::clone(&embd))?)
+            Some(TokenEmbedding::new(
+                embd_type,
+                Arc::clone(&embd),
+                vocab,
+                n_embd,
+            )?)
         };
         let lm_head = if front.is_some() {
             None
         } else if loader.has(name::OUTPUT) {
             Some(loader.matmul(name::OUTPUT, &[vocab, n_embd])?)
         } else {
-            Some(loader.to_matmul(embd, name::TOKEN_EMBD)?)
+            Some(loader.to_matmul(embd_type, embd, &embd_shape, name::TOKEN_EMBD)?)
         };
         let output_norm = loader.vector(name::OUTPUT_NORM, n_embd)?;
 
@@ -4289,8 +4270,8 @@ mod tests {
         );
     }
 
-    /// A dense hybrid model whose FFN down projections are K-quants (served
-    /// by candle's per-row kernel next to the row-batched legacy dtypes).
+    /// A dense hybrid model whose FFN down projections rotate through the
+    /// 256-value types, next to the other matrices' 32- and 64-value ones.
     pub(super) fn mixed_dense() -> TinyQwen35 {
         TinyQwen35 {
             ff: 256,
@@ -4299,9 +4280,9 @@ mod tests {
         }
     }
 
-    /// A hybrid MoE model whose experts and shared experts hold K-quant down
-    /// projections (candle's kernel) and every dtype the row-batched kernel
-    /// serves.
+    /// A hybrid MoE model whose experts and shared experts hold the
+    /// 256-value types in their down projections and every other format of
+    /// the row-batched kernel elsewhere.
     pub(super) fn mixed_moe() -> TinyQwen35 {
         TinyQwen35 {
             moe: Some(TinyMoe {
@@ -4315,7 +4296,7 @@ mod tests {
         }
     }
 
-    /// A Llama whose FFN down projections are K-quants.
+    /// A Llama whose FFN down projections hold the 256-value types.
     fn mixed_llama() -> TinySpec {
         TinySpec {
             ff: 256,
@@ -4335,64 +4316,8 @@ mod tests {
             .collect()
     }
 
-    /// A drafter's proposal copy of a K-quant matrix is a Q8_0 matrix within
-    /// a Q8_0 step of it (rows past a conversion chunk included); a weight the
-    /// row-batched kernel serves already, or a float one, needs none.
-    #[test]
-    fn a_proposal_copy_requantizes_only_what_candle_serves_per_row() {
-        let (rows, cols) = (REQUANTIZE_ROWS + 37, 512);
-        let noise = |n: usize, salt: u64| -> Vec<f32> {
-            (0..n as u64)
-                .map(|i| {
-                    let z = (i + salt).wrapping_mul(0x9E37_79B9_7F4A_7C15);
-                    (z >> 40) as f32 / 8_388_608.0 - 1.0
-                })
-                .collect()
-        };
-        let dense = Tensor::from_vec(noise(rows * cols, 1), (rows, cols), &Device::Cpu).unwrap();
-        let q6 = Arc::new(QTensor::quantize(&dense, GgmlDType::Q6K).unwrap());
-        let weight = QMatMul::from_arc_row_batched(q6).unwrap();
-        assert!(
-            matches!(weight, QMatMul::Candle(_)),
-            "a K-quant stays on candle's kernel"
-        );
-        let copy = weight
-            .proposal_copy()
-            .unwrap()
-            .expect("a K-quant gets a copy");
-        let QMatMul::RowBatched(w) = &copy else {
-            panic!("the copy is served by the row-batched kernel");
-        };
-        assert_eq!((w.n(), w.k()), (rows, cols));
-
-        let x = Tensor::from_vec(noise(3 * cols, 7), (3, cols), &Device::Cpu).unwrap();
-        let flat = |t: Tensor| t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-        let (want, got) = (
-            flat(weight.forward(&x).unwrap()),
-            flat(copy.forward(&x).unwrap()),
-        );
-        assert_eq!(want.len(), got.len());
-        let scale = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-        let worst = want
-            .iter()
-            .zip(&got)
-            .fold(0f32, |m, (a, b)| m.max((a - b).abs()));
-        assert!(
-            worst <= 0.02 * scale,
-            "worst difference {worst}, largest output {scale}"
-        );
-
-        for dtype in [GgmlDType::Q4_0, GgmlDType::Q8_0] {
-            let q = Arc::new(QTensor::quantize(&dense, dtype).unwrap());
-            let served = QMatMul::from_arc_row_batched(q).unwrap();
-            assert!(served.proposal_copy().unwrap().is_none(), "{dtype:?}");
-        }
-        assert!(QMatMul::tensor(dense).proposal_copy().unwrap().is_none());
-    }
-
-    /// The mixed models really mix: every dtype the row-batched kernel serves
-    /// and every K-quant (candle's kernel) is in one of them, and every one
-    /// loads and runs a pass.
+    /// The mixed models really mix: the legacy types and the K-quants are in
+    /// them, and every one loads and runs a pass.
     #[test]
     fn mixed_dtype_models_hold_every_kernel_dtype() {
         let mut seen = std::collections::BTreeSet::new();
@@ -4414,6 +4339,35 @@ mod tests {
         }
     }
 
+    /// Every format the row-batched kernel serves, alone in a model whose
+    /// matrices all hold it where their rows fit it: the model loads, a pass
+    /// runs, and batched rows equal solo rows bit for bit.
+    #[test]
+    fn every_kernel_dtype_loads_and_batches_like_solo() {
+        for ty in super::super::tiny::MIXED_TYPES {
+            let spec = TinySpec {
+                ff: 256,
+                mixed: true,
+                forced: Some(ty),
+                ..TinySpec::llama()
+            };
+            let model = write_spec(&spec);
+            assert!(
+                file_dtypes(&model).contains(&ty.name()),
+                "{} is missing from the model",
+                ty.name()
+            );
+            let mut m = load(&model, 32);
+            let f = m.forward_ext(&PROMPT, 0, Want::Last, Hidden::None, true);
+            assert!(
+                f.unwrap().logits.unwrap().iter().all(|v| v.is_finite()),
+                "{}",
+                ty.name()
+            );
+            check_batched(&model, &ty.name());
+        }
+    }
+
     /// Batched rows equal solo rows bit for bit on models mixing every dtype.
     #[test]
     fn mixed_dtype_models_batch_like_solo() {
@@ -4422,8 +4376,8 @@ mod tests {
         check_batched(&write_qwen35(&mixed_moe()), "mixed qwen35moe");
     }
 
-    /// Tiered placement of experts of every dtype, K-quants included,
-    /// computes the resident logits bit for bit.
+    /// Tiered placement of experts of every dtype, K-quants and I-quants
+    /// included, computes the resident logits bit for bit.
     #[test]
     fn mixed_dtype_tiered_experts_match_resident_bit_for_bit() {
         let model = write_qwen35(&mixed_moe());

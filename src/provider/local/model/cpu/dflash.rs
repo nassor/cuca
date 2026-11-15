@@ -39,13 +39,6 @@
 //! the target's scale) turn rows `1..=k` into the logits of the `k` draft
 //! tokens, the token after `first` first: one pass, `k` tokens.
 //!
-//! Ranking is the expensive part on a CPU: it reads the whole LM head, and
-//! candle's per-row kernel, which serves the K-quants, reads it once per row.
-//! A K-quant head is therefore ranked through a Q8_0 copy
-//! (`QMatMul::proposal_copy`, built when the drafter opens) that the
-//! row-batched kernel reads once for all rows. It only changes which tokens
-//! are proposed, never the output: the target verifies every draft.
-//!
 //! # Context cache
 //!
 //! The context K/V of a position depends only on that position's feature row,
@@ -296,11 +289,6 @@ pub(crate) struct DflashNet {
     enc_norm: Tensor,
     layers: Vec<DflashLayer>,
     out_norm: Tensor,
-    /// A row-batched Q8_0 copy of the target's LM head for ranking the block's
-    /// rows when the target's own head is a quantized type candle serves per
-    /// row; `None` when the target's head already reads its weight once for
-    /// all rows. Proposals only: the target verifies every draft.
-    rank: Option<QMatMul>,
     /// RoPE cos/sin `(context_length + block_size, rope_dims / 2)`.
     cos: Tensor,
     sin: Tensor,
@@ -441,12 +429,6 @@ impl DflashNet {
             .max(1);
         let ring = geo.n_kv_head * cap * geo.head_dim;
         let n_layer = layers.len();
-        // A K-quant LM head is read once per block row by candle's kernel:
-        // rank the block through a Q8_0 copy that is read once for all rows.
-        let rank = target
-            .lm_head()
-            .and_then(QMatMul::proposal_copy)
-            .map_err(candle_err)?;
         Ok(Self {
             geo,
             layers_set,
@@ -455,7 +437,6 @@ impl DflashNet {
             enc_norm,
             layers,
             out_norm,
-            rank,
             cos,
             sin,
             cap,
@@ -653,10 +634,7 @@ impl DflashNet {
             x = self.block_layer(lw, il, &x, len)?;
         }
         let normed = rms(&x, &self.out_norm, g.eps)?.narrow(1, 1, k)?;
-        let logits = match &self.rank {
-            Some(rank) => target.cap_logits(rank.forward(&normed)?)?,
-            None => target.head(&normed)?,
-        };
+        let logits = target.head(&normed)?;
         logits.flatten_all()?.to_vec1::<f32>()
     }
 

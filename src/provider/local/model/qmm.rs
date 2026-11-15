@@ -1,5 +1,8 @@
-//! Row-batched quantized matmul for Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 and MXFP4
-//! weights.
+//! Row-batched quantized matmul for every quantized matrix dtype the engine
+//! reads: the legacy blocks (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0), the K-quants
+//! (Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, Q8_K), the I-quants (IQ1_S, IQ1_M, IQ2_XXS,
+//! IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL, IQ4_XS), the ternary TQ1_0 and
+//! TQ2_0, MXFP4 and NVFP4. No quantized matrix runs on candle's kernel.
 //!
 //! candle's quantized matmul loops over the activation rows and streams the
 //! whole weight matrix once per row, so verifying `k + 1` drafted tokens in one
@@ -10,48 +13,58 @@
 //!
 //! # Arithmetic
 //!
-//! The activations are quantised the way ggml pairs them with the weight
-//! dtype, exactly as candle's vec-dot partners do:
+//! The activations are quantised to Q8_0 blocks of 32 values (`d = max|x| /
+//! 127` rounded to f16, `q = round(x * (1 / d))`), exactly as candle's vec-dot
+//! partners do, plus, for a format with minima, a sum term the minimum
+//! multiplies:
 //!
-//! - Q4_0, Q5_0, Q8_0, MXFP4: Q8_0 (`d = max|x| / 127` rounded to f16,
-//!   `q = round(x * (1 / d))`, 32-element blocks);
-//! - Q4_1, Q5_1: Q8_1, the same quants plus the sum term
-//!   `s = f16(f16(sum q) * d)`, which multiplies the weight block's minimum.
+//! - Q4_1, Q5_1: ggml's Q8_1 term `s = f16(f16(sum q) * d)` of the 32 quants;
+//! - Q2_K, Q4_K, Q5_K: the two half sums `d * sum q` of the first and the
+//!   last 16 quants, each the exact integer sum times `d` rounded once to f32
+//!   (ggml's `Q8_K` keeps the same sixteen-value sums).
 //!
-//! The products are the integer dot of one weight block with one activation
-//! block, scaled by the product of the two block scales.
+//! A weight row is a sequence of *entries*, each the quants of 32 consecutive
+//! values as `i16`, one f32 scale and, with minima, two f32 minima (one per
+//! 16 values) that the format defines from its block ([`Format::entries`]).
+//! The integer sub-block scales of a K-quant or I-quant are folded into the
+//! quants (`sc * q`, at most 4096 in magnitude), so the entry's scale is the
+//! block's own factor; NVFP4's four 16-value scales cannot be folded, so each
+//! 32 values make two entries whose quants are zero in the other half.
 //!
 //! The value for activation row `j` and weight row `r` is a fixed function of
-//! that row pair alone: sixteen `f32` lanes, each adding its share of the
-//! block's exact integer dot times the block scale in block order (how the
-//! integer part is computed is free), reduced by a fixed pairwise tree, plus
-//! for Q4_1 and Q5_1 a scalar `min * s` per block added after the reduction.
-//! No cross-row term exists and tile shape never changes the order, so a row's
-//! result is bit-identical whether it is computed alone or in a batch of any
-//! size, which speculative-decoding verification needs. It differs from
-//! candle's own result only in float rounding order.
+//! that row pair alone: sixteen `f32` lanes, each adding, entry by entry in
+//! row order, its share of the exact integer dot of the entry's quants with
+//! the activation block's quants times the product of the two f32 scales (how
+//! the integer part is computed is free), reduced by a fixed pairwise tree,
+//! plus a scalar sum of minimum terms added after the reduction, block by
+//! block (Q4_1, Q5_1: the minimum times `s`; Q2_K, Q4_K, Q5_K: the first
+//! minimum times the first half sum, then the second times the second, the
+//! minima being the negated `dmin * mn`). No cross-row term exists and tile
+//! shape never changes the order, so a row's result is bit-identical whether
+//! it is computed alone or in a batch of any size, which speculative-decoding
+//! verification needs. It differs from candle's and ggml's own results only
+//! in float rounding order and, for the K-quants and I-quants, in the
+//! activation format (Q8_0 blocks of 32 instead of Q8_K blocks of 256).
 //!
 //! Work is split in chunks of weight rows over candle's persistent barrier pool
-//! (the one its own quantized matmul uses, so the two never oversubscribe the
+//! (the one its own quantized matmul used, so the two never oversubscribe the
 //! cores), with dynamic chunk claiming; which worker computes a chunk never
 //! changes its bits.
 //!
-//! # K-quants stay on candle
-//!
-//! Q2_K to Q6_K weights are not served here: [`QmmWeight::new`] returns `None`
-//! for them and candle's per-row kernel multiplies them (a row's result still
-//! depends on that row alone, whatever the batch). A row's bits must not depend
-//! on the batch size, so the dispatch cannot pick a faster kernel per `m`: one
-//! dtype is served by exactly one kernel.
+//! One dtype is served by exactly one kernel: a row's bits must not depend on
+//! the batch size, so the dispatch cannot pick a faster kernel per `m`.
 
 use std::sync::{Arc, Mutex, PoisonError};
 
-use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::utils::barrier_pool;
 use half::f16;
 use wide::{f32x4, f32x16, i8x16, i8x32, i16x16, i16x32, u8x32};
 
 use super::pool::for_each;
+use super::quant::block::{MAX_BLOCK, Unpacked};
+use super::quant::iq_tables::{KVALUES_FP4, KVALUES_IQ4NL};
+use super::quant::{iquants as iq, kquants as kq};
+use crate::provider::local::gguf::GgufType;
 
 /// Elements per quantisation block of the served formats (Q4_0, Q4_1, Q5_0,
 /// Q5_1, Q8_0), and of their Q8_0/Q8_1 activations.
@@ -64,6 +77,16 @@ const NR: usize = 4;
 const MR: usize = 4;
 /// Below this many weight elements the matmul runs on the calling thread.
 const SERIAL_BELOW: usize = 1 << 17;
+
+/// A format without minima.
+const MIN_NONE: u8 = 0;
+/// One minimum per 32 values (Q4_1, Q5_1), multiplied by Q8_1's sum term.
+const MIN_Q8_1: u8 = 1;
+/// Two minima per 32 values, one per 16 (Q2_K, Q4_K, Q5_K), multiplied by the
+/// exact half sums of the activation block.
+const MIN_HALVES: u8 = 2;
+/// Most entries one block decodes to (a 256-value block of 32-value entries).
+const MAX_ENTRIES: usize = 8;
 
 /// A block's 32 quants as two halves of sixteen: lane `l` of the first half is
 /// element `l`, lane `l` of the second is element `l + 16`. The definition of
@@ -100,7 +123,61 @@ fn nibble_pairs(nibbles: &[u8]) -> i8x32 {
     i8x32::from_ne_bytes(pairs.to_ne_bytes())
 }
 
-/// A 32-element weight block: its bytes, f32 scale, optional minimum and quants.
+/// One entry of a weight row: 32 values' quants, f32 scale and minima. The
+/// definition of a format ([`Format::entries`]).
+#[derive(Clone, Copy, Default)]
+struct Entry {
+    halves: Halves,
+    scale: f32,
+    /// `[min of the first 16 values, min of the last 16]`; the element is
+    /// `scale * quant + min` (Q4_1, Q5_1: only `mins[0]`, for all 32).
+    mins: [f32; 2],
+}
+
+/// Where [`Format::decode`] writes one block's entries.
+struct Dst<'a> {
+    quants: &'a mut [Quants],
+    scales: &'a mut [f32],
+    /// One pair per 32 values of the block; empty for a format without minima.
+    mins: &'a mut [[f32; 2]],
+}
+
+/// A weight format: blocks of bytes that decode to 32-value entries.
+trait Format {
+    type Block;
+    /// Which minima the blocks carry (`MIN_*`).
+    const MIN: u8 = MIN_NONE;
+    /// Entries per 32 values: 2 when the two halves of 32 values have
+    /// scales that cannot be folded (NVFP4), else 1. A format with 2 has no
+    /// minima.
+    const SUB: usize = 1;
+    /// Values per block.
+    const VALUES: usize = QK;
+    /// Entries per block.
+    const ENTRIES: usize = Self::VALUES / QK * Self::SUB;
+    /// The blocks of one row (`row` is a whole number of them).
+    fn blocks(row: &[u8]) -> &[Self::Block];
+    /// The block's entries, scalar: the format's definition. `out` has
+    /// [`Format::ENTRIES`] elements.
+    fn entries(block: &Self::Block, out: &mut [Entry]);
+    /// [`Format::entries`] as vectors, into `dst`. A format that overrides it
+    /// with vector code writes the same values (`decode_equals_halves`).
+    #[inline(always)]
+    fn decode(block: &Self::Block, dst: &mut Dst) {
+        let mut e = [Entry::default(); MAX_ENTRIES];
+        let e = &mut e[..Self::ENTRIES];
+        Self::entries(block, e);
+        for ((q, s), e) in dst.quants.iter_mut().zip(&mut *dst.scales).zip(&*e) {
+            *q = interleave(&e.halves);
+            *s = e.scale;
+        }
+        for (m, e) in dst.mins.iter_mut().zip(e.iter().step_by(Self::SUB)) {
+            *m = e.mins;
+        }
+    }
+}
+
+/// A format of 32-value blocks with one scale and at most one minimum.
 trait Legacy {
     type Block;
     /// Blocks carry a minimum (`element = scale * quant + min`), paired with
@@ -119,6 +196,34 @@ trait Legacy {
     #[inline(always)]
     fn decode(block: &Self::Block) -> Quants {
         interleave(&Self::halves(block))
+    }
+}
+
+impl<L: Legacy> Format for L {
+    type Block = L::Block;
+    const MIN: u8 = if L::HAS_MIN { MIN_Q8_1 } else { MIN_NONE };
+
+    #[inline(always)]
+    fn blocks(row: &[u8]) -> &[Self::Block] {
+        L::blocks(row)
+    }
+
+    #[inline(always)]
+    fn entries(block: &Self::Block, out: &mut [Entry]) {
+        out[0] = Entry {
+            halves: L::halves(block),
+            scale: L::scale(block),
+            mins: [L::min(block), 0.0],
+        };
+    }
+
+    #[inline(always)]
+    fn decode(block: &Self::Block, dst: &mut Dst) {
+        dst.quants[0] = L::decode(block);
+        dst.scales[0] = L::scale(block);
+        if L::HAS_MIN {
+            dst.mins[0] = [L::min(block), 0.0];
+        }
     }
 }
 
@@ -322,20 +427,23 @@ impl Legacy for Q8_0 {
     }
 }
 
-/// The doubled E2M1 values an MXFP4 nibble selects (ggml's `kvalues_mxfp4`).
-const KVALUES_MXFP4: [i16; 16] = [0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12];
-
-/// [`KVALUES_MXFP4`] as a byte table, once in each 128-bit half of a vector
-/// (a byte shuffle looks up within its half).
-const MXFP4_TABLE: i8x32 = {
+/// A 16-entry code table as a byte table, once in each 128-bit half of a
+/// vector (a byte shuffle looks up within its half).
+const fn byte_table(values: &[i8; 16]) -> i8x32 {
     let mut t = [0i8; QK];
     let mut i = 0;
     while i < QK {
-        t[i] = KVALUES_MXFP4[i % 16] as i8;
+        t[i] = values[i % 16];
         i += 1;
     }
     i8x32::new(t)
-};
+}
+
+/// The doubled E2M1 values an MXFP4 nibble selects (ggml's `kvalues_mxfp4`).
+const MXFP4_TABLE: i8x32 = byte_table(&KVALUES_FP4);
+
+/// IQ4_NL's 16-entry code table (ggml's `kvalues_iq4nl`).
+const IQ4NL_TABLE: i8x32 = byte_table(&KVALUES_IQ4NL);
 
 /// OCP MXFP4: one E8M0 scale byte, then 16 bytes of nibbles (element `i` is
 /// the low nibble of byte `i`, element `i + 16` its high nibble) that index
@@ -361,8 +469,8 @@ impl Legacy for Mxfp4 {
         let mut w = [[0i16; LANES]; 2];
         for i in 0..LANES {
             let b = block[1 + i];
-            w[0][i] = KVALUES_MXFP4[usize::from(b & 0x0F)];
-            w[1][i] = KVALUES_MXFP4[usize::from(b >> 4)];
+            w[0][i] = i16::from(KVALUES_FP4[usize::from(b & 0x0F)]);
+            w[1][i] = i16::from(KVALUES_FP4[usize::from(b >> 4)]);
         }
         w
     }
@@ -373,9 +481,379 @@ impl Legacy for Mxfp4 {
     }
 }
 
-/// Activations of one call, quantised to Q8_0 (or Q8_1, which adds the sum
-/// term) and laid out block-major so the blocks of consecutive rows at one
-/// block index are contiguous.
+/// `d: f16`, then 16 bytes of nibbles (element `i` is the low nibble of byte
+/// `i`, element `i + 16` its high nibble) that index ggml's `kvalues_iq4nl`.
+struct Iq4Nl;
+
+impl Legacy for Iq4Nl {
+    type Block = [u8; 18];
+
+    #[inline(always)]
+    fn blocks(row: &[u8]) -> &[Self::Block] {
+        row.as_chunks().0
+    }
+
+    #[inline(always)]
+    fn scale(block: &Self::Block) -> f32 {
+        f16_le(block, 0)
+    }
+
+    #[inline(always)]
+    fn halves(block: &Self::Block) -> Halves {
+        let mut w = [[0i16; LANES]; 2];
+        for i in 0..LANES {
+            let b = block[2 + i];
+            w[0][i] = i16::from(KVALUES_IQ4NL[usize::from(b & 0x0F)]);
+            w[1][i] = i16::from(KVALUES_IQ4NL[usize::from(b >> 4)]);
+        }
+        w
+    }
+
+    #[inline(always)]
+    fn decode(block: &Self::Block) -> Quants {
+        Quants::from_i8x32(IQ4NL_TABLE.swizzle_half_relaxed(nibble_pairs(&block[2..18])))
+    }
+}
+
+/// The entries of an unpacked block ([`Unpacked`]): the folded quants
+/// `sc * q` of each 32 values, the scale of the sub-block they lie in, and
+/// with `mins` the negated `dmin * mn` of the sub-blocks of each 16 values.
+/// With `sub == 2` every 32 values are two entries holding 16 values each.
+fn unpacked_entries(u: &Unpacked, mins: bool, sub: usize, out: &mut [Entry]) {
+    let mut folded = [0i16; MAX_BLOCK];
+    u.fold_into(&mut folded);
+    let group = u.group.max(1);
+    for (i, e) in out.iter_mut().enumerate() {
+        let at = QK * (i / sub);
+        let sixteen = |from: usize| -> [i16; LANES] { std::array::from_fn(|l| folded[from + l]) };
+        if sub == 1 {
+            e.halves = [sixteen(at), sixteen(at + LANES)];
+            e.scale = u.d[at / group];
+            if mins {
+                e.mins = [-u.min_f32(at / group), -u.min_f32((at + LANES) / group)];
+            }
+        } else {
+            let half = i % sub;
+            let from = at + LANES * half;
+            e.halves = [[0; LANES]; 2];
+            e.halves[half] = sixteen(from);
+            e.scale = u.d[from / group];
+        }
+    }
+}
+
+/// A format of 256-value (NVFP4: 64-value) blocks that [`Unpacked`]
+/// describes: `$unpack` is the foundation's unpacker and the entries are
+/// derived from it ([`unpacked_entries`]), with an optional vector `decode`.
+macro_rules! superblock {
+    (
+        $(#[$meta:meta])*
+        $name:ident, $bytes:expr, $unpack:path, min: $min:expr, values: $values:expr, sub: $sub:expr
+        $(, decode: $fast:path)?
+    ) => {
+        $(#[$meta])*
+        struct $name;
+
+        impl Format for $name {
+            type Block = [u8; $bytes];
+            const MIN: u8 = $min;
+            const SUB: usize = $sub;
+            const VALUES: usize = $values;
+
+            #[inline(always)]
+            fn blocks(row: &[u8]) -> &[Self::Block] {
+                row.as_chunks().0
+            }
+
+            fn entries(block: &Self::Block, out: &mut [Entry]) {
+                let mut u = Unpacked::default();
+                $unpack(block, &mut u);
+                unpacked_entries(&u, $min != MIN_NONE, $sub, out);
+            }
+
+            $(
+                #[inline(always)]
+                fn decode(block: &Self::Block, dst: &mut Dst) {
+                    $fast(block, dst)
+                }
+            )?
+        }
+    };
+}
+
+superblock!(
+    /// Q2_K: 16 sub-blocks of 16 values with a 4-bit scale and a 4-bit min.
+    Q2K, kq::Q2_K_BYTES, kq::unpack_q2_k, min: MIN_HALVES, values: 256, sub: 1, decode: decode_q2k
+);
+superblock!(
+    /// Q3_K: 16 sub-blocks of 16 values with a 6-bit scale.
+    Q3K, kq::Q3_K_BYTES, kq::unpack_q3_k, min: MIN_NONE, values: 256, sub: 1, decode: decode_q3k
+);
+superblock!(
+    /// Q4_K: 8 sub-blocks of 32 values with a 6-bit scale and a 6-bit min.
+    Q4K, kq::Q4_K_BYTES, kq::unpack_q4_k, min: MIN_HALVES, values: 256, sub: 1, decode: decode_q4k
+);
+superblock!(
+    /// Q5_K: Q4_K with a fifth bit.
+    Q5K, kq::Q5_K_BYTES, kq::unpack_q5_k, min: MIN_HALVES, values: 256, sub: 1, decode: decode_q5k
+);
+superblock!(
+    /// Q6_K: 16 sub-blocks of 16 values with an 8-bit scale.
+    Q6K, kq::Q6_K_BYTES, kq::unpack_q6_k, min: MIN_NONE, values: 256, sub: 1, decode: decode_q6k
+);
+superblock!(
+    /// Q8_K: an f32 scale and 256 signed bytes.
+    Q8K, kq::Q8_K_BYTES, kq::unpack_q8_k, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ2_XXS: 8 sub-blocks of 32 values from a grid, with a sign set and a
+    /// 4-bit scale each.
+    Iq2Xxs, iq::IQ2_XXS_BYTES, iq::unpack_iq2_xxs, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ2_XS: 16 sub-blocks of 16 values from a larger grid.
+    Iq2Xs, iq::IQ2_XS_BYTES, iq::unpack_iq2_xs, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ2_S: IQ2_XS with explicit sign bytes.
+    Iq2S, iq::IQ2_S_BYTES, iq::unpack_iq2_s, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ3_XXS: 8 sub-blocks of 32 values from a grid of 4.
+    Iq3Xxs, iq::IQ3_XXS_BYTES, iq::unpack_iq3_xxs, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ3_S: IQ3_XXS with explicit sign bytes.
+    Iq3S, iq::IQ3_S_BYTES, iq::unpack_iq3_s, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ1_S: ternary grid points with a delta, 8 sub-blocks of 32 values.
+    Iq1S, iq::IQ1_S_BYTES, iq::unpack_iq1_s, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ1_M: IQ1_S with a delta per 16 values.
+    Iq1M, iq::IQ1_M_BYTES, iq::unpack_iq1_m, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// IQ4_XS: 8 sub-blocks of 32 values through the IQ4_NL table.
+    Iq4Xs, iq::IQ4_XS_BYTES, iq::unpack_iq4_xs, min: MIN_NONE, values: 256, sub: 1, decode: decode_iq4xs
+);
+superblock!(
+    /// TQ1_0: 256 ternary values, five per byte.
+    Tq1_0, iq::TQ1_0_BYTES, iq::unpack_tq1_0, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// TQ2_0: 256 ternary values, two bits each.
+    Tq2_0, iq::TQ2_0_BYTES, iq::unpack_tq2_0, min: MIN_NONE, values: 256, sub: 1
+);
+superblock!(
+    /// NVFP4: 64 E2M1 values as four sub-blocks of 16 with a UE4M3 scale each.
+    Nvfp4, iq::NVFP4_BYTES, iq::unpack_nvfp4, min: MIN_NONE, values: 64, sub: 2
+);
+
+/// 16 bytes as 16 lanes holding `0..=255`.
+#[inline(always)]
+fn bytes16(bytes: &[u8]) -> i16x16 {
+    i16x16::from_i8x16(i8x16::new(std::array::from_fn(|i| bytes[i] as i8))) & i16x16::splat(0xFF)
+}
+
+/// The quants of an entry whose elements `l` and `l + 16` are lane `l` of `a`
+/// and of `b` (each `0..=127`): [`Quants`]' layout is element `l` in lane `2 *
+/// l` and element `l + 16` in lane `2 * l + 1`.
+#[inline(always)]
+fn pair_lanes(a: i16x16, b: i16x16) -> Quants {
+    Quants::from_i8x32(i8x32::from_ne_bytes((a | (b << 8u32)).to_ne_bytes()))
+}
+
+/// The scales of an entry with one per 16 values: `lo` for the elements `0..16`
+/// (even lanes of [`Quants`]), `hi` for the elements `16..32` (odd lanes).
+#[inline(always)]
+fn pair_scale(lo: i16, hi: i16) -> Quants {
+    Quants::new(std::array::from_fn(|i| if i % 2 == 0 { lo } else { hi }))
+}
+
+/// The 6-bit scale and min of sub-block `j` (0 to 7) out of the 12 packed
+/// bytes of a Q4_K or Q5_K block (ggml's `get_scale_min_k4`).
+#[inline(always)]
+fn scale_min_k4(j: usize, q: &[u8]) -> (i16, i16) {
+    let (sc, mn) = if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
+    };
+    (i16::from(sc), i16::from(mn))
+}
+
+/// The sixteen 6-bit scales of a Q3_K block, minus 32, out of its 12 packed
+/// bytes.
+#[inline(always)]
+fn q3_scales(sc: &[u8]) -> [i16; 16] {
+    std::array::from_fn(|i| {
+        let low = if i < 8 { sc[i] & 0x0F } else { sc[i - 8] >> 4 };
+        let high = (sc[8 + i % 4] >> (2 * (i / 4))) & 3;
+        i16::from(low | (high << 4)) - 32
+    })
+}
+
+/// [`Format::decode`] of Q2_K: entry `e` holds sub-blocks `2e` and `2e + 1`,
+/// whose 2-bit quants lie at shift `2 * (e % 4)` of the 32 bytes `32 * (e /
+/// 4)` on.
+#[inline(always)]
+fn decode_q2k(b: &[u8; kq::Q2_K_BYTES], dst: &mut Dst) {
+    let (scales, rest) = b.split_at(16);
+    let (qs, rest) = rest.split_at(64);
+    let (d, dmin) = (f16_le(rest, 0), f16_le(rest, 2));
+    let three = i16x16::splat(3);
+    for e in 0..8 {
+        let q = &qs[32 * (e / 4)..32 * (e / 4) + 32];
+        let shift = 2 * (e % 4) as u32;
+        let a = (bytes16(&q[..16]) >> shift) & three;
+        let c = (bytes16(&q[16..]) >> shift) & three;
+        let (s0, s1) = (scales[2 * e], scales[2 * e + 1]);
+        dst.quants[e] = pair_lanes(a, c) * pair_scale(i16::from(s0 & 0x0F), i16::from(s1 & 0x0F));
+        dst.scales[e] = d;
+        dst.mins[e] = [
+            -(dmin * f32::from(i16::from(s0 >> 4))),
+            -(dmin * f32::from(i16::from(s1 >> 4))),
+        ];
+    }
+}
+
+/// [`Format::decode`] of Q3_K: as Q2_K, the quant minus 4 where the matching
+/// bit of `hmask` is clear.
+#[inline(always)]
+fn decode_q3k(b: &[u8; kq::Q3_K_BYTES], dst: &mut Dst) {
+    let (hmask, rest) = b.split_at(32);
+    let (qs, rest) = rest.split_at(64);
+    let (packed, rest) = rest.split_at(12);
+    let d = f16_le(rest, 0);
+    let scales = q3_scales(packed);
+    let (ha, hb) = (bytes16(&hmask[..16]), bytes16(&hmask[16..]));
+    let (three, one) = (i16x16::splat(3), i16x16::splat(1));
+    for e in 0..8 {
+        let q = &qs[32 * (e / 4)..32 * (e / 4) + 32];
+        let shift = 2 * (e % 4) as u32;
+        let a = (bytes16(&q[..16]) >> shift) & three;
+        let c = (bytes16(&q[16..]) >> shift) & three;
+        let bit = e as u32;
+        let (ba, bb) = (((ha >> bit) & one) << 2u32, ((hb >> bit) & one) << 2u32);
+        let quants = pair_lanes(a | ba, c | bb) - Quants::splat(4);
+        dst.quants[e] = quants * pair_scale(scales[2 * e], scales[2 * e + 1]);
+        dst.scales[e] = d;
+    }
+}
+
+/// [`Format::decode`] of Q4_K: entry `2j` is the low nibbles and entry `2j +
+/// 1` the high nibbles of the 32 bytes `32 * j` on.
+#[inline(always)]
+fn decode_q4k(b: &[u8; kq::Q4_K_BYTES], dst: &mut Dst) {
+    let (d, dmin) = (f16_le(b, 0), f16_le(b, 2));
+    let nibble = i16x16::splat(0x0F);
+    for (j, q) in b[16..].as_chunks::<32>().0.iter().enumerate() {
+        let (a, c) = (bytes16(&q[..16]), bytes16(&q[16..]));
+        for t in 0..2 {
+            let e = 2 * j + t;
+            let (sc, mn) = scale_min_k4(e, &b[4..16]);
+            let (a, c) = if t == 0 {
+                (a & nibble, c & nibble)
+            } else {
+                ((a >> 4u32) & nibble, (c >> 4u32) & nibble)
+            };
+            dst.quants[e] = pair_lanes(a, c) * Quants::splat(sc);
+            dst.scales[e] = d;
+            let m = -(dmin * f32::from(mn));
+            dst.mins[e] = [m, m];
+        }
+    }
+}
+
+/// [`Format::decode`] of Q5_K: Q4_K with bit `e` of the 32 high-bit bytes as
+/// the fifth bit of entry `e`.
+#[inline(always)]
+fn decode_q5k(b: &[u8; kq::Q5_K_BYTES], dst: &mut Dst) {
+    let (d, dmin) = (f16_le(b, 0), f16_le(b, 2));
+    let (qh, qs) = b[16..].split_at(32);
+    let (ha, hb) = (bytes16(&qh[..16]), bytes16(&qh[16..]));
+    let (nibble, one) = (i16x16::splat(0x0F), i16x16::splat(1));
+    for (j, q) in qs.as_chunks::<32>().0.iter().enumerate() {
+        let (a, c) = (bytes16(&q[..16]), bytes16(&q[16..]));
+        for t in 0..2 {
+            let e = 2 * j + t;
+            let (sc, mn) = scale_min_k4(e, &b[4..16]);
+            let (a, c) = if t == 0 {
+                (a & nibble, c & nibble)
+            } else {
+                ((a >> 4u32) & nibble, (c >> 4u32) & nibble)
+            };
+            let bit = e as u32;
+            let (ba, bb) = (((ha >> bit) & one) << 4u32, ((hb >> bit) & one) << 4u32);
+            dst.quants[e] = pair_lanes(a | ba, c | bb) * Quants::splat(sc);
+            dst.scales[e] = d;
+            let m = -(dmin * f32::from(mn));
+            dst.mins[e] = [m, m];
+        }
+    }
+}
+
+/// [`Format::decode`] of Q6_K: entry `4h + e` holds the `e`-th of the four
+/// 32-value runs a byte of half `h` carries (low then high nibble of the first
+/// and the second 32 `ql` bytes, plus two bits of `qh`), minus 32.
+#[inline(always)]
+fn decode_q6k(b: &[u8; kq::Q6_K_BYTES], dst: &mut Dst) {
+    let (ql, rest) = b.split_at(128);
+    let (qh, rest) = rest.split_at(64);
+    let (sc, rest) = rest.split_at(16);
+    let d = f16_le(rest, 0);
+    let (nibble, three) = (i16x16::splat(0x0F), i16x16::splat(3));
+    for h in 0..2 {
+        let ql = &ql[64 * h..64 * h + 64];
+        let qh = &qh[32 * h..32 * h + 32];
+        let (ha, hb) = (bytes16(&qh[..16]), bytes16(&qh[16..]));
+        for e in 0..4 {
+            let src = &ql[32 * (e % 2)..32 * (e % 2) + 32];
+            let (a, c) = (bytes16(&src[..16]), bytes16(&src[16..]));
+            let (a, c) = if e < 2 {
+                (a & nibble, c & nibble)
+            } else {
+                ((a >> 4u32) & nibble, (c >> 4u32) & nibble)
+            };
+            let shift = 2 * e as u32;
+            let (ba, bb) = (
+                ((ha >> shift) & three) << 4u32,
+                ((hb >> shift) & three) << 4u32,
+            );
+            let quants = pair_lanes(a | ba, c | bb) - Quants::splat(32);
+            let s = pair_scale(
+                i16::from(sc[8 * h + 2 * e].cast_signed()),
+                i16::from(sc[8 * h + 2 * e + 1].cast_signed()),
+            );
+            dst.quants[4 * h + e] = quants * s;
+            dst.scales[4 * h + e] = d;
+        }
+    }
+}
+
+/// [`Format::decode`] of IQ4_XS: entry `ib` is 16 bytes of nibbles through the
+/// IQ4_NL table times its 6-bit scale minus 32.
+#[inline(always)]
+fn decode_iq4xs(b: &[u8; iq::IQ4_XS_BYTES], dst: &mut Dst) {
+    let d = f16_le(b, 0);
+    let high = u16::from_le_bytes([b[2], b[3]]);
+    for ib in 0..8 {
+        let low = (b[4 + ib / 2] >> (4 * (ib % 2))) & 0x0F;
+        let ls = i16::from(low | ((((high >> (2 * ib)) & 3) as u8) << 4)) - 32;
+        let table = IQ4NL_TABLE.swizzle_half_relaxed(nibble_pairs(&b[8 + 16 * ib..24 + 16 * ib]));
+        dst.quants[ib] = Quants::from_i8x32(table) * Quants::splat(ls);
+        dst.scales[ib] = d;
+    }
+}
+
+/// Activations of one call, quantised to Q8_0 (plus the sum terms of
+/// [`Format::MIN`]) and laid out block-major so the blocks of consecutive rows
+/// at one block index are contiguous.
 struct Acts {
     /// Blocks per row.
     nb: usize,
@@ -386,8 +864,11 @@ struct Acts {
     /// `[nb][m]` f16-rounded scales.
     scales: Vec<f32>,
     /// `[nb][m]` Q8_1 sum terms `f16(f16(sum of the quants) * d)`; empty
-    /// for plain Q8_0.
+    /// unless the format is [`MIN_Q8_1`].
     sums: Vec<f32>,
+    /// `[nb][m]` half sums `[d * sum of the first 16 quants, d * sum of the
+    /// last 16]`; empty unless the format is [`MIN_HALVES`].
+    halves: Vec<[f32; 2]>,
 }
 
 /// `f32::round` (nearest, ties away from zero) in a form that vectorises:
@@ -402,10 +883,21 @@ fn round_away(t: f32) -> f32 {
     }
 }
 
+/// One activation block quantised.
+struct Quantised {
+    quants: Quants,
+    /// The f16-rounded scale.
+    scale: f32,
+    /// The Q8_1 sum term, for [`MIN_Q8_1`].
+    sum: f32,
+    /// The half sums, for [`MIN_HALVES`].
+    halves: [f32; 2],
+}
+
 /// One activation block quantised: its quants in [`Quants`]' layout, its
-/// f16-rounded scale and, when `with_sums`, the Q8_1 sum term.
+/// f16-rounded scale and the sum terms `min` asks for.
 #[inline(always)]
-fn quantise_block(src: &[f32; QK], with_sums: bool) -> (Quants, f32, f32) {
+fn quantise_block(src: &[f32; QK], min: u8) -> Quantised {
     // `max` ignores NaN and is associative, so eight running maxima give the
     // sequential fold's value.
     let mut maxima = [0f32; 8];
@@ -423,30 +915,49 @@ fn quantise_block(src: &[f32; QK], with_sums: bool) -> (Quants, f32, f32) {
         lanes[2 * l] = i16::from(round_away(src[l] * id) as i8);
         lanes[2 * l + 1] = i16::from(round_away(src[l + LANES] * id) as i8);
     }
-    let sum = if with_sums {
-        let sum: i32 = lanes.iter().map(|&q| i32::from(q)).sum();
-        (f16::from_f32(sum as f32) * d16).to_f32()
-    } else {
-        0.0
-    };
-    (Quants::new(lanes), d16.to_f32(), sum)
+    let mut sum = 0.0;
+    let mut halves = [0.0; 2];
+    if min == MIN_Q8_1 {
+        let total: i32 = lanes.iter().map(|&q| i32::from(q)).sum();
+        sum = (f16::from_f32(total as f32) * d16).to_f32();
+    } else if min == MIN_HALVES {
+        let (mut lo, mut hi) = (0i32, 0i32);
+        for l in 0..LANES {
+            lo += i32::from(lanes[2 * l]);
+            hi += i32::from(lanes[2 * l + 1]);
+        }
+        let d = d16.to_f32();
+        halves = [lo as f32 * d, hi as f32 * d];
+    }
+    Quantised {
+        quants: Quants::new(lanes),
+        scale: d16.to_f32(),
+        sum,
+        halves,
+    }
 }
 
 /// One job of [`Acts::new`]: a run of blocks' quants, scales and sum terms.
-type Part<'a> = (&'a mut [Quants], &'a mut [f32], &'a mut [f32]);
+type Part<'a> = (
+    &'a mut [Quants],
+    &'a mut [f32],
+    &'a mut [f32],
+    &'a mut [[f32; 2]],
+);
 
 impl Acts {
     /// Quantise `x` (`m` rows of `k` floats, `k` a multiple of [`QK`]) the way
-    /// candle's `BlockQ8_0::from_float` does, or `BlockQ8_1::from_float` when
-    /// `with_sums`.
+    /// candle's `BlockQ8_0::from_float` does, with `BlockQ8_1::from_float`'s
+    /// sum term for [`MIN_Q8_1`] or the half sums for [`MIN_HALVES`].
     ///
     /// A large call splits the blocks over the pool: each block is quantised
     /// from its own 32 values alone, so the split changes no bit.
-    fn new(x: &[f32], m: usize, k: usize, with_sums: bool) -> Self {
+    fn new(x: &[f32], m: usize, k: usize, min: u8) -> Self {
         let nb = k / QK;
         let mut qs = vec![Quants::default(); nb * m];
         let mut scales = vec![0f32; nb * m];
-        let mut sums = vec![0f32; if with_sums { nb * m } else { 0 }];
+        let mut sums = vec![0f32; if min == MIN_Q8_1 { nb * m } else { 0 }];
+        let mut halves = vec![[0f32; 2]; if min == MIN_HALVES { nb * m } else { 0 }];
         let pooled = m * k >= SERIAL_BELOW && barrier_pool().n_workers() > 0;
         let threads = barrier_pool().n_workers() + 1;
         let per = if pooled {
@@ -456,16 +967,22 @@ impl Acts {
         };
         let width = (per * m).max(1);
         let mut sum_chunks = sums.chunks_mut(width);
+        let mut half_chunks = halves.chunks_mut(width);
         let jobs: Vec<Mutex<Part<'_>>> = qs
             .chunks_mut(width)
             .zip(scales.chunks_mut(width))
             .map(|(q, s)| {
-                let su: &mut [f32] = if with_sums {
+                let su: &mut [f32] = if min == MIN_Q8_1 {
                     sum_chunks.next().unwrap_or_default()
                 } else {
                     &mut []
                 };
-                Mutex::new((q, s, su))
+                let hs: &mut [[f32; 2]] = if min == MIN_HALVES {
+                    half_chunks.next().unwrap_or_default()
+                } else {
+                    &mut []
+                };
+                Mutex::new((q, s, su, hs))
             })
             .collect();
         for_each(
@@ -474,7 +991,7 @@ impl Acts {
             || (),
             |(), i| {
                 let mut part = jobs[i].lock().unwrap_or_else(PoisonError::into_inner);
-                let (q, s, su) = &mut *part;
+                let (q, s, su, hs) = &mut *part;
                 for bi in 0..q.len() / m {
                     let b = i * per + bi;
                     for j in 0..m {
@@ -482,11 +999,13 @@ impl Acts {
                         let Ok(src) = <&[f32; QK]>::try_from(&x[at..at + QK]) else {
                             continue;
                         };
-                        let (quants, scale, sum) = quantise_block(src, with_sums);
-                        q[bi * m + j] = quants;
-                        s[bi * m + j] = scale;
-                        if with_sums {
-                            su[bi * m + j] = sum;
+                        let block = quantise_block(src, min);
+                        q[bi * m + j] = block.quants;
+                        s[bi * m + j] = block.scale;
+                        if min == MIN_Q8_1 {
+                            su[bi * m + j] = block.sum;
+                        } else if min == MIN_HALVES {
+                            hs[bi * m + j] = block.halves;
                         }
                     }
                 }
@@ -499,6 +1018,7 @@ impl Acts {
             qs,
             scales,
             sums,
+            halves,
         }
     }
 }
@@ -513,38 +1033,46 @@ fn hsum(a: &[f32; LANES]) -> f32 {
     ((h[0] + h[4]) + (h[1] + h[5])) + ((h[2] + h[6]) + (h[3] + h[7]))
 }
 
-/// Up to [`NR`] weight rows with every block decoded: the quants, f32 scales
-/// and minima of rows by `nb` blocks, kept apart from the weights so that one
-/// decode serves every activation tile.
+/// Up to [`NR`] weight rows with every block decoded: the entries' quants and
+/// f32 scales and the minima of the rows by `nb` blocks of 32 values, kept
+/// apart from the weights so that one decode serves every activation tile.
 struct Decoded {
     nb: usize,
-    /// `[row][block]`.
+    /// `[row][block][sub]`.
     quants: Vec<Quants>,
     scales: Vec<f32>,
-    /// Empty for a format without minima.
-    mins: Vec<f32>,
+    /// `[row][block]`; empty for a format without minima.
+    mins: Vec<[f32; 2]>,
 }
 
 impl Decoded {
-    fn new<L: Legacy>(nb: usize) -> Self {
+    fn new<F: Format>(nb: usize) -> Self {
         Self {
             nb,
-            quants: vec![Quants::default(); NR * nb],
-            scales: vec![0f32; NR * nb],
-            mins: vec![0f32; if L::HAS_MIN { NR * nb } else { 0 }],
+            quants: vec![Quants::default(); NR * nb * F::SUB],
+            scales: vec![0f32; NR * nb * F::SUB],
+            mins: vec![[0f32; 2]; if F::MIN != MIN_NONE { NR * nb } else { 0 }],
         }
     }
 
-    /// Decode `rows` (at most [`NR`], each `nb` blocks) into rows `0..`.
-    fn load<L: Legacy>(&mut self, rows: &[&[L::Block]]) {
+    /// Decode `rows` (at most [`NR`], each `nb` 32-value blocks) into rows `0..`.
+    fn load<F: Format>(&mut self, rows: &[&[F::Block]]) {
         let nb = self.nb;
+        let per = F::VALUES / QK;
         for (r, row) in rows.iter().enumerate() {
-            for (b, block) in row.iter().enumerate() {
-                self.quants[r * nb + b] = L::decode(block);
-                self.scales[r * nb + b] = L::scale(block);
-                if L::HAS_MIN {
-                    self.mins[r * nb + b] = L::min(block);
-                }
+            for (i, block) in row.iter().enumerate() {
+                let first = r * nb + i * per;
+                let entries = first * F::SUB..(first + per) * F::SUB;
+                let mut dst = Dst {
+                    quants: &mut self.quants[entries.clone()],
+                    scales: &mut self.scales[entries],
+                    mins: if F::MIN != MIN_NONE {
+                        &mut self.mins[first..first + per]
+                    } else {
+                        &mut []
+                    },
+                };
+                F::decode(block, &mut dst);
             }
         }
     }
@@ -568,16 +1096,17 @@ fn scale_products<const M: usize>(d: f32, sc: &[f32]) -> [f32; M] {
 
 /// `R <= 4` decoded weight rows against activation rows `j0..j0 + M` (`M <=
 /// 4`): `out[i][jj]` is the dot of weight row `i` with activation row `j0 +
-/// jj`, defined as sixteen `f32` lanes that each add, in block order, the
-/// exact integer sum of the block's two elements of that lane times the
-/// product of the two block scales, reduced by [`hsum`]. The accumulators stay
+/// jj`, defined as sixteen `f32` lanes that each add, entry by entry in block
+/// order, the exact integer sum of the entry's two elements of that lane times
+/// the product of the two scales, reduced by [`hsum`]. The accumulators stay
 /// in registers across the blocks.
 ///
-/// A format with a block minimum (`L::HAS_MIN`) adds `min * s` per block to a
-/// scalar sum in block order, where `s` is the activation block's Q8_1 sum
-/// term, after the lanes are reduced.
+/// A format with minima (`MIN`) adds `min * s` per block to a scalar sum in
+/// block order after the lanes are reduced: `s` is the activation block's
+/// Q8_1 sum term ([`MIN_Q8_1`]), or the two minima times the two half sums,
+/// first half first ([`MIN_HALVES`]).
 #[inline(always)]
-fn tile<L: Legacy, const R: usize, const M: usize>(
+fn tile<const MIN: u8, const SUB: usize, const R: usize, const M: usize>(
     dec: &Decoded,
     act: &Acts,
     j0: usize,
@@ -585,26 +1114,39 @@ fn tile<L: Legacy, const R: usize, const M: usize>(
     let nb = act.nb;
     let mut acc = [[f32x16::ZERO; M]; R];
     let mut extra = [[0f32; M]; R];
-    let rows: [&[Quants]; R] = std::array::from_fn(|r| &dec.quants[r * nb..(r + 1) * nb]);
-    let scales: [&[f32]; R] = std::array::from_fn(|r| &dec.scales[r * nb..(r + 1) * nb]);
+    let rows: [&[Quants]; R] =
+        std::array::from_fn(|r| &dec.quants[r * nb * SUB..(r + 1) * nb * SUB]);
+    let scales: [&[f32]; R] =
+        std::array::from_fn(|r| &dec.scales[r * nb * SUB..(r + 1) * nb * SUB]);
     for b in 0..nb {
         let at = b * act.m + j0;
         let xs = &act.qs[at..at + M];
         let sc = &act.scales[at..at + M];
         for r in 0..R {
-            let w = rows[r][b];
-            let s = scale_products::<M>(scales[r][b], sc);
-            for jj in 0..M {
-                let p = f32x16::from_i32x16(w.dot(xs[jj]));
-                acc[r][jj] += p * f32x16::splat(s[jj]);
+            for t in 0..SUB {
+                let w = rows[r][b * SUB + t];
+                let s = scale_products::<M>(scales[r][b * SUB + t], sc);
+                for jj in 0..M {
+                    let p = f32x16::from_i32x16(w.dot(xs[jj]));
+                    acc[r][jj] += p * f32x16::splat(s[jj]);
+                }
             }
         }
-        if L::HAS_MIN {
+        if MIN == MIN_Q8_1 {
             let sums = &act.sums[at..at + M];
             for (r, row) in extra.iter_mut().enumerate() {
-                let mn = dec.mins[r * nb + b];
+                let [mn, _] = dec.mins[r * nb + b];
                 for (e, &s) in row.iter_mut().zip(sums) {
                     *e += mn * s;
+                }
+            }
+        } else if MIN == MIN_HALVES {
+            let halves = &act.halves[at..at + M];
+            for (r, row) in extra.iter_mut().enumerate() {
+                let [lo, hi] = dec.mins[r * nb + b];
+                for (e, h) in row.iter_mut().zip(halves) {
+                    *e += lo * h[0];
+                    *e += hi * h[1];
                 }
             }
         }
@@ -613,10 +1155,10 @@ fn tile<L: Legacy, const R: usize, const M: usize>(
     for r in 0..R {
         for jj in 0..M {
             let lanes = acc[r][jj].to_array();
-            out[r][jj] = if L::HAS_MIN {
-                hsum(&lanes) + extra[r][jj]
-            } else {
+            out[r][jj] = if MIN == MIN_NONE {
                 hsum(&lanes)
+            } else {
+                hsum(&lanes) + extra[r][jj]
             };
         }
     }
@@ -641,9 +1183,10 @@ fn put<const R: usize, const M: usize>(
 }
 
 /// `R` decoded weight rows against every activation row: full [`MR`]-row
-/// tiles, then one tile for the remaining 1..=3 rows.
-#[inline(always)]
-fn tiles<L: Legacy, const R: usize>(
+/// tiles, then one tile for the remaining 1..=3 rows. One instance per shape
+/// (`MIN`, `SUB`, `R`), shared by every format of it.
+#[inline(never)]
+fn tiles<const MIN: u8, const SUB: usize, const R: usize>(
     dec: &Decoded,
     act: &Acts,
     res: &mut [f32],
@@ -653,35 +1196,59 @@ fn tiles<L: Legacy, const R: usize>(
     let m = act.m;
     let mut j0 = 0;
     while m - j0 >= MR {
-        put(tile::<L, R, MR>(dec, act, j0), res, rows, r, j0);
+        put(tile::<MIN, SUB, R, MR>(dec, act, j0), res, rows, r, j0);
         j0 += MR;
     }
     match m - j0 {
         0 => {}
-        1 => put(tile::<L, R, 1>(dec, act, j0), res, rows, r, j0),
-        2 => put(tile::<L, R, 2>(dec, act, j0), res, rows, r, j0),
-        _ => put(tile::<L, R, 3>(dec, act, j0), res, rows, r, j0),
+        1 => put(tile::<MIN, SUB, R, 1>(dec, act, j0), res, rows, r, j0),
+        2 => put(tile::<MIN, SUB, R, 2>(dec, act, j0), res, rows, r, j0),
+        _ => put(tile::<MIN, SUB, R, 3>(dec, act, j0), res, rows, r, j0),
     }
+}
+
+/// [`tiles`] of the shape a format has (`min`: `MIN_*`, `sub`: [`Format::SUB`]).
+#[inline(always)]
+fn shaped_tiles<const R: usize>(
+    (min, sub): (u8, usize),
+    dec: &Decoded,
+    act: &Acts,
+    res: &mut [f32],
+    rows: usize,
+    r: usize,
+) {
+    match (min, sub) {
+        (MIN_Q8_1, _) => tiles::<MIN_Q8_1, 1, R>(dec, act, res, rows, r),
+        (MIN_HALVES, _) => tiles::<MIN_HALVES, 1, R>(dec, act, res, rows, r),
+        (_, 2) => tiles::<MIN_NONE, 2, R>(dec, act, res, rows, r),
+        _ => tiles::<MIN_NONE, 1, R>(dec, act, res, rows, r),
+    }
+}
+
+/// Bytes of a weight row of `k` values.
+fn row_bytes<F: Format>(k: usize) -> usize {
+    k / F::VALUES * size_of::<F::Block>()
 }
 
 /// Weight rows `w` (a whole number of rows) against every activation row;
 /// `res[j * rows + r]` receives the dot of weight row `r` with activation row
 /// `j`. A group of [`NR`] rows is decoded once and dotted against all the
 /// activation tiles.
-fn chunk<L: Legacy>(w: &[u8], act: &Acts, dec: &mut Decoded, res: &mut [f32]) {
-    let row_bytes = act.nb * size_of::<L::Block>();
+fn chunk<F: Format>(w: &[u8], act: &Acts, dec: &mut Decoded, res: &mut [f32]) {
+    let row_bytes = row_bytes::<F>(act.nb * QK);
     let rows = w.len() / row_bytes;
-    let row = |r: usize| L::blocks(&w[r * row_bytes..(r + 1) * row_bytes]);
+    let row = |r: usize| F::blocks(&w[r * row_bytes..(r + 1) * row_bytes]);
+    let shape = (F::MIN, F::SUB);
     let mut r = 0;
     while r + NR <= rows {
-        let rs: [&[L::Block]; NR] = std::array::from_fn(|i| row(r + i));
-        dec.load::<L>(&rs);
-        tiles::<L, NR>(dec, act, res, rows, r);
+        let rs: [&[F::Block]; NR] = std::array::from_fn(|i| row(r + i));
+        dec.load::<F>(&rs);
+        shaped_tiles::<NR>(shape, dec, act, res, rows, r);
         r += NR;
     }
     while r < rows {
-        dec.load::<L>(&[row(r)]);
-        tiles::<L, 1>(dec, act, res, rows, r);
+        dec.load::<F>(&[row(r)]);
+        shaped_tiles::<1>(shape, dec, act, res, rows, r);
         r += 1;
     }
 }
@@ -694,67 +1261,189 @@ enum Kind {
     Q5_0,
     Q5_1,
     Q8_0,
+    Q2K,
+    Q3K,
+    Q4K,
+    Q5K,
+    Q6K,
+    Q8K,
+    Iq2Xxs,
+    Iq2Xs,
+    Iq2S,
+    Iq3Xxs,
+    Iq3S,
+    Iq1S,
+    Iq1M,
+    Iq4Nl,
+    Iq4Xs,
+    Tq1_0,
+    Tq2_0,
     Mxfp4,
+    Nvfp4,
 }
 
 impl Kind {
-    fn of(dtype: GgmlDType) -> Option<Self> {
-        Some(match dtype {
-            GgmlDType::Q4_0 => Self::Q4_0,
-            GgmlDType::Q4_1 => Self::Q4_1,
-            GgmlDType::Q5_0 => Self::Q5_0,
-            GgmlDType::Q5_1 => Self::Q5_1,
-            GgmlDType::Q8_0 => Self::Q8_0,
+    /// The format of a GGUF type, `None` for a float or unknown type.
+    fn of(ty: GgufType) -> Option<Self> {
+        use candle_core::quantized::GgmlDType as G;
+        Some(match ty {
+            GgufType::Ggml(G::Q4_0) => Self::Q4_0,
+            GgufType::Ggml(G::Q4_1) => Self::Q4_1,
+            GgufType::Ggml(G::Q5_0) => Self::Q5_0,
+            GgufType::Ggml(G::Q5_1) => Self::Q5_1,
+            GgufType::Ggml(G::Q8_0) => Self::Q8_0,
+            GgufType::Ggml(G::Q2K) => Self::Q2K,
+            GgufType::Ggml(G::Q3K) => Self::Q3K,
+            GgufType::Ggml(G::Q4K) => Self::Q4K,
+            GgufType::Ggml(G::Q5K) => Self::Q5K,
+            GgufType::Ggml(G::Q6K) => Self::Q6K,
+            GgufType::Ggml(G::Q8K) => Self::Q8K,
+            GgufType::Iq2Xxs => Self::Iq2Xxs,
+            GgufType::Iq2Xs => Self::Iq2Xs,
+            GgufType::Iq2S => Self::Iq2S,
+            GgufType::Iq3Xxs => Self::Iq3Xxs,
+            GgufType::Iq3S => Self::Iq3S,
+            GgufType::Iq1S => Self::Iq1S,
+            GgufType::Iq1M => Self::Iq1M,
+            GgufType::Iq4Nl => Self::Iq4Nl,
+            GgufType::Iq4Xs => Self::Iq4Xs,
+            GgufType::Tq1_0 => Self::Tq1_0,
+            GgufType::Tq2_0 => Self::Tq2_0,
+            GgufType::Mxfp4 => Self::Mxfp4,
+            GgufType::Nvfp4 => Self::Nvfp4,
             _ => return None,
         })
     }
 }
 
-/// Where a weight's blocks live: candle's tensor, or bytes candle has no type
-/// for (MXFP4).
-enum Blocks {
-    Tensor(Arc<QTensor>),
-    Raw(Arc<[u8]>),
+/// Run `$body` with the type alias `$f` naming the [`Format`] of `$kind`.
+macro_rules! with_format {
+    ($kind:expr, $f:ident => $body:expr) => {
+        match $kind {
+            Kind::Q4_0 => {
+                type $f = Q4_0;
+                $body
+            }
+            Kind::Q4_1 => {
+                type $f = Q4_1;
+                $body
+            }
+            Kind::Q5_0 => {
+                type $f = Q5_0;
+                $body
+            }
+            Kind::Q5_1 => {
+                type $f = Q5_1;
+                $body
+            }
+            Kind::Q8_0 => {
+                type $f = Q8_0;
+                $body
+            }
+            Kind::Q2K => {
+                type $f = Q2K;
+                $body
+            }
+            Kind::Q3K => {
+                type $f = Q3K;
+                $body
+            }
+            Kind::Q4K => {
+                type $f = Q4K;
+                $body
+            }
+            Kind::Q5K => {
+                type $f = Q5K;
+                $body
+            }
+            Kind::Q6K => {
+                type $f = Q6K;
+                $body
+            }
+            Kind::Q8K => {
+                type $f = Q8K;
+                $body
+            }
+            Kind::Iq2Xxs => {
+                type $f = Iq2Xxs;
+                $body
+            }
+            Kind::Iq2Xs => {
+                type $f = Iq2Xs;
+                $body
+            }
+            Kind::Iq2S => {
+                type $f = Iq2S;
+                $body
+            }
+            Kind::Iq3Xxs => {
+                type $f = Iq3Xxs;
+                $body
+            }
+            Kind::Iq3S => {
+                type $f = Iq3S;
+                $body
+            }
+            Kind::Iq1S => {
+                type $f = Iq1S;
+                $body
+            }
+            Kind::Iq1M => {
+                type $f = Iq1M;
+                $body
+            }
+            Kind::Iq4Nl => {
+                type $f = Iq4Nl;
+                $body
+            }
+            Kind::Iq4Xs => {
+                type $f = Iq4Xs;
+                $body
+            }
+            Kind::Tq1_0 => {
+                type $f = Tq1_0;
+                $body
+            }
+            Kind::Tq2_0 => {
+                type $f = Tq2_0;
+                $body
+            }
+            Kind::Mxfp4 => {
+                type $f = Mxfp4;
+                $body
+            }
+            Kind::Nvfp4 => {
+                type $f = Nvfp4;
+                $body
+            }
+        }
+    };
 }
 
 /// A quantized `[n, k]` weight (`y = x * w^T`) computed by the row-batched
-/// kernel: Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 or MXFP4. Reads the blocks in place.
+/// kernel, over the blocks as the GGUF file stores them (`k` a whole number
+/// of blocks per row). Reads the blocks in place.
 pub(crate) struct QmmWeight {
-    blocks: Blocks,
+    data: Arc<[u8]>,
     kind: Kind,
     n: usize,
     k: usize,
 }
 
 impl QmmWeight {
-    /// The kernel's view of `qt`, or `None` when it is not a 2-D tensor of a
-    /// served dtype with rows a whole number of blocks long (candle's path
-    /// serves it).
-    pub(crate) fn new(qt: &Arc<QTensor>) -> Option<Self> {
-        let kind = Kind::of(qt.dtype())?;
-        let [n, k] = *qt.shape().dims() else {
-            return None;
-        };
-        (k % QK == 0 && n > 0).then(|| Self {
-            blocks: Blocks::Tensor(Arc::clone(qt)),
-            kind,
-            n,
-            k,
-        })
-    }
-
-    /// An MXFP4 `[n, k]` weight over its file bytes (`k / 32` blocks of 17
-    /// bytes per row); `None` for a row that is not whole blocks or a wrong
-    /// byte count.
-    pub(crate) fn mxfp4(bytes: Arc<[u8]>, n: usize, k: usize) -> Option<Self> {
-        (k.is_multiple_of(QK) && n > 0 && bytes.len() == n * (k / QK) * size_of::<[u8; 17]>()).then(
-            || Self {
-                blocks: Blocks::Raw(bytes),
-                kind: Kind::Mxfp4,
-                n,
-                k,
-            },
-        )
+    /// The `[n, k]` weight of GGUF type `dtype` over its file bytes, or `None`
+    /// for a type the kernel does not serve (the float types), a row that is
+    /// not whole blocks, or a wrong byte count.
+    pub(crate) fn from_raw(
+        dtype: impl Into<GgufType>,
+        data: Arc<[u8]>,
+        n: usize,
+        k: usize,
+    ) -> Option<Self> {
+        let dtype = dtype.into();
+        let kind = Kind::of(dtype)?;
+        let row = dtype.byte_len(k)?;
+        (n > 0 && row.checked_mul(n) == Some(data.len())).then_some(Self { data, kind, n, k })
     }
 
     /// Output width (weight rows).
@@ -799,31 +1488,20 @@ impl QmmWeight {
         if m == 0 {
             return Ok(out);
         }
-        let data = match &self.blocks {
-            Blocks::Tensor(qt) => qt.data()?,
-            Blocks::Raw(bytes) => std::borrow::Cow::Borrowed(&bytes[..]),
-        };
-        let row_bytes = data.len() / self.n;
-        let weights = data.get(..rows * row_bytes).unwrap_or(&data[..]);
+        let row_bytes = self.data.len() / self.n;
+        let weights = self.data.get(..rows * row_bytes).unwrap_or(&self.data[..]);
         let (k, o) = (self.k, &mut out);
-        match self.kind {
-            Kind::Q4_0 => run::<Q4_0>(weights, x, m, k, rows, o)?,
-            Kind::Q4_1 => run::<Q4_1>(weights, x, m, k, rows, o)?,
-            Kind::Q5_0 => run::<Q5_0>(weights, x, m, k, rows, o)?,
-            Kind::Q5_1 => run::<Q5_1>(weights, x, m, k, rows, o)?,
-            Kind::Q8_0 => run::<Q8_0>(weights, x, m, k, rows, o)?,
-            Kind::Mxfp4 => run::<Mxfp4>(weights, x, m, k, rows, o)?,
-        }
+        with_format!(self.kind, F => run::<F>(weights, x, m, k, rows, o))?;
         Ok(out)
     }
 }
 
-/// Quantise the `m` activation rows for the format `L`, split the `[m, n]`
+/// Quantise the `m` activation rows for the format `F`, split the `[m, n]`
 /// output into `rows_per_chunk`-wide column chunks per activation row and
 /// compute them over the pool; each worker claims chunks dynamically,
 /// computes one into a private scratch (with its own decode buffers) and
 /// copies it out.
-fn run<L: Legacy>(
+fn run<F: Format>(
     data: &[u8],
     x: &[f32],
     m: usize,
@@ -831,9 +1509,9 @@ fn run<L: Legacy>(
     n: usize,
     out: &mut [f32],
 ) -> candle_core::Result<()> {
-    let act = Acts::new(x, m, k, L::HAS_MIN);
+    let act = Acts::new(x, m, k, F::MIN);
     let act = &act;
-    let row_bytes = act.nb * size_of::<L::Block>();
+    let row_bytes = row_bytes::<F>(k);
     if data.len() != n * row_bytes {
         candle_core::bail!(
             "qmm: weight holds {} bytes, expected {n} rows of {row_bytes}",
@@ -857,11 +1535,11 @@ fn run<L: Legacy>(
     for_each(
         n_chunks,
         !serial,
-        || (vec![0f32; m * rows_per_chunk], Decoded::new::<L>(act.nb)),
+        || (vec![0f32; m * rows_per_chunk], Decoded::new::<F>(act.nb)),
         |(res, dec), c| {
             let r0 = c * rows_per_chunk;
             let rows = rows_per_chunk.min(n - r0);
-            chunk::<L>(
+            chunk::<F>(
                 &data[r0 * row_bytes..(r0 + rows) * row_bytes],
                 act,
                 dec,
@@ -879,593 +1557,4 @@ fn run<L: Legacy>(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use candle_core::quantized::QMatMul;
-    use candle_core::{Device, Module, Tensor};
-
-    /// Every dtype the kernel serves.
-    const DTYPES: [GgmlDType; 5] = [
-        GgmlDType::Q4_0,
-        GgmlDType::Q4_1,
-        GgmlDType::Q5_0,
-        GgmlDType::Q5_1,
-        GgmlDType::Q8_0,
-    ];
-
-    /// Deterministic pseudo-random floats in `[-1, 1)` scaled by `scale`.
-    pub(super) fn noise(len: usize, seed: u64, scale: f32) -> Vec<f32> {
-        let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
-        (0..len)
-            .map(|_| {
-                s ^= s << 13;
-                s ^= s >> 7;
-                s ^= s << 17;
-                ((s >> 40) as f32 / (1u64 << 23) as f32 - 1.0) * scale
-            })
-            .collect()
-    }
-
-    pub(super) fn weight(n: usize, k: usize, dtype: GgmlDType, seed: u64) -> Arc<QTensor> {
-        let t = Tensor::from_vec(noise(n * k, seed, 0.5), (n, k), &Device::Cpu).unwrap();
-        Arc::new(QTensor::quantize(&t, dtype).unwrap())
-    }
-
-    /// `(n, k, m)` shapes whose rows are whole blocks: tails in both tilings,
-    /// and 600 rows exceeding `SERIAL_BELOW` so the pooled path runs.
-    fn shapes() -> [(usize, usize, usize); 4] {
-        [(10, 2 * QK, 7), (3, QK, 1), (600, 256, 5), (64, 3 * QK, 17)]
-    }
-
-    /// Element `e` of block `b` of activation row `j`, from the kernel's
-    /// [`Quants`] layout.
-    fn act_quant(act: &Acts, b: usize, j: usize, e: usize) -> i16 {
-        let lane = if e < LANES {
-            2 * e
-        } else {
-            2 * (e - LANES) + 1
-        };
-        act.qs[b * act.m + j].to_array()[lane]
-    }
-
-    /// The definition in the module docs, scalar and in the straightforward
-    /// order: the product of weight row `r` and activation row `j` is sixteen
-    /// `f32` lanes, each adding its two elements' exact integer sum times the
-    /// product of the block scales block by block, reduced by [`hsum`].
-    fn scalar_definition<L: Legacy>(data: &[u8], act: &Acts, n: usize) -> Vec<f32> {
-        let row_bytes = act.nb * size_of::<L::Block>();
-        let mut out = vec![0f32; act.m * n];
-        for j in 0..act.m {
-            for r in 0..n {
-                let mut lanes = [0f32; LANES];
-                let mut extra = 0f32;
-                for (b, block) in L::blocks(&data[r * row_bytes..(r + 1) * row_bytes])
-                    .iter()
-                    .enumerate()
-                {
-                    let w = L::halves(block);
-                    let s = L::scale(block) * act.scales[b * act.m + j];
-                    for (l, lane) in lanes.iter_mut().enumerate() {
-                        let p = i32::from(w[0][l]) * i32::from(act_quant(act, b, j, l))
-                            + i32::from(w[1][l]) * i32::from(act_quant(act, b, j, l + LANES));
-                        *lane += p as f32 * s;
-                    }
-                    if L::HAS_MIN {
-                        extra += L::min(block) * act.sums[b * act.m + j];
-                    }
-                }
-                out[j * n + r] = if L::HAS_MIN {
-                    hsum(&lanes) + extra
-                } else {
-                    hsum(&lanes)
-                };
-            }
-        }
-        out
-    }
-
-    /// [`scalar_definition`] for the format `q` holds.
-    fn scalar_forward(q: &QmmWeight, x: &[f32], m: usize) -> Vec<f32> {
-        let data = match &q.blocks {
-            Blocks::Tensor(qt) => qt.data().unwrap().into_owned(),
-            Blocks::Raw(bytes) => bytes.to_vec(),
-        };
-        let act = |has_min| Acts::new(x, m, q.k, has_min);
-        match q.kind {
-            Kind::Q4_0 => scalar_definition::<Q4_0>(&data, &act(false), q.n),
-            Kind::Q4_1 => scalar_definition::<Q4_1>(&data, &act(true), q.n),
-            Kind::Q5_0 => scalar_definition::<Q5_0>(&data, &act(false), q.n),
-            Kind::Q5_1 => scalar_definition::<Q5_1>(&data, &act(true), q.n),
-            Kind::Q8_0 => scalar_definition::<Q8_0>(&data, &act(false), q.n),
-            Kind::Mxfp4 => scalar_definition::<Mxfp4>(&data, &act(false), q.n),
-        }
-    }
-
-    #[test]
-    fn the_kernel_equals_the_scalar_definition_bit_for_bit() {
-        for dtype in DTYPES {
-            for (n, k, m) in [
-                (10, 2 * QK, 7),
-                (3, 3 * QK, 1),
-                (130, 512, 41),
-                (64, 3 * QK, 17),
-                (37, 4 * QK, 6),
-                (9, 8 * QK, 2),
-            ] {
-                let w = weight(n, k, dtype, 11);
-                let x = awkward_acts(m, k);
-                let q = QmmWeight::new(&w).unwrap();
-                let got = q.forward(&x, m).unwrap();
-                let want = scalar_forward(&q, &x, m);
-                for (i, (g, r)) in got.iter().zip(&want).enumerate() {
-                    assert_eq!(
-                        g.to_bits(),
-                        r.to_bits(),
-                        "{dtype:?} {n}x{k} m={m} output {i}: {g} vs {r}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Every format's vector decode gives the lanes of its scalar definition,
-    /// on random blocks.
-    #[test]
-    fn decode_equals_halves() {
-        fn check<L: Legacy>(name: &str) {
-            let bytes: Vec<u8> = noise(4096 * size_of::<L::Block>(), 7, 127.0)
-                .iter()
-                .map(|&v| (v * 2.0) as i32 as u8)
-                .collect();
-            for (i, block) in L::blocks(&bytes).iter().enumerate() {
-                assert_eq!(
-                    L::decode(block).to_array(),
-                    interleave(&L::halves(block)).to_array(),
-                    "{name} block {i}"
-                );
-            }
-        }
-        check::<Q4_0>("Q4_0");
-        check::<Q4_1>("Q4_1");
-        check::<Q5_0>("Q5_0");
-        check::<Q5_1>("Q5_1");
-        check::<Q8_0>("Q8_0");
-        check::<Mxfp4>("Mxfp4");
-    }
-
-    /// The activations as the kernel sees them: quantised and dequantised.
-    fn rounded_acts(x: &[f32], m: usize, k: usize) -> Vec<f64> {
-        let mut xd = vec![0f64; m * k];
-        let act = Acts::new(x, m, k, false);
-        for j in 0..m {
-            for b in 0..act.nb {
-                for e in 0..QK {
-                    xd[j * k + b * QK + e] =
-                        f64::from(act_quant(&act, b, j, e)) * f64::from(act.scales[b * act.m + j]);
-                }
-            }
-        }
-        xd
-    }
-
-    /// The dequantised weights, row-major.
-    pub(super) fn dequantised(w: &QTensor) -> Vec<f32> {
-        w.dequantize(&Device::Cpu)
-            .unwrap()
-            .flatten_all()
-            .unwrap()
-            .to_vec1::<f32>()
-            .unwrap()
-    }
-
-    /// Reference in f64: dequantised weights times dequantised (rounded)
-    /// activations.
-    fn reference(w: &QTensor, x: &[f32], m: usize) -> Vec<f64> {
-        let [n, k] = *w.shape().dims() else {
-            unreachable!()
-        };
-        let wd = dequantised(w);
-        let xd = rounded_acts(x, m, k);
-        let mut out = vec![0f64; m * n];
-        for j in 0..m {
-            for r in 0..n {
-                out[j * n + r] = (0..k)
-                    .map(|e| f64::from(wd[r * k + e]) * xd[j * k + e])
-                    .sum();
-            }
-        }
-        out
-    }
-
-    /// Per output, the most the Q8_1 sum term's f16 rounding can move a Q4_1 or
-    /// Q5_1 result: `|min| * |s|` per block, at 2^-10 (two f16 roundings of the
-    /// sum term `s`). Zero for every other dtype, whose arithmetic is exact
-    /// integer.
-    fn sum_term_slack(w: &QTensor, x: &[f32], m: usize) -> Vec<f64> {
-        let [n, k] = *w.shape().dims() else {
-            unreachable!()
-        };
-        let mut slack = vec![0f64; m * n];
-        if !matches!(w.dtype(), GgmlDType::Q4_1 | GgmlDType::Q5_1) {
-            return slack;
-        }
-        let act = Acts::new(x, m, k, true);
-        let data = w.data().unwrap();
-        let block = w.dtype().type_size();
-        for j in 0..m {
-            for r in 0..n {
-                slack[j * n + r] = (0..act.nb)
-                    .map(|b| {
-                        let at = (r * act.nb + b) * block;
-                        let min = f64::from(f16_le(&data[at..at + block], 2));
-                        min.abs() * f64::from(act.sums[b * act.m + j]).abs() * 1.0e-3
-                    })
-                    .sum();
-            }
-        }
-        slack
-    }
-
-    #[test]
-    fn matches_the_f64_reference_and_candle() {
-        for dtype in DTYPES {
-            for (n, k, m) in shapes() {
-                let w = weight(n, k, dtype, 11);
-                let x = noise(m * k, 5, 1.0);
-                let q = QmmWeight::new(&w).unwrap();
-                let got = q.forward(&x, m).unwrap();
-                let want = reference(&w, &x, m);
-                let slack = sum_term_slack(&w, &x, m);
-                let scale = want.iter().fold(0f64, |a, v| a.max(v.abs()));
-                for ((g, r), s) in got.iter().zip(&want).zip(&slack) {
-                    assert!(
-                        (f64::from(*g) - r).abs() <= 1e-4 * scale + s,
-                        "{dtype:?} {n}x{k} m={m}: {g} vs {r}"
-                    );
-                }
-                // candle's Q4_1, Q5_0 and Q5_1 dots assert an even block count.
-                if (k / QK) % 2 == 1
-                    && matches!(dtype, GgmlDType::Q4_1 | GgmlDType::Q5_0 | GgmlDType::Q5_1)
-                {
-                    continue;
-                }
-                let xt = Tensor::from_vec(x, (m, k), &Device::Cpu).unwrap();
-                let candle = QMatMul::from_arc(Arc::clone(&w))
-                    .unwrap()
-                    .forward(&xt)
-                    .unwrap()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap();
-                for (g, c) in got.iter().zip(&candle) {
-                    assert!(
-                        (f64::from(*g) - f64::from(*c)).abs() <= 1e-4 * scale,
-                        "{dtype:?} {n}x{k} m={m}: {g} vs candle {c}"
-                    );
-                }
-            }
-        }
-    }
-
-    /// Against the dequantised weights and the true (unrounded) activations the
-    /// error is the activation rounding alone: at most half a quant step
-    /// (plus the f16 rounding of the scale, 2^-11 of 127 steps) per element,
-    /// `0.6 * d_block * sum |w|` per block.
-    #[test]
-    fn the_error_is_bounded_by_the_activation_rounding() {
-        for dtype in DTYPES {
-            let b = QK;
-            for (n, k, m) in [(12, 2 * b, 5), (20, 512, 3)] {
-                let w = weight(n, k, dtype, 23);
-                let mut x = noise(m * k, 8, 1.0);
-                // An outlier per row makes the quant step coarse.
-                for j in 0..m {
-                    x[j * k + 7] = 6.0 * (j as f32 + 1.0);
-                }
-                let got = QmmWeight::new(&w).unwrap().forward(&x, m).unwrap();
-                let wd = dequantised(&w);
-                let slack = sum_term_slack(&w, &x, m);
-                for j in 0..m {
-                    for r in 0..n {
-                        let mut exact = 0f64;
-                        let mut bound = slack[j * n + r];
-                        for blk in 0..k / b {
-                            let xs = &x[j * k + blk * b..j * k + (blk + 1) * b];
-                            let ws = &wd[r * k + blk * b..r * k + (blk + 1) * b];
-                            let amax = xs.iter().fold(0f32, |a, v| a.max(v.abs()));
-                            let abs_w: f64 = ws.iter().map(|v| f64::from(v.abs())).sum();
-                            bound += 0.6 * f64::from(amax) / 127.0 * abs_w;
-                            exact += xs
-                                .iter()
-                                .zip(ws)
-                                .map(|(&a, &c)| f64::from(a) * f64::from(c))
-                                .sum::<f64>();
-                        }
-                        let g = f64::from(got[j * n + r]);
-                        assert!(
-                            (g - exact).abs() <= bound + 1e-5,
-                            "{dtype:?} {n}x{k} row {j} col {r}: {g} vs {exact} (bound {bound})"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// A prefix of the weight rows computes exactly the first outputs of the
-    /// whole product, whatever the tiling.
-    #[test]
-    fn a_weight_row_prefix_equals_the_start_of_the_product() {
-        for dtype in DTYPES {
-            let b = QK;
-            for (n, k, m, rows) in [(10, 2 * b, 3, 7), (600, 256, 2, 450), (64, 3 * b, 5, 1)] {
-                let w = weight(n, k, dtype, 17);
-                let x = noise(m * k, 9, 1.0);
-                let q = QmmWeight::new(&w).unwrap();
-                let whole = q.forward(&x, m).unwrap();
-                let part = q.forward_rows(&x, m, rows).unwrap();
-                assert_eq!(part.len(), m * rows);
-                for j in 0..m {
-                    assert_eq!(
-                        part[j * rows..(j + 1) * rows],
-                        whole[j * n..j * n + rows],
-                        "{dtype:?} {n}x{k} m={m} rows={rows} row {j}"
-                    );
-                }
-                assert!(q.forward_rows(&x, m, 0).is_err());
-                assert!(q.forward_rows(&x, m, n + 1).is_err());
-            }
-        }
-    }
-
-    #[test]
-    fn round_away_equals_f32_round() {
-        let mut values = noise(4096, 2, 300.0);
-        values.extend((-260..260).map(|i| i as f32 * 0.5));
-        values.extend([
-            0.0,
-            -0.0,
-            0.499_999_97,
-            -0.499_999_97,
-            0.500_000_06,
-            8_388_608.0,
-            -16_777_216.0,
-            f32::NAN,
-        ]);
-        for t in values {
-            assert_eq!(
-                round_away(t).to_bits(),
-                t.round().to_bits(),
-                "round({t}) = {}",
-                t.round()
-            );
-        }
-    }
-
-    /// Activations with a zero block, outliers, and a block whose largest
-    /// magnitude appears twice (first negative).
-    fn awkward_acts(m: usize, k: usize) -> Vec<f32> {
-        let mut x = noise(m * k, 4, 3.0);
-        x[..QK].fill(0.0);
-        x[QK + 3] = 127.0;
-        x[QK + 4] = 0.5;
-        x[QK + 5] = -1.5;
-        x[2 * QK + 10] = -9.0;
-        x[2 * QK + 20] = 9.0;
-        x
-    }
-
-    #[test]
-    fn activations_quantise_like_candles_q8_0_and_q8_1() {
-        let (m, k) = (3, 512);
-        let x = awkward_acts(m, k);
-        let t = Tensor::from_vec(x.clone(), (m, k), &Device::Cpu).unwrap();
-        for (dtype, with_sums, size, quants_at) in [
-            (GgmlDType::Q8_0, false, 34, 2),
-            (GgmlDType::Q8_1, true, 36, 4),
-        ] {
-            let q = QTensor::quantize(&t, dtype).unwrap();
-            let bytes = q.data().unwrap();
-            let act = Acts::new(&x, m, k, with_sums);
-            for j in 0..m {
-                for b in 0..k / QK {
-                    let block = &bytes[(j * (k / QK) + b) * size..][..size];
-                    assert_eq!(
-                        act.scales[b * act.m + j],
-                        f16_le(block, 0),
-                        "{dtype:?} scale of row {j} block {b}"
-                    );
-                    if with_sums {
-                        assert_eq!(
-                            act.sums[b * act.m + j],
-                            f16_le(block, 2),
-                            "{dtype:?} sum term of row {j} block {b}"
-                        );
-                    }
-                    for e in 0..QK {
-                        assert_eq!(
-                            act_quant(&act, b, j, e),
-                            i16::from(block[quants_at + e] as i8),
-                            "{dtype:?} quant {e} of row {j} block {b}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// Row exactness at the weight shapes of a real 100B-class MoE model
-    /// (n not a multiple of the chunk size: the pooled path has tail chunks).
-    #[test]
-    fn real_shapes_are_row_exact() {
-        for dtype in DTYPES {
-            for (n, k) in [
-                (4104usize, 4096usize),
-                (2056, 2048),
-                (4096, 2048),
-                (1030, 4096),
-            ] {
-                assert_eq!(k % QK, 0);
-                let w = weight(n, k, dtype, 3);
-                let q = QmmWeight::new(&w).unwrap();
-                let x = noise(9 * k, 9, 2.0);
-                let alone: Vec<Vec<f32>> = (0..9)
-                    .map(|j| q.forward(&x[j * k..(j + 1) * k], 1).unwrap())
-                    .collect();
-                for m in [2, 3, 4, 5, 6, 7, 8, 9] {
-                    let batch = q.forward(&x[..m * k], m).unwrap();
-                    for j in 0..m {
-                        assert_eq!(
-                            batch[j * n..(j + 1) * n],
-                            alone[j][..],
-                            "{dtype:?} {n}x{k}: row {j} of a batch of {m}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    /// The determinism contract: a row's bits do not depend on the batch.
-    #[test]
-    fn a_row_is_bit_identical_alone_and_in_any_batch() {
-        for dtype in DTYPES {
-            let b = QK;
-            for (n, k) in [(10, 2 * b), (512, 512)] {
-                let w = weight(n, k, dtype, 3);
-                let q = QmmWeight::new(&w).unwrap();
-                let x = noise(17 * k, 9, 2.0);
-                let alone: Vec<Vec<f32>> = (0..17)
-                    .map(|j| q.forward(&x[j * k..(j + 1) * k], 1).unwrap())
-                    .collect();
-                for m in [2, 3, 4, 5, 8, 16, 17] {
-                    let batch = q.forward(&x[..m * k], m).unwrap();
-                    for j in 0..m {
-                        assert_eq!(
-                            batch[j * n..(j + 1) * n],
-                            alone[j][..],
-                            "{dtype:?} {n}x{k}: row {j} of a batch of {m}"
-                        );
-                    }
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn zero_activations_give_exact_zeros() {
-        for dtype in DTYPES {
-            let b = QK;
-            let w = weight(9, 2 * b, dtype, 6);
-            let q = QmmWeight::new(&w).unwrap();
-            let out = q.forward(&vec![0f32; 4 * 2 * b], 4).unwrap();
-            assert!(out.iter().all(|v| *v == 0.0), "{dtype:?}: {out:?}");
-        }
-    }
-
-    #[test]
-    fn other_dtypes_and_shapes_are_left_to_candle() {
-        for dtype in DTYPES {
-            let w = weight(4, 2 * QK, dtype, 1);
-            assert!(QmmWeight::new(&w).is_some(), "{dtype:?}");
-        }
-        // The K-quants stay on candle's per-row kernel (see the module docs).
-        for dtype in [
-            GgmlDType::Q2K,
-            GgmlDType::Q3K,
-            GgmlDType::Q4K,
-            GgmlDType::Q5K,
-            GgmlDType::Q6K,
-            GgmlDType::F16,
-            GgmlDType::F32,
-            GgmlDType::Q8_1,
-        ] {
-            let w = weight(4, 256, dtype, 1);
-            assert!(QmmWeight::new(&w).is_none(), "{dtype:?}");
-        }
-        let t = Tensor::zeros((2, 4, 64), candle_core::DType::F32, &Device::Cpu).unwrap();
-        let three_d = Arc::new(QTensor::quantize(&t, GgmlDType::Q8_0).unwrap());
-        assert!(QmmWeight::new(&three_d).is_none());
-    }
-
-    // ---- MXFP4 ----------------------------------------------------------
-
-    use crate::provider::local::gguf::GgufType;
-    use crate::provider::local::model::quant::dequant_row;
-    use crate::provider::local::model::tiny::mxfp4_bytes;
-
-    fn mxfp4_weight(n: usize, k: usize, seed: u64) -> (Arc<[u8]>, Vec<f32>) {
-        let bytes = mxfp4_bytes(&noise(n * k, seed, 3.0));
-        let row_bytes = k / QK * 17;
-        let mut values = vec![0f32; n * k];
-        for (src, dst) in bytes
-            .chunks_exact(row_bytes)
-            .zip(values.chunks_exact_mut(k))
-        {
-            dequant_row(GgufType::Mxfp4, src, 1.0, dst).unwrap();
-        }
-        (Arc::from(bytes), values)
-    }
-
-    #[test]
-    fn mxfp4_matches_the_f64_reference() {
-        for (n, k, m) in shapes() {
-            let (bytes, wd) = mxfp4_weight(n, k, 11);
-            let x = noise(m * k, 5, 1.0);
-            let got = QmmWeight::mxfp4(bytes, n, k)
-                .unwrap()
-                .forward(&x, m)
-                .unwrap();
-            let xd = rounded_acts(&x, m, k);
-            let mut scale = 0f64;
-            let mut want = vec![0f64; m * n];
-            for j in 0..m {
-                for r in 0..n {
-                    want[j * n + r] = (0..k)
-                        .map(|e| f64::from(wd[r * k + e]) * xd[j * k + e])
-                        .sum();
-                    scale = scale.max(want[j * n + r].abs());
-                }
-            }
-            for (g, w) in got.iter().zip(&want) {
-                assert!(
-                    (f64::from(*g) - w).abs() <= 1e-4 * scale,
-                    "{n}x{k} m={m}: {g} vs {w}"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn mxfp4_rows_are_independent_of_the_batch_at_real_shapes() {
-        // The expert matrices of the real model: gate/up (2304 x 5120) and
-        // down (5120 x 2304).
-        for (n, k) in [(2304, 5120), (5120, 2304)] {
-            let (bytes, _) = mxfp4_weight(n, k, 3);
-            let q = QmmWeight::mxfp4(bytes, n, k).unwrap();
-            let x = noise(17 * k, 9, 1.0);
-            let batch = q.forward(&x, 17).unwrap();
-            for j in [0usize, 5, 16] {
-                let alone = q.forward(&x[j * k..(j + 1) * k], 1).unwrap();
-                assert_eq!(alone, batch[j * n..(j + 1) * n], "{n}x{k} row {j}");
-            }
-            let part = q.forward(&x[..3 * k], 3).unwrap();
-            assert_eq!(part, batch[..3 * n]);
-            let rows = q.forward_rows(&x, 17, n / 3).unwrap();
-            for j in 0..17 {
-                assert_eq!(
-                    rows[j * (n / 3)..(j + 1) * (n / 3)],
-                    batch[j * n..j * n + n / 3]
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn mxfp4_rejects_a_wrong_byte_count() {
-        assert!(QmmWeight::mxfp4(Arc::from(vec![0u8; 16]), 1, 32).is_none());
-        assert!(QmmWeight::mxfp4(Arc::from(vec![0u8; 17]), 1, 32).is_some());
-        assert!(QmmWeight::mxfp4(Arc::from(vec![0u8; 17]), 1, 48).is_none());
-    }
-}
+mod tests;

@@ -323,9 +323,9 @@ impl DsparkNet {
                 target.vocab
             )));
         }
-        let markov_in = TokenEmbedding::new(Arc::new(
-            loader.qtensor("markov_w1.weight", &[vocab, markov_rank])?,
-        ))?;
+        let (markov_type, markov_bytes) = loader.raw("markov_w1.weight", &[vocab, markov_rank])?;
+        let markov_in =
+            TokenEmbedding::new(markov_type, Arc::from(markov_bytes), vocab, markov_rank)?;
         let markov_out = loader.matmul("markov_w2.weight", &[vocab, markov_rank])?;
         let conf = loader.floats("conf_proj.weight", &[d + markov_rank])?;
 
