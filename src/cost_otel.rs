@@ -182,7 +182,7 @@ impl CostObserver for OtelCostObserver {
 #[cfg(all(test, feature = "plugin-cost", feature = "plugin-telemetry"))]
 mod tests {
     // Same in-memory reading recipe the telemetry plugin's tests use
-    // (opentelemetry_sdk 0.32): `PeriodicReader` exports on its own OS thread,
+    // (opentelemetry_sdk 0.33): `PeriodicReader` exports on its own OS thread,
     // so `force_flush` needs no runtime, and the default Cumulative
     // temporality means one flushed batch carries the last gauge value.
 

@@ -39,6 +39,7 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use minijinja::syntax::SyntaxConfig;
 use minijinja::value::{Enumerator, Kwargs, Object, ValueKind};
 use minijinja::{Environment, Error, ErrorKind, Value};
 
@@ -89,8 +90,13 @@ impl ChatTemplate {
         eos_token: String,
     ) -> Result<Self, CucaError> {
         let mut env = Environment::new();
-        env.set_trim_blocks(true);
-        env.set_lstrip_blocks(true);
+        env.set_syntax(
+            SyntaxConfig::builder()
+                .trim_blocks(true)
+                .lstrip_blocks(true)
+                .build()
+                .map_err(template_err)?,
+        );
         env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
         env.add_function("raise_exception", |msg: String| -> Result<String, Error> {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
@@ -297,8 +303,20 @@ fn ordered_object(
         }
         serde_json::Value::String(text) => Value::from(text.as_str()),
         serde_json::Value::Bool(flag) => Value::from(*flag),
-        serde_json::Value::Number(number) => Value::from_serialize(number),
+        serde_json::Value::Number(number) => number_value(number),
         serde_json::Value::Null => Value::from(()),
+    }
+}
+
+/// A JSON number as a template integer when it fits `i64` or `u64`, else a
+/// float.
+fn number_value(number: &serde_json::Number) -> Value {
+    if let Some(int) = number.as_i64() {
+        Value::from(int)
+    } else if let Some(int) = number.as_u64() {
+        Value::from(int)
+    } else {
+        Value::from(number.as_f64().unwrap_or(f64::NAN))
     }
 }
 
@@ -512,9 +530,18 @@ impl JsonDumper {
         match value.kind() {
             ValueKind::None | ValueKind::Undefined => out.push_str("null"),
             ValueKind::Bool => out.push_str(if value.is_true() { "true" } else { "false" }),
+            ValueKind::Number if value.is_integer() => {
+                let int = i128::try_from(value.clone())?;
+                let _ = write!(out, "{int}");
+            }
             ValueKind::Number => {
-                let number = serde_json::to_value(value).map_err(unserializable)?;
-                out.push_str(&number.to_string());
+                // serde_json's float layout, `null` for a non-finite value.
+                match serde_json::Number::from_f64(f64::try_from(value.clone())?) {
+                    Some(number) => {
+                        let _ = write!(out, "{number}");
+                    }
+                    None => out.push_str("null"),
+                }
             }
             ValueKind::String => self.string(value.as_str().unwrap_or_default(), out),
             ValueKind::Seq | ValueKind::Iterable => {

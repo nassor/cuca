@@ -107,7 +107,7 @@ impl CucaPlugin for OpenTelemetryPlugin {
 
 #[cfg(all(test, feature = "plugin-telemetry"))]
 mod tests {
-    // In-memory reading recipe (opentelemetry_sdk 0.32): the in-memory exporter
+    // In-memory reading recipe (opentelemetry_sdk 0.33): the in-memory exporter
     // lives at `metrics::InMemoryMetricExporter` (behind the `testing`
     // feature), and the plain `PeriodicReader::builder(exporter)` runs its
     // export loop on a dedicated OS thread, no tokio runtime argument. We
@@ -146,7 +146,7 @@ mod tests {
             .unwrap_or_else(|| panic!("metric `{name}` missing from export"))
     }
 
-    // Current-thread flavor: the SDK 0.32 `PeriodicReader` exports on its own
+    // Current-thread flavor: the SDK 0.33 `PeriodicReader` exports on its own
     // OS thread, so `force_flush` cannot deadlock a single-thread tokio
     // runtime (this crate never enables `rt-multi-thread`).
     #[tokio::test]

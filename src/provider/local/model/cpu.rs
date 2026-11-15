@@ -108,8 +108,8 @@ thread_local! {
 /// Speculative verification needs batch rows that equal decode steps
 /// bit for bit, so while this guard lives every float matmul runs per row and
 /// every attention runs per query row over exactly its own keys, as a decode
-/// step would; the quantized matmuls and the element-wise operations are
-/// row-independent already.
+/// step would; the quantized matmuls (see [`QMatMul::forward`]) and the
+/// element-wise operations are row-independent already.
 struct RowExact(bool);
 
 impl RowExact {
@@ -126,7 +126,8 @@ impl Drop for RowExact {
 }
 
 /// A matmul weight: candle's, or the row-batched kernel's; [`RowExact`]
-/// applies to its float weights.
+/// applies to its float weights, and candle's quantized weights always run
+/// one activation row at a time.
 enum QMatMul {
     Candle(CandleMatMul),
     /// A Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0 weight read once for all activation
@@ -152,19 +153,20 @@ impl QMatMul {
         }
     }
 
+    /// `x * w^T`. A quantized weight on candle's kernel runs one activation
+    /// row at a time, always: candle picks its quantized kernel by row count
+    /// (on x86-64 a Q6_K product of one row takes the compact kernel and of
+    /// several the repacked one; on AArch64 Q4_K, Q5_K and Q6_K switch between
+    /// a one-row and a four-row-tile kernel), so a row's bits would depend on
+    /// the batch and the prefill chunking.
     fn forward(&self, x: &Tensor) -> candle_core::Result<Tensor> {
         let m = match self {
             Self::Candle(m) => m,
             // Row-independent by construction: no per-row split needed.
             Self::RowBatched(w) => return row_batched(w, x, w.n()),
         };
-        let float_weight = !matches!(m, CandleMatMul::QTensor(_));
-        if float_weight && ROW_EXACT.get() && x.rank() >= 2 && x.dim(D::Minus2)? > 1 {
-            let rows = x.dim(D::Minus2)?;
-            let parts = (0..rows)
-                .map(|i| m.forward(&x.narrow(D::Minus2, i, 1)?))
-                .collect::<candle_core::Result<Vec<_>>>()?;
-            return Tensor::cat(&parts, x.rank() - 2);
+        if matches!(m, CandleMatMul::QTensor(_)) || ROW_EXACT.get() {
+            return forward_per_row(m, x);
         }
         m.forward(x)
     }
@@ -228,6 +230,26 @@ fn requantize_q8_0(qt: &QTensor) -> candle_core::Result<QTensor> {
         out.extend_from_slice(&q.data()?);
     }
     from_bytes(q8, rows, &out)
+}
+
+/// `m.forward(x)` computed one row of `x` at a time.
+fn forward_per_row(m: &CandleMatMul, x: &Tensor) -> candle_core::Result<Tensor> {
+    let dims = x.dims();
+    let Some((&width, lead)) = dims.split_last() else {
+        candle_core::bail!("matmul: a scalar input");
+    };
+    let rows: usize = lead.iter().product();
+    if rows <= 1 {
+        return m.forward(x);
+    }
+    let flat = x.reshape((rows, width))?;
+    let parts = (0..rows)
+        .map(|i| m.forward(&flat.narrow(0, i, 1)?))
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let out = Tensor::cat(&parts, 0)?;
+    let mut shape = lead.to_vec();
+    shape.push(out.dim(1)?);
+    out.reshape(shape)
 }
 
 /// `x * w^T` over the first `rows` rows of `w`.
