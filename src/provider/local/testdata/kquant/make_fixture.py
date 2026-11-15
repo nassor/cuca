@@ -19,6 +19,10 @@ oracle for them; where it has one (`q4_0`, `q5_0`, `q5_1`) the script checks the
 compiled harness against it, which validates the harness itself (the FP16
 conversion and the build) before its K-quant output is trusted.
 
+The bytes are those of a build without floating-point contraction (the x86-64
+baseline, and `-ffp-contract=off` here): a ggml build that fuses `a*b+c` into FMA
+can differ in the last bit of some scales, and the Rust port does not fuse.
+
 Requires numpy; gguf is optional.
 """
 
@@ -88,7 +92,8 @@ def extract(source):
 def compiler_command(out_exe):
     for cc in ("cc", "gcc", "clang"):
         if shutil.which(cc):
-            return [cc, "-O2", "-std=c11", "-I.", "ref_harness.c", "-lm", "-o", str(out_exe)]
+            command = [cc, "-O2", "-std=c11", "-ffp-contract=off", "-I.", "ref_harness.c"]
+            return command + ["-lm", "-o", str(out_exe)]
     pattern = r"C:\Program Files*\Microsoft Visual Studio\*\*\VC\Auxiliary\Build\vcvars64.bat"
     vcvars = sorted(glob.glob(pattern))
     if vcvars:
