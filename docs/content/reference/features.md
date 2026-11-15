@@ -239,7 +239,7 @@ There are 24 examples in `examples/`. Run one with `cargo run --example <name> -
 
 | Field | Value |
 |---|---|
-| Package | `cuca`, version `0.9.0` |
+| Package | `cuca`, version `0.9.1` |
 | Edition | `2024` |
 | Minimum Rust | `1.98`; `rust-toolchain.toml` pins `1.98.0` |
 | License | `Apache-2.0` |
