@@ -23,9 +23,9 @@ use super::arch::ConvArch;
 use super::cfg_err;
 use super::config::{ExtraTensor, Hp};
 use super::gguf_writer::{Dtype, TensorSpec};
+use super::refquant::{Kind as RefKind, quantize_row};
 use super::safetensors::{Shards, StDtype, TensorMeta};
 use crate::error::CucaError;
-use crate::provider::local::WeightQuant;
 use crate::provider::local::model::layout::name as gguf;
 
 /// Elements read and converted at once when a tensor needs no whole-tensor
@@ -100,7 +100,7 @@ pub(crate) struct Plan {
 /// Whether the engine reads a tensor as a weight matrix that may be
 /// quantized (the converter's rule: a 2-D or larger `.weight` that is not a
 /// norm, the router, or a convolution kernel).
-fn is_matmul(name: &str, n_dims: usize) -> bool {
+pub(super) fn is_matmul(name: &str, n_dims: usize) -> bool {
     n_dims >= 2
         && name.ends_with(".weight")
         && !name.ends_with("_norm.weight")
@@ -110,35 +110,13 @@ fn is_matmul(name: &str, n_dims: usize) -> bool {
 }
 
 impl Plan {
-    /// The storage type of this tensor under `quant`.
-    pub(crate) fn dtype(&self, quant: WeightQuant) -> Dtype {
-        let cols = self.dims.last().copied().unwrap_or(1);
-        if !is_matmul(&self.name, self.dims.len()) {
-            return Dtype::F32;
-        }
-        // llama.cpp's Q4_0 mixes keep the embedding table and the output head
-        // (the tied head too) above 4 bits: the published Gemma 4 E2B Q4_0
-        // has `token_embd` at Q8_0 and `per_layer_model_proj` at half
-        // precision, everything else at Q4_0. `q4_0` follows it.
-        let dtype = match (quant, self.name.as_str()) {
-            (WeightQuant::F16, _) => Dtype::F16,
-            (WeightQuant::Q8_0, _) => Dtype::Q8_0,
-            (WeightQuant::Q4_0, "token_embd.weight" | "output.weight") => Dtype::Q8_0,
-            (WeightQuant::Q4_0, "per_layer_model_proj.weight") => Dtype::F16,
-            (WeightQuant::Q4_0, _) => Dtype::Q4_0,
-        };
-        if cols.is_multiple_of(dtype.block_size()) {
-            dtype
-        } else {
-            Dtype::F32
-        }
-    }
-
-    pub(crate) fn spec(&self, quant: WeightQuant) -> TensorSpec {
+    /// The tensor as the writer's header lists it, stored as `dtype` (chosen by
+    /// [`super::quantmix::assign`]).
+    pub(crate) fn spec(&self, dtype: Dtype) -> TensorSpec {
         TensorSpec {
             name: self.name.clone(),
             dims: self.dims.clone(),
-            dtype: self.dtype(quant),
+            dtype,
         }
     }
 
@@ -410,9 +388,10 @@ pub(super) fn encode(dtype: Dtype, data: &[f32], out: &mut Vec<u8>) -> Result<()
 /// Encode whole blocks of `src` into `dst`, which holds exactly their bytes.
 ///
 /// The quantizers are llama.cpp's `quantize_row_q4_0` / `quantize_row_q8_0`
-/// reference code (candle's `from_float` for the two types) and
-/// `quantize_row_mxfp4_ref`, operation for operation, so the bytes are those
-/// of `ggml`.
+/// reference code (candle's `from_float` for the two types),
+/// `quantize_row_mxfp4_ref`, and (in [`super::refquant`]) the reference rows of
+/// Q5_0, Q5_1, Q4_K, Q5_K and Q6_K, operation for operation, so the bytes are
+/// those of `ggml`.
 fn encode_piece(dtype: Dtype, src: &[f32], dst: &mut [u8]) {
     match dtype {
         Dtype::F32 => {
@@ -495,6 +474,11 @@ fn encode_piece(dtype: Dtype, src: &[f32], dst: &mut [u8]) {
                 }
             }
         }
+        Dtype::Q5_0 => quantize_row(RefKind::Q5_0, src, dst),
+        Dtype::Q5_1 => quantize_row(RefKind::Q5_1, src, dst),
+        Dtype::Q4K => quantize_row(RefKind::Q4K, src, dst),
+        Dtype::Q5K => quantize_row(RefKind::Q5K, src, dst),
+        Dtype::Q6K => quantize_row(RefKind::Q6K, src, dst),
     }
 }
 
@@ -1385,6 +1369,7 @@ pub(crate) fn plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::local::WeightQuant;
     use crate::provider::local::convert::safetensors::tests::{f32_bytes, temp_dir, write_file};
 
     /// A checkpoint with these tensors (values `0..n`), opened as shards.
@@ -1424,6 +1409,16 @@ mod tests {
                 plans.iter().map(|p| &p.name).collect::<Vec<_>>()
             )
         })
+    }
+
+    /// The storage type of one plan at a uniform precision.
+    fn dtype_of(plan: &Plan, quant: WeightQuant) -> Dtype {
+        super::super::quantmix::assign(
+            std::slice::from_ref(plan),
+            quant,
+            &super::super::quantmix::ModelInfo::default(),
+        )
+        .unwrap()[0]
     }
 
     #[test]
@@ -1688,16 +1683,25 @@ mod tests {
             [0.0, 1.0]
         );
         assert_eq!(
-            by_name(&plans, "blk.0.layer_output_scale.weight").dtype(WeightQuant::Q8_0),
+            dtype_of(
+                by_name(&plans, "blk.0.layer_output_scale.weight"),
+                WeightQuant::Q8_0
+            ),
             Dtype::F32
         );
         assert_eq!(
-            by_name(&plans, "per_layer_proj_norm.weight").dtype(WeightQuant::Q8_0),
+            dtype_of(
+                by_name(&plans, "per_layer_proj_norm.weight"),
+                WeightQuant::Q8_0
+            ),
             Dtype::F32
         );
         // [4, 6]: 6 is not a multiple of 32, so it stays f32.
         assert_eq!(
-            by_name(&plans, "per_layer_token_embd.weight").dtype(WeightQuant::Q4_0),
+            dtype_of(
+                by_name(&plans, "per_layer_token_embd.weight"),
+                WeightQuant::Q4_0
+            ),
             Dtype::F32
         );
         let _ = std::fs::remove_dir_all(dir);
@@ -1818,7 +1822,7 @@ mod tests {
         by_name(&plans, "blk.0.ssm_dt.bias");
         let conv = by_name(&plans, "blk.0.ssm_conv1d.weight");
         assert_eq!(conv.dims, [8, 3]);
-        assert_eq!(conv.dtype(WeightQuant::Q8_0), Dtype::F32);
+        assert_eq!(dtype_of(conv, WeightQuant::Q8_0), Dtype::F32);
         // The delta-net's own norm is not shifted; every other norm is.
         assert_eq!(
             values(&s, by_name(&plans, "blk.0.ssm_norm.weight")),
@@ -1869,7 +1873,7 @@ mod tests {
         let h = hp(serde_json::json!({"num_hidden_layers": 1}));
         let plans = plan(ConvArch::Qwen2, &h, &s, Vec::new(), None).unwrap();
         let p = &plans[0];
-        assert_eq!(p.dtype(WeightQuant::Q8_0), Dtype::Q8_0);
+        assert_eq!(dtype_of(p, WeightQuant::Q8_0), Dtype::Q8_0);
         let mut got = Vec::new();
         p.write(&s, Dtype::Q8_0, &mut |b| {
             got.extend_from_slice(b);
@@ -2040,9 +2044,12 @@ mod tests {
         let want: Vec<f32> = (8..20).chain(28..40).map(|i| i as f32).collect();
         assert_eq!(values(&s, v_b), want);
         // Quantized, k_b and v_b stay weights; the router and norms stay f32.
-        assert_eq!(k_b.dtype(WeightQuant::F16), Dtype::F16);
+        assert_eq!(dtype_of(k_b, WeightQuant::F16), Dtype::F16);
         assert_eq!(
-            by_name(&plans, "blk.0.ffn_gate_inp.weight").dtype(WeightQuant::F16),
+            dtype_of(
+                by_name(&plans, "blk.0.ffn_gate_inp.weight"),
+                WeightQuant::F16
+            ),
             Dtype::F32
         );
         let _ = std::fs::remove_dir_all(dir);

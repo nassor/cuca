@@ -105,7 +105,7 @@ Memory reports its use on every request. A `ContextUsageObserver` receives a `Co
 
 `provider-local` allocates its K/V memory up front and bounds its queues. The K/V cache is the memory where a model keeps what it has already read, so it does not recompute it for each new token. [Limits and errors](@/providers/local/limits-and-errors.md) has the full table.
 
-- K/V block pool: `BatchingConfig::kv_tokens` positions per full-attention group, default twice `context_length`, in blocks of 16. At the cap the least recently used unreferenced block is evicted. A running request that needs a block preempts the youngest one. Read it with `LocalModel::kv_cache_bytes()` and `serving_stats()`.
+- K/V block pool: `BatchingConfig::kv_tokens` positions per full-attention group, default twice `context_length` on the CPU and `context_length` plus at most 4,096 on a GPU, in blocks of 16. At the cap the least recently used unreferenced block is evicted. A running request that needs a block preempts the youngest one. Read it with `LocalModel::kv_cache_bytes()` and `serving_stats()`.
 - Prefix store: the unreferenced full 16-position blocks of the same pool, least recently used first. At the cap the least recently used block is evicted, first when an allocation finds no free block. Read it with `ServingStats` (free and cached blocks, prefix hits).
 - Recurrent snapshots (hybrid models): `max_sequences + 4`. At the cap the least recently used snapshot is evicted. Read it with `ServingStats`.
 - Running sequences: `BatchingConfig::max_sequences`, 1 to 64, default 4. At the cap later requests wait. Read it with `ServingStats`.

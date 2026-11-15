@@ -31,7 +31,7 @@ local {
         // batching max_sequences=4 kv_tokens=16384
         // experts { tiered ram_bytes="4g"; }
         // engram ram_bytes="2g" reader_threads=8
-        // convert quant="f16"
+        // convert quant="f16"               // f16 | q8_0 (default) | q4_0 | q4_k_s | q4_k_m | q5_k_m | q6_k
         // drafter "gemma4-e2b-mtp-f16"      // or "in-trunk", or file="..."
     }
     // Without a `source`, download and run the default preset.

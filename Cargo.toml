@@ -251,11 +251,11 @@ kdl = { version = "6.7", optional = true, default-features = false, features = [
 # through it): `f32x8` for the vector store's cosine scan, and the i16 multiply-add
 # and f32 lanes of provider-local's row-batched quantized matmul (`model/qmm.rs`).
 wide = { version = "1.7", optional = true }
-# provider-local: candle for CPU tensors and quantized matmul; half for f16 block
-# scales; minijinja (+pycompat for the chat templates' Python string methods).
-# candle is pinned exactly: 0.11.1 picks its quantized CPU kernel by row count, so
-# model/cpu.rs runs candle's quantized matmuls one activation row at a time to keep
-# the engine's batch invariance. Re-run the qwen35 hybrid and mixed-dtype tests
+# provider-local: candle for CPU tensors and float matmuls (every quantized matmul runs
+# on the crate's own row-batched kernel, model/qmm.rs); half for f16 block scales;
+# minijinja (+pycompat for the chat templates' Python string methods).
+# candle is pinned exactly because the engine's bit-for-bit batch invariance rests on
+# its float kernels: re-run the qwen35 hybrid and mixed-dtype tests
 # (`prefill_in_any_chunking_*`, `mixed_dtype_*`) before raising the pin.
 candle-core = { version = "=0.11.1", optional = true, default-features = false }
 candle-nn = { version = "=0.11.1", optional = true, default-features = false }

@@ -19,13 +19,15 @@
 //!
 //! A matrix is stored at the [`WeightQuant`] precision, except that the token
 //! embedding and the output head (and the drafter's markov tables) stay at
-//! Q8_0 under Q4_0. `ffn.gate.bias_vl`, the vision tower, the aligner and the
+//! Q8_0 under Q4_0, and that a K-quant `quant` types each matrix by llama.cpp's
+//! rules (see [`plan`]). `ffn.gate.bias_vl`, the vision tower, the aligner and the
 //! image tokens are not converted.
 
 use std::collections::HashSet;
 
 use super::super::cfg_err;
 use super::super::gguf_writer::{Dtype, TensorSpec};
+use super::super::quantmix;
 use super::super::safetensors::{BLOCK, Shards, StDtype};
 use super::hparams::Config;
 use crate::error::CucaError;
@@ -237,16 +239,17 @@ const EXPERT_STACKS: [(&str, &str); 3] = [
 
 /// The storage type of a matrix at `quant`: the token embedding, the output head
 /// and the markov tables stay at Q8_0 under Q4_0; a row that does not fill whole
-/// blocks falls back to `f32`.
+/// blocks falls back to `f32`. The K-quant mixes never reach it: [`plan`] types
+/// their matrices with [`quantmix`] once every tensor is planned.
 fn matrix_dtype(quant: WeightQuant, gguf_name: &str, cols: usize) -> Dtype {
     let dtype = match (quant, gguf_name) {
         (WeightQuant::F16, _) => Dtype::F16,
-        (WeightQuant::Q8_0, _) => Dtype::Q8_0,
         (
             WeightQuant::Q4_0,
             "token_embd.weight" | "output.weight" | "markov_w1.weight" | "markov_w2.weight",
         ) => Dtype::Q8_0,
         (WeightQuant::Q4_0, _) => Dtype::Q4_0,
+        _ => Dtype::Q8_0,
     };
     if cols.is_multiple_of(dtype.block_size()) {
         dtype
@@ -270,6 +273,8 @@ struct Planner<'a> {
     cfg: &'a Config,
     quant: WeightQuant,
     items: Vec<Item>,
+    /// The items typed by the K-quant rules at a K-quant `quant`.
+    matrices: Vec<usize>,
     used: HashSet<String>,
 }
 
@@ -321,6 +326,11 @@ impl Planner<'_> {
             Kind::Float => Dtype::F32,
             Kind::Half => Dtype::F16,
             Kind::Matrix if dims.len() < 2 => Dtype::F32,
+            // A K-quant mix is typed once every tensor is planned (`plan`).
+            Kind::Matrix if self.quant.is_mixed() => {
+                self.matrices.push(self.items.len());
+                Dtype::F32
+            }
             Kind::Matrix => matrix_dtype(self.quant, &name, cols),
         };
         self.items.push(Item {
@@ -472,6 +482,13 @@ impl Planner<'_> {
 
 /// Plan the conversion of the checkpoint `index` describes for `role`.
 ///
+/// At a K-quant `quant` (`q4_k_s`, `q4_k_m`, `q5_k_m`, `q6_k`) the matrices get
+/// llama.cpp's per-tensor types ([`quantmix::assign_shapes`] over every planned
+/// tensor, so its layer counts see the whole file). The routed experts stay
+/// MXFP4 (`llama-quantize` refuses to requantize a quantized source tensor, so
+/// it would keep them as well), the half-precision and `f32` tensors keep their
+/// types, and the Engram table keeps `engram_quant`.
+///
 /// # Errors
 ///
 /// [`CucaError::Config`] naming a missing tensor, a tensor of a type or shape the
@@ -488,11 +505,26 @@ pub(super) fn plan(
         cfg,
         quant,
         items: Vec::new(),
+        matrices: Vec::new(),
         used: HashSet::new(),
     };
     match role {
         Role::Main => main(&mut p, engram_quant)?,
         Role::Drafter => drafter(&mut p)?,
+    }
+    if quant.is_mixed() {
+        let shapes: Vec<quantmix::Shape<'_>> = p
+            .items
+            .iter()
+            .map(|i| quantmix::Shape {
+                name: &i.name,
+                dims: &i.dims,
+            })
+            .collect();
+        let types = quantmix::assign_shapes(&shapes, quant, &quantmix::ModelInfo::default())?;
+        for &i in &p.matrices {
+            p.items[i].dtype = types[i];
+        }
     }
     Ok(Plan { items: p.items })
 }

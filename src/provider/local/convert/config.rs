@@ -317,6 +317,10 @@ pub(crate) fn file_type(q: WeightQuant) -> u32 {
         WeightQuant::F16 => 1,
         WeightQuant::Q4_0 => 2,
         WeightQuant::Q8_0 => 7,
+        WeightQuant::Q4KS => 14,
+        WeightQuant::Q4KM => 15,
+        WeightQuant::Q5KM => 17,
+        WeightQuant::Q6K => 18,
     }
 }
 

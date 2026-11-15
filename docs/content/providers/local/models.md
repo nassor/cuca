@@ -46,14 +46,16 @@ Start from the memory you can spare. A model needs about its file size plus a K/
 - A small laptop: `gemma3-1b-q4_0` (1.4 GB, plain chat) or `qwen3-0.6b-q8_0` (reasons, calls tools). Qwen 3 0.6B reserves a large K/V cache for its size, 3.76 GB at the default context. `context_length 2048` cuts it to about a quarter, so the model then needs about 1.6 GB.
 - A normal laptop: the default, `gemma4-e2b-q4_0` (3.3 GB). It reasons and calls tools. `gemma4-e2b-q8_0` is more accurate and needs 5.5 GB.
 - 8 GB or more: `gemma4-e4b-q4_0` (6.1 GB) or `qwen3-1.7b-q8_0` (5.6 GB).
-- 20 GB or more: `qwen3.6-35b-a3b-q4_0`, `qwen3-30b-a3b-q4_0`, `gemma4-26b-a4b-q4_0` or `muse-glimmer-30b-q4_0`.
+- 14 GB or more, or a 16 GB GPU: `qwen3-30b-a3b-iq2_xxs` (13.6 GB), a 2-bit file of the 30B mixture of experts. It passed every live check on the CPU and on an RX 9070 XT.
+- 20 GB or more: `qwen3.6-35b-a3b-q4_0`, `qwen3-30b-a3b-q4_0`, `qwen3-30b-a3b-q4_k_m`, `gemma4-26b-a4b-q4_0` or `muse-glimmer-30b-q4_0`.
+- The `q4_k_m` and `iq4_xs` presets are the formats most downloads use. They are about the size of `q4_0` and closer to the original model; see [Weight formats](#weight-formats).
 - A mixture of experts bigger than your RAM: keep its experts on disk with `experts { tiered ram_bytes="4g"; }`. A mixture of experts is a model with many small expert networks that uses only a few for each token. With this setting `qwen3.6-35b-a3b-q4_0` peaked at 5.95 GiB of RAM instead of 18.8 GiB and decoded at about half the speed (CPU, Ryzen 9 9950X3D2, release build). See [Tiered experts](@/providers/local/expert-tiers.md).
 - Reasoning and tool calls: the Gemma 4, Qwen 3, Qwen 3.5, Qwen 3.6, SmolLM 3, Granite 3.3, Muse Glimmer, Ministral 3 Reasoning and Mistral Small 4 presets do both. Ministral 3 Instruct calls tools and does not reason. The DeepSeek-R1 distills reason but cannot call tools. Phi 4 mini, OLMo 2, OLMoE and Gemma 3 do neither.
 - A model larger than your GPU: see [Fit a large model](@/providers/local/placement.md).
 
 ## The presets
 
-`ModelSource::PRESETS` has 24 models and 2 drafters. Each is pinned to one repository commit and one SHA-256, so every download is the same file. A name is ASCII case-insensitive.
+`ModelSource::PRESETS` has 30 models and 2 drafters. Each is pinned to one repository commit and one SHA-256, so every download is the same file. A name is ASCII case-insensitive.
 
 - Download is the file size.
 - Memory is the file plus the K/V cache at the default `context_length` of 8,192 positions with 4 parallel requests. Lower `context_length` to shrink the cache. A mixture of experts with tiered experts needs less.
@@ -64,14 +66,20 @@ Start from the memory you can spare. A model needs about its file size plus a K/
 |---|---|---|---|---|---|
 | `gemma4-e2b-q4_0` (default) | Gemma 4 E2B | 2.84 GB | 3.3 GB | yes | yes |
 | `gemma4-e2b-q8_0` | Gemma 4 E2B | 4.97 GB | 5.5 GB | yes | yes |
+| `gemma4-e2b-q4_k_m` | Gemma 4 E2B | 3.11 GB | 3.6 GB | yes | yes |
+| `gemma4-e2b-iq4_xs` | Gemma 4 E2B | 2.98 GB | 3.5 GB | yes | yes |
 | `gemma4-e4b-q4_0` | Gemma 4 E4B | 4.59 GB | 6.1 GB | yes | yes |
 | `gemma4-e4b-q8_0` | Gemma 4 E4B | 8.03 GB | 9.5 GB | yes | yes |
 | `gemma4-26b-a4b-q4_0` | Gemma 4 26B-A4B | 14.62 GB | 20.8 GB | yes | yes |
 | `gemma3-270m-q8_0` | Gemma 3 270M | 0.29 GB | 0.7 GB | no | no |
 | `gemma3-1b-q4_0` | Gemma 3 1B | 0.72 GB | 1.4 GB | no | no |
 | `qwen3-0.6b-q8_0` | Qwen 3 0.6B | 0.64 GB | 4.4 GB | yes | yes |
+| `qwen3-0.6b-q4_k_m` | Qwen 3 0.6B | 0.40 GB | 4.2 GB | yes | yes |
+| `qwen3-0.6b-iq4_xs` | Qwen 3 0.6B | 0.37 GB | 4.1 GB | yes | yes |
 | `qwen3-1.7b-q8_0` | Qwen 3 1.7B | 1.83 GB | 5.6 GB | yes | yes |
 | `qwen3-30b-a3b-q4_0` | Qwen 3 30B-A3B | 17.38 GB | 20.6 GB | yes | yes |
+| `qwen3-30b-a3b-q4_k_m` | Qwen 3 30B-A3B | 18.56 GB | 21.8 GB | yes | yes |
+| `qwen3-30b-a3b-iq2_xxs` | Qwen 3 30B-A3B, 2-bit | 10.36 GB | 13.6 GB | yes | yes |
 | `qwen3.5-0.8b-q8_0` | Qwen 3.5 0.8B | 0.83 GB | 1.3 GB | yes | yes |
 | `qwen3.6-35b-a3b-q4_0` | Qwen 3.6 35B-A3B | 20.84 GB | 21.6 GB | yes | yes |
 | `r1-distill-qwen-1.5b-q4_0` | DeepSeek-R1 distill, Qwen 1.5B | 1.07 GB | 2.0 GB | always | no |
@@ -228,22 +236,22 @@ A `context_length` above the model's maximum fails with `context_length N exceed
 
 ## Weight formats
 
-The weight format is how the file stores the numbers of the model. The engine runs these:
+The weight format is how the file stores the numbers of the model. Every format below stays in the file's own blocks in memory, on the CPU and on a GPU, so a model needs about its file size:
 
-| Format | On the CPU | On a GPU |
+| Family | Formats | Bits per weight |
 |---|---|---|
-| Q4_0, Q4_1, Q8_0 | stays quantized | stays quantized |
-| Q5_0, Q5_1 | stays quantized | converted to Q8_0 at load |
-| K-quants (Q2_K to Q6_K) | stays quantized | converted to Q8_0 at load |
-| Q8_1 | stays quantized | converted to Q8_0 at load |
-| MXFP4 | stays quantized | stays quantized |
-| F32, F16, BF16 | held as 32-bit floats, 4 bytes per element | held as 32-bit floats, 4 bytes per element |
-| IQ4_NL | read only as an embedding table; a weight matrix fails the load | the same |
-| other IQ types | the file opens and the load fails when it needs such a tensor | the same |
+| Legacy | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 | 4.5 to 8.5 |
+| K-quants | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and the mixes `Q4_K_M`, `Q5_K_M` and others built from them; Q8_K | 2.6 to 6.6; Q8_K 9.1 |
+| I-quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL | 1.6 to 4.5 |
+| Ternary | TQ1_0, TQ2_0 | 1.7, 2.1 |
+| 4-bit floats | MXFP4, NVFP4 | 4.25, 4.5 |
+| Floats | F32, F16, BF16 | held as 32-bit floats, 4 bytes per element |
 
-- Memory is about the file size for the quantized formats. F16 and BF16 files take about twice their file size, because they are held at 4 bytes per element.
-- A GPU converts the formats it does not run natively to Q8_0, one row at a time. The change is smaller than the error a Q4_K or Q6_K file already carries, but GPU replies can differ a little from CPU replies for those files.
-- A GPU file that mixes Q4_0, Q4_1 and Q8_0 weights keeps each weight in its own format, so the Q4_0 presets with a Q8_0 embedding load as they are.
+- `Q4_K_M` is the most common download and a good default: it is about the size of Q4_0 and closer to the original model. `IQ4_XS` is a little smaller at similar quality.
+- The 1-bit and 2-bit formats exist to fit large models into little memory. A small model at 2 bits loses much of its quality: Qwen 3 0.6B at `UD-IQ2_XXS` loops and misses tool calls, while its `Q4_K_M` and `IQ4_XS` files pass every live check.
+- Q8_1 is the one format not run directly: the CPU cannot load it, and a GPU converts it to Q8_0 at load. A GPU split over several cards (`shards`) that cuts through a block also converts that weight to Q8_0.
+- F16 and BF16 files take about twice their file size, because they are held at 4 bytes per element.
+- On the CPU a request's reply equals the one it gets alone, bit for bit, in every format. A GPU's replies can differ a little from the CPU's, because the two round floats in a different order.
 - A mixture of experts is split once at load into one weight per expert. `experts { tiered ... }` leaves the experts in the file instead, see [Tiered experts](@/providers/local/expert-tiers.md).
 
 ## Tokenizers

@@ -69,7 +69,7 @@ fn a_header_with_types_candle_rejects_opens_and_names_the_tensor_on_use() {
         RawTensor {
             name: "unk",
             dims: &[3, 4],
-            dtype: GgufType::Unknown(16),
+            dtype: GgufType::Unknown(31),
             data: &unk,
         },
         RawTensor {
@@ -85,7 +85,7 @@ fn a_header_with_types_candle_rejects_opens_and_names_the_tensor_on_use() {
     assert_eq!(content.tensor_infos.len(), 5);
     assert_eq!(content.info("mx").unwrap().dtype, GgufType::Mxfp4);
     assert_eq!(content.info("mx").unwrap().shape.dims(), [2, 5120]);
-    assert_eq!(content.info("unk").unwrap().dtype, GgufType::Unknown(16));
+    assert_eq!(content.info("unk").unwrap().dtype, GgufType::Unknown(31));
 
     let mut r = content.reader();
     assert_eq!(r.bytes("mx").unwrap(), mx);
@@ -95,7 +95,7 @@ fn a_header_with_types_candle_rejects_opens_and_names_the_tensor_on_use() {
     assert_eq!(q.data().unwrap().as_ref(), q8.as_slice());
 
     let msg = r.bytes("unk").unwrap_err().to_string();
-    assert!(msg.contains("unk") && msg.contains("ggml type 16"), "{msg}");
+    assert!(msg.contains("unk") && msg.contains("ggml type 31"), "{msg}");
     let msg = r.tensor("mx", &Device::Cpu).unwrap_err().to_string();
     assert!(msg.contains("`mx`") && msg.contains("MXFP4"), "{msg}");
     let msg = content.info("absent").unwrap_err().to_string();

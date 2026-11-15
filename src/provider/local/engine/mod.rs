@@ -843,6 +843,25 @@ fn resolve_batching(
     )
 }
 
+/// Positions beyond one context that the default K/V pool of a model on a GPU
+/// holds for cached prefixes. On the CPU the default is twice the context;
+/// device memory is scarcer than RAM, and at the default 8192 positions the
+/// second context would be 1.6 GB of f32 K/V for Qwen3-30B-A3B, the
+/// difference between fitting a 16 GB card beside its 10 GB of weights and
+/// not.
+const GPU_PREFIX_SLACK: usize = 4096;
+
+/// The K/V pool size of `batching.kv_tokens = None` for a model of
+/// `context_length` positions on `device`: twice the context on the CPU, a
+/// context plus at most [`GPU_PREFIX_SLACK`] positions on a GPU.
+fn default_kv_tokens(context_length: usize, device: LocalDevice) -> usize {
+    if device == LocalDevice::Cpu {
+        2 * context_length
+    } else {
+        context_length + context_length.min(GPU_PREFIX_SLACK)
+    }
+}
+
 /// [`resolve_batching`] for a model that prefills `chunk` tokens of one prompt
 /// per step ([`super::model::prefill_rows`]).
 ///
@@ -858,7 +877,7 @@ fn resolve_batching_with(
     use super::model::paged::BLOCK_SIZE;
     let b = &config.batching;
     let kv_tokens = match b.kv_tokens {
-        None => 2 * context_length,
+        None => default_kv_tokens(context_length, config.device),
         Some(n) if n >= context_length + BLOCK_SIZE => n.div_ceil(BLOCK_SIZE) * BLOCK_SIZE,
         Some(n) => {
             return Err(CucaError::Config(format!(
@@ -1496,8 +1515,8 @@ mod tests {
         assert!(matches!(&out.items[0], Err(CucaError::Provider { .. })));
     }
 
-    /// A GGUF header declaring one tensor of type 16 (an IQ type the engine
-    /// does not know): the header opens, and the tensor that is asked for
+    /// A GGUF header declaring one tensor of type 31 (a removed repacked
+    /// type the engine does not know): the header opens, and the tensor that is asked for
     /// names its type instead of the whole file failing to parse.
     #[test]
     fn an_unknown_tensor_dtype_opens_and_names_the_tensor_on_use() {
@@ -1509,7 +1528,7 @@ mod tests {
         bytes.push(b'x');
         bytes.extend(1u32.to_le_bytes()); // dimensions
         bytes.extend(32u64.to_le_bytes());
-        bytes.extend(16u32.to_le_bytes()); // IQ2_XXS
+        bytes.extend(31u32.to_le_bytes()); // removed Q4_0_4_4
         bytes.extend(0u64.to_le_bytes()); // offset
         bytes.resize(bytes.len().next_multiple_of(32) + 64, 0);
         let path = std::env::temp_dir().join(format!("cuca-iq4-{}.gguf", std::process::id()));
@@ -1517,7 +1536,7 @@ mod tests {
 
         let content = open_gguf(&path, &[]).unwrap();
         let msg = content.reader().bytes("x").unwrap_err().to_string();
-        assert!(msg.contains("`x`") && msg.contains("ggml type 16"), "{msg}");
+        assert!(msg.contains("`x`") && msg.contains("ggml type 31"), "{msg}");
         let config = LocalModelConfig::default();
         let result = Engine::open(&path, None, Arc::default(), &config, None);
         let _ = std::fs::remove_file(&path);
@@ -1779,6 +1798,12 @@ mod tests {
             }
         );
         assert_eq!(sizing.kv_tokens, 2000, "twice the context by default");
+        // A GPU keeps one context and at most 4096 positions of prefixes.
+        let gpu = LocalDevice::Vulkan(super::super::GpuAdapter::Default);
+        assert_eq!(default_kv_tokens(1000, gpu), 2000);
+        assert_eq!(default_kv_tokens(8192, gpu), 12288);
+        assert_eq!(default_kv_tokens(32768, gpu), 36864);
+        assert_eq!(default_kv_tokens(8192, LocalDevice::Cpu), 16384);
         assert_eq!(sizing.max_sequences, 4);
         // An explicit pool rounds up to blocks and holds at least a context
         // and a block.
@@ -1826,8 +1851,8 @@ mod tests {
         })
     }
 
-    /// A hybrid model mixing every weight dtype of the row-batched kernel,
-    /// with K-quant FFN down projections (trunk and head) on candle's kernel.
+    /// A hybrid model mixing the weight dtypes of the row-batched kernel,
+    /// with 256-value-type FFN down projections (trunk and head).
     fn mixed_qwen35() -> TinyQwen35 {
         TinyQwen35 {
             ff: 256,

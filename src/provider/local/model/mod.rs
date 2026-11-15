@@ -103,13 +103,14 @@
 //!
 //! # Memory
 //!
-//! - Weights stay quantized (any dtype candle's quantized matmul reads) and
-//!   are consumed by the row-batched kernel of [`qmm`] (Q4_0, Q4_1, Q5_0,
-//!   Q5_1 and Q8_0) or by candle's quantized matmul (the K-quants Q2_K to
-//!   Q6_K and any other dtype, one activation row at a time); norm vectors,
+//! - Weights stay quantized (every dtype of [`qmm`]: the legacy blocks, the
+//!   K-quants, the I-quants, IQ4_NL, TQ1_0, TQ2_0, MXFP4 and NVFP4, read
+//!   from the file's own blocks by the row-batched kernel); norm vectors,
 //!   biases and float-typed matmul
 //!   weights (including `per_layer_model_proj`, BF16 in the published Gemma 4
-//!   files) are held as f32. Resident weights are about the file size.
+//!   files) are held as f32, and a quantized token embedding table stays
+//!   quantized and dequantizes the rows it looks up. Resident weights are
+//!   about the file size.
 //! - Expert tensors are split once at load into one quantized 2-D weight per
 //!   expert, so a mixture-of-experts model also costs its file size, and the
 //!   transient memory of a forward pass is independent of the expert count:
@@ -127,8 +128,8 @@
 //!   times 16 times `n_kv_head` times `head_dim` per block (f32 keys and
 //!   values) per K/V-owning layer, with that layer's own head count and head
 //!   dimension. Layers with the same window share block ids (a group). A
-//!   full-attention group holds `kv_tokens` positions (twice
-//!   `context_length` by default) shared by every running sequence and the
+//!   full-attention group holds `kv_tokens` positions (twice `context_length`
+//!   by default on the CPU, one context plus at most 4096 on a GPU) shared by every running sequence and the
 //!   cached prefixes, so a finished request's blocks stay cached while the
 //!   next runs; a sliding-window group holds `ceil((window - 1 + rows) / 16) +
 //!   2` blocks per running sequence plus up to `kv_tokens - context_length`

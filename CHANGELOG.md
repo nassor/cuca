@@ -2,16 +2,35 @@
 
 ## Unreleased
 
+### Added
+
+- `provider-local`: every llama.cpp weight format runs natively on the CPU and on a GPU, in the
+  file's own blocks: the K-quants Q2_K to Q6_K and Q8_K, the I-quants IQ1_S, IQ1_M, IQ2_XXS,
+  IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_NL and IQ4_XS, the ternary TQ1_0 and TQ2_0, and NVFP4, beside
+  the legacy formats and MXFP4. The I-quant, TQ and NVFP4 files did not load before. Decoding is
+  bit-exact to ggml (checked against gguf-py fixtures for every type).
+- `provider-local`: the GPU keeps K-quant weights at the file's size instead of converting them to
+  Q8_0 at load: a Q4_K_M Qwen 3 0.6B uploads 392 MB of weights instead of 633 MB. Only Q8_1 is
+  still converted.
+- `provider-local`: the checkpoint converter writes llama.cpp's K-quant mixes: `convert quant`
+  takes `q4_k_s`, `q4_k_m`, `q5_k_m` and `q6_k`, with llama.cpp's per-tensor type rules and
+  ggml's reference quantizers (no importance matrix). DeepSeek-V4.1 applies them to its dense
+  weights and keeps MXFP4 experts.
+- Presets `gemma4-e2b-q4_k_m`, `gemma4-e2b-iq4_xs`, `qwen3-0.6b-q4_k_m`, `qwen3-0.6b-iq4_xs`,
+  `qwen3-30b-a3b-q4_k_m` and `qwen3-30b-a3b-iq2_xxs` (unsloth files; the Gemma ones pin Google's
+  chat template).
+
 ### Changed
 
 - Dependencies raised to their latest releases: `candle-core` and `candle-nn` `=0.11.1`,
   `tokenizers` 0.23 (now the one copy candle also compiles), `minijinja` and `minijinja-contrib`
   3.1, `wasmtime` 50, `jsonschema` 0.61, `opentelemetry` and `opentelemetry_sdk` 0.33, `ctor`
   1.0.14.
-- `provider-local`: candle's quantized matmuls (the K-quants) run one activation row at a time.
-  candle 0.11.1 picks its quantized CPU kernel by row count, which broke the engine's bit-for-bit
-  batch invariance; per-row calls restore it on every architecture. Replies of models with K-quant
-  weights may differ in the last bits from 0.8.1, because candle's x86-64 Q4_K kernel changed.
+- `provider-local`: every quantized matrix on the CPU runs on the crate's batch-invariant
+  row-batched kernel; candle multiplies only float weights. Replies of K-quant models differ in
+  the last bits from 0.8.1. Prefill of a Q4_K_M model is about 10% faster, decode unchanged.
+- `provider-local`: a quantized token embedding stays quantized in memory; only the looked-up rows
+  are decoded.
 - `provider-local`: chat templates render with minijinja 3 without its `serde` feature; JSON
   numbers convert natively and the `tojson` filter keeps serde_json's number layout.
 - Faster builds for cuca and the crates that depend on it:

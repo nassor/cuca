@@ -33,6 +33,7 @@
 //! result does not depend on its batch, on how its sequence was chunked or on
 //! the thread that computed it.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, PoisonError};
 
@@ -300,30 +301,18 @@ pub(super) fn row_groups(
     cols: usize,
     groups: usize,
 ) -> Result<Vec<QMatMul>, CucaError> {
-    let qt = loader.qtensor(tensor_name, &[rows, cols])?;
+    let (dtype, bytes) = loader.raw(tensor_name, &[rows, cols])?;
     let per = rows / groups;
-    let wrap = |e: candle_core::Error| err(format!("tensor `{tensor_name}`: {e}"));
-    if loader.dequantize {
-        let t = qt.dequantize(&Device::Cpu).map_err(wrap)?;
-        return (0..groups)
-            .map(|g| {
-                t.narrow(0, g * per, per)
-                    .and_then(|p| p.contiguous())
-                    .map(QMatMul::tensor)
-                    .map_err(wrap)
-            })
-            .collect();
-    }
-    let dtype = qt.dtype();
-    let row_bytes = cols / dtype.block_size() * dtype.type_size();
-    let data = qt.data().map_err(wrap)?;
+    let Some(row_bytes) = dtype.byte_len(cols) else {
+        return Err(err(format!(
+            "tensor `{tensor_name}`: a row of {cols} values is not a whole number of {} blocks",
+            dtype.name()
+        )));
+    };
     (0..groups)
         .map(|g| {
-            let bytes = &data[g * per * row_bytes..(g + 1) * per * row_bytes];
-            super::super::super::gguf::qtensor_from_bytes(dtype, &[per, cols], bytes, &Device::Cpu)
-                .map(std::sync::Arc::new)
-                .map_err(wrap)
-                .and_then(|q| loader.to_matmul(q, tensor_name))
+            let part = &bytes[g * per * row_bytes..(g + 1) * per * row_bytes];
+            loader.to_matmul(dtype, Arc::from(part), &[per, cols], tensor_name)
         })
         .collect()
 }

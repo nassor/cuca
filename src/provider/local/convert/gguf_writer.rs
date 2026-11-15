@@ -34,7 +34,15 @@ pub(crate) enum Dtype {
     F32,
     F16,
     Q4_0,
+    Q5_0,
+    Q5_1,
     Q8_0,
+    /// 256 values in 144 bytes: 4-bit levels, 6-bit scales and minimums per 32.
+    Q4K,
+    /// 256 values in 176 bytes: 5-bit levels, 6-bit scales and minimums per 32.
+    Q5K,
+    /// 256 values in 210 bytes: 6-bit levels, 8-bit scales per 16.
+    Q6K,
     /// OCP MXFP4: 17 bytes per 32 values (one E8M0 scale byte, then 16 bytes of
     /// nibbles). The converter repacks the checkpoint's FP4 experts into raw
     /// blocks; `tensors::encode` also quantizes floats to them.
@@ -50,7 +58,12 @@ impl Dtype {
             Self::F32 => 0,
             Self::F16 => 1,
             Self::Q4_0 => 2,
+            Self::Q5_0 => 6,
+            Self::Q5_1 => 7,
             Self::Q8_0 => 8,
+            Self::Q4K => 12,
+            Self::Q5K => 13,
+            Self::Q6K => 14,
             Self::Mxfp4 => 39,
             Self::Bf16 => 30,
         }
@@ -60,7 +73,8 @@ impl Dtype {
     pub(crate) fn block_size(self) -> usize {
         match self {
             Self::F32 | Self::F16 | Self::Bf16 => 1,
-            Self::Q4_0 | Self::Q8_0 | Self::Mxfp4 => 32,
+            Self::Q4_0 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Mxfp4 => 32,
+            Self::Q4K | Self::Q5K | Self::Q6K => 256,
         }
     }
 
@@ -70,7 +84,12 @@ impl Dtype {
             Self::F32 => 4,
             Self::F16 | Self::Bf16 => 2,
             Self::Q4_0 => 18,
+            Self::Q5_0 => 22,
+            Self::Q5_1 => 24,
             Self::Q8_0 => 34,
+            Self::Q4K => 144,
+            Self::Q5K => 176,
+            Self::Q6K => 210,
             Self::Mxfp4 => 17,
         }
     }

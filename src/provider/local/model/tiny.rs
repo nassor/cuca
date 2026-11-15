@@ -25,9 +25,10 @@
 use std::fs::File;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::provider::local::gguf::{self, Value};
+use crate::provider::local::gguf::{self, GgufType, RawTensor, Value, write_raw};
 use candle_core::quantized::{GgmlDType, QTensor};
 use candle_core::{Device, Tensor};
+use half::f16;
 
 use super::cpu::Transformer;
 use super::paged::Sizing;
@@ -85,43 +86,179 @@ fn quantize(values: Vec<f32>, dims: &[usize], dtype: GgmlDType) -> QTensor {
     QTensor::quantize(&t, dtype).unwrap()
 }
 
-/// Requantise every Q4_0 or Q8_0 `.weight` tensor through a rotation of
-/// dtypes: the legacy formats (all served by the row-batched kernel) where
-/// the rows are whole 32-element blocks, the K-quants (candle's per-row
-/// kernel) where they are whole 256-element ones. A model written this way
-/// mixes dtypes the way a K-quant GGUF does, so both kernels run in one
-/// forward pass and the engine's invariants are checked across them.
-pub(crate) fn mix_dtypes(tensors: &mut [(String, QTensor)]) {
-    const LEGACY: [GgmlDType; 5] = [
-        GgmlDType::Q4_0,
-        GgmlDType::Q4_1,
-        GgmlDType::Q5_0,
-        GgmlDType::Q5_1,
-        GgmlDType::Q8_0,
-    ];
-    const KQUANT: [GgmlDType; 5] = [
-        GgmlDType::Q2K,
-        GgmlDType::Q3K,
-        GgmlDType::Q4K,
-        GgmlDType::Q5K,
-        GgmlDType::Q6K,
-    ];
-    let (mut legacy, mut kquant) = (0, 0);
+/// Weights whose type candle cannot hold, by tensor name: the file's type and
+/// the blocks' bytes ([`mix_dtypes`]).
+pub(crate) type Retyped = Vec<(String, GgufType, Vec<u8>)>;
+
+/// Every type [`mix_dtypes`] rotates through, K-quants first: the quantized
+/// matrix types the CPU kernel serves.
+pub(crate) const MIXED_TYPES: [GgufType; 24] = [
+    GgufType::Ggml(GgmlDType::Q2K),
+    GgufType::Ggml(GgmlDType::Q3K),
+    GgufType::Ggml(GgmlDType::Q4K),
+    GgufType::Ggml(GgmlDType::Q5K),
+    GgufType::Ggml(GgmlDType::Q6K),
+    GgufType::Ggml(GgmlDType::Q4_0),
+    GgufType::Ggml(GgmlDType::Q4_1),
+    GgufType::Ggml(GgmlDType::Q5_0),
+    GgufType::Ggml(GgmlDType::Q5_1),
+    GgufType::Ggml(GgmlDType::Q8_0),
+    GgufType::Ggml(GgmlDType::Q8K),
+    GgufType::Iq4Nl,
+    GgufType::Mxfp4,
+    GgufType::Nvfp4,
+    GgufType::Iq2Xxs,
+    GgufType::Iq2Xs,
+    GgufType::Iq2S,
+    GgufType::Iq3Xxs,
+    GgufType::Iq3S,
+    GgufType::Iq1S,
+    GgufType::Iq1M,
+    GgufType::Iq4Xs,
+    GgufType::Tq1_0,
+    GgufType::Tq2_0,
+];
+
+/// Retype every Q4_0 or Q8_0 `.weight` tensor through a rotation of the types
+/// whose blocks its rows hold whole (`forced`: that type alone, where it
+/// fits): the legacy formats, MXFP4 and IQ4_NL where the rows are whole
+/// 32-value blocks, NVFP4 where they are 64-value ones, and the K-quants,
+/// I-quants and ternary types where they are 256-value ones. A model written
+/// this way mixes dtypes the way a K-quant or I-quant GGUF does, so every
+/// format of the row-batched kernel runs in one forward pass and the engine's
+/// invariants are checked across them.
+///
+/// A type candle can quantize is requantized from the tensor's values; the
+/// others (I-quants, ternary, MXFP4, NVFP4) get random valid blocks, returned
+/// for [`write_retyped`].
+pub(crate) fn mix_dtypes(tensors: &mut [(String, QTensor)], forced: Option<GgufType>) -> Retyped {
+    let mut retyped = Retyped::new();
+    // The next type of the rotation, per class of row length.
+    let mut next = [0usize; 3];
     for (name, qt) in tensors.iter_mut() {
         if !name.ends_with(".weight") || !matches!(qt.dtype(), GgmlDType::Q4_0 | GgmlDType::Q8_0) {
             continue;
         }
-        let inner = qt.shape().dims().last().copied().unwrap_or(0);
-        let (table, n) = if inner % 256 == 0 {
-            (&KQUANT, &mut kquant)
-        } else {
-            (&LEGACY, &mut legacy)
+        let dims = qt.shape().dims().to_vec();
+        let inner = dims.last().copied().unwrap_or(0);
+        let fits: Vec<GgufType> = MIXED_TYPES
+            .into_iter()
+            .filter(|t| t.block_size().is_some_and(|b| inner % b == 0))
+            .collect();
+        let ty = match forced {
+            Some(t) if fits.contains(&t) => t,
+            Some(_) => continue,
+            None => {
+                let class = if inner % 256 == 0 {
+                    0
+                } else if inner % 64 == 0 {
+                    1
+                } else {
+                    2
+                };
+                let n = &mut next[class];
+                *n += 1;
+                fits[(*n - 1) % fits.len()]
+            }
         };
-        let dtype = table[*n % table.len()];
-        *n += 1;
-        let values = qt.dequantize(&Device::Cpu).unwrap();
-        *qt = QTensor::quantize(&values, dtype).unwrap();
+        match ty {
+            GgufType::Ggml(dtype) => {
+                let values = qt.dequantize(&Device::Cpu).unwrap();
+                *qt = QTensor::quantize(&values, dtype).unwrap();
+            }
+            other => {
+                let rows: usize = dims[..dims.len() - 1].iter().product();
+                let seed = name
+                    .bytes()
+                    .fold(7u64, |h, b| h.wrapping_mul(131).wrapping_add(u64::from(b)));
+                retyped.push((
+                    name.clone(),
+                    other,
+                    random_blocks(other, rows, inner, seed, 4e-4),
+                ));
+            }
+        }
     }
+    retyped
+}
+
+/// Make the scale fields of `block` (a block of `ty`) finite and modest: an
+/// f16 of `base` to 3 `base`, an E8M0 byte of 120 to 124, a UE4M3 byte with an
+/// exponent of at most 3. The quant bytes are left as they are.
+pub(crate) fn fix_scales(ty: GgufType, block: &mut [u8], pick: u32, base: f32) {
+    let set16 = |block: &mut [u8], at: usize, v: u32| {
+        let h = f16::from_f32(base * (1.0 + (v % 64) as f32 / 32.0));
+        block[at..at + 2].copy_from_slice(&h.to_le_bytes());
+    };
+    match ty {
+        GgufType::Ggml(GgmlDType::Q4_0 | GgmlDType::Q5_0 | GgmlDType::Q8_0)
+        | GgufType::Iq2Xxs
+        | GgufType::Iq2Xs
+        | GgufType::Iq2S
+        | GgufType::Iq3Xxs
+        | GgufType::Iq3S
+        | GgufType::Iq1S
+        | GgufType::Iq4Nl
+        | GgufType::Iq4Xs => set16(block, 0, pick),
+        GgufType::Ggml(GgmlDType::Q4_1 | GgmlDType::Q5_1 | GgmlDType::Q4K | GgmlDType::Q5K) => {
+            set16(block, 0, pick);
+            set16(block, 2, pick / 7);
+        }
+        GgufType::Ggml(GgmlDType::Q2K) => {
+            set16(block, 80, pick);
+            set16(block, 82, pick / 7);
+        }
+        GgufType::Ggml(GgmlDType::Q3K) => set16(block, 108, pick),
+        GgufType::Ggml(GgmlDType::Q6K) => set16(block, 208, pick),
+        GgufType::Ggml(GgmlDType::Q8K) => {
+            block[..4].copy_from_slice(&(base * (1.0 + (pick % 64) as f32 / 32.0)).to_le_bytes());
+        }
+        GgufType::Tq1_0 => set16(block, 52, pick),
+        GgufType::Tq2_0 => set16(block, 64, pick),
+        GgufType::Iq1M => {
+            // The f16 scale is spread over the top nibbles of the four 16-bit
+            // scale words at the end of the block.
+            let bits = f16::from_f32(base * (1.0 + (pick % 64) as f32 / 32.0)).to_bits();
+            for i in 0..4 {
+                let at = 48 + 2 * i;
+                let word = u16::from_le_bytes([block[at], block[at + 1]]);
+                let word = (word & 0x0FFF) | (((bits >> (4 * i)) & 0xF) << 12);
+                block[at..at + 2].copy_from_slice(&word.to_le_bytes());
+            }
+        }
+        // E8M0 bytes 120 to 124 (a half scale of 2^-8 to 2^-4); UE4M3 bytes
+        // with an exponent of at most 3 (no NaN code, at most 0.12): the
+        // quants reach 12, so a weight stays below 1.
+        GgufType::Mxfp4 => block[0] = 120 + (pick % 5) as u8,
+        GgufType::Nvfp4 => block[..4].iter_mut().for_each(|s| *s &= 0x1F),
+        _ => {}
+    }
+}
+
+/// `rows` rows of `cols` values of type `ty` as random but valid blocks (the
+/// scales per [`fix_scales`]): a type no quantizer here produces.
+pub(crate) fn random_blocks(
+    ty: GgufType,
+    rows: usize,
+    cols: usize,
+    seed: u64,
+    base: f32,
+) -> Vec<u8> {
+    let size = ty.type_size().unwrap();
+    let total = rows * ty.byte_len(cols).unwrap();
+    let mut s = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let mut bytes: Vec<u8> = (0..total)
+        .map(|_| {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            (s >> 32) as u8
+        })
+        .collect();
+    for (i, block) in bytes.chunks_exact_mut(size).enumerate() {
+        fix_scales(ty, block, (i as u32).wrapping_mul(2_654_435_761) >> 7, base);
+    }
+    bytes
 }
 
 fn quantized(rng: &mut Lcg, dims: &[usize], dtype: GgmlDType, scale: f32) -> QTensor {
@@ -139,10 +276,38 @@ fn f32_tensor(values: Vec<f32>) -> QTensor {
 }
 
 fn write(path: &std::path::Path, meta: &[(String, Value)], tensors: &[(String, QTensor)]) {
+    write_retyped(path, meta, tensors, &Retyped::new());
+}
+
+/// [`write`] with the tensors of `retyped` stored in their own type and bytes
+/// (the tensor of the same name in `tensors` only gives the shape).
+fn write_retyped(
+    path: &std::path::Path,
+    meta: &[(String, Value)],
+    tensors: &[(String, QTensor)],
+    retyped: &Retyped,
+) {
     let meta_refs: Vec<(&str, &Value)> = meta.iter().map(|(k, v)| (k.as_str(), v)).collect();
-    let tensor_refs: Vec<(&str, &QTensor)> = tensors.iter().map(|(n, t)| (n.as_str(), t)).collect();
+    let own = |name: &str| retyped.iter().find(|(n, ..)| n == name);
+    let data: Vec<Vec<u8>> = tensors
+        .iter()
+        .map(|(n, t)| match own(n) {
+            Some((_, _, bytes)) => bytes.clone(),
+            None => t.data().unwrap().into_owned(),
+        })
+        .collect();
+    let raw: Vec<RawTensor> = tensors
+        .iter()
+        .zip(&data)
+        .map(|((n, t), data)| RawTensor {
+            name: n,
+            dims: t.shape().dims(),
+            dtype: own(n).map_or(GgufType::Ggml(t.dtype()), |(_, ty, _)| *ty),
+            data,
+        })
+        .collect();
     let mut file = File::create(path).unwrap();
-    gguf::write(&mut file, &meta_refs, &tensor_refs).unwrap();
+    write_raw(&mut file, &meta_refs, &raw).unwrap();
 }
 
 fn kv(key: &str, value: Value) -> (String, Value) {
@@ -409,9 +574,11 @@ pub(crate) fn write_gemma4_moe(s: &TinyGemma4Moe) -> TinyModel {
             f32_tensor(vec![0.7 + 0.05 * il as f32]),
         ));
     }
-    if s.mixed {
-        mix_dtypes(&mut tensors);
-    }
+    let retyped = if s.mixed {
+        mix_dtypes(&mut tensors, None)
+    } else {
+        Retyped::new()
+    };
 
     let pattern = Value::Array(G4M_SLIDING.iter().copied().map(Value::Bool).collect());
     let kv_heads = Value::Array(G4M_N_KV.iter().map(|&n| u(n)).collect());
@@ -441,7 +608,7 @@ pub(crate) fn write_gemma4_moe(s: &TinyGemma4Moe) -> TinyModel {
         kv("gemma4.attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
         kv("gemma4.final_logit_softcapping", Value::F32(30.0)),
     ];
-    write(&path, &meta, &tensors);
+    write_retyped(&path, &meta, &tensors, &retyped);
     TinyModel { path }
 }
 
@@ -488,8 +655,10 @@ pub(crate) struct TinySpec {
     /// `context_length` metadata: the most positions the model loads with.
     pub(crate) context: usize,
     /// Mix the weight dtypes ([`mix_dtypes`]); give `ff` a multiple of 256 so
-    /// the FFN down projections are K-quants.
+    /// the FFN down projections hold the 256-value types.
     pub(crate) mixed: bool,
+    /// With `mixed`: every matrix that can is this one type.
+    pub(crate) forced: Option<GgufType>,
 }
 
 impl TinySpec {
@@ -519,6 +688,7 @@ impl TinySpec {
             rope_long_short: None,
             context: CONTEXT,
             mixed: false,
+            forced: None,
         }
     }
 
@@ -882,10 +1052,12 @@ pub(crate) fn write_spec(s: &TinySpec) -> TinyModel {
     for (key, value) in &s.meta {
         meta.push(kv(&format!("{p}.{key}"), value.clone()));
     }
-    if s.mixed {
-        mix_dtypes(&mut tensors);
-    }
-    write(&path, &meta, &tensors);
+    let retyped = if s.mixed {
+        mix_dtypes(&mut tensors, s.forced)
+    } else {
+        Retyped::new()
+    };
+    write_retyped(&path, &meta, &tensors, &retyped);
     TinyModel { path }
 }
 
@@ -970,8 +1142,10 @@ pub(crate) struct TinyQwen35 {
     /// Width of the dense FFN ([`Q35_FF`] by default).
     pub(crate) ff: usize,
     /// Mix the weight dtypes ([`mix_dtypes`]); give the experts a width that
-    /// is a multiple of 256 so the down projections are K-quants.
+    /// is a multiple of 256 so the down projections hold the 256-value types.
     pub(crate) mixed: bool,
+    /// With `mixed`: every matrix that can is this one type.
+    pub(crate) forced: Option<GgufType>,
 }
 
 impl Default for TinyQwen35 {
@@ -988,6 +1162,7 @@ impl Default for TinyQwen35 {
             moe: None,
             ff: Q35_FF,
             mixed: false,
+            forced: None,
         }
     }
 }
@@ -1176,10 +1351,12 @@ pub(crate) fn write_qwen35(s: &TinyQwen35) -> TinyModel {
         ));
     }
     overlay(&mut meta, p, &s.meta);
-    if s.mixed {
-        mix_dtypes(&mut tensors);
-    }
-    write(&path, &meta, &tensors);
+    let retyped = if s.mixed {
+        mix_dtypes(&mut tensors, s.forced)
+    } else {
+        Retyped::new()
+    };
+    write_retyped(&path, &meta, &tensors, &retyped);
     TinyModel { path }
 }
 

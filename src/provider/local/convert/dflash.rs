@@ -340,7 +340,8 @@ pub(crate) fn convert(
     check_metadata(&md)
         .map_err(|e| cfg_err(format!("the converted metadata does not load: {e}")))?;
 
-    super::write_plans(partial, &kv, &plans, &shards, quant, progress)
+    let info = super::quantmix::ModelInfo::default();
+    super::write_plans(partial, &kv, &plans, &shards, (quant, &info), progress)
 }
 
 #[cfg(test)]

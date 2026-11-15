@@ -55,8 +55,10 @@
 //! weights are dequantized); any other architecture fails
 //! before a weight is downloaded) and writes the file llama.cpp would write
 //! (compared with its output tensor by tensor, see the local-provider docs). [`WeightQuant`]
-//! (`LocalModelConfig::convert`, `f16`, `q8_0` by default, or `q4_0`) sets
-//! the matrix precision; each precision is converted once and cached.
+//! (`LocalModelConfig::convert`: `f16`, `q8_0` by default, `q4_0`, or the K-quant
+//! mixes `q4_k_s`, `q4_k_m`, `q5_k_m` and `q6_k`, whose per-tensor types follow
+//! llama.cpp's `llama-quantize`) sets the matrix precision; each precision is
+//! converted once and cached.
 //! Conversion streams tensor by tensor (peak memory is one whole tensor in
 //! `f32` when it is rearranged, as the Q/K permutation is, otherwise two
 //! 32 MiB blocks of one tensor), and reports its progress through
@@ -90,7 +92,7 @@
 //!   head_dim` bytes per block and layer that owns K/V ([`LocalModel::kv_cache_bytes`]),
 //!   in RAM or device memory. The pool is shared by every running sequence and
 //!   the cached prefixes: a full-attention group holds [`BatchingConfig::kv_tokens`]
-//!   positions (twice `context_length` by default, whatever `max_sequences`
+//!   positions (twice `context_length` by default on the CPU, one context plus at most 4096 positions on a GPU, whatever `max_sequences`
 //!   is), a sliding-window group `ceil((window - 1 + rows) / 16) + 2` blocks
 //!   per running sequence plus cached prefixes. When the pool is full a
 //!   running request that needs a block preempts the youngest one, which
@@ -131,9 +133,9 @@
 //! On the CPU a token's logits do not depend on how the prompt was split:
 //! prefill and speculative verification run in a row-exact mode (float
 //! matmuls per row, paged attention per query row on candle's worker pool,
-//! and a safe row-batched matmul kernel for Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0
-//! weights whose rows are independent of their batch; the K-quants and other
-//! dtypes run on candle's per-row kernel, also row independent) that equals
+//! and a safe row-batched matmul kernel for every quantized weight dtype
+//! (legacy, K-quant, I-quant, ternary, MXFP4 and NVFP4 blocks), whose rows
+//! are independent of their batch) that equals
 //! single-token decoding bit for bit, at no cost in
 //! prefill throughput. A request that reuses a cached prefix therefore
 //! generates what a cold request generates. (Quantized matmuls round
@@ -406,6 +408,15 @@ const fn preset(
     }
 }
 
+/// Google's `chat_template.jinja` for Gemma 4 E2B, pinned by the presets of
+/// GGUFs that embed a reworded copy of it.
+const GEMMA4_E2B_TEMPLATE: PresetTemplate = PresetTemplate {
+    repo: "google/gemma-4-E2B-it",
+    revision: "4adf15748de9e1a0097b6274cee9c15836c41c37",
+    file: "chat_template.jinja",
+    sha256: "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5",
+};
+
 const PRESET_TABLE: &[ModelPreset] = &[
     preset(
         "gemma4-e2b-q4_0",
@@ -443,6 +454,32 @@ const PRESET_TABLE: &[ModelPreset] = &[
         8_031_242_688,
         "gemma4",
     ),
+    // unsloth's K-quant and I-quant files embed a reworded template; the
+    // presets pin the repository's `chat_template.jinja`.
+    ModelPreset {
+        template: Some(GEMMA4_E2B_TEMPLATE),
+        ..preset(
+            "gemma4-e2b-q4_k_m",
+            "unsloth/gemma-4-E2B-it-GGUF",
+            "0314792d7f1f7e229411f620751375812bb9faf2",
+            "gemma-4-E2B-it-Q4_K_M.gguf",
+            "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8",
+            3_106_738_272,
+            "gemma4",
+        )
+    },
+    ModelPreset {
+        template: Some(GEMMA4_E2B_TEMPLATE),
+        ..preset(
+            "gemma4-e2b-iq4_xs",
+            "unsloth/gemma-4-E2B-it-GGUF",
+            "0314792d7f1f7e229411f620751375812bb9faf2",
+            "gemma-4-E2B-it-IQ4_XS.gguf",
+            "c149620926221669c4941ae6dac259953cc729c48e4a4edb69e9807b782fd1e3",
+            2_983_944_288,
+            "gemma4",
+        )
+    },
     preset(
         "gemma4-26b-a4b-q4_0",
         "ggml-org/gemma-4-26B-A4B-it-GGUF",
@@ -477,6 +514,26 @@ const PRESET_TABLE: &[ModelPreset] = &[
         "Qwen3-0.6B-Q8_0.gguf",
         "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
         639_446_688,
+        "qwen3",
+    ),
+    // unsloth's Q4_K_M (Q4_K, Q6_K for `output` and half the `attn_v` and
+    // `ffn_down` layers) and IQ4_XS.
+    preset(
+        "qwen3-0.6b-q4_k_m",
+        "unsloth/Qwen3-0.6B-GGUF",
+        "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+        "Qwen3-0.6B-Q4_K_M.gguf",
+        "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a",
+        396_705_472,
+        "qwen3",
+    ),
+    preset(
+        "qwen3-0.6b-iq4_xs",
+        "unsloth/Qwen3-0.6B-GGUF",
+        "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+        "Qwen3-0.6B-IQ4_XS.gguf",
+        "dacc1fe1dc6f4799f366ac3385299f71c7e02c58b8702448a174f14d91b1c64d",
+        367_804_096,
         "qwen3",
     ),
     preset(
@@ -561,6 +618,25 @@ const PRESET_TABLE: &[ModelPreset] = &[
         "qwen3moe",
     ),
     preset(
+        "qwen3-30b-a3b-q4_k_m",
+        "unsloth/Qwen3-30B-A3B-GGUF",
+        "d5b1d57bd0b504ac62ae6c725904e96ef228dc74",
+        "Qwen3-30B-A3B-Q4_K_M.gguf",
+        "9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48",
+        18_556_686_912,
+        "qwen3moe",
+    ),
+    // imatrix 2-bit: 10.4 GB, fits a 16 GB GPU or modest RAM.
+    preset(
+        "qwen3-30b-a3b-iq2_xxs",
+        "unsloth/Qwen3-30B-A3B-GGUF",
+        "d5b1d57bd0b504ac62ae6c725904e96ef228dc74",
+        "Qwen3-30B-A3B-UD-IQ2_XXS.gguf",
+        "40e7b72332c89fae04e4088422000bae4b0763f0ff28a31adf75e4f441e78442",
+        10_362_262_080,
+        "qwen3moe",
+    ),
+    preset(
         "olmoe-1b-7b-q4_0",
         "allenai/OLMoE-1B-7B-0125-Instruct-GGUF",
         "2ac1d27317927518c9ef7bd99f91f3f1e4ee288d",
@@ -587,8 +663,8 @@ const PRESET_TABLE: &[ModelPreset] = &[
         20_836_243_072,
         "qwen35moe",
     ),
-    // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers (candle's
-    // kernel: K-quants are not served by the row-batched one) and a Q4_1
+    // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers (row-batched
+    // like every quantized dtype) and a Q4_1
     // `ffn_down` in 6 (row-batched). Its embedded Muse chat template renders
     // the same bytes as the repository's current one except when the caller's
     // system prompt itself mentions "Reasoning effort": the current template
@@ -1121,8 +1197,13 @@ impl From<ModelSource> for DrafterSource {
 /// this precision (at `Q4_0` the token embedding and the output head stay at
 /// Q8_0 and Gemma 4's `per_layer_model_proj` at F16, as in llama.cpp's Q4_0
 /// files); norms, biases, scales, RoPE factors, the router and the
-/// recurrent-layer parameters stay `f32`. Parses from a string (`str::parse`,
-/// ASCII case-insensitive): `f16`, `q8_0` or `q4_0`.
+/// recurrent-layer parameters stay `f32`. The four K-quant mixes
+/// ([`WeightQuant::Q4KS`], [`WeightQuant::Q4KM`], [`WeightQuant::Q5KM`],
+/// [`WeightQuant::Q6K`]) are llama.cpp's file types of the same names: each
+/// tensor's type follows `llama_tensor_get_type` and the bytes are those of
+/// `llama-quantize` without an importance matrix. Parses from a string
+/// (`str::parse`, ASCII case-insensitive): `f16`, `q8_0`, `q4_0`, `q4_k_s`,
+/// `q4_k_m`, `q5_k_m` or `q6_k`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WeightQuant {
     /// IEEE half precision: 2 bytes per weight, the closest to the checkpoint.
@@ -1134,17 +1215,52 @@ pub enum WeightQuant {
     /// 4-bit blocks of 32 (4.5 bits per weight): smallest and fastest, with
     /// visible quantization noise on small models.
     Q4_0,
+    /// llama.cpp's `Q4_K_S`: Q4_K (4.5 bits per weight) everywhere, with Q5_K
+    /// for the first four attention value projections and the first eighth of
+    /// the FFN down projections, and Q6_K for the output head.
+    Q4KS,
+    /// llama.cpp's `Q4_K_M`: Q4_K with Q6_K for every attention value and FFN
+    /// down projection of the first and last eighth of the layers and of every
+    /// third layer in between, and for the output head.
+    Q4KM,
+    /// llama.cpp's `Q5_K_M`: Q5_K (5.5 bits per weight) with Q6_K for the same
+    /// tensors as [`WeightQuant::Q4KM`].
+    Q5KM,
+    /// llama.cpp's `Q6_K`: Q6_K (6.56 bits per weight) everywhere.
+    Q6K,
 }
 
 impl WeightQuant {
-    /// The lowercase name: `f16`, `q8_0` or `q4_0`; also the stem suffix of the
-    /// converted file (`model-q8_0.gguf`).
+    /// Every precision, in the order of the docs.
+    const ALL: [Self; 7] = [
+        Self::F16,
+        Self::Q8_0,
+        Self::Q4_0,
+        Self::Q4KS,
+        Self::Q4KM,
+        Self::Q5KM,
+        Self::Q6K,
+    ];
+
+    /// The lowercase name: `f16`, `q8_0`, `q4_0`, `q4_k_s`, `q4_k_m`, `q5_k_m`
+    /// or `q6_k`; also the stem suffix of the converted file
+    /// (`model-q8_0.gguf`).
     pub fn name(self) -> &'static str {
         match self {
             Self::F16 => "f16",
             Self::Q8_0 => "q8_0",
             Self::Q4_0 => "q4_0",
+            Self::Q4KS => "q4_k_s",
+            Self::Q4KM => "q4_k_m",
+            Self::Q5KM => "q5_k_m",
+            Self::Q6K => "q6_k",
         }
+    }
+
+    /// Whether each tensor's type is chosen by llama.cpp's mixing rules (the
+    /// K-quant file types) rather than being one type for every matrix.
+    pub(crate) fn is_mixed(self) -> bool {
+        matches!(self, Self::Q4KS | Self::Q4KM | Self::Q5KM | Self::Q6K)
     }
 }
 
@@ -1153,12 +1269,12 @@ impl std::str::FromStr for WeightQuant {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-        [Self::F16, Self::Q8_0, Self::Q4_0]
+        Self::ALL
             .into_iter()
             .find(|q| q.name().eq_ignore_ascii_case(s))
             .ok_or_else(|| {
                 CucaError::Config(format!(
-                    "unknown weight quantization `{s}`; expected f16, q8_0 or q4_0"
+                    "unknown weight quantization `{s}`; expected f16, q8_0, q4_0, q4_k_s, q4_k_m, q5_k_m or q6_k"
                 ))
             })
     }
@@ -1435,7 +1551,7 @@ pub struct LocalModelConfig {
     /// or an empty string downloads anonymously.
     pub hf_token: Option<String>,
     /// Maximum tokens of prompt plus completion per request. The K/V block
-    /// pools hold twice this many positions per full-attention layer group
+    /// pools hold twice this many positions (on a GPU one context plus at most 4096) per full-attention layer group
     /// (shared by every running request; [`BatchingConfig::kv_tokens`] sets
     /// the pool), so a layer costs `2 * context_length * 2 * 4 * n_kv_head * head_dim` bytes
     /// of RAM (Gemma 4 E2B 481 MB at 8192, Qwen3-0.6B 458,752 bytes per
@@ -1668,7 +1784,7 @@ struct LocalModelInner {
 ///   owns K/V (each layer's head count and head dimension come from the file;
 ///   [`LocalModel::kv_cache_bytes`] reports the total). The pool is shared by
 ///   all running sequences: a full-attention group holds
-///   [`BatchingConfig::kv_tokens`] positions (twice `context_length` by
+///   [`BatchingConfig::kv_tokens`] positions (twice `context_length` on the CPU, one context plus at most 4096 on a GPU, by
 ///   default, however many sequences run), a sliding-window group its
 ///   window plus about 270 positions per running sequence plus cached
 ///   prefixes. At the default 8192 that is 481 MB for Gemma 4 E2B, 1.47 GB for
@@ -1855,7 +1971,9 @@ pub struct BatchingConfig {
     /// full-attention layer group holds this many positions for all running
     /// sequences and the cached prefixes together (a sliding-window group
     /// `max_sequences` windows plus cached prefixes). `None` (the default)
-    /// is twice `context_length`; an explicit value is at least
+    /// is twice `context_length` on the CPU, and on a GPU `context_length`
+    /// plus at most 4096 positions of cached prefixes (12288 at the default
+    /// 8192; device memory is scarcer); an explicit value is at least
     /// `context_length + 16` and rounds up to whole blocks of 16. It is the
     /// K/V memory knob: [`LocalModel::kv_cache_bytes`] reports the result, and
     /// raising `max_sequences` does not raise it.
@@ -1891,7 +2009,7 @@ impl LocalModel {
     /// positions, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and layer
     /// that owns K/V. A full-attention group of layers holds
     /// [`BatchingConfig::kv_tokens`] positions, shared by every running
-    /// sequence (twice `context_length` by default, whatever `max_sequences`
+    /// sequence (twice `context_length` by default on the CPU, one context plus at most 4096 positions on a GPU, whatever `max_sequences`
     /// is); a sliding-window group `ceil((window - 1 + rows) / 16) + 2` blocks
     /// per running sequence (rows: one call's, at most 256) plus up to
     /// `kv_tokens - context_length` positions of cached prefixes (see the
@@ -3358,6 +3476,26 @@ shard_dirs "E:/parts" "F:/parts"
 
         // An empty document is the default configuration.
         assert_same(&kdl("").unwrap(), &LocalModelConfig::default());
+    }
+
+    #[test]
+    fn every_weight_quant_deserializes_from_kdl() {
+        for (text, want) in [
+            ("f16", WeightQuant::F16),
+            ("q8_0", WeightQuant::Q8_0),
+            ("q4_0", WeightQuant::Q4_0),
+            ("q4_k_s", WeightQuant::Q4KS),
+            ("q4_k_m", WeightQuant::Q4KM),
+            ("Q5_K_M", WeightQuant::Q5KM),
+            ("q6_k", WeightQuant::Q6K),
+        ] {
+            let config = kdl(&format!(r#"convert quant="{text}""#)).unwrap();
+            assert_eq!(config.convert.quant, want, "{text}");
+            assert_eq!(want.name(), text.to_ascii_lowercase());
+            assert_eq!(want.name().parse::<WeightQuant>().unwrap(), want);
+        }
+        let e = kdl(r#"convert quant="q3_k_m""#).unwrap_err().to_string();
+        assert!(e.contains("q3_k_m") && e.contains("q6_k"), "{e}");
     }
 
     #[test]

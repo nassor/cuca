@@ -138,7 +138,7 @@ All fields are public. `LocalModel::load` checks the configuration before it sta
 - `experts`: matters only for a mixture of experts model. KDL forms are `experts "resident"`, `experts { host; }`, `experts { host layers=4; }` and `experts { tiered ram_bytes="4g"; }`. `host` needs a GPU. `tiered` needs a RAM budget on the CPU, and on a GPU a device budget, a RAM budget or both. See [Tiered experts](@/providers/local/expert-tiers.md) and [Fit a large model](@/providers/local/placement.md).
 - `drafter`: `drafter "in-trunk"` uses the prediction head inside the model's own file and needs the CPU. Any source form of `source` names a separate drafter file. The pairings and limits are on [Speculative decoding](@/providers/local/drafting.md).
 - `chat_template` also replaces a template a preset pins, and it wins over `chat_template_file`.
-- `convert` applies to checkpoint sources only: `source dir=".."`, `source { checkpoint ..; }` and the `"repo:revision"` string. `quant` is `f16`, `q8_0` or `q4_0`. `engram_quant` is `q8_0`, `q4_0` or `bf16` and applies to DeepSeek-V4.1's Engram table only. A non-default value converts and caches next to the default one. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+- `convert` applies to checkpoint sources only: `source dir=".."`, `source { checkpoint ..; }` and the `"repo:revision"` string. `quant` is `f16`, `q8_0`, `q4_0`, `q4_k_s`, `q4_k_m`, `q5_k_m` or `q6_k`. `engram_quant` is `q8_0`, `q4_0` or `bf16` and applies to DeepSeek-V4.1's Engram table only. A non-default value converts and caches next to the default one. See [Model files and downloads](@/providers/local/model-sources.md) and [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
 - `shard_dirs`: searched after the directory of the named first part, for a split GGUF whose parts sit on different volumes. See [Model files and downloads](@/providers/local/model-sources.md).
 - `Debug` for `LocalModelConfig` prints `hf_token` as `<redacted>`.
 
@@ -205,7 +205,7 @@ The fields are optional so that "set" and "default" differ: `top_k: Some(64)` be
 | Field | Default | Sets |
 |---|---|---|
 | `max_sequences` | 4 | requests that run at once, 1 to 64 |
-| `kv_tokens` | twice `context_length` | positions in the shared K/V pool |
+| `kv_tokens` | twice `context_length`; on a GPU `context_length` plus at most 4,096 | positions in the shared K/V pool |
 | `max_step_tokens` | the prefill chunk | rows of one forward step across all requests |
 | `prefix_cache` | `true` | keep the K/V of finished requests for later prompts |
 
