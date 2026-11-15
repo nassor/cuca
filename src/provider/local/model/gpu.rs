@@ -737,8 +737,9 @@ struct WeightReader<'a> {
     buf: Vec<u8>,
     device: &'a Device,
     /// The lookup tables of the quantized formats on `device`, shared by
-    /// every weight this reader uploads.
-    tables: Tensor<1, Int>,
+    /// every weight this reader uploads; made on the first upload, so a
+    /// reader that only reads the file never opens the device.
+    tables: std::cell::OnceCell<Tensor<1, Int>>,
     /// `ExpertPlacement::Host`: which layers keep their experts in host RAM.
     host: Option<HostPlan>,
 }
@@ -751,9 +752,14 @@ impl<'a> WeightReader<'a> {
             reader: content.reader(),
             buf: Vec::new(),
             device,
-            tables: mk::tables_tensor(device),
+            tables: std::cell::OnceCell::new(),
             host,
         }
+    }
+
+    /// The format lookup tables on the reader's device.
+    fn tables(&self) -> &Tensor<1, Int> {
+        self.tables.get_or_init(|| mk::tables_tensor(self.device))
     }
 }
 
@@ -815,7 +821,7 @@ impl WeightReader<'_> {
             rows,
             cols,
             self.device,
-            &self.tables,
+            self.tables(),
             MAX_WEIGHT_CHUNK_BYTES,
         )
     }
@@ -895,7 +901,7 @@ impl WeightReader<'_> {
             cut.n_rows(),
             cut.cols.len(),
             self.device,
-            &self.tables,
+            self.tables(),
             MAX_WEIGHT_CHUNK_BYTES,
         )
     }
@@ -1017,7 +1023,7 @@ impl WeightReader<'_> {
             let pool = Tensor::<1, Int>::zeros([device_slots * layout.words], self.device);
             return Ok(GpuExpertBank::Tiered(TieredBank {
                 il,
-                tables: self.tables.clone(),
+                tables: self.tables().clone(),
                 layout,
                 device_slots,
                 store: Arc::clone(&plan.store),
@@ -1073,7 +1079,7 @@ impl WeightReader<'_> {
         let pool = Tensor::<1, Int>::from_data(TensorData::new(words, [n]), self.device);
         Ok(GpuExpertBank::Resident {
             pool,
-            tables: self.tables.clone(),
+            tables: self.tables().clone(),
             no_list,
             layout,
         })
