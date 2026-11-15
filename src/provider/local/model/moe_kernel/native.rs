@@ -57,12 +57,14 @@ pub(super) mod code {
     pub(crate) const TQ2_0: u32 = 20;
     pub(crate) const NVFP4: u32 = 21;
     pub(crate) const Q8_K: u32 = 22;
+    pub(crate) const Q5_0: u32 = 23;
+    pub(crate) const Q5_1: u32 = 24;
 }
 
 /// Values per block of the format with code `format`: 32 for the legacy
 /// formats, MXFP4 and IQ4_NL, 64 for NVFP4, 256 for the super-block types.
 pub(super) const fn block_elems_of(format: u32) -> usize {
-    if format <= code::IQ4_NL {
+    if format <= code::IQ4_NL || format == code::Q5_0 || format == code::Q5_1 {
         32
     } else if format == code::NVFP4 {
         64
@@ -98,6 +100,8 @@ pub(super) const fn file_block_bytes(format: u32) -> usize {
         code::TQ2_0 => 66,
         code::NVFP4 => 36,
         code::Q8_K => 292,
+        code::Q5_0 => 22,
+        code::Q5_1 => 24,
         _ => 0,
     }
 }
@@ -570,6 +574,50 @@ fn pow3(n: usize) -> u32 {
         p = p * 3u32;
     }
     p
+}
+
+/// Q5_0 (22 bytes) and Q5_1 (24 bytes) block of 32 values: `d` (and for Q5_1
+/// `m`) as f16, a `u32` of the fifth bits, 16 bytes of nibbles (byte `j`:
+/// element `j` low, element `j + 16` high).
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn q5_block(
+    pool: &Tensor<u32>,
+    i0: usize,
+    nblk: usize,
+    x: &Tensor<f32>,
+    xo: usize,
+    out: &mut Tensor<f32>,
+    oo: usize,
+    #[comptime] emit: bool,
+    #[comptime] with_min: bool,
+) -> f32 {
+    let mut acc = 0.0f32;
+    let d = half_to_f32(rhalf(pool, i0, nblk, 0usize));
+    let mut m = d - d;
+    let mut at = 2usize;
+    if comptime![with_min] {
+        m = half_to_f32(rhalf(pool, i0, nblk, 2usize));
+        at = 4usize;
+    }
+    let qh = rword(pool, i0, nblk, at);
+    for j in 0..16usize {
+        let q = rbyte(pool, i0, nblk, at + 4usize + j);
+        let ju = u32::cast_from(j);
+        let xh0 = ((qh >> ju) << 4u32) & 0x10u32;
+        let xh1 = (qh >> (ju + 12u32)) & 0x10u32;
+        let lo = (q & 0xFu32) | xh0;
+        let hi = (q >> 4u32) | xh1;
+        let mut v0 = (f32::cast_from(lo) - 16.0f32) * d;
+        let mut v1 = (f32::cast_from(hi) - 16.0f32) * d;
+        if comptime![with_min] {
+            v0 = f32::cast_from(lo) * d + m;
+            v1 = f32::cast_from(hi) * d + m;
+        }
+        acc += consume(v0, x, xo, out, oo, j, emit);
+        acc += consume(v1, x, xo, out, oo, j + 16usize, emit);
+    }
+    acc
 }
 
 /// Q8_K block (292 bytes): an f32 `d`, 256 signed bytes, 16 `i16` block sums
@@ -1128,6 +1176,10 @@ pub(super) fn native_block(
         tq10_block(pool, i0, nblk, x, xo, out, oo, emit)
     } else if comptime![format == code::TQ2_0] {
         tq20_block(pool, i0, nblk, x, xo, out, oo, emit)
+    } else if comptime![format == code::Q5_0] {
+        q5_block(pool, i0, nblk, x, xo, out, oo, emit, false)
+    } else if comptime![format == code::Q5_1] {
+        q5_block(pool, i0, nblk, x, xo, out, oo, emit, true)
     } else if comptime![format == code::Q8_K] {
         q8k_block(pool, i0, nblk, x, xo, out, oo, emit)
     } else {

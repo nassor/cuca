@@ -40,14 +40,15 @@
 //!   ([`dequant_row`]) and uploaded as f32 for burn's float matmul, exactly.
 //!   They cost 4 bytes per element on the device whatever their size in the
 //!   file (an F16 or BF16 weight doubles).
-//! - Q5_0, Q5_1 and Q8_1, the dtypes the kernels do not read, are
+//! - Q8_1 and I8, the dtypes the kernels do not read, are
 //!   dequantized on the host row by row and requantized to Q8_0
 //!   ([`quantize_q8_0`]), then packed like a native Q8_0 weight, so they cost
 //!   about 1.06 bytes per element on the device instead of 4. The price is a
 //!   rounding error: each element moves by at most half a Q8_0 step, that
 //!   is `block_max / 254` (plus the f16 rounding of the scale, below 0.1% of
 //!   the block maximum); logits differ from a host-dequantized reference by
-//!   more than float rounding.
+//!   more than float rounding. (Q5_0 and Q5_1 are native, 6 bits per value
+//!   with the word padding.)
 //! - Norm vectors, biases and scalars are f32 whatever their stored dtype.
 //!
 //! # Memory
@@ -692,7 +693,7 @@ impl<'a> PackPlan<'a> {
 ///   quantized, at the file's bits per weight;
 /// - F32, F16 and BF16 are dequantized on the host row by row to f32
 ///   (exact);
-/// - every other quantized dtype (Q5_0, Q5_1, Q8_1) is dequantized row by
+/// - every other quantized dtype (Q8_1, I8) is dequantized row by
 ///   row and requantized to Q8_0 ([`quantize_q8_0`]), at a rounding error of
 ///   at most half a Q8_0 step per element.
 ///
@@ -7482,12 +7483,9 @@ mod tests {
         }
     }
 
-    /// A model whose matmul weights are float, Q4_0, Q4_1 or Q8_0 matches the
-    /// dequantized CPU reference as closely as a Q4_0 one: no requantization
-    /// happens. A model in Q5_0 or Q5_1, which the engine requantizes to Q8_0,
-    /// is within the Q8_0 rounding of it: at most 8% of the largest logit
-    /// (a random-weight model amplifies the rounding). The loop gives Q4_1 the
-    /// same loose bound, which it does not need.
+    /// A model whose matmul weights are float, Q4_0, Q4_1, Q5_0, Q5_1 or Q8_0
+    /// matches the dequantized CPU reference as closely as a Q4_0 one: no
+    /// requantization happens.
     #[test]
     fn gpu_matches_cpu_on_other_weight_dtypes() {
         let Some(device) = test_device() else {
@@ -7501,7 +7499,6 @@ mod tests {
             GgmlDType::Q5_0,
             GgmlDType::Q5_1,
         ] {
-            let requantized = !matches!(dtype, GgmlDType::F16 | GgmlDType::F32 | GgmlDType::Q8_0);
             let spec = TinySpec {
                 weight_dtype: dtype,
                 embd_dtype: GgmlDType::Q5_0,
@@ -7515,18 +7512,7 @@ mod tests {
             ] {
                 let c = cpu.forward(tokens, start, Want::Last).unwrap().unwrap();
                 let g = gpu.forward(tokens, start, Want::Last).unwrap().unwrap();
-                if requantized {
-                    let scale = c.iter().fold(1f32, |m, v| m.max(v.abs()));
-                    let worst = c
-                        .iter()
-                        .zip(&g)
-                        .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
-                        / scale;
-                    println!("{dtype:?} {what}: max error {worst:.4} of the largest logit");
-                    assert!(worst <= 0.08, "{dtype:?} {what}: {worst}");
-                } else {
-                    assert_matches_cpu(&c, &g, LOOSE, &format!("{dtype:?} {what}"));
-                }
+                assert_matches_cpu(&c, &g, LOOSE, &format!("{dtype:?} {what}"));
             }
         }
     }
@@ -7534,11 +7520,10 @@ mod tests {
     /// Models whose weights mix the legacy formats with K-quants (the FFN down
     /// projections and expert matrices, whose rows are whole 256-value blocks
     /// at `ff = 256`; a Q4_K_M file's layout) match the dequantized CPU
-    /// reference. The K-quants run natively on the device and the MoE model's
-    /// experts mix a legacy gate and up with a K-quant down; only the Q5_0 and
-    /// Q5_1 attention weights of the rotation are requantized to Q8_0, so the
-    /// bound is the requantized one of
-    /// `gpu_matches_cpu_on_other_weight_dtypes`.
+    /// reference. Every weight of the rotation (the legacy formats including
+    /// Q5_0 and Q5_1, and the K-quants) runs natively on the device, and the
+    /// MoE model's experts mix a legacy gate and up with a K-quant down, so
+    /// the bound is the one of the exact dtypes.
     #[test]
     fn gpu_matches_cpu_on_mixed_k_quant_models() {
         let Some(device) = test_device() else {
@@ -7570,14 +7555,8 @@ mod tests {
             ] {
                 let c = cpu.forward(tokens, start, Want::Last).unwrap().unwrap();
                 let g = gpu.forward(tokens, start, Want::Last).unwrap().unwrap();
-                let scale = c.iter().fold(1f32, |m, v| m.max(v.abs()));
-                let worst = c
-                    .iter()
-                    .zip(&g)
-                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
-                    / scale;
-                println!("{name} {what}: max error {worst:.4} of the largest logit");
-                assert!(worst <= 0.08, "{name} {what}: {worst}");
+                println!("{name} {what}");
+                assert_matches_cpu(&c, &g, LOOSE, &format!("{name} {what}"));
             }
         }
     }
@@ -7752,11 +7731,10 @@ mod tests {
         assert!(back.iter().all(|v| *v == 0.0));
     }
 
-    /// Q5_0 and Q5_1, the dtypes the engine still requantizes to Q8_0, land on
-    /// the device as a Q8_0 weight within half a Q8_0 step, per 32-element
-    /// block, of candle's own dequantization. Q4_1 and every K-quant (Q2_K to
-    /// Q6_K, Q8_K) stay in their own format and decode to candle's values up
-    /// to the rounding of the kernel's arithmetic.
+    /// Every dtype in the loop (Q4_1, Q5_0, Q5_1 and the K-quants Q2_K to
+    /// Q6_K and Q8_K) stays in its own format on the device and decodes to
+    /// candle's dequantization up to the rounding of the kernel's
+    /// arithmetic.
     #[test]
     fn upload_matches_host_dequantization() {
         use candle_core::quantized::QTensor;
@@ -7792,11 +7770,7 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap();
             let w = upload_matrix("k", dtype, &qt.data().unwrap(), rows, cols, &device).unwrap();
-            let want = if matches!(dtype, GgmlDType::Q5_0 | GgmlDType::Q5_1) {
-                mk::ExpertFormat::Q8_0
-            } else {
-                mk::ExpertFormat::of(dtype)
-            };
+            let want = mk::ExpertFormat::of(dtype);
             assert!(
                 matches!(&w.parts[0], Part::Packed(p) if p.layout.format == want),
                 "{dtype:?} is held as {want:?}"
@@ -7805,12 +7779,7 @@ mod tests {
             assert_eq!(got.len(), expected.len(), "{dtype:?}");
             for (b, (g, e)) in got.chunks(32).zip(expected.chunks(32)).enumerate() {
                 let amax = e.iter().fold(0f32, |m, v| m.max(v.abs()));
-                let native = want != mk::ExpertFormat::Q8_0;
-                let bound = if native {
-                    amax * 1e-5 + 1e-6
-                } else {
-                    amax * (0.5 / 127.0 + 1.0 / 1024.0) + 1e-6
-                };
+                let bound = amax * 1e-5 + 1e-6;
                 for (x, y) in g.iter().zip(e) {
                     assert!((x - y).abs() <= bound, "{dtype:?} block {b}: {x} vs {y}");
                 }
@@ -7989,6 +7958,7 @@ mod tests {
             [GgmlDType::Q4_1, GgmlDType::Q4_1, GgmlDType::Q4_1],
             [GgmlDType::Q8_0, GgmlDType::Q8_0, GgmlDType::F32],
             [GgmlDType::Q5_0, GgmlDType::F16, GgmlDType::Q4_0],
+            [GgmlDType::Q5_1, GgmlDType::Q5_0, GgmlDType::Q5_1],
         ];
         for dtypes in formats {
             let layout = SlotLayout::new(n_embd, ff, dtypes).unwrap();
@@ -8152,13 +8122,7 @@ mod tests {
                         &c,
                     );
                     let resident = read_f32(mk::sum(scratch, &c), "out").unwrap();
-                    // A dtype the kernels hold requantized to Q8_0 (Q5_0 here) is
-                    // off by the requantization step.
-                    let tol = if dtypes[0] == GgmlDType::Q5_0 {
-                        4e-2
-                    } else {
-                        2e-3
-                    };
+                    let tol = 2e-3;
                     for (i, (g, e)) in resident.iter().zip(&want).enumerate() {
                         assert!(
                             (g - e).abs() <= tol * (1.0 + e.abs()),
