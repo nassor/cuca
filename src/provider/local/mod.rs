@@ -134,9 +134,9 @@
 //! On the CPU a token's logits do not depend on how the prompt was split:
 //! prefill and speculative verification run in a row-exact mode (float
 //! matmuls per row, paged attention per query row on candle's worker pool,
-//! and a safe row-batched matmul kernel for Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0
-//! weights whose rows are independent of their batch; the K-quants and other
-//! dtypes run on candle's per-row kernel, also row independent) that equals
+//! and a safe row-batched matmul kernel for every quantized weight dtype
+//! (legacy, K-quant, I-quant, ternary, MXFP4 and NVFP4 blocks), whose rows
+//! are independent of their batch) that equals
 //! single-token decoding bit for bit, at no cost in
 //! prefill throughput. A request that reuses a cached prefix therefore
 //! generates what a cold request generates. (Quantized matmuls round
@@ -590,8 +590,8 @@ const PRESET_TABLE: &[ModelPreset] = &[
         20_836_243_072,
         "qwen35moe",
     ),
-    // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers (candle's
-    // kernel: K-quants are not served by the row-batched one) and a Q4_1
+    // imatrix Q4_0 with a Q6_K `output` and `attn_q` in 26 layers (row-batched
+    // like every quantized dtype) and a Q4_1
     // `ffn_down` in 6 (row-batched). Its embedded Muse chat template renders
     // the same bytes as the repository's current one except when the caller's
     // system prompt itself mentions "Reasoning effort": the current template
