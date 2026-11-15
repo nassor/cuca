@@ -163,25 +163,6 @@ pub(crate) fn ffn_norm_part(post_attention_is_ffn_norm: bool) -> &'static str {
 }
 
 /// The index entry of `tensor_name`, without reading its data.
-#[cfg(feature = "provider-local-gpu")]
-/// The candle type of tensor `tensor`, which the engines that read tensors
-/// through candle's block layouts (every CPU path, the GPU uploads) require.
-///
-/// # Errors
-///
-/// A type only the row readers know (IQ4_NL, MXFP4, I8) or none at all.
-pub(crate) fn ggml_dtype(
-    info: &gguf::TensorInfo,
-    tensor: &str,
-) -> Result<candle_core::quantized::GgmlDType, CucaError> {
-    info.dtype.ggml().ok_or_else(|| {
-        err(format!(
-            "tensor `{tensor}` has type {}, which this engine cannot run",
-            info.dtype.name()
-        ))
-    })
-}
-
 pub(crate) fn tensor_info<'a>(
     content: &'a gguf::Content,
     tensor_name: &str,

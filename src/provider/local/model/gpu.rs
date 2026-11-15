@@ -18,34 +18,36 @@
 //!
 //! # Weights
 //!
-//! - Q4_0, Q4_1 and Q8_0 matmul weights are repacked once at load into the
-//!   `u32` words of the dense kernels of [`mk`] ([`mk::DenseLayout`]: block
-//!   values then f16 scales, and minimums for Q4_1, in block-major order so
-//!   that the threads of a launch, one per output row, read consecutive
-//!   blocks) and stay quantized on the device, one copy per weight. Up to
+//! - Q4_0, Q4_1, Q8_0, IQ4_NL, MXFP4, the K-quants (Q2_K to Q6_K, Q8_K), the
+//!   I-quants (IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS),
+//!   TQ1_0, TQ2_0 and NVFP4 matmul weights are repacked once at load into the
+//!   `u32` words of the dense kernels of [`mk`] ([`mk::DenseLayout`]: the
+//!   legacy formats as block values then f16 scales, and minimums for Q4_1;
+//!   the block formats as the file's own blocks padded to whole words, in
+//!   word-major order; all in block-major order so that the threads of a
+//!   launch, one per output row, read consecutive blocks) and stay quantized
+//!   on the device, one copy per weight, at the file's bits per weight (the
+//!   word padding adds at most 3 bytes per 256-value block). Up to
 //!   [`GEMV_ROWS`] input rows (decode, batched decode, verification) the
 //!   matrix-vector kernel of [`mk::dense_gemv`] dots the blocks with the
 //!   input in f32; more rows (prefill) dequantize slices of the weight to f32
 //!   ([`mk::dense_dequant`]) and use burn's float matmul. burn's own
-//!   quantized matmul is not used by any weight (see [`linear`]).
+//!   quantized matmul is not used by any weight (see [`linear`]). The
+//!   lookup tables of the I-quants are one device tensor per reader
+//!   ([`mk::tables_tensor`]) shared by every weight and expert bank of the
+//!   load.
 //! - F32, F16 and BF16 matmul weights are dequantized on the host row by row
 //!   ([`dequant_row`]) and uploaded as f32 for burn's float matmul, exactly.
 //!   They cost 4 bytes per element on the device whatever their size in the
 //!   file (an F16 or BF16 weight doubles).
-//! - Every other quantized dtype (Q5_0, Q5_1, Q8_1 and the K-quants Q2_K
-//!   to Q6_K) is dequantized on the host row by row and requantized to Q8_0
-//!   ([`quantize_q8_0`]), then packed like a native Q8_0 weight, so it costs
-//!   about 1.06 bytes per element on the device instead of 4: a 3.8
-//!   B-parameter Q4_K_M file needs about 4 GB rather than 15 GB. The price is
-//!   a rounding error: each element moves by at most half a Q8_0 step, that
+//! - Q5_0, Q5_1 and Q8_1, the dtypes the kernels do not read, are
+//!   dequantized on the host row by row and requantized to Q8_0
+//!   ([`quantize_q8_0`]), then packed like a native Q8_0 weight, so they cost
+//!   about 1.06 bytes per element on the device instead of 4. The price is a
+//!   rounding error: each element moves by at most half a Q8_0 step, that
 //!   is `block_max / 254` (plus the f16 rounding of the scale, below 0.1% of
-//!   the block maximum). Q8_0 resolves a block with 255 levels where Q4_K,
-//!   Q5_K and Q6_K resolve theirs with about 15, 31 and 63, so this extra
-//!   error is below the one the file's own quantization already carries.
-//!   Logits therefore differ from a host-dequantized reference by far more
-//!   than float rounding (about 1e-2 of their magnitude in the tiny-model
-//!   tests), so a K-quant model decodes the CPU engine's tokens except where
-//!   two candidates are that close.
+//!   the block maximum); logits differ from a host-dequantized reference by
+//!   more than float rounding.
 //! - Norm vectors, biases and scalars are f32 whatever their stored dtype.
 //!
 //! # Memory
@@ -64,7 +66,8 @@
 //! - Resident experts (the default) are read, converted to the MoE kernels'
 //!   words ([`mk`], not burn's quantized layout) and uploaded as one pool per
 //!   layer, expert `e` in slot `e`: the host buffer is one layer's pool and the
-//!   device memory is the file's bytes for Q4_0, Q4_1 and Q8_0 experts.
+//!   device memory is the file's bytes (plus the word padding of the block
+//!   formats) for every format the kernels read.
 //!   `ExpertPlacement::Tiered` reads no expert at load: see "Tiered experts"
 //!   below.
 //! - The K/V cache lives on the device as a paged cache (see the
@@ -92,7 +95,7 @@
 //! - RoPE cos/sin tables for `context_length` positions, one pair per distinct
 //!   rotary embedding, live on the device.
 //! - During load the host holds the read buffer of the whole tensor (its file
-//!   size), the converted copy of one chunk (f32 or Q8_0, at most 1 GiB of
+//!   size), the converted copy of one chunk (f32, Q8_0 or the kernels' words, at most 1 GiB of
 //!   device bytes) and the repacked copy of that chunk; per forward pass it
 //!   holds the embedding rows, the attention masks and, per MoE layer, the
 //!   router logits (`tokens * n_expert` f32).
@@ -148,7 +151,7 @@
 //!   ([`GpuExpertBank::Tiered`]), with `device_slots = min(n_expert,
 //!   device_bytes / per_expert)` where `per_expert` is the size of one
 //!   expert of every MoE layer in the kernels' layout (the file's bytes for
-//!   Q4_0, Q4_1 and Q8_0). A budget below `n_used` experts per layer fails
+//!   every format the kernels read). A budget below `n_used` experts per layer fails
 //!   the load with `CucaError::Config` naming the minimum. The pool is
 //!   allocated at load.
 //! - RAM tier (`ram_bytes > 0`): the packed host copies of experts
@@ -232,8 +235,9 @@
 //!   shard's own hyperparameters (its head counts) from sliced reads
 //!   ([`WeightReader::matrix_cut`]: a shard reads only its rows from the
 //!   file and copies its columns' bytes out of whole rows; a column cut that
-//!   splits a block of the file's dtype, as a K-quant `ffn_down` can, is cut
-//!   from the dequantized rows and held as Q8_0). Only shard 0 holds
+//!   splits a block of the file's dtype (a 256-value super-block of a
+//!   K-quant or I-quant `ffn_down`; cuts on block bounds are byte copies)
+//!   is cut from the dequantized rows and held as Q8_0). Only shard 0 holds
 //!   the LM head and the final norm; norms, per-head Q/K norms, the router,
 //!   the shared expert's gate, the per-layer-embedding weights, the layer
 //!   output scales and the RoPE tables are replicated, and so is the
@@ -309,7 +313,7 @@ use super::arch::{Act, Arch};
 use super::cpu::{CpuExpert, Forward, Hidden, HostExperts, open_expert_store};
 use super::csa::Gating;
 use super::engram::{self, RowSource};
-use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, ggml_dtype, name, tensor_info};
+use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
 use super::moe::Routing;
 use super::moe_kernel::{self as mk, MoeCall, SlotLayout};
 #[cfg(test)]
@@ -443,10 +447,13 @@ struct Weight {
 }
 
 /// A weight held in the dense kernels' own layout on the device
-/// ([`mk::DenseLayout`]): one `u32` pool.
+/// ([`mk::DenseLayout`]): one `u32` pool, plus the device's lookup tables
+/// ([`mk::tables_tensor`]) that the I-quant formats read.
 #[derive(Clone)]
 struct Packed {
     pool: Tensor<1, Int>,
+    /// Boxed so that a `Part::Packed` stays about the size of a `Part::Float`.
+    tables: Box<Tensor<1, Int>>,
     layout: mk::DenseLayout,
 }
 
@@ -455,7 +462,7 @@ struct Packed {
 enum Part {
     /// f32, row-major `[rows, cols]` (the float dtypes).
     Float(Tensor<2>),
-    /// Q4_0, Q4_1 or Q8_0 blocks.
+    /// Quantized blocks in the dense kernels' layout.
     Packed(Packed),
 }
 
@@ -494,7 +501,7 @@ pub(super) fn quantize_q8_0(values: &[f32], out: &mut Vec<u8>) {
 #[cfg(test)]
 fn upload_matrix(
     tensor_name: &str,
-    dtype: GgmlDType,
+    dtype: impl Into<GgufType>,
     raw: &[u8],
     rows: usize,
     cols: usize,
@@ -507,6 +514,7 @@ fn upload_matrix(
         rows,
         cols,
         device,
+        &mk::tables_tensor(device),
         MAX_WEIGHT_CHUNK_BYTES,
     )
 }
@@ -523,25 +531,29 @@ fn upload_matrix(
 /// cut past the row, a `held` other than `dtype` or Q8_0, or a Q8_0 cut
 /// that is not whole 32-element blocks.
 fn append_columns(
-    dtype: GgmlDType,
+    dtype: impl Into<GgufType>,
     raw: &[u8],
     row_len: usize,
     cols: &Range<usize>,
-    held: GgmlDType,
+    held: impl Into<GgufType>,
     out: &mut Vec<u8>,
 ) -> Result<(), CucaError> {
+    let (dtype, held) = (dtype.into(), held.into());
     if held == dtype
         && let Some(bytes) = tp::copy_columns(dtype, raw, row_len, cols)
     {
         out.extend_from_slice(&bytes);
         return Ok(());
     }
-    let row_bytes = row_len / dtype.block_size() * dtype.type_size();
+    let (Some(block), Some(size)) = (dtype.block_size(), dtype.type_size()) else {
+        return Err(err(format!("a cut of {}", dtype.name())));
+    };
+    let row_bytes = row_len / block * size;
     if row_bytes == 0
-        || !row_len.is_multiple_of(dtype.block_size())
+        || !row_len.is_multiple_of(block)
         || !raw.len().is_multiple_of(row_bytes)
         || cols.end > row_len
-        || held != GgmlDType::Q8_0
+        || held != GgufType::Ggml(GgmlDType::Q8_0)
         || !cols.len().is_multiple_of(32)
     {
         return Err(err(format!(
@@ -561,7 +573,7 @@ fn append_columns(
 /// layout it takes there and the row chunks it is split into.
 struct PackPlan<'a> {
     tensor_name: &'a str,
-    dtype: GgmlDType,
+    dtype: GgufType,
     rows: usize,
     cols: usize,
     /// Quantized in the kernels' layout; `false` for f32 (the float dtypes).
@@ -577,32 +589,34 @@ impl<'a> PackPlan<'a> {
     /// `raw_len` long, in chunks of at most `limit` device bytes.
     fn new(
         tensor_name: &'a str,
-        dtype: GgmlDType,
+        dtype: GgufType,
         raw_len: usize,
         rows: usize,
         cols: usize,
         limit: usize,
     ) -> Result<Self, CucaError> {
-        let block = dtype.block_size();
+        let (Some(block), Some(type_size)) = (dtype.block_size(), dtype.type_size()) else {
+            return Err(err(format!(
+                "tensor `{tensor_name}` has type {}, which this engine cannot run",
+                dtype.name()
+            )));
+        };
         if !cols.is_multiple_of(block) {
             return Err(err(format!(
                 "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size {block}"
             )));
         }
-        let row_bytes = cols / block * dtype.type_size();
+        let row_bytes = cols / block * type_size;
         if raw_len != rows * row_bytes {
             return Err(err(format!(
                 "tensor `{tensor_name}`: {raw_len} bytes do not hold a [{rows}, {cols}] {dtype:?} tensor"
             )));
         }
-        let quantized = !matches!(dtype, GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16);
+        let quantized = !matches!(
+            dtype,
+            GgufType::Ggml(GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16)
+        );
         let device_row_bytes = if quantized {
-            if !cols.is_multiple_of(mk::BLOCK) {
-                return Err(err(format!(
-                    "tensor `{tensor_name}`: row length {cols} is not a multiple of the {}-element block",
-                    mk::BLOCK
-                )));
-            }
             mk::DenseLayout::new(dtype, 1, cols)
                 .map_err(|e| err(format!("tensor `{tensor_name}`: {e}")))?
                 .bytes()
@@ -631,7 +645,13 @@ impl<'a> PackPlan<'a> {
 
     /// Convert the rows `rows` of the weight, whose file bytes are `raw`, and
     /// upload them as one part.
-    fn upload(&self, raw: &[u8], rows: Range<usize>, device: &Device) -> Result<Part, CucaError> {
+    fn upload(
+        &self,
+        raw: &[u8],
+        rows: Range<usize>,
+        device: &Device,
+        tables: &Tensor<1, Int>,
+    ) -> Result<Part, CucaError> {
         let context = |e: CucaError| err(format!("tensor `{}`: {e}", self.tensor_name));
         let (dtype, cols, row_bytes) = (self.dtype, self.cols, self.row_bytes);
         let n = rows.len();
@@ -644,6 +664,7 @@ impl<'a> PackPlan<'a> {
             let len = words.len();
             Ok(Part::Packed(Packed {
                 pool: Tensor::from_data(TensorData::new(words, [len]), device),
+                tables: Box::new(tables.clone()),
                 layout,
             }))
         } else {
@@ -665,31 +686,47 @@ impl<'a> PackPlan<'a> {
 /// The `[rows, cols]` weight whose GGUF bytes are `raw`, on the device, in
 /// row chunks of at most `limit` device bytes:
 ///
-/// - Q4_0, Q4_1 and Q8_0 are repacked into the dense kernels' block-major
-///   words ([`mk::pack_dense`]) and stay quantized;
+/// - every quantized dtype the kernels read (Q4_0, Q4_1, Q8_0, IQ4_NL, MXFP4,
+///   the K-quants, I-quants, ternary types and NVFP4) is repacked into the
+///   dense kernels' block-major words ([`mk::pack_dense`]) and stays
+///   quantized, at the file's bits per weight;
 /// - F32, F16 and BF16 are dequantized on the host row by row to f32
 ///   (exact);
-/// - every other quantized dtype (Q5_0, Q5_1, Q8_1, the K-quants) is
-///   dequantized row by row and requantized to Q8_0 ([`quantize_q8_0`]), at
-///   a rounding error of at most half a Q8_0 step per element.
+/// - every other quantized dtype (Q5_0, Q5_1, Q8_1) is dequantized row by
+///   row and requantized to Q8_0 ([`quantize_q8_0`]), at a rounding error of
+///   at most half a Q8_0 step per element.
 ///
 /// Chunks are converted and uploaded one at a time (the host holds one
 /// converted chunk, not the whole weight).
+#[allow(clippy::too_many_arguments)]
 fn upload_matrix_with(
     tensor_name: &str,
-    dtype: GgmlDType,
+    dtype: impl Into<GgufType>,
     raw: &[u8],
     rows: usize,
     cols: usize,
     device: &Device,
+    tables: &Tensor<1, Int>,
     limit: usize,
 ) -> Result<Weight, CucaError> {
-    let plan = PackPlan::new(tensor_name, dtype, raw.len(), rows, cols, limit)?;
+    let plan = PackPlan::new(tensor_name, dtype.into(), raw.len(), rows, cols, limit)?;
     let parts = plan
         .chunks()
-        .map(|range| plan.upload(raw, range, device))
+        .map(|range| plan.upload(raw, range, device, tables))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Weight { parts })
+}
+
+/// Values and bytes per block of `dtype`, or the error naming the tensor of a
+/// type this engine does not know.
+fn block_geometry(dtype: GgufType, tensor_name: &str) -> Result<(usize, usize), CucaError> {
+    match (dtype.block_size(), dtype.type_size()) {
+        (Some(block), Some(size)) => Ok((block, size)),
+        _ => Err(err(format!(
+            "tensor `{tensor_name}` has type {}, which this engine cannot run",
+            dtype.name()
+        ))),
+    }
 }
 
 /// Reads tensors from the GGUF file into one reused buffer and uploads them.
@@ -698,6 +735,9 @@ struct WeightReader<'a> {
     reader: gguf::TensorReader<'a>,
     buf: Vec<u8>,
     device: &'a Device,
+    /// The lookup tables of the quantized formats on `device`, shared by
+    /// every weight this reader uploads.
+    tables: Tensor<1, Int>,
     /// `ExpertPlacement::Host`: which layers keep their experts in host RAM.
     host: Option<HostPlan>,
 }
@@ -710,6 +750,7 @@ impl<'a> WeightReader<'a> {
             reader: content.reader(),
             buf: Vec::new(),
             device,
+            tables: mk::tables_tensor(device),
             host,
         }
     }
@@ -743,7 +784,7 @@ impl WeightReader<'_> {
 
     /// Read `tensor_name` into `buf` after checking its shape; returns its
     /// dtype.
-    fn read(&mut self, tensor_name: &str, shape: &[usize]) -> Result<GgmlDType, CucaError> {
+    fn read(&mut self, tensor_name: &str, shape: &[usize]) -> Result<GgufType, CucaError> {
         let info = tensor_info(self.content, tensor_name)?;
         let dims = info.shape.dims();
         if dims != shape {
@@ -751,18 +792,15 @@ impl WeightReader<'_> {
                 "tensor `{tensor_name}`: expected shape {shape:?}, found {dims:?}"
             )));
         }
-        let dtype = ggml_dtype(info, tensor_name)?;
+        let dtype = info.dtype;
+        let (block, size) = block_geometry(dtype, tensor_name)?;
         let elements: usize = shape.iter().product();
-        if !elements.is_multiple_of(dtype.block_size()) {
+        if !elements.is_multiple_of(block) {
             return Err(err(format!(
                 "tensor `{tensor_name}`: {elements} elements are not whole {dtype:?} blocks"
             )));
         }
-        self.read_at(
-            tensor_name,
-            0,
-            elements / dtype.block_size() * dtype.type_size(),
-        )?;
+        self.read_at(tensor_name, 0, elements / block * size)?;
         Ok(dtype)
     }
 
@@ -776,6 +814,7 @@ impl WeightReader<'_> {
             rows,
             cols,
             self.device,
+            &self.tables,
             MAX_WEIGHT_CHUNK_BYTES,
         )
     }
@@ -796,7 +835,7 @@ impl WeightReader<'_> {
         tensor_name: &str,
         (rows, cols): (usize, usize),
         cut: &Cut,
-    ) -> Result<(GgmlDType, Vec<u8>), CucaError> {
+    ) -> Result<(GgufType, Vec<u8>), CucaError> {
         let info = tensor_info(self.content, tensor_name)?;
         let dims = info.shape.dims();
         if dims != [rows, cols] {
@@ -805,8 +844,8 @@ impl WeightReader<'_> {
                 [rows, cols]
             )));
         }
-        let dtype = ggml_dtype(info, tensor_name)?;
-        let block = dtype.block_size();
+        let dtype = info.dtype;
+        let (block, size) = block_geometry(dtype, tensor_name)?;
         if !cols.is_multiple_of(block) {
             return Err(err(format!(
                 "tensor `{tensor_name}`: row length {cols} is not a multiple of the {dtype:?} block size {block}"
@@ -817,7 +856,7 @@ impl WeightReader<'_> {
                 "tensor `{tensor_name}`: the cut {cut:?} lies outside the [{rows}, {cols}] matrix"
             )));
         }
-        let row_bytes = cols / block * dtype.type_size();
+        let row_bytes = cols / block * size;
         if cut.cols == (0..cols)
             && let [r] = cut.rows.as_slice()
         {
@@ -855,6 +894,7 @@ impl WeightReader<'_> {
             cut.n_rows(),
             cut.cols.len(),
             self.device,
+            &self.tables,
             MAX_WEIGHT_CHUNK_BYTES,
         )
     }
@@ -976,6 +1016,7 @@ impl WeightReader<'_> {
             let pool = Tensor::<1, Int>::zeros([device_slots * layout.words], self.device);
             return Ok(GpuExpertBank::Tiered(TieredBank {
                 il,
+                tables: self.tables.clone(),
                 layout,
                 device_slots,
                 store: Arc::clone(&plan.store),
@@ -993,7 +1034,7 @@ impl WeightReader<'_> {
         let down_dtype = if whole {
             layer.down.dtype
         } else {
-            GgufType::Ggml(tp::column_dtype(layer.down.ggml()?, ff, &part))
+            tp::column_dtype(layer.down.dtype, ff, &part)
         };
         let dtypes = [layer.gate.dtype, layer.up.dtype, down_dtype];
         let layout = SlotLayout::new(n_embd, part.len(), dtypes)?;
@@ -1020,15 +1061,8 @@ impl WeightReader<'_> {
                 down
             } else {
                 let mut cut = Vec::new();
-                append_columns(
-                    layer.down.ggml()?,
-                    &down,
-                    ff,
-                    &part,
-                    down_dtype.ggml().ok_or_else(|| err("a cut MXFP4 expert"))?,
-                    &mut cut,
-                )
-                .map_err(|e| err(format!("layer {il} experts: {e}")))?;
+                append_columns(layer.down.dtype, &down, ff, &part, down_dtype, &mut cut)
+                    .map_err(|e| err(format!("layer {il} experts: {e}")))?;
                 cut
             };
             let packed = mk::pack_expert(&layout, dtypes, &gate, &up, &down)?;
@@ -1038,6 +1072,7 @@ impl WeightReader<'_> {
         let pool = Tensor::<1, Int>::from_data(TensorData::new(words, [n]), self.device);
         Ok(GpuExpertBank::Resident {
             pool,
+            tables: self.tables.clone(),
             no_list,
             layout,
         })
@@ -1322,6 +1357,8 @@ enum GpuExpertBank {
     /// Every expert on the device, expert `e` in slot `e`.
     Resident {
         pool: Tensor<1, Int>,
+        /// The lookup tables of the quantized formats ([`mk::tables_tensor`]).
+        tables: Tensor<1, Int>,
         /// An unused pair list (the kernels take the pairs from the router
         /// output).
         no_list: Tensor<1, Int>,
@@ -1340,6 +1377,7 @@ enum GpuExpertBank {
 
 struct TieredBank {
     il: usize,
+    tables: Tensor<1, Int>,
     layout: SlotLayout,
     device_slots: usize,
     store: Arc<ExpertStore<PackedExpert>>,
@@ -1409,12 +1447,32 @@ impl GpuExpertBank {
         let c = call(0, false);
         let (t, k, n_embd) = (c.tokens, c.n_used, c.slot.down.rows);
         let (routed, extra) = match self {
-            Self::Resident { pool, no_list, .. } => {
+            Self::Resident {
+                pool,
+                tables,
+                no_list,
+                ..
+            } => {
                 let c = call(t * k, false);
-                let hidden =
-                    mk::up_clamped(f, route.clone(), no_list.clone(), pool.clone(), &c, clamp);
+                let hidden = mk::up_clamped(
+                    f,
+                    route.clone(),
+                    no_list.clone(),
+                    pool.clone(),
+                    tables.clone(),
+                    &c,
+                    clamp,
+                );
                 let scratch = Tensor::<2>::empty([t * k, n_embd], device);
-                let scratch = mk::down(hidden, route, no_list.clone(), pool.clone(), scratch, &c);
+                let scratch = mk::down(
+                    hidden,
+                    route,
+                    no_list.clone(),
+                    pool.clone(),
+                    tables.clone(),
+                    scratch,
+                    &c,
+                );
                 (mk::sum(scratch, &c), shared())
             }
             Self::Tiered(bank) => (bank.run(f, route, call, device, clamp)?, shared()),
@@ -1606,10 +1664,19 @@ impl TieredBank {
                 route.clone(),
                 list.clone(),
                 pool.clone(),
+                self.tables.clone(),
                 &c,
                 clamp,
             );
-            scratch = mk::down(hidden, route.clone(), list, pool, scratch, &c);
+            scratch = mk::down(
+                hidden,
+                route.clone(),
+                list,
+                pool,
+                self.tables.clone(),
+                scratch,
+                &c,
+            );
             pending.retain(|e| group.binary_search(e).is_err());
         }
         Ok(mk::sum(scratch, &call(t * k, false)))
@@ -5052,7 +5119,7 @@ const DEQUANT_SLICE_BYTES: usize = 64 << 20;
 /// A weight in several row chunks runs one product per chunk and
 /// concatenates the outputs.
 ///
-/// - A quantized chunk (Q4_0, Q4_1, Q8_0 in the layout of
+/// - A quantized chunk (a format the kernels read, in the layout of
 ///   [`mk::DenseLayout`]) with at most [`GEMV_ROWS`] input rows runs the
 ///   matrix-vector kernel of this crate (f32 accumulation straight from the
 ///   blocks, one thread per row and token). More rows dequantize slices of
@@ -5101,14 +5168,19 @@ fn linear_part(x: Tensor<2>, part: &Part) -> Tensor<2> {
                 count,
             };
             if t <= GEMV_ROWS {
-                return mk::dense_gemv(x, p.pool.clone(), &call(0, 0));
+                return mk::dense_gemv(x, p.pool.clone(), (*p.tables).clone(), &call(0, 0));
             }
             let like = Tensor::<1>::zeros([1], &x.device());
             let slice = (DEQUANT_SLICE_BYTES / (layout.cols * 4)).clamp(1, layout.rows);
             let mut outs = Vec::with_capacity(layout.rows.div_ceil(slice));
             for row0 in (0..layout.rows).step_by(slice) {
                 let count = slice.min(layout.rows - row0);
-                let w = mk::dense_dequant(like.clone(), p.pool.clone(), &call(row0, count));
+                let w = mk::dense_dequant(
+                    like.clone(),
+                    p.pool.clone(),
+                    (*p.tables).clone(),
+                    &call(row0, count),
+                );
                 outs.push(w.matmul(x.clone().transpose()).transpose());
             }
             if outs.len() == 1 {
@@ -7459,6 +7531,57 @@ mod tests {
         }
     }
 
+    /// Models whose weights mix the legacy formats with K-quants (the FFN down
+    /// projections and expert matrices, whose rows are whole 256-value blocks
+    /// at `ff = 256`; a Q4_K_M file's layout) match the dequantized CPU
+    /// reference. The K-quants run natively on the device and the MoE model's
+    /// experts mix a legacy gate and up with a K-quant down; only the Q5_0 and
+    /// Q5_1 attention weights of the rotation are requantized to Q8_0, so the
+    /// bound is the requantized one of
+    /// `gpu_matches_cpu_on_other_weight_dtypes`.
+    #[test]
+    fn gpu_matches_cpu_on_mixed_k_quant_models() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        for (name, spec) in [
+            (
+                "llama",
+                TinySpec {
+                    ff: 256,
+                    mixed: true,
+                    ..TinySpec::llama()
+                },
+            ),
+            (
+                "qwen3moe",
+                TinySpec {
+                    ff: 256,
+                    mixed: true,
+                    ..TinySpec::qwen3moe()
+                },
+            ),
+        ] {
+            let model = write_spec(&spec);
+            let (mut cpu, mut gpu) = load_both(&model, device);
+            for (tokens, start, what) in [
+                (&PROMPT[..], 0, "prefill"),
+                (&[7][..], PROMPT.len(), "decode"),
+            ] {
+                let c = cpu.forward(tokens, start, Want::Last).unwrap().unwrap();
+                let g = gpu.forward(tokens, start, Want::Last).unwrap().unwrap();
+                let scale = c.iter().fold(1f32, |m, v| m.max(v.abs()));
+                let worst = c
+                    .iter()
+                    .zip(&g)
+                    .fold(0f32, |m, (a, b)| m.max((a - b).abs()))
+                    / scale;
+                println!("{name} {what}: max error {worst:.4} of the largest logit");
+                assert!(worst <= 0.08, "{name} {what}: {worst}");
+            }
+        }
+    }
+
     /// `linear` against a host matmul of the dequantized weight, over shapes
     /// that stress burn's Vulkan matmul and `vecmat` paths. The order replays cached
     /// autotune entries across shapes of one power-of-two bucket (`out = 96`
@@ -7629,11 +7752,13 @@ mod tests {
         assert!(back.iter().all(|v| *v == 0.0));
     }
 
-    /// Every dtype the engine requantizes to Q8_0 (the K-quants too, whose
-    /// blocks are 256 wide) lands on the device as a Q8_0 weight within half
-    /// a Q8_0 step, per 32-element block, of candle's own dequantization.
+    /// Q5_0 and Q5_1, the dtypes the engine still requantizes to Q8_0, land on
+    /// the device as a Q8_0 weight within half a Q8_0 step, per 32-element
+    /// block, of candle's own dequantization. Q4_1 and every K-quant (Q2_K to
+    /// Q6_K, Q8_K) stay in their own format and decode to candle's values up
+    /// to the rounding of the kernel's arithmetic.
     #[test]
-    fn requantized_upload_matches_host_dequantization() {
+    fn upload_matches_host_dequantization() {
         use candle_core::quantized::QTensor;
 
         let Some(device) = test_device() else {
@@ -7651,9 +7776,12 @@ mod tests {
             GgmlDType::Q4_1,
             GgmlDType::Q5_0,
             GgmlDType::Q5_1,
+            GgmlDType::Q2K,
+            GgmlDType::Q3K,
             GgmlDType::Q4K,
             GgmlDType::Q5K,
             GgmlDType::Q6K,
+            GgmlDType::Q8K,
         ] {
             let qt = QTensor::quantize(&source, dtype).unwrap();
             let expected = qt
@@ -7664,10 +7792,10 @@ mod tests {
                 .to_vec1::<f32>()
                 .unwrap();
             let w = upload_matrix("k", dtype, &qt.data().unwrap(), rows, cols, &device).unwrap();
-            let want = if dtype == GgmlDType::Q4_1 {
-                mk::ExpertFormat::Q4_1
-            } else {
+            let want = if matches!(dtype, GgmlDType::Q5_0 | GgmlDType::Q5_1) {
                 mk::ExpertFormat::Q8_0
+            } else {
+                mk::ExpertFormat::of(dtype)
             };
             assert!(
                 matches!(&w.parts[0], Part::Packed(p) if p.layout.format == want),
@@ -7677,7 +7805,12 @@ mod tests {
             assert_eq!(got.len(), expected.len(), "{dtype:?}");
             for (b, (g, e)) in got.chunks(32).zip(expected.chunks(32)).enumerate() {
                 let amax = e.iter().fold(0f32, |m, v| m.max(v.abs()));
-                let bound = amax * (0.5 / 127.0 + 1.0 / 1024.0) + 1e-6;
+                let native = want != mk::ExpertFormat::Q8_0;
+                let bound = if native {
+                    amax * 1e-5 + 1e-6
+                } else {
+                    amax * (0.5 / 127.0 + 1.0 / 1024.0) + 1e-6
+                };
                 for (x, y) in g.iter().zip(e) {
                     assert!((x - y).abs() <= bound, "{dtype:?} block {b}: {x} vs {y}");
                 }
@@ -7800,12 +7933,13 @@ mod tests {
             assert_eq!(whole.parts.len(), 1, "{dtype:?}");
             // A limit of 64 rows of the stored layout: 64, 64, 64 and 8.
             let row_bytes = match dtype {
-                GgmlDType::Q4_0 => cols / 2 + cols / 16,
                 GgmlDType::F32 => cols * 4,
-                _ => cols + cols / 16,
+                _ => mk::DenseLayout::new(dtype, 1, cols).unwrap().bytes(),
             };
             let limit = 64 * row_bytes;
-            let split = upload_matrix_with("w", dtype, &raw, rows, cols, &device, limit).unwrap();
+            let tables = mk::tables_tensor(&device);
+            let split =
+                upload_matrix_with("w", dtype, &raw, rows, cols, &device, &tables, limit).unwrap();
             let sizes: Vec<usize> = split.parts.iter().map(Part::rows).collect();
             assert_eq!(sizes, [64, 64, 64, 8], "{dtype:?}");
             for t in [1usize, 3] {
@@ -7965,6 +8099,7 @@ mod tests {
                         &device,
                     );
                     let dummy = Tensor::<1, Int>::zeros([2], &device);
+                    let tables = mk::tables_tensor(&device);
                     let route = mk::route(logits_t, &call(t * n_used, false), norm);
                     let route_host = read_f32(route.clone(), "route").unwrap();
                     // Routing: every token's experts and weights.
@@ -7998,9 +8133,24 @@ mod tests {
                     // Resident form.
                     let pool = upload(&(0..n_expert).collect::<Vec<_>>());
                     let c = call(t * n_used, false);
-                    let hidden = mk::up(xt(), route.clone(), dummy.clone(), pool.clone(), &c);
+                    let hidden = mk::up(
+                        xt(),
+                        route.clone(),
+                        dummy.clone(),
+                        pool.clone(),
+                        tables.clone(),
+                        &c,
+                    );
                     let scratch = Tensor::<2>::zeros([t * n_used, n_embd], &device);
-                    let scratch = mk::down(hidden, route.clone(), dummy.clone(), pool, scratch, &c);
+                    let scratch = mk::down(
+                        hidden,
+                        route.clone(),
+                        dummy.clone(),
+                        pool,
+                        tables.clone(),
+                        scratch,
+                        &c,
+                    );
                     let resident = read_f32(mk::sum(scratch, &c), "out").unwrap();
                     // A dtype the kernels hold requantized to Q8_0 (Q5_0 here) is
                     // off by the requantization step.
@@ -8035,8 +8185,23 @@ mod tests {
                         let list =
                             Tensor::<1, Int>::from_data(TensorData::new(list, [2 * p]), &device);
                         let c = call(p, true);
-                        let hidden = mk::up(xt(), route.clone(), list.clone(), pool.clone(), &c);
-                        scratch = mk::down(hidden, route.clone(), list, pool.clone(), scratch, &c);
+                        let hidden = mk::up(
+                            xt(),
+                            route.clone(),
+                            list.clone(),
+                            pool.clone(),
+                            tables.clone(),
+                            &c,
+                        );
+                        scratch = mk::down(
+                            hidden,
+                            route.clone(),
+                            list,
+                            pool.clone(),
+                            tables.clone(),
+                            scratch,
+                            &c,
+                        );
                     }
                     let tiered =
                         read_f32(mk::sum(scratch, &call(t * n_used, false)), "out").unwrap();
@@ -8329,6 +8494,7 @@ mod tests {
             router,
             experts: GpuExpertBank::Resident {
                 pool: Tensor::<1, Int>::from_data(TensorData::new(all, [n]), &device),
+                tables: mk::tables_tensor(&device),
                 no_list: Tensor::<1, Int>::zeros([2], &device),
                 layout,
             },
@@ -8403,8 +8569,9 @@ mod tests {
     }
 
     /// The values of `raw`, rows of `width` elements stored as `dtype`.
-    fn decode_rows(dtype: GgmlDType, raw: &[u8], width: usize) -> Vec<f32> {
-        let row_bytes = width / dtype.block_size() * dtype.type_size();
+    fn decode_rows(dtype: impl Into<GgufType>, raw: &[u8], width: usize) -> Vec<f32> {
+        let dtype = dtype.into();
+        let row_bytes = dtype.byte_len(width).unwrap();
         let mut out = vec![0f32; raw.len() / row_bytes * width];
         for (src, dst) in raw.chunks_exact(row_bytes).zip(out.chunks_exact_mut(width)) {
             dequant_row(dtype, src, 1.0, dst).unwrap();
@@ -8431,7 +8598,11 @@ mod tests {
             let (raw, whole) = encoded_matrix(dtype, rows, width);
             for cols in [0..128, 0..64, 64..128, 32..96, 96..128, 0..32] {
                 let held = tp::column_dtype(dtype, width, &cols);
-                assert_eq!(held, dtype, "{dtype:?} {cols:?} is a byte copy");
+                assert_eq!(
+                    held,
+                    GgufType::Ggml(dtype),
+                    "{dtype:?} {cols:?} is a byte copy"
+                );
                 let mut out = Vec::new();
                 append_columns(dtype, &raw, width, &cols, held, &mut out).unwrap();
                 assert_eq!(
@@ -8444,7 +8615,7 @@ mod tests {
         for dtype in [GgmlDType::F32, GgmlDType::F16] {
             let (raw, whole) = encoded_matrix(dtype, rows, width);
             let cols = 5..77;
-            assert_eq!(tp::column_dtype(dtype, width, &cols), dtype);
+            assert_eq!(tp::column_dtype(dtype, width, &cols), GgufType::Ggml(dtype));
             let mut out = Vec::new();
             append_columns(dtype, &raw, width, &cols, dtype, &mut out).unwrap();
             assert_eq!(
@@ -8521,7 +8692,7 @@ mod tests {
         let aligned = 256..512;
         assert_eq!(
             tp::column_dtype(GgmlDType::Q6K, width, &aligned),
-            GgmlDType::Q6K
+            GgufType::Ggml(GgmlDType::Q6K)
         );
         let mut copy = Vec::new();
         append_columns(
@@ -8541,7 +8712,7 @@ mod tests {
         let cols = 32..288;
         assert_eq!(
             tp::column_dtype(GgmlDType::Q6K, width, &cols),
-            GgmlDType::Q8_0
+            GgufType::Ggml(GgmlDType::Q8_0)
         );
         let kept = host_columns(&whole, width, &cols);
         let mut q8 = Vec::new();
@@ -8549,6 +8720,50 @@ mod tests {
         let mut want = Vec::new();
         quantize_q8_0(&kept, &mut want);
         assert_eq!(q8, want);
+    }
+
+    /// The same for the I-quants, the ternary types, NVFP4 and the other
+    /// K-quants: a cut on the file's block bounds is a byte copy that decodes
+    /// to the host's columns, a cut inside a block is requantized to Q8_0.
+    /// Host only.
+    #[test]
+    fn column_cuts_of_native_block_formats() {
+        use super::super::moe_kernel::tests::random_blocks_seeded;
+
+        let (rows, width) = (3usize, 1024usize);
+        for dtype in [
+            GgufType::Ggml(GgmlDType::Q2K),
+            GgufType::Ggml(GgmlDType::Q4K),
+            GgufType::Iq4Xs,
+            GgufType::Iq2Xxs,
+            GgufType::Iq2S,
+            GgufType::Iq3S,
+            GgufType::Iq1M,
+            GgufType::Tq1_0,
+            GgufType::Nvfp4,
+        ] {
+            let raw = random_blocks_seeded(dtype, rows * width, 5);
+            let whole = decode_rows(dtype, &raw, width);
+            let aligned = 256..768;
+            let held = tp::column_dtype(dtype, width, &aligned);
+            assert_eq!(held, dtype, "{dtype:?}");
+            let mut copy = Vec::new();
+            append_columns(dtype, &raw, width, &aligned, held, &mut copy).unwrap();
+            assert_eq!(
+                decode_rows(dtype, &copy, aligned.len()),
+                host_columns(&whole, width, &aligned),
+                "{dtype:?}"
+            );
+
+            let cols = 32..800;
+            let held = tp::column_dtype(dtype, width, &cols);
+            assert_eq!(held, GgufType::Ggml(GgmlDType::Q8_0), "{dtype:?}");
+            let mut q8 = Vec::new();
+            append_columns(dtype, &raw, width, &cols, held, &mut q8).unwrap();
+            let mut want = Vec::new();
+            quantize_q8_0(&host_columns(&whole, width, &cols), &mut want);
+            assert_eq!(q8, want, "{dtype:?}");
+        }
     }
 
     /// The GPU devices under test, as `test_devices` plus a repeat of the
