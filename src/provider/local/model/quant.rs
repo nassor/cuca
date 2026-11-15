@@ -55,27 +55,14 @@ pub(crate) fn dequant_row(
 ) -> Result<(), CucaError> {
     match dtype.into() {
         GgufType::Ggml(d) => dequant_ggml_row(d, bytes, scale, out),
-        ty @ (GgufType::Iq4Nl | GgufType::Mxfp4) => {
-            check_row(ty, bytes, out)?;
-            for (b, o) in bytes
-                .chunks_exact(ty.type_size().unwrap_or(1))
-                .zip(out.as_chunks_mut::<32>().0)
-            {
-                let (lo, hi) = o.split_at_mut(16);
-                if ty == GgufType::Iq4Nl {
-                    let d = half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32() * scale;
-                    for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[2..18]) {
-                        *lo = f32::from(iq_tables::KVALUES_IQ4NL[usize::from(q & 0x0F)]) * d;
-                        *hi = f32::from(iq_tables::KVALUES_IQ4NL[usize::from(q >> 4)]) * d;
-                    }
-                } else {
-                    let d = e8m0_half(b[0]) * scale;
-                    for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[1..17]) {
-                        *lo = f32::from(iq_tables::KVALUES_FP4[usize::from(q & 0x0F)]) * d;
-                        *hi = f32::from(iq_tables::KVALUES_FP4[usize::from(q >> 4)]) * d;
-                    }
-                }
-            }
+        GgufType::Iq4Nl => {
+            check_row(GgufType::Iq4Nl, bytes, out)?;
+            decode_blocks(bytes, 1.0, out, |b, o| iquants::dequant_iq4_nl(b, scale, o));
+            Ok(())
+        }
+        GgufType::Mxfp4 => {
+            check_row(GgufType::Mxfp4, bytes, out)?;
+            decode_blocks(bytes, 1.0, out, |b, o| iquants::dequant_mxfp4(b, scale, o));
             Ok(())
         }
         GgufType::I8 => {

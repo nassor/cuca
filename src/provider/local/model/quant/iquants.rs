@@ -576,6 +576,17 @@ pub(crate) fn unpack_iq1_m(b: &[u8; IQ1_M_BYTES], out: &mut Unpacked) {
     }
 }
 
+/// Decode one IQ4_NL block (32 values), the f16 `d` folded with `scale` before
+/// the table values are multiplied (`dequant_row`'s convention for this type).
+pub(crate) fn dequant_iq4_nl(b: &[u8; IQ4_NL_BYTES], scale: f32, out: &mut [f32; QK32]) {
+    let d = f16_at(b, 0) * scale;
+    let (lo, hi) = out.split_at_mut(16);
+    for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[2..]) {
+        *lo = f32::from(KVALUES_IQ4NL[usize::from(q & 0x0F)]) * d;
+        *hi = f32::from(KVALUES_IQ4NL[usize::from(q >> 4)]) * d;
+    }
+}
+
 /// Unpack one IQ4_NL block: 32 values in one sub-block, raw quants the table
 /// values (-127 to 113), `sc` 1, `d`.
 pub(crate) fn unpack_iq4_nl(b: &[u8; IQ4_NL_BYTES], out: &mut Unpacked) {
@@ -720,6 +731,18 @@ pub(crate) fn unpack_tq2_0(b: &[u8; TQ2_0_BYTES], out: &mut Unpacked) {
                 *y = ((q >> (2 * l)) & 3).cast_signed() - 1;
             }
         }
+    }
+}
+
+/// Decode one MXFP4 block (32 values), the E8M0 half scale folded with `scale`
+/// before the doubled E2M1 values are multiplied (`dequant_row`'s convention
+/// for this type).
+pub(crate) fn dequant_mxfp4(b: &[u8; MXFP4_BYTES], scale: f32, out: &mut [f32; QK32]) {
+    let d = e8m0_half(b[0]) * scale;
+    let (lo, hi) = out.split_at_mut(16);
+    for ((lo, hi), &q) in lo.iter_mut().zip(hi).zip(&b[1..]) {
+        *lo = f32::from(KVALUES_FP4[usize::from(q & 0x0F)]) * d;
+        *hi = f32::from(KVALUES_FP4[usize::from(q >> 4)]) * d;
     }
 }
 
