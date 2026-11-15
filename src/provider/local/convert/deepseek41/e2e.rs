@@ -1129,32 +1129,81 @@ fn a_missing_checkpoint_tensor_fails_the_conversion_naming_it() {
     }
 }
 
+/// The matrices a K-quant mix stores in a 64-wide model (no row fills a 256
+/// block, so llama.cpp's fallbacks apply), the experts native, the Engram table
+/// at `engram_quant`.
 #[test]
-fn a_k_quant_mix_is_refused_before_anything_is_written() {
+fn a_k_quant_mix_types_the_matrices_and_keeps_experts_and_engram() {
     let fixture = checkpoint(true, &[]);
-    let ck = CheckpointDir::open(&fixture.dir).unwrap();
-    for quant in [
-        WeightQuant::Q4KS,
-        WeightQuant::Q4KM,
-        WeightQuant::Q5KM,
-        WeightQuant::Q6K,
+    // (quant, token_embd, ffn_down_shexp of layer 0 and of layer 1): two layers
+    // make `use_more_bits` true for layer 1 only, and Q6_K falls back to Q8_0.
+    for (quant, embd, down0, down1) in [
+        (WeightQuant::Q4KM, "Q5_0", "Q5_0", "Q8_0"),
+        (WeightQuant::Q5KM, "Q5_1", "Q5_1", "Q8_0"),
+        (WeightQuant::Q4KS, "Q5_0", "Q5_0", "Q5_0"),
+        (WeightQuant::Q6K, "Q8_0", "Q8_0", "Q8_0"),
     ] {
-        let out = fixture.dir.join("kquant").join("model.gguf");
         let config = ConvertConfig {
             quant,
-            ..f16_exact()
+            ..ConvertConfig::default()
         };
-        for role in [Role::Main, Role::Drafter] {
-            let e = convert_set(&ck, &out, config, role, None)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                e.contains(quant.name()) && e.contains("DeepSeek-V4.1"),
-                "{e}"
-            );
-            assert!(converted(&out, role).is_none());
+        let (_, first) = convert_fixture(&fixture, quant.name(), config, Role::Main);
+        let content = Content::open(&first).unwrap();
+        let dtype = |name: &str| content.info(name).unwrap().dtype.name().to_string();
+        let what = quant.name();
+        assert_eq!(dtype("token_embd.weight"), embd, "{what}");
+        // The head's row (64) is no multiple of 256: Q8_0 before the table.
+        assert_eq!(dtype("output.weight"), "Q8_0", "{what}");
+        assert_eq!(dtype("blk.0.ffn_down_shexp.weight"), down0, "{what}");
+        assert_eq!(dtype("blk.1.ffn_down_shexp.weight"), down1, "{what}");
+        assert_eq!(dtype("blk.1.ffn_up_exps.weight"), "MXFP4", "{what}");
+        assert_eq!(dtype("blk.0.ffn_down_exps.weight"), "MXFP4", "{what}");
+        assert_eq!(dtype("per_layer_token_embd.weight"), "Q8_0", "{what}");
+        assert_eq!(dtype("blk.1.attn_compressor_gate.weight"), "F16", "{what}");
+        assert_eq!(dtype("blk.0.ffn_gate_inp.weight"), "F32", "{what}");
+        assert_eq!(dtype("blk.0.engram_gate.weight"), "F32", "{what}");
+        for (name, (_, expected)) in &fixture.main.want {
+            let (ty, _, got) = values(&content, name);
+            let step = match ty.name().as_str() {
+                "MXFP4" | "F32" | "F16" => {
+                    assert_eq!(&got, expected, "{what} {name}");
+                    continue;
+                }
+                "Q8_0" => |amax: f32, _range: f32| amax / 127.0 * 0.51,
+                // One step: Q5_0 clamps the block's most negative extreme.
+                "Q5_0" => |amax: f32, _range: f32| amax / 16.0 * 1.02,
+                "Q5_1" => |_amax: f32, range: f32| range / 31.0 * 0.6,
+                other => panic!("{what} {name} is stored as {other}"),
+            };
+            for (g, w) in got.chunks(32).zip(expected.chunks(32)) {
+                let amax = w.iter().fold(0f32, |m, x| m.max(x.abs()));
+                let range = w.iter().fold(f32::MIN, |m, x| m.max(*x))
+                    - w.iter().fold(f32::MAX, |m, x| m.min(*x));
+                for (a, b) in g.iter().zip(w) {
+                    assert!(
+                        (a - b).abs() <= step(amax, range) + 1e-5,
+                        "{what} {name}: {a} vs {b}"
+                    );
+                }
+            }
         }
     }
+}
+
+#[test]
+fn a_k_quant_mix_converts_the_drafter_and_keeps_its_experts() {
+    let fixture = checkpoint(true, &[]);
+    let config = ConvertConfig {
+        quant: WeightQuant::Q4KM,
+        ..ConvertConfig::default()
+    };
+    let (out, path) = convert_fixture(&fixture, "kdrafter", config, Role::Drafter);
+    assert_eq!(converted(&out, Role::Drafter), Some(path.clone()));
+    let content = Content::open(&path).unwrap();
+    let dtype = |name: &str| content.info(name).unwrap().dtype.name().to_string();
+    assert_eq!(dtype("blk.0.ffn_up_exps.weight"), "MXFP4");
+    // A 64-wide `fc` falls back from Q4_K to Q5_0.
+    assert_eq!(dtype("fc.weight"), "Q5_0");
 }
 
 #[test]

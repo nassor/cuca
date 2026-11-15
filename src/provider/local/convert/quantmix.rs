@@ -44,34 +44,62 @@ pub(crate) struct ModelInfo {
     pub(crate) n_layer: usize,
 }
 
+/// A tensor as the type choice sees it: its name and row-major shape.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Shape<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) dims: &'a [usize],
+}
+
 /// The storage type of each plan under `quant`, in plan order.
 ///
 /// # Errors
 ///
-/// [`CucaError::Config`] for a mixture of experts whose `ffn_down` tensor has
-/// no `blk.<layer>.` prefix.
+/// As [`assign_shapes`].
 pub(crate) fn assign(
     plans: &[Plan],
     quant: WeightQuant,
     info: &ModelInfo,
 ) -> Result<Vec<Dtype>, CucaError> {
-    if !quant.is_mixed() {
-        return Ok(plans.iter().map(|p| uniform(p, quant)).collect());
-    }
-    Mix::new(plans, quant, info).assign(plans)
+    let shapes: Vec<Shape<'_>> = plans
+        .iter()
+        .map(|p| Shape {
+            name: &p.name,
+            dims: &p.dims,
+        })
+        .collect();
+    assign_shapes(&shapes, quant, info)
 }
 
-/// The storage type of `plan` at a uniform precision.
-fn uniform(plan: &Plan, quant: WeightQuant) -> Dtype {
-    let cols = plan.dims.last().copied().unwrap_or(1);
-    if !is_matmul(&plan.name, plan.dims.len()) {
+/// [`assign`] over tensors given by name and shape (DeepSeek-V4.1 plans its
+/// tensors without [`Plan`]s). Tensors that are not weight matrices get F32.
+///
+/// # Errors
+///
+/// [`CucaError::Config`] for a mixture of experts whose `ffn_down` tensor has
+/// no `blk.<layer>.` prefix.
+pub(crate) fn assign_shapes(
+    shapes: &[Shape<'_>],
+    quant: WeightQuant,
+    info: &ModelInfo,
+) -> Result<Vec<Dtype>, CucaError> {
+    if !quant.is_mixed() {
+        return Ok(shapes.iter().map(|s| uniform(s, quant)).collect());
+    }
+    Mix::new(shapes, quant, info).assign(shapes)
+}
+
+/// The storage type of a tensor at a uniform precision.
+fn uniform(shape: &Shape<'_>, quant: WeightQuant) -> Dtype {
+    let cols = shape.dims.last().copied().unwrap_or(1);
+    if !is_matmul(shape.name, shape.dims.len()) {
         return Dtype::F32;
     }
     // llama.cpp's Q4_0 mixes keep the embedding table and the output head
     // (the tied head too) above 4 bits: the published Gemma 4 E2B Q4_0
     // has `token_embd` at Q8_0 and `per_layer_model_proj` at half
     // precision, everything else at Q4_0. `q4_0` follows it.
-    let dtype = match (quant, plan.name.as_str()) {
+    let dtype = match (quant, shape.name) {
         (WeightQuant::F16, _) => Dtype::F16,
         (WeightQuant::Q4_0, "token_embd.weight" | "output.weight") => Dtype::Q8_0,
         (WeightQuant::Q4_0, "per_layer_model_proj.weight") => Dtype::F16,
@@ -171,11 +199,11 @@ struct Mix {
 }
 
 impl Mix {
-    fn new(plans: &[Plan], quant: WeightQuant, info: &ModelInfo) -> Self {
-        let n_expert = plans
+    fn new(shapes: &[Shape<'_>], quant: WeightQuant, info: &ModelInfo) -> Self {
+        let n_expert = shapes
             .iter()
-            .filter(|p| p.name.contains("_exps.") && p.dims.len() == 3)
-            .map(|p| p.dims[0])
+            .filter(|s| s.name.contains("_exps.") && s.dims.len() == 3)
+            .map(|s| s.dims[0])
             .max()
             .unwrap_or(1)
             .max(1);
@@ -185,19 +213,19 @@ impl Mix {
             n_expert,
             // llama.cpp's `n_layer_all` is the file's `block_count`, the
             // multi-token-prediction blocks included.
-            n_layer: plans
+            n_layer: shapes
                 .iter()
-                .filter_map(|p| layer_of(&p.name))
+                .filter_map(|s| layer_of(s.name))
                 .max()
                 .map_or(0, |l| l + 1)
                 .max(info.n_layer),
-            n_attention_wv: plans
+            n_attention_wv: shapes
                 .iter()
-                .filter(|p| Category::of(&p.name).is_attn_v())
+                .filter(|s| Category::of(s.name).is_attn_v())
                 .count(),
             i_attention_wv: 0,
             i_ffn_down: 0,
-            tied_embeddings: !plans.iter().any(|p| p.name == "output.weight"),
+            tied_embeddings: !shapes.iter().any(|s| s.name == "output.weight"),
         }
     }
 
@@ -210,25 +238,25 @@ impl Mix {
         }
     }
 
-    fn assign(mut self, plans: &[Plan]) -> Result<Vec<Dtype>, CucaError> {
+    fn assign(mut self, shapes: &[Shape<'_>]) -> Result<Vec<Dtype>, CucaError> {
         // llama.cpp's tensor map orders by layer (tensors outside one first),
         // then by name; the counters depend on that order.
-        let mut order: Vec<usize> = (0..plans.len()).collect();
+        let mut order: Vec<usize> = (0..shapes.len()).collect();
         order.sort_by(|&a, &b| {
-            let key = |i: usize| (layer_of(&plans[i].name), plans[i].name.as_str());
+            let key = |i: usize| (layer_of(shapes[i].name), shapes[i].name);
             key(a).cmp(&key(b))
         });
-        let mut out = vec![Dtype::F32; plans.len()];
+        let mut out = vec![Dtype::F32; shapes.len()];
         for i in order {
-            out[i] = self.tensor(&plans[i])?;
+            out[i] = self.tensor(&shapes[i])?;
         }
         Ok(out)
     }
 
     /// `llama_tensor_get_type`: the type of one tensor, advancing the counters.
-    fn tensor(&mut self, plan: &Plan) -> Result<Dtype, CucaError> {
-        let name = plan.name.as_str();
-        if !is_matmul(name, plan.dims.len()) {
+    fn tensor(&mut self, shape: &Shape<'_>) -> Result<Dtype, CucaError> {
+        let name = shape.name;
+        if !is_matmul(name, shape.dims.len()) {
             return Ok(Dtype::F32);
         }
         // `tensor_allows_quantization` excludes it: it keeps the source type
@@ -236,7 +264,7 @@ impl Mix {
         if name.contains("per_layer_model_proj") {
             return Ok(Dtype::F16);
         }
-        let cols = plan.dims.last().copied().unwrap_or(1);
+        let cols = shape.dims.last().copied().unwrap_or(1);
         let ty = self.choose(name, cols)?;
         Ok(fallback(ty, cols))
     }

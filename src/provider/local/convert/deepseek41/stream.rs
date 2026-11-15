@@ -605,6 +605,42 @@ mod tests {
     }
 
     #[test]
+    fn a_streamed_k_quant_matrix_equals_one_shot_encoding_at_any_blocking() {
+        // 256 columns: whole K-quant blocks per row, 8 scale columns.
+        let (rows, cols) = (70, 256);
+        let weight = fp8_bytes(rows * cols, 5);
+        let grid: Vec<u8> = (0..24).map(|i| 124 + i as u8 % 5).collect();
+        let (shards, dir) = shards(
+            "kmatrix",
+            &[
+                ("m.weight", "F8_E4M3", &[rows, cols], weight.clone()),
+                ("m.scale", "F8_E8M0", &[3, 8], grid.clone()),
+            ],
+        );
+        let values = dequantized(&weight, &grid, rows, cols);
+        for dtype in [Dtype::Q4K, Dtype::Q5K, Dtype::Q6K, Dtype::Q5_0, Dtype::Q5_1] {
+            let mut want = Vec::new();
+            encode(dtype, &values, &mut want).unwrap();
+            let it = item(
+                "m",
+                &[rows, cols],
+                dtype,
+                Source::Matrix {
+                    tensor: "m.weight".into(),
+                },
+            );
+            for block_elems in [1, cols * 5, cols * 33, 1 << 20] {
+                assert_eq!(
+                    collect(&it, &shards, block_elems).unwrap(),
+                    want,
+                    "{dtype:?} {block_elems}"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn float_matrices_and_vectors_stream_as_they_are() {
         let values: Vec<f32> = (0..24).map(|i| i as f32 * 0.25 - 3.0).collect();
         let bf16: Vec<u8> = values
