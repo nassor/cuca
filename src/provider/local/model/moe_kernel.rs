@@ -2760,6 +2760,40 @@ pub(crate) mod tests {
         }
     }
 
+    /// The expert slots of Qwen3-30B-A3B (2048 inputs, 768 features; the mixes
+    /// of its IQ2_XXS and Q4_K_M files) hold the file's bytes plus at most 3
+    /// bytes of word padding per block, and a layer's 128 slots fit one device
+    /// buffer: the 10 GB IQ2_XXS file must stay near 10 GB on a 16 GB card.
+    #[test]
+    fn native_expert_slots_at_the_real_shape_hold_the_files_bytes() {
+        let (n_embd, ff, n_expert) = (2048usize, 768usize, 128usize);
+        let mixes = [
+            [GgufType::Iq2Xxs, GgufType::Iq2Xxs, GgufType::Iq3Xxs],
+            [GgufType::Iq2Xxs, GgufType::Iq2Xxs, GgufType::Iq4Xs],
+            [
+                GgufType::Ggml(GgmlDType::Q4K),
+                GgufType::Ggml(GgmlDType::Q4K),
+                GgufType::Ggml(GgmlDType::Q6K),
+            ],
+        ];
+        for dtypes in mixes {
+            let layout = SlotLayout::new(n_embd, ff, dtypes).unwrap();
+            let [gate, up, down] = dtypes;
+            let file = gate.byte_len(n_embd).unwrap() * ff
+                + up.byte_len(n_embd).unwrap() * ff
+                + down.byte_len(ff).unwrap() * n_embd;
+            let blocks = ff * n_embd / gate.block_size().unwrap()
+                + ff * n_embd / up.block_size().unwrap()
+                + n_embd * ff / down.block_size().unwrap();
+            assert!(
+                layout.bytes() >= file && layout.bytes() - file <= 3 * blocks,
+                "{dtypes:?}: {} device bytes for {file} file bytes",
+                layout.bytes()
+            );
+            assert!(n_expert * layout.bytes() <= 1 << 30, "{dtypes:?}");
+        }
+    }
+
     /// The word-major words read back as the file's bytes, in both orders.
     #[test]
     fn native_words_are_the_files_bytes_word_major() {

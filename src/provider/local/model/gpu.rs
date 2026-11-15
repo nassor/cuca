@@ -2238,6 +2238,30 @@ impl Weights {
     }
 }
 
+/// Run `load`, whose device allocations (weights and K/V pools, which live as
+/// long as the model) are served by burn's persistent pool: exact-fit slices.
+/// The default pool carves every allocation from pages sized to the largest
+/// one it has served, so a layer-by-layer upload of expert pools of unequal
+/// sizes strands the tail of each page (0.7 GB of a 10 GB model) and a
+/// nearly full card fails on the last layers.
+fn persistent<I: Send, T: Send>(device: &Device, input: I, load: impl Fn(I) -> T + Send) -> T {
+    device.memory_persistent_allocations(input, load)
+}
+
+/// Wait for `devices`' queued uploads and fail if one did not land. Uploads
+/// queue: a failed one (out of device memory) would otherwise surface at the
+/// first read of a forward pass, long after the load reported success.
+fn finish_upload<'a>(devices: impl IntoIterator<Item = &'a Device>) -> Result<(), CucaError> {
+    for device in devices {
+        device.sync().map_err(|e| {
+            err(format!(
+                "the device failed while the model loaded (most likely out of memory: lower `context_length` or `batching.kv_tokens`): {e}"
+            ))
+        })?;
+    }
+    Ok(())
+}
+
 /// The K/V pool of every K/V-owning layer of `hp`, zeroed on `device`, `[n_blocks,
 /// n_kv_head, BLOCK_SIZE, head_dim]` with the block count of the layer's group
 /// in `layout`; `None` for the layers that share another layer's pool or have
@@ -2664,15 +2688,19 @@ impl GpuTransformer {
         let mut weights: Vec<Weights> = Vec::with_capacity(world);
         for (shard, device) in devices.iter().enumerate() {
             let mut reader = WeightReader::open(content, device, host.clone());
-            weights.push(Weights::load(
-                &mut reader,
-                &hp,
-                Tp { world, shard },
-                context_length,
-                plan,
-                first,
-                engram_rows.clone(),
-            )?);
+            let tp = Tp { world, shard };
+            let loaded = persistent(device, &mut reader, |reader| {
+                Weights::load(
+                    reader,
+                    &hp,
+                    tp,
+                    context_length,
+                    plan,
+                    first,
+                    engram_rows.clone(),
+                )
+            });
+            weights.push(loaded?);
         }
         if let Some((tiers, plan)) = &tiers
             && let Some(heat) = &tiers.warm_from
@@ -2686,13 +2714,15 @@ impl GpuTransformer {
         let kv = weights
             .iter()
             .map(|w| {
-                alloc_pools(
-                    &w.hp,
-                    &layout,
-                    &w.device,
-                    first,
-                    back.map_or(&[][..], |b| &b.mirror),
-                )
+                persistent(&w.device, (), |()| {
+                    alloc_pools(
+                        &w.hp,
+                        &layout,
+                        &w.device,
+                        first,
+                        back.map_or(&[][..], |b| &b.mirror),
+                    )
+                })
             })
             .collect::<Result<Vec<_>, _>>()?;
         #[cfg(test)]
@@ -2730,6 +2760,7 @@ impl GpuTransformer {
         } else {
             Vec::new()
         };
+        finish_upload(weights.iter().map(|w| &w.device))?;
         Ok(Self {
             weights,
             collective: Collective::new(&locals, &devices),
@@ -3466,9 +3497,13 @@ impl GpuDrafter {
         }
         let (n_embd, n_embd_out) = (hp.n_embd, hp.n_embd_out);
         let mut reader = WeightReader::open(content, &target.weights[0].device, None);
-        let pre = reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?;
-        let post = reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?;
-        let net = Weights::load(&mut reader, &hp, Tp::SOLO, context_length, None, 0, None)?;
+        let (pre, post, net) = persistent(&target.weights[0].device, &mut reader, |reader| {
+            Ok::<_, CucaError>((
+                reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?,
+                reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?,
+                Weights::load(reader, &hp, Tp::SOLO, context_length, None, 0, None)?,
+            ))
+        })?;
         let vocab = net.head_parts()?.lm_head.rows();
         if vocab != target.vocab() {
             return Err(err(format!(
@@ -3476,6 +3511,7 @@ impl GpuDrafter {
                 target.vocab()
             )));
         }
+        finish_upload([&target.weights[0].device])?;
         Ok(Self {
             net,
             pre,

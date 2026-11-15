@@ -128,8 +128,8 @@
 //!   times 16 times `n_kv_head` times `head_dim` per block (f32 keys and
 //!   values) per K/V-owning layer, with that layer's own head count and head
 //!   dimension. Layers with the same window share block ids (a group). A
-//!   full-attention group holds `kv_tokens` positions (twice
-//!   `context_length` by default) shared by every running sequence and the
+//!   full-attention group holds `kv_tokens` positions (twice `context_length`
+//!   by default on the CPU, one context plus at most 4096 on a GPU) shared by every running sequence and the
 //!   cached prefixes, so a finished request's blocks stay cached while the
 //!   next runs; a sliding-window group holds `ceil((window - 1 + rows) / 16) +
 //!   2` blocks per running sequence plus up to `kv_tokens - context_length`
