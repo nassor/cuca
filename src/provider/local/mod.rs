@@ -56,8 +56,10 @@
 //! weights are dequantized); any other architecture fails
 //! before a weight is downloaded) and writes the file llama.cpp would write
 //! (compared with its output tensor by tensor, see the local-provider docs). [`WeightQuant`]
-//! (`LocalModelConfig::convert`, `f16`, `q8_0` by default, or `q4_0`) sets
-//! the matrix precision; each precision is converted once and cached.
+//! (`LocalModelConfig::convert`: `f16`, `q8_0` by default, `q4_0`, or the K-quant
+//! mixes `q4_k_s`, `q4_k_m`, `q5_k_m` and `q6_k`, whose per-tensor types follow
+//! llama.cpp's `llama-quantize`) sets the matrix precision; each precision is
+//! converted once and cached.
 //! Conversion streams tensor by tensor (peak memory is one whole tensor in
 //! `f32` when it is rearranged, as the Q/K permutation is, otherwise two
 //! 32 MiB blocks of one tensor), and reports its progress through
@@ -1122,8 +1124,13 @@ impl From<ModelSource> for DrafterSource {
 /// this precision (at `Q4_0` the token embedding and the output head stay at
 /// Q8_0 and Gemma 4's `per_layer_model_proj` at F16, as in llama.cpp's Q4_0
 /// files); norms, biases, scales, RoPE factors, the router and the
-/// recurrent-layer parameters stay `f32`. Parses from a string (`str::parse`,
-/// ASCII case-insensitive): `f16`, `q8_0` or `q4_0`.
+/// recurrent-layer parameters stay `f32`. The four K-quant mixes
+/// ([`WeightQuant::Q4KS`], [`WeightQuant::Q4KM`], [`WeightQuant::Q5KM`],
+/// [`WeightQuant::Q6K`]) are llama.cpp's file types of the same names: each
+/// tensor's type follows `llama_tensor_get_type` and the bytes are those of
+/// `llama-quantize` without an importance matrix. Parses from a string
+/// (`str::parse`, ASCII case-insensitive): `f16`, `q8_0`, `q4_0`, `q4_k_s`,
+/// `q4_k_m`, `q5_k_m` or `q6_k`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum WeightQuant {
     /// IEEE half precision: 2 bytes per weight, the closest to the checkpoint.
@@ -1135,17 +1142,52 @@ pub enum WeightQuant {
     /// 4-bit blocks of 32 (4.5 bits per weight): smallest and fastest, with
     /// visible quantization noise on small models.
     Q4_0,
+    /// llama.cpp's `Q4_K_S`: Q4_K (4.5 bits per weight) everywhere, with Q5_K
+    /// for the first four attention value projections and the first eighth of
+    /// the FFN down projections, and Q6_K for the output head.
+    Q4KS,
+    /// llama.cpp's `Q4_K_M`: Q4_K with Q6_K for every attention value and FFN
+    /// down projection of the first and last eighth of the layers and of every
+    /// third layer in between, and for the output head.
+    Q4KM,
+    /// llama.cpp's `Q5_K_M`: Q5_K (5.5 bits per weight) with Q6_K for the same
+    /// tensors as [`WeightQuant::Q4KM`].
+    Q5KM,
+    /// llama.cpp's `Q6_K`: Q6_K (6.56 bits per weight) everywhere.
+    Q6K,
 }
 
 impl WeightQuant {
-    /// The lowercase name: `f16`, `q8_0` or `q4_0`; also the stem suffix of the
-    /// converted file (`model-q8_0.gguf`).
+    /// Every precision, in the order of the docs.
+    const ALL: [Self; 7] = [
+        Self::F16,
+        Self::Q8_0,
+        Self::Q4_0,
+        Self::Q4KS,
+        Self::Q4KM,
+        Self::Q5KM,
+        Self::Q6K,
+    ];
+
+    /// The lowercase name: `f16`, `q8_0`, `q4_0`, `q4_k_s`, `q4_k_m`, `q5_k_m`
+    /// or `q6_k`; also the stem suffix of the converted file
+    /// (`model-q8_0.gguf`).
     pub fn name(self) -> &'static str {
         match self {
             Self::F16 => "f16",
             Self::Q8_0 => "q8_0",
             Self::Q4_0 => "q4_0",
+            Self::Q4KS => "q4_k_s",
+            Self::Q4KM => "q4_k_m",
+            Self::Q5KM => "q5_k_m",
+            Self::Q6K => "q6_k",
         }
+    }
+
+    /// Whether each tensor's type is chosen by llama.cpp's mixing rules (the
+    /// K-quant file types) rather than being one type for every matrix.
+    pub(crate) fn is_mixed(self) -> bool {
+        matches!(self, Self::Q4KS | Self::Q4KM | Self::Q5KM | Self::Q6K)
     }
 }
 
@@ -1154,12 +1196,12 @@ impl std::str::FromStr for WeightQuant {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         let s = s.trim();
-        [Self::F16, Self::Q8_0, Self::Q4_0]
+        Self::ALL
             .into_iter()
             .find(|q| q.name().eq_ignore_ascii_case(s))
             .ok_or_else(|| {
                 CucaError::Config(format!(
-                    "unknown weight quantization `{s}`; expected f16, q8_0 or q4_0"
+                    "unknown weight quantization `{s}`; expected f16, q8_0, q4_0, q4_k_s, q4_k_m, q5_k_m or q6_k"
                 ))
             })
     }
@@ -3359,6 +3401,26 @@ shard_dirs "E:/parts" "F:/parts"
 
         // An empty document is the default configuration.
         assert_same(&kdl("").unwrap(), &LocalModelConfig::default());
+    }
+
+    #[test]
+    fn every_weight_quant_deserializes_from_kdl() {
+        for (text, want) in [
+            ("f16", WeightQuant::F16),
+            ("q8_0", WeightQuant::Q8_0),
+            ("q4_0", WeightQuant::Q4_0),
+            ("q4_k_s", WeightQuant::Q4KS),
+            ("q4_k_m", WeightQuant::Q4KM),
+            ("Q5_K_M", WeightQuant::Q5KM),
+            ("q6_k", WeightQuant::Q6K),
+        ] {
+            let config = kdl(&format!(r#"convert quant="{text}""#)).unwrap();
+            assert_eq!(config.convert.quant, want, "{text}");
+            assert_eq!(want.name(), text.to_ascii_lowercase());
+            assert_eq!(want.name().parse::<WeightQuant>().unwrap(), want);
+        }
+        let e = kdl(r#"convert quant="q3_k_m""#).unwrap_err().to_string();
+        assert!(e.contains("q3_k_m") && e.contains("q6_k"), "{e}");
     }
 
     #[test]

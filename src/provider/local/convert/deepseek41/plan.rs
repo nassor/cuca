@@ -237,16 +237,17 @@ const EXPERT_STACKS: [(&str, &str); 3] = [
 
 /// The storage type of a matrix at `quant`: the token embedding, the output head
 /// and the markov tables stay at Q8_0 under Q4_0; a row that does not fill whole
-/// blocks falls back to `f32`.
+/// blocks falls back to `f32`. [`plan`] rejects the K-quant mixes before any
+/// matrix is typed.
 fn matrix_dtype(quant: WeightQuant, gguf_name: &str, cols: usize) -> Dtype {
     let dtype = match (quant, gguf_name) {
         (WeightQuant::F16, _) => Dtype::F16,
-        (WeightQuant::Q8_0, _) => Dtype::Q8_0,
         (
             WeightQuant::Q4_0,
             "token_embd.weight" | "output.weight" | "markov_w1.weight" | "markov_w2.weight",
         ) => Dtype::Q8_0,
         (WeightQuant::Q4_0, _) => Dtype::Q4_0,
+        _ => Dtype::Q8_0,
     };
     if cols.is_multiple_of(dtype.block_size()) {
         dtype
@@ -475,7 +476,10 @@ impl Planner<'_> {
 /// # Errors
 ///
 /// [`CucaError::Config`] naming a missing tensor, a tensor of a type or shape the
-/// converter does not read, or a checkpoint tensor no rule accounts for.
+/// converter does not read, or a checkpoint tensor no rule accounts for; also a
+/// K-quant `quant` (`q4_k_s`, `q4_k_m`, `q5_k_m`, `q6_k`): the routed experts
+/// are MXFP4 and the dense matrices FP8, a mix llama.cpp's K-quant rules do not
+/// describe.
 pub(super) fn plan(
     index: &dyn Index,
     cfg: &Config,
@@ -483,6 +487,12 @@ pub(super) fn plan(
     engram_quant: EngramQuant,
     role: Role,
 ) -> Result<Plan, CucaError> {
+    if quant.is_mixed() {
+        return Err(cfg_err(format!(
+            "DeepSeek-V4.1 converts at f16, q8_0 or q4_0, not `{}`: its experts stay MXFP4 and the K-quant mixes of llama.cpp do not cover its layout",
+            quant.name()
+        )));
+    }
     let mut p = Planner {
         index,
         cfg,

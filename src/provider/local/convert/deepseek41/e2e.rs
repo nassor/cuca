@@ -1130,6 +1130,34 @@ fn a_missing_checkpoint_tensor_fails_the_conversion_naming_it() {
 }
 
 #[test]
+fn a_k_quant_mix_is_refused_before_anything_is_written() {
+    let fixture = checkpoint(true, &[]);
+    let ck = CheckpointDir::open(&fixture.dir).unwrap();
+    for quant in [
+        WeightQuant::Q4KS,
+        WeightQuant::Q4KM,
+        WeightQuant::Q5KM,
+        WeightQuant::Q6K,
+    ] {
+        let out = fixture.dir.join("kquant").join("model.gguf");
+        let config = ConvertConfig {
+            quant,
+            ..f16_exact()
+        };
+        for role in [Role::Main, Role::Drafter] {
+            let e = convert_set(&ck, &out, config, role, None)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                e.contains(quant.name()) && e.contains("DeepSeek-V4.1"),
+                "{e}"
+            );
+            assert!(converted(&out, role).is_none());
+        }
+    }
+}
+
+#[test]
 fn a_directory_source_converts_in_place_and_the_drafter_resolves_to_its_own_file() {
     use crate::provider::local::{
         DrafterSource, LocalModelConfig, ModelSource, resolve_drafter_path, resolve_model_path,

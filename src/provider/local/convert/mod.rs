@@ -47,6 +47,10 @@ mod oracle_dflash;
 mod oracle_ds41;
 #[cfg(test)]
 mod oracle_local;
+#[cfg(test)]
+mod quant_e2e;
+pub(crate) mod quantmix;
+mod refquant;
 pub(crate) mod safetensors;
 pub(crate) mod spm;
 pub(crate) mod tekken;
@@ -279,17 +283,26 @@ pub(crate) fn write_atomically(
 }
 
 /// Stream the GGUF file `partial`: the metadata `kv`, then every plan's
-/// tensor read from `shards` at `quant`. `progress` receives the plans
-/// written so far and their count.
+/// tensor read from `shards`, stored as [`quantmix::assign`] chooses for
+/// `quant` and `info`. `progress` receives the plans written so far and their
+/// count.
 pub(super) fn write_plans(
     partial: &Path,
     kv: &[(String, Value)],
     plans: &[Plan],
     shards: &Shards,
-    quant: WeightQuant,
+    (quant, info): (WeightQuant, &quantmix::ModelInfo),
     progress: Option<&DownloadProgressCallback>,
 ) -> Result<(), CucaError> {
-    let specs: Vec<_> = plans.iter().map(|p| p.spec(quant)).collect();
+    // llama.cpp's `n_layer_all`: the file's block count.
+    let n_layer = kv
+        .iter()
+        .find(|(k, _)| k.ends_with(".block_count"))
+        .and_then(|(_, v)| v.to_u32().ok())
+        .map_or(0, |n| n as usize);
+    let info = quantmix::ModelInfo { n_layer, ..*info };
+    let dtypes = quantmix::assign(plans, quant, &info)?;
+    let specs: Vec<_> = plans.iter().zip(dtypes).map(|(p, d)| p.spec(d)).collect();
     let file = File::create(partial)?;
     let mut writer = GgufWriter::start(BufWriter::with_capacity(WRITE_BUFFER, file), kv, &specs)?;
     let total = plans.len() as u64;
@@ -352,7 +365,18 @@ fn convert_locked(
         Tokenizer::from_gguf(&md)
             .map_err(|e| cfg_err(format!("the converted tokenizer does not load: {e}")))?;
     }
-    write_plans(partial, &kv, &plans, &shards, quant, progress)
+    // llama.cpp's `LLM_TYPE_70B`, the one model-size check of its type table.
+    let llama_70b = arch == ConvArch::Llama && hp.n_layer()? == 80 && {
+        let n_head = hp.n_head()?;
+        hp.uint(&["num_key_value_heads", "n_kv_heads"])
+            .unwrap_or(n_head)
+            != n_head
+    };
+    let info = quantmix::ModelInfo {
+        llama_70b,
+        ..Default::default()
+    };
+    write_plans(partial, &kv, &plans, &shards, (quant, &info), progress)
 }
 
 #[cfg(test)]
