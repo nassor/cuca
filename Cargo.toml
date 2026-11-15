@@ -1,6 +1,6 @@
 [package]
 name = "cuca"
-version = "0.8.0"
+version = "0.8.1"
 edition = "2024"
 rust-version = "1.98"
 description = "Compact Universal Client for Agents: an asynchronous LLM client that parses multi-modal SSE streams into typed blocks behind one unified request/response abstraction."
@@ -240,8 +240,11 @@ kdl = { version = "6.7", optional = true, default-features = false, features = [
 wide = { version = "1.7", optional = true }
 # provider-local: candle for CPU tensors and quantized matmul; half for f16 block
 # scales; minijinja (+pycompat for the chat templates' Python string methods).
-candle-core = { version = "0.11.0", optional = true, default-features = false }
-candle-nn = { version = "0.11.0", optional = true, default-features = false }
+# candle is pinned exactly: 0.11.1 changes the CPU kernels so a row's bits depend on
+# the batch and the prefill chunking, which breaks the engine's batch-invariance
+# (qwen35 hybrid and mixed-dtype tests). Raise the pin only with those tests green.
+candle-core = { version = "=0.11.0", optional = true, default-features = false }
+candle-nn = { version = "=0.11.0", optional = true, default-features = false }
 half = { version = "2", optional = true }
 minijinja = { version = "2.24", optional = true, features = ["loader"] }
 minijinja-contrib = { version = "2.24", optional = true, features = ["pycompat"] }

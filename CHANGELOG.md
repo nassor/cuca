@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.8.1 - 2026-11-14
+
+### Changed
+
+- Documentation site rewritten for first-time readers: plainer pages, SVG diagrams for the main
+  flows, and no development data. The local provider section gains *How it works* and *Run
+  DeepSeek-V4.1* pages; its tokenizer, chat template and checkpoint pages merge into *Choose a
+  model*, *Requests, thinking and tool calls* and *Model files and downloads*.
+- The docs name both model formats the local engine loads: a GGUF file or a Hugging Face
+  safetensors checkpoint.
+- Docs styling: tables fit the content column, inline code has its own colour, and KDL samples are
+  highlighted.
+- `Cargo.lock` is no longer tracked.
+
+### Fixed
+
+- `provider-local`: `candle-core` and `candle-nn` are pinned to `=0.11.0`. candle 0.11.1 changes
+  its CPU kernels so a row's output depends on the batch and the prefill chunking, which broke the
+  engine's bit-for-bit batch invariance (Qwen 3.5 hybrid and mixed-dtype models).
+
 ## 0.8.0 - 2026-11-14
 
 ### Added
