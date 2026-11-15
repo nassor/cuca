@@ -64,7 +64,7 @@
 //! # API mapping to rmcp 3.x
 //!
 //! [`ClientHandler`](rmcp::ClientHandler) is a *trait* the client service
-//! implements ([`ClientInfo`] implements it out of the box), and the
+//! implements ([`ClientConfig`] implements it out of the box), and the
 //! connection is established by
 //! [`serve_client_with_lifecycle`] with
 //! [`ClientLifecycleMode::Discover`](rmcp::ClientLifecycleMode), which sends
@@ -104,7 +104,7 @@ use std::collections::HashMap;
 use std::sync::{Mutex, mpsc};
 
 use rmcp::model::{
-    CallToolRequestParams, CallToolResponse, CallToolResult, ClientInfo, ContentBlock,
+    CallToolRequestParams, CallToolResponse, CallToolResult, ClientConfig, ContentBlock,
     Implementation, ProtocolVersion, Tool,
 };
 use rmcp::serve_client_with_lifecycle;
@@ -459,10 +459,10 @@ fn worker_run<T, E, A, F, Fut>(
     F: FnOnce() -> Fut + Send + 'static,
     Fut: Future<Output = Result<T, PluginError>>,
 {
-    let setup: Result<(RunningService<RoleClient, ClientInfo>, Vec<Tool>), PluginError> = rt
+    let setup: Result<(RunningService<RoleClient, ClientConfig>, Vec<Tool>), PluginError> = rt
         .block_on(async move {
             let client = factory().await?;
-            let mut client_info = ClientInfo::default();
+            let mut client_info = ClientConfig::default();
             client_info.protocol_version = ProtocolVersion::V_2026_07_28;
             client_info.client_info =
                 Implementation::new("cuca-mcp-connector", env!("CARGO_PKG_VERSION"));
@@ -507,7 +507,7 @@ fn worker_run<T, E, A, F, Fut>(
 /// [`PluginError::NotSupported`] instead of a fabricated tool output. See the
 /// module docs for the MRTR rationale.
 async fn execute_tool_call(
-    running: &RunningService<RoleClient, ClientInfo>,
+    running: &RunningService<RoleClient, ClientConfig>,
     name: String,
     arguments: Value,
 ) -> Result<String, PluginError> {
@@ -632,7 +632,7 @@ mod tests {
     use rmcp::model::{
         CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ElicitRequest,
         ElicitRequestParams, ErrorData, InputRequest, InputRequiredResult, ListToolsResult,
-        PaginatedRequestParams, ServerCapabilities, ServerInfo, Tool,
+        PaginatedRequestParams, ServerCapabilities, ServerConfig, Tool,
     };
     use rmcp::service::{RequestContext, RoleServer, serve_server};
     use serde_json::{Value, json};
@@ -682,9 +682,9 @@ mod tests {
     }
 
     impl ServerHandler for MockMcpServer {
-        fn get_info(&self) -> ServerInfo {
-            // `ServerInfo` is `#[non_exhaustive]`, so mutate the default.
-            let mut info = ServerInfo::default();
+        fn get_info(&self) -> ServerConfig {
+            // `ServerConfig` is `#[non_exhaustive]`, so mutate the default.
+            let mut info = ServerConfig::default();
             info.capabilities = ServerCapabilities::builder().enable_tools().build();
             info
         }

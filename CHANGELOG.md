@@ -19,6 +19,8 @@
 - `provider-local`: `candle-core` and `candle-nn` are pinned to `=0.11.0`. candle 0.11.1 changes
   its CPU kernels so a row's output depends on the batch and the prefill chunking, which broke the
   engine's bit-for-bit batch invariance (Qwen 3.5 hybrid and mixed-dtype models).
+- `plugin-mcp`: uses rmcp's `ClientConfig` and `ServerConfig`, which replace the deprecated
+  `ClientInfo` and `ServerInfo` aliases; the rmcp requirement is now 3.10.
 
 ## 0.8.0 - 2026-11-14
 
