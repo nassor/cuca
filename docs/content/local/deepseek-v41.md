@@ -2,6 +2,7 @@
 title = "Run DeepSeek-V4.1"
 description = "Run DeepSeek-V4.1 Flash on one PC: the disk, RAM and SSD it needs, the config, the first-run conversion, the speed to expect, and the Engram cache, drafter and GPU settings."
 template = "page.html"
+aliases = ["providers/local/deepseek-v41/"]
 weight = 10
 +++
 
@@ -24,7 +25,7 @@ DeepSeek-V4.1 is a mixture of experts: each layer holds 384 small expert network
 - RAM: about 90 GB for the expert cache. A smaller `ram_bytes` also works and reads more from disk. At 90g each layer caches 128 of its 384 experts, at 64g 91 and at 48g 68.
 - Storage speed: the experts are read from disk while the model answers. An NVMe SSD gives about 2 tokens per second. A hard disk gives about 0.2.
 - Processor: the CPU, or one GPU. A GPU gains little here, see [What to expect](#what-to-expect).
-- Model source: DeepSeek-V4.1 has no preset. It loads as a checkpoint, a `repo:revision` string. See [Model files and downloads](@/providers/local/model-sources.md).
+- Model source: DeepSeek-V4.1 has no preset. It loads as a checkpoint, a `repo:revision` string. See [Model files and downloads](@/local/model-sources.md).
 
 ## 1. Write the config
 
@@ -129,7 +130,7 @@ timing: 21 prompt tokens, first block after <s> s (~<r> prompt tokens/s); 1 comp
 
 - On the first run stderr shows a `<n> / Some(<total>) bytes` counter for each file it downloads, then one for the conversion, which counts bytes written out of bytes to write.
 - A later run prints no counter. Loading takes 6 to 11 seconds from an NVMe SSD. On the CPU from a hard disk it takes 40 to 75 seconds.
-- Leave `--thinking off` out and the model reasons first. For `What is 9 * 8?` it reasons briefly and answers `72`. Thinking, tools and the request fields are on [Requests, thinking and tool calls](@/providers/local/requests.md).
+- Leave `--thinking off` out and the model reasons first. For `What is 9 * 8?` it reasons briefly and answers `72`. Thinking, tools and the request fields are on [Requests, thinking and tool calls](@/local/requests.md).
 
 ## 3. Use a GPU (optional)
 
@@ -151,7 +152,7 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 cargo run --release --example local_model --features provider-local-vulkan -- --config deepseek-gpu.kdl --prompt "What is the capital of France? Answer in one word." --thinking off --temperature 0
 ```
 
-The reply is `Paris` again, and the `loaded on` line names the device. This setup used 12.5 GiB of VRAM at its peak on a 16 GB card. It uses one GPU: a model split over several GPUs (`shards`) is rejected. GPU setup is on [Run on a GPU](@/providers/local/gpu.md).
+The reply is `Paris` again, and the `loaded on` line names the device. This setup used 12.5 GiB of VRAM at its peak on a 16 GB card. It uses one GPU: a model split over several GPUs (`shards`) is rejected. GPU setup is on [Run on a GPU](@/local/gpu.md).
 
 ## Where the parts live
 
@@ -276,7 +277,7 @@ The first run then also writes `dspark-model-q8_0.gguf`. The output equals plain
 
 - It runs on the CPU only. A GPU `device` fails with ``the DSpark drafter runs on the CPU only: use `LocalDevice::Cpu` ``, and `gpu_layers` fails the load.
 - It loads its own 7.2 GB of experts into RAM when it opens.
-- It serves one request at a time. `draft_tokens` (default 5, 1 to 16) caps the tokens per round, and the real file's block is 5. More on drafters is on [Speculative decoding](@/providers/local/drafting.md).
+- It serves one request at a time. `draft_tokens` (default 5, 1 to 16) caps the tokens per round, and the real file's block is 5. More on drafters is on [Speculative decoding](@/local/drafting.md).
 
 ## Put layers on the GPU with gpu_layers
 
@@ -308,4 +309,4 @@ This runs slower than the default. With a 3 GiB device tier it decodes at 0.94 t
 - `engram.reader_threads must be in 1..=64, got N`: use 1 to 64.
 - `engram.ram_bytes must be in 1048576..=1099511627776 (1 MiB to 1 TiB), got N`: use a size in that range.
 
-Other device, configuration and download errors are on [Limits and errors](@/providers/local/limits-and-errors.md).
+Other device, configuration and download errors are on [Limits and errors](@/local/limits-and-errors.md).

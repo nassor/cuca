@@ -26,7 +26,7 @@ The `cuca` program turns the local engine into a service. A *server* answers HTT
 | `cuca balance` | sits in front of several `cuca serve` instances and sends each request to one of them |
 | `cuca tui` | shows a running server or balancer live in your terminal |
 
-All three read the same stats API (a JSON page of live numbers). To run your first server, follow [Serve a model over HTTP](@/guides/serve-a-model.md). The server is built on the [`provider-local`](@/providers/local/_index.md) engine.
+All three read the same stats API (a JSON page of live numbers). To run your first server, follow [Serve a model over HTTP](@/guides/serve-a-model.md). The server is built on the [`provider-local`](@/local/_index.md) engine.
 
 <div class="dgm">
 <div class="dgm-scroll">
@@ -85,7 +85,7 @@ Both features build with no other provider. The [feature matrix](@/reference/fea
 cargo build --release --no-default-features --features server,provider-local-vulkan --bin cuca
 ```
 
-The CPU kernels choose their instructions when you build. A CPU server should build with `RUSTFLAGS="-C target-cpu=native"` (Windows PowerShell: `$env:RUSTFLAGS = "-C target-cpu=native"`). [Build requirements](@/providers/local/build-and-tests.md) explains why.
+The CPU kernels choose their instructions when you build. A CPU server should build with `RUSTFLAGS="-C target-cpu=native"` (Windows PowerShell: `$env:RUSTFLAGS = "-C target-cpu=native"`). [Build requirements](@/local/build-and-tests.md) explains why.
 
 ## What to expect
 

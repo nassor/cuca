@@ -2,6 +2,7 @@
 title = "Fit a large model"
 description = "Choose how to run a model that is bigger than your GPU memory or your RAM: layer offload, host experts, tiered experts, with a decision chart, config examples and measured speeds."
 template = "page.html"
+aliases = ["providers/local/placement/"]
 weight = 7
 +++
 
@@ -21,7 +22,7 @@ A model has to live somewhere while it runs. The GPU computes from its own memor
 Two terms help here:
 
 - A **dense** model uses all of its weights for every token.
-- A **mixture of experts** (MoE) model has many small expert blocks in each layer, and every token uses only a few of them. That makes it easy to keep most experts out of fast memory. See [How it works](@/providers/local/how-it-works.md).
+- A **mixture of experts** (MoE) model has many small expert blocks in each layer, and every token uses only a few of them. That makes it easy to keep most experts out of fast memory. See [How it works](@/local/how-it-works.md).
 
 ## Pick a placement
 
@@ -133,7 +134,7 @@ Follow the chart from the top. The first question you can answer "yes" to is you
 <p class="dgm-cap"><b>The GPU computes from VRAM and the CPU from RAM.</b> Reader threads fill RAM from the file, uploads fill VRAM from RAM, and the hidden state crosses between the processors where a model is split.</p>
 </div>
 
-The K/V cache is the model's memory of the tokens it has already read (see [How it works](@/providers/local/how-it-works.md)). It sits with the layers that use it.
+The K/V cache is the model's memory of the tokens it has already read (see [How it works](@/local/how-it-works.md)). It sits with the layers that use it.
 
 | Placement | In VRAM | In RAM | Read from the file while running |
 |---|---|---|---|
@@ -148,7 +149,7 @@ The K/V cache is the model's memory of the tokens it has already read (see [How 
 | GPU, `gpu_layers` and `tiered` | the last layers, their device tier | the first layers, both RAM tiers | the other experts |
 | Several GPUs, `shards` | a slice of every layer on each GPU | nothing | token embedding rows |
 
-A `tiered` placement on a GPU with `device_bytes` at 0 is called host-tiered. The CPU computes the experts from the RAM tier while the rest runs on the GPU. A split GGUF set (a model stored as several part files) opens in place, and its parts may sit on different volumes. See [Model files and downloads](@/providers/local/model-sources.md).
+A `tiered` placement on a GPU with `device_bytes` at 0 is called host-tiered. The CPU computes the experts from the RAM tier while the rest runs on the GPU. A split GGUF set (a model stored as several part files) opens in place, and its parts may sit on different volumes. See [Model files and downloads](@/local/model-sources.md).
 
 ## Layer offload
 
@@ -195,7 +196,7 @@ experts { host layers=20; }
 
 ## Tiered experts
 
-Use this when a mixture of experts is bigger than the RAM you want to spend, or to cache the hottest experts in VRAM. The experts stay in the file. Two caches, one in VRAM and one in RAM, keep the experts the model uses most. The rest are read from the SSD when a token needs them. The budgets, slots and counters are on [Tiered experts](@/providers/local/expert-tiers.md).
+Use this when a mixture of experts is bigger than the RAM you want to spend, or to cache the hottest experts in VRAM. The experts stay in the file. Two caches, one in VRAM and one in RAM, keep the experts the model uses most. The rest are read from the SSD when a token needs them. The budgets, slots and counters are on [Tiered experts](@/local/expert-tiers.md).
 
 A mixture of experts larger than the card, with experts in VRAM, RAM and the file:
 
@@ -237,7 +238,7 @@ cargo run --release --example local_model --features provider-local -- --config 
 - `shards` rejects tiered and host experts, `gpu_layers` and a `drafter`.
 - On the CPU, `tiered` needs `ram_bytes` above 0 and `device_bytes` at 0.
 - The Gemma 4 mixture of experts (26B-A4B) runs on the CPU only, with resident or RAM-tiered experts.
-- `deepseek41` takes `gpu_layers` at only a few values. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+- `deepseek41` takes `gpu_layers` at only a few values. See [Run DeepSeek-V4.1](@/local/deepseek-v41.md).
 
 Placement changes speed, not the answer. On the CPU, tiered experts give the resident load's output bit for bit. A placement that uses a GPU agrees with the one-GPU model to float rounding.
 
@@ -299,4 +300,4 @@ Method: a prompt of about 1,100 tokens and 96 generated tokens, prefix cache off
 - A dense model bigger than the card decodes faster with every layer you move to the GPU. Muse 30B is 2.4 times faster at 38 layers. It does not fit at 40.
 - A mixture of experts that fits in RAM decodes faster on the CPU alone, because the CPU computes the experts at full memory bandwidth and the GPU pays a launch and a copy per MoE layer. A GPU placement pays off there for long prompts.
 - In a separate CPU test (three short replies), Mistral Small 4 with `experts { tiered ram_bytes="48g"; }` ran at 2.1 tokens/s once warm, against 8.7 tokens/s with all 68 GB in RAM. Reading experts from the SSD is the price of fitting the model.
-- DeepSeek-V4.1 is about 507 GB, bigger than most RAM. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+- DeepSeek-V4.1 is about 507 GB, bigger than most RAM. See [Run DeepSeek-V4.1](@/local/deepseek-v41.md).

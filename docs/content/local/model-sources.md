@@ -2,6 +2,7 @@
 title = "Model files and downloads"
 description = "Where a local model file comes from: preset names, Hugging Face files, files on disk and converted checkpoints, plus the download cache, split GGUF files and checkpoint conversion."
 template = "page.html"
+aliases = ["providers/local/model-sources/"]
 weight = 3
 +++
 
@@ -82,7 +83,7 @@ Each form is shown as its KDL and its Rust spelling.
 - In `repo:revision:file`, none of the three parts contains `:`. In `repo:revision`, `repo` is `owner/name`.
 - Use a commit hash as the revision. The cache is keyed by it, so a moving name such as `main` pins a stale file.
 - A source with `sha256: None` skips the checksum, and so does every source parsed from a string except a preset.
-- `template` is a chat template file that replaces the model's own. See [Requests, thinking and tool calls](@/providers/local/requests.md).
+- `template` is a chat template file that replaces the model's own. See [Requests, thinking and tool calls](@/local/requests.md).
 
 A string that is none of the three forms fails with a `CucaError::Config`:
 
@@ -94,7 +95,7 @@ The message lists every preset name where this page shows `...`.
 
 ## Presets
 
-`ModelSource::PRESETS` has 26 entries: 24 models and 2 drafters. Each is pinned to one Hugging Face commit and one SHA-256. The names, sizes and memory need are on [Choose a model](@/providers/local/models.md).
+`ModelSource::PRESETS` has 26 entries: 24 models and 2 drafters. Each is pinned to one Hugging Face commit and one SHA-256. The names, sizes and memory need are on [Choose a model](@/local/models.md).
 
 A `ModelPreset` has these fields:
 
@@ -159,7 +160,7 @@ A Hugging Face source downloads once from `https://huggingface.co/{repo}/resolve
 - The finished file is renamed into place in one step, so a final file that exists is complete.
 - A lock file, `<file>.lock`, makes two loaders in one process or in two processes take turns. The empty file stays in the cache.
 - A download fails when no data arrives for 60 seconds. Connecting times out after 30 seconds.
-- `hf_token` is sent as a bearer token. `None` or an empty string downloads anonymously, as the preset files do. A KDL file can read it from the environment with `hf_token "${HF_TOKEN:-}"`; see [Configuration](@/providers/local/configuration.md).
+- `hf_token` is sent as a bearer token. `None` or an empty string downloads anonymously, as the preset files do. A KDL file can read it from the environment with `hf_token "${HF_TOKEN:-}"`; see [Configuration](@/local/configuration.md).
 
 | System | Default cache directory |
 |---|---|
@@ -251,11 +252,11 @@ The first load downloads the shards and converts them. Later loads open the cach
 | `Ministral3ForCausalLM`, or `Mistral3ForConditionalGeneration` whose `text_config.model_type` is `ministral3` or `mistral` | `mistral3` |
 | `Mistral3ForConditionalGeneration` whose `text_config.model_type` is `mistral4` | `mistral4` |
 | `EagleMistralLarge3ForCausalLM` (read from `params.json` and `consolidated.safetensors`) | `mistral4-eagle`, a drafter |
-| `DeepseekV41ForCausalLM` (text part only) | `deepseek41` and its drafter; see [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md) |
+| `DeepseekV41ForCausalLM` (text part only) | `deepseek41` and its drafter; see [Run DeepSeek-V4.1](@/local/deepseek-v41.md) |
 
 - `mistral3` covers Ministral 3, Devstral Small 2, Mistral Small 3.1 and 3.2, and Magistral 2509. Mistral Small 4 is `mistral4`.
 - Any other class fails with ``architecture `X` has no checkpoint converter; convert it to GGUF with llama.cpp`` before a shard downloads. A `Mistral3ForConditionalGeneration` with another text model fails naming it.
-- Drafter pairings are on [Speculative decoding](@/providers/local/drafting.md).
+- Drafter pairings are on [Speculative decoding](@/local/drafting.md).
 
 ### Precision
 
@@ -275,7 +276,7 @@ The first load downloads the shards and converts them. Later loads open the cach
 - An existing output is reused without touching the network or the shards. A lock file keeps two loaders from converting at once.
 - A checkpoint source downloads `config.json` first, then the optional tokenizer and template files that exist, then the shards.
 - The chat template comes from `chat_template.jinja`, else `chat_template.json`, else `tokenizer_config.json`. A checkpoint with none fails with `checkpoint has no chat template`.
-- Sampling defaults in `generation_config.json` become the GGUF's `general.sampling.*` keys, see [Configuration](@/providers/local/configuration.md).
+- Sampling defaults in `generation_config.json` become the GGUF's `general.sampling.*` keys, see [Configuration](@/local/configuration.md).
 - Memory stays small whatever the model size. Free disk must hold the converted file.
 
 ### Not converted
@@ -286,7 +287,7 @@ Each of these fails with a `CucaError::Config` that names the cause:
 - Qwen 3 MoE with `norm_topk_prob = false`, shared experts or `mlp_only_layers`, and OLMoE with `norm_topk_prob = true`;
 - an explicit YaRN `attention_factor`, and a rope scaling type the engine does not run;
 - block-scaled FP8 (`quantization_config.weight_block_size`), except DeepSeek-V4.1's 32 by 32 grid;
-- a pre-tokenizer the engine does not implement, see [Choose a model](@/providers/local/models.md);
+- a pre-tokenizer the engine does not implement, see [Choose a model](@/local/models.md);
 - a Muse Glimmer checkpoint with rope scaling, attention biases or a `post_norm_eps` other than 1e-8.
 
 ### Checkpoints with only tekken.json

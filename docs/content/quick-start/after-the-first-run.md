@@ -92,7 +92,7 @@ Any OpenAI-compatible server, including Ollama, vLLM and LM Studio, needs a diff
 
 ## Run a model without a server
 
-`provider-local` runs a model inside your program, so there is no `llama-server` to start. See [Local (in-process)](@/providers/local/_index.md).
+`provider-local` runs a model inside your program, so there is no `llama-server` to start. See [Local (in-process)](@/local/_index.md).
 
 ## Run the tests
 

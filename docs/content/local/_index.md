@@ -2,8 +2,8 @@
 title = "Local (in-process)"
 description = "Run a language model inside your own program, on the CPU or a GPU, with no server and no HTTP endpoint. Start here for a first run, then pick a model, a GPU or a configuration."
 template = "section.html"
+aliases = ["providers/local/"]
 sort_by = "weight"
-weight = 8
 
 [extra]
 kicker = "Reference"
@@ -18,7 +18,7 @@ kicker = "Reference"
 <dd>You want a model that needs no external service, or you route requests through <code>ProviderEndpoint::Local</code>.</dd>
 </dl>
 
-`provider-local` runs a language model inside your own program. The model is a GGUF file, one file that holds the weights, the tokenizer and the chat template, or a Hugging Face safetensors checkpoint that CUCA converts once to a cached GGUF. See [Model files and downloads](@/providers/local/model-sources.md). You load it from Rust, send it a request and read the reply as a stream.
+`provider-local` runs a language model inside your own program. The model is a GGUF file, one file that holds the weights, the tokenizer and the chat template, or a Hugging Face safetensors checkpoint that CUCA converts once to a cached GGUF. See [Model files and downloads](@/local/model-sources.md). You load it from Rust, send it a request and read the reply as a stream.
 
 The engine is written in Rust. It uses no llama.cpp and no FFI written by cuca. The [server](@/server/_index.md) runs the same engine behind an HTTP API.
 
@@ -66,7 +66,7 @@ The engine is written in Rust. It uses no llama.cpp and no FFI written by cuca. 
 <p class="dgm-cap"><b>No server sits between your code and the model.</b> Your program calls a <code>LocalModel</code>, one engine thread runs the model on the CPU or a GPU, and content blocks stream back the same way. The network is used once, to download the file.</p>
 </div>
 
-New to the words on this page? Read [How local inference works](@/providers/local/how-it-works.md) first or after the tutorial.
+New to the words on this page? Read [How local inference works](@/local/how-it-works.md) first or after the tutorial.
 
 ## Run your first local model
 
@@ -75,7 +75,7 @@ This tutorial runs the default model, `gemma4-e2b-q4_0`, from a new Rust crate. 
 You need:
 
 - Rust 1.98 or newer.
-- A C compiler. See [Build requirements](@/providers/local/build-and-tests.md) if the build fails on a native dependency.
+- A C compiler. See [Build requirements](@/local/build-and-tests.md) if the build fails on a native dependency.
 - About 3 GB of free disk. The default model is a 2.84 GB download.
 - About 2 GB of RAM for the default model: 1.5 GB of weights and 481 MB of K/V cache. The K/V cache is the memory a model keeps for the text it has already read. `LocalModel::kv_cache_bytes` reports its size.
 
@@ -176,17 +176,17 @@ source "qwen3-0.6b-q8_0"
 cargo run --release --example local_model --features provider-local -- --config qwen.kdl
 ```
 
-Result: the example downloads the new file once, prints `loaded on cpu` and then the reply. `--prompt "Say hi"` changes the question. The other flags and every key of the file are on [Configuration](@/providers/local/configuration.md).
+Result: the example downloads the new file once, prints `loaded on cpu` and then the reply. `--prompt "Say hi"` changes the question. The other flags and every key of the file are on [Configuration](@/local/configuration.md).
 
 ## Where to go next
 
-- Learn the words and what happens to a request: [How local inference works](@/providers/local/how-it-works.md).
-- Pick another model, or load your own GGUF file or safetensors checkpoint: [Choose a model](@/providers/local/models.md). The presets range from 0.29 GB to 67.71 GB.
-- Run on a GPU: [Run on a GPU](@/providers/local/gpu.md).
-- The model is too big for your memory: [Fit a large model](@/providers/local/placement.md).
-- Send tools, switch thinking on or off, or stop on a string: [Requests, thinking and tool calls](@/providers/local/requests.md).
-- Change a setting or look up a default: [Configuration](@/providers/local/configuration.md).
-- Match an error message to its cause: [Limits and errors](@/providers/local/limits-and-errors.md).
+- Learn the words and what happens to a request: [How local inference works](@/local/how-it-works.md).
+- Pick another model, or load your own GGUF file or safetensors checkpoint: [Choose a model](@/local/models.md). The presets range from 0.29 GB to 67.71 GB.
+- Run on a GPU: [Run on a GPU](@/local/gpu.md).
+- The model is too big for your memory: [Fit a large model](@/local/placement.md).
+- Send tools, switch thinking on or off, or stop on a string: [Requests, thinking and tool calls](@/local/requests.md).
+- Change a setting or look up a default: [Configuration](@/local/configuration.md).
+- Match an error message to its cause: [Limits and errors](@/local/limits-and-errors.md).
 
 ## Features and endpoint
 
@@ -213,5 +213,5 @@ There is no API key. The one credential is the optional Hugging Face token, `hf_
 - After the stream ends, `LocalGeneration::report()` returns a `GenerationReport`. It holds the exact `usage`, the prompt reuse as `prompt_cache`, the `finish_reason` and `queue_secs`, the wait from dispatch to first admission. `finish_reason` is `stop` for the end token or a stop string, and `length` when `max_tokens` or the context ran out. Dropping the `LocalGeneration` stops the request.
 - `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`: whether the model writes reasoning, whether a request can switch it off, and whether it has a tool call format the engine reads. `LocalModel::sampling()` returns the resolved sampling defaults.
 - `LocalModel::kv_cache_bytes()` returns the K/V cache size in bytes. `LocalModel::weights_file_bytes()` returns the size of the model file it runs from, every part of a split set added up. `LocalModel::context_length()` returns the resolved context length.
-- The other accessors return counters and layout facts: `serving_stats()`, `draft_stats()`, `expert_tier_stats()`, `engram_stats()` and `layer_split()`. The last three return `None` when the model has no such part. The fields are on [Configuration](@/providers/local/configuration.md) and [Limits and errors](@/providers/local/limits-and-errors.md).
-- `ModelSource::default_model()` and `ModelSource::preset(name)` pick a preset. `LocalModelConfig` also reads from a KDL file, with the field names as keys; see [Configuration](@/providers/local/configuration.md).
+- The other accessors return counters and layout facts: `serving_stats()`, `draft_stats()`, `expert_tier_stats()`, `engram_stats()` and `layer_split()`. The last three return `None` when the model has no such part. The fields are on [Configuration](@/local/configuration.md) and [Limits and errors](@/local/limits-and-errors.md).
+- `ModelSource::default_model()` and `ModelSource::preset(name)` pick a preset. `LocalModelConfig` also reads from a KDL file, with the field names as keys; see [Configuration](@/local/configuration.md).

@@ -94,7 +94,7 @@ A key you mistype stops the run with a panic that names it. The keys the suites 
 | `cache_dir` | where tests download and convert models | the platform cache directory |
 | `llamacpp base_url="..."` | the llama.cpp server, with `/v1` | `http://127.0.0.1:1234/v1` |
 | `llamacpp model="..."` | the model id under test | the first id the server reports |
-| `local { model { ... } }` | the in-process model. It holds the keys of a `LocalModelConfig` (see [Configuration](@/providers/local/configuration.md)): `source`, `device`, `gpu_layers`, `experts`, `drafter` and so on | none |
+| `local { model { ... } }` | the in-process model. It holds the keys of a `LocalModelConfig` (see [Configuration](@/local/configuration.md)): `source`, `device`, `gpu_layers`, `experts`, `drafter` and so on | none |
 | `local { download_default #true }` | with no `source`, download and use the default preset | `#false` |
 | `local { experts_ref ... }` | the placement the tiered run is compared with | `"resident"` |
 | `local { draft_tokens 1 2 3 4 }` | one drafter run per value | `3` |
@@ -260,7 +260,7 @@ TIERS|warm|... tok/s|...|hit rate ...|read at load ...
 test result: ok. ...
 ```
 
-The reference placement is `resident` unless you set `local { experts_ref ... }`. [Tiered experts](@/providers/local/expert-tiers.md) explains the placement.
+The reference placement is `resident` unless you set `local { experts_ref ... }`. [Tiered experts](@/local/expert-tiers.md) explains the placement.
 
 ### Drafters: provider_local_mtp
 
@@ -285,7 +285,7 @@ k 3 "Write a Python function that ...": plain ... tok/s, speculative ... tok/s (
 test result: ok. ...
 ```
 
-`identical false` fails the test on the CPU. `local { allow_mismatch #true }` reports it instead. [Speculative decoding](@/providers/local/drafting.md) lists the drafter types.
+`identical false` fails the test on the CPU. `local { allow_mismatch #true }` reports it instead. [Speculative decoding](@/local/drafting.md) lists the drafter types.
 
 ### Checkpoint conversion: provider_local_convert
 
@@ -320,7 +320,7 @@ local {
 cargo test --release --features provider-local-vulkan --test provider_local
 ```
 
-Result: the output includes `MATRIX|devices|...` with the device that was used. The first request on a GPU takes longer while the GPU kernels compile. [Run on a GPU](@/providers/local/gpu.md) covers the backends.
+Result: the output includes `MATRIX|devices|...` with the device that was used. The first request on a GPU takes longer while the GPU kernels compile. [Run on a GPU](@/local/gpu.md) covers the backends.
 
 ## Check that one feature builds alone
 

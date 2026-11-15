@@ -30,8 +30,7 @@ github_repo = "https://github.com/nassor/cuca"
 # The reading order, declared once. `base.html` renders the sidebar, the
 # breadcrumb and the previous/next pager from this list, so all three agree.
 # A group lists its hub (`_index.md`) and its pages as sibling items. An item
-# with `[[extra.nav.items.children]]` nests those pages under it, as the Local
-# provider's subpages sit under Local (in-process).
+# with `[[extra.nav.items.children]]` nests those pages under it.
 [[extra.nav]]
 label = "Quick start"
 [[extra.nav.items]]
@@ -63,6 +62,51 @@ title = "Memory discipline"
 path = "@/concepts/memory-discipline.md"
 
 [[extra.nav]]
+label = "Local"
+[[extra.nav.items]]
+title = "Local (in-process)"
+path = "@/local/_index.md"
+[[extra.nav.items.children]]
+title = "How it works"
+path = "@/local/how-it-works.md"
+[[extra.nav.items.children]]
+title = "Choose a model"
+path = "@/local/models.md"
+[[extra.nav.items.children]]
+title = "Model files and downloads"
+path = "@/local/model-sources.md"
+[[extra.nav.items.children]]
+title = "Requests, thinking and tool calls"
+path = "@/local/requests.md"
+[[extra.nav.items.children]]
+title = "Configuration"
+path = "@/local/configuration.md"
+[[extra.nav.items.children]]
+title = "Run on a GPU"
+path = "@/local/gpu.md"
+[[extra.nav.items.children]]
+title = "Fit a large model"
+path = "@/local/placement.md"
+[[extra.nav.items.children]]
+title = "Tiered experts"
+path = "@/local/expert-tiers.md"
+[[extra.nav.items.children]]
+title = "Speculative decoding"
+path = "@/local/drafting.md"
+[[extra.nav.items.children]]
+title = "Run DeepSeek-V4.1"
+path = "@/local/deepseek-v41.md"
+[[extra.nav.items.children]]
+title = "Limits and errors"
+path = "@/local/limits-and-errors.md"
+[[extra.nav.items.children]]
+title = "Support status and known limits"
+path = "@/local/verification.md"
+[[extra.nav.items.children]]
+title = "Build requirements"
+path = "@/local/build-and-tests.md"
+
+[[extra.nav]]
 label = "Providers"
 [[extra.nav.items]]
 title = "Overview"
@@ -88,48 +132,6 @@ path = "@/providers/vllm.md"
 [[extra.nav.items]]
 title = "LM Studio"
 path = "@/providers/lmstudio.md"
-[[extra.nav.items]]
-title = "Local (in-process)"
-path = "@/providers/local/_index.md"
-[[extra.nav.items.children]]
-title = "How it works"
-path = "@/providers/local/how-it-works.md"
-[[extra.nav.items.children]]
-title = "Choose a model"
-path = "@/providers/local/models.md"
-[[extra.nav.items.children]]
-title = "Model files and downloads"
-path = "@/providers/local/model-sources.md"
-[[extra.nav.items.children]]
-title = "Requests, thinking and tool calls"
-path = "@/providers/local/requests.md"
-[[extra.nav.items.children]]
-title = "Configuration"
-path = "@/providers/local/configuration.md"
-[[extra.nav.items.children]]
-title = "Run on a GPU"
-path = "@/providers/local/gpu.md"
-[[extra.nav.items.children]]
-title = "Fit a large model"
-path = "@/providers/local/placement.md"
-[[extra.nav.items.children]]
-title = "Tiered experts"
-path = "@/providers/local/expert-tiers.md"
-[[extra.nav.items.children]]
-title = "Speculative decoding"
-path = "@/providers/local/drafting.md"
-[[extra.nav.items.children]]
-title = "Run DeepSeek-V4.1"
-path = "@/providers/local/deepseek-v41.md"
-[[extra.nav.items.children]]
-title = "Limits and errors"
-path = "@/providers/local/limits-and-errors.md"
-[[extra.nav.items.children]]
-title = "Support status and known limits"
-path = "@/providers/local/verification.md"
-[[extra.nav.items.children]]
-title = "Build requirements"
-path = "@/providers/local/build-and-tests.md"
 
 [[extra.nav]]
 label = "Plugins"

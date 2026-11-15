@@ -2,6 +2,7 @@
 title = "Requests, thinking and tool calls"
 description = "What each request field does on the local engine, what the reply stream and the token counts mean, how thinking is switched, which tool-call formats are read, and how to replace a chat template."
 template = "page.html"
+aliases = ["providers/local/requests/"]
 weight = 4
 +++
 
@@ -11,7 +12,7 @@ weight = 4
 <dt>In one line</dt>
 <dd>The request becomes a prompt through the model's chat template, and the reply comes back as <code>Text</code>, <code>Thinking</code> and <code>ToolCall</code> blocks.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature and a loaded <code>LocalModel</code>; see <a href="@/providers/local/_index.md">Local (in-process)</a>.</dd>
+<dd>The <code>provider-local</code> feature and a loaded <code>LocalModel</code>; see <a href="@/local/_index.md">Local (in-process)</a>.</dd>
 <dt>Read this if</dt>
 <dd>You want to send tools or thinking to a local model, read the token counts, or replace a model's chat template.</dd>
 </dl>
@@ -113,13 +114,13 @@ A model reads and writes plain text. Two pieces translate. The chat template (a 
 - `messages`: `System` and `User` messages send their `Text` blocks joined with a newline. An `Assistant` message adds its `Thinking` blocks as `reasoning_content` and its `ToolCall` blocks as `tool_calls`. A `Tool` message carries the `tool_call_id` and its `ToolResult` outputs joined with a newline.
 - Tool call `arguments` stay JSON objects with their key order. An object, `null` or a string holding an object is accepted; anything else fails the request with ``tool call `NAME` arguments must be a JSON object``.
 - `tools`: each tool reaches the template as a function with `name`, `description` and `parameters` (from `input_schema`). The template sees the `tools` variable only when the request declares at least one tool.
-- `temperature`, `top_p`, `top_k`, `seed` and `max_tokens` apply to this request. A sampling field you leave unset takes the value [`SamplingConfig` resolves](@/providers/local/configuration.md#samplingconfig). A request `seed` restarts the generator for that request only. A `temperature` below 0 or not finite, or a `top_p` outside `(0, 1]`, is a `CucaError::Config`.
+- `temperature`, `top_p`, `top_k`, `seed` and `max_tokens` apply to this request. A sampling field you leave unset takes the value [`SamplingConfig` resolves](@/local/configuration.md#samplingconfig). A request `seed` restarts the generator for that request only. A `temperature` below 0 or not finite, or a `top_p` outside `(0, 1]`, is a `CucaError::Config`.
 - `stop`: the reply ends before the first occurrence of any stop string, and the stop text is not emitted. Text that might still begin a stop string is held back until it cannot. Empty strings are ignored. `Thinking` and `ToolCall` blocks pass through unchanged.
 - `thinking`: sets template variables; see [Thinking](#thinking).
 - An `ImageBase64` block is rejected: the engine reads text only.
 - The prompt always ends with the generation prompt, so the model continues as the assistant.
 
-Errors a request can raise are on [Limits and errors](@/providers/local/limits-and-errors.md#errors).
+Errors a request can raise are on [Limits and errors](@/local/limits-and-errors.md#errors).
 
 ## The reply stream
 
@@ -139,7 +140,7 @@ Read the counts per call with `CucaClient::generate_stream_with_response`, or wi
 - When the cache is full, the least recently used block goes first, so an unrelated request does not evict a prefix that still fits. A request that arrives while another with the same prompt runs reuses its blocks as soon as they are filled.
 - A hybrid model (Qwen 3.5) resumes only at the block boundary below the last end-of-turn token of an earlier prompt, so its `read_tokens` is at most that boundary.
 - `reasoning_tokens` is set only when thinking was on for the rendered prompt. It counts the tokens inside reasoning blocks, markers included.
-- On the CPU, a request that reuses a prefix generates the same tokens as a cold request. `batching prefix_cache=#false` turns the cache off; see [Configuration](@/providers/local/configuration.md#batchingconfig).
+- On the CPU, a request that reuses a prefix generates the same tokens as a cold request. `batching prefix_cache=#false` turns the cache off; see [Configuration](@/local/configuration.md#batchingconfig).
 
 ## Thinking
 
@@ -161,7 +162,7 @@ Some models write their reasoning before the answer. It arrives as `Thinking` bl
 - `enable_thinking` and `thinking` are both true when thinking is enabled and both false when it is disabled or missing. For a DeepSeek-V4.1 template they are true unless the request disables thinking.
 - `preserve_thinking` is always false.
 - If the rendered prompt ends inside an open reasoning block, generation starts in thinking.
-- Give a reasoning model a generous `max_tokens`, or it can spend the whole budget before it answers. See [Known limits](@/providers/local/verification.md#known-limits).
+- Give a reasoning model a generous `max_tokens`, or it can spend the whole budget before it answers. See [Known limits](@/local/verification.md#known-limits).
 - `LocalModel::capabilities()` reports what a loaded model supports: `reasoning`, `can_disable_thinking` and `tools`.
 
 The parser finds a model's reasoning markers from its template and vocabulary: `<think>` and `</think>`, `[THINK]` and `[/THINK]`, Gemma 4's channel markers, or Muse Glimmer's messages addressed to `self`.
@@ -252,4 +253,4 @@ chat_template "mistral-v7-tekken"
 
 - The two Mistral names write a system message where it stands, write every role other than system and user (assistant, tool) as an assistant turn, add no BOS (the tokenizer adds it) and ignore declared tools, so the model never sees them.
 - Any other bare name (letters, digits, `.`, `-` and `_` only) fails the load with a message naming the three supported names.
-- DeepSeek-V4.1 ships no Jinja, so its converted GGUF carries the name `deepseek-v41`. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+- DeepSeek-V4.1 ships no Jinja, so its converted GGUF carries the name `deepseek-v41`. See [Run DeepSeek-V4.1](@/local/deepseek-v41.md).

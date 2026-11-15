@@ -34,7 +34,7 @@ CUCA does two jobs:
 
 1. [Stream a first reply](@/quick-start/first-stream.md). About 15 minutes. You start a local model server and watch text arrive in your terminal.
 2. [After the first run](@/quick-start/after-the-first-run.md). Short recipes for your own project: all block types, a plugin, thinking.
-3. [Providers](@/providers/_index.md). Pick the service you will really use, or run a model yourself with [Local (in-process)](@/providers/local/_index.md).
+3. [Providers](@/providers/_index.md). Pick the service you will really use, or run a model yourself with [Local (in-process)](@/local/_index.md).
 4. [The unified request and stream](@/concepts/unified-request.md). Read this when you want to know why the request looks the way it does.
 
 ## Two ways to use CUCA
@@ -93,11 +93,11 @@ Two optional extras sit around the request. Plugins watch every request and ever
 
 ### Run a model yourself
 
-`provider-local` runs a language model in Rust, on the CPU, a GPU or both. The model is a GGUF file, the single-file format llama.cpp made common, or a Hugging Face safetensors checkpoint that CUCA converts once to a cached GGUF. A model that is bigger than your GPU memory can still run: CUCA keeps some of it in RAM or on the SSD. See [Model files and downloads](@/providers/local/model-sources.md) and [Fit a large model](@/providers/local/placement.md).
+`provider-local` runs a language model in Rust, on the CPU, a GPU or both. The model is a GGUF file, the single-file format llama.cpp made common, or a Hugging Face safetensors checkpoint that CUCA converts once to a cached GGUF. A model that is bigger than your GPU memory can still run: CUCA keeps some of it in RAM or on the SSD. See [Model files and downloads](@/local/model-sources.md) and [Fit a large model](@/local/placement.md).
 
 The local engine has three modes:
 
-- Library mode: the model runs inside your program, behind the same `CucaClient`. See [Local (in-process)](@/providers/local/_index.md).
+- Library mode: the model runs inside your program, behind the same `CucaClient`. See [Local (in-process)](@/local/_index.md).
 - Server mode: `cuca serve` answers OpenAI-compatible chat requests over HTTP, with metrics and a stats API. See [Serve a model over HTTP](@/guides/serve-a-model.md) and [Model server](@/server/model-server.md).
 - Balancer mode: `cuca balance` spreads requests over several `cuca serve` instances. See [Balancer](@/server/balancer.md).
 

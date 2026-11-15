@@ -2,6 +2,7 @@
 title = "Choose a model"
 description = "Pick a local model preset by machine size, see the supported architectures and weight formats, and load any GGUF file or safetensors checkpoint that is not a preset."
 template = "page.html"
+aliases = ["providers/local/models/"]
 weight = 2
 +++
 
@@ -37,7 +38,7 @@ loaded on cpu
 timing: <n> prompt tokens, first block after <s> s (~<r> prompt tokens/s); <n> completion tokens (<n> blocks), then <t> tokens/s after the first block
 ```
 
-`load:` is the load time. A model that reasons prints its thinking dimmed after `[thinking]`, then the answer. How to load and configure a model in your own code is on [Local (in-process)](@/providers/local/_index.md).
+`load:` is the load time. A model that reasons prints its thinking dimmed after `[thinking]`, then the answer. How to load and configure a model in your own code is on [Local (in-process)](@/local/_index.md).
 
 ## Pick a preset
 
@@ -49,19 +50,19 @@ Start from the memory you can spare. A model needs about its file size plus a K/
 - 14 GB or more, or a 16 GB GPU: `qwen3-30b-a3b-iq2_xxs` (13.6 GB), a 2-bit file of the 30B mixture of experts. It passed every live check on the CPU and on an RX 9070 XT.
 - 20 GB or more: `qwen3.6-35b-a3b-q4_0`, `qwen3-30b-a3b-q4_0`, `qwen3-30b-a3b-q4_k_m`, `gemma4-26b-a4b-q4_0` or `muse-glimmer-30b-q4_0`.
 - The `q4_k_m` and `iq4_xs` presets are the formats most downloads use. They are about the size of `q4_0` and closer to the original model; see [Weight formats](#weight-formats).
-- A mixture of experts bigger than your RAM: keep its experts on disk with `experts { tiered ram_bytes="4g"; }`. A mixture of experts is a model with many small expert networks that uses only a few for each token. With this setting `qwen3.6-35b-a3b-q4_0` peaked at 5.95 GiB of RAM instead of 18.8 GiB and decoded at about half the speed (CPU, Ryzen 9 9950X3D2, release build). See [Tiered experts](@/providers/local/expert-tiers.md).
+- A mixture of experts bigger than your RAM: keep its experts on disk with `experts { tiered ram_bytes="4g"; }`. A mixture of experts is a model with many small expert networks that uses only a few for each token. With this setting `qwen3.6-35b-a3b-q4_0` peaked at 5.95 GiB of RAM instead of 18.8 GiB and decoded at about half the speed (CPU, Ryzen 9 9950X3D2, release build). See [Tiered experts](@/local/expert-tiers.md).
 - Reasoning and tool calls: the Gemma 4, Qwen 3, Qwen 3.5, Qwen 3.6, SmolLM 3, Granite 3.3, Muse Glimmer, Ministral 3 Reasoning and Mistral Small 4 presets do both. Ministral 3 Instruct calls tools and does not reason. The DeepSeek-R1 distills reason but cannot call tools. Phi 4 mini, OLMo 2, OLMoE and Gemma 3 do neither.
-- A model larger than your GPU: see [Fit a large model](@/providers/local/placement.md).
+- A model larger than your GPU: see [Fit a large model](@/local/placement.md).
 
 ## The presets
 
 `ModelSource::PRESETS` has 30 models and 2 drafters. Each is pinned to one repository commit and one SHA-256, so every download is the same file. A name is ASCII case-insensitive.
 
 - Download is the file size in GB.
-- K/V is the cache in GB at the default settings, on the CPU and on a GPU: the default `context_length` of 8,192 positions (4,096 for OLMo 2 and OLMoE) and 4 parallel requests. The pool holds twice the context on the CPU and the context plus 4,096 positions on a GPU, so a GPU keeps fewer finished prompts cached; see [When to change kv_tokens](@/providers/local/configuration.md#when-to-change-kv-tokens). `LocalModel::kv_cache_bytes` reports the cache of a loaded model.
+- K/V is the cache in GB at the default settings, on the CPU and on a GPU: the default `context_length` of 8,192 positions (4,096 for OLMo 2 and OLMoE) and 4 parallel requests. The pool holds twice the context on the CPU and the context plus 4,096 positions on a GPU, so a GPU keeps fewer finished prompts cached; see [When to change kv_tokens](@/local/configuration.md#when-to-change-kv-tokens). `LocalModel::kv_cache_bytes` reports the cache of a loaded model.
 - A model needs about its download plus its K/V cache. Lower `context_length` to shrink the cache. A mixture of experts with tiered experts needs less.
 - Thinking is `yes` when a request can switch reasoning on or off, `always` when the model reasons on every request, and `no` when it has no reasoning mode.
-- Tools is `yes` when the model can call tools you declare. Details on calls and reasoning are on [Requests, thinking and tool calls](@/providers/local/requests.md).
+- Tools is `yes` when the model can call tools you declare. Details on calls and reasoning are on [Requests, thinking and tool calls](@/local/requests.md).
 
 | Preset | Family | Download | K/V CPU / GPU | Thinking | Tools |
 |---|---|---|---|---|---|
@@ -101,14 +102,14 @@ The number after `q` is the bits per weight. This is quantization: Q4_0 keeps ea
 Notes that change what you do:
 
 - `gemma4-26b-a4b-q4_0` runs on the CPU only. The GPU engine rejects it. Its experts can stay in RAM (resident) or be tiered.
-- `mistral-small-4-119b-q4_0` is two files, 39.92 GB and 27.79 GB. They download together and open as one model, see [Model files and downloads](@/providers/local/model-sources.md). Resident it needs 67.7 GB of RAM plus 0.76 GB of K/V cache. Tiered experts need less.
-- `qwen3.5-0.8b-q8_0` has a draft head inside its file, so `drafter "in-trunk"` works with it. See [Speculative decoding](@/providers/local/drafting.md).
+- `mistral-small-4-119b-q4_0` is two files, 39.92 GB and 27.79 GB. They download together and open as one model, see [Model files and downloads](@/local/model-sources.md). Resident it needs 67.7 GB of RAM plus 0.76 GB of K/V cache. Tiered experts need less.
+- `qwen3.5-0.8b-q8_0` has a draft head inside its file, so `drafter "in-trunk"` works with it. See [Speculative decoding](@/local/drafting.md).
 - `olmo2-1b-q4_0` and `olmoe-1b-7b-q4_0` were trained on 4,096 positions. They load at 4,096 by default, and a larger `context_length` fails with `context_length N exceeds the model maximum M`.
 - Reasoning models spend many tokens thinking, so give a request a generous `max_tokens`. This matters most for `r1-distill-*`, `ministral3-3b-reasoning-q4_0`, `muse-glimmer-30b-q4_0` and `smollm3-3b-q4_0`.
 - A model that always reasons can use its whole token budget thinking at temperature 0 and never write the tool call. `ministral3-3b-reasoning-q4_0` does. When you need tool calls from such a model, leave `temperature` at the model's own default instead of setting 0.
 - `gemma4-e4b-q8_0` answers an easy question at once without a reasoning block, even with thinking on. A harder question makes it reason. `gemma3-270m-q8_0` is tiny and can end its answer at once on prompts of about 750 tokens or more.
 
-What was run on which model is on [Support status and known limits](@/providers/local/verification.md).
+What was run on which model is on [Support status and known limits](@/local/verification.md).
 
 ## Drafter presets
 
@@ -140,7 +141,7 @@ The architecture is the model's design, stored in the file as `general.architect
 | `muse-glimmer` | Muse Glimmer 30B | |
 | `mistral3` | Ministral 3 (3B, 8B, 14B), Devstral Small 2 | |
 | `mistral4` | Mistral Small 4 (119B) | mixture of experts, not split over several GPUs |
-| `deepseek41` | DeepSeek-V4.1 Flash | mixture of experts, no preset, not split over several GPUs; see [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md) |
+| `deepseek41` | DeepSeek-V4.1 Flash | mixture of experts, no preset, not split over several GPUs; see [Run DeepSeek-V4.1](@/local/deepseek-v41.md) |
 | `gemma4-assistant` | the Gemma 4 drafter | through `drafter` only |
 | `mistral4-eagle` | the Mistral Small 4 drafter | through `drafter` only, CPU only |
 
@@ -154,7 +155,7 @@ The `dflash` architecture is a drafter only: it loads through `drafter` as the M
 
 ## Load your own model
 
-A model that is not a preset loads from disk or from Hugging Face, as a GGUF file or as a safetensors checkpoint. A checkpoint (`source "repo:revision"` or `source dir="/ckpt"`) is converted once in process to a cached GGUF, at the precision `convert quant` names; see [Model files and downloads](@/providers/local/model-sources.md). The rest of this section covers a GGUF file:
+A model that is not a preset loads from disk or from Hugging Face, as a GGUF file or as a safetensors checkpoint. A checkpoint (`source "repo:revision"` or `source dir="/ckpt"`) is converted once in process to a cached GGUF, at the precision `convert quant` names; see [Model files and downloads](@/local/model-sources.md). The rest of this section covers a GGUF file:
 
 ```kdl,name=A GGUF file you already have
 source file="/models/x.gguf"
@@ -218,7 +219,7 @@ The loader reads everything about the model from the file, so no config says wha
 <p class="dgm-cap"><b>A file loads only if all four checks pass.</b> A failed check stops the load with an error that names the cause. The common ones are below.</p>
 </div>
 
-Two more things must hold. The file names an end-of-generation token (the token that stops the reply), and its attention keys and values have the same size. A split set (`<base>-00001-of-0000N.gguf`) loads from any of its parts, see [Model files and downloads](@/providers/local/model-sources.md).
+Two more things must hold. The file names an end-of-generation token (the token that stops the reply), and its attention keys and values have the same size. A split set (`<base>-00001-of-0000N.gguf`) loads from any of its parts, see [Model files and downloads](@/local/model-sources.md).
 
 A file that loads is not a verified model. Check that its rendered prompt and token ids equal the reference tokenizer's before you rely on it.
 
@@ -233,7 +234,7 @@ All of them are a `CucaError::Provider` that names the cause.
 - ``GGUF metadata `ARCH.attention.value_length`: ... only equal key and value lengths are supported``: the model's attention keys and values differ in size. Pick another model.
 - `cannot determine the end-of-generation token`: the file names no end token and the vocabulary holds no known one. Pick another file of the model.
 
-A `context_length` above the model's maximum fails with `context_length N exceeds the model maximum M`, a `CucaError::Config`. Device, configuration and download errors are on [Limits and errors](@/providers/local/limits-and-errors.md).
+A `context_length` above the model's maximum fails with `context_length N exceeds the model maximum M`, a `CucaError::Config`. Device, configuration and download errors are on [Limits and errors](@/local/limits-and-errors.md).
 
 ## Weight formats
 
@@ -253,7 +254,7 @@ The weight format is how the file stores the numbers of the model. Every format 
 - Q8_1 is the one format not run directly: the CPU cannot load it, and a GPU converts it to Q8_0 at load. A GPU split over several cards (`shards`) that cuts through a block also converts that weight to Q8_0.
 - F16 and BF16 files take about twice their file size, because they are held at 4 bytes per element.
 - On the CPU a request's reply equals the one it gets alone, bit for bit, in every format. A GPU's replies can differ a little from the CPU's, because the two round floats in a different order.
-- A mixture of experts is split once at load into one weight per expert. `experts { tiered ... }` leaves the experts in the file instead, see [Tiered experts](@/providers/local/expert-tiers.md).
+- A mixture of experts is split once at load into one weight per expert. `experts { tiered ... }` leaves the experts in the file instead, see [Tiered experts](@/local/expert-tiers.md).
 
 ## Tokenizers
 

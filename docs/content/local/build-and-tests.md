@@ -2,6 +2,7 @@
 title = "Build requirements"
 description = "What to install before you build provider-local and each GPU feature, why to build for the host CPU, and the one command that runs the live local tests."
 template = "page.html"
+aliases = ["providers/local/build-and-tests/"]
 weight = 13
 +++
 
@@ -32,9 +33,9 @@ weight = 13
 
 ## GPU drivers
 
-A GPU build does not need the GPU or its driver. The driver is a system library that the program loads when it runs, for example the Vulkan loader. Install the normal driver for your GPU. On Windows, ROCm also needs AMD's HIP runtime files; the steps are on [Run on a GPU](@/providers/local/gpu.md).
+A GPU build does not need the GPU or its driver. The driver is a system library that the program loads when it runs, for example the Vulkan loader. Install the normal driver for your GPU. On Windows, ROCm also needs AMD's HIP runtime files; the steps are on [Run on a GPU](@/local/gpu.md).
 
-A missing driver or GPU fails `LocalModel::load` with a `CucaError::Provider` such as `device Cuda(N): K such device(s) found (missing driver or GPU?)`. The messages are on [Limits and errors](@/providers/local/limits-and-errors.md).
+A missing driver or GPU fails `LocalModel::load` with a `CucaError::Provider` such as `device Cuda(N): K such device(s) found (missing driver or GPU?)`. The messages are on [Limits and errors](@/local/limits-and-errors.md).
 
 ## Build for your CPU
 

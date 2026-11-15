@@ -2,6 +2,7 @@
 title = "Tiered experts"
 description = "Run a mixture-of-experts model with its experts on disk and a RAM and VRAM cache you size: the config keys, how big the budget must be, warm starts, counters, errors and measured speed."
 template = "page.html"
+aliases = ["providers/local/expert-tiers/"]
 weight = 8
 +++
 
@@ -18,7 +19,7 @@ weight = 8
 
 A mixture-of-experts model has many small expert blocks in every layer, and each token uses only a few of them. Loading the whole file puts every expert in memory, even though most sit unused. Tiered placement keeps the experts in the file on disk and caches the ones the model uses most. The dense parts (attention, norms, routers, embeddings and the output head) stay in memory.
 
-How tiers combine with `gpu_layers` and host experts is on [Fit a large model](@/providers/local/placement.md).
+How tiers combine with `gpu_layers` and host experts is on [Fit a large model](@/local/placement.md).
 
 ## Try it
 
@@ -117,7 +118,7 @@ experts { host layers=4; }
 
 - `ram_bytes` and `device_bytes` are an integer or a string with an optional `k`, `m` or `g` suffix. The suffixes are powers of 1024 and not case sensitive: `"4g"` is 4,294,967,296 bytes.
 - `experts { tiered loader_threads=8; }` parses, but the load rejects it because it names no tier.
-- `host` is a different placement: the GPU keeps attention and the CPU computes the experts, with no cache tiers. See [Fit a large model](@/providers/local/placement.md).
+- `host` is a different placement: the GPU keeps attention and the CPU computes the experts, with no cache tiers. See [Fit a large model](@/local/placement.md).
 - A GPU with `device_bytes` at 0 and a `ram_bytes` budget is host-tiered. The experts sit behind the RAM tier and the CPU computes them, while attention, the router, the shared expert and the head run on the GPU. It does not combine with `gpu_layers` or `shards`.
 - An unknown key inside `experts` is an error naming it.
 
@@ -137,7 +138,7 @@ slots = min(n_expert, budget / per_expert)
 - `gemma4-26b-a4b-q4_0`: 128 experts per layer, 8 used. The smallest budget is `766m`. The suggested budget is `ram_bytes="6g"`, which gives 64 slots per layer.
 - `mistral-small-4-119b-q4_0`: 128 experts per layer, 4 used. The smallest budget is `2g`. The suggested budget is `ram_bytes="48g"`, which gives 100 slots per layer.
 
-The shared expert and the router are dense weights and always stay in memory. A GPU layer's device pool is one buffer of at most 1 GiB, which caps the slots of a device tier. DeepSeek-V4.1 has its own sizes: see [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+The shared expert and the router are dense weights and always stay in memory. A GPU layer's device pool is one buffer of at most 1 GiB, which caps the slots of a device tier. DeepSeek-V4.1 has its own sizes: see [Run DeepSeek-V4.1](@/local/deepseek-v41.md).
 
 ## Heat and warm start
 

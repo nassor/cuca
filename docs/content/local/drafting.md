@@ -2,6 +2,7 @@
 title = "Speculative decoding"
 description = "Speed up the local model with a drafter that guesses tokens the main model then checks: how a round works, which drafter pairs with which model, how to turn it on, and what speedup to expect."
 template = "page.html"
+aliases = ["providers/local/drafting/"]
 weight = 9
 +++
 
@@ -136,7 +137,7 @@ Each drafter works with one family of target. Use the pair in the same bullet.
 - DFlash: set `drafter` to the preset `muse-glimmer-30b-dflash-q4_0`, or the checkpoint `meta-models/Muse-Glimmer-30B-assistant:c676cce91658f9568aaf264a416211e2782735b7`. Target: Muse Glimmer 30B. CPU only.
 - DSpark: set `drafter` to the target's own checkpoint, `deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>`. Target: DeepSeek-V4.1. CPU only.
 
-A checkpoint source is `repo:revision`, a Hugging Face safetensors checkpoint. The engine converts it once, in process, and caches the result. DSpark and DeepSeek-V4.1 are on [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md). The checkpoint classes are on [Model files and downloads](@/providers/local/model-sources.md).
+A checkpoint source is `repo:revision`, a Hugging Face safetensors checkpoint. The engine converts it once, in process, and caches the result. DSpark and DeepSeek-V4.1 are on [Run DeepSeek-V4.1](@/local/deepseek-v41.md). The checkpoint classes are on [Model files and downloads](@/local/model-sources.md).
 
 - The Gemma 4 assistant is a four-layer decoder that reads the target's K/V cache (the model's memory of past tokens), so it adds no cache memory.
 - The Qwen 3.5 head is a prediction head already inside the model file. Nothing more is downloaded. It keeps a K/V cache of its own, 4 KB per context position for the 0.8B model.

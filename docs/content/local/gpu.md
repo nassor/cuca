@@ -2,6 +2,7 @@
 title = "Run on a GPU"
 description = "Pick the GPU feature, set device in the config, run the local model on Vulkan, Metal, CUDA or ROCm, and learn what the GPU runs, how much video memory it needs and what speed to expect."
 template = "page.html"
+aliases = ["providers/local/gpu/"]
 weight = 6
 +++
 
@@ -13,7 +14,7 @@ weight = 6
 <dt>You need</dt>
 <dd>One GPU feature (<code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code>) and the normal driver for your GPU.</dd>
 <dt>Read this if</dt>
-<dd>You want the local model on a GPU, or you want to know what the GPU does and does not run. For a model that is bigger than your GPU memory, go to <a href="@/providers/local/placement.md">Fit a large model</a>.</dd>
+<dd>You want the local model on a GPU, or you want to know what the GPU does and does not run. For a model that is bigger than your GPU memory, go to <a href="@/local/placement.md">Fit a large model</a>.</dd>
 </dl>
 
 A GPU runs the model's math much faster than a CPU, because it does many small calculations at once. The model lives in the GPU's own memory, called VRAM. This page shows how to turn a GPU on and what to expect. The GPU path is built on burn and CubeCL, two Rust GPU libraries.
@@ -31,7 +32,7 @@ A cargo feature is a build option. Each GPU brand has its own feature:
 | NVIDIA GPU | `provider-local-cuda` | Compile-checked only | a prebuilt LLVM, downloaded on the first build |
 | AMD GPU | `provider-local-rocm` | Ran on Windows; compile-checked on Linux | the same LLVM download |
 
-If you are unsure, choose Vulkan. `provider-local-gpu` is the shared engine behind all four and selects no backend by itself. The GPU driver is a system library that loads when the program starts, for example the Vulkan loader. CI has no GPU, so every GPU run is manual. See [Support status and known limits](@/providers/local/verification.md) for what ran. Build tools for each platform are on [Build requirements](@/providers/local/build-and-tests.md).
+If you are unsure, choose Vulkan. `provider-local-gpu` is the shared engine behind all four and selects no backend by itself. The GPU driver is a system library that loads when the program starts, for example the Vulkan loader. CI has no GPU, so every GPU run is manual. See [Support status and known limits](@/local/verification.md) for what ran. Build tools for each platform are on [Build requirements](@/local/build-and-tests.md).
 
 ### 2. Write the config
 
@@ -93,26 +94,26 @@ Two errors to know:
 - Any other text fails with a `CucaError::Config`: ``unknown local device `...`; expected cpu, vulkan[:<n>|:integrated:<n>], metal[...], cuda[:<n>] or rocm[:<n>]``.
 - A device whose feature is off fails the load: ``device Vulkan(Default) requires the `provider-local-vulkan` cargo feature``. Rebuild with that feature.
 
-Other load errors are on [Limits and errors](@/providers/local/limits-and-errors.md).
+Other load errors are on [Limits and errors](@/local/limits-and-errors.md).
 
 ## What runs on the GPU
 
 - Every supported model architecture runs on the GPU, except the Gemma 4 mixture of experts (26B-A4B). It runs on the CPU only, and a GPU load of it fails with a `CucaError::Provider`.
-- The Gemma 4 assistant drafter runs on the GPU. The Qwen 3.5 in-trunk head, EAGLE, DFlash and DSpark drafters are CPU only. See [Speculative decoding](@/providers/local/drafting.md).
-- A model larger than the card splits between the GPU and the CPU. See [Fit a large model](@/providers/local/placement.md).
-- DeepSeek-V4.1 on a GPU has its own steps and limits: see [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+- The Gemma 4 assistant drafter runs on the GPU. The Qwen 3.5 in-trunk head, EAGLE, DFlash and DSpark drafters are CPU only. See [Speculative decoding](@/local/drafting.md).
+- A model larger than the card splits between the GPU and the CPU. See [Fit a large model](@/local/placement.md).
+- DeepSeek-V4.1 on a GPU has its own steps and limits: see [Run DeepSeek-V4.1](@/local/deepseek-v41.md).
 - The GPU keeps activations in f32, so its logits differ slightly from the CPU's. A batch of rows equals single-token steps only to float rounding, so a speculative greedy run on a GPU can differ from plain decoding where two choices are that close.
 
 ## GPU memory
 
 How a weight is stored decides how much VRAM it takes.
 
-- Quantized weights stay in the file's own blocks: the legacy formats, the K-quants behind files such as Q4_K_M, the I-quants, ternary and FP4 formats. One copy sits in VRAM, about the file size. Only Q8_1 becomes Q8_0 at load. See [Weight formats](@/providers/local/models.md#weight-formats).
+- Quantized weights stay in the file's own blocks: the legacy formats, the K-quants behind files such as Q4_K_M, the I-quants, ternary and FP4 formats. One copy sits in VRAM, about the file size. Only Q8_1 becomes Q8_0 at load. See [Weight formats](@/local/models.md#weight-formats).
 - F32, F16 and BF16 weights are held as f32, so an F16 or BF16 model takes twice its file size.
-- The K/V cache (the attention memory of past tokens, see [How it works](@/providers/local/how-it-works.md)) lives in VRAM as f32. By default it holds `context_length` plus at most 4,096 positions (12,288 at an 8,192 context), where the CPU holds twice `context_length`: VRAM is the scarcer memory. The [presets table](@/providers/local/models.md#the-presets) gives each preset's cache on both, and [When to change kv_tokens](@/providers/local/configuration.md#when-to-change-kv-tokens) says when to set it yourself.
+- The K/V cache (the attention memory of past tokens, see [How it works](@/local/how-it-works.md)) lives in VRAM as f32. By default it holds `context_length` plus at most 4,096 positions (12,288 at an 8,192 context), where the CPU holds twice `context_length`: VRAM is the scarcer memory. The [presets table](@/local/models.md#the-presets) gives each preset's cache on both, and [When to change kv_tokens](@/local/configuration.md#when-to-change-kv-tokens) says when to set it yourself.
 - Dropping the last clone of a `LocalModel` returns its VRAM to the driver, so another model can load in the same process.
 - Every new batch size compiles kernels once per process, so the first request of each size is slower.
-- If the model does not fit, the load fails with `the device failed while the model loaded (most likely out of memory: ...)`. Lower `context_length` or `batching kv_tokens`, or use `gpu_layers` or expert placement from [Fit a large model](@/providers/local/placement.md).
+- If the model does not fit, the load fails with `the device failed while the model loaded (most likely out of memory: ...)`. Lower `context_length` or `batching kv_tokens`, or use `gpu_layers` or expert placement from [Fit a large model](@/local/placement.md).
 
 ## Several GPUs
 
@@ -239,4 +240,4 @@ Method: a prompt of about 1,100 tokens and 96 generated tokens, prefix cache off
 
 - The GPU shortens every prefill.
 - A small model that fits the card decodes about 1.7 to 3 times faster on the GPU.
-- The Muse row splits the model between GPU and CPU. How to choose `gpu_layers` is on [Fit a large model](@/providers/local/placement.md).
+- The Muse row splits the model between GPU and CPU. How to choose `gpu_layers` is on [Fit a large model](@/local/placement.md).

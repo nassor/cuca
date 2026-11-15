@@ -208,14 +208,14 @@ With `server`, `cuca::server` exports `CucaConfig`, `LogConfig`, `LogFormat`, `S
 
 ## Local model types
 
-With `provider-local`, the root re-exports are the whole public path to the engine. Each page of [Local (in-process)](@/providers/local/_index.md) uses these types. The meaning of each configuration field is on [Configuration](@/providers/local/configuration.md). Every type that a `LocalModelConfig` holds implements `Deserialize`, so the KDL keys are the field names; see [The model keys](@/reference/environment.md#the-model-keys).
+With `provider-local`, the root re-exports are the whole public path to the engine. Each page of [Local (in-process)](@/local/_index.md) uses these types. The meaning of each configuration field is on [Configuration](@/local/configuration.md). Every type that a `LocalModelConfig` holds implements `Deserialize`, so the KDL keys are the field names; see [The model keys](@/reference/environment.md#the-model-keys).
 
 | Type | What it holds |
 |---|---|
 | `LocalModelConfig` | fields `source`, `cache_dir`, `hf_token`, `context_length`, `sampling`, `chat_template`, `chat_template_file`, `device`, `drafter`, `draft_tokens`, `on_download_progress`, `experts`, `convert`, `batching`, `shards`, `gpu_layers`, `engram`, `shard_dirs` |
 | `LocalModel` | `load`, `generate`, `capabilities`, `sampling`, `context_length`, `kv_cache_bytes`, `weights_file_bytes`, `layer_split`, `draft_stats`, `serving_stats`, `expert_tier_stats`, `expert_heat`, `engram_stats` |
 | `LocalGeneration`, `GenerationReport` | the stream of one `LocalModel::generate` request (no client, no plugin hooks) and its `report()`: `usage`, `prompt_cache`, `finish_reason` (`stop` or `length`), `queue_secs` |
-| `ModelSource` | variants `HuggingFace { repo, revision, file, sha256, parts, template }` and `File(PathBuf)` name a GGUF file; `Checkpoint { repo, revision }` and `Dir(PathBuf)` name a Hugging Face safetensors checkpoint, converted once to a cached GGUF (see [Model sources](@/providers/local/model-sources.md)); also `PRESETS`, `preset`, `default_model`, `hugging_face` and `FromStr` |
+| `ModelSource` | variants `HuggingFace { repo, revision, file, sha256, parts, template }` and `File(PathBuf)` name a GGUF file; `Checkpoint { repo, revision }` and `Dir(PathBuf)` name a Hugging Face safetensors checkpoint, converted once to a cached GGUF (see [Model sources](@/local/model-sources.md)); also `PRESETS`, `preset`, `default_model`, `hugging_face` and `FromStr` |
 | `ModelPreset` | `name`, `repo`, `revision`, `file`, `size_bytes`, `architecture`, `drafter`, `parts`, `template`; method `source` |
 | `ModelPart`, `PresetPart` | one part of a split GGUF: `file` and `sha256` (the digest is optional in `ModelPart`); `PresetPart` also has `size_bytes` |
 | `ModelTemplate`, `PresetTemplate` | a chat template file: `repo`, `revision`, `file`, `sha256` (optional in `ModelTemplate`) |

@@ -171,7 +171,7 @@ serve {
 | `latency_window` | `"60s"` | the sliding window of the latency figures |
 | `model` | none; at least one | one node per model, at most 16; see below |
 
-A `model` node holds a [`LocalModelConfig`](@/providers/local/configuration.md). Its keys are the field names. The common ones:
+A `model` node holds a [`LocalModelConfig`](@/local/configuration.md). Its keys are the field names. The common ones:
 
 - `source`: required. What to load; see below.
 - `device`: default `"cpu"`. One of `"cpu"`, `"vulkan:0"`, `"metal"`, `"cuda:0"` or `"rocm:0"`.
@@ -179,7 +179,7 @@ A `model` node holds a [`LocalModelConfig`](@/providers/local/configuration.md).
 - `context_length`: default the smaller of 8192 and the model's maximum. Tokens of prompt plus reply per request.
 - `batching`: default `max_sequences=4`. Takes `max_sequences=4 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false`.
 - `experts`: default `"resident"`. Takes `"resident"`, `{ tiered ram_bytes="4g" device_bytes="6g" loader_threads=4 }` or `{ host layers=4 }`.
-- `gpu_layers`: default all. Layers on the GPU, the rest on the CPU; see [Fit a large model](@/providers/local/placement.md).
+- `gpu_layers`: default all. Layers on the GPU, the rest on the CPU; see [Fit a large model](@/local/placement.md).
 - `cache_dir`: default the platform cache directory. Where models download and convert.
 - `chat_template_file`: default the model's template. A Jinja file that replaces the template.
 - `convert`: default `quant="q8_0"`. Checkpoint conversion: `quant` is `f16`, `q8_0` or `q4_0`.
@@ -191,12 +191,12 @@ A device whose Cargo feature is off fails the load with a configuration error. T
 
 The argument of `model` is the name clients pass as `model`. The `source` is one of:
 
-- a preset name, such as `source "qwen3-0.6b-q8_0"` (the presets are listed on [Choose a model](@/providers/local/models.md));
+- a preset name, such as `source "qwen3-0.6b-q8_0"` (the presets are listed on [Choose a model](@/local/models.md));
 - `source "repo:revision:file"`, a GGUF on Hugging Face;
 - `source "repo:revision"`, a safetensors checkpoint, converted once to a cached GGUF;
 - `source file="/models/x.gguf"`, a GGUF file, or `source dir="/ckpt"`, a checkpoint directory.
 
-Without an argument the name is the preset name, else the file stem, the checkpoint's repository name or the directory name. Names are unique, and at most 16 models load per server. [Model files and downloads](@/providers/local/model-sources.md) covers the cache and split files.
+Without an argument the name is the preset name, else the file stem, the checkpoint's repository name or the directory name. Names are unique, and at most 16 models load per server. [Model files and downloads](@/local/model-sources.md) covers the cache and split files.
 
 ## Routes
 

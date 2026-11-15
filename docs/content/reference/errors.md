@@ -86,7 +86,7 @@ Nine variants, none behind a feature. `CucaError::provider(endpoint, msg)` build
 
 The `provider` field prints as `llamacpp`, `vllm`, `lmstudio`, `openai`, `anthropic`, `gemini`, `deepseek`, `local`, or the inner text of `Custom`.
 
-Which `provider-local` failures are `Provider` errors: an unsupported or malformed GGUF file or safetensors checkpoint; a request the engine cannot take (an `ImageBase64` block, tool arguments that are not a JSON object, a chat template that does not render); a prompt that does not fit the context; a failed forward pass; a drafter that does not match its target; a download checksum mismatch. [Limits and errors](@/providers/local/limits-and-errors.md) lists each cause and fix.
+Which `provider-local` failures are `Provider` errors: an unsupported or malformed GGUF file or safetensors checkpoint; a request the engine cannot take (an `ImageBase64` block, tool arguments that are not a JSON object, a chat template that does not render); a prompt that does not fit the context; a failed forward pass; a drafter that does not match its target; a download checksum mismatch. [Limits and errors](@/local/limits-and-errors.md) lists each cause and fix.
 
 `source()` returns `Some` for `Plugin` only. Every other variant returns `None`.
 
@@ -126,7 +126,7 @@ The check runs when the request body is built, before any network call.
 
 ### Local model settings
 
-`LocalModel::load` and the local dispatch check the model settings and report the first problem. The messages are in [Limits and errors](@/providers/local/limits-and-errors.md); the valid ranges are in [Configuration](@/providers/local/configuration.md). The groups are:
+`LocalModel::load` and the local dispatch check the model settings and report the first problem. The messages are in [Limits and errors](@/local/limits-and-errors.md); the valid ranges are in [Configuration](@/local/configuration.md). The groups are:
 
 - the cache directory cannot be found: set `LocalModelConfig::cache_dir`.
 - an unknown model, preset or device string; a GPU device whose Cargo feature is off (`device ... requires the ... cargo feature`) or that is not present.

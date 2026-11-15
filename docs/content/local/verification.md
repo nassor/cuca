@@ -2,6 +2,7 @@
 title = "Support status and known limits"
 description = "Which model presets and devices were actually run, what each status means, and the known limits of individual models with the practical advice for each."
 template = "page.html"
+aliases = ["providers/local/verification/"]
 weight = 12
 +++
 
@@ -28,7 +29,7 @@ The live test suite loads one real model and sends it a fixed set of requests. W
 
 ## Model presets
 
-The names are the presets of [Choose a model](@/providers/local/models.md). The GPU column is Vulkan on an AMD RX 9070 XT under Windows.
+The names are the presets of [Choose a model](@/local/models.md). The GPU column is Vulkan on an AMD RX 9070 XT under Windows.
 
 | Preset | CPU | GPU (Vulkan) | Notes |
 |---|---|---|---|
@@ -57,7 +58,7 @@ The names are the presets of [Choose a model](@/providers/local/models.md). The 
 | `ministral3-3b-instruct-q4_0` | Passes | Not run | no reasoning |
 | `mistral-small-4-119b-q4_0` | Passes | Passes | CPU resident or tiered; Vulkan with `experts { host; }` |
 
-The two drafter presets are on [Speculative decoding](@/providers/local/drafting.md). DeepSeek-V4.1 has no preset: it has run from a converted checkpoint on the CPU and on Vulkan. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+The two drafter presets are on [Speculative decoding](@/local/drafting.md). DeepSeek-V4.1 has no preset: it has run from a converted checkpoint on the CPU and on Vulkan. See [Run DeepSeek-V4.1](@/local/deepseek-v41.md).
 
 ## Devices
 
@@ -70,7 +71,7 @@ The two drafter presets are on [Speculative decoding](@/providers/local/drafting
 | Metal | compile-checked only | no run on Apple hardware |
 | Tensor parallelism | ran on one Vulkan GPU | the same device twice, at about a third of the speed; never run over two different GPUs, and the CUDA collective never ran |
 
-See [Run on a GPU](@/providers/local/gpu.md) for the features to build with and the Windows ROCm setup.
+See [Run on a GPU](@/local/gpu.md) for the features to build with and the Windows ROCm setup.
 
 ## Numerical accuracy
 
@@ -90,4 +91,4 @@ Each entry comes from the model itself or from quantization rounding. The live s
 
 ## Converted checkpoints
 
-A model you convert from a checkpoint gives the same live results as the preset GGUF of the same model. This was checked for Qwen 3 0.6B, Phi 4 mini and Gemma 4 E2B. Gemma 3 1B converted at `q8_0` writes a count in words where the `q4_0` preset writes digits, so convert at `q4_0` to match the preset. The conversion itself is on [Model files and downloads](@/providers/local/model-sources.md).
+A model you convert from a checkpoint gives the same live results as the preset GGUF of the same model. This was checked for Qwen 3 0.6B, Phi 4 mini and Gemma 4 E2B. Gemma 3 1B converted at `q8_0` writes a count in words where the `q4_0` preset writes digits, so convert at `q4_0` to match the preset. The conversion itself is on [Model files and downloads](@/local/model-sources.md).

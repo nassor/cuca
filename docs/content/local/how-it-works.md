@@ -2,6 +2,7 @@
 title = "How local inference works"
 description = "The words a newcomer needs, one request step by step, how several requests share the engine, and how a repeated prompt is reused instead of recomputed."
 template = "page.html"
+aliases = ["providers/local/how-it-works/"]
 weight = 1
 +++
 
@@ -135,9 +136,9 @@ The engine does not finish one request before it starts the next. Each step is o
 - `max_sequences` requests run at once: 4 by default, 1 to 64. The rest wait in the queue.
 - A step has at most `max_step_tokens` rows. The default is the prefill chunk: 256 rows at 8,192 positions of context.
 - The K/V pool does not grow with `max_sequences`. When it is full, the engine evicts cached blocks that no request uses, least recently used first. Then it preempts the youngest running request, which goes back to the front of the queue and reads its prompt again, mostly from the blocks it left in the cache. The oldest running request is never preempted.
-- A drafter that reads every position of its sequence (see [Speculative decoding](@/providers/local/drafting.md)) limits the engine to one request at a time.
+- A drafter that reads every position of its sequence (see [Speculative decoding](@/local/drafting.md)) limits the engine to one request at a time.
 
-The `batching` keys are in [Configuration](@/providers/local/configuration.md). The caps and what happens at each are in [Limits and errors](@/providers/local/limits-and-errors.md).
+The `batching` keys are in [Configuration](@/local/configuration.md). The caps and what happens at each are in [Limits and errors](@/local/limits-and-errors.md).
 
 ## Reusing a prompt
 
@@ -196,9 +197,9 @@ Chat programs send the same start again and again: the system prompt, the tools 
 - A request that arrives while another with the same prompt runs reuses the blocks as soon as they are filled.
 - When the pool is full, the least recently used cached block goes first, so an unrelated request does not evict a prefix that fits.
 - On the CPU a request that reuses a prefix generates exactly what a cold request generates.
-- A hybrid model such as Qwen 3.5 also keeps a saved state at the block boundary before the last end-of-turn token, so its `read_tokens` stops there at most; see [Choose a model](@/providers/local/models.md).
+- A hybrid model such as Qwen 3.5 also keeps a saved state at the block boundary before the last end-of-turn token, so its `read_tokens` stops there at most; see [Choose a model](@/local/models.md).
 - `batching prefix_cache=#false` in a KDL file turns the cache off, and every prompt is then read in full.
 
-The request side is in [Requests, thinking and tool calls](@/providers/local/requests.md).
+The request side is in [Requests, thinking and tool calls](@/local/requests.md).
 
-Next page: [Choose a model](@/providers/local/models.md).
+Next page: [Choose a model](@/local/models.md).

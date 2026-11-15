@@ -2,6 +2,7 @@
 title = "Limits and errors"
 description = "The caps of the local engine and what happens at each, how much memory a model needs, the option combinations that fail to load, and the errors with their causes and fixes."
 template = "page.html"
+aliases = ["providers/local/limits-and-errors/"]
 weight = 11
 +++
 
@@ -36,7 +37,7 @@ weight = 11
 
 - Requests start in arrival order while fewer than `max_sequences` run and the pool can hold their prompts. A preempted request goes back to the front of the queue and prefills again, mostly from blocks it left in the prefix cache.
 - A prefill chunk is 256 tokens at 8,192 positions, 64 at 32,768 and 16 at 131,072.
-- A drafter that reads every position of its sequence (the in-trunk head, EAGLE, DFlash, DSpark) serves one request at a time, and the Gemma 4 assistant speculates only while one request runs alone. See [Speculative decoding](@/providers/local/drafting.md).
+- A drafter that reads every position of its sequence (the in-trunk head, EAGLE, DFlash, DSpark) serves one request at a time, and the Gemma 4 assistant speculates only while one request runs alone. See [Speculative decoding](@/local/drafting.md).
 
 ## How much memory a model needs
 
@@ -77,14 +78,14 @@ A local model needs memory for its weights and for its K/V cache. The K/V cache 
 <p class="dgm-cap"><b>Plan for the weights plus the K/V cache.</b> Lower <code>context_length</code> or <code>batching.kv_tokens</code> to shrink the cache. The weights are the file.</p>
 </div>
 
-- Weights stay quantized, so resident weights are about the file size. A 4.6 GB file needs about 4.6 GB. Gemma 4's per-layer embedding table (1.32 GB in E2B Q4_0) is not loaded, so E2B Q4_0 holds 1.5 GB of its 2.84 GB file. DeepSeek-V4.1's Engram table (208.9 GB at the default precision) is not loaded either; see [Engram cache](@/providers/local/configuration.md#engram-cache).
+- Weights stay quantized, so resident weights are about the file size. A 4.6 GB file needs about 4.6 GB. Gemma 4's per-layer embedding table (1.32 GB in E2B Q4_0) is not loaded, so E2B Q4_0 holds 1.5 GB of its 2.84 GB file. DeepSeek-V4.1's Engram table (208.9 GB at the default precision) is not loaded either; see [Engram cache](@/local/configuration.md#engram-cache).
 - Each cached position stores a key and a value of `n_kv_head * head_dim` numbers, as 4-byte floats, in every layer that keeps K/V. The pool holds `kv_tokens` positions for all running requests together, twice `context_length` by default on the CPU, `context_length` plus at most 4,096 on a GPU. So a full-attention layer costs `kv_tokens * 2 * 4 * n_kv_head * head_dim` bytes, and the cache is the sum over layers. It does not grow with `max_sequences`.
 - At 8,192 positions, Qwen 3 0.6B costs 458,752 bytes per context position, 3.76 GB in all, because it has many K/V heads for its size. Gemma 4 E2B costs 481 MB, because its sliding-window layers keep only a window per running request plus cached prefixes.
-- The K/V column of the presets table on [Choose a model](@/providers/local/models.md) gives the cache for each preset at the default settings. `LocalModel::kv_cache_bytes` reports the cache of a loaded model.
+- The K/V column of the presets table on [Choose a model](@/local/models.md) gives the cache for each preset at the default settings. `LocalModel::kv_cache_bytes` reports the cache of a loaded model.
 - A hybrid model (Qwen 3.5) also keeps a recurrent state per running request, about 20 MB for the 0.8B model, and one more per cached snapshot. `kv_cache_bytes` does not count it; `ServingStats::snapshot_bytes` reports the snapshots.
-- Resident experts of a mixture of experts model cost the file size. With tiered experts, memory is the dense weights plus the RAM and device budgets; see [Tiered experts](@/providers/local/expert-tiers.md).
-- With `gpu_layers`, the CPU half keeps its weights and K/V in RAM and the GPU half keeps its own in device memory. With `experts { host; }`, every hosted expert is read into RAM at load. See [Fit a large model](@/providers/local/placement.md).
-- A DSpark drafter reads its experts into RAM when it opens (7.2 GB of MXFP4 experts in a 7.91 GB file at the default precision). See [Speculative decoding](@/providers/local/drafting.md).
+- Resident experts of a mixture of experts model cost the file size. With tiered experts, memory is the dense weights plus the RAM and device budgets; see [Tiered experts](@/local/expert-tiers.md).
+- With `gpu_layers`, the CPU half keeps its weights and K/V in RAM and the GPU half keeps its own in device memory. With `experts { host; }`, every hosted expert is read into RAM at load. See [Fit a large model](@/local/placement.md).
+- A DSpark drafter reads its experts into RAM when it opens (7.2 GB of MXFP4 experts in a 7.91 GB file at the default precision). See [Speculative decoding](@/local/drafting.md).
 - Only the oldest running request, alone in a pool smaller than it needs, fails: `CucaError::Provider`, `the K/V block pool is exhausted by a single sequence`. Raise `kv_tokens` or lower `context_length`.
 
 ## Rejected combinations
@@ -138,8 +139,8 @@ The EAGLE, DFlash and DSpark drafters fail on a GPU device, each with its own me
 | `engram.ram_bytes must be in 1048576..=1099511627776 (1 MiB to 1 TiB), got N` | Use a size from 1 MiB to 1 TiB. |
 | `engram.reader_threads must be in 1..=64, got N` | Use 1 to 64. |
 | ``expected a byte count such as `4294967296`, `512m` or `4g` `` | A size string is not an integer with an optional `k`, `m` or `g`. |
-| An `experts` placement outside its rules | `loader_threads` outside 1 to 64, `device_bytes` on the CPU, `ram_bytes` of 0 on the CPU, or both budgets 0 on a GPU. The messages are on [Tiered experts](@/providers/local/expert-tiers.md). |
-| `chat_template override does not compile: ...` or `... does not render a one-message conversation: ...` | Your template is broken. See [Replace the chat template](@/providers/local/requests.md#replace-the-chat-template). |
+| An `experts` placement outside its rules | `loader_threads` outside 1 to 64, `device_bytes` on the CPU, `ram_bytes` of 0 on the CPU, or both budgets 0 on a GPU. The messages are on [Tiered experts](@/local/expert-tiers.md). |
+| `chat_template override does not compile: ...` or `... does not render a one-message conversation: ...` | Your template is broken. See [Replace the chat template](@/local/requests.md#replace-the-chat-template). |
 | A `chat_template` that is a bare name the engine does not know | The message names the three built-in names. |
 | No resolvable cache directory | Set `cache_dir`. |
 | A repo, revision or file with an empty, `.`, `..` or `:` segment, a backslash or a leading `/` | Fix the name. |
@@ -161,12 +162,12 @@ A checkpoint conversion that cannot run is a `CucaError::Config` that names the 
 - `CucaError::Transport`: a download failed, stalled for 60 seconds, ended short of the reported size, or got an unusable range response. Run again: the partial file stays and the download resumes.
 - `CucaError::Http`: the server answered a download with a non-2xx status. The message holds the first 512 characters of the body. A gated or private repository needs `hf_token`.
 - `sha256 mismatch for FILE: expected X, got Y`: `CucaError::Provider`. The file is corrupt or not the pinned one. The partial file is deleted; run again.
-- ``unsupported GGUF architecture `<name>`; supported: ...``: `CucaError::Provider`. The engine does not load that architecture. The message lists the supported ones. See [Choose a model](@/providers/local/models.md).
+- ``unsupported GGUF architecture `<name>`; supported: ...``: `CucaError::Provider`. The engine does not load that architecture. The message lists the supported ones. See [Choose a model](@/local/models.md).
 - An unsupported tokenizer model, pre-tokenizer or tensor type, a missing tensor or metadata key, or no end-of-generation token: `CucaError::Provider`. The message names the cause. IQ4_NL and MXFP4 tensors load; the other IQ types do not.
 - ``GGUF metadata `tokenizer.chat_template`: missing``: the model file carries no chat template. Set `chat_template` or `chat_template_file`.
 - `chat template: ...`: the model's own template does not compile. Set `chat_template` or `chat_template_file`.
 - ``part N of M of the split GGUF `<path>` is missing: `<name>` ``: a part of a split GGUF set is missing. The loader looks next to the named file, then in `shard_dirs`. Other messages for this set: `... is named part N but its split.no is M` and `the split GGUF ... declares N tensors but its parts hold M`.
-- A drafter that does not match its target, or `drafter "in-trunk"` on a file with no prediction head: `CucaError::Provider`. See [Speculative decoding](@/providers/local/drafting.md).
+- A drafter that does not match its target, or `drafter "in-trunk"` on a file with no prediction head: `CucaError::Provider`. See [Speculative decoding](@/local/drafting.md).
 - `deepseek41.attention.kv_source_layers` missing: a DeepSeek-V4.1 GGUF written in an older layout. Convert the checkpoint again.
 
 ### GPU errors

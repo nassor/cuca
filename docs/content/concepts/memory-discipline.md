@@ -103,7 +103,7 @@ Memory reports its use on every request. A `ContextUsageObserver` receives a `Co
 
 ## The local engine
 
-`provider-local` allocates its K/V memory up front and bounds its queues. The K/V cache is the memory where a model keeps what it has already read, so it does not recompute it for each new token. [Limits and errors](@/providers/local/limits-and-errors.md) has the full table.
+`provider-local` allocates its K/V memory up front and bounds its queues. The K/V cache is the memory where a model keeps what it has already read, so it does not recompute it for each new token. [Limits and errors](@/local/limits-and-errors.md) has the full table.
 
 - K/V block pool: `BatchingConfig::kv_tokens` positions per full-attention group, default twice `context_length` on the CPU and `context_length` plus at most 4,096 on a GPU, in blocks of 16. At the cap the least recently used unreferenced block is evicted. A running request that needs a block preempts the youngest one. Read it with `LocalModel::kv_cache_bytes()` and `serving_stats()`.
 - Prefix store: the unreferenced full 16-position blocks of the same pool, least recently used first. At the cap the least recently used block is evicted, first when an allocation finds no free block. Read it with `ServingStats` (free and cached blocks, prefix hits).
@@ -116,11 +116,11 @@ Memory reports its use on every request. A `ContextUsageObserver` receives a `Co
 - Tiered experts, device: `ExpertTiers::device_bytes`, GPU only. Same policy as the RAM tier. Read it with `LocalModel::expert_tier_stats()`.
 - Engram row cache (DeepSeek-V4.1): `EngramCache::ram_bytes`, 1 MiB to 1 TiB, default 4 GiB. A cached row counts its bytes plus 48 bytes of bookkeeping. At the cap the least recently used row is evicted, and a row evicted before its pass uses it is read again. Read it with `LocalModel::engram_stats()`.
 
-The K/V pool never grows. Only the oldest request, alone in a pool smaller than it needs, fails with a `CucaError::Provider`. The queues make callers wait and refuse nothing, which suits one in-process caller that can wait. See [Local configuration](@/providers/local/configuration.md) and [Tiered experts](@/providers/local/expert-tiers.md).
+The K/V pool never grows. Only the oldest request, alone in a pool smaller than it needs, fails with a `CucaError::Provider`. The queues make callers wait and refuse nothing, which suits one in-process caller that can wait. See [Local configuration](@/local/configuration.md) and [Tiered experts](@/local/expert-tiers.md).
 
 The Engram table of a DeepSeek-V4.1 model stays in the model file. Reader threads (`EngramCache::reader_threads`, 1 to 64, default 16) fetch the distinct rows of each pass. The cache only decides how many rows are read twice.
 
-Converting a checkpoint to GGUF is bounded too. It streams one tensor at a time. DeepSeek-V4.1 streams blocks of rows through two buffers of at most 32 MiB of `f32`. See [Model files and downloads](@/providers/local/model-sources.md).
+Converting a checkpoint to GGUF is bounded too. It streams one tensor at a time. DeepSeek-V4.1 streams blocks of rows through two buffers of at most 32 MiB of `f32`. See [Model files and downloads](@/local/model-sources.md).
 
 ## The server
 
@@ -160,4 +160,4 @@ A structure may go uncapped only when something other than traffic sets its size
 
 Every capped structure is described by three facts, in this order. A bound alone says nothing about what happens at the limit. A bound and a policy do not say how close the structure is to it. With all three, you can decide whether to raise the cap.
 
-Next page: [Providers](@/providers/_index.md).
+Next page: [Local (in-process)](@/local/_index.md).

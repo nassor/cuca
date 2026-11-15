@@ -131,7 +131,7 @@ Every `reqwest` entry turns on its `rustls` TLS backend with `ring` as the crypt
 
 ## Local GPU features
 
-Five features extend `provider-local`. None is a provider on its own. See [Run on a GPU](@/providers/local/gpu.md).
+Five features extend `provider-local`. None is a provider on its own. See [Run on a GPU](@/local/gpu.md).
 
 | Feature | What it is for | Pulls in |
 |---|---|---|
@@ -142,7 +142,7 @@ Five features extend `provider-local`. None is a provider on its own. See [Run o
 | `provider-local-rocm` | AMD GPUs through ROCm (Linux, Windows) | `provider-local-gpu`, `burn/rocm` |
 
 - `LocalDevice` and `GpuAdapter` exist in every `provider-local` build. Choosing a backend whose feature is off makes `LocalModel::load` fail with `CucaError::Config`.
-- A GPU feature alone does not move the model: set `device` in the model configuration. See [Configuration](@/providers/local/configuration.md).
+- A GPU feature alone does not move the model: set `device` in the model configuration. See [Configuration](@/local/configuration.md).
 
 ## Plugin features
 

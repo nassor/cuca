@@ -179,7 +179,7 @@ Details: [The model server](@/server/model-server.md), [The balancer](@/server/b
 
 ## The model keys
 
-A `model` node in `serve`, the file of the `local_model` example and `local { model { ... } }` in the test file are all a `LocalModelConfig`. The keys are its field names, and `examples/configs/local_model.kdl` lists every one. [Configuration](@/providers/local/configuration.md) has the meaning, default and range of each key.
+A `model` node in `serve`, the file of the `local_model` example and `local { model { ... } }` in the test file are all a `LocalModelConfig`. The keys are its field names, and `examples/configs/local_model.kdl` lists every one. [Configuration](@/local/configuration.md) has the meaning, default and range of each key.
 
 ```kdl,name=A model with a few common keys
 source "qwen3-0.6b-q8_0"

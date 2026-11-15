@@ -19,6 +19,8 @@ kicker = "Reference"
 
 A provider is the service that runs the model. CUCA has one adapter per provider. You write the request once as a `UnifiedRequest`, pick a provider on the client, and the adapter does the rest.
 
+The in-process Local provider has its own section, [Local (in-process)](@/local/_index.md). This section covers the HTTP providers and the rules every adapter shares.
+
 ## What you need
 
 - One `provider-*` feature in `Cargo.toml`, for example `provider-openai`.
@@ -120,7 +122,7 @@ The reply arrives as a stream. Each `Text` block is one piece of it, printed as 
 - [llama.cpp](@/providers/llamacpp.md) (`LlamaCpp`): feature `provider-llamacpp`, default base URL `http://127.0.0.1:8080`. Auth header `Authorization: Bearer`, when a key is set. Rejects nothing. The `Completion` route has no tools and no thinking.
 - [vLLM](@/providers/vllm.md) (`Vllm`): feature `provider-vllm`, default base URL `http://127.0.0.1:8000/v1`. Auth header `Authorization: Bearer`, when a key is set. Rejects nothing.
 - [LM Studio](@/providers/lmstudio.md) (`LmStudio`): feature `provider-lmstudio`, default base URL `http://127.0.0.1:1234/v1`. Auth header `Authorization: Bearer`, when a key is set. Rejects nothing.
-- [Local](@/providers/local/_index.md) (`Local`): feature `provider-local`. No base URL, it runs in your process, and no auth header. Needs a model attached to the client.
+- [Local](@/local/_index.md) (`Local`): feature `provider-local`. No base URL, it runs in your process, and no auth header. Needs a model attached to the client.
 
 These notes apply to every adapter above:
 
@@ -164,7 +166,7 @@ Gemini nests all four fields under `generationConfig`, for example `generationCo
 
 - `stop` is sent only when non-empty.
 - The rejection messages are ``"`top_k` is not supported by OpenAI"``, ``"`top_k` is not supported by DeepSeek"`` and ``"`seed` is not supported by Anthropic"``. A `top_k` on any other endpoint that reaches the OpenAI-compatible builder reads ``"`top_k` is not supported by this endpoint"``.
-- `provider-local` accepts all four and checks `top_p` in `(0, 1]`. See [Requests, thinking and tool calls](@/providers/local/requests.md).
+- `provider-local` accepts all four and checks `top_p` in `(0, 1]`. See [Requests, thinking and tool calls](@/local/requests.md).
 
 ## The in-process adapter
 
@@ -175,7 +177,7 @@ Gemini nests all four fields under `generationConfig`, for example `generationCo
 - It does not use `tokio-stream`. It uses `reqwest` only for the one-time model download.
 - The engine is pure Rust. The one C crate in its dependency tree is `ring`, the TLS crypto provider of the download client.
 
-See [Local (in-process)](@/providers/local/_index.md) for a first run, [Choose a model](@/providers/local/models.md) for the supported architectures and presets, and [Configuration](@/providers/local/configuration.md) for every setting.
+See [Local (in-process)](@/local/_index.md) for a first run, [Choose a model](@/local/models.md) for the supported architectures and presets, and [Configuration](@/local/configuration.md) for every setting.
 
 ## Dispatch
 
@@ -205,7 +207,7 @@ configuration error: custom endpoints require a registered adapter
 
 None of the seven HTTP adapters reads an environment variable. Base URLs, API keys and bearer tokens reach them only through `CucaClientBuilder`. The examples take their base URL and model as flags, and the tests read `cuca-test.kdl`. Both are on [Configuration files](@/reference/environment.md).
 
-`provider-local` reads no environment variable for its settings either. A KDL file fills the same fields as `LocalModelConfig`. See [Configuration files](@/reference/environment.md) and the local [Configuration](@/providers/local/configuration.md) reference.
+`provider-local` reads no environment variable for its settings either. A KDL file fills the same fields as `LocalModelConfig`. See [Configuration files](@/reference/environment.md) and the local [Configuration](@/local/configuration.md) reference.
 
 ## Related pages
 
