@@ -1972,7 +1972,9 @@ pub struct BatchingConfig {
     /// full-attention layer group holds this many positions for all running
     /// sequences and the cached prefixes together (a sliding-window group
     /// `max_sequences` windows plus cached prefixes). `None` (the default)
-    /// is twice `context_length`; an explicit value is at least
+    /// is twice `context_length` on the CPU, and on a GPU `context_length`
+    /// plus at most 4096 positions of cached prefixes (12288 at the default
+    /// 8192; device memory is scarcer); an explicit value is at least
     /// `context_length + 16` and rounds up to whole blocks of 16. It is the
     /// K/V memory knob: [`LocalModel::kv_cache_bytes`] reports the result, and
     /// raising `max_sequences` does not raise it.

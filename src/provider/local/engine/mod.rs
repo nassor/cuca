@@ -843,6 +843,25 @@ fn resolve_batching(
     )
 }
 
+/// Positions beyond one context that the default K/V pool of a model on a GPU
+/// holds for cached prefixes. On the CPU the default is twice the context;
+/// device memory is scarcer than RAM, and at the default 8192 positions the
+/// second context would be 1.6 GB of f32 K/V for Qwen3-30B-A3B, the
+/// difference between fitting a 16 GB card beside its 10 GB of weights and
+/// not.
+const GPU_PREFIX_SLACK: usize = 4096;
+
+/// The K/V pool size of `batching.kv_tokens = None` for a model of
+/// `context_length` positions on `device`: twice the context on the CPU, a
+/// context plus at most [`GPU_PREFIX_SLACK`] positions on a GPU.
+fn default_kv_tokens(context_length: usize, device: LocalDevice) -> usize {
+    if device == LocalDevice::Cpu {
+        2 * context_length
+    } else {
+        context_length + context_length.min(GPU_PREFIX_SLACK)
+    }
+}
+
 /// [`resolve_batching`] for a model that prefills `chunk` tokens of one prompt
 /// per step ([`super::model::prefill_rows`]).
 ///
@@ -858,7 +877,7 @@ fn resolve_batching_with(
     use super::model::paged::BLOCK_SIZE;
     let b = &config.batching;
     let kv_tokens = match b.kv_tokens {
-        None => 2 * context_length,
+        None => default_kv_tokens(context_length, config.device),
         Some(n) if n >= context_length + BLOCK_SIZE => n.div_ceil(BLOCK_SIZE) * BLOCK_SIZE,
         Some(n) => {
             return Err(CucaError::Config(format!(
@@ -1779,6 +1798,12 @@ mod tests {
             }
         );
         assert_eq!(sizing.kv_tokens, 2000, "twice the context by default");
+        // A GPU keeps one context and at most 4096 positions of prefixes.
+        let gpu = LocalDevice::Vulkan(super::super::GpuAdapter::Default);
+        assert_eq!(default_kv_tokens(1000, gpu), 2000);
+        assert_eq!(default_kv_tokens(8192, gpu), 12288);
+        assert_eq!(default_kv_tokens(32768, gpu), 36864);
+        assert_eq!(default_kv_tokens(8192, LocalDevice::Cpu), 16384);
         assert_eq!(sizing.max_sequences, 4);
         // An explicit pool rounds up to blocks and holds at least a context
         // and a block.
