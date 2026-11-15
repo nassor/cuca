@@ -57,7 +57,8 @@
 //!   `"repo:revision:file"` GGUF on Hugging Face, or `"repo:revision"`, a
 //!   safetensors checkpoint that is downloaded and converted to a GGUF once.
 //! - `convert quant="..."`: the weight precision of a converted checkpoint,
-//!   `f16`, `q8_0` (default) or `q4_0`.
+//!   `f16`, `q8_0` (default), `q4_0`, or the llama.cpp K-quant mixes `q4_k_s`,
+//!   `q4_k_m`, `q5_k_m` and `q6_k`.
 //! - `drafter`: a preset name, `"in-trunk"`, a `"repo:revision"` checkpoint
 //!   (DeepSeek-V4.1's DSpark stages live in the target's own checkpoint: the
 //!   same `repo:revision` as `source` converts to the drafter's file next to

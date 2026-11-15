@@ -19,7 +19,7 @@ source "qwen3-0.6b-q8_0"                 // or: source file="/models/x.gguf" | s
 // batching max_sequences=8 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false
 // experts { tiered ram_bytes="4g" device_bytes="6g" loader_threads=8; }   // or: experts "resident" | experts { host layers=4; } | experts { host; }
 // engram ram_bytes="2g" reader_threads=8
-// convert quant="q4_0" engram_quant="q8_0"
+// convert quant="q4_0" engram_quant="q8_0"   // quant: f16 | q8_0 (default) | q4_0 | q4_k_s | q4_k_m | q5_k_m | q6_k
 // drafter "in-trunk"                       // or a source in any form above
 // draft_tokens 5
 // shard_dirs "E:/parts" "F:/parts"

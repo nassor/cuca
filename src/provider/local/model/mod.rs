@@ -103,13 +103,14 @@
 //!
 //! # Memory
 //!
-//! - Weights stay quantized (any dtype candle's quantized matmul reads) and
-//!   are consumed by the row-batched kernel of [`qmm`] (Q4_0, Q4_1, Q5_0,
-//!   Q5_1 and Q8_0) or by candle's quantized matmul (the K-quants Q2_K to
-//!   Q6_K and any other dtype, one activation row at a time); norm vectors,
+//! - Weights stay quantized (every dtype of [`qmm`]: the legacy blocks, the
+//!   K-quants, the I-quants, IQ4_NL, TQ1_0, TQ2_0, MXFP4 and NVFP4, read
+//!   from the file's own blocks by the row-batched kernel); norm vectors,
 //!   biases and float-typed matmul
 //!   weights (including `per_layer_model_proj`, BF16 in the published Gemma 4
-//!   files) are held as f32. Resident weights are about the file size.
+//!   files) are held as f32, and a quantized token embedding table stays
+//!   quantized and dequantizes the rows it looks up. Resident weights are
+//!   about the file size.
 //! - Expert tensors are split once at load into one quantized 2-D weight per
 //!   expert, so a mixture-of-experts model also costs its file size, and the
 //!   transient memory of a forward pass is independent of the expert count:

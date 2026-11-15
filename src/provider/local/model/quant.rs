@@ -23,7 +23,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
 use candle_core::Device;
-use candle_core::quantized::{GgmlDType, QTensor};
+use candle_core::quantized::GgmlDType;
 
 use super::layout::tensor_info;
 use super::{candle_err, err};
@@ -347,40 +347,49 @@ fn q5_pair(q: u8, qh: u32, j: usize) -> (i16, i16) {
     (i16::from(lo), i16::from(hi))
 }
 
-/// The token embedding table (also the tied LM head), held quantized.
+/// The token embedding table (also the tied LM head), held in the file's
+/// type: a lookup dequantizes only the rows it reads.
 pub(crate) struct TokenEmbedding {
-    tensor: Arc<QTensor>,
-    dtype: GgmlDType,
+    data: Arc<[u8]>,
+    dtype: GgufType,
     rows: usize,
     row_len: usize,
     row_bytes: usize,
 }
 
 impl TokenEmbedding {
-    /// Wrap the `[rows, row_len]` table `tensor`.
-    pub(crate) fn new(tensor: Arc<QTensor>) -> Result<Self, CucaError> {
-        let &[rows, row_len] = tensor.shape().dims() else {
-            return Err(err("the token embedding is not a matrix"));
-        };
-        let dtype = tensor.dtype();
-        if !row_len.is_multiple_of(dtype.block_size()) {
+    /// Wrap the `[rows, row_len]` table of type `dtype` over its file bytes.
+    pub(crate) fn new(
+        dtype: GgufType,
+        data: Arc<[u8]>,
+        rows: usize,
+        row_len: usize,
+    ) -> Result<Self, CucaError> {
+        let Some(row_bytes) = dtype.byte_len(row_len) else {
             return Err(err(format!(
-                "token embedding: row length {row_len} is not a multiple of the {dtype:?} block size {}",
-                dtype.block_size()
+                "token embedding: row length {row_len} is not a whole number of {} blocks",
+                dtype.name()
+            )));
+        };
+        if rows.checked_mul(row_bytes) != Some(data.len()) {
+            return Err(err(format!(
+                "token embedding: {} bytes do not hold {rows} rows of {row_len} {} values",
+                data.len(),
+                dtype.name()
             )));
         }
         Ok(Self {
-            row_bytes: row_len / dtype.block_size() * dtype.type_size(),
-            tensor,
+            data,
             dtype,
             rows,
             row_len,
+            row_bytes,
         })
     }
 
     /// Embedding rows of `tokens`, concatenated and multiplied by `scale`.
     pub(crate) fn rows(&self, tokens: &[u32], scale: f32) -> Result<Vec<f32>, CucaError> {
-        let data = self.tensor.data().map_err(candle_err)?;
+        let data = &self.data;
         let mut out = vec![0f32; tokens.len() * self.row_len];
         for (&id, dst) in tokens.iter().zip(out.chunks_exact_mut(self.row_len)) {
             let id = id as usize;
@@ -494,6 +503,7 @@ impl RowTable {
 #[cfg(test)]
 mod tests {
     use candle_core::Tensor;
+    use candle_core::quantized::QTensor;
 
     use super::*;
 

@@ -1826,8 +1826,8 @@ mod tests {
         })
     }
 
-    /// A hybrid model mixing every weight dtype of the row-batched kernel,
-    /// with K-quant FFN down projections (trunk and head) on candle's kernel.
+    /// A hybrid model mixing the weight dtypes of the row-batched kernel,
+    /// with 256-value-type FFN down projections (trunk and head).
     fn mixed_qwen35() -> TinyQwen35 {
         TinyQwen35 {
             ff: 256,

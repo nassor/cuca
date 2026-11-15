@@ -104,7 +104,7 @@ fn local_checkpoint_matches_the_reference() {
     assert_eq!(out, greedy, "greedy ids");
 }
 
-/// Converts `oracle { convert_probe "<checkpoint dir>|<output file>|<f16|q8_0|q4_0>" }`
+/// Converts `oracle { convert_probe "<checkpoint dir>|<output file>|<f16|q8_0|q4_0|q4_k_s|q4_k_m|q5_k_m|q6_k>" }`
 /// to the given path, for diffing against the llama.cpp converter's output
 /// (`.omp/local-models/convert/runcmp.py`). Skips without the key.
 #[test]
