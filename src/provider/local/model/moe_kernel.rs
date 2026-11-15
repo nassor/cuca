@@ -53,6 +53,21 @@
 //! the block scale is `2^(e - 128)` (ggml's half scale of the E8M0 byte `e`).
 //! The dot products multiply them with the f32 activations; the CPU engine
 //! rounds the activations to Q8_0 first, so the engines agree loosely.
+//!
+//! The K-quants (Q2_K to Q6_K, Q8_K), the I-quants (IQ1_S, IQ1_M, IQ2_XXS,
+//! IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS), the ternary types (TQ1_0, TQ2_0)
+//! and NVFP4 are read as the file stores them too, one block per (thread, row
+//! or lane) decoded by the `native` module: the file's bytes of every block,
+//! padded to whole words (at most 3 bytes per 256 or 64 values, under 0.1
+//! bit per value), in a word-major order. Their dot products decode the same
+//! f32 expressions as `quant::dequant_row` and multiply them with the f32
+//! activations. The grids, sign table and scale table of the I-quants are one
+//! small device tensor per model load and device ([`tables_tensor`]) that
+//! every call passes next to the pool. IQ4_NL (32 values) keeps the Q4_0 word
+//! layout and reads its nibbles through the same table. The kernels take the
+//! formats of the gate, up and down matrices as comptime arguments, so each
+//! format mix compiles to a kernel of its own. Only Q5_0, Q5_1 and Q8_1 are
+//! still requantized to Q8_0.
 
 // The `#[cube]` kernels are Rust the CubeCL macro translates: it needs runtime
 // values built from runtime values (`tid - tid` is a runtime zero where a
@@ -80,6 +95,10 @@ use super::quant::dequant_row;
 use crate::error::CucaError;
 use crate::provider::local::gguf::GgufType;
 
+mod native;
+
+use native::{block_elems_of, code, is_native_code, kv4, native_block};
+
 /// Elements per quantization block (every format here).
 pub(crate) const BLOCK: usize = 32;
 
@@ -98,44 +117,130 @@ pub(crate) enum ExpertFormat {
     /// `kvalues_mxfp4`) times a power-of-two E8M0 scale byte per block, as the
     /// file stores them.
     Mxfp4,
+    /// IQ4_NL: the 4-bit layout of Q4_0 (an f16 scale and 4 words of
+    /// nibbles per block) read through the `kvalues_iq4nl` table.
+    Iq4Nl,
+    /// Q2_K, held as the file's 256-value blocks ([`native`]).
+    Q2K,
+    /// Q3_K, as the file's blocks.
+    Q3K,
+    /// Q4_K, as the file's blocks.
+    Q4K,
+    /// Q5_K, as the file's blocks.
+    Q5K,
+    /// Q6_K, as the file's blocks.
+    Q6K,
+    /// IQ4_XS, as the file's blocks.
+    Iq4Xs,
+    /// IQ2_XXS, as the file's blocks.
+    Iq2Xxs,
+    /// IQ2_XS, as the file's blocks.
+    Iq2Xs,
+    /// IQ2_S, as the file's blocks.
+    Iq2S,
+    /// IQ3_XXS, as the file's blocks.
+    Iq3Xxs,
+    /// IQ3_S, as the file's blocks.
+    Iq3S,
+    /// IQ1_S, as the file's blocks.
+    Iq1S,
+    /// IQ1_M, as the file's blocks.
+    Iq1M,
+    /// TQ1_0, as the file's blocks.
+    Tq1_0,
+    /// TQ2_0, as the file's blocks.
+    Tq2_0,
+    /// NVFP4, as the file's 64-value blocks.
+    Nvfp4,
+    /// Q8_K, as the file's blocks.
+    Q8K,
 }
 
 impl ExpertFormat {
-    /// The format of a matrix held as `dtype`: Q4_0, Q4_1, Q8_0, MXFP4 and the
-    /// float dtypes as they are, every other dtype requantized to Q8_0.
+    /// The format of a matrix held as `dtype`: Q4_0, Q4_1, Q8_0, MXFP4, the
+    /// K-quants and the float dtypes as they are, every other dtype
+    /// requantized to Q8_0.
     pub(crate) fn of(dtype: impl Into<GgufType>) -> Self {
         match dtype.into() {
             GgufType::Ggml(GgmlDType::Q4_0) => Self::Q4_0,
             GgufType::Ggml(GgmlDType::Q4_1) => Self::Q4_1,
             GgufType::Ggml(GgmlDType::Q8_0) => Self::Q8_0,
             GgufType::Ggml(GgmlDType::F32 | GgmlDType::F16 | GgmlDType::BF16) => Self::F32,
+            GgufType::Ggml(GgmlDType::Q2K) => Self::Q2K,
+            GgufType::Ggml(GgmlDType::Q3K) => Self::Q3K,
+            GgufType::Ggml(GgmlDType::Q4K) => Self::Q4K,
+            GgufType::Ggml(GgmlDType::Q5K) => Self::Q5K,
+            GgufType::Ggml(GgmlDType::Q6K) => Self::Q6K,
+            GgufType::Ggml(GgmlDType::Q8K) => Self::Q8K,
             GgufType::Mxfp4 => Self::Mxfp4,
+            GgufType::Iq4Nl => Self::Iq4Nl,
+            GgufType::Iq4Xs => Self::Iq4Xs,
+            GgufType::Iq2Xxs => Self::Iq2Xxs,
+            GgufType::Iq2Xs => Self::Iq2Xs,
+            GgufType::Iq2S => Self::Iq2S,
+            GgufType::Iq3Xxs => Self::Iq3Xxs,
+            GgufType::Iq3S => Self::Iq3S,
+            GgufType::Iq1S => Self::Iq1S,
+            GgufType::Iq1M => Self::Iq1M,
+            GgufType::Tq1_0 => Self::Tq1_0,
+            GgufType::Tq2_0 => Self::Tq2_0,
+            GgufType::Nvfp4 => Self::Nvfp4,
             _ => Self::Q8_0,
         }
     }
 
-    /// The code the kernels branch on.
+    /// The code the kernels branch on (a comptime argument).
     fn code(self) -> u32 {
         match self {
-            Self::Q4_0 => 0,
-            Self::Q4_1 => 1,
-            Self::Q8_0 => 2,
-            Self::F32 => 3,
-            Self::Mxfp4 => 4,
+            Self::Q4_0 => code::Q4_0,
+            Self::Q4_1 => code::Q4_1,
+            Self::Q8_0 => code::Q8_0,
+            Self::F32 => code::F32,
+            Self::Mxfp4 => code::MXFP4,
+            Self::Q2K => code::Q2_K,
+            Self::Q3K => code::Q3_K,
+            Self::Q4K => code::Q4_K,
+            Self::Q5K => code::Q5_K,
+            Self::Q6K => code::Q6_K,
+            Self::Iq4Nl => code::IQ4_NL,
+            Self::Iq4Xs => code::IQ4_XS,
+            Self::Iq2Xxs => code::IQ2_XXS,
+            Self::Iq2Xs => code::IQ2_XS,
+            Self::Iq2S => code::IQ2_S,
+            Self::Iq3Xxs => code::IQ3_XXS,
+            Self::Iq3S => code::IQ3_S,
+            Self::Iq1S => code::IQ1_S,
+            Self::Iq1M => code::IQ1_M,
+            Self::Tq1_0 => code::TQ1_0,
+            Self::Tq2_0 => code::TQ2_0,
+            Self::Nvfp4 => code::NVFP4,
+            Self::Q8K => code::Q8_K,
         }
     }
 
-    /// `u32` words of values per block.
+    /// Whether the format is the file's blocks in the word-major layout of
+    /// [`native`], scales and all, instead of values and scale arrays.
+    fn is_native(self) -> bool {
+        is_native_code(self.code())
+    }
+
+    /// Values per block: 32, or 256 for a native super-block format.
+    pub(crate) fn block_elems(self) -> usize {
+        block_elems_of(self.code())
+    }
+
+    /// `u32` words of values per block (a native block: all its words).
     fn value_words(self) -> usize {
         match self {
-            Self::Q4_0 | Self::Q4_1 | Self::Mxfp4 => 4,
+            Self::Q4_0 | Self::Q4_1 | Self::Mxfp4 | Self::Iq4Nl => 4,
             Self::Q8_0 => 8,
             Self::F32 => BLOCK,
+            _ => native::block_words_of(self.code()),
         }
     }
 
     fn has_scale(self) -> bool {
-        self != Self::F32
+        self != Self::F32 && !self.is_native()
     }
 
     fn has_min(self) -> bool {
@@ -178,13 +283,17 @@ pub(crate) struct MatrixLayout {
 
 impl MatrixLayout {
     fn blocks(&self) -> usize {
-        self.rows * self.cols / BLOCK
+        self.rows * self.cols / self.format.block_elems()
     }
 
     /// Words of the scales (or minimums): two f16 per word, or four E8M0
     /// bytes per word.
     fn scale_words(&self) -> usize {
-        packed_words(self.blocks(), self.format.scale_bits())
+        if self.format.has_scale() {
+            packed_words(self.blocks(), self.format.scale_bits())
+        } else {
+            0
+        }
     }
 
     fn scale_offset(&self) -> usize {
@@ -223,12 +332,22 @@ impl SlotLayout {
         ff: usize,
         dtypes: [T; 3],
     ) -> Result<Self, CucaError> {
-        if !n_embd.is_multiple_of(BLOCK) || !ff.is_multiple_of(BLOCK) {
+        let [gate_format, up_format, down_format] = dtypes.map(ExpertFormat::of);
+        let formats = [
+            (gate_format, n_embd),
+            (up_format, n_embd),
+            (down_format, ff),
+        ];
+        if !n_embd.is_multiple_of(BLOCK)
+            || !ff.is_multiple_of(BLOCK)
+            || formats
+                .iter()
+                .any(|(format, cols)| !cols.is_multiple_of(format.block_elems()))
+        {
             return Err(CucaError::Config(format!(
-                "expert matrices of {n_embd} inputs and {ff} features are not whole {BLOCK}-element blocks"
+                "expert matrices of {n_embd} inputs and {ff} features are not whole blocks of their formats"
             )));
         }
-        let [gate_type, up_type, down_type] = dtypes;
         let mut offset = 0;
         let mut next = |format, rows, cols| {
             let m = MatrixLayout {
@@ -240,9 +359,9 @@ impl SlotLayout {
             offset += m.words();
             m
         };
-        let gate = next(ExpertFormat::of(gate_type), ff, n_embd);
-        let up = next(ExpertFormat::of(up_type), ff, n_embd);
-        let down = next(ExpertFormat::of(down_type), n_embd, ff);
+        let gate = next(gate_format, ff, n_embd);
+        let up = next(up_format, ff, n_embd);
+        let down = next(down_format, n_embd, ff);
         Ok(Self {
             gate,
             up,
@@ -296,11 +415,9 @@ pub(crate) fn pack_matrix(
         _ => Err(err(format!("{} bytes of {}", raw.len(), dtype.name()))),
     };
     match layout.format {
-        ExpertFormat::Q4_0 | ExpertFormat::Q4_1 => {
+        ExpertFormat::Q4_0 | ExpertFormat::Q4_1 | ExpertFormat::Iq4Nl => {
             let block_bytes = dtype.type_size().unwrap_or(0);
-            if dtype != GgufType::Ggml(GgmlDType::Q4_0) && dtype != GgufType::Ggml(GgmlDType::Q4_1)
-                || raw.len() != blocks * block_bytes
-            {
+            if ExpertFormat::of(dtype) != layout.format || raw.len() != blocks * block_bytes {
                 return Err(err(format!(
                     "{} bytes of {} for {blocks} blocks",
                     raw.len(),
@@ -395,6 +512,25 @@ pub(crate) fn pack_matrix(
                 }
             }
         }
+        // Every other format is a native one: the file's blocks, word-major
+        // (see `native`).
+        _ => {
+            if ExpertFormat::of(dtype) != layout.format {
+                return Err(err(format!(
+                    "{} for a {:?} matrix",
+                    dtype.name(),
+                    layout.format
+                )));
+            }
+            native::pack_native(
+                layout.format.code(),
+                layout.rows,
+                layout.cols,
+                raw,
+                false,
+                values,
+            )?;
+        }
     }
     Ok(())
 }
@@ -435,9 +571,9 @@ pub(crate) struct DenseLayout {
 }
 
 impl DenseLayout {
-    /// The layout of a `[rows, cols]` weight held as `dtype`: Q4_0, Q4_1,
-    /// Q8_0 and MXFP4 as they are, every other quantized dtype requantized
-    /// to Q8_0.
+    /// The layout of a `[rows, cols]` weight held as `dtype`: every format
+    /// the kernels read as it is (see [`ExpertFormat::of`]), every other
+    /// quantized dtype (Q5_0, Q5_1, Q8_1) requantized to Q8_0.
     ///
     /// # Errors
     ///
@@ -450,7 +586,7 @@ impl DenseLayout {
     ) -> Result<Self, CucaError> {
         let dtype = dtype.into();
         let format = ExpertFormat::of(dtype);
-        if format == ExpertFormat::F32 || !cols.is_multiple_of(BLOCK) {
+        if format == ExpertFormat::F32 || !cols.is_multiple_of(format.block_elems()) {
             return Err(CucaError::Config(format!(
                 "a dense {} weight of rows of {cols} values has no block layout",
                 dtype.name()
@@ -460,7 +596,7 @@ impl DenseLayout {
     }
 
     pub(crate) fn blocks_per_row(&self) -> usize {
-        self.cols / BLOCK
+        self.cols / self.format.block_elems()
     }
 
     fn blocks(&self) -> usize {
@@ -468,7 +604,11 @@ impl DenseLayout {
     }
 
     fn scale_words(&self) -> usize {
-        packed_words(self.blocks(), self.format.scale_bits())
+        if self.format.has_scale() {
+            packed_words(self.blocks(), self.format.scale_bits())
+        } else {
+            0
+        }
     }
 
     fn scale_offset(&self) -> usize {
@@ -506,6 +646,26 @@ pub(crate) fn pack_dense(
     dtype: impl Into<GgufType>,
     raw: &[u8],
 ) -> Result<Vec<u32>, CucaError> {
+    let dtype = dtype.into();
+    if layout.format.is_native() {
+        if ExpertFormat::of(dtype) != layout.format {
+            return Err(super::err(format!(
+                "dense matrix: {} for a {:?} weight",
+                dtype.name(),
+                layout.format
+            )));
+        }
+        let mut out = vec![0u32; layout.words()];
+        native::pack_native(
+            layout.format.code(),
+            layout.rows,
+            layout.cols,
+            raw,
+            true,
+            &mut out,
+        )?;
+        return Ok(out);
+    }
     let matrix = MatrixLayout {
         format: layout.format,
         rows: layout.rows,
@@ -698,36 +858,54 @@ fn mxfp4_block_dot(pool: &Tensor<u32>, wb: usize, e: u32, x: &Tensor<f32>, xo: u
 
 /// Partial dot product of row `row` of the matrix at `matrix` (words from the
 /// start of the pool) with `x[x_base..]` over the blocks `first`, `first +
-/// step`, ... (`count` of them).
+/// step`, ... (`count` of them); the matrix has `nblk` blocks in all, `sink`
+/// is only the buffer the decoders of [`native`] would store values in.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn dot_row(
     pool: &Tensor<u32>,
+    tables: &Tensor<u32>,
     matrix: usize,
     scales: usize,
     mins: usize,
-    format: u32,
+    #[comptime] format: u32,
     row: usize,
     blocks_per_row: usize,
+    nblk: usize,
     first: usize,
     step: usize,
     count: usize,
     x: &Tensor<f32>,
     x_base: usize,
+    sink: &mut Tensor<f32>,
 ) -> f32 {
+    let elems = comptime![block_elems_of(format)];
     let mut acc = 0.0f32;
     for i in 0..count {
         let b = first + i * step;
         let block = row * blocks_per_row + b;
-        let xo = x_base + b * 32usize;
-        if format == 3u32 {
+        let xo = x_base + b * elems;
+        if comptime![is_native_code(format)] {
+            acc += native_block(
+                format,
+                pool,
+                tables,
+                matrix + block,
+                nblk,
+                x,
+                xo,
+                sink,
+                0usize,
+                false,
+            );
+        } else if comptime![format == code::F32] {
             let wb = matrix + block * 32usize;
             let mut s = 0.0f32;
             for i in 0..32usize {
                 s += f32::reinterpret(pool[wb + i]) * x[xo + i];
             }
             acc += s;
-        } else if format == 2u32 {
+        } else if comptime![format == code::Q8_0] {
             let wb = matrix + block * 8usize;
             let mut s = 0.0f32;
             for w in 0..8usize {
@@ -739,9 +917,20 @@ fn dot_row(
                 }
             }
             acc += half_at(pool, scales, block) * s;
-        } else if format == 4u32 {
+        } else if comptime![format == code::MXFP4] {
             let e = byte_at(pool, scales, block);
             acc += mxfp4_block_dot(pool, matrix + block * 4usize, e, x, xo);
+        } else if comptime![format == code::IQ4_NL] {
+            let wb = matrix + block * 4usize;
+            let mut s = 0.0f32;
+            for w in 0..4usize {
+                let word = pool[wb + w];
+                for i in 0..8usize {
+                    let q = (word >> (u32::cast_from(i) * 4u32)) & 0xFu32;
+                    s += kv4(tables, q) * x[xo + w * 8usize + i];
+                }
+            }
+            acc += half_at(pool, scales, block) * s;
         } else {
             let wb = matrix + block * 4usize;
             let mut s = 0.0f32;
@@ -755,7 +944,7 @@ fn dot_row(
                     sx += xv;
                 }
             }
-            if format == 0u32 {
+            if comptime![format == code::Q4_0] {
                 acc += half_at(pool, scales, block) * (s - 8.0f32 * sx);
             } else {
                 acc += half_at(pool, scales, block) * s + half_at(pool, mins, block) * sx;
@@ -960,7 +1149,8 @@ const EXPERT_LANES: usize = 8;
 /// threads serves `EXPERT_GROUP / lanes` rows of one pair, `lanes` threads per
 /// row: thread `tid` is lane `tid % lanes` of row `tid / lanes`. Lane `l`
 /// takes the blocks `l`, `l + lanes`, ... in f32 and lane 0 adds the lanes'
-/// partial sums in lane order.
+/// partial sums in lane order. The gate and up matrices have `gate_bpr` and
+/// `up_bpr` blocks per row, in the formats `gate_fmt` and `up_fmt`.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn up_kernel(
@@ -968,6 +1158,7 @@ fn up_kernel(
     route: &Tensor<f32>,
     list: &Tensor<u32>,
     pool: &Tensor<u32>,
+    tables: &Tensor<u32>,
     hidden: &mut Tensor<f32>,
     use_list: u32,
     n_used: u32,
@@ -975,16 +1166,18 @@ fn up_kernel(
     ff: u32,
     act: u32,
     slot_words: u32,
-    gate_fmt: u32,
     gate_at: u32,
     gate_scales: u32,
     gate_mins: u32,
-    up_fmt: u32,
+    gate_bpr: u32,
     up_at: u32,
     up_scales: u32,
     up_mins: u32,
+    up_bpr: u32,
     clamp: f32,
     lanes: u32,
+    #[comptime] gate_fmt: u32,
+    #[comptime] up_fmt: u32,
     #[comptime] group: usize,
 ) {
     let tid = UNIT_POS_X as usize;
@@ -1004,40 +1197,51 @@ fn up_kernel(
             slot = usize::cast_from(list[2usize * pi + 1usize]);
         }
         let token = pair / usize::cast_from(n_used);
-        let blocks = usize::cast_from(n_embd) / 32usize;
+        let gbpr = usize::cast_from(gate_bpr);
+        let ubpr = usize::cast_from(up_bpr);
         let base = slot * usize::cast_from(slot_words);
         let x_base = token * usize::cast_from(n_embd);
-        let mut count = 0usize;
-        if lane < blocks {
-            count = (blocks - lane + lanes - 1usize) / lanes;
+        let mut gcount = 0usize;
+        if lane < gbpr {
+            gcount = (gbpr - lane + lanes - 1usize) / lanes;
+        }
+        let mut ucount = 0usize;
+        if lane < ubpr {
+            ucount = (ubpr - lane + lanes - 1usize) / lanes;
         }
         g_acc = dot_row(
             pool,
+            tables,
             base + usize::cast_from(gate_at),
             base + usize::cast_from(gate_scales),
             base + usize::cast_from(gate_mins),
             gate_fmt,
             row,
-            blocks,
+            gbpr,
+            usize::cast_from(ff) * gbpr,
             lane,
             lanes,
-            count,
+            gcount,
             x,
             x_base,
+            hidden,
         );
         u_acc = dot_row(
             pool,
+            tables,
             base + usize::cast_from(up_at),
             base + usize::cast_from(up_scales),
             base + usize::cast_from(up_mins),
             up_fmt,
             row,
-            blocks,
+            ubpr,
+            usize::cast_from(ff) * ubpr,
             lane,
             lanes,
-            count,
+            ucount,
             x,
             x_base,
+            hidden,
         );
     }
     gate_part[tid] = g_acc;
@@ -1076,7 +1280,8 @@ fn up_kernel(
 }
 
 /// `scratch[pair] = weight * (down . hidden[pair])`, the lanes of a row
-/// as in [`up_kernel`].
+/// as in [`up_kernel`]; the down matrix has `bpr` blocks per row in the
+/// format `fmt`.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn down_kernel(
@@ -1084,6 +1289,7 @@ fn down_kernel(
     route: &Tensor<f32>,
     list: &Tensor<u32>,
     pool: &Tensor<u32>,
+    tables: &Tensor<u32>,
     scratch: &mut Tensor<f32>,
     use_list: u32,
     tokens: u32,
@@ -1091,11 +1297,12 @@ fn down_kernel(
     n_embd: u32,
     ff: u32,
     slot_words: u32,
-    fmt: u32,
     at: u32,
     scales: u32,
     mins: u32,
+    bpr: u32,
     lanes: u32,
+    #[comptime] fmt: u32,
     #[comptime] group: usize,
 ) {
     let tid = UNIT_POS_X as usize;
@@ -1113,24 +1320,27 @@ fn down_kernel(
     }
     if row < usize::cast_from(n_embd) {
         let base = slot * usize::cast_from(slot_words);
-        let blocks = usize::cast_from(ff) / 32usize;
+        let blocks = usize::cast_from(bpr);
         let mut count = 0usize;
         if lane < blocks {
             count = (blocks - lane + lanes - 1usize) / lanes;
         }
         acc = dot_row(
             pool,
+            tables,
             base + usize::cast_from(at),
             base + usize::cast_from(scales),
             base + usize::cast_from(mins),
             fmt,
             row,
             blocks,
+            usize::cast_from(n_embd) * blocks,
             lane,
             lanes,
             count,
             hidden,
             pi * usize::cast_from(ff),
+            scratch,
         );
     }
     part[tid] = acc;
@@ -1190,31 +1400,49 @@ fn gemv_lanes(rows: usize, blocks_per_row: usize, tokens: usize) -> usize {
 
 /// Partial dot product of row `row` of the dense weight (block-major, see
 /// [`DenseLayout`]) with `x[x_base..]` over the blocks `first`, `first +
-/// step`, ... (`count` of them).
+/// step`, ... (`count` of them); `sink` is only the buffer the decoders of
+/// [`native`] would store values in.
 #[cube]
 #[allow(clippy::too_many_arguments)]
 fn dense_dot(
     pool: &Tensor<u32>,
+    tables: &Tensor<u32>,
     row: usize,
     rows: usize,
+    blocks_per_row: usize,
     first: usize,
     step: usize,
     count: usize,
-    format: u32,
+    #[comptime] format: u32,
     scales: usize,
     mins: usize,
     x: &Tensor<f32>,
     x_base: usize,
+    sink: &mut Tensor<f32>,
 ) -> f32 {
+    let elems = comptime![block_elems_of(format)];
     let mut acc = 0.0f32;
     for i in 0..count {
         let b = first + i * step;
         let block = b * rows + row;
-        let xo = x_base + b * 32usize;
-        if format == 4u32 {
+        let xo = x_base + b * elems;
+        if comptime![is_native_code(format)] {
+            acc += native_block(
+                format,
+                pool,
+                tables,
+                block,
+                rows * blocks_per_row,
+                x,
+                xo,
+                sink,
+                0usize,
+                false,
+            );
+        } else if comptime![format == code::MXFP4] {
             let e = byte_at(pool, scales, block);
             acc += mxfp4_block_dot(pool, block * 4usize, e, x, xo);
-        } else if format == 2u32 {
+        } else if comptime![format == code::Q8_0] {
             let wb = block * 8usize;
             let mut s = 0.0f32;
             for w in 0..8usize {
@@ -1223,6 +1451,17 @@ fn dense_dot(
                     let byte = (word >> (u32::cast_from(k) * 8u32)) & 0xFFu32;
                     let q = i32::cast_from(byte & 0x7Fu32) - i32::cast_from(byte & 0x80u32);
                     s += f32::cast_from(q) * x[xo + w * 4usize + k];
+                }
+            }
+            acc += half_at(pool, scales, block) * s;
+        } else if comptime![format == code::IQ4_NL] {
+            let wb = block * 4usize;
+            let mut s = 0.0f32;
+            for w in 0..4usize {
+                let word = pool[wb + w];
+                for k in 0..8usize {
+                    let q = (word >> (u32::cast_from(k) * 4u32)) & 0xFu32;
+                    s += kv4(tables, q) * x[xo + w * 8usize + k];
                 }
             }
             acc += half_at(pool, scales, block) * s;
@@ -1239,7 +1478,7 @@ fn dense_dot(
                     sx += xv;
                 }
             }
-            if format == 0u32 {
+            if comptime![format == code::Q4_0] {
                 acc += half_at(pool, scales, block) * (s - 8.0f32 * sx);
             } else {
                 acc += half_at(pool, scales, block) * s + half_at(pool, mins, block) * sx;
@@ -1261,15 +1500,17 @@ fn dense_dot(
 fn dense_gemv_kernel(
     x: &Tensor<f32>,
     pool: &Tensor<u32>,
+    tables: &Tensor<u32>,
     out: &mut Tensor<f32>,
     rows: u32,
     blocks_per_row: u32,
-    format: u32,
     scales: u32,
     mins: u32,
     lanes: u32,
+    #[comptime] format: u32,
     #[comptime] group: usize,
 ) {
+    let elems = comptime![block_elems_of(format)];
     let tid = UNIT_POS_X as usize;
     let lanes = usize::cast_from(lanes);
     let per_group = group / lanes;
@@ -1285,8 +1526,10 @@ fn dense_gemv_kernel(
         let count = (bpr - lane + lanes - 1usize) / lanes;
         acc = dense_dot(
             pool,
+            tables,
             row,
             rows,
+            bpr,
             lane,
             lanes,
             count,
@@ -1294,7 +1537,8 @@ fn dense_gemv_kernel(
             usize::cast_from(scales),
             usize::cast_from(mins),
             x,
-            token * bpr * 32usize,
+            token * bpr * elems,
+            out,
         );
     }
     partial[tid] = acc;
@@ -1309,28 +1553,45 @@ fn dense_gemv_kernel(
 }
 
 /// `out[r, c]` = element `c` of row `row0 + r` of the weight, for `count`
-/// rows: one thread per (row, block).
+/// rows: one thread per (row, block). `like` is a dummy input the native
+/// decoders take where the matrix-vector kernels take the activations.
 #[cube(launch)]
 #[allow(clippy::too_many_arguments)]
 fn dense_dequant_kernel(
+    like: &Tensor<f32>,
     pool: &Tensor<u32>,
+    tables: &Tensor<u32>,
     out: &mut Tensor<f32>,
     rows: u32,
     row0: u32,
     count: u32,
     blocks_per_row: u32,
-    format: u32,
     scales: u32,
     mins: u32,
+    #[comptime] format: u32,
 ) {
+    let elems = comptime![block_elems_of(format)];
     let i = ABSOLUTE_POS;
     let bpr = usize::cast_from(blocks_per_row);
     if i < usize::cast_from(count) * bpr {
         let r = i / bpr;
         let b = i % bpr;
         let block = b * usize::cast_from(rows) + usize::cast_from(row0) + r;
-        let dst = i * 32usize;
-        if format == 4u32 {
+        let dst = i * elems;
+        if comptime![is_native_code(format)] {
+            native_block(
+                format,
+                pool,
+                tables,
+                block,
+                usize::cast_from(rows) * bpr,
+                like,
+                0usize,
+                out,
+                dst,
+                true,
+            );
+        } else if comptime![format == code::MXFP4] {
             let e = byte_at(pool, usize::cast_from(scales), block);
             for w in 0..4usize {
                 let word = pool[block * 4usize + w];
@@ -1341,7 +1602,7 @@ fn dense_dequant_kernel(
                     out[dst + j + 16usize] = mxfp4_scaled(mxfp4_value(byte >> 4u32), e);
                 }
             }
-        } else if format == 2u32 {
+        } else if comptime![format == code::Q8_0] {
             let d = half_at(pool, usize::cast_from(scales), block);
             for w in 0..8usize {
                 let word = pool[block * 8usize + w];
@@ -1351,17 +1612,26 @@ fn dense_dequant_kernel(
                     out[dst + w * 4usize + k] = d * f32::cast_from(q);
                 }
             }
+        } else if comptime![format == code::IQ4_NL] {
+            let d = half_at(pool, usize::cast_from(scales), block);
+            for w in 0..4usize {
+                let word = pool[block * 4usize + w];
+                for k in 0..8usize {
+                    let q = (word >> (u32::cast_from(k) * 4u32)) & 0xFu32;
+                    out[dst + w * 8usize + k] = d * kv4(tables, q);
+                }
+            }
         } else {
             let d = half_at(pool, usize::cast_from(scales), block);
             let mut m = 0.0f32;
-            if format == 1u32 {
+            if comptime![format == code::Q4_1] {
                 m = half_at(pool, usize::cast_from(mins), block);
             }
             for w in 0..4usize {
                 let word = pool[block * 4usize + w];
                 for k in 0..8usize {
                     let q = f32::cast_from((word >> (u32::cast_from(k) * 4u32)) & 0xFu32);
-                    if format == 0u32 {
+                    if comptime![format == code::Q4_0] {
                         out[dst + w * 8usize + k] = d * (q - 8.0f32);
                     } else {
                         out[dst + w * 8usize + k] = d * q + m;
@@ -1401,6 +1671,7 @@ pub trait MoeKernels: burn::backend::Backend {
         route: FloatTensor<Self>,
         list: IntTensor<Self>,
         pool: IntTensor<Self>,
+        tables: IntTensor<Self>,
         call: MoeCall,
         clamp: f32,
     ) -> FloatTensor<Self>;
@@ -1413,6 +1684,7 @@ pub trait MoeKernels: burn::backend::Backend {
         route: FloatTensor<Self>,
         list: IntTensor<Self>,
         pool: IntTensor<Self>,
+        tables: IntTensor<Self>,
         scratch: FloatTensor<Self>,
         call: MoeCall,
     ) -> FloatTensor<Self>;
@@ -1435,6 +1707,7 @@ pub trait MoeKernels: burn::backend::Backend {
     fn dense_gemv(
         x: FloatTensor<Self>,
         pool: IntTensor<Self>,
+        tables: IntTensor<Self>,
         call: DenseCall,
     ) -> FloatTensor<Self>;
 
@@ -1445,6 +1718,7 @@ pub trait MoeKernels: burn::backend::Backend {
     fn dense_dequant(
         like: FloatTensor<Self>,
         pool: IntTensor<Self>,
+        tables: IntTensor<Self>,
         call: DenseCall,
     ) -> FloatTensor<Self>;
 }
@@ -1507,6 +1781,7 @@ impl MoeKernels for CubeBackend {
         route: CubeTensor,
         list: CubeTensor,
         pool: CubeTensor,
+        tables: CubeTensor,
         call: MoeCall,
         clamp: f32,
     ) -> CubeTensor {
@@ -1514,7 +1789,7 @@ impl MoeKernels for CubeBackend {
         let x = into_contiguous(x);
         let out = f32_tensor(&x, Shape::new([call.pairs, g.rows]));
         let client = x.client.clone();
-        let lanes = expert_lanes(g.cols / BLOCK);
+        let lanes = expert_lanes(g.cols / g.format.block_elems());
         let rows = g.rows.div_ceil(EXPERT_GROUP / lanes) as u32;
         up_kernel::launch(
             &client,
@@ -1524,6 +1799,7 @@ impl MoeKernels for CubeBackend {
             route.into_tensor_arg(),
             list.into_tensor_arg(),
             pool.into_tensor_arg(),
+            tables.into_tensor_arg(),
             out.clone().into_tensor_arg(),
             u32::from(call.use_list),
             call.n_used as u32,
@@ -1531,16 +1807,18 @@ impl MoeKernels for CubeBackend {
             g.rows as u32,
             call.act,
             call.slot.words as u32,
-            g.format.code(),
             g.offset as u32,
             g.scale_offset() as u32,
             g.min_offset() as u32,
-            u.format.code(),
+            (g.cols / g.format.block_elems()) as u32,
             u.offset as u32,
             u.scale_offset() as u32,
             u.min_offset() as u32,
+            (u.cols / u.format.block_elems()) as u32,
             clamp,
             lanes as u32,
+            g.format.code(),
+            u.format.code(),
             EXPERT_GROUP,
         );
         out
@@ -1551,12 +1829,13 @@ impl MoeKernels for CubeBackend {
         route: CubeTensor,
         list: CubeTensor,
         pool: CubeTensor,
+        tables: CubeTensor,
         scratch: CubeTensor,
         call: MoeCall,
     ) -> CubeTensor {
         let d = &call.slot.down;
         let client = hidden.client.clone();
-        let lanes = expert_lanes(d.cols / BLOCK);
+        let lanes = expert_lanes(d.cols / d.format.block_elems());
         let rows = d.rows.div_ceil(EXPERT_GROUP / lanes) as u32;
         down_kernel::launch(
             &client,
@@ -1566,6 +1845,7 @@ impl MoeKernels for CubeBackend {
             route.into_tensor_arg(),
             list.into_tensor_arg(),
             pool.into_tensor_arg(),
+            tables.into_tensor_arg(),
             scratch.clone().into_tensor_arg(),
             u32::from(call.use_list),
             call.tokens as u32,
@@ -1573,11 +1853,12 @@ impl MoeKernels for CubeBackend {
             d.rows as u32,
             d.cols as u32,
             call.slot.words as u32,
-            d.format.code(),
             d.offset as u32,
             d.scale_offset() as u32,
             d.min_offset() as u32,
+            (d.cols / d.format.block_elems()) as u32,
             lanes as u32,
+            d.format.code(),
             EXPERT_GROUP,
         );
         scratch
@@ -1603,7 +1884,12 @@ impl MoeKernels for CubeBackend {
         out
     }
 
-    fn dense_gemv(x: CubeTensor, pool: CubeTensor, call: DenseCall) -> CubeTensor {
+    fn dense_gemv(
+        x: CubeTensor,
+        pool: CubeTensor,
+        tables: CubeTensor,
+        call: DenseCall,
+    ) -> CubeTensor {
         let x = into_contiguous(x);
         let l = &call.layout;
         let out = f32_tensor(&x, Shape::new([call.tokens, l.rows]));
@@ -1616,19 +1902,25 @@ impl MoeKernels for CubeBackend {
             CubeDim::new_1d(GEMV_GROUP as u32),
             x.into_tensor_arg(),
             pool.into_tensor_arg(),
+            tables.into_tensor_arg(),
             out.clone().into_tensor_arg(),
             l.rows as u32,
             l.blocks_per_row() as u32,
-            l.format.code(),
             l.scale_offset() as u32,
             l.min_offset() as u32,
             lanes as u32,
+            l.format.code(),
             GEMV_GROUP,
         );
         out
     }
 
-    fn dense_dequant(like: CubeTensor, pool: CubeTensor, call: DenseCall) -> CubeTensor {
+    fn dense_dequant(
+        like: CubeTensor,
+        pool: CubeTensor,
+        tables: CubeTensor,
+        call: DenseCall,
+    ) -> CubeTensor {
         let l = &call.layout;
         let out = f32_tensor(&like, Shape::new([call.count, l.cols]));
         let client = like.client.clone();
@@ -1639,15 +1931,17 @@ impl MoeKernels for CubeBackend {
             &client,
             count,
             dim,
+            like.into_tensor_arg(),
             pool.into_tensor_arg(),
+            tables.into_tensor_arg(),
             out.clone().into_tensor_arg(),
             l.rows as u32,
             call.row0 as u32,
             call.count as u32,
             l.blocks_per_row() as u32,
-            l.format.code(),
             l.scale_offset() as u32,
             l.min_offset() as u32,
+            l.format.code(),
         );
         out
     }
@@ -1675,7 +1969,19 @@ impl MoeKernels for CubeBackend {
 // ---------------------------------------------------------- tensor wrappers
 
 use burn::backend::Dispatch;
-use burn::tensor::{Int, Tensor as BTensor};
+use burn::tensor::{Device, Int, Tensor as BTensor, TensorData};
+
+/// The lookup tables of the native formats ([`native::table_words`]) as a
+/// device tensor: one per device and model load, shared by every weight and
+/// expert bank, which pass it to the kernels next to their pool.
+pub(crate) fn tables_tensor(device: &Device) -> BTensor<1, Int> {
+    let words: Vec<i32> = native::table_words()
+        .into_iter()
+        .map(|w| w as i32)
+        .collect();
+    let len = words.len();
+    BTensor::from_data(TensorData::new(words, [len]), device)
+}
 
 /// [`MoeKernels::moe_route`] on tensors: the softmax scores, no bias.
 pub(crate) fn route(logits: BTensor<2>, call: &MoeCall, norm: bool) -> BTensor<1> {
@@ -1711,9 +2017,10 @@ pub(crate) fn up(
     route: BTensor<1>,
     list: BTensor<1, Int>,
     pool: BTensor<1, Int>,
+    tables: BTensor<1, Int>,
     call: &MoeCall,
 ) -> BTensor<2> {
-    up_clamped(x, route, list, pool, call, 0.0)
+    up_clamped(x, route, list, pool, tables, call, 0.0)
 }
 
 /// [`MoeKernels::moe_up`] on tensors with the SwiGLU clamp `clamp` (0: none).
@@ -1722,6 +2029,7 @@ pub(crate) fn up_clamped(
     route: BTensor<1>,
     list: BTensor<1, Int>,
     pool: BTensor<1, Int>,
+    tables: BTensor<1, Int>,
     call: &MoeCall,
     clamp: f32,
 ) -> BTensor<2> {
@@ -1730,6 +2038,7 @@ pub(crate) fn up_clamped(
         route.into_dispatch(),
         list.into_dispatch(),
         pool.into_dispatch(),
+        tables.into_dispatch(),
         call.clone(),
         clamp,
     ))
@@ -1741,6 +2050,7 @@ pub(crate) fn down(
     route: BTensor<1>,
     list: BTensor<1, Int>,
     pool: BTensor<1, Int>,
+    tables: BTensor<1, Int>,
     scratch: BTensor<2>,
     call: &MoeCall,
 ) -> BTensor<2> {
@@ -1749,6 +2059,7 @@ pub(crate) fn down(
         route.into_dispatch(),
         list.into_dispatch(),
         pool.into_dispatch(),
+        tables.into_dispatch(),
         scratch.into_dispatch(),
         call.clone(),
     ))
@@ -1776,10 +2087,16 @@ pub(crate) fn write_slot(
 }
 
 /// [`MoeKernels::dense_gemv`] on tensors.
-pub(crate) fn dense_gemv(x: BTensor<2>, pool: BTensor<1, Int>, call: &DenseCall) -> BTensor<2> {
+pub(crate) fn dense_gemv(
+    x: BTensor<2>,
+    pool: BTensor<1, Int>,
+    tables: BTensor<1, Int>,
+    call: &DenseCall,
+) -> BTensor<2> {
     BTensor::from_dispatch(<Dispatch as MoeKernels>::dense_gemv(
         x.into_dispatch(),
         pool.into_dispatch(),
+        tables.into_dispatch(),
         call.clone(),
     ))
 }
@@ -1788,17 +2105,19 @@ pub(crate) fn dense_gemv(x: BTensor<2>, pool: BTensor<1, Int>, call: &DenseCall)
 pub(crate) fn dense_dequant(
     like: BTensor<1>,
     pool: BTensor<1, Int>,
+    tables: BTensor<1, Int>,
     call: &DenseCall,
 ) -> BTensor<2> {
     BTensor::from_dispatch(<Dispatch as MoeKernels>::dense_dequant(
         like.into_dispatch(),
         pool.into_dispatch(),
+        tables.into_dispatch(),
         call.clone(),
     ))
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::time::Instant;
 
     use burn::tensor::{Device, TensorData};
@@ -1860,6 +2179,12 @@ mod tests {
         })
     }
 
+    /// `elems` values of `dtype` as random blocks with finite scales, the
+    /// same bytes for the same `seed` (for tests of other modules).
+    pub(crate) fn random_blocks_seeded(dtype: GgufType, elems: usize, seed: u64) -> Vec<u8> {
+        Raw::random_blocks(dtype, elems, &mut Rng(seed))
+    }
+
     /// A `[rows, cols]` matrix as the file bytes of a type.
     struct Raw {
         dtype: GgufType,
@@ -1868,18 +2193,77 @@ mod tests {
 
     impl Raw {
         /// Random values in `[-amp / 2, amp / 2)` quantized to `dtype` (MXFP4
-        /// by the tiny model's quantizer, Q8_0 by the engine's).
+        /// by the tiny model's quantizer, Q8_0 by the engine's), or, for a
+        /// native block format, random blocks with finite f16 scales
+        /// ([`random_blocks`]).
         fn random(dtype: GgufType, seed: u64, rows: usize, cols: usize, amp: f32) -> Self {
             let mut rng = Rng(seed);
-            let values: Vec<f32> = (0..rows * cols).map(|_| rng.unit() * amp).collect();
-            let bytes = if dtype == MXFP4 {
-                mxfp4_bytes(&values)
+            let bytes = if dtype == MXFP4 || dtype == Q8_0 {
+                let values: Vec<f32> = (0..rows * cols).map(|_| rng.unit() * amp).collect();
+                if dtype == MXFP4 {
+                    mxfp4_bytes(&values)
+                } else {
+                    let mut bytes = Vec::new();
+                    quantize_q8_0(&values, &mut bytes);
+                    bytes
+                }
             } else {
-                let mut bytes = Vec::new();
-                quantize_q8_0(&values, &mut bytes);
-                bytes
+                Self::random_blocks(dtype, rows * cols, &mut rng)
             };
             Self { dtype, bytes }
+        }
+
+        /// Random blocks of `dtype` holding `elems` values: random bytes, with
+        /// every f16 scale set to a finite value in `[0.002, 0.012)`.
+        fn random_blocks(dtype: GgufType, elems: usize, rng: &mut Rng) -> Vec<u8> {
+            let (block, size) = (dtype.block_size().unwrap(), dtype.type_size().unwrap());
+            let mut bytes = vec![0u8; elems / block * size];
+            for b in bytes.chunks_exact_mut(size) {
+                for w in b.chunks_mut(4) {
+                    let r = rng.bits().to_le_bytes();
+                    w.copy_from_slice(&r[..w.len()]);
+                }
+                let scale =
+                    |rng: &mut Rng| half::f16::from_f32(0.007 + 0.01 * rng.unit()).to_bits();
+                match dtype {
+                    GgufType::Ggml(GgmlDType::Q2K) => {
+                        let (d, m) = (scale(rng), scale(rng));
+                        b[80..82].copy_from_slice(&d.to_le_bytes());
+                        b[82..84].copy_from_slice(&m.to_le_bytes());
+                    }
+                    GgufType::Ggml(GgmlDType::Q4K | GgmlDType::Q5K) => {
+                        let (d, m) = (scale(rng), scale(rng));
+                        b[0..2].copy_from_slice(&d.to_le_bytes());
+                        b[2..4].copy_from_slice(&m.to_le_bytes());
+                    }
+                    GgufType::Iq1M => {
+                        // The f16 is spread over the top nibbles of the four
+                        // 16-bit scale words.
+                        let bits = scale(rng);
+                        for k in 0..4 {
+                            let at = 48 + 2 * k;
+                            let w = u16::from_le_bytes([b[at], b[at + 1]]) & 0x0FFF;
+                            let w = w | (((bits >> (4 * k)) & 0xF) << 12);
+                            b[at..at + 2].copy_from_slice(&w.to_le_bytes());
+                        }
+                    }
+                    GgufType::Nvfp4 => {}
+                    GgufType::Ggml(GgmlDType::Q8K) => {
+                        b[0..4].copy_from_slice(&(0.007f32 + 0.01 * rng.unit()).to_le_bytes());
+                    }
+                    other => {
+                        let at = match other {
+                            GgufType::Ggml(GgmlDType::Q3K) => 108,
+                            GgufType::Ggml(GgmlDType::Q6K) => 208,
+                            GgufType::Tq1_0 => 52,
+                            GgufType::Tq2_0 => 64,
+                            _ => 0,
+                        };
+                        b[at..at + 2].copy_from_slice(&scale(rng).to_le_bytes());
+                    }
+                }
+            }
+            bytes
         }
 
         fn row_bytes(&self, cols: usize) -> usize {
@@ -2056,9 +2440,18 @@ mod tests {
         let x = BTensor::<2>::from_data(TensorData::new(x.to_vec(), [t, n_embd]), device);
         let route = BTensor::<1>::from_data(TensorData::new(route.to_vec(), [route.len()]), device);
         let none = BTensor::<1, Int>::zeros([2], device);
-        let hidden = up_clamped(x, route.clone(), none.clone(), pool.clone(), &call, clamp);
+        let tables = tables_tensor(device);
+        let hidden = up_clamped(
+            x,
+            route.clone(),
+            none.clone(),
+            pool.clone(),
+            tables.clone(),
+            &call,
+            clamp,
+        );
         let scratch = BTensor::<2>::zeros([t * n_used, n_embd], device);
-        let scratch = down(hidden, route, none, pool.clone(), scratch, &call);
+        let scratch = down(hidden, route, none, pool.clone(), tables, scratch, &call);
         read_f32(sum(scratch, &call), "experts").unwrap()
     }
 
@@ -2088,14 +2481,24 @@ mod tests {
         let route = random_route(t, n_used, slots);
         let route = BTensor::<1>::from_data(TensorData::new(route.clone(), [route.len()]), device);
         let none = BTensor::<1, Int>::zeros([2], device);
+        let tables = tables_tensor(device);
         let run = |x: BTensor<2>| {
-            let hidden = up_clamped(x, route.clone(), none.clone(), pool.clone(), &call, 0.0);
+            let hidden = up_clamped(
+                x,
+                route.clone(),
+                none.clone(),
+                pool.clone(),
+                tables.clone(),
+                &call,
+                0.0,
+            );
             let scratch = BTensor::<2>::zeros([t * n_used, n_embd], device);
             let scratch = down(
                 hidden,
                 route.clone(),
                 none.clone(),
                 pool.clone(),
+                tables.clone(),
                 scratch,
                 &call,
             );
@@ -2280,6 +2683,170 @@ mod tests {
         }
     }
 
+    /// Every block format the engine keeps native on the device (the file's
+    /// bits per weight): K-quants, I-quants, ternary and NVFP4.
+    const NATIVE: [GgufType; 18] = [
+        GgufType::Ggml(GgmlDType::Q8K),
+        GgufType::Ggml(GgmlDType::Q2K),
+        GgufType::Ggml(GgmlDType::Q3K),
+        GgufType::Ggml(GgmlDType::Q4K),
+        GgufType::Ggml(GgmlDType::Q5K),
+        GgufType::Ggml(GgmlDType::Q6K),
+        GgufType::Iq4Nl,
+        GgufType::Iq4Xs,
+        GgufType::Iq2Xxs,
+        GgufType::Iq2Xs,
+        GgufType::Iq2S,
+        GgufType::Iq3Xxs,
+        GgufType::Iq3S,
+        GgufType::Iq1S,
+        GgufType::Iq1M,
+        GgufType::Tq1_0,
+        GgufType::Tq2_0,
+        GgufType::Nvfp4,
+    ];
+
+    /// No native format is requantized, and a matrix keeps the file's size
+    /// (the 4-byte word padding of the block formats aside: at most 3 bytes
+    /// per block, under 0.1 bit per value).
+    #[test]
+    fn native_formats_keep_the_files_bits_per_weight() {
+        let (rows, cols) = (24usize, 1536usize);
+        for dtype in NATIVE {
+            let format = ExpertFormat::of(dtype);
+            assert_ne!(format, ExpertFormat::Q8_0, "{dtype:?} is requantized");
+            let file = dtype.byte_len(cols).unwrap() * rows;
+            let blocks = rows * cols / dtype.block_size().unwrap();
+            let dense = DenseLayout::new(dtype, rows, cols).unwrap();
+            let slot = SlotLayout::new(cols, 512, [dtype; 3]).unwrap();
+            // The block formats pad each block to words; IQ4_NL keeps the
+            // Q4_0 word layout (the scale as an f16, 20 bytes per 32 values
+            // before the padding of the scale words).
+            let extra = if dtype == GgufType::Iq4Nl {
+                blocks * 4 / 2
+            } else {
+                blocks * 3
+            };
+            assert!(dense.bytes() >= file, "{dtype:?}");
+            assert!(
+                dense.bytes() <= file + extra,
+                "{dtype:?}: {} vs {file}",
+                dense.bytes()
+            );
+            let bits = |bytes: usize| bytes as f64 * 8.0 / (rows * cols) as f64;
+            assert!(
+                bits(dense.bytes()) - bits(file) <= 0.5,
+                "{dtype:?}: {} bits per weight over the file's {}",
+                bits(dense.bytes()),
+                bits(file)
+            );
+            assert_eq!(slot.gate.format, format);
+        }
+    }
+
+    /// The word-major words read back as the file's bytes, in both orders.
+    #[test]
+    fn native_words_are_the_files_bytes_word_major() {
+        let (rows, cols) = (5usize, 768usize);
+        for dtype in NATIVE {
+            let format = ExpertFormat::of(dtype);
+            if !format.is_native() {
+                continue;
+            }
+            let raw = Raw::random(dtype, 3, rows, cols, 1.0);
+            let size = dtype.type_size().unwrap();
+            let (bpr, nblk) = (
+                cols / dtype.block_size().unwrap(),
+                rows * cols / dtype.block_size().unwrap(),
+            );
+            let words = format.value_words();
+            let m = MatrixLayout {
+                format,
+                rows,
+                cols,
+                offset: 0,
+            };
+            let mut packed = Vec::new();
+            pack_matrix(&m, dtype, &raw.bytes, &mut packed).unwrap();
+            assert_eq!(packed.len(), nblk * words, "{dtype:?}");
+            let dense = DenseLayout::new(dtype, rows, cols).unwrap();
+            let dense_words = pack_dense(&dense, dtype, &raw.bytes).unwrap();
+            for idx in 0..nblk {
+                let (r, b) = (idx / bpr, idx % bpr);
+                let file = &raw.bytes[idx * size..(idx + 1) * size];
+                for (name, words_of, blk) in [
+                    ("slot", &packed, idx),
+                    ("dense", &dense_words, b * rows + r),
+                ] {
+                    let mut back = Vec::new();
+                    for w in 0..words {
+                        back.extend_from_slice(&words_of[w * nblk + blk].to_le_bytes());
+                    }
+                    assert_eq!(&back[..size], file, "{dtype:?} {name} block {idx}");
+                    assert!(back[size..].iter().all(|b| *b == 0), "{dtype:?} padding");
+                }
+            }
+        }
+    }
+
+    /// The expert kernels over every native format (and mixes like a
+    /// Q4_K_M file's) against the host's dequantization.
+    #[test]
+    fn native_format_experts_match_the_host() {
+        let Some(device) = kernel_test_device() else {
+            return;
+        };
+        let q = |d| GgufType::Ggml(d);
+        let mut configs: Vec<(usize, usize, [GgufType; 3])> = Vec::new();
+        for dtype in NATIVE {
+            // 2 blocks per row up, 1 block per row down; and 3 and 2 (lanes
+            // that do not divide the blocks).
+            configs.push((512, 256, [dtype; 3]));
+            configs.push((768, 512, [dtype; 3]));
+        }
+        configs.push((
+            512,
+            256,
+            [q(GgmlDType::Q4K), q(GgmlDType::Q4K), q(GgmlDType::Q6K)],
+        ));
+        configs.push((512, 256, [q(GgmlDType::Q4K), q(GgmlDType::Q5K), Q8_0]));
+        configs.push((
+            512,
+            256,
+            [GgufType::Iq2Xxs, GgufType::Iq2S, GgufType::Iq3Xxs],
+        ));
+        configs.push((512, 256, [GgufType::Iq4Xs, GgufType::Iq4Nl, MXFP4]));
+        let (slots, n_used) = (4usize, 2usize);
+        for (n_embd, ff, dtypes) in configs {
+            let layout = SlotLayout::new(n_embd, ff, dtypes).unwrap();
+            let all = experts(dtypes, n_embd, ff, slots, 11, 1.0);
+            let pool = upload_pool(&device, &layout, &all);
+            for t in [1usize, 3] {
+                let x = random_x(t, n_embd);
+                let route = random_route(t, n_used, slots);
+                let got = run_experts(
+                    &device,
+                    &layout,
+                    &pool,
+                    &x,
+                    &route,
+                    (t, n_used, slots),
+                    0,
+                    0.0,
+                );
+                for tok in 0..t {
+                    let want = host_moe(&all, &x, &route, (t, n_used, ff), (0, 0.0), tok);
+                    assert_close(
+                        &got[tok * n_embd..(tok + 1) * n_embd],
+                        &want,
+                        5e-4,
+                        &format!("{dtypes:?} {n_embd}x{ff} t={t} token {tok}"),
+                    );
+                }
+            }
+        }
+    }
+
     /// The lanes of a row follow the row's blocks, never the launch.
     #[test]
     fn expert_lanes_depend_on_the_layout_alone() {
@@ -2415,8 +2982,13 @@ mod tests {
 
     // ------------------------------------------------------------- dense
 
-    fn upload_dense(device: &Device, layout: &DenseLayout, raw: &[u8]) -> BTensor<1, Int> {
-        let words: Vec<i32> = pack_dense(layout, MXFP4, raw)
+    fn upload_dense(
+        device: &Device,
+        layout: &DenseLayout,
+        dtype: GgufType,
+        raw: &[u8],
+    ) -> BTensor<1, Int> {
+        let words: Vec<i32> = pack_dense(layout, dtype, raw)
             .unwrap()
             .into_iter()
             .map(|w| w as i32)
@@ -2436,8 +3008,9 @@ mod tests {
         sample: &[usize],
         slices: &[(usize, usize)],
     ) -> f64 {
-        let layout = DenseLayout::new(MXFP4, rows, cols).unwrap();
-        let pool = upload_dense(device, &layout, &raw.bytes);
+        let layout = DenseLayout::new(raw.dtype, rows, cols).unwrap();
+        let pool = upload_dense(device, &layout, raw.dtype, &raw.bytes);
+        let tables = tables_tensor(device);
         let all: Vec<usize> = (0..rows).collect();
         let sample = if sample.is_empty() { &all } else { sample };
         let host_rows: Vec<Vec<f32>> = sample.iter().map(|&r| raw.row(r, cols)).collect();
@@ -2451,7 +3024,13 @@ mod tests {
                 row0: 0,
                 count: rows,
             };
-            let run = || read_f32(dense_gemv(xt.clone(), pool.clone(), &call), "gemv").unwrap();
+            let run = || {
+                read_f32(
+                    dense_gemv(xt.clone(), pool.clone(), tables.clone(), &call),
+                    "gemv",
+                )
+                .unwrap()
+            };
             let _warm = run();
             let started = Instant::now();
             let got = run();
@@ -2473,16 +3052,29 @@ mod tests {
                 row0,
                 count,
             };
-            let got =
-                read_f32(dense_dequant(like.clone(), pool.clone(), &call), "dequant").unwrap();
+            let got = read_f32(
+                dense_dequant(like.clone(), pool.clone(), tables.clone(), &call),
+                "dequant",
+            )
+            .unwrap();
             assert_eq!(got.len(), count * cols);
             for r in 0..count {
                 let want = raw.row(row0 + r, cols);
+                // MXFP4 and the legacy formats decode exactly; the block
+                // formats may differ by a rounding of a fused multiply-add
+                // (`d * q - m` in one step).
+                let slack = if raw.dtype == MXFP4 {
+                    0.0
+                } else {
+                    1e-6 * want.iter().fold(0f32, |m, v| m.max(v.abs()))
+                };
                 for (c, (g, w)) in got[r * cols..(r + 1) * cols].iter().zip(&want).enumerate() {
                     // A denormal result may be flushed to zero.
                     assert!(
-                        g == w || (w.abs() < f32::MIN_POSITIVE && g.abs() <= w.abs()),
-                        "dequant {rows}x{cols} row {} column {c}: gpu {g} vs host {w}",
+                        (g - w).abs() <= slack
+                            || (w.abs() < f32::MIN_POSITIVE && g.abs() <= w.abs()),
+                        "{:?} dequant {rows}x{cols} row {} column {c}: gpu {g} vs host {w}",
+                        raw.dtype,
                         row0 + r
                     );
                 }
@@ -2516,6 +3108,29 @@ mod tests {
         }
     }
 
+    /// The dense kernels (matrix-vector and dequantizing) over every native
+    /// format against the host, at odd row counts and widths of 3 and 1
+    /// blocks per row.
+    #[test]
+    fn native_format_dense_kernels_match_the_host() {
+        let Some(device) = kernel_test_device() else {
+            return;
+        };
+        for dtype in NATIVE {
+            for (rows, cols) in [(37usize, 768usize), (130, 256)] {
+                let raw = Raw::random(dtype, 5, rows, cols, 1.0);
+                check_dense(
+                    &device,
+                    &raw,
+                    (rows, cols),
+                    &[1, 3, 17],
+                    &[],
+                    &[(0, rows), (rows / 3, rows / 2)],
+                );
+            }
+        }
+    }
+
     #[test]
     fn mxfp4_dense_dequant_handles_every_scale_byte() {
         let Some(device) = kernel_test_device() else {
@@ -2530,7 +3145,7 @@ mod tests {
             block[0] = scales[b % scales.len()];
         }
         let layout = DenseLayout::new(MXFP4, rows, cols).unwrap();
-        let pool = upload_dense(&device, &layout, &raw.bytes);
+        let pool = upload_dense(&device, &layout, MXFP4, &raw.bytes);
         let call = DenseCall {
             layout,
             tokens: 1,
@@ -2538,7 +3153,12 @@ mod tests {
             count: rows,
         };
         let got = read_f32(
-            dense_dequant(BTensor::<1>::zeros([1], &device), pool, &call),
+            dense_dequant(
+                BTensor::<1>::zeros([1], &device),
+                pool,
+                tables_tensor(&device),
+                &call,
+            ),
             "dequant",
         )
         .unwrap();

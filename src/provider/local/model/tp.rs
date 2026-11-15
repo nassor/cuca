@@ -80,12 +80,15 @@
 //!
 //! A column range of a weight is a per-row byte sub-slice when both bounds
 //! lie on the dtype's block boundaries (every 32 columns for Q4_0, Q4_1,
-//! Q5_x, Q8_x; every column for F32/F16/BF16; every 256 for the K-quants).
-//! A cut that splits a block (a K-quant `ffn_down` whose slice is not a
-//! multiple of 256 wide) dequantizes the rows, cuts the f32 values and
-//! quantizes them to Q8_0 (f32 for a weight the loader keeps dense): the
-//! same values the unsplit loader would hold for those columns, since Q8_0
-//! blocks are 32 columns wide and the cut lies on 32-column bounds.
+//! Q5_x, Q8_x, IQ4_NL and MXFP4; every 64 for NVFP4; every column for
+//! F32/F16/BF16; every 256 for the K-quants, the I-quants and the ternary
+//! types), so a shard keeps the file's format whenever its slice is a whole
+//! number of the file's blocks, super-blocks included. A cut that splits a
+//! block (a K-quant or I-quant `ffn_down` whose slice is not a multiple of
+//! 256 wide) dequantizes the rows, cuts the f32 values and quantizes them to
+//! Q8_0 (f32 for a weight the loader keeps dense), which moves each element
+//! by at most half a Q8_0 step from the unsplit loader's value (Q8_0 blocks
+//! are 32 columns wide and the cut lies on 32-column bounds).
 //!
 //! # All-reduce
 //!
@@ -115,6 +118,8 @@ use burn::tensor::distributed::{
 };
 use burn::tensor::{Device, Tensor, TensorData};
 use candle_core::quantized::GgmlDType;
+
+use crate::provider::local::gguf::GgufType;
 
 use super::gpu::{push_rows, read_f32};
 use super::layout::{Ffn, LayerLayout, Qkv, name};
@@ -431,10 +436,14 @@ impl Cut {
     }
 }
 
-/// Whether both bounds of `cols` lie on block boundaries of `dtype`, so the
-/// columns are a byte sub-slice of every row of a `row_len`-wide matrix.
-fn on_blocks(dtype: GgmlDType, row_len: usize, cols: &Range<usize>) -> bool {
-    let block = dtype.block_size();
+/// Whether both bounds of `cols` lie on block boundaries of `dtype` (32
+/// values for the legacy types, 256 for the K-quants, I-quants and ternary
+/// types, 64 for NVFP4), so the columns are a byte sub-slice of every row of
+/// a `row_len`-wide matrix.
+fn on_blocks(dtype: GgufType, row_len: usize, cols: &Range<usize>) -> bool {
+    let Some(block) = dtype.block_size() else {
+        return false;
+    };
     row_len.is_multiple_of(block)
         && cols.start.is_multiple_of(block)
         && cols.end.is_multiple_of(block)
@@ -442,13 +451,19 @@ fn on_blocks(dtype: GgmlDType, row_len: usize, cols: &Range<usize>) -> bool {
 
 /// The dtype the columns `cols` of a `row_len`-wide matrix of `dtype` are
 /// held in: `dtype` itself when the cut is every column or lies on block
-/// boundaries (a byte copy, [`copy_columns`]), else the rows are dequantized
-/// and cut, and quantized to Q8_0.
-pub(super) fn column_dtype(dtype: GgmlDType, row_len: usize, cols: &Range<usize>) -> GgmlDType {
+/// boundaries (a byte copy, [`copy_columns`]: a shard's cut of a K-quant or
+/// I-quant row is a whole number of its super-blocks), else the rows are
+/// dequantized and cut, and quantized to Q8_0.
+pub(super) fn column_dtype(
+    dtype: impl Into<GgufType>,
+    row_len: usize,
+    cols: &Range<usize>,
+) -> GgufType {
+    let dtype = dtype.into();
     if *cols == (0..row_len) || on_blocks(dtype, row_len, cols) {
         dtype
     } else {
-        GgmlDType::Q8_0
+        GgufType::Ggml(GgmlDType::Q8_0)
     }
 }
 
@@ -457,15 +472,16 @@ pub(super) fn column_dtype(dtype: GgmlDType, row_len: usize, cols: &Range<usize>
 /// a bound does not lie on a block boundary of `dtype` or `raw` is not whole
 /// rows.
 pub(super) fn copy_columns(
-    dtype: GgmlDType,
+    dtype: impl Into<GgufType>,
     raw: &[u8],
     row_len: usize,
     cols: &Range<usize>,
 ) -> Option<Vec<u8>> {
+    let dtype = dtype.into();
     if !on_blocks(dtype, row_len, cols) || cols.end > row_len {
         return None;
     }
-    let (block, size) = (dtype.block_size(), dtype.type_size());
+    let (block, size) = (dtype.block_size()?, dtype.type_size()?);
     let row_bytes = row_len / block * size;
     if row_bytes == 0 {
         return raw.is_empty().then(Vec::new);
