@@ -7731,11 +7731,10 @@ mod tests {
         assert!(back.iter().all(|v| *v == 0.0));
     }
 
-    /// Q5_0 and Q5_1, the dtypes the engine still requantizes to Q8_0, land on
-    /// the device as a Q8_0 weight within half a Q8_0 step, per 32-element
-    /// block, of candle's own dequantization. Q4_1 and every K-quant (Q2_K to
-    /// Q6_K, Q8_K) stay in their own format and decode to candle's values up
-    /// to the rounding of the kernel's arithmetic.
+    /// Every dtype in the loop (Q4_1, Q5_0, Q5_1 and the K-quants Q2_K to
+    /// Q6_K and Q8_K) stays in its own format on the device and decodes to
+    /// candle's dequantization up to the rounding of the kernel's
+    /// arithmetic.
     #[test]
     fn upload_matches_host_dequantization() {
         use candle_core::quantized::QTensor;
