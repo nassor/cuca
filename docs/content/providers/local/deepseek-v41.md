@@ -215,7 +215,7 @@ The converted files go to `<cache>/converted/deepseek-ai--DeepSeek-V4.1-Flash-10
 
 Part 1 is written last, so a present part 1 means a finished set. A later load reuses the set with no network and no shards.
 
-- The dense weights are stored at 8 bits (`q8_0`) by default and the experts keep their native 4-bit format (MXFP4). `convert quant` also takes `q4_0` and `f16`; the experts stay MXFP4 except at `f16`.
+- The dense weights are stored at 8 bits (`q8_0`) by default and the experts keep their native 4-bit format (MXFP4). `convert quant` also takes `q4_0`, `f16` and the K-quant mixes `q4_k_s`, `q4_k_m`, `q5_k_m` and `q6_k`, which apply to the dense weights; the experts stay MXFP4 except at `f16`.
 - `convert engram_quant="q4_0"` shrinks the Engram part to about 110.6 GB, so the set is about 409 GB. The default `q8_0` is 208.90 GB, and `bf16` is about 393.2 GB. A non-default value converts into its own files next to the default ones.
 - The conversion checks the free space of the output volume first. It needs little RAM, about 220 MB at its peak.
 

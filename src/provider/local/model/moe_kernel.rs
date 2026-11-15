@@ -66,8 +66,9 @@
 //! every call passes next to the pool. IQ4_NL (32 values) keeps the Q4_0 word
 //! layout and reads its nibbles through the same table. The kernels take the
 //! formats of the gate, up and down matrices as comptime arguments, so each
-//! format mix compiles to a kernel of its own. Only Q5_0, Q5_1 and Q8_1 are
-//! still requantized to Q8_0.
+//! format mix compiles to a kernel of its own. Q5_0 and Q5_1 (32-value
+//! blocks of 22 and 24 bytes, both held in 24) are native too, 6 bits per
+//! value. Only Q8_1 and I8 are still requantized to Q8_0.
 
 // The `#[cube]` kernels are Rust the CubeCL macro translates: it needs runtime
 // values built from runtime values (`tid - tid` is a runtime zero where a
@@ -154,6 +155,10 @@ pub(crate) enum ExpertFormat {
     Nvfp4,
     /// Q8_K, as the file's blocks.
     Q8K,
+    /// Q5_0, as the file's 32-value blocks.
+    Q5_0,
+    /// Q5_1, as the file's 32-value blocks.
+    Q5_1,
 }
 
 impl ExpertFormat {
@@ -172,6 +177,8 @@ impl ExpertFormat {
             GgufType::Ggml(GgmlDType::Q5K) => Self::Q5K,
             GgufType::Ggml(GgmlDType::Q6K) => Self::Q6K,
             GgufType::Ggml(GgmlDType::Q8K) => Self::Q8K,
+            GgufType::Ggml(GgmlDType::Q5_0) => Self::Q5_0,
+            GgufType::Ggml(GgmlDType::Q5_1) => Self::Q5_1,
             GgufType::Mxfp4 => Self::Mxfp4,
             GgufType::Iq4Nl => Self::Iq4Nl,
             GgufType::Iq4Xs => Self::Iq4Xs,
@@ -215,6 +222,8 @@ impl ExpertFormat {
             Self::Tq2_0 => code::TQ2_0,
             Self::Nvfp4 => code::NVFP4,
             Self::Q8K => code::Q8_K,
+            Self::Q5_0 => code::Q5_0,
+            Self::Q5_1 => code::Q5_1,
         }
     }
 
@@ -573,7 +582,7 @@ pub(crate) struct DenseLayout {
 impl DenseLayout {
     /// The layout of a `[rows, cols]` weight held as `dtype`: every format
     /// the kernels read as it is (see [`ExpertFormat::of`]), every other
-    /// quantized dtype (Q5_0, Q5_1, Q8_1) requantized to Q8_0.
+    /// quantized dtype (Q8_1, I8) requantized to Q8_0.
     ///
     /// # Errors
     ///
@@ -2248,6 +2257,11 @@ pub(crate) mod tests {
                         }
                     }
                     GgufType::Nvfp4 => {}
+                    GgufType::Ggml(GgmlDType::Q5_1) => {
+                        let (d, m) = (scale(rng), scale(rng));
+                        b[0..2].copy_from_slice(&d.to_le_bytes());
+                        b[2..4].copy_from_slice(&m.to_le_bytes());
+                    }
                     GgufType::Ggml(GgmlDType::Q8K) => {
                         b[0..4].copy_from_slice(&(0.007f32 + 0.01 * rng.unit()).to_le_bytes());
                     }
@@ -2684,8 +2698,10 @@ pub(crate) mod tests {
     }
 
     /// Every block format the engine keeps native on the device (the file's
-    /// bits per weight): K-quants, I-quants, ternary and NVFP4.
-    const NATIVE: [GgufType; 18] = [
+    /// bits per weight): Q5_0, Q5_1, K-quants, I-quants, ternary and NVFP4.
+    const NATIVE: [GgufType; 20] = [
+        GgufType::Ggml(GgmlDType::Q5_0),
+        GgufType::Ggml(GgmlDType::Q5_1),
         GgufType::Ggml(GgmlDType::Q8K),
         GgufType::Ggml(GgmlDType::Q2K),
         GgufType::Ggml(GgmlDType::Q3K),
@@ -2708,7 +2724,7 @@ pub(crate) mod tests {
 
     /// No native format is requantized, and a matrix keeps the file's size
     /// (the 4-byte word padding of the block formats aside: at most 3 bytes
-    /// per block, under 0.1 bit per value).
+    /// per block, 0.5 bit per value for Q5_0's 22-byte block).
     #[test]
     fn native_formats_keep_the_files_bits_per_weight() {
         let (rows, cols) = (24usize, 1536usize);
@@ -2735,7 +2751,7 @@ pub(crate) mod tests {
             );
             let bits = |bytes: usize| bytes as f64 * 8.0 / (rows * cols) as f64;
             assert!(
-                bits(dense.bytes()) - bits(file) <= 0.5,
+                bits(dense.bytes()) - bits(file) <= 0.5 + 1e-9,
                 "{dtype:?}: {} bits per weight over the file's {}",
                 bits(dense.bytes()),
                 bits(file)

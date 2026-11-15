@@ -409,6 +409,15 @@ const fn preset(
     }
 }
 
+/// Google's `chat_template.jinja` for Gemma 4 E2B, pinned by the presets of
+/// GGUFs that embed a reworded copy of it.
+const GEMMA4_E2B_TEMPLATE: PresetTemplate = PresetTemplate {
+    repo: "google/gemma-4-E2B-it",
+    revision: "4adf15748de9e1a0097b6274cee9c15836c41c37",
+    file: "chat_template.jinja",
+    sha256: "0a2c8073c878ab1da004bee933a998606537bbb62016310352c7285c3f01c5b5",
+};
+
 const PRESET_TABLE: &[ModelPreset] = &[
     preset(
         "gemma4-e2b-q4_0",
@@ -446,6 +455,32 @@ const PRESET_TABLE: &[ModelPreset] = &[
         8_031_242_688,
         "gemma4",
     ),
+    // unsloth's K-quant and I-quant files embed a reworded template; the
+    // presets pin the repository's `chat_template.jinja`.
+    ModelPreset {
+        template: Some(GEMMA4_E2B_TEMPLATE),
+        ..preset(
+            "gemma4-e2b-q4_k_m",
+            "unsloth/gemma-4-E2B-it-GGUF",
+            "0314792d7f1f7e229411f620751375812bb9faf2",
+            "gemma-4-E2B-it-Q4_K_M.gguf",
+            "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8",
+            3_106_738_272,
+            "gemma4",
+        )
+    },
+    ModelPreset {
+        template: Some(GEMMA4_E2B_TEMPLATE),
+        ..preset(
+            "gemma4-e2b-iq4_xs",
+            "unsloth/gemma-4-E2B-it-GGUF",
+            "0314792d7f1f7e229411f620751375812bb9faf2",
+            "gemma-4-E2B-it-IQ4_XS.gguf",
+            "c149620926221669c4941ae6dac259953cc729c48e4a4edb69e9807b782fd1e3",
+            2_983_944_288,
+            "gemma4",
+        )
+    },
     preset(
         "gemma4-26b-a4b-q4_0",
         "ggml-org/gemma-4-26B-A4B-it-GGUF",
@@ -480,6 +515,26 @@ const PRESET_TABLE: &[ModelPreset] = &[
         "Qwen3-0.6B-Q8_0.gguf",
         "9465e63a22add5354d9bb4b99e90117043c7124007664907259bd16d043bb031",
         639_446_688,
+        "qwen3",
+    ),
+    // unsloth's Q4_K_M (Q4_K, Q6_K for `output` and half the `attn_v` and
+    // `ffn_down` layers) and IQ4_XS.
+    preset(
+        "qwen3-0.6b-q4_k_m",
+        "unsloth/Qwen3-0.6B-GGUF",
+        "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+        "Qwen3-0.6B-Q4_K_M.gguf",
+        "ac2d97712095a558e31573f62f466a3f9d93990898b0ec79d7c974c1780d524a",
+        396_705_472,
+        "qwen3",
+    ),
+    preset(
+        "qwen3-0.6b-iq4_xs",
+        "unsloth/Qwen3-0.6B-GGUF",
+        "50968a4468ef4233ed78cd7c3de230dd1d61a56b",
+        "Qwen3-0.6B-IQ4_XS.gguf",
+        "dacc1fe1dc6f4799f366ac3385299f71c7e02c58b8702448a174f14d91b1c64d",
+        367_804_096,
         "qwen3",
     ),
     preset(
@@ -561,6 +616,25 @@ const PRESET_TABLE: &[ModelPreset] = &[
         "Qwen3-30B-A3B-Q4_0.gguf",
         "8b8e9febb6ed326d91a016f5d465cf5b55a0b328d157a43e2242fda71fde9c40",
         17_379_988_032,
+        "qwen3moe",
+    ),
+    preset(
+        "qwen3-30b-a3b-q4_k_m",
+        "unsloth/Qwen3-30B-A3B-GGUF",
+        "d5b1d57bd0b504ac62ae6c725904e96ef228dc74",
+        "Qwen3-30B-A3B-Q4_K_M.gguf",
+        "9f1a24700a339b09c06009b729b5c809e0b64c213b8af5b711b3dbdfd0c5ba48",
+        18_556_686_912,
+        "qwen3moe",
+    ),
+    // imatrix 2-bit: 10.4 GB, fits a 16 GB GPU or modest RAM.
+    preset(
+        "qwen3-30b-a3b-iq2_xxs",
+        "unsloth/Qwen3-30B-A3B-GGUF",
+        "d5b1d57bd0b504ac62ae6c725904e96ef228dc74",
+        "Qwen3-30B-A3B-UD-IQ2_XXS.gguf",
+        "40e7b72332c89fae04e4088422000bae4b0763f0ff28a31adf75e4f441e78442",
+        10_362_262_080,
         "qwen3moe",
     ),
     preset(

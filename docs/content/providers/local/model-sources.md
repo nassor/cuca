@@ -259,10 +259,12 @@ The first load downloads the shards and converts them. Later loads open the cach
 
 ### Precision
 
-`convert quant` is `f16`, `q8_0` (the default) or `q4_0`. Each precision converts and caches separately. KDL: `convert quant="q4_0"`.
+`convert quant` is `f16`, `q8_0` (the default), `q4_0`, or one of llama.cpp's K-quant mixes `q4_k_s`, `q4_k_m`, `q5_k_m` and `q6_k`. Each precision converts and caches separately. KDL: `convert quant="q4_k_m"`.
 
 - Every 2-D weight whose rows are a multiple of 32 long is stored at the chosen precision. Norms, biases, scales, the router and the recurrent-layer parameters stay in 32-bit floats.
 - At `q4_0` the token embedding and the output head stay at Q8_0.
+- The K-quant mixes choose each tensor's type with the rules of llama.cpp's `llama-quantize`, without an importance matrix: `q4_k_m` stores most weights as Q4_K and promotes the output head and part of the `attn_v` and `ffn_down` layers to Q6_K, and a row length that is not a multiple of 256 falls back to Q5_0, Q5_1 or Q8_0 as llama.cpp does. The blocks equal ggml's reference quantizer.
+- DeepSeek-V4.1 applies a K-quant mix to its dense 8-bit weights only; its experts keep their native 4-bit format (MXFP4), as `llama-quantize` leaves them.
 - FP8 checkpoints are converted from their scales and stored at the chosen precision, never as FP8.
 - `convert engram_quant` is `q8_0` (the default), `q4_0` or `bf16`. It sets the storage type of DeepSeek-V4.1's Engram table, and every other architecture ignores it.
 

@@ -228,22 +228,22 @@ A `context_length` above the model's maximum fails with `context_length N exceed
 
 ## Weight formats
 
-The weight format is how the file stores the numbers of the model. The engine runs these:
+The weight format is how the file stores the numbers of the model. Every format below stays in the file's own blocks in memory, on the CPU and on a GPU, so a model needs about its file size:
 
-| Format | On the CPU | On a GPU |
+| Family | Formats | Bits per weight |
 |---|---|---|
-| Q4_0, Q4_1, Q8_0 | stays quantized | stays quantized |
-| Q5_0, Q5_1 | stays quantized | converted to Q8_0 at load |
-| K-quants (Q2_K to Q6_K) | stays quantized | converted to Q8_0 at load |
-| Q8_1 | stays quantized | converted to Q8_0 at load |
-| MXFP4 | stays quantized | stays quantized |
-| F32, F16, BF16 | held as 32-bit floats, 4 bytes per element | held as 32-bit floats, 4 bytes per element |
-| IQ4_NL | read only as an embedding table; a weight matrix fails the load | the same |
-| other IQ types | the file opens and the load fails when it needs such a tensor | the same |
+| Legacy | Q4_0, Q4_1, Q5_0, Q5_1, Q8_0 | 4.5 to 8.5 |
+| K-quants | Q2_K, Q3_K, Q4_K, Q5_K, Q6_K, and the mixes `Q4_K_M`, `Q5_K_M` and others built from them; Q8_K | 2.6 to 6.6; Q8_K 9.1 |
+| I-quants | IQ1_S, IQ1_M, IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S, IQ4_XS, IQ4_NL | 1.6 to 4.5 |
+| Ternary | TQ1_0, TQ2_0 | 1.7, 2.1 |
+| 4-bit floats | MXFP4, NVFP4 | 4.25, 4.5 |
+| Floats | F32, F16, BF16 | held as 32-bit floats, 4 bytes per element |
 
-- Memory is about the file size for the quantized formats. F16 and BF16 files take about twice their file size, because they are held at 4 bytes per element.
-- A GPU converts the formats it does not run natively to Q8_0, one row at a time. The change is smaller than the error a Q4_K or Q6_K file already carries, but GPU replies can differ a little from CPU replies for those files.
-- A GPU file that mixes Q4_0, Q4_1 and Q8_0 weights keeps each weight in its own format, so the Q4_0 presets with a Q8_0 embedding load as they are.
+- `Q4_K_M` is the most common download and a good default: it is about the size of Q4_0 and closer to the original model. `IQ4_XS` is a little smaller at similar quality.
+- The 1-bit and 2-bit formats exist to fit large models into little memory. A small model at 2 bits loses much of its quality: Qwen 3 0.6B at `UD-IQ2_XXS` loops and misses tool calls, while its `Q4_K_M` and `IQ4_XS` files pass every live check.
+- Q8_1 is the one format not run directly: the CPU cannot load it, and a GPU converts it to Q8_0 at load. A GPU split over several cards (`shards`) that cuts through a block also converts that weight to Q8_0.
+- F16 and BF16 files take about twice their file size, because they are held at 4 bytes per element.
+- On the CPU a request's reply equals the one it gets alone, bit for bit, in every format. A GPU's replies can differ a little from the CPU's, because the two round floats in a different order.
 - A mixture of experts is split once at load into one weight per expert. `experts { tiered ... }` leaves the experts in the file instead, see [Tiered experts](@/providers/local/expert-tiers.md).
 
 ## Tokenizers
