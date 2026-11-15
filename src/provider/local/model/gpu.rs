@@ -2237,6 +2237,7 @@ impl Weights {
         })
     }
 }
+
 /// Run `load`, whose device allocations (weights and K/V pools, which live as
 /// long as the model) are served by burn's persistent pool: exact-fit slices.
 /// The default pool carves every allocation from pages sized to the largest
@@ -2245,6 +2246,20 @@ impl Weights {
 /// nearly full card fails on the last layers.
 fn persistent<I: Send, T: Send>(device: &Device, input: I, load: impl Fn(I) -> T + Send) -> T {
     device.memory_persistent_allocations(input, load)
+}
+
+/// Wait for `devices`' queued uploads and fail if one did not land. Uploads
+/// queue: a failed one (out of device memory) would otherwise surface at the
+/// first read of a forward pass, long after the load reported success.
+fn finish_upload<'a>(devices: impl IntoIterator<Item = &'a Device>) -> Result<(), CucaError> {
+    for device in devices {
+        device.sync().map_err(|e| {
+            err(format!(
+                "the device failed while the model loaded (most likely out of memory: lower `context_length` or `batching.kv_tokens`): {e}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 /// The K/V pool of every K/V-owning layer of `hp`, zeroed on `device`, `[n_blocks,
@@ -2710,16 +2725,6 @@ impl GpuTransformer {
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-        // The uploads queue: a failed one (out of device memory) would
-        // surface at the first read of a forward pass, long after the load
-        // reported success.
-        for w in &weights {
-            w.device.sync().map_err(|e| {
-                err(format!(
-                    "uploading the model to the device failed (out of device memory? lower `context_length` or `batching.kv_tokens`): {e}"
-                ))
-            })?;
-        }
         #[cfg(test)]
         let solo = Solo::new(&layout);
         let hyper = match &weights[0].hyper {
@@ -2755,6 +2760,7 @@ impl GpuTransformer {
         } else {
             Vec::new()
         };
+        finish_upload(weights.iter().map(|w| &w.device))?;
         Ok(Self {
             weights,
             collective: Collective::new(&locals, &devices),
@@ -3505,6 +3511,7 @@ impl GpuDrafter {
                 target.vocab()
             )));
         }
+        finish_upload([&target.weights[0].device])?;
         Ok(Self {
             net,
             pre,
