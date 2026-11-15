@@ -18,7 +18,15 @@ kicker = "Reference"
 <dd>You want vLLM or llama.cpp style endpoints backed by the cuca engine, or the latency, resource and metric names a dashboard can read.</dd>
 </dl>
 
-The server is an application layer over [`provider-local`](@/providers/local/_index.md), and it holds two of the local engine's three modes: `cuca serve` is server mode and `cuca balance` is balancer mode. `serve` loads one or more GGUF or checkpoint models with `LocalModel::load` and answers `POST /v1/chat/completions` the way vLLM and llama.cpp's server do. One binary, `cuca`, carries three subcommands.
+The `cuca` program turns the local engine into a service. A *server* answers HTTP requests from any OpenAI client, and a *load balancer* shares requests between several servers. You choose a command:
+
+| Command | What it does |
+|---|---|
+| `cuca serve` | loads one or more models and answers the OpenAI chat API, the way vLLM and llama.cpp's server do |
+| `cuca balance` | sits in front of several `cuca serve` instances and sends each request to one of them |
+| `cuca tui` | shows a running server or balancer live in your terminal |
+
+All three read the same stats API (a JSON page of live numbers). To run your first server, follow [Serve a model over HTTP](@/guides/serve-a-model.md). The server is built on the [`provider-local`](@/providers/local/_index.md) engine.
 
 <div class="dgm">
 <div class="dgm-scroll">
@@ -53,36 +61,43 @@ The server is an application layer over [`provider-local`](@/providers/local/_in
   <text class="t-ax" x="262" y="128">stats API</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>The stats API is the one interface the terminal UI reads.</b> A balancer serves the same API as a server, with each upstream's own snapshot nested inside.</p>
+<p class="dgm-cap"><b>The stats API is the one interface the terminal UI reads.</b> A balancer serves the same API as a server, with each upstream's own snapshot inside it. An upstream is one server behind the balancer.</p>
 </div>
 
 ## Pages
 
-- [Model server](@/server/model-server.md): the `serve` command, its configuration file, the routes and the OpenAI wire format.
-- [Balancer](@/server/balancer.md): the `balance` command, routing policies, prefix affinity, health checks and retries.
-- [Stats API and metrics](@/server/stats-and-metrics.md): the JSON snapshot, every Prometheus series, the latency diagnosis and the logs.
-- [Terminal UI](@/server/tui.md): the `tui` command, its panels and keys, and which resource figures each platform reports.
-- [Serve a model over HTTP](@/guides/serve-a-model.md): a how-to from build to a streamed reply.
+- [Model server](@/server/model-server.md): write `cuca.kdl`, start `cuca serve`, call it. Then the keys, routes, errors and limits.
+- [Balancer](@/server/balancer.md): put `cuca balance` in front of several servers. Then the routing rules, health checks and retries.
+- [Stats API and metrics](@/server/stats-and-metrics.md): the JSON snapshot, every Prometheus series, the "why is it slow" list and the logs.
+- [Terminal UI](@/server/tui.md): the `tui` command, its panels and keys, and which figures each platform reports.
+- [Serve a model over HTTP](@/guides/serve-a-model.md): a step-by-step how-to from build to a streamed reply.
 
-## Features
+## Build the binary
 
-| Feature | Enables |
+| Feature | Gives you |
 |---|---|
-| `server` | `provider-local`, the HTTP server, the balancer, the stats API, the metrics and the system sampler, and the `cuca` binary |
-| `server-tui` | `server`, `ratatui` and `crossterm`, for `cuca tui` |
+| `server` | the `cuca` binary with `serve` and `balance`, the stats API, `/metrics`, and the local engine |
+| `server-tui` | everything in `server`, plus `cuca tui` |
 
-Both features build alone, with no other provider. The [feature matrix](@/reference/features.md) lists the dependencies they own. A GPU build adds the backend feature:
+Both features build with no other provider. The [feature matrix](@/reference/features.md) lists what each one pulls in. To serve from a GPU, add a backend feature such as `provider-local-vulkan`:
 
 ```bash,name=Runs the same on all three platforms
 cargo build --release --no-default-features --features server,provider-local-vulkan --bin cuca
 ```
 
-The CPU kernels select their instructions at compile time, so a CPU server wants `RUSTFLAGS="-C target-cpu=native"` (Windows PowerShell: `$env:RUSTFLAGS = "-C target-cpu=native"`), as [Build requirements and tests](@/providers/local/build-and-tests.md) explains.
+The CPU kernels choose their instructions when you build. A CPU server should build with `RUSTFLAGS="-C target-cpu=native"` (Windows PowerShell: `$env:RUSTFLAGS = "-C target-cpu=native"`). [Build requirements](@/providers/local/build-and-tests.md) explains why.
 
-## What was verified
+## What to expect
 
-- Run on Windows with the CPU engine and Qwen3-0.6B Q8_0 (release build, `target-cpu=native`): `serve` (non-streaming and streaming chat, tool calls, two concurrent streams, a client disconnect, a prompt over the context length), `balance` over two servers (prefix affinity, concurrent spread, an upstream killed mid-run), `/metrics` and the stats API.
-- Run on Windows on a Vulkan GPU (Radeon RX 9070 XT, `server-tui,provider-local-vulkan` release build) with the same model: streaming and four concurrent requests through `cuca serve` with `device "vulkan"` in the model node. The stats showed `device: vulkan`, a 3.5 GiB K/V pool and 0.6 GB of weights, this process's VRAM at 5.1 GiB through WMI, GPU utilization of 43% under load, and about 150 tokens per second over four concurrent requests once the kernels were compiled. The first request on a GPU takes about 10 seconds while kernels compile.
-- The terminal UI was exercised live in a Windows ConPTY against a server and a balancer: both views, the keys, a reconnect after the node restarted, and the terminal restored on exit. Tests also draw it on ratatui's test backend.
-- Covered by unit and in-process tests: the wire mapping, the routing rules, the diagnosis rules, and the balancer against mock upstreams.
-- Compile-checked only: the Linux and macOS system samplers, other GPU backends through the server (Metal, CUDA, ROCm), and NVML.
+| Setup | Result |
+|---|---|
+| Qwen3-0.6B Q8_0 on a Vulkan GPU, four requests at once, Windows, release build | about 150 tokens per second in total |
+| The same, first request after start | about 10 seconds longer, while the GPU kernels compile |
+
+A token is a word piece, roughly four characters of English. Speed depends on your model, device and prompt, so measure on your own hardware.
+
+## Platform support
+
+- `serve`, `balance` and the terminal UI run on Windows, Linux and macOS.
+- The CPU engine and the Vulkan GPU engine are tested through the server on Windows.
+- The Linux and macOS resource readers, the Metal, CUDA and ROCm backends through the server, and NVIDIA readings are compile-checked only. They build, and nobody has run them against a live server yet.

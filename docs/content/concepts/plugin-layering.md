@@ -1,6 +1,6 @@
 +++
 title = "Plugins and services"
-description = "Two tiers and three attachment mechanisms: every plugin hooks the pipeline, every service is called directly or replaces the dispatch stage."
+description = "Two kinds of add-on: a plugin hooks into every turn, a service is something you call yourself or that picks the model."
 template = "page.html"
 weight = 3
 +++
@@ -9,32 +9,111 @@ weight = 3
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>A plugin observes the request and stream pipeline; a service is called directly. Attachment follows from whether the pipeline can drive the capability without being told to</dd>
+<dd>A plugin watches the request and the stream through hooks. A service is called directly, or chooses the model. Which one a capability is depends on whether the pipeline can run it without being told to</dd>
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You are adding a capability and need its tier and attachment point, or you want to know why <code>register_plugin</code> refuses a service</dd>
+<dd>You are adding a capability and need to know its kind, or you want to know why <code>register_plugin</code> refuses a service</dd>
 </dl>
 
-CUCA has nineteen non-provider features: twelve plugins and seven services. Every plugin implements `CucaPlugin` and registers on the builder. A service never implements `CucaPlugin`, so registering one is a compile error. Six services are called directly, and one replaces the dispatch stage.
+CUCA has nineteen add-on features besides the providers: twelve plugins and seven services. They solve different problems, so they attach to a turn in different ways.
 
-Tier and attachment are separate questions. The tier decides the feature namespace and the dependency rules. The attachment is how the client drives the capability.
+- A **plugin** implements the `CucaPlugin` trait and registers on the client builder. CUCA calls its hooks at fixed points in every turn.
+- A **service** never implements `CucaPlugin`, so registering one is a compile error. You call it yourself, or, for one service, it replaces the step that sends the request.
 
-## Tier and attachment
+A hook is a method CUCA calls for you at a set moment, for example just before a request is sent.
 
-| Tier | Attachment | Members |
+## Which one is it?
+
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 232" role="img" aria-labelledby="kind-title kind-desc">
+  <title id="kind-title">How a capability becomes a plugin or a service</title>
+  <desc id="kind-desc">A question: can a fixed point in every turn drive the capability? If yes, it is a plugin that registers with register_plugin and runs through hooks. If no, and you decide when to call it, it is an explicit-call service. If no, and it chooses which model answers, it is the dispatch-replacing service, attached with with_orchestrator.</desc>
+  <defs>
+    <marker id="kind-arrow" viewBox="0 0 8 8" refX="7" refY="4"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="6" y="20">Plugin or service</text>
+  <rect class="blk" x="6" y="92" width="176" height="64" rx="6"/>
+  <text class="t-sm t-mid" x="94" y="119">Can a fixed point in</text>
+  <text class="t-sm t-mid" x="94" y="133">every turn drive it?</text>
+  <rect class="blk blk-ctl" x="266" y="36" width="210" height="48" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="371" y="56">plugin</text>
+  <text class="t-sm t-mid" x="371" y="72">register_plugin, hooks</text>
+  <rect class="blk blk-ctl" x="266" y="100" width="210" height="48" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="371" y="120">service</text>
+  <text class="t-sm t-mid" x="371" y="136">you call it when you decide</text>
+  <rect class="blk blk-ctl" x="266" y="164" width="210" height="48" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="371" y="184">service</text>
+  <text class="t-sm t-mid" x="371" y="200">with_orchestrator</text>
+  <path class="arw" d="M184 124 C226 124 222 60 262 60" marker-end="url(#kind-arrow)"/>
+  <path class="arw" d="M184 124 H262" marker-end="url(#kind-arrow)"/>
+  <path class="arw" d="M184 124 C226 124 222 188 262 188" marker-end="url(#kind-arrow)"/>
+  <text class="t-sm t-end" x="228" y="78">yes</text>
+  <text class="t-sm t-end" x="244" y="118">no</text>
+  <text class="t-sm t-end" x="228" y="182">no</text>
+  <text class="t-sm" x="496" y="64">plugin-* (12 features)</text>
+  <text class="t-sm" x="496" y="128">six service-* features</text>
+  <text class="t-sm" x="496" y="192">service-speculative</text>
+</svg>
+</div>
+<p class="dgm-cap"><b>The kind follows from how the capability is driven.</b> A hook can drive a plugin. A service needs a caller who decides when to run it, or it picks the model itself.</p>
+</div>
+
+The same split as a table:
+
+| Kind | Attached by | Members |
 |---|---|---|
-| Plugin | hook, through `register_plugin` | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost`, `plugin-redaction` |
+| Plugin | `register_plugin`, hook | `plugin-mcp`, `plugin-sandbox`, `plugin-memory`, `plugin-guardrails`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `plugin-skills`, `plugin-telemetry`, `plugin-session-log`, `plugin-cost`, `plugin-redaction` |
 | Service | explicit call | `service-prompt-cache`, `service-entity-extraction`, `service-replay`, `service-rate-limit`, `service-vector-store`, `service-scheduler` |
-| Service | dispatch replacement, through `with_orchestrator` | `service-speculative` |
-
-- A hook fires at a fixed point in every turn, in registration order. The pipeline drives a plugin.
-- An explicit-call service runs when the caller decides, and the caller applies the result. The pipeline has no moment that calls it.
-- The orchestrator owns the dispatch stage, so the pipeline hosts nothing there.
+| Service | `with_orchestrator`, replaces dispatch | `service-speculative` |
 
 `plugin-session-log` also implements `SessionStorePlugin`, which extends `CucaPlugin` with `append_log`, `replay_session` and `fork_session`.
 
-## The layers
+## The hook contract
+
+`CucaPlugin` has five methods. `name` is required. The other four have default bodies that do nothing and succeed, so a plugin writes only the hooks it uses.
+
+```rust,name=The CucaPlugin trait
+fn name(&self) -> &'static str;
+fn on_request(&self, req: &mut UnifiedRequest) -> Result<(), PluginError>;
+fn execute_local_tool(&self, call: &MessageContentBlock)
+    -> Result<Option<MessageContentBlock>, PluginError>;
+fn on_stream_chunk(&self, chunk: &mut MessageContentBlock) -> Result<(), PluginError>;
+fn on_response_complete(&self, res: &UnifiedResponse) -> Result<(), PluginError>;
+```
+
+Plugins run in the order you registered them at every hook. What a plugin's answer does differs per hook:
+
+| Hook | Runs | Errors |
+|---|---|---|
+| `on_request` | for every plugin, before the request is sent. Each may change the request. | The first error becomes `CucaError::Plugin` and ends the turn before anything is sent. |
+| `execute_local_tool` | only for a `ToolCall` block. The first plugin that returns `Some` wins and the rest are skipped. | The result must be a `ToolResult` with the same `tool_call_id`, or the stream yields `PluginError::Validation`. |
+| `on_stream_chunk` | for every plugin, once per block. Each may change the block. | The first error is yielded in place of the block. That block is not counted. Polling continues. |
+| `on_response_complete` | once, for every plugin, when the stream ends. | The error is not shown to you and does not stop the other plugins. |
+
+The last hook is the one place CUCA swallows an error. The answer has already reached you, so a failing telemetry export must not break a turn you already read. With `plugin-guardrails` compiled in, the error is reported through `tracing`. Otherwise it is dropped.
+
+## Why a service is not a plugin
+
+A service could carry an empty `CucaPlugin` impl and a comment saying "call the methods directly". It would compile, register and do nothing. An inert registration is a bug that looks like configuration, so services do not implement the trait. Each one needs something a hook cannot give:
+
+- `RateLimiter` paces a caller. A permit taken in one hook and released in another would leak when the request fails or the stream is dropped early. `RateLimitPermit` releases itself on every exit.
+- `PromptCache` must look up after every `on_request` hook has changed the request, because its key covers the request that is really sent. A hit skips sending, `execute_local_tool` and `on_stream_chunk`, and still runs `on_response_complete` once. No hook fires at that point, so `CucaClient` calls the cache itself.
+- `EntityExtractor` produces a graph of facts that does nothing until you merge it into a `MemoryPlugin` with `merge_graph`. No moment in a turn makes the merge obviously right, so you decide.
+- `SessionReplay` replays a recorded session. A replay has no live request to change and no arriving block to annotate.
+- `Dispatcher` waits for a free slot, and a hook cannot wait. Waiting needs `.await` on the caller's task, so it is a method you await.
+
+## The orchestrator replaces sending
+
+`ModelOrchestrator` does not watch a turn. It decides which model runs it. With one attached, `generate_stream` runs the `on_request` hooks and the prompt cache lookup, then hands the turn to `execute_adaptive_turn` instead of a provider.
+
+The orchestrator's stream does its own validation, fallback and session events. The top-level `on_stream_chunk` and `on_response_complete` hooks do not run over an orchestrator turn. The exception is a configured prompt cache that misses, because the cache write needs to know the turn ended. [Speculative fast/slow routing](@/concepts/speculative-routing.md) covers the routing itself.
+
+## How the features depend on each other
 
 <div class="dgm">
 <div class="dgm-scroll">
@@ -66,66 +145,17 @@ Tier and attachment are separate questions. The tier decides the feature namespa
   <text class="t-sm t-mid" x="444" y="132">core only</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>Core sits below every plugin and every service.</b> Services may depend on the plugin features they declare, and nothing depends upward.</p>
+<p class="dgm-cap"><b>Core sits below every plugin and every service.</b> A service may depend on the plugin features it declares. Nothing depends upward.</p>
 </div>
 
-## The hook contract
+Plugins do not depend on each other and never name a service, so you can turn on any one plugin alone. Three services need a plugin feature, and Cargo turns it on for you:
 
-`CucaPlugin` has five methods. `name` is required. The other four have default bodies that return success and ignore their inputs.
-
-```rust,name=The CucaPlugin trait surface
-fn name(&self) -> &'static str;
-fn on_request(&self, req: &mut UnifiedRequest) -> Result<(), PluginError>;
-fn execute_local_tool(&self, call: &MessageContentBlock)
-    -> Result<Option<MessageContentBlock>, PluginError>;
-fn on_stream_chunk(&self, chunk: &mut MessageContentBlock) -> Result<(), PluginError>;
-fn on_response_complete(&self, res: &UnifiedResponse) -> Result<(), PluginError>;
-```
-
-A plugin implements only the hooks it uses. `Send + Sync` is a supertrait so the plugin list can cross `await` points in the async pipeline.
-
-Order is registration order at every hook site. What differs is what a plugin's answer does:
-
-- `on_request` runs for every plugin in order, and each may mutate the request. The first error becomes `CucaError::Plugin` and ends the turn before dispatch.
-- `execute_local_tool` runs only for a `ToolCall` block. The first plugin to return `Some` wins and the rest are skipped. The block must be a `ToolResult` whose `tool_call_id` matches the call, or the stream yields a `PluginError::Validation` error.
-- `on_stream_chunk` runs for every plugin in order, per block. The first error is yielded in place of the block, which is neither accumulated nor token counted, and polling continues.
-- `on_response_complete` runs once when the stream ends, for every plugin. An error never reaches the consumer and never stops the other plugins' hooks.
-
-The last hook is the one place the pipeline swallows an error. The response has already been delivered, so a failing telemetry export must not break a turn the caller consumed. The client reports the error through `tracing` when `plugin-guardrails` is compiled in and drops it otherwise.
-
-## Why a service is not a plugin
-
-A service could carry a `CucaPlugin` impl with empty hook bodies and a comment saying "call the methods directly". That would compile, register and do nothing. An inert registration is a bug that looks like configuration, so services do not implement the trait.
-
-- `RateLimiter` paces a caller, and `on_request` is synchronous, so a hook could only reject a request. A permit taken in a hook and released in `on_response_complete` would leak on a dispatch error, an early stream drop, or the orchestrator's unwrapped stream, none of which reaches a terminal hook. `RateLimitPermit` is an RAII value that releases on every exit.
-- `PromptCache` must look up after `on_request` has finished mutating the request, because the digest covers the request that is actually sent. A hit skips provider dispatch, `execute_local_tool` and `on_stream_chunk`, and still runs `on_response_complete` once. No hook fires at the lookup position, so `CucaClient` calls the cache itself.
-- `EntityExtractor` produces a graph delta that has no effect until the application merges it into a `MemoryPlugin` with `merge_graph`. No moment in a turn makes applying the delta obviously right, so the caller decides. The feature declares `service-entity-extraction = ["plugin-memory"]` because the delta is a `MemoryGraph`.
-- `SessionReplay` drives a recorded session. A turn has no live request to mutate and no arriving chunk to annotate, and no hook signature returns a stream. Its work is caller-triggered backend reads through `SessionReplay::load` and its streaming methods. The feature declares `service-replay = ["plugin-session-log"]` because it reads a trajectory through the `SessionBackend` seam.
-- `Dispatcher` waits for a slot, and a hook cannot wait. A queue that orders calls from many callers needs `.await` on the caller's task, so the capability is a method the caller awaits.
-
-## The orchestrator replaces dispatch
-
-`ModelOrchestrator` does not instrument a turn. It decides which model runs it. When one is attached, `generate_stream` runs the `on_request` hooks and the prompt cache lookup, then hands the turn to `execute_adaptive_turn` instead of a provider.
-
-`OrchestratorStream` carries its own validation, fallback and session events. The top-level `on_stream_chunk` and `on_response_complete` hooks do not run over an orchestrator turn, except when a prompt cache is configured and misses, because the cache write needs a completion point.
-
-The tier executors run through pooled `CucaClient` instances built without `with_orchestrator`. Their `generate_stream` calls go straight to a provider and cannot re-enter the orchestrator. [Speculative fast/slow routing](@/concepts/speculative-routing.md) covers the routing itself.
-
-## What the tiers forbid
-
-Core sits below every plugin and every service. The plugin tier is flat: no plugin depends on another plugin in Cargo features, in `#[cfg]` and import edges, or at runtime. Services may depend on the plugin features they declare. `Cargo.toml` has three hard edges, all from a service to a plugin.
-
-```toml,name=The three hard service feature edges in Cargo.toml
+```toml,name=The three service to plugin edges in Cargo.toml
 service-entity-extraction = ["plugin-memory"]
 service-replay = ["plugin-session-log"]
 service-vector-store = ["plugin-memory", "dep:wide"]
 ```
 
-- `plugin-memory` and `plugin-session-log` build and work with no knowledge that a dependent service exists.
-- `service-speculative` has no Cargo edge to `plugin-session-log`. `ModelOrchestrator::with_session_store` exists only when `plugin-session-log` is also enabled, and then records `SessionEvent::ModelSwap`.
-- `service-scheduler` declares no plugin dependency; it owns `tokio` and `tracing` itself.
-- `service-prompt-cache` and `service-rate-limit` declare no plugin dependency.
-
-A plugin never names a service in any form: no `use crate::services`, no `cfg(feature = "service-...")`, no runtime lookup. The CI `plugin_layering` job greps `src/plugins/` for `service-`, `crate::services`, and `plugins::` paths ending in `prompt_cache`, `entity_extraction`, `replay` or `rate_limit`. A `cfg(all(...))` reverse edge compiles in both the solo and all-features builds, so only inspection catches it. The `plugin_solo` and `service_solo` jobs build each feature alone on `provider-openai`, which catches undeclared forward edges.
+The other four services need no plugin. `ModelOrchestrator::with_session_store` exists only when `plugin-session-log` is also on, and then records `SessionEvent::ModelSwap`.
 
 Next page: [Speculative fast/slow routing](@/concepts/speculative-routing.md).

@@ -1,6 +1,6 @@
 +++
 title = "DeepSeek"
-description = "The DeepSeek adapter's two wire protocols: the native OpenAI-compatible route and the Anthropic Messages bridge, chosen by base URL."
+description = "The DeepSeek adapter: a first request, and its two routes, the native OpenAI-compatible route and the Anthropic Messages bridge, chosen by base URL."
 template = "page.html"
 weight = 4
 +++
@@ -9,93 +9,16 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Dispatches unified requests to DeepSeek over the OpenAI-compatible route or the Anthropic Messages bridge, chosen by the base URL.</dd>
+<dd>Sends unified requests to DeepSeek over the OpenAI-compatible route or the Anthropic Messages bridge, chosen by the base URL.</dd>
 <dt>You need</dt>
 <dd>The <code>provider-deepseek</code> feature and an API key. The bridge route requires the key.</dd>
 <dt>Read this if</dt>
 <dd>You route requests through <code>ProviderEndpoint::DeepSeek</code> on either route, or need the bridge's model id and prompt cache rules.</dd>
 </dl>
 
-The adapter reuses two other adapters instead of translating on its own. The native route runs the code on the [OpenAI](@/providers/openai.md) page, and the bridge runs the code on the [Anthropic](@/providers/anthropic.md) page. Its own differences:
+## Send a first request
 
-- A base URL containing `api.deepseek.com/anthropic`, or ending in `/anthropic`, selects the bridge. Every other base URL selects the native route.
-- Native thinking is a `thinking` mode object with no effort level.
-- The bridge translates Claude-style model ids and always disables prompt caching.
-
-## Endpoint
-
-| Fact | Native route | Bridge route |
-|---|---|---|
-| Feature flag | `provider-deepseek` | `provider-deepseek` |
-| `ProviderEndpoint` variant | `DeepSeek` | `DeepSeek` |
-| Default base URL | `https://api.deepseek.com/v1`, used when the client's base URL is empty | none; set `https://api.deepseek.com/anthropic` or another URL ending in `/anthropic` |
-| Route | `POST {base_url}/chat/completions` | `POST {base_url}/messages` |
-| Wire protocol | OpenAI-compatible | Anthropic Messages |
-
-The native route trims a trailing `/` and appends `/chat/completions`. The bridge uses the base URL as given, with no `/v1` handling.
-
-## Authentication
-
-| | Native route | Bridge route |
-|---|---|---|
-| Header | `Authorization: Bearer <api_key>` | `x-api-key: <api_key>` |
-| Without a key | no header is sent | `CucaError::Config("deepseek anthropic bridge requires an api key")` |
-| Other headers | none | `anthropic-version: 2023-06-01` |
-
-The bridge ignores `CucaClientBuilder::with_bearer_token`. It sends no `anthropic-beta` header.
-
-## Request translation
-
-Native route: the body is the one described under [OpenAI request translation](@/providers/openai.md#request-translation), with the request's model unchanged.
-
-Bridge route: the body is the one described under [Anthropic request translation](@/providers/anthropic.md#request-translation), after two changes to the request:
-
-- The model id is mapped: `claude-opus` becomes `deepseek-v4-pro`, and `claude-sonnet` and `claude-haiku` become `deepseek-v4-flash`. Any other id passes through unchanged.
-- `PromptCacheDirective` is set to `Disabled`, whatever the caller requested. No bridge request carries a prompt cache beta header, a `cache_control` block or a breakpoint check.
-
-## Response stream
-
-- Native route: the stream is the one described under [OpenAI response stream](@/providers/openai.md#response-stream). `reasoning_content` deltas become `Thinking` blocks.
-- Bridge route: the stream is the one described under [Anthropic response stream](@/providers/anthropic.md#response-stream).
-
-## Token usage
-
-- Native route: DeepSeek sends the `usage` object on the final `finish_reason` frame, and the shared translator reads it. The rules are on the [OpenAI](@/providers/openai.md#token-usage) page.
-- Bridge route: no token counts are read, as on the [Anthropic](@/providers/anthropic.md#token-usage) page. `usage` is `None`, `prompt_tokens` is `0`, and `completion_tokens` counts one per `Text`, `Thinking` and `ToolCall` block.
-- The bridge still reads prompt cache counters from `message_start` when the server sends them.
-
-## Thinking
-
-- Native route: `req.thinking` becomes a top-level `thinking` object. An enabled config sends `{"type": "enabled"}` and a disabled one sends `{"type": "disabled"}`. With no `thinking` on the request, the key is omitted. No `reasoning_effort` is sent, and the effort level and `ThinkingParams` are ignored.
-- Bridge route: `req.thinking` follows the budget and adaptive rules in the [Anthropic thinking table](@/providers/anthropic.md#thinking).
-
-## Errors
-
-| Condition | Error |
-|---|---|
-| Feature not compiled | `CucaError::ProviderNotEnabled("provider-deepseek")` |
-| Bridge route with no API key | `CucaError::Config` |
-| Non-2xx response | `CucaError::Http { status, body }` with the captured body |
-| Connection or body-read failure | `CucaError::Transport { message }` |
-| Native frame is not valid JSON | `CucaError::Json` |
-| Native frame carries `{"error": {"message": ...}}` | `CucaError::Provider` with `provider: OpenAi` |
-| Bridge `error` event | `CucaError::Provider` with `provider: Anthropic` |
-| Frame bytes are not valid UTF-8 | `CucaError::SseParse` |
-
-The provider name in a stream error comes from the shared translator: `OpenAi` on the native route and `Anthropic` on the bridge, never `DeepSeek`.
-
-## Limits
-
-- No cap on request or response size, and the client sets no request timeout.
-- The SSE parser keeps one reusable buffer that starts at 8192 bytes. Its high-water mark is the largest single frame plus one partial line.
-- Native route: in-flight tool calls hold their argument fragments until each call completes. Bridge route: one thinking text, signature or tool call input is buffered at a time.
-- The bridge sends `max_tokens` 1024 when the request leaves it unset. The native route sends none.
-- Native route: `top_p`, `seed` and `stop` go out under those names. `top_k` fails with `CucaError::Config` and the message ``"`top_k` is not supported by DeepSeek"``.
-- Bridge route: `top_p`, `top_k` and `stop_sequences` go out. `seed` fails with `CucaError::Config` and the message ``"`seed` is not supported by Anthropic"``, because the bridge builds the body with the Anthropic builder.
-
-## Example
-
-The smallest streaming turn: the `DeepSeek` variant and an API key. The default base URL selects the native route.
+The default base URL selects the native route.
 
 ```bash,name=Runs the same on all three platforms
 cargo add cuca --path /path/to/cuca --features provider-deepseek
@@ -153,10 +76,121 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 cargo run
 ```
 
-The `provider-deepseek` feature comes from the `cargo add` line above.
+```text,name=Expected shape; not captured from a live run
+Hello! How can I help you today?
+blocks: 1 text, 0 thinking
+```
 
 To use the bridge, add `.with_base_url("https://api.deepseek.com/anthropic")` to the builder.
 
+## What you need
+
+| Fact | Native route | Bridge route |
+|---|---|---|
+| Feature flag | `provider-deepseek` | `provider-deepseek` |
+| `ProviderEndpoint` variant | `DeepSeek` | `DeepSeek` |
+| Default base URL | `https://api.deepseek.com/v1`, used when the client's base URL is empty | none. Set `https://api.deepseek.com/anthropic` or another URL ending in `/anthropic` |
+| Route | `POST {base_url}/chat/completions` | `POST {base_url}/messages` |
+| Wire protocol | OpenAI-compatible | Anthropic Messages |
+| Auth | `Authorization: Bearer <api_key>`, no header without a key | `x-api-key: <api_key>`, required |
+
+The native route trims a trailing `/` and appends `/chat/completions`. The bridge uses the base URL as given, with no `/v1` handling.
+
+## How it chooses a route
+
+The adapter has no translator of its own. It reuses two others, and the base URL picks which.
+
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 170" role="img" aria-labelledby="dsk-title dsk-desc">
+  <title id="dsk-title">The DeepSeek base URL selects the translator</title>
+  <desc id="dsk-desc">A DeepSeek request goes to a base URL check. A base URL that contains api.deepseek.com/anthropic or ends in /anthropic goes to the Anthropic Messages bridge, which maps Claude model ids and disables prompt caching. Any other base URL goes to the native OpenAI-compatible route.</desc>
+  <defs>
+    <marker id="dsk-arrow" viewBox="0 0 8 8" refX="7" refY="4"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="6" y="20">ProviderEndpoint::DeepSeek</text>
+  <rect class="blk blk-ctl" x="6" y="66" width="140" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="76" y="88">base URL check</text>
+  <text class="t-sm t-mid" x="76" y="104">ends in /anthropic?</text>
+  <rect class="blk blk-bnd" x="280" y="38" width="374" height="52" rx="6"/>
+  <text class="t-lbl t-mid t-bnd" x="467" y="59">Bridge: Anthropic Messages</text>
+  <text class="t-sm t-mid" x="467" y="76">POST /messages. Maps claude-* ids. No prompt cache</text>
+  <rect class="blk blk-bnd" x="280" y="108" width="374" height="52" rx="6"/>
+  <text class="t-lbl t-mid t-bnd" x="467" y="129">Native: OpenAI-compatible</text>
+  <text class="t-sm t-mid" x="467" y="146">POST /chat/completions. Default route</text>
+  <path class="arw arw-bnd" d="M148 84 L276 64" marker-end="url(#dsk-arrow)"/>
+  <text class="t-ax" x="190" y="66">yes</text>
+  <path class="arw arw-bnd" d="M148 98 L276 134" marker-end="url(#dsk-arrow)"/>
+  <text class="t-ax" x="190" y="130">no</text>
+</svg>
+</div>
+<p class="dgm-cap"><b>The base URL alone picks the route.</b> A URL containing <code>api.deepseek.com/anthropic</code>, or ending in <code>/anthropic</code>, selects the bridge. Every other URL selects the native route.</p>
+</div>
+
+The native route runs the code on the [OpenAI](@/providers/openai.md) page. The bridge runs the code on the [Anthropic](@/providers/anthropic.md) page. The differences:
+
+- Native thinking is a `thinking` mode object with no effort level.
+- The bridge translates Claude-style model ids and always disables prompt caching.
+
+## Authentication
+
+- Native route: the header is `Authorization: Bearer <api_key>`. Without a key no header is sent. There are no other headers.
+- Bridge route: the header is `x-api-key: <api_key>`. Without a key the call fails with `CucaError::Config("deepseek anthropic bridge requires an api key")`. It also sends `anthropic-version: 2023-06-01`.
+
+The bridge ignores `CucaClientBuilder::with_bearer_token`. It sends no `anthropic-beta` header.
+
+## Request translation
+
+Native route: the body is the one under [OpenAI request translation](@/providers/openai.md#request-translation), with the request's model unchanged.
+
+Bridge route: the body is the one under [Anthropic request translation](@/providers/anthropic.md#request-translation), after two changes to the request:
+
+- The model id is mapped. `claude-opus` becomes `deepseek-v4-pro`, and `claude-sonnet` and `claude-haiku` become `deepseek-v4-flash`. Any other id passes through unchanged.
+- `PromptCacheDirective` is set to `Disabled`, whatever you asked for. No bridge request carries a prompt cache beta header, a `cache_control` block or a breakpoint check.
+
+## Response stream
+
+- Native route: the stream is the one under [OpenAI response stream](@/providers/openai.md#response-stream). `reasoning_content` deltas become `Thinking` blocks.
+- Bridge route: the stream is the one under [Anthropic response stream](@/providers/anthropic.md#response-stream).
+
+## Token usage
+
+- Native route: DeepSeek sends the `usage` object on the final `finish_reason` frame, and the shared translator reads it. The rules are on the [OpenAI](@/providers/openai.md#token-usage) page.
+- Bridge route: no token counts are read, as on the [Anthropic](@/providers/anthropic.md#token-usage) page. `usage` is `None`, `prompt_tokens` is `0`, and `completion_tokens` counts one per `Text`, `Thinking` and `ToolCall` block.
+- The bridge still reads prompt cache counters from `message_start` when the server sends them.
+
+## Thinking
+
+- Native route: `req.thinking` becomes a top-level `thinking` object. An enabled config sends `{"type": "enabled"}` and a disabled one sends `{"type": "disabled"}`. With no `thinking` on the request, the key is omitted. No `reasoning_effort` is sent, and the effort level and `ThinkingParams` are ignored.
+- Bridge route: `req.thinking` follows the budget and adaptive rules in the [Anthropic thinking table](@/providers/anthropic.md#thinking).
+
+## Errors
+
+| Condition | Error |
+|---|---|
+| Feature not compiled | `CucaError::ProviderNotEnabled("provider-deepseek")` |
+| Bridge route with no API key | `CucaError::Config` |
+| Non-2xx response | `CucaError::Http { status, body }` with the captured body |
+| Connection or body-read failure | `CucaError::Transport { message }` |
+| Native frame is not valid JSON | `CucaError::Json` |
+| Native frame carries `{"error": {"message": ...}}` | `CucaError::Provider` with `provider: OpenAi` |
+| Bridge `error` event | `CucaError::Provider` with `provider: Anthropic` |
+| Frame bytes are not valid UTF-8 | `CucaError::SseParse` |
+
+The provider name in a stream error comes from the shared translator: `OpenAi` on the native route and `Anthropic` on the bridge, never `DeepSeek`.
+
+## Limits
+
+- No cap on request or response size. The client sets no request timeout.
+- The SSE parser keeps one reusable buffer that starts at 8192 bytes. It grows to the largest single frame plus one partial line.
+- Native route: pending tool calls hold their argument fragments until each call completes. Bridge route: one thinking text, signature or tool call input is buffered at a time.
+- The bridge sends `max_tokens` 1024 when the request leaves it unset. The native route sends none.
+- Native route: `top_p`, `seed` and `stop` go out under those names. `top_k` fails with `CucaError::Config` and the message ``"`top_k` is not supported by DeepSeek"``.
+- Bridge route: `top_p`, `top_k` and `stop_sequences` go out. `seed` fails with `CucaError::Config` and the message ``"`seed` is not supported by Anthropic"``, because the bridge builds the body with the Anthropic builder.
+
 ## Related pages
 
-- [Prompt cache](@/services/prompt-cache.md) is the client-owned local response cache, a separate feature from the provider-side prompt caching the bridge disables.
+- [Prompt cache](@/services/prompt-cache.md) is the client-side response cache. It is separate from the provider-side prompt caching that the bridge disables.

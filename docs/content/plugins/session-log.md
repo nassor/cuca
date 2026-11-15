@@ -1,6 +1,6 @@
 +++
 title = "Session log"
-description = "The append-only session trajectory plugin: the SessionEvent model, the two storage backends, and forking."
+description = "Record every request, streamed block and completion in an append-only log that you can replay and fork."
 template = "page.html"
 weight = 12
 +++
@@ -9,105 +9,18 @@ weight = 12
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Records every request, streamed block, and completion as an append-only SessionEvent, and supports replay and forking.</dd>
+<dd><code>SessionLogPlugin</code> writes each request, streamed block and completion to an append-only log, so you can replay a session or fork it from any point.</dd>
 <dt>You need</dt>
 <dd>The <code>plugin-session-log</code> feature.</dd>
 <dt>Read this if</dt>
-<dd>You are registering <code>SessionLogPlugin</code>, choosing a <code>SessionBackend</code>, or forking a session.</dd>
+<dd>You want a record of what the model saw and said, or you want to branch a conversation from an earlier point.</dd>
 </dl>
 
-## Feature and entry type
+Append-only means the plugin only adds records and never edits or removes one. The log can live in memory (`InMemoryBackend`) or in files on disk (`FileBackend`).
 
-| Item | Value |
-|---|---|
-| Feature flag | `plugin-session-log` (enables `postcard`) |
-| Entry types | `SessionLogPlugin`, `SessionBackend`, `InMemoryBackend`, `FileBackend` |
-| Plugin name | `"session-log"` |
-| Attachment | `register_plugin` |
-| Also implements | `SessionStorePlugin`: `append_log`, `replay_session`, `fork_session` |
-| Needs | A `SessionBackend`; `SessionLogPlugin::new_in_memory()` builds one over a fresh `InMemoryBackend` |
+## Register it
 
-## Hooks
-
-`SessionLogPlugin` overrides `on_request`, `on_stream_chunk`, and `on_response_complete`. `execute_local_tool` uses the trait default. Every hook writes to the plugin's session id.
-
-- `on_request` appends a `SystemPrompt` for every `System` message on every request. It appends a `Message` for a `User` or `Assistant` message only the first time that message position appears. `Tool` messages are not recorded. It records the request as earlier `on_request` hooks left it.
-- `on_stream_chunk` appends one record per block: `Thinking` becomes `Reasoning`, `Text` becomes `Output`, `ToolCall` becomes `ToolCall`, and `ToolResult` becomes `ToolResult` with `stdout`, `stderr`, and `exit_code` set to `None`. `ImageBase64` blocks are not recorded. Blocks are recorded verbatim.
-- `on_response_complete` appends `Latency` (`duration_ms`) and `TokenUsage`, in that order.
-- `ModelSwap` records arrive through `append_log`, called by whoever holds the store handle. The plugin's own hooks never write one.
-
-The plugin assigns every sequence number. Backends store records as given, with one exception: the `Fork` audit record a backend appends during `fork`, sequenced at the original session's tail.
-
-### Session events
-
-| Variant | Fields |
-|---|---|
-| `SystemPrompt` | `text` |
-| `Message` | `role`, `content` |
-| `Reasoning` | `reasoning`, `signature` |
-| `Output` | `text` |
-| `ToolCall` | `id`, `name`, `arguments` |
-| `ToolResult` | `tool_call_id`, `output`, `stdout`, `stderr`, `exit_code` |
-| `ModelSwap` | `from`, `to`, `reason` |
-| `Latency` | `duration_ms` |
-| `TokenUsage` | `prompt_tokens`, `completion_tokens` |
-| `Fork` | `from_point`, `to_session` |
-
-Each stored `SessionRecord` carries `session_id`, a 0-based `sequence`, a `timestamp_ms`, and the `event`. `SessionRecord::point_id()` returns `"{session_id}:{sequence}"`, the string `fork_session` takes as `point_id`.
-
-### Forking
-
-`fork_session(session_id, point_id)` branches from any historical point. The new session holds the original's prefix up to and including that point, relabelled with the new session id. The original gains one `SessionEvent::Fork` record, and the plugin then realigns that session's next sequence number to its replayed length.
-
-The new id is `{session_id}:fork:{point_id}:{n}`, where `n` counts forks on that backend instance.
-
-## Configuration
-
-| Key | Type | Default | Meaning |
-|---|---|---|---|
-| `SessionLogPlugin::with_session_id(id)` | `impl Into<String>` | `"default"` | Session the hooks write to |
-| `InMemoryBackend::with_max_records(n)` | `usize` | `InMemoryBackend::DEFAULT_MAX_RECORDS` (65536) | Total-record cap across sessions; zero is rejected |
-| `FileBackend::new(dir)` | `impl Into<PathBuf>` | required | Directory for the session files; created if missing |
-
-### Backends
-
-- `InMemoryBackend` stores a `HashMap<session_id, Vec<SessionRecord>>`. It is not persisted.
-- `FileBackend` stores one file per session, `{dir}/{session_id}.cslog`, with one COBS-framed postcard record per append. It opens files with `append(true)` and never truncates or rewrites a frame.
-
-### File format
-
-- Each `.cslog` file starts with the 8-byte magic `CUCASLOG` and a one-byte format version, `1`, written once when the file is created.
-- A missing file replays as an empty session.
-- `FileBackend` rejects a session id containing `/` or `\` rather than mapping it into a subdirectory.
-
-## Caps and at-cap policy
-
-| Structure | Bound | At-cap policy | Usage gauge |
-|---|---|---|---|
-| `InMemoryBackend` records | `max_records`, default 65536 records in total across sessions | `append` and `fork` fail with `PluginError::Internal` and evict nothing, because dropping a record would corrupt replay and forking | `InMemoryBackend::len()` against `max_records()` |
-| `FileBackend` trajectory | Disk | No in-process bound | None |
-| `FileBackend` framing scratch | 64 KiB of retained capacity | The buffer is cleared and shrunk back to 64 KiB after any larger record; no record is refused or truncated | `FileBackend::scratch_capacity()` |
-| `SessionLogPlugin` bookkeeping | None: one small entry per distinct session id | Not evicted, because evicting an entry would restart that session's sequence numbering. A caller that mints unbounded session ids owns that bound | None |
-
-`fork` on `InMemoryBackend` checks the cap before it changes anything. It needs room for the branch prefix plus the `Fork` audit record, and fails whole when that does not fit.
-
-## Errors
-
-`SessionLogPlugin` returns the `PluginError` its backend returns, and a hook propagates an append failure. A failure in `on_response_complete` is logged by the client and does not abort the turn.
-
-| Variant | When |
-|---|---|
-| `Validation`, schema `max_records` | `InMemoryBackend::with_max_records(0)` |
-| `Internal` | `InMemoryBackend` is full on `append` or `fork` |
-| `Validation`, schema `point_id` | `fork` names a `point_id` that no record in the session carries |
-| `Validation`, schema `session_id` | `FileBackend` gets a session id containing `/` or `\`, including the derived fork id |
-| `Validation`, schema `cslog` | A `.cslog` file is shorter than its header, lacks the `CUCASLOG` magic, has an unknown format version, or holds an undecodable frame |
-| `Validation`, schema `cslog` | A session has a `{session_id}.jsonl` file and no `.cslog` file; it is rejected, not replayed as empty |
-| `Io` | `FileBackend::new` cannot create the directory, or a file read, write, or frame serialization fails |
-
-## Example
-
-`examples/session_log.rs` records the same two live turns through two plugin instances, one over `InMemoryBackend` and one over `FileBackend`, then forks the in-memory session at its first `Message` record.
+`SessionLogPlugin::new_in_memory()` builds a plugin over a fresh in-memory log.
 
 ```rust,name=Record to memory and to disk, then fork
 let memory_backend = Arc::new(InMemoryBackend::new());
@@ -129,11 +42,15 @@ let client = CucaClient::builder()
 let branch = memory_log.fork_session("demo", &point)?;
 ```
 
+Expected effect: both logs hold the same records for session `demo`. The file log is `{dir}/demo.cslog`. `fork_session` makes a new session that copies the records up to the point you name.
+
+## Run the example
+
+`examples/session_log.rs` records two turns to memory and to disk, then forks the in-memory session at its first `Message` record. It needs a `llama-server` on port 1234. Put `--base-url` and `--model` after `--` to use another OpenAI-compatible server.
+
 ```bash,name=Runs the same on all three platforms
 cargo run --example session_log --features "provider-llamacpp plugin-session-log"
 ```
-
-It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, retarget it at another OpenAI-compatible server.
 
 ```text,name=Expected output
 Session "demo", two backends recording the same turns
@@ -159,10 +76,97 @@ Fork at demo:1, the first Message record
 The file backend replays the same trajectory: 213 records
 ```
 
-The `Reasoning` records are one per streamed `Thinking` block. Turn 2 appends a second `SystemPrompt` because only user and assistant messages are deduplicated by position. The counts and byte totals come from `google/gemma-4-12b-qat` and change with the model. The record kinds, the branch prefix, and the audit record do not.
+There is one `Reasoning` record per streamed `Thinking` block. Turn 2 adds a second `SystemPrompt` because only user and assistant messages are matched by position. Counts and byte sizes depend on the model. The record kinds and the fork result do not.
+
+## Feature and entry type
+
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-session-log` |
+| Entry types | `SessionLogPlugin`, `SessionBackend`, `InMemoryBackend`, `FileBackend` |
+| Plugin name | `"session-log"` |
+| Attachment | `register_plugin` |
+| Also implements | `SessionStorePlugin`: `append_log`, `replay_session`, `fork_session` |
+| Needs | A `SessionBackend`. `SessionLogPlugin::new_in_memory()` builds one over a fresh `InMemoryBackend`. |
+
+## Hooks
+
+`SessionLogPlugin` acts on `on_request`, `on_stream_chunk` and `on_response_complete`. Every hook writes to the plugin's session id.
+
+- `on_request` adds a `SystemPrompt` for every `System` message, on every request. It adds a `Message` for a `User` or `Assistant` message only the first time that message position appears. `Tool` messages are not recorded. It records the request as earlier plugins left it.
+- `on_stream_chunk` adds one record per block: `Thinking` becomes `Reasoning`, `Text` becomes `Output`, `ToolCall` becomes `ToolCall`, and `ToolResult` becomes `ToolResult` with `stdout`, `stderr` and `exit_code` set to `None`. `ImageBase64` blocks are not recorded. Blocks are recorded as they are.
+- `on_response_complete` adds `Latency` (`duration_ms`) and then `TokenUsage`.
+- `ModelSwap` records come only from `append_log`, which the holder of the store handle calls. The hooks never write one.
+
+The plugin numbers every record. Backends store records as given, except for the `Fork` record a backend adds during a fork, numbered at the tail of the original session.
+
+### Session events
+
+| Variant | Fields |
+|---|---|
+| `SystemPrompt` | `text` |
+| `Message` | `role`, `content` |
+| `Reasoning` | `reasoning`, `signature` |
+| `Output` | `text` |
+| `ToolCall` | `id`, `name`, `arguments` |
+| `ToolResult` | `tool_call_id`, `output`, `stdout`, `stderr`, `exit_code` |
+| `ModelSwap` | `from`, `to`, `reason` |
+| `Latency` | `duration_ms` |
+| `TokenUsage` | `prompt_tokens`, `completion_tokens` |
+| `Fork` | `from_point`, `to_session` |
+
+Each stored `SessionRecord` has `session_id`, a `sequence` that starts at 0, a `timestamp_ms` and the `event`. `SessionRecord::point_id()` returns `"{session_id}:{sequence}"`. That string is what `fork_session` takes as `point_id`.
+
+### Forking
+
+`fork_session(session_id, point_id)` branches from any earlier point. The new session holds the original's records up to and including that point, relabelled with the new session id. The original gets one `SessionEvent::Fork` record.
+
+The new id is `{session_id}:fork:{point_id}:{n}`, where `n` counts forks on that backend.
+
+## Configuration
+
+- `SessionLogPlugin::with_session_id(id)`: takes `impl Into<String>`, default `"default"`. The session the hooks write to.
+- `InMemoryBackend::with_max_records(n)`: takes a `usize`, default `InMemoryBackend::DEFAULT_MAX_RECORDS` (65536). Limit on records across all sessions. Zero is rejected.
+- `FileBackend::new(dir)`: takes `impl Into<PathBuf>`, required. Folder for the session files. Created if missing.
+
+### Backends
+
+- `InMemoryBackend` keeps records in memory. Nothing is saved to disk.
+- `FileBackend` keeps one file per session, `{dir}/{session_id}.cslog`, with one record added per append. It never truncates or rewrites a record.
+
+### File format
+
+- A `.cslog` file starts with the 8-byte marker `CUCASLOG` and a one-byte format version, `1`. They are written once, when the file is created.
+- A missing file replays as an empty session.
+- `FileBackend` rejects a session id that contains `/` or `\`.
+
+## Caps and at-cap policy
+
+| Structure | Limit | At the limit | Usage gauge |
+|---|---|---|---|
+| `InMemoryBackend` records | `max_records`, default 65536 records across all sessions | `append` and `fork` fail with `PluginError::Internal`. Nothing is dropped, because dropping a record would break replay and forking. | `InMemoryBackend::len()` against `max_records()` |
+| `FileBackend` log | Disk space | No limit inside the process. | None |
+| `FileBackend` write buffer | 64 KiB kept between writes | The buffer shrinks back to 64 KiB after a larger record. No record is refused or cut. | `FileBackend::scratch_capacity()` |
+| `SessionLogPlugin` bookkeeping | None: one small entry per session id | Never dropped, because dropping one would restart that session's numbering. If you create unlimited session ids, you own that bound. | None |
+
+`fork` on `InMemoryBackend` checks the limit first. It needs room for the copied records plus the `Fork` record, and fails as a whole if there is not enough.
+
+## Errors
+
+`SessionLogPlugin` returns the `PluginError` its backend returns. A hook passes on an append failure. A failure in `on_response_complete` is logged by the client and does not stop the turn.
+
+| Variant | When |
+|---|---|
+| `Validation`, schema `max_records` | `InMemoryBackend::with_max_records(0)` |
+| `Internal` | `InMemoryBackend` is full on `append` or `fork` |
+| `Validation`, schema `point_id` | `fork` names a `point_id` that no record in the session has |
+| `Validation`, schema `session_id` | `FileBackend` gets a session id with `/` or `\`, including the derived fork id |
+| `Validation`, schema `cslog` | A `.cslog` file is shorter than its header, lacks the `CUCASLOG` marker, has an unknown format version, or has a record that cannot be decoded |
+| `Validation`, schema `cslog` | A session has a `{session_id}.jsonl` file and no `.cslog` file. It is rejected, not replayed as empty. |
+| `Io` | `FileBackend::new` cannot create the folder, or a file read, write or record encode fails |
 
 ## Related pages
 
-- [Memory discipline](@/concepts/memory-discipline.md): why the in-memory backend refuses at its cap instead of evicting.
-- [Replay](@/services/replay.md): the service that reads a trajectory back through `SessionBackend`.
+- [Memory discipline](@/concepts/memory-discipline.md): why the in-memory log refuses at its limit instead of dropping records.
+- [Replay](@/services/replay.md): the service that reads a log back through `SessionBackend`.
 - [Redaction](@/plugins/redaction.md): registration order decides whether the log stores scrubbed or raw content.

@@ -92,46 +92,43 @@ path = "@/providers/lmstudio.md"
 title = "Local (in-process)"
 path = "@/providers/local/_index.md"
 [[extra.nav.items.children]]
+title = "How it works"
+path = "@/providers/local/how-it-works.md"
+[[extra.nav.items.children]]
+title = "Choose a model"
+path = "@/providers/local/models.md"
+[[extra.nav.items.children]]
+title = "Model files and downloads"
+path = "@/providers/local/model-sources.md"
+[[extra.nav.items.children]]
+title = "Requests, thinking and tool calls"
+path = "@/providers/local/requests.md"
+[[extra.nav.items.children]]
 title = "Configuration"
 path = "@/providers/local/configuration.md"
 [[extra.nav.items.children]]
-title = "Requests and responses"
-path = "@/providers/local/requests.md"
+title = "Run on a GPU"
+path = "@/providers/local/gpu.md"
 [[extra.nav.items.children]]
-title = "Limits and errors"
-path = "@/providers/local/limits-and-errors.md"
+title = "Fit a large model"
+path = "@/providers/local/placement.md"
 [[extra.nav.items.children]]
-title = "Model sources and presets"
-path = "@/providers/local/model-sources.md"
-[[extra.nav.items.children]]
-title = "Checkpoint conversion"
-path = "@/providers/local/checkpoints.md"
-[[extra.nav.items.children]]
-title = "Local models and formats"
-path = "@/providers/local/models.md"
-[[extra.nav.items.children]]
-title = "Tokenizers"
-path = "@/providers/local/tokenizers.md"
-[[extra.nav.items.children]]
-title = "Chat templates, reasoning and tool calls"
-path = "@/providers/local/chat-templates.md"
-[[extra.nav.items.children]]
-title = "Verification and known limits"
-path = "@/providers/local/verification.md"
+title = "Tiered experts"
+path = "@/providers/local/expert-tiers.md"
 [[extra.nav.items.children]]
 title = "Speculative decoding"
 path = "@/providers/local/drafting.md"
 [[extra.nav.items.children]]
-title = "Hybrid placement"
-path = "@/providers/local/placement.md"
+title = "Run DeepSeek-V4.1"
+path = "@/providers/local/deepseek-v41.md"
 [[extra.nav.items.children]]
-title = "Local engine on a GPU"
-path = "@/providers/local/gpu.md"
+title = "Limits and errors"
+path = "@/providers/local/limits-and-errors.md"
 [[extra.nav.items.children]]
-title = "Tiered expert placement"
-path = "@/providers/local/expert-tiers.md"
+title = "Support status and known limits"
+path = "@/providers/local/verification.md"
 [[extra.nav.items.children]]
-title = "Build requirements and tests"
+title = "Build requirements"
 path = "@/providers/local/build-and-tests.md"
 
 [[extra.nav]]
@@ -233,7 +230,7 @@ path = "@/guides/custom-plugin.md"
 title = "Serve a model over HTTP"
 path = "@/guides/serve-a-model.md"
 [[extra.nav.items]]
-title = "Run the live integration suite"
+title = "Run the live integration suites"
 path = "@/guides/integration-tests.md"
 
 [[extra.nav]]

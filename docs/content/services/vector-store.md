@@ -1,6 +1,6 @@
 +++
 title = "Vector store"
-description = "The bounded in-process vector store behind the memory plugin's offload seam: the config bounds, the SIMD scan, and the recall injection hand-off."
+description = "Keep old conversation turns as embeddings in memory and recall the closest ones into the next request."
 template = "page.html"
 weight = 6
 +++
@@ -9,147 +9,56 @@ weight = 6
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Keeps offloaded turns as unit-normalized embeddings in a capped arena and answers top-k similarity queries the caller injects into the next prompt.</dd>
+<dd>Stores turns that were removed from the prompt as embeddings (lists of numbers that capture meaning) in a capped in-memory store, and finds the closest turns to a question.</dd>
 <dt>You need</dt>
-<dd>The <code>service-vector-store</code> feature, which enables <code>plugin-memory</code>, plus one <code>provider-*</code> feature.</dd>
+<dd>The <code>service-vector-store</code> feature, which turns on <code>plugin-memory</code>, plus one <code>provider-*</code> feature. An embedding function you write.</dd>
 <dt>Read this if</dt>
-<dd>You are wiring recall of compacted history, or sizing the store's bounds.</dd>
+<dd>You compact long conversations and want the model to recall details from the removed turns, or you are sizing the store.</dd>
 </dl>
 
-## Feature and entry type
+## What it does
 
-| Item | Value |
-|---|---|
-| Feature flag | `service-vector-store = ["plugin-memory", "dep:wide"]` |
-| Declared plugin edge | `plugin-memory`, hard |
-| Entry type | `InMemoryVectorStore`, which implements the memory plugin's `VectorStore` seam |
-| Other public types | `Embedder`, `VectorStoreConfig`, `VectorStoreUsage`, `VectorStoreError`, `RetrievalReport`, `RetrievedTurn`, `RecallInjection`, `RECALL_RENDER_MARKER` |
+A long conversation outgrows the prompt. The [memory](@/plugins/memory.md) plugin can move old turns out of the prompt (the `Offload` strategy). `InMemoryVectorStore` keeps those turns. Later you ask it for the turns closest in meaning to a question and put them back into the next request.
 
-`InMemoryVectorStore` is an explicit-call service. It never implements `CucaPlugin`, so passing it to `register_plugin` is a compile error. The edge is one-way. The store implements a seam that `plugin-memory` declares, so it cannot exist without that plugin. `plugin-memory` never names the service, and nothing under `src/plugins/` may.
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 200" role="img" aria-labelledby="vs-flow-title vs-flow-desc">
+  <title id="vs-flow-title">Offloaded turns are embedded and stored. Before the next request you retrieve the closest turns and inject them.</title>
+  <desc id="vs-flow-desc">Write path on top: the memory plugin's Offload strategy sends turns to your Embedder, which turns each into a vector, and the vector store keeps them in a capped arena. Read path below: you call retrieve with a question and k, which scans the store and returns the top k turns, then inject writes them into the request as one system message.</desc>
+  <defs>
+    <marker id="vs-flow-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="6" y="20">Write path: runs inside the memory plugin</text>
+  <rect class="blk blk-ctl" x="6" y="36" width="140" height="50" rx="6"/>
+  <text class="t-sm t-mid t-ctl" x="76" y="58">compress</text>
+  <text class="t-sm t-mid" x="76" y="73">Offload strategy</text>
+  <path class="arw arw-ctl" d="M148 61 H174" marker-end="url(#vs-flow-arrow)"/>
+  <rect class="blk blk-bnd" x="176" y="36" width="130" height="50" rx="6"/>
+  <text class="t-sm t-mid t-bnd" x="241" y="58">Embedder</text>
+  <text class="t-sm t-mid" x="241" y="73">your embed()</text>
+  <path class="arw arw-data" d="M308 61 H334" marker-end="url(#vs-flow-arrow)"/>
+  <rect class="blk blk-data" x="336" y="36" width="150" height="50" rx="6"/>
+  <text class="t-sm t-mid t-data" x="411" y="58">InMemoryVectorStore</text>
+  <text class="t-sm t-mid" x="411" y="73">capped, oldest out</text>
+  <text class="t-sm" x="6" y="116">Read path: you call it before the next request</text>
+  <path class="arw arw-data" d="M411 88 V132" marker-end="url(#vs-flow-arrow)"/>
+  <rect class="blk blk-data" x="336" y="134" width="150" height="50" rx="6"/>
+  <text class="t-sm t-mid t-data" x="411" y="156">retrieve(q, k)</text>
+  <text class="t-sm t-mid" x="411" y="171">top k by similarity</text>
+  <path class="arw arw-data" d="M488 159 H506" marker-end="url(#vs-flow-arrow)"/>
+  <rect class="blk blk-ctl" x="508" y="134" width="146" height="50" rx="6"/>
+  <text class="t-sm t-mid t-ctl" x="581" y="156">inject(&amp;mut req)</text>
+  <text class="t-sm t-mid" x="581" y="171">one system message</text>
+</svg>
+</div>
+<p class="dgm-cap"><b>Recall is a step you run.</b> The write path happens inside the memory plugin's hook. The read path does not, so you call <code>retrieve</code> and <code>inject</code> before you send the request.</p>
+</div>
 
-## Entry points
+## Try it
 
-### Write path
-
-- `MemoryPlugin::with_extensions(config, summarizer, store)` is the only constructor that accepts a store.
-- `CompactionStrategy::Offload { turns }` writes to the store. It calls `VectorStore::store_turns` with the fixed session hint `"cuca-memory"`, so the turns compaction removes from the live prompt are embedded and stored.
-- `store_turns` runs inside the synchronous `on_request` hook, so `Embedder` is a synchronous, caller-supplied bridge: `embed(&self, text) -> Result<Vec<f32>, PluginError>`. No implementation may await. No provider adapter exposes an embeddings route, so a caller that wants HTTP embeddings owns that blocking decision.
-- An entry is embedded from a space-joined projection of its blocks: `Text` verbatim, `ToolCall` contributes its `name`, and `ToolResult` contributes its `output`. `Thinking` and `ImageBase64` are excluded.
-- Every embedding is unit-normalized once at insert. A zero-norm embedding is kept, counted in `VectorStoreUsage::zero_norm_entries`, and scores exactly `0.0`.
-
-### Read path
-
-| Method | Scans | Embeds the query |
-|---|---|---|
-| `retrieve(query, k)` | every session hint | yes |
-| `retrieve_in(session_hint, query, k)` | one session hint | yes |
-| `retrieve_embedding(session_hint, query, k)` | one hint, or all when `None` | no; the caller passes the vector |
-
-- Each returns an exact top-k `RetrievalReport` with `turns` (best first) and `scanned`. Each `RetrievedTurn` carries `message`, `score`, `sequence` and `session_hint`.
-- The scan is exact and never approximate. The bounded entry count sits far below the size where a graph index pays off, and a randomized index would give up the deterministic ranking.
-- `retrieve_embedding` accepts a vector that is not normalized and leaves the caller's slice untouched.
-- Narrow reads are `usage()`, `len()`, `is_empty()` and `capacity()`.
-
-### Hand-off: inject the recall
-
-A `RetrievalReport` is inert. Recall reaches the model only when the application calls `RetrievalReport::inject(&mut request)`.
-
-- `inject` removes a system message whose first text block starts with `RECALL_RENDER_MARKER` (`"CUCA recall:"`), so it is idempotent.
-- It places the new recall as a system message immediately before the most recent user message, or appends it when the request has no user message.
-- It returns a `RecallInjection`: `Inserted`, `Replaced`, `Removed` (an empty report removed an existing recall) or `Absent` (nothing to remove).
-- `RetrievalReport::render()` returns the message text, or `None` for an empty report. Line one is the marker plus the hit count, then one `N. [score] projection` line per hit.
-
-### Ordering against compaction
-
-The order is compress, then retrieve and inject, then dispatch.
-
-- Recall is a caller-driven step. It cannot run after compaction inside the hook as the memory plugin's graph injection does, so a later compaction pass can drop the injected message through `DropObservations` or `SlidingWindow`.
-- `digest_request` hashes the full message list. An injected recall changes the digest, so an otherwise identical turn misses the prompt cache.
-
-### Scan kernel
-
-- Vectors live in one contiguous slot arena, so a scan walks memory linearly. Cosine similarity is one dot product per entry.
-- The kernel is `wide::f32x8` with four accumulators (32 lanes per iteration), then an 8-lane loop, then a scalar tail. Ranking uses `select_nth_unstable_by`, then sorts only the k survivors.
-- Each query allocates one embedding `Vec` (skipped by `retrieve_embedding`), one scored `Vec` of 16-byte tuples, and k message clones.
-- `wide` selects its implementation at compile time and has no runtime dispatch. A baseline `x86-64` build lowers `f32x8` to two `f32x4` halves. `-C target-cpu=native`, or `+avx,+fma`, enables the 256-bit single-rounding path.
-- Scores and ranking are bit-deterministic for a given build: lane order and accumulator order are fixed, and the horizontal sum is a fixed-order tree. FMA and non-FMA builds can differ in a score's low bits, so across builds only exact ties are stable. Ties break on the monotonic insertion sequence, newest first.
-
-`benches/vector_store.rs` runs under Divan with `k = 8`. It pairs the store's `retrieve_embedding` against a plain scalar dot-product loop with the same ranking at 1024 entries of 384 floats, 8192 of 768, and 8192 of 1536. It also times `store_turns` for a batch of 64 turns of 768 floats.
-
-```bash,name=Runs the same on all three platforms
-cargo bench --features "provider-openai service-vector-store"
-```
-
-```bash,name=Linux and macOS: bench with native SIMD
-RUSTFLAGS="-C target-cpu=native" cargo bench --features "provider-openai service-vector-store"
-```
-
-```powershell,name=Windows (PowerShell): bench with native SIMD
-$env:RUSTFLAGS = "-C target-cpu=native"
-cargo bench --features "provider-openai service-vector-store"
-```
-
-## Configuration
-
-`VectorStoreConfig::new(max_entries, dimensions, max_entry_bytes)` is the constructor, and `with_warn_fraction(fraction)` arms the near-cap flag. `InMemoryVectorStore::new(config, embedder)` validates again, since the fields are public.
-
-| Key | Type | Default | Valid values |
-|---|---|---|---|
-| `max_entries` | `usize` | required | non-zero |
-| `dimensions` | `usize` | required | non-zero |
-| `max_entry_bytes` | `usize` | required | non-zero |
-| `warn_fraction` | `Option<f32>` | `None` | `None`, or finite and in `(0.0, 1.0]` |
-
-- `max_entries` is the number of live turns retained.
-- `dimensions` is the exact width every embedding must have.
-- `max_entry_bytes` is the largest accepted turn, measured in payload bytes. The count includes every block variant, the message `name` and `tool_call_id`, and a tool call's arguments as serialized JSON.
-- `warn_fraction` is the fill fraction at which `VectorStoreUsage::near_cap` turns `true`; `None` keeps it `false`.
-- `max_entries * dimensions`, in floats and in bytes, must not overflow `usize`.
-
-## Caps and at-cap policy
-
-| Bound | At-cap policy | Usage gauge |
-|---|---|---|
-| `max_entries` live turns | evicts entries oldest first (FIFO) and reuses the freed arena slot | `usage().entries` against `usage().capacity`, plus `evicted_entries` |
-| `max_entry_bytes` per turn | rejects the turn with `EntryTooLarge`, never truncates | the error carries `bytes` and `max_entry_bytes` |
-
-- `usage()` is O(1). `VectorStoreUsage` holds `entries`, `capacity`, `fraction`, `near_cap`, `evicted_entries` (cumulative) and `zero_norm_entries`.
-- The arena and the entry queue are allocated to `max_entries` at construction and never reallocate.
-- Resident size is bounded by `max_entries * (max_entry_bytes + dimensions * 4 + session hint + constant metadata)`.
-- A batch longer than `max_entries` keeps its newest `max_entries` turns and counts the rest as evictions. Only the surviving turns are embedded. The dropped head is still size-checked.
-- A batch commits all or nothing. A rejected turn leaves the store unchanged.
-- An injected recall adds at most `k` projected turns, each at most `max_entry_bytes`, plus one header line. The choice of `k` bounds that growth.
-- There is no time-to-live. The store holds conversation history rather than a cache, so eviction needs no clock.
-- Entries are full-fidelity turns, including system prompts, tool arguments and tool results. The store is process-local: it has no serde derives, no snapshot, no `cuca-export` section and writes no file.
-
-## Errors
-
-The store's own methods return `VectorStoreError`, which implements `std::error::Error`.
-
-- `Config(String)`: a bound is zero, `warn_fraction` is outside `(0.0, 1.0]`, the arena size overflows, or a query has `k == 0`.
-- `Embedding(String)`: an embedding has the wrong width, a non-finite component, or a non-finite squared norm.
-- `EntryTooLarge { bytes, max_entry_bytes }`: a turn is over `max_entry_bytes`.
-- `Embedder(PluginError)`: the caller's `Embedder` failed. The error is carried unchanged.
-- `Poisoned`: the state lock was poisoned by a panic in another thread.
-- `Json(String)`: measuring a tool call's arguments failed. This cannot happen for a `serde_json::Value`.
-
-Which methods return which variants:
-
-- `retrieve` and `retrieve_in` return `Config`, `Embedder`, `Embedding` and `Poisoned`.
-- `retrieve_embedding` returns the same set without `Embedder`, since it skips the embedder.
-- `usage`, `len` and `is_empty` return `Poisoned`.
-
-`VectorStore::store_turns` has the memory plugin's `PluginError` signature, so the seam converts:
-
-- `EntryTooLarge` and `Embedding` become `PluginError::Validation` with schema `vector-store`.
-- `Embedder(e)` becomes `e` unchanged.
-- `Config`, `Poisoned` and `Json` become `PluginError::Internal`.
-
-One rejection aborts the whole batch. `CompactionStrategy::Offload` then puts every turn back at its original index and records the converted error in `CompressionReport::last_error`. A later strategy such as `ClampOversizedMessages` can shrink the offending turn so a following pass succeeds.
-
-## Example
-
-The program below offloads four turns, retrieves the two closest to a question, and injects them into the next request. The embedder is a deterministic bag of words, so the scores repeat on every run. A real deployment puts an embedding model behind the same one-method trait. The program sends no request, so it needs no server.
+This program offloads four turns, finds the two closest to a question, and injects them into the next request. The embedder counts hashed words, so the scores are the same on every run. In a real app you put an embedding model behind the same one-method trait. The program sends no request and needs no server.
 
 ```rust,name=Offload history then recall it into the next request
 use std::sync::Arc;
@@ -164,7 +73,7 @@ use cuca::{
 const DIMENSIONS: usize = 64;
 const QUESTION: &str = "where does the deploy token live?";
 
-// FNV-1a bag of words: deterministic, unlike a per-process reseeded `DefaultHasher`.
+// FNV-1a bag of words: the same vector on every run.
 struct HashEmbedder;
 
 impl Embedder for HashEmbedder {
@@ -268,16 +177,134 @@ CUCA recall: 2 offloaded turn(s), best first
 2. [0.5443] Noted: the deploy token is in vault slot 7.
 ```
 
-`examples/vector_store.rs` runs the same order against a live model in four stages: one turn over a scripted eight-message history, `MemoryPlugin::compress` out of band, a recall for the same question, then `inject` plus a second turn that answers from the recall alone. It needs a `llama-server` on port 1234 with the demo model loaded; the flags `--base-url` and `--model`, written after `--`, point it at any OpenAI-compatible server.
+`examples/vector_store.rs` runs the same order against a live model in four stages: one turn over a scripted eight-message history, `MemoryPlugin::compress` out of band, a recall for the same question, then `inject` and a second turn that answers from the recall alone. It needs a `llama-server` on port 1234. The flags `--base-url` and `--model`, written after `--`, point it at any OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example vector_store --features "provider-llamacpp service-vector-store"
 ```
 
+## Feature and entry type
+
+| Item | Value |
+|---|---|
+| Feature flag | `service-vector-store = ["plugin-memory", "dep:wide"]` |
+| Plugin it needs | `plugin-memory` |
+| Entry type | `InMemoryVectorStore`, which implements the memory plugin's `VectorStore` trait |
+| Other public types | `Embedder`, `VectorStoreConfig`, `VectorStoreUsage`, `VectorStoreError`, `RetrievalReport`, `RetrievedTurn`, `RecallInjection`, `RECALL_RENDER_MARKER` |
+
+The store implements a trait that `plugin-memory` declares, so it cannot exist without that plugin. `plugin-memory` never names the store.
+
+## Entry points
+
+### Write path
+
+- `MemoryPlugin::with_extensions(config, summarizer, store)` is the only constructor that accepts a store.
+- `CompactionStrategy::Offload { turns }` writes to the store. It calls `VectorStore::store_turns` with the fixed session hint `"cuca-memory"`, so the turns that compaction removes from the prompt are embedded and stored.
+- `store_turns` runs inside the synchronous `on_request` hook, so `Embedder` is a synchronous function you supply: `embed(&self, text) -> Result<Vec<f32>, PluginError>`. It must not await. No provider adapter exposes an embeddings route, so if you want HTTP embeddings, the blocking call is yours to make.
+- Each entry is embedded from its blocks joined by spaces: `Text` as is, `ToolCall` as its `name`, and `ToolResult` as its `output`. `Thinking` and `ImageBase64` are left out.
+- Every embedding is scaled to unit length once, at insert. A zero-length embedding is kept, counted in `VectorStoreUsage::zero_norm_entries`, and scores exactly `0.0`.
+
+### Read path
+
+| Method | Scans | Embeds the query |
+|---|---|---|
+| `retrieve(query, k)` | every session hint | yes |
+| `retrieve_in(session_hint, query, k)` | one session hint | yes |
+| `retrieve_embedding(session_hint, query, k)` | one hint, or all when `None` | no: you pass the vector |
+
+- Each returns a `RetrievalReport` with the exact top k `turns` (best first) and `scanned`. Each `RetrievedTurn` has `message`, `score`, `sequence` and `session_hint`.
+- The scan is exact, not approximate. Equal scores break ties by insertion order, newest first.
+- `retrieve_embedding` accepts a vector that is not scaled to unit length, and leaves your slice untouched.
+- Small reads are `usage()`, `len()`, `is_empty()` and `capacity()`.
+- The scan uses SIMD chosen at compile time. A build with `-C target-cpu=native` is faster on a CPU with 256-bit vectors. Scores are the same for a given build, but two builds can differ in the last digits.
+
+```bash,name=Linux and macOS: build with native SIMD
+RUSTFLAGS="-C target-cpu=native" cargo build --release --features "provider-openai service-vector-store"
+```
+
+```powershell,name=Windows (PowerShell): build with native SIMD
+$env:RUSTFLAGS = "-C target-cpu=native"
+cargo build --release --features "provider-openai service-vector-store"
+```
+
+### Inject the recall
+
+A `RetrievalReport` does nothing by itself. The model sees the recall only when you call `RetrievalReport::inject(&mut request)`.
+
+- `inject` removes a system message whose first text block starts with `RECALL_RENDER_MARKER` (`"CUCA recall:"`), so calling it twice is safe.
+- It puts the new recall in a system message right before the most recent user message, or at the end when the request has no user message.
+- It returns a `RecallInjection`: `Inserted`, `Replaced`, `Removed` (an empty report removed an old recall) or `Absent` (nothing to remove).
+- `RetrievalReport::render()` returns the message text, or `None` for an empty report. Line one is the marker plus the hit count. Then each hit is one `N. [score] projection` line.
+
+### Order of steps
+
+Compress, then retrieve and inject, then send.
+
+- Recall is a step you run. It cannot run after compaction inside the hook, as the memory plugin's graph injection does. A later compaction pass can therefore drop the injected message through `DropObservations` or `SlidingWindow`.
+- An injected recall changes the request, so it changes the [prompt cache](@/services/prompt-cache.md) key. An otherwise identical turn misses the cache.
+
+## Configuration
+
+`VectorStoreConfig::new(max_entries, dimensions, max_entry_bytes)` is the constructor, and `with_warn_fraction(fraction)` arms the near-cap flag. `InMemoryVectorStore::new(config, embedder)` checks again, since the fields are public.
+
+| Key | Type | Default | Valid values |
+|---|---|---|---|
+| `max_entries` | `usize` | required | non-zero |
+| `dimensions` | `usize` | required | non-zero |
+| `max_entry_bytes` | `usize` | required | non-zero |
+| `warn_fraction` | `Option<f32>` | `None` | `None`, or finite and in `(0.0, 1.0]` |
+
+- `max_entries` is the number of turns kept.
+- `dimensions` is the exact length every embedding must have.
+- `max_entry_bytes` is the largest accepted turn, counted in payload bytes. The count includes every block type, the message `name` and `tool_call_id`, and a tool call's arguments as JSON text.
+- `warn_fraction` is the fill level at which `VectorStoreUsage::near_cap` turns `true`. `None` keeps it `false`.
+- `max_entries * dimensions`, in floats and in bytes, must not overflow `usize`.
+
+## Caps and at-cap policy
+
+| Bound | At the cap | Gauge |
+|---|---|---|
+| `max_entries` turns | evicts the oldest first (FIFO) and reuses its space | `usage().entries` against `usage().capacity`, plus `evicted_entries` |
+| `max_entry_bytes` per turn | rejects the turn with `EntryTooLarge`, never cuts it | the error carries `bytes` and `max_entry_bytes` |
+
+- `usage()` is O(1). `VectorStoreUsage` holds `entries`, `capacity`, `fraction`, `near_cap`, `evicted_entries` (running total) and `zero_norm_entries`.
+- The storage is allocated to `max_entries` at construction and never reallocates.
+- Memory use is at most `max_entries * (max_entry_bytes + dimensions * 4 + session hint + a small constant)`.
+- A batch longer than `max_entries` keeps its newest `max_entries` turns and counts the rest as evictions. Only the kept turns are embedded. The dropped head is still size-checked.
+- A batch is all or nothing. A rejected turn leaves the store unchanged.
+- An injected recall adds at most `k` turns, each at most `max_entry_bytes`, plus one header line. Your choice of `k` bounds that growth.
+- There is no time-to-live. The store holds conversation history, not a cache, so eviction needs no clock.
+- Entries are full turns, including system prompts, tool arguments and tool results. The store lives in the process. It has no serde derives, no snapshot, no `cuca-export` section, and writes no file.
+
+## Errors
+
+The store's own methods return `VectorStoreError`, which implements `std::error::Error`.
+
+- `Config(String)`: a bound is zero, `warn_fraction` is outside `(0.0, 1.0]`, the storage size overflows, or a query has `k == 0`.
+- `Embedding(String)`: an embedding has the wrong length, a non-finite number, or a non-finite squared length.
+- `EntryTooLarge { bytes, max_entry_bytes }`: a turn is over `max_entry_bytes`.
+- `Embedder(PluginError)`: your `Embedder` failed. The error is carried unchanged.
+- `Poisoned`: the state lock was poisoned by a panic in another thread.
+- `Json(String)`: measuring a tool call's arguments failed. This cannot happen for a `serde_json::Value`.
+
+Which methods return which variants:
+
+- `retrieve` and `retrieve_in` return `Config`, `Embedder`, `Embedding` and `Poisoned`.
+- `retrieve_embedding` returns the same set without `Embedder`, since it skips the embedder.
+- `usage`, `len` and `is_empty` return `Poisoned`.
+
+`VectorStore::store_turns` has the memory plugin's `PluginError` signature, so the errors convert:
+
+- `EntryTooLarge` and `Embedding` become `PluginError::Validation` with schema `vector-store`.
+- `Embedder(e)` becomes `e` unchanged.
+- `Config`, `Poisoned` and `Json` become `PluginError::Internal`.
+
+One rejection aborts the whole batch. `CompactionStrategy::Offload` then puts every turn back at its original index and records the converted error in `CompressionReport::last_error`. A later strategy such as `ClampOversizedMessages` can shrink the offending turn so a following pass succeeds.
+
 ## Related pages
 
-- [Memory](@/plugins/memory.md) declares the `VectorStore` seam and the `Offload` strategy.
+- [Memory](@/plugins/memory.md) declares the `VectorStore` trait and the `Offload` strategy.
 - [Prompt cache](@/services/prompt-cache.md) keys on the full message list, which includes an injected recall.
-- [Services](@/services/_index.md) lists every service and its plugin edge.
+- [Services](@/services/_index.md) lists every service and its plugin dependency.
 - [Plugins and services](@/concepts/plugin-layering.md) explains the explicit-call tier.
 - [Memory discipline](@/concepts/memory-discipline.md) explains the bounded-by-default rule.

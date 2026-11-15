@@ -1,6 +1,6 @@
 +++
 title = "MCP"
-description = "The Model Context Protocol client plugin: transports, the stateless 2026-07-28 protocol, and tool call routing."
+description = "Connect to a Model Context Protocol server and let the model call its tools."
 template = "page.html"
 weight = 1
 +++
@@ -9,83 +9,20 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>McpPlugin</code> connects to one Model Context Protocol server, discovers its tools once, and executes matching <code>ToolCall</code> blocks as <code>ToolResult</code> blocks.</dd>
+<dd><code>McpPlugin</code> connects to one Model Context Protocol server, finds its tools, and runs the model's calls to them.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-mcp</code> feature and a reachable MCP server: a child process over stdio or a Streamable HTTP endpoint.</dd>
+<dd>The <code>plugin-mcp</code> feature and an MCP server: a program you start over stdio, or a Streamable HTTP address.</dd>
 <dt>Read this if</dt>
-<dd>You are registering <code>McpPlugin</code> or choosing an <code>McpTransport</code>.</dd>
+<dd>You want the model to use tools that an MCP server provides.</dd>
 </dl>
 
-## Feature and entry type
+The Model Context Protocol (MCP) is a standard way for a program to offer tools to a model. This plugin is the client side. It connects once, lists the server's tools, and answers each matching `ToolCall` with a `ToolResult`.
 
-| Item | Value |
-|---|---|
-| Feature flag | `plugin-mcp` (enables `dep:rmcp` and `dep:tokio`) |
-| Plugin name | `"mcp-connector"` |
-| Entry types | `McpPlugin`, `McpTransport` |
-| Attachment | `CucaClientBuilder::register_plugin` |
-| Needs | An MCP server speaking protocol version `2026-07-28` |
+## Register it
 
-## Hooks
+`connect_stdio` starts the server program and talks to it over its input and output pipes. Then you give the discovered tools to the request, so the model knows they exist.
 
-`McpPlugin` acts on `on_stream_chunk`. It does not override `execute_local_tool`.
-
-| Hook | Behavior |
-|---|---|
-| `on_request` | No-op. The caller publishes the discovered tools through `McpPlugin::tools()`. |
-| `on_stream_chunk` | Replaces a `ToolCall` whose name is a discovered tool with a `ToolResult`. Other blocks and unknown tool names pass through. |
-| `on_response_complete` | No-op. |
-
-- The replacement `ToolResult` carries the tool's rendered output, or the error text when the call fails. The hook itself returns `Ok(())`.
-- The stream pauses while the tool runs: the hook blocks the calling thread until the server replies.
-- `McpPlugin::call_tool(name, arguments)` is the async entry point. It awaits the same worker channel through `spawn_blocking`.
-
-### Protocol
-
-- The plugin speaks only MCP `2026-07-28`, the stateless protocol. It has no connection-setup phase and no legacy fallback.
-- Every request carries its protocol version, client identity and client capabilities in `_meta`.
-- Connecting probes the server once with `server/discover`, then lists every tool with pagination-aware `tools/list`.
-- A `tools/call` answered with `resultType: "input_required"` (SEP-2322) or `resultType: "task"` (SEP-2663) is not driven further. It surfaces as `PluginError::NotSupported`.
-- Arguments map to a JSON object: an object stays as is, `null` becomes no arguments, anything else is a validation error.
-- Output rendering: text blocks join with newlines, images, audio and resources become compact placeholders, error results get a prefix, and `structuredContent` renders as JSON when no content blocks exist.
-
-## Configuration
-
-`McpPlugin` has no config struct and no keys with defaults. The `McpTransport` argument of `McpPlugin::connect` selects the connection.
-
-| Variant | Fields | Connection |
-|---|---|---|
-| `Stdio` | `command`, `args` | Spawns the executable as a child process and speaks MCP over its stdio pipes. |
-| `StreamableHttp` | `url` | Connects over Streamable HTTP, the `2026-07-28` binding. |
-| `WebSocket` | `url` | Not connectable: resolves to `PluginError::NotSupported`. |
-
-`McpPlugin::connect_stdio(command)` is shorthand for `McpPlugin::connect(McpTransport::stdio(command))`, a stdio transport with no arguments.
-
-## Caps and at-cap policy
-
-No cap: nothing grows with traffic.
-
-- The tool map is filled once at connect time from `tools/list`.
-- `McpPlugin::tools()` returns the full list sorted by name.
-- One worker thread named `cuca-mcp-worker` runs every call over an unbounded `std::sync::mpsc` channel; each hook call blocks until its own reply arrives.
-- No usage gauge exists.
-
-## Errors
-
-The hooks return no `PluginError`. A failed tool call becomes `ToolResult` text. `connect` and `call_tool` return these variants:
-
-| Variant | When |
-|---|---|
-| `Io` | The stdio child process fails to spawn, or the worker thread fails to spawn. |
-| `NotSupported` | `McpTransport::WebSocket` is used, or a tool call answers `input_required` or `task`. |
-| `Validation` (schema `tools/call arguments`) | Tool arguments are neither a JSON object nor `null`. |
-| `Internal` | The worker runtime fails to build, discovery or `tools/list` fails, a tool call fails, the worker exits or drops its reply channel, or the server returns an unrecognized response. |
-
-## Example
-
-`examples/mcp.rs` re-executes its own binary with `--mcp-add-server` as a stdio server with one `add` tool. The model calls `add`, the child computes the sum, and a second turn answers from it.
-
-```rust,name=Register McpPlugin and publish its tools
+```rust,name=Connect, publish the tools, register
 let mcp = Arc::new(McpPlugin::connect_stdio("github-mcp-server").await?);
 
 let mut request = UnifiedRequest::new(&model);
@@ -104,7 +41,11 @@ let client = CucaClient::builder()
     .build()?;
 ```
 
-The example needs a `llama-server` on port 1234 with the demo model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
+Expected effect: when the model calls one of those tools, the stream contains a `ToolResult` with the server's answer instead of the `ToolCall`. The plugin does not add the tools to the request for you.
+
+## Run the example
+
+`examples/mcp.rs` starts its own binary as a small MCP server with one `add` tool. It needs a `llama-server` on port 1234 with a tool-calling model loaded. Put `--base-url` and `--model` after `--` to use another OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example mcp --features "provider-llamacpp plugin-mcp"
@@ -123,10 +64,68 @@ Turn 2: the same question, with the server's answer in the prompt
   thinking blocks: 44
 ```
 
-The tool-call id, the reply wording and the thinking-block counts depend on the model. The output above came from `google/gemma-4-12b-qat`.
+The reply wording and the thinking block counts depend on the model.
+
+## Feature and entry type
+
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-mcp` |
+| Plugin name | `"mcp-connector"` |
+| Entry types | `McpPlugin`, `McpTransport` |
+| Attachment | `CucaClientBuilder::register_plugin` |
+| Needs | An MCP server that speaks protocol version `2026-07-28` |
+
+## Hooks
+
+`McpPlugin` acts on `on_stream_chunk` only.
+
+| Hook | Behavior |
+|---|---|
+| `on_request` | Does nothing. Publish the tools yourself with `McpPlugin::tools()`. |
+| `on_stream_chunk` | Replaces a `ToolCall` whose name is a discovered tool with a `ToolResult`. Other blocks and unknown tool names pass through. |
+| `on_response_complete` | Does nothing. |
+
+- The `ToolResult` holds the tool's output, or the error text if the call failed. The hook still returns `Ok(())`.
+- The stream pauses while the tool runs.
+- `McpPlugin::call_tool(name, arguments)` is the async way to call a tool directly.
+- Arguments must be a JSON object. `null` means no arguments. Anything else is a validation error.
+- Output text blocks join with newlines. Images, audio and resources become short placeholders. If there are no content blocks, `structuredContent` renders as JSON.
+
+### Protocol limits
+
+- The plugin speaks only MCP `2026-07-28`, which is stateless. There is no older-version fallback.
+- A `tools/call` answered with `resultType: "input_required"` or `resultType: "task"` is not followed up. It fails with `PluginError::NotSupported`.
+
+## Configuration
+
+`McpPlugin` has no config struct. The `McpTransport` you pass to `McpPlugin::connect` picks the connection.
+
+| Variant | Fields | Connection |
+|---|---|---|
+| `Stdio` | `command`, `args` | Starts the program and speaks MCP over its stdio pipes. |
+| `StreamableHttp` | `url` | Connects over Streamable HTTP. |
+| `WebSocket` | `url` | Not supported. Fails with `PluginError::NotSupported`. |
+
+`McpPlugin::connect_stdio(command)` is shorthand for `McpPlugin::connect(McpTransport::stdio(command))`, with no arguments.
+
+## Caps and at-cap policy
+
+No cap. The tool list is read once at connect time, and nothing grows with traffic. `McpPlugin::tools()` returns the list sorted by name. There is no usage gauge.
+
+## Errors
+
+A failed tool call becomes `ToolResult` text, so the hooks return no error. `connect` and `call_tool` return these:
+
+| Variant | When |
+|---|---|
+| `Io` | The server program or the worker thread fails to start. |
+| `NotSupported` | You use `McpTransport::WebSocket`, or a tool call answers `input_required` or `task`. |
+| `Validation` (schema `tools/call arguments`) | The arguments are neither a JSON object nor `null`. |
+| `Internal` | Discovery, `tools/list` or a tool call fails, the worker exits, or the server sends a response the plugin does not recognize. |
 
 ## Related pages
 
-- [Plugins](@/plugins/_index.md): hook order, error handling and the plugin tier rules.
+- [Plugins](@/plugins/_index.md): the hooks, their order and the error rules.
 - [Error types](@/reference/errors.md): `PluginError` and `CucaError`.
 - [Point the client at another OpenAI-compatible server](@/guides/other-openai-server.md): retarget the example.

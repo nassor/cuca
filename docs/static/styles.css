@@ -53,6 +53,11 @@
     --boundary:    light-dark(hsl(266 62% 48%),    hsl(266 86% 76%));
     --boundary-dim: light-dark(hsl(266 62% 48% / 0.10), hsl(266 86% 76% / 0.14));
 
+    /* Inline code: a blue no plane uses */
+    --code-fg:     light-dark(hsl(220 70% 40%),    hsl(212 90% 76%));
+    --code-bg:     light-dark(hsl(220 60% 97%),    hsl(220 30% 12%));
+    --code-border: light-dark(hsl(220 40% 89%),    hsl(220 22% 21%));
+
     /* Type */
     --font-sans: 'Geist', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', sans-serif;
     --font-mono: 'Geist Mono', ui-monospace, 'SFMono-Regular', Menlo, monospace;
@@ -787,19 +792,25 @@ pre code {
     color: var(--foreground);
 }
 
+/* Inline code gets its own blue hue, outside the three plane colours, so an
+   identifier never reads as a data, control or boundary label and stands
+   apart from prose in both themes. */
 :not(pre) > code {
     font-family: var(--font-mono);
     font-size: 0.85em;
-    padding: 0.15em 0.36em;
-    background: var(--muted);
+    padding: 0.12em 0.4em;
+    background: var(--code-bg);
+    border: 1px solid var(--code-border);
     border-radius: var(--r-sm);
-    color: var(--foreground);
+    color: var(--code-fg);
     overflow-wrap: break-word;
 }
+a > code, a:hover > code { color: inherit; }
 
 h1 code, h2 code, h3 code, h4 code, .brand code {
     font-size: 0.88em;
     background: none;
+    border: none;
     padding: 0;
     color: inherit;
 }
@@ -1369,14 +1380,20 @@ a.card:hover, .concept-card:hover, .next-card:hover {
     color: var(--muted-foreground);
 }
 .markdown blockquote > :last-child { margin-bottom: 0; }
-/* Tables share the figure edge like code blocks do. Cells never break inside
-   a word: `overflow-wrap: anywhere` lowers min-content to one character, so
-   the auto layout squeezed short columns ("Plugi/n") to feed the long one.
-   Cells wrap only at spaces; inline code stays whole (nowrap), and a table
-   wider than the column scrolls inside itself (display: block) instead. */
+/* Tables share the figure edge like code blocks do. At desktop width cells
+   wrap only at spaces and inline code stays whole (nowrap): `overflow-wrap:
+   anywhere` lowers min-content to one character, so the auto layout would
+   squeeze short columns ("Plugi/n") to feed the long one. The pages keep
+   every table inside the 48rem column at that width. Below 1440px the column
+   narrows, and there inline code may break inside a word so a table never
+   scrolls sideways; `overflow-x: auto` stays as the last resort (phones). */
 .markdown table { display: block; width: 100%; overflow-x: auto; }
 .markdown table code { white-space: nowrap; }
 .markdown td, .markdown th { overflow-wrap: normal; word-break: normal; hyphens: none; }
+@media (max-width: 1439px) {
+    .markdown table code { white-space: normal; overflow-wrap: anywhere; }
+    .markdown td, .markdown th { padding-left: var(--s3); padding-right: var(--s3); }
+}
 
 /* --------------------------------------------------------------------------
    20. Responsive

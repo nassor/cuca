@@ -1,99 +1,60 @@
 +++
-title = "Tiered expert placement"
-description = "LocalModelConfig::experts runs a mixture-of-experts model with its experts in the GGUF file and a bounded RAM and device cache, with the same output as a resident load."
+title = "Tiered experts"
+description = "Run a mixture-of-experts model with its experts on disk and a RAM and VRAM cache you size: the config keys, how big the budget must be, warm starts, counters, errors and measured speed."
 template = "page.html"
-weight = 13
+weight = 8
 +++
 
-# Tiered expert placement
+# Tiered experts
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>ExpertPlacement::Tiered</code> keeps a mixture-of-experts model's experts in the GGUF file and loads them on demand through caches of a byte size you choose, with the same output as the resident load.</dd>
+<dd><code>ExpertPlacement::Tiered</code> keeps a mixture-of-experts model's experts in the model file and caches the most used ones in RAM, and on a GPU in VRAM, within byte budgets you choose. The output stays the same.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts (<code>qwen3moe</code>, <code>olmoe</code>, <code>qwen35moe</code>, <code>mistral4</code>, <code>deepseek41</code>, or <code>gemma4</code> with <code>expert_count</code> above 0: the CPU only, the GPU engine does not run it yet).</dd>
+<dd>The <code>provider-local</code> feature, or a GPU feature such as <code>provider-local-vulkan</code>, and a model with experts.</dd>
 <dt>Read this if</dt>
-<dd>A mixture-of-experts model is larger than the RAM or device memory you want to spend on it, or you need the cache counters and the heat export.</dd>
+<dd>A mixture-of-experts model is bigger than the RAM or VRAM you want to spend on it, or you want the cache counters and the heat export.</dd>
 </dl>
 
-A token routes to `n_used` of a layer's `n_expert` experts, yet the default placement, `ExpertPlacement::Resident`, loads every expert at startup, so memory is the file size. Tiered placement keeps the dense weights (attention, norms, routers, embeddings, head) resident and leaves the experts in the file. Qwen3-30B-A3B is 17.38 GB, of which the expert tensors are 16.38 GB. How the tiers combine with `gpu_layers` and host experts is on [Hybrid placement](@/providers/local/placement.md).
+A mixture-of-experts model has many small expert blocks in every layer, and each token uses only a few of them. Loading the whole file puts every expert in memory, even though most sit unused. Tiered placement keeps the experts in the file on disk and caches the ones the model uses most. The dense parts (attention, norms, routers, embeddings and the output head) stay in memory.
 
-## Configuration
+How tiers combine with `gpu_layers` and host experts is on [Fit a large model](@/providers/local/placement.md).
 
-`LocalModelConfig::experts` is an `ExpertPlacement`, `Resident` by default. `Tiered` carries an `ExpertTiers`:
+## Try it
 
-| Field | Default | Rule |
-|---|---|---|
-| `ram_bytes` | `0` | bytes of RAM for cached experts. On `LocalDevice::Cpu` it must be above 0. On a GPU device `0` disables the RAM tier, unless `device_bytes` is 0 too |
-| `device_bytes` | `0` | bytes of device memory for cached experts. Above 0 gives a GPU device a device tier. On a GPU device, `0` with a `ram_bytes` above 0 is host-tiered (below). Exactly 0 on `LocalDevice::Cpu` |
-| `loader_threads` | `4` | disk reader threads, `1..=64` |
-| `warm_from` | `None` | an `ExpertHeat` from an earlier session; the hottest experts load at startup |
+This loads OLMoE 1B-7B with room for 600 MiB of experts in RAM. The rest of the model stays on disk.
 
-In KDL the placement is the `experts` node of a `LocalModelConfig`:
-
-```kdl,name=The forms of experts (write one)
-experts "resident"
-experts { tiered ram_bytes="4g"; }
-experts { tiered ram_bytes="12g" device_bytes="6g" loader_threads=8; }
-experts { host; }
-experts { host layers=4; }
+```kdl,name=olmoe-tiered.kdl
+source "olmoe-1b-7b-q4_0"
+experts { tiered ram_bytes="600m"; }
 ```
 
-- `ram_bytes` and `device_bytes` are an integer or a string with an optional `k`, `m` or `g` suffix, powers of 1024, ASCII case-insensitive: `"4g"` is 4,294,967,296 bytes and `"1100m"` is 1,153,433,600.
-- `experts { tiered loader_threads=8; }` parses, and `LocalModel::load` rejects it because it names no tier.
-- `host` and `host layers=<n>` are `ExpertPlacement::Host`, the GPU placement with experts computed on the CPU. It is not a tier; see [Host experts](@/providers/local/gpu.md#host-experts).
-- An unknown key inside `experts` is an error naming it. The rules in the table apply at `LocalModel::load`.
-
-## Slots and the minimum budget
-
-A tier budget becomes the same number of slots in every layer that has experts:
-
-```text
-slots = min(n_expert, budget / per_expert)
+```bash,name=Linux and macOS: the example with tiered experts
+RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local -- --config olmoe-tiered.kdl
 ```
 
-`per_expert` is the bytes one expert occupies in that tier, summed over the layers that have experts. An expert is the gate, up and down matrices of one layer. The CPU's RAM tier counts an expert's file bytes. A GPU's RAM tier and device tier count its packed bytes, ready to upload.
+```powershell,name=Windows (PowerShell): the example with tiered experts
+$env:RUSTFLAGS = "-C target-cpu=native"
+cargo run --release --example local_model --features provider-local -- --config olmoe-tiered.kdl
+```
 
-A tier must hold `n_used` experts in every layer, so the minimum budget is `n_used * per_expert`.
+After the reply, the example prints the cache counters on stderr:
 
-| Model | Experts per layer, used | MoE layers | `per_expert`, bytes | Minimum, bytes | Slots per layer |
-|---|---|---|---|---|---|
-| `olmoe-1b-7b-q4_0` | 64, 8 | 16 | 56,885,248 | 455,081,984 | `ram_bytes="500m"`: 9 |
-| `qwen3-30b-a3b-q4_0` | 128, 8 | 48 | 127,991,808 | 1,023,934,464 | `ram_bytes="4g"`: 33<br>`ram_bytes="1100m"`: 9 |
-| `qwen3.6-35b-a3b-q4_0` | 256, 8 | 40 | 71,106,560 | 568,852,480 | `ram_bytes="600m"`: 8<br>`ram_bytes="4g"`: 60<br>`device_bytes="2g"`: 30<br>`device_bytes="4g"`: 60<br>`device_bytes="6g"`: 90 |
-| `gemma4-26b-a4b-q4_0` | 128, 8 | 30 | 100,362,240 | 802,897,920 | `ram_bytes="4g"`: 42<br>`ram_bytes="6g"`: 64<br>`ram_bytes="8g"`: 85 |
-| `mistral-small-4-119b-q4_0` | 128, 4 | 36 | about 511.7 MB | about 2.05 GB | `ram_bytes="8g"`: 16<br>`ram_bytes="48g"`: 100 |
-| `deepseek-ai/DeepSeek-V4.1-Flash-1017` (checkpoint source) | 384, 6 | 40 | 752,025,600 | 4,512,153,600 | `ram_bytes="48g"`: 68<br>`ram_bytes="64g"`: 91 |
+```text,name=Expected on stderr after the reply
+expert tiers: ExpertTierStats { lookups: <n>, device_hits: 0, ram_hits: <n>, disk_reads: <n>, bytes_read: <n>, ram_resident_bytes: <n>, device_resident_bytes: 0 }
+```
 
-- In the Qwen3 models the down matrices are Q4_0 in most layers and Q4_1 in the rest, so `per_expert` is a sum over layers: for Qwen3-30B-A3B, 42 layers of 2,654,208 bytes and 6 of 2,752,512.
-- The shared expert and the router are dense weights and stay resident.
-- A GPU tier counts the MoE kernels' own layout, which holds as many bytes as the file for Q4_0, Q4_1, Q8_0 and MXFP4 experts (every other dtype is requantized to Q8_0, a float dtype held as f32; see [Weight formats](@/providers/local/models.md#weight-formats)). The figures above hold on a GPU too, except that a layer's device pool is one buffer of at most 1 GiB, which caps its slots.
-- A GPU device with `device_bytes = 0` and a `ram_bytes` budget has no device tier (host-tiered): the experts sit behind the RAM tier, which counts file bytes as on the CPU, and the CPU computes them while attention, the router, the shared expert and the head run on the GPU. It does not combine with `gpu_layers` (`experts.device_bytes must be greater than 0 with gpu_layers: host-tiered experts serve a model that runs on one device`) or with `shards`.
-- The minimum printed by a failed load is the number to use.
+`disk_reads` is above 0 once the first token has been routed. Each field is explained in [Counters](#counters).
 
-## DeepSeek-V4.1 experts
+Supported models are the mixture-of-experts architectures `qwen3moe`, `olmoe`, `qwen35moe`, `mistral4`, `deepseek41`, and `gemma4` with experts (the Gemma 4 26B-A4B, CPU only).
 
-Every one of the 40 layers of `deepseek41` is a mixture of experts with 384 routed experts and 6 used per token. The experts are three stacked tensors per layer (`ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps`, shape `[384, rows, cols]`) in the backbone part of the split set, in MXFP4: 32 values take 17 bytes (16 bytes of nibbles and one E8M0 scale byte). A matrix of 2304 rows by 5120 columns takes 6,266,880 bytes, so one expert of one layer is 18,800,640 bytes and one expert of all 40 layers is 752,025,600 bytes. The figures in the table above are this arithmetic, from the tensor shapes.
-
-- Resident placement would hold all 384 experts of all layers, about 288.8 GB by the arithmetic above, in RAM. Tiered placement keeps the dense weights resident and the experts behind a cache.
-- The router scores with `sqrt(softplus)` and a selection bias, which changes which experts are picked and nothing about the tiers.
-- A tier needs 6 slots, so its minimum is 4,512,153,600 bytes. A GPU layer's device pool is one buffer of at most 1 GiB, which holds about 57 experts of a layer, so a device tier on this model caps near 57 slots per layer.
-- The heat table costs `4 * 40 * 384` = 61,440 bytes.
-- A tiered `deepseek41` model prefills in steps of 4096 rows by default (`BatchingConfig::max_step_tokens`), because a step costs the experts its rows route to and a bigger step shares them among more rows.
-- Each expert read takes its three matrices from the part file of the set that holds them, with positional reads on that file's handle.
-- On the real checkpoint with `experts { tiered ram_bytes="90g" loader_threads=16; }` (CPU, default-precision set on an HDD-class volume that serves the experts at about 0.4 to 0.5 GB/s), a 16-token pass reads about 32.7 GB of experts cold and takes 13 s warm. A chat request of 42 prompt tokens and 17 generated tokens read 78.2 GB in 4,158 expert reads for 7,592 lookups, because the RAM tier starts cold in every process. Decoding is bound by those reads, at about 5 s per token cold.
-- On an NVMe SSD (random 6 MiB unbuffered reads measure 3.47 GB/s, 4.07 GB/s at 18 MiB) the same model with `experts { tiered ram_bytes="90g" loader_threads=32; }` reads experts at up to 3.5 GB/s. A chat request of 42 prompt tokens and 17 generated tokens (78.2 GB read) answers after 20.75 s on the CPU, and 200 generated tokens after a 24-token prompt run at 2.1 tokens/s with 84 % RAM hits. A prompt of 2,014 tokens that needs 301 of the 384 experts per layer (226.3 GB read) prefills at 13.7 tokens/s with an average read rate of 1.5 GB/s, so compute still bounds a long prefill. 8 to 64 loader threads differ by less than the run-to-run spread. The measurements are on [Local verification and known limits](@/providers/local/verification.md#deepseek-v4-1-real-checkpoint-on-an-ssd).
-
-The DSpark drafter's three stages hold 128 experts each in their own file and are not tiered; see [Speculative decoding](@/providers/local/drafting.md#dspark-for-deepseek-v4-1).
-
-
-## Tiers
+## How it works
 
 <div class="dgm">
 <div class="dgm-scroll">
 <svg viewBox="0 0 660 146" role="img" aria-labelledby="tier-title tier-desc">
   <title id="tier-title">Where an expert travels from the file to the compute</title>
-  <desc id="tier-desc">Five boxes, left to right. The GGUF file on disk holds every expert. Loader threads read a missing expert with positional reads. The RAM tier holds built experts. The device tier holds uploaded experts and exists on GPU devices only. Expert compute runs the routed experts of a layer in ascending order. On the CPU a second arrow carries experts from the RAM tier straight to compute.</desc>
+  <desc id="tier-desc">Five boxes, left to right. The model file on disk holds every expert. Loader threads read a missing expert with positional reads. The RAM tier holds built experts. The device tier holds uploaded experts and exists on GPU devices only. Expert compute runs the routed experts of a layer in ascending order. On the CPU a second arrow carries experts from the RAM tier straight to compute.</desc>
   <defs>
     <marker id="tier-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -102,7 +63,7 @@ The DSpark drafter's three stages hold 128 experts each in their own file and ar
   </defs>
   <text class="t-title" x="6" y="20">Experts on demand</text>
   <rect class="blk" x="6" y="44" width="104" height="50" rx="6"/>
-  <text class="t-sm t-mid" x="58" y="67">GGUF file</text>
+  <text class="t-sm t-mid" x="58" y="67">model file</text>
   <text class="t-sm t-mid" x="58" y="81">all experts</text>
   <rect class="blk blk-ctl" x="142" y="44" width="104" height="50" rx="6"/>
   <text class="t-sm t-mid t-ctl" x="194" y="67">loader threads</text>
@@ -127,54 +88,60 @@ The DSpark drafter's three stages hold 128 experts each in their own file and ar
 <p class="dgm-cap"><b>The CPU has one cache, a GPU has two.</b> A GPU device with <code>ram_bytes = 0</code> reads every device miss from the file.</p>
 </div>
 
-- On `LocalDevice::Cpu` the RAM tier holds quantized matmul weights ready to compute. An expert costs its file bytes.
-- On a GPU device the device tier holds the uploaded weights. The optional RAM tier holds packed host copies that upload without conversion.
-- Loader threads read the three matrices of an expert with positional reads on one shared file handle, so they never move a cursor. On a GPU they also convert the matrices to the packed layout, so the engine thread only uploads. At most twice `loader_threads` experts are in flight.
-- Missing experts of one layer that are adjacent in the file are read as one run of at most 4: one read per matrix of up to four experts' bytes. A layer qualifies when it stores its experts expert after expert (a fused gate/up tensor interleaves its halves and reads one expert at a time). Each expert of a run is built, counted and slotted on its own, so the bytes, the budgets and the output are the single reads'. A loader thread's three read buffers grow to its largest run and no budget counts them: at most 3 x 4 x 6.27 MB per thread on `deepseek41`. On the SSD set the loader alone reads 3.41 GB/s one expert at a time and 3.50 GB/s with runs.
-- Reads in flight count against the RAM slots, and a tier never holds more experts than its slots. An expert a pass is computing may outlive its eviction for that pass: one on the CPU, and on a GPU up to `n_used` in a single-token pass, whose missing experts are all uploaded before it computes.
-- The heat table costs `4 * n_layer * n_expert` bytes, fixed at load.
+- On the CPU, the RAM tier holds experts ready to compute. An expert costs its file bytes.
+- On a GPU, the device tier holds the uploaded experts. The optional RAM tier holds host copies that upload without conversion.
+- Loader threads read an expert's matrices from the file. On a GPU they also convert them to the layout the GPU kernels read, so the engine thread only uploads.
+- Each expert has a heat counter that rises when the router picks it and halves after every 4,096 routed rows of its layer, so heat follows recent use. A full tier evicts the cached expert with the lowest heat that the running pass no longer needs. A prefill that scans many cold experts evicts them among themselves and leaves the hot ones in place.
+- Placement changes speed only. On the CPU the output equals the resident load's bit for bit. On a GPU, tiered placements agree with each other bit for bit and with the resident load to float rounding.
 
-## Eviction
+## Configuration
 
-Each `(layer, expert)` pair has a heat counter. Every routing adds the expert's pick count to it. After every 4,096 routed rows of a layer, all of that layer's counts halve, so heat follows recent traffic.
+`LocalModelConfig::experts` is an `ExpertPlacement`, `Resident` by default. `Tiered` carries an `ExpertTiers`:
 
-A full tier evicts one expert to make room:
+| Field | Default | Rule |
+|---|---|---|
+| `ram_bytes` | `0` | Bytes of RAM for cached experts. On the CPU it must be above 0. On a GPU, `0` turns the RAM tier off, unless `device_bytes` is 0 too |
+| `device_bytes` | `0` | Bytes of VRAM for cached experts. Above 0 gives a GPU a device tier. On a GPU, `0` with a `ram_bytes` above 0 is host-tiered (see below). Exactly 0 on the CPU |
+| `loader_threads` | `4` | Disk reader threads, `1` to `64` |
+| `warm_from` | `None` | An `ExpertHeat` from an earlier session. The hottest experts load at startup |
 
-- The victim is the cached expert that the running layer pass no longer needs, with the lowest heat. Ties go to the least recently used, then to the lower expert id.
-- If the pass still needs every cached expert, the one needed farthest ahead goes (the largest id, since a pass computes experts in ascending order), and only when it is needed after the expert being fetched.
-- On a GPU, a pass whose experts outnumber the device slots runs in groups of at most `device_slots` experts: the pool's hits first, then the misses, written into free slots or the slots of victims outside the group. The kernels sum every group's results in expert order at the end, so grouping changes no bit.
+In KDL the placement is the `experts` node:
 
-A prefill that scans many cold experts evicts them among themselves and leaves the hot ones in place.
+```kdl,name=The forms of experts (write one)
+experts "resident"
+experts { tiered ram_bytes="4g"; }
+experts { tiered ram_bytes="12g" device_bytes="6g" loader_threads=8; }
+experts { host; }
+experts { host layers=4; }
+```
 
-## Output guarantee
+- `ram_bytes` and `device_bytes` are an integer or a string with an optional `k`, `m` or `g` suffix. The suffixes are powers of 1024 and not case sensitive: `"4g"` is 4,294,967,296 bytes.
+- `experts { tiered loader_threads=8; }` parses, but the load rejects it because it names no tier.
+- `host` is a different placement: the GPU keeps attention and the CPU computes the experts, with no cache tiers. See [Fit a large model](@/providers/local/placement.md).
+- A GPU with `device_bytes` at 0 and a `ram_bytes` budget is host-tiered. The experts sit behind the RAM tier and the CPU computes them, while attention, the router, the shared expert and the head run on the GPU. It does not combine with `gpu_layers` or `shards`.
+- An unknown key inside `experts` is an error naming it.
 
-Placement decides speed only. An expert is built from the same file bytes as in the resident load, and a layer pass accumulates its experts in the same ascending order.
+## How big a budget
 
-- On the CPU the output equals the resident load's bit for bit.
-- On a GPU the kernels' result does not depend on how a pass groups its experts, so tiered placements agree with each other bit for bit. Against the resident load on the same device they agree to float rounding: the resident load never reads the router output back and a tiered one does at every layer, which splits burn's fused elementwise kernels at other places.
+A budget is divided into the same number of slots in every layer that has experts. A slot holds one expert:
 
-What ran:
+```text,name=Slots per layer
+slots = min(n_expert, budget / per_expert)
+```
 
-- The CPU unit tests `tiered_experts_match_resident_bit_for_bit` and `tiered_fused_experts_match_resident_bit_for_bit`, and on a GPU (when the `device` of the `local` model in `cuca-test.kdl` names one) `gpu_tiered_experts_match_gpu_resident`, on tiny models. The tiny `deepseek41` models with MXFP4 experts are among them: `a_warm_start_serves_the_first_pass_from_the_experts_it_loaded` checks a cold and a warm tiered load against the resident logits, and the GPU tiered, host and host-tiered tests run on all three tiny `deepseek41` variants. A gated test, `real_tests.rs`, loads the converted real set with tiered experts when `oracle.ds41.real_dir` is set; the repository records no result of it.
-- `tests/provider_local_tiers.rs`: on the CPU every run of the table below equaled the resident replies (for Mistral Small 4 at `ram_bytes="8g"`, the `ram_bytes="48g"` run, which equals them). On Vulkan (RX 9070 XT, Windows) it reproduced the reference replies for OLMoE 1B-7B (`tiered device_bytes="1g" ram_bytes=0` against resident), Qwen3-30B-A3B (`tiered device_bytes="6g" ram_bytes="12g"` cold and warm against `tiered device_bytes="2g" ram_bytes=0`) and Qwen3.6-35B-A3B (`tiered device_bytes="4g" ram_bytes="12g"` and `tiered device_bytes="2g" ram_bytes="4g"`). The live suite `tests/provider_local.rs` passed all seven scenarios for Qwen3-30B-A3B at `tiered device_bytes="6g" ram_bytes="12g"`.
+`per_expert` is the bytes one expert takes in that tier, summed over the layers that have experts. A tier must hold at least `n_used` experts in every layer (the number of experts one token uses), so the smallest budget is `n_used * per_expert`. A budget below that fails the load and prints the number to use.
 
-## Statistics and heat
+- `olmoe-1b-7b-q4_0`: 64 experts per layer, 8 used per token. The smallest budget is `434m`. The suggested budget is `ram_bytes="600m"`, which gives 11 slots per layer.
+- `qwen3-30b-a3b-q4_0`: 128 experts per layer, 8 used. The smallest budget is `977m`. The suggested budget is `ram_bytes="4g"`, which gives 33 slots per layer.
+- `qwen3.6-35b-a3b-q4_0`: 256 experts per layer, 8 used. The smallest budget is `543m`. The suggested budget is `ram_bytes="4g"` or `device_bytes="4g"`, which gives 60 slots per layer.
+- `gemma4-26b-a4b-q4_0`: 128 experts per layer, 8 used. The smallest budget is `766m`. The suggested budget is `ram_bytes="6g"`, which gives 64 slots per layer.
+- `mistral-small-4-119b-q4_0`: 128 experts per layer, 4 used. The smallest budget is `2g`. The suggested budget is `ram_bytes="48g"`, which gives 100 slots per layer.
 
-`LocalModel::expert_tier_stats()` returns `Option<ExpertTierStats>`, `None` unless the model loaded with `Tiered`. The counters are cumulative since load, except the two resident gauges.
+The shared expert and the router are dense weights and always stay in memory. A GPU layer's device pool is one buffer of at most 1 GiB, which caps the slots of a device tier. DeepSeek-V4.1 has its own sizes: see [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
 
-| Field | Meaning |
-|---|---|
-| `lookups` | expert computations the routers asked for, one per expert per layer pass |
-| `device_hits` | lookups served by the device tier, GPU only |
-| `ram_hits` | lookups served by the RAM tier |
-| `disk_reads` | experts read from the file, loads of a warm start included |
-| `bytes_read` | bytes read from the file for experts |
-| `ram_resident_bytes` | bytes the RAM tier holds now |
-| `device_resident_bytes` | bytes the device tier holds now |
+## Heat and warm start
 
-`ExpertTierStats::hit_rate()` is `(device_hits + ram_hits) / lookups`, `None` before the first lookup.
-
-`LocalModel::expert_heat()` returns `Option<ExpertHeat>`: the learned counters, one per layer and expert. `ExpertHeat` implements serde's `Serialize` and `Deserialize`, and has `n_layer()`, `n_expert()` and `count(layer, expert)`. Pass it back as `ExpertTiers::warm_from` and the next load seeds the counters and loads the hottest experts of every layer at startup, the device tier first and then the RAM tier. A heat file from a model of another shape fails the load.
+Heat counts how often each expert was picked. A model starts cold, with empty caches. `LocalModel::expert_heat()` returns the learned counters as `Option<ExpertHeat>`. `ExpertHeat` implements serde's `Serialize` and `Deserialize`. Pass it back as `ExpertTiers::warm_from` and the next load starts warm: it seeds the counters and loads the hottest experts of every layer at startup, the device tier first and then the RAM tier. A heat file from a model of another shape fails the load.
 
 ```rust,name=Save the heat and start warm next time (provider-local)
 use cuca::{ExpertHeat, ExpertPlacement, ExpertTiers, LocalModel, LocalModelConfig, ModelSource};
@@ -212,105 +179,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The example needs `cargo add serde_json` and `cargo add tokio --features rt,macros` next to `cuca` with the `provider-local` feature. Heat is in memory only: the library writes no file.
+The example needs `cargo add serde_json` and `cargo add tokio --features rt,macros` next to `cuca` with the `provider-local` feature. Heat lives in memory only: the library writes no file.
 
-## Measured speed
+## Counters
 
-Tiered placement trades speed for memory. Method: `tests/provider_local_tiers.rs`, three prompts of 48 greedy tokens each, the GGUF file in the OS page cache. Cold starts with empty caches. Warm loads with the heat the cold run exported.
+`LocalModel::expert_tier_stats()` returns `Option<ExpertTierStats>`, `None` unless the model loaded with `Tiered`. The counters add up from load, except the two `resident` gauges.
 
-CPU: Ryzen 9 9950X3D2 with 125 GB of RAM, release build with `RUSTFLAGS="-C target-cpu=native"`.
+| Field | Meaning |
+|---|---|
+| `lookups` | Expert computations the routers asked for, one per expert per layer pass |
+| `device_hits` | Lookups served by the device tier (GPU only) |
+| `ram_hits` | Lookups served by the RAM tier |
+| `disk_reads` | Experts read from the file, loads of a warm start included |
+| `bytes_read` | Bytes read from the file for experts |
+| `ram_resident_bytes` | Bytes the RAM tier holds now |
+| `device_resident_bytes` | Bytes the device tier holds now |
 
-| Model | Placement | Tokens per second | Hit rate |
-|---|---|---|---|
-| `olmoe-1b-7b-q4_0` | resident | 42 | not applicable |
-| `olmoe-1b-7b-q4_0` | `tiered ram_bytes="500m"`, 9 of 64 experts per layer | 10.0 cold, 10.1 warm | 0.381 cold, 0.385 warm |
-| `qwen3-30b-a3b-q4_0` | resident, 17.4 GB of RAM | 12.3 | not applicable |
-| `qwen3-30b-a3b-q4_0` | `tiered ram_bytes="4g"`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.641 cold, 0.686 warm |
-| `qwen3-30b-a3b-q4_0` | `tiered ram_bytes="1100m"`, 9 of 128 experts per layer | 6.2 cold, 5.3 warm | 0.381 cold, 0.383 warm |
-| `qwen3.6-35b-a3b-q4_0` | resident, 18.9 GiB peak resident set in this test | 14.7 and 14.9 | not applicable |
-| `qwen3.6-35b-a3b-q4_0` | `tiered ram_bytes="4g"`, 60 of 256 experts per layer | 7.4 cold, 7.1 warm | 0.661 cold, 0.708 warm |
-| `qwen3.6-35b-a3b-q4_0` | `tiered ram_bytes="600m"`, 8 of 256 experts per layer | 6.3 cold, 6.2 warm | 0.307 cold, 0.308 warm |
-| `mistral-small-4-119b-q4_0` | resident, 67.7 GB of RAM | 8.7 | not applicable |
-| `mistral-small-4-119b-q4_0` | `tiered ram_bytes="48g"`, 100 of 128 experts per layer | 0.8 cold, 2.1 warm | 0.824 cold, 0.958 warm |
-| `mistral-small-4-119b-q4_0` | `tiered ram_bytes="8g"`, 16 of 128 experts per layer | 1.1 cold, 1.8 warm | 0.310 cold, 0.337 warm |
-
-- Mistral Small 4 is 67.7 GB next to 125 GB of RAM, so only part of the file stayed in the page cache. One expert of all 36 layers is 511.7 MB. The cold run at `ram_bytes="48g"` read 4,618 experts (65.7 GB) out of 26,205 lookups, and the cold run at `ram_bytes="8g"` read 18,081 (257 GB).
-- Qwen3.6-35B-A3B: the cold runs read 18,861 experts (33.6 GB) at `ram_bytes="4g"` and 38,510 (68.5 GB) at `ram_bytes="600m"`, out of 55,597 lookups, from a file that was in the OS page cache. In a separate run of one 1,024-token reply (`examples/local_model.rs`) the peak resident set was 18.8 GiB with resident experts, 5.95 GiB at `ram_bytes="4g"` and 2.43 GiB at `ram_bytes="600m"`. The model loaded in 8.3 s resident against 0.8 s tiered.
-- Gemma 4 26B-A4B (`gemma4-26b-a4b-q4_0`, fused gate/up experts, 12.85 GB of the 14.62 GB file are experts): one reply of 164 tokens with thinking off and greedy sampling (`examples/local_model.rs`, same CPU) printed the same text resident and at `experts { tiered ram_bytes="6g" loader_threads=8; }` (64 of 128 experts per layer). The file sat on an HDD-class volume but had just been read many times, so it was in the OS page cache and every expert read was a cache hit: the tiered rate is a page-cache-warm figure, not a disk or SSD one, and no cold-disk run was made. Resident it decoded at 10.0 tokens per second with a peak resident set of 13.8 GiB; tiered at 8.8 tokens per second with 7.8 GiB, 41,407 lookups, 37,355 of them RAM hits (0.90) and 4,052 expert reads (13.56 GB). The dense branch of each layer, the router and its scales, the attention and the embedding stay resident whatever the budget (about 1.8 GB).
-
-Vulkan: RX 9070 XT with 15.9 GiB, Windows, release build. The rates include the kernel tuning that each new matrix shape pays on first use, which a short run does not amortize.
-
-| Model | Placement | Tokens per second | Hit rate |
-|---|---|---|---|
-| `olmoe-1b-7b-q4_0` | resident | 8.3 | not applicable |
-| `olmoe-1b-7b-q4_0` | `tiered device_bytes="1g" ram_bytes=0` | 5.7 cold, 6.1 warm | 0.575 cold, 0.599 warm |
-| `qwen3-30b-a3b-q4_0` | `tiered device_bytes="2g" ram_bytes=0` | 1.9 | 0.501 |
-| `qwen3-30b-a3b-q4_0` | `tiered device_bytes="6g" ram_bytes="12g"` | 4.9 cold, 6.1 warm | 0.911 cold, 0.983 warm |
-| `qwen3.6-35b-a3b-q4_0` | `tiered device_bytes="2g" ram_bytes=0` | 1.9 to 2.5 | 0.541 |
-| `qwen3.6-35b-a3b-q4_0` | `tiered device_bytes="2g" ram_bytes="4g"` | 4.8 cold, 4.8 warm | 0.669 cold, 0.736 warm |
-| `qwen3.6-35b-a3b-q4_0` | `tiered device_bytes="4g" ram_bytes="12g"` | 6.5 cold, 8.3 warm | 0.863 cold, 0.973 warm |
-
-- In the `qwen3.6-35b-a3b-q4_0` run at `device_bytes="4g" ram_bytes="12g"` the cold start read 7,627 experts from the file, 9,939 hits came from the RAM tier and 38,041 from the device tier, out of 55,607 lookups. One 1,024-token reply (`examples/local_model.rs`, `loaded on Vulkan(Default)`) ran at about 9.6 tokens per second with `tiered device_bytes="6g" ram_bytes="12g"` and 10.1 with `tiered device_bytes="4g" ram_bytes="12g"`.
-- The desktop held 2.4 to 3.2 GiB of the card during these runs. Dedicated memory of the whole card, desktop included, peaked at 10.5 GiB over the full live suite at `device_bytes="4g" ram_bytes="12g"` and at 14.6 GiB at `device_bytes="6g" ram_bytes="12g"`.
+`ExpertTierStats::hit_rate()` is `(device_hits + ram_hits) / lookups`, and `None` before the first lookup.
 
 ## Errors
 
-`LocalModel::load` fails with `CucaError::Config`, before any thread starts, for:
+`LocalModel::load` fails with a `CucaError::Config`, before any thread starts, for:
 
 - `experts.loader_threads must be in 1..=64, got N`.
 - `experts.device_bytes is for GPU devices; set it to 0 on LocalDevice::Cpu`.
 - `experts.ram_bytes must be greater than 0 on LocalDevice::Cpu`.
-- On a GPU device with both `device_bytes` and `ram_bytes` at 0: ``experts: on <device> set device_bytes (a device tier) or ram_bytes (host-tiered: the CPU computes the experts from the RAM tier)``, with the device as `LocalDevice`'s `Debug` text.
+- A GPU with `device_bytes` and `ram_bytes` both 0: ``experts: on <device> set device_bytes (a device tier) or ram_bytes (host-tiered: the CPU computes the experts from the RAM tier)``. The device appears in its `Debug` text.
 
-At load, once the file is open, `LocalModel::load` also fails with `CucaError::Config` for:
+Once the file is open, it also fails with a `CucaError::Config` for:
 
-- A budget below the minimum: ``expert RAM tier of 524288000 bytes holds 4 experts per layer; this model needs at least 8 (1023934464 bytes)``, from `qwen3-30b-a3b-q4_0` at `ram_bytes="500m"`. A device tier reads ``expert device tier of ...`` instead.
-- `warm_from` of another shape: `experts.warm_from is heat for AxB experts; this model has CxD`, with layers by experts.
+- A budget below the smallest: ``expert RAM tier of 524288000 bytes holds 4 experts per layer; this model needs at least 8 (1023934464 bytes)``. This one came from `qwen3-30b-a3b-q4_0` at `ram_bytes="500m"`. A device tier prints ``expert device tier of ...`` instead. Use the number it prints.
+- A `warm_from` of another shape: `experts.warm_from is heat for AxB experts; this model has CxD`, with layers by experts.
 - A model without experts: ``expert tiers need a mixture-of-experts model; `llama` has no experts``.
+- `gpu_layers` with host-tiered experts: `experts.device_bytes must be greater than 0 with gpu_layers: host-tiered experts serve a model that runs on one device`.
 
-A KDL `experts` node with an unknown key or an unknown placement name is `CucaError::Config` naming it.
+A KDL `experts` node with an unknown key or placement name is also a `CucaError::Config` that names it. An expert read that fails while generating, for example from a truncated file, fails the request with a `CucaError::Provider` item in the stream.
 
-An expert read that fails while generating (a truncated file, for example) fails the request with a `CucaError::Provider` item in the stream.
+## What to expect
 
-## Run it
+Tiered placement trades speed for memory. Method: the CPU of a Ryzen 9 desktop, release build with `RUSTFLAGS="-C target-cpu=native"`, three prompts of 48 greedy tokens, the model file in the OS page cache. Cold starts with empty caches. Warm loads with the heat the cold run exported. The hit rate is the share of lookups served from a cache.
 
-The example reads the `experts` node of the file `--config` names and prints the tier counters on stderr after the reply, as a line that starts with `expert tiers: ExpertTierStats {`. `disk_reads` is above 0 once the first token has routed.
+| Model | Placement | Tokens per second | Hit rate |
+|---|---|---|---|
+| `olmoe-1b-7b-q4_0` | resident | 42 | not applicable |
+| `olmoe-1b-7b-q4_0` | `ram_bytes="500m"`, 9 of 64 experts per layer | 10.0 cold, 10.1 warm | 0.38 cold, 0.39 warm |
+| `qwen3-30b-a3b-q4_0` | resident, 17.4 GB of RAM | 12.3 | not applicable |
+| `qwen3-30b-a3b-q4_0` | `ram_bytes="4g"`, 33 of 128 experts per layer | 6.7 cold, 6.9 warm | 0.64 cold, 0.69 warm |
+| `mistral-small-4-119b-q4_0` | resident, 67.7 GB of RAM | 8.7 | not applicable |
+| `mistral-small-4-119b-q4_0` | `ram_bytes="48g"`, 100 of 128 experts per layer | 0.8 cold, 2.1 warm | 0.82 cold, 0.96 warm |
 
-```kdl,name=olmoe-tiered.kdl
-source "olmoe-1b-7b-q4_0"
-experts { tiered ram_bytes="600m"; }
-```
+- A bigger budget gives a higher hit rate and usually more speed. A warm start matters most when reading from disk is slow: Mistral Small 4 runs at 0.8 tokens/s cold and 2.1 warm.
+- Memory drops a lot. For Qwen3.6-35B-A3B, one 1,024-token reply peaked at 18.8 GiB of RAM with resident experts, 5.95 GiB at `ram_bytes="4g"` and 2.43 GiB at `ram_bytes="600m"`. The model loaded in 8.3 s resident against 0.8 s tiered.
+- Mistral Small 4 is 67.7 GB next to 125 GB of RAM, so only part of the file stayed in the page cache. Its cold start reads many experts from disk.
 
-```bash,name=Linux and macOS: the example with tiered experts
-RUSTFLAGS="-C target-cpu=native" cargo run --release --example local_model --features provider-local -- --config olmoe-tiered.kdl
-```
-
-```powershell,name=Windows (PowerShell): the example with tiered experts
-$env:RUSTFLAGS = "-C target-cpu=native"
-cargo run --release --example local_model --features provider-local -- --config olmoe-tiered.kdl
-```
-
-The live test `tests/provider_local_tiers.rs` loads the reference placement, then the tiered one cold, then warm from the exported heat. It asserts equal greedy replies (three prompts, 48 tokens), resident bytes within the budgets, and that the warm start saves reads while generating. It drops each model and waits 5 seconds before the next load, so a GPU gives its memory back. It prints `TIERS|reference|...`, `TIERS|cold|...` and `TIERS|warm|...` lines with the tokens per second, the counters and the hit rate. Without a model or without an `experts` node in the `local` model of `cuca-test.kdl` it prints `SKIP` and passes, `require_live #true` turns the skip into a failure, and an `experts` node that is not tiered fails the test.
-
-```kdl,name=cuca-test.kdl: the tiers test
-local {
-    model {
-        source "olmoe-1b-7b-q4_0"
-        experts { tiered ram_bytes="500m"; }
-    }
-}
-```
-
-```bash,name=Linux and macOS: the tiers test
-RUSTFLAGS="-C target-cpu=native" cargo test --release --features provider-local --test provider_local_tiers -- --nocapture
-```
-
-```powershell,name=Windows (PowerShell): the tiers test
-$env:RUSTFLAGS = "-C target-cpu=native"
-cargo test --release --features provider-local --test provider_local_tiers -- --nocapture
-```
-
-- `local { experts_ref { ... } }` sets the reference placement, `resident` by default. Set it to a small tiered placement, for example `experts_ref { tiered ram_bytes="1g"; }`, when the resident model does not fit the device.
-- `device` of the `local` model selects one device. A GPU run needs its feature and a placement with `device_bytes`, for example `experts { tiered device_bytes="6g" ram_bytes="12g"; }` with `--features provider-local-vulkan`.
-- `gpu_layers` of the `local` model sets `gpu_layers` for every phase, so the CPU layers use the RAM tier and the GPU layers the device tier.
-- `tests/provider_local.rs` reads the `experts` node too, so the whole scenario matrix runs on tiered experts. Without it the experts are resident.
+To run the tiers test yourself, see [Run the live integration suite](@/guides/integration-tests.md).

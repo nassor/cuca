@@ -1,22 +1,82 @@
 +++
-title = "Hybrid placement"
-description = "How one local model spreads over VRAM, RAM and the SSD, and over the GPU and the CPU: the keys that place each part, the combinations that load, and measured choices."
+title = "Fit a large model"
+description = "Choose how to run a model that is bigger than your GPU memory or your RAM: layer offload, host experts, tiered experts, with a decision chart, config examples and measured speeds."
 template = "page.html"
-weight = 11
+weight = 7
 +++
 
-# Hybrid placement
+# Fit a large model
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>device</code>, <code>gpu_layers</code>, <code>experts</code> and <code>engram</code> decide which parts of a model sit in VRAM, in RAM or only in the GGUF file on disk, and whether the GPU or the CPU computes them.</dd>
+<dd>Three config keys, <code>gpu_layers</code>, <code>experts</code> and <code>device</code>, decide which parts of a model sit in GPU memory, in RAM or only in the model file on disk.</dd>
 <dt>You need</dt>
-<dd><code>provider-local</code> for the CPU placements, a GPU feature such as <code>provider-local-vulkan</code> for the others, and a mixture-of-experts model for the <code>experts</code> placements.</dd>
+<dd><code>provider-local</code> for CPU placements, a GPU feature such as <code>provider-local-vulkan</code> for the others, and a mixture-of-experts model for the <code>experts</code> keys.</dd>
 <dt>Read this if</dt>
-<dd>A model does not fit your GPU, or does not fit your RAM, and you are choosing how to split it.</dd>
+<dd>A model does not fit your GPU memory, or does not fit your RAM, and you need to choose how to split it.</dd>
 </dl>
 
-The engine has two processors and three places to keep a weight. The GPU computes from VRAM, the CPU computes from RAM, and the GGUF file on disk holds every tensor. A resident part is read into its memory at load; a part behind a cache is read from the file while the model runs.
+A model has to live somewhere while it runs. The GPU computes from its own memory (VRAM). The CPU computes from RAM. The model file on the SSD holds every weight, but reading from it while the model runs is slow. When the model is bigger than VRAM, you split it between these places.
+
+Two terms help here:
+
+- A **dense** model uses all of its weights for every token.
+- A **mixture of experts** (MoE) model has many small expert blocks in each layer, and every token uses only a few of them. That makes it easy to keep most experts out of fast memory. See [How it works](@/providers/local/how-it-works.md).
+
+## Pick a placement
+
+Follow the chart from the top. The first question you can answer "yes" to is your placement.
+
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 296" role="img" aria-labelledby="pick-title pick-desc">
+  <title id="pick-title">Which placement fits which model</title>
+  <desc id="pick-desc">Four questions in order. If the model fits in VRAM, run it on the GPU with the device key. If not and it is dense, use gpu_layers to put the last layers on the GPU. If it is a mixture of experts that fits in RAM, use host experts, or tiered experts with a device tier. If it is a mixture of experts bigger than RAM, use tiered experts with a RAM budget so the rest is read from the SSD.</desc>
+  <defs>
+    <marker id="pick-arrow" viewBox="0 0 8 8" refX="7" refY="4"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="6" y="20">Which placement for which model</text>
+  <rect class="blk" x="6" y="40" width="230" height="44" rx="6"/>
+  <text class="t-lbl t-mid" x="121" y="67">Fits in VRAM?</text>
+  <rect class="blk blk-ctl" x="330" y="40" width="324" height="44" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="492" y="58">Run it on the GPU</text>
+  <text class="t-sm t-mid" x="492" y="74">device "vulkan"</text>
+  <path class="arw" d="M238 62 H326" marker-end="url(#pick-arrow)"/>
+  <text class="t-ax t-mid" x="282" y="54">yes</text>
+  <path class="arw" d="M121 86 V104" marker-end="url(#pick-arrow)"/>
+  <text class="t-ax" x="130" y="99">no</text>
+  <rect class="blk" x="6" y="106" width="230" height="44" rx="6"/>
+  <text class="t-lbl t-mid" x="121" y="133">Dense, bigger than VRAM?</text>
+  <rect class="blk blk-ctl" x="330" y="106" width="324" height="44" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="492" y="124">Layer offload</text>
+  <text class="t-sm t-mid" x="492" y="140">gpu_layers 38</text>
+  <path class="arw" d="M238 128 H326" marker-end="url(#pick-arrow)"/>
+  <text class="t-ax t-mid" x="282" y="120">yes</text>
+  <path class="arw" d="M121 152 V170" marker-end="url(#pick-arrow)"/>
+  <text class="t-ax" x="130" y="165">no</text>
+  <rect class="blk" x="6" y="172" width="230" height="44" rx="6"/>
+  <text class="t-lbl t-mid" x="121" y="199">MoE, fits in RAM?</text>
+  <rect class="blk blk-ctl" x="330" y="172" width="324" height="44" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="492" y="190">Host or tiered experts</text>
+  <text class="t-sm t-mid" x="492" y="206">experts { host; } or a device tier</text>
+  <path class="arw" d="M238 194 H326" marker-end="url(#pick-arrow)"/>
+  <text class="t-ax t-mid" x="282" y="186">yes</text>
+  <path class="arw" d="M121 218 V236" marker-end="url(#pick-arrow)"/>
+  <text class="t-ax" x="130" y="231">no</text>
+  <rect class="blk" x="6" y="238" width="230" height="44" rx="6"/>
+  <text class="t-lbl t-mid" x="121" y="265">MoE, bigger than RAM?</text>
+  <rect class="blk blk-ctl" x="330" y="238" width="324" height="44" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="492" y="256">Tiered experts on the SSD</text>
+  <text class="t-sm t-mid" x="492" y="272">experts { tiered ram_bytes="48g"; }</text>
+  <path class="arw" d="M238 260 H326" marker-end="url(#pick-arrow)"/>
+  <text class="t-ax t-mid" x="282" y="252">yes</text>
+</svg>
+</div>
+<p class="dgm-cap"><b>Fit the model, then split what does not fit.</b> A dense model splits by layer. A mixture of experts splits by expert, because only a few experts work on each token.</p>
+</div>
 
 ## Where each part lives
 
@@ -24,7 +84,7 @@ The engine has two processors and three places to keep a weight. The GPU compute
 <div class="dgm-scroll">
 <svg viewBox="10 12 660 296" role="img" aria-labelledby="hyb-title hyb-desc">
   <title id="hyb-title">One local model spread over VRAM, RAM and the SSD, computed by the GPU and the CPU</title>
-  <desc id="hyb-desc">Two processors sit above two memories: the GPU above VRAM and the CPU above RAM. The GGUF file on the SSD sits beside them with no processor. VRAM holds the last gpu_layers layers, attention, the router and the head, the expert device tier, and the K/V of the GPU layers. RAM holds the first layers and the embeddings, host experts, the expert RAM tier, the Engram row cache, and the K/V of the CPU layers. The file holds every tensor, the experts no tier holds, the Engram table, and split parts on any volume. Reader threads read from the file into RAM, and uploads move experts from RAM to VRAM. The hidden state crosses between the GPU and the CPU at the gpu_layers cut and for host experts.</desc>
+  <desc id="hyb-desc">Two processors sit above two memories: the GPU above VRAM and the CPU above RAM. The model file on the SSD sits beside them with no processor. VRAM holds the last gpu_layers layers, attention, the router and the head, the expert device tier, and the K/V of the GPU layers. RAM holds the first layers and the embeddings, host experts, the expert RAM tier, and the K/V of the CPU layers. The file holds every tensor, the experts no tier holds, and split parts on any volume. Reader threads read from the file into RAM, and uploads move experts from RAM to VRAM. The hidden state crosses between the GPU and the CPU at the gpu_layers cut and for host experts.</desc>
   <defs>
     <marker id="hyb-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
@@ -45,7 +105,7 @@ The engine has two processors and three places to keep a weight. The GPU compute
   <path class="arw" d="M330 98 V124" marker-end="url(#hyb-arrow)"/>
   <rect class="blk blk-data" x="20" y="128" width="170" height="146" rx="6"/>
   <text class="t-lbl t-mid t-data" x="105" y="150">VRAM</text>
-  <text class="t-ax t-mid" x="105" y="166">device memory</text>
+  <text class="t-ax t-mid" x="105" y="166">GPU memory</text>
   <text class="t-sm t-mid" x="105" y="190">last gpu_layers layers</text>
   <text class="t-sm t-mid" x="105" y="207">attention, router, head</text>
   <text class="t-sm t-mid" x="105" y="224">expert device tier</text>
@@ -56,95 +116,86 @@ The engine has two processors and three places to keep a weight. The GPU compute
   <text class="t-sm t-mid" x="330" y="190">first layers, embeddings</text>
   <text class="t-sm t-mid" x="330" y="207">host experts</text>
   <text class="t-sm t-mid" x="330" y="224">expert RAM tier</text>
-  <text class="t-sm t-mid" x="330" y="241">Engram row cache</text>
-  <text class="t-sm t-mid" x="330" y="258">K/V of the CPU layers</text>
+  <text class="t-sm t-mid" x="330" y="241">K/V of the CPU layers</text>
   <rect class="blk" x="470" y="128" width="170" height="146" rx="6"/>
   <text class="t-lbl t-mid" x="555" y="150">SSD</text>
-  <text class="t-ax t-mid" x="555" y="166">the GGUF file</text>
+  <text class="t-ax t-mid" x="555" y="166">the model file</text>
   <text class="t-sm t-mid" x="555" y="190">every tensor</text>
   <text class="t-sm t-mid" x="555" y="207">experts no tier holds</text>
-  <text class="t-sm t-mid" x="555" y="224">Engram table</text>
-  <text class="t-sm t-mid" x="555" y="241">split parts, any volume</text>
+  <text class="t-sm t-mid" x="555" y="224">split parts, any volume</text>
   <path class="arw arw-data" d="M468 200 H419" marker-end="url(#hyb-arrow)"/>
   <text class="t-ax t-mid t-data" x="442" y="192">reads</text>
   <path class="arw arw-data" d="M243 200 H194" marker-end="url(#hyb-arrow)"/>
   <text class="t-ax t-mid t-data" x="217" y="192">uploads</text>
-  <text class="t-ax" x="20" y="300">device, gpu_layers, experts and engram choose where each part lives</text>
+  <text class="t-ax" x="20" y="300">device, gpu_layers and experts choose where each part lives</text>
 </svg>
 </div>
 <p class="dgm-cap"><b>The GPU computes from VRAM and the CPU from RAM.</b> Reader threads fill RAM from the file, uploads fill VRAM from RAM, and the hidden state crosses between the processors where a model is split.</p>
 </div>
 
-- Tiered experts and Engram rows are read by reader threads (`loader_threads`, `reader_threads`, 1 to 64 each) with positional reads on the file. On a GPU the expert loaders also pack each expert into the kernels' layout, so the engine thread only uploads it.
-- The GPU engine reads token embedding rows from the file on the host. Gemma 4's per-layer embedding table and DeepSeek-V4.1's Engram table stay in the file on every device.
-- Under `gpu_layers` the hidden state crosses to the GPU once per forward pass. Host experts cost one readback and one upload per MoE layer. Tiered experts on a GPU read back each layer's router output, a few hundred floats, to find the experts the device pool lacks.
-- A split GGUF set opens in place: its parts may sit on different volumes (`shard_dirs`), and nothing is merged or copied. See [Split GGUF files](@/providers/local/model-sources.md#split-gguf-files).
+The K/V cache is the model's memory of the tokens it has already read (see [How it works](@/providers/local/how-it-works.md)). It sits with the layers that use it.
 
-## The placements
-
-Each row is one placement, named by its `LocalModelConfig` keys; a GPU row also sets `device "vulkan"` or another GPU. A part in VRAM runs on the GPU; a part in RAM runs on the CPU unless the cell says it waits for upload.
-
-| Placement | VRAM | RAM | Read from the file while running |
+| Placement | In VRAM | In RAM | Read from the file while running |
 |---|---|---|---|
 | CPU, the default | nothing | every weight, the K/V | nothing |
-| CPU<br>`tiered ram_bytes` | nothing | dense weights, the K/V, the hottest experts | the other experts |
+| CPU, `tiered ram_bytes` | nothing | dense weights, the K/V, the hottest experts | the other experts |
 | GPU | every layer, the head, the K/V | nothing | token embedding rows |
-| GPU<br>`gpu_layers` | the last layers, the head, their K/V | the first layers, the embeddings, their K/V | nothing |
-| GPU<br>`host` | attention, router, shared expert, head, the K/V | the routed experts | token embedding rows |
-| GPU<br>`host layers=n` | the same, plus the experts of the later MoE layers | the routed experts of the first `n` MoE layers | token embedding rows |
-| GPU<br>`tiered device_bytes`<br>`ram_bytes` | dense weights, the K/V, the hottest experts | the next hottest experts, waiting for upload | the other experts, token embedding rows |
-| GPU<br>`tiered ram_bytes` | dense weights, the K/V | the hottest experts | the other experts, token embedding rows |
-| GPU<br>`gpu_layers`<br>`tiered device_bytes`<br>`ram_bytes` | the last layers, their device tier | the first layers, both halves' RAM tiers | the other experts |
-| GPUs<br>`shards` | a slice of every layer on each GPU, each with its own K/V | nothing | token embedding rows |
+| GPU, `gpu_layers` | the last layers, the head, their K/V | the first layers, the embeddings, their K/V | nothing |
+| GPU, `host` | attention, router, shared expert, head, the K/V | the routed experts | token embedding rows |
+| GPU, `host layers=n` | the same, plus the experts of the later MoE layers | the routed experts of the first `n` MoE layers | token embedding rows |
+| GPU, `tiered device_bytes` and `ram_bytes` | dense weights, the K/V, the hottest experts | the next hottest experts | the other experts |
+| GPU, `tiered ram_bytes` only | dense weights, the K/V | the hottest experts | the other experts |
+| GPU, `gpu_layers` and `tiered` | the last layers, their device tier | the first layers, both RAM tiers | the other experts |
+| Several GPUs, `shards` | a slice of every layer on each GPU | nothing | token embedding rows |
 
-- A `tiered` placement on a GPU with `device_bytes` at 0 is host-tiered: the CPU computes the experts from the RAM tier while the rest runs on the GPU.
-- Under `gpu_layers` with tiered experts the CPU layers read the RAM tier and the GPU layers their device tier, which has a RAM tier of its own. `ram_bytes` is split between the halves by MoE layer count, and `device_bytes` belongs to the GPU half.
-- `engram ram_bytes="4g"` bounds the Engram row cache of a model with an Engram table on every device; see [Engram cache](@/providers/local/configuration.md#engram-cache).
-- The budgets, slots and eviction of the expert tiers are on [Tiered expert placement](@/providers/local/expert-tiers.md); `gpu_layers`, host experts and `shards` are on [Local engine on a GPU](@/providers/local/gpu.md).
+A `tiered` placement on a GPU with `device_bytes` at 0 is called host-tiered. The CPU computes the experts from the RAM tier while the rest runs on the GPU. A split GGUF set (a model stored as several part files) opens in place, and its parts may sit on different volumes. See [Model files and downloads](@/providers/local/model-sources.md).
 
-## Combinations that load
+## Layer offload
 
-`LocalModel::load` rejects the others with `CucaError::Config`, naming the rule.
+Use this for a dense model that is bigger than VRAM. It is llama.cpp's `-ngl`. The last `n` layers, the final norm and the output head run on the GPU. The first layers and the token embeddings stay on the CPU. The hidden state (the values passed from layer to layer) crosses to the GPU once per forward pass.
 
-- `gpu_layers` needs a GPU `device` and rejects `shards` and a `drafter`.
-- `experts { host; }` needs a GPU `device`. It composes with `gpu_layers` and batching, not with `shards`.
-- Host-tiered experts serve a model on one device, so `gpu_layers` with tiered experts needs `device_bytes` above 0.
-- `shards` rejects tiered and host experts, `gpu_layers` and a `drafter`.
-- On the CPU, `tiered` needs `ram_bytes` above 0 and `device_bytes` at 0.
-- The Gemma 4 mixture of experts (26B-A4B) runs on the CPU engine only, with resident or RAM-tiered experts.
-- `deepseek41` takes `gpu_layers` only at cuts that keep each compressed cache source with its readers: 0, 20, 26, 32, 38, 39 and 40 of 40.
+1. Write the config. This runs 17 of the 35 layers of Gemma 4 E2B on the GPU:
 
-On the CPU, tiered experts give the resident load's output bit for bit. A placement that uses a GPU agrees with the single-device GPU model to float rounding.
+   ```kdl,name=gemma4-offload.kdl
+   device "vulkan"
+   gpu_layers 17
+   ```
 
-## Measured choices
+2. Run it:
 
-Machine: Ryzen 9 9950X3D2 with 125 GB of RAM, RX 9070 XT with 15.9 GiB under Windows, Vulkan, release build with native CPU flags. Test: `perf_long_prompt` in `tests/provider_local.rs`, a prompt of about 1,100 tokens and 96 generated tokens, with the prefix cache bypassed. VRAM is the adapter's peak. The Qwen3.6 and Mistral Small 4 rows ran with 1 GiB weight chunks, the others with the current 256 MiB.
+   ```bash,name=Runs the same on all three platforms
+   cargo run --release --example local_model --features provider-local-vulkan -- --config gemma4-offload.kdl
+   ```
 
-| Model and placement | Decode, tokens/s | Prefill | VRAM, GiB |
-|---|---|---|---|
-| `muse-glimmer-30b-q4_0` (16.27 GB, dense), CPU only | 3.5 | 79.8 to 83.0 s | 0 |
-| the same, `gpu_layers 38` of 52 | 8.3 to 8.4 | 37.5 to 40.7 s | 14.2 |
-| `qwen3.6-35b-a3b-q4_0` (20.84 GB, experts), CPU only | 18.8 to 18.9 | 23.8 to 24.4 s | 0 |
-| the same, `experts { host; }` | 10.1 to 10.2 | 19.6 to 21.8 s | 5.9 |
-| the same, `experts { tiered device_bytes="6g" ram_bytes="12g"; }` | 10.6 to 10.9 | 12.2 to 14.4 s | 10.6 |
-| `mistral-small-4-119b-q4_0` (67.71 GB, experts), CPU only | 11.2 | 34.4 s | 0 |
-| the same, `experts { host; }` | 8.6 to 8.8 | 22.3 to 23.9 s | 6.6 |
+3. Check the split on stderr:
 
-- The GPU shortens every prefill.
-- A dense model larger than the card decodes faster with every layer moved to the GPU: Muse 30B gains about 5.3 ms per token for each layer between 26 and 38. At 40 layers it runs out of device memory.
-- A mixture of experts that fits in RAM decodes faster on the CPU alone, which computes the experts at full memory bandwidth while the GPU path pays a launch and a readback per MoE layer. A GPU placement pays off there for long prompts.
+   ```text,name=Expected line on stderr
+   loaded on vulkan: 17 of 35 layers on the GPU (layers 18 to 34), layers 0 to 17 and the embeddings on the CPU
+   ```
 
-DeepSeek-V4.1 is larger than RAM: the converted set is about 507 GB, and the runs read it from an NVMe SSD with `experts { tiered ram_bytes="90g" loader_threads=32; }`. On the CPU alone a 24-token prompt decodes 200 tokens at 2.15 tokens/s and a 2,014-token prompt prefills at 13.7 tokens/s. With attention on the GPU (host-tiered, 12.5 GiB of VRAM at the peak) it decodes at 1.96 tokens/s and prefills a 1,752-token prompt at 11.8 tokens/s. Moving 20 of its 40 layers to the GPU with a 3 or 6 GiB device tier is slower, 0.94 and 1.08 tokens/s. Method and every run: [DeepSeek-V4.1 real checkpoint on an SSD](@/providers/local/verification.md#deepseek-v4-1-real-checkpoint-on-an-ssd).
+To choose `n`, start high and lower it until the load works. Each layer you move to the GPU makes decoding faster. If `n` is too high, the load or the first request can fail when VRAM runs out (the error text comes from the GPU backend): lower `n` and try again.
 
-## Examples
+- `gpu_layers 0` loads a plain CPU model and opens no device. `gpu_layers` equal to the layer count loads a plain GPU model.
+- `LocalModel::layer_split()` returns `(layers on the GPU, layers in all)`, and `None` for a model on one device.
+- It fails with a `CucaError::Config` for a CPU device, for `shards` or a `drafter`, and for a count above the layer count (``gpu_layers N exceeds the M layers of `<architecture>` ``).
 
-A dense model larger than the card, with 38 of its 52 layers on the GPU:
+## Host experts
 
-```kdl,name=muse-offload.kdl
-source "muse-glimmer-30b-q4_0"
-device "vulkan"
-gpu_layers 38
+Use this for a mixture of experts that fits in RAM but not in VRAM. It is llama.cpp's `--cpu-moe` and `--n-cpu-moe`. The routed experts stay in RAM, and the CPU computes them. Attention, the router (the part that picks the experts for each token), the shared expert and the head run on the GPU. For each MoE layer, the GPU routes, the CPU runs the chosen experts, and the sum goes back to the GPU.
+
+```kdl,name=host-experts.kdl (write one of the two)
+experts { host; }
+experts { host layers=20; }
 ```
+
+- `host` keeps every MoE layer's experts in RAM. `host layers=20` does so for the first 20 MoE layers, and the other layers keep their experts in VRAM.
+- Every hosted expert is read into RAM at load, so your RAM must hold them.
+- It works with batching and with `gpu_layers`.
+- It fails with a `CucaError::Config` on a CPU device, with `shards`, and on a model without experts.
+
+## Tiered experts
+
+Use this when a mixture of experts is bigger than the RAM you want to spend, or to cache the hottest experts in VRAM. The experts stay in the file. Two caches, one in VRAM and one in RAM, keep the experts the model uses most. The rest are read from the SSD when a token needs them. The budgets, slots and counters are on [Tiered experts](@/providers/local/expert-tiers.md).
 
 A mixture of experts larger than the card, with experts in VRAM, RAM and the file:
 
@@ -158,7 +209,9 @@ experts { tiered device_bytes="4g" ram_bytes="12g"; }
 cargo run --release --example local_model --features provider-local-vulkan -- --config qwen-moe.kdl
 ```
 
-A mixture of experts larger than the RAM you give it, on the CPU alone, with 48 GiB of experts in RAM and the rest read from the file (2.1 tokens/s warm in the tiers test, against 8.7 with all 67.7 GB resident):
+The example prints the split on stderr, and after the reply a line that starts with `expert tiers: ExpertTierStats {`.
+
+A mixture of experts larger than the RAM you give it, on the CPU alone. This keeps 48 GiB of experts in RAM and reads the rest from the file:
 
 ```kdl,name=mistral-tiered.kdl
 source "mistral-small-4-119b-q4_0"
@@ -174,7 +227,21 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 cargo run --release --example local_model --features provider-local -- --config mistral-tiered.kdl
 ```
 
-The example prints the split on stderr (`loaded on Vulkan(Default): 38 of 52 layers on the GPU ...` for the first file) and, with tiered experts, a line that starts with `expert tiers: ExpertTierStats {` after the reply.
+## Combinations that load
+
+`LocalModel::load` rejects every other combination with a `CucaError::Config` that names the rule.
+
+- `gpu_layers` needs a GPU `device`, and rejects `shards` and a `drafter`.
+- `experts { host; }` needs a GPU `device`. It works with `gpu_layers` and batching, and not with `shards`.
+- `gpu_layers` with tiered experts needs `device_bytes` above 0, because host-tiered experts serve a model on one device.
+- `shards` rejects tiered and host experts, `gpu_layers` and a `drafter`.
+- On the CPU, `tiered` needs `ram_bytes` above 0 and `device_bytes` at 0.
+- The Gemma 4 mixture of experts (26B-A4B) runs on the CPU only, with resident or RAM-tiered experts.
+- `deepseek41` takes `gpu_layers` at only a few values. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+
+Placement changes speed, not the answer. On the CPU, tiered experts give the resident load's output bit for bit. A placement that uses a GPU agrees with the one-GPU model to float rounding.
+
+## Use a placement in `cuca serve` and Rust
 
 `cuca serve` takes the same keys in a `model` node:
 
@@ -188,7 +255,7 @@ serve {
 }
 ```
 
-In Rust the keys are the fields of `LocalModelConfig`:
+In Rust the keys are fields of `LocalModelConfig`. `gpu_layers: Some(38)` is layer offload, and `ExpertPlacement::Host { layers: None }` is `experts { host; }`:
 
 ```rust,name=The qwen-moe placement in library mode (provider-local-vulkan)
 use cuca::{
@@ -213,3 +280,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+## What to expect
+
+Method: a prompt of about 1,100 tokens and 96 generated tokens, prefix cache off. Vulkan on an AMD RX 9070 XT (16 GB) under Windows, with a Ryzen 9 desktop CPU and 125 GB of RAM, release build with native CPU flags. VRAM is the peak of the run. Prefill is the time to read the prompt.
+
+| Model and placement | Decode, tokens/s | Prefill | VRAM, GiB |
+|---|---|---|---|
+| `muse-glimmer-30b-q4_0` (16 GB, dense), CPU only | 3.5 | 81 s | 0 |
+| the same, `gpu_layers 38` of 52 | 8.3 | 39 s | 14.2 |
+| `qwen3.6-35b-a3b-q4_0` (21 GB, MoE), CPU only | 18.9 | 24 s | 0 |
+| the same, `experts { host; }` | 10.2 | 21 s | 5.9 |
+| the same, `tiered device_bytes="6g" ram_bytes="12g"` | 10.8 | 13 s | 10.6 |
+| `mistral-small-4-119b-q4_0` (68 GB, MoE), CPU only | 11.2 | 34 s | 0 |
+| the same, `experts { host; }` | 8.7 | 23 s | 6.6 |
+
+- The GPU shortens every prefill.
+- A dense model bigger than the card decodes faster with every layer you move to the GPU. Muse 30B is 2.4 times faster at 38 layers. It does not fit at 40.
+- A mixture of experts that fits in RAM decodes faster on the CPU alone, because the CPU computes the experts at full memory bandwidth and the GPU pays a launch and a copy per MoE layer. A GPU placement pays off there for long prompts.
+- In a separate CPU test (three short replies), Mistral Small 4 with `experts { tiered ram_bytes="48g"; }` ran at 2.1 tokens/s once warm, against 8.7 tokens/s with all 68 GB in RAM. Reading experts from the SSD is the price of fitting the model.
+- DeepSeek-V4.1 is about 507 GB, bigger than most RAM. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).

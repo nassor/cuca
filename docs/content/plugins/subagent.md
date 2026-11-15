@@ -1,6 +1,6 @@
 +++
 title = "Subagent"
-description = "The child subagent delegation plugin: spawn and collect tools, Git worktree isolation, and the pending-child cap."
+description = "Let the model start child agent runs in the background, then collect their results."
 template = "page.html"
 weight = 6
 +++
@@ -9,95 +9,19 @@ weight = 6
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Turns <code>spawn_subagent</code> and <code>collect_subagent</code> tool calls into asynchronous child agent runs, optionally isolated in a Git worktree.</dd>
+<dd><code>SubagentPlugin</code> turns <code>spawn_subagent</code> and <code>collect_subagent</code> tool calls into background child agent runs. A child can work in its own Git worktree.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-subagent</code> feature and a caller-supplied <code>SubagentRunner</code> that executes one child run.</dd>
+<dd>The <code>plugin-subagent</code> feature and a <code>SubagentRunner</code> that you write. It runs one child. <code>git</code> must be on the path if you use worktrees.</dd>
 <dt>Read this if</dt>
-<dd>You are registering <code>SubagentPlugin</code> or implementing <code>SubagentRunner</code>.</dd>
+<dd>You want a parent agent to hand work to child agents and read their summaries later.</dd>
 </dl>
 
-## Feature and entry type
+A subagent is a second agent that does one task for the parent. The plugin handles the hand-off: it starts the child, remembers it, and returns the result when the parent asks. It does not decide how a child runs. Your `SubagentRunner` does that, for example by calling a second `CucaClient` or an outside process.
 
-| Item | Value |
-|---|---|
-| Feature flag | `plugin-subagent` (enables `dep:tokio`) |
-| Entry type | `SubagentPlugin` |
-| Supporting types | `SubagentSpec`, `SubagentResult`, `SubagentRunner`, `WorktreeConfig` |
-| Plugin name | `"subagent-delegation"` |
-| Attachment | `register_plugin` |
-| Peer features | None |
-| Needs | A `SubagentRunner`; a running Tokio runtime when a child spawns; `git` on the path when a worktree is requested |
+## Register it
 
-`SubagentPlugin` provides the fan-out plumbing only. The `SubagentRunner` seam executes each child, for example by wrapping an external agent process or a second `CucaClient`.
-
-## Hooks
-
-`SubagentPlugin` overrides `on_stream_chunk`. Its `on_request` and `on_response_complete` are explicit no-ops. Tool calls with any other name pass through untouched.
-
-- `spawn_subagent` builds a `SubagentSpec` from the call arguments, starts the child on a background Tokio task, and replaces the block with a `ToolResult` whose output is the child id. Ids have the form `sub-<n>` from a per-plugin counter. Spawning does not block.
-- `collect_subagent` takes `subagent_id`, blocks the calling thread until that child finishes, and replaces the block with a `ToolResult` carrying `SubagentResult::summary`. On failure the output is the error text instead.
-
-`spawn_subagent` arguments:
-
-- `task` is required and must not be blank.
-- `name` is a label for the child; default is the empty string.
-- `tool_scope` is an array of tool names for the child; non-string entries are ignored, and the default empty array means unrestricted. The plugin passes the scope to the runner in the spec and does not enforce it.
-- `worktree` is an object with a string `path` and an optional string `branch`; default is none.
-- `session_id` is the parent session id, recorded in the spawn log.
-
-When `worktree` is set, `spawn_subagent` first runs `git worktree add <path>` (or `git worktree add -b <branch> <path>` with a branch) in the process working directory. The runner reads the path from `spec.worktree`. The plugin never removes the worktree. `SubagentResult::worktree_path` lets the caller do so after collection.
-
-`SubagentResult` fields are `subagent_id`, `summary`, `worktree_path` and `exit_ok`. The `collect_subagent` tool result carries only `summary`.
-
-`collect` parks the calling thread on a std channel. On a current-thread Tokio runtime that thread is the only executor the child has, so the child must have delivered its result before the collect call. `examples/subagent.rs` waits for the delivery before it asks the parent to collect.
-
-The plugin also exposes direct methods: `spawn_subagent(spec)`, `collect(id)`, `pending_len()`, `max_pending()`, `spawn_count()`, `spawns()` and `worktree_args(config)`, the dry-run `git worktree add` arguments.
-
-## Configuration
-
-`SubagentPlugin` has no config struct. Constructors take the settings.
-
-| Setting | Type | Default | Meaning |
-|---|---|---|---|
-| `runner` | `Arc<dyn SubagentRunner>` | required | Executes one child. |
-| `max_pending` | `usize` | `1024` | Cap on spawned, uncollected children. |
-
-- `SubagentPlugin::new(runner)` uses `DEFAULT_MAX_PENDING`, 1024.
-- `SubagentPlugin::with_max_pending(runner, max_pending)` sets the cap and rejects zero.
-- `MAX_SPAWN_LOG`, 4096, is a constant and cannot be set.
-
-## Caps and at-cap policy
-
-| Structure | Bound | At-cap policy | Usage gauge |
-|---|---|---|---|
-| Pending children | `DEFAULT_MAX_PENDING`, 1024, or `max_pending()` | `spawn_subagent` refuses the spawn; no pending child is evicted | `pending_len()` against `max_pending()` |
-| Spawn log | `MAX_SPAWN_LOG`, 4096 entries | The oldest entry is dropped | `spawns()` |
-
-- A full registry never evicts: each pending child keeps its result receiver until `collect` removes it, and dropping one would discard a running child's result. `collect` is what drains `pending_len()`.
-- The spawn log holds `(parent_session_id, worktree_path)` per spawn. It is a rolling sample, not an audit trail.
-- `spawn_count()` is a `u64` total of every spawn since construction. It is not capped because it holds one integer.
-
-## Errors
-
-A `spawn_subagent` tool call fails the stream with `CucaError::Plugin` carrying one of these:
-
-- `PluginError::Validation` when the arguments are not a JSON object, `task` is missing or blank, `worktree` is not an object, or `worktree.path` is missing.
-- `PluginError::NotSupported` when a requested worktree cannot be prepared: `git` cannot run, the directory is not a repository, or `git worktree add` exits with failure.
-- `PluginError::Internal` when `max_pending` children already await collection. The message names the count and the cap.
-
-A `collect_subagent` call with no string `subagent_id` fails the stream with `PluginError::Validation`. Any other `collect` failure becomes the `ToolResult` output text and the stream continues:
-
-- `PluginError::NotSupported` for an unknown id.
-- `PluginError::Internal` when the background task ends without delivering a result.
-
-`SubagentPlugin::with_max_pending` returns `PluginError::Validation` for a cap of zero.
-
-## Example
-
-`examples/subagent.rs` runs a parent turn that spawns a child, waits for its result, then runs a second parent turn that collects the summary. It needs a `llama-server` on port 1234 with the demo model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
-
-```rust,name=Register SubagentPlugin, from examples/subagent.rs
-// LiveRunner implements SubagentRunner; it is defined in examples/subagent.rs.
+```rust,name=Register SubagentPlugin
+// LiveRunner implements SubagentRunner; examples/subagent.rs defines it.
 let subagent = Arc::new(SubagentPlugin::new(Arc::new(LiveRunner {
     client: child_client,
     model: model.clone(),
@@ -110,6 +34,48 @@ let client = CucaClient::builder()
     .register_plugin(Arc::clone(&subagent) as Arc<dyn CucaPlugin>)
     .build()?;
 ```
+
+Expected effect: a `spawn_subagent` call in the stream is replaced by a `ToolResult` holding a child id such as `sub-0`, and the child starts at once. A later `collect_subagent` call with that id is replaced by the child's summary. Declare both tools in your request yourself. The plugin does not add them.
+
+## How spawn and collect work
+
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 190" role="img" aria-labelledby="sub-title sub-desc">
+  <title id="sub-title">A parent spawns a child, gets an id, and later collects the summary.</title>
+  <desc id="sub-desc">In turn one the parent sends spawn_subagent. The plugin starts the child in the background through the runner and returns the child id as a ToolResult. In a later turn the parent sends collect_subagent with that id. The plugin waits for the child to finish and returns its summary as a ToolResult.</desc>
+  <defs>
+    <marker id="sub-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="6" y="20">SubagentPlugin on_stream_chunk</text>
+  <rect class="blk blk-data" x="5" y="40" width="150" height="40" rx="6"/>
+  <text class="t-sm t-mid" x="80" y="64">spawn_subagent</text>
+  <rect class="blk blk-ctl" x="255" y="40" width="150" height="40" rx="6"/>
+  <text class="t-sm t-mid t-ctl" x="330" y="64">SubagentRunner</text>
+  <rect class="blk blk-data" x="505" y="40" width="150" height="40" rx="6"/>
+  <text class="t-sm t-mid" x="580" y="64">ToolResult: sub-0</text>
+  <rect class="blk blk-data" x="5" y="124" width="150" height="40" rx="6"/>
+  <text class="t-sm t-mid" x="80" y="148">collect_subagent</text>
+  <rect class="blk blk-ctl" x="255" y="124" width="150" height="40" rx="6"/>
+  <text class="t-sm t-mid t-ctl" x="330" y="148">wait for the child</text>
+  <rect class="blk blk-data" x="505" y="124" width="150" height="40" rx="6"/>
+  <text class="t-sm t-mid" x="580" y="148">ToolResult: summary</text>
+  <path class="arw arw-ctl" d="M156 60 H253" marker-end="url(#sub-arrow)"/>
+  <path class="arw arw-data" d="M406 60 H503" marker-end="url(#sub-arrow)"/>
+  <path class="arw arw-ctl" d="M156 144 H253" marker-end="url(#sub-arrow)"/>
+  <path class="arw arw-data" d="M406 144 H503" marker-end="url(#sub-arrow)"/>
+  <text class="t-sm" x="6" y="108">Turn 1: spawning does not block.</text>
+  <text class="t-sm" x="6" y="184">A later turn: collecting blocks until the child finishes.</text>
+</svg>
+</div>
+<p class="dgm-cap"><b>Spawn returns at once. Collect waits.</b> The child runs in the background between the two calls. Each uncollected child counts toward <code>max_pending</code>.</p>
+</div>
+
+## Run the example
+
+`examples/subagent.rs` runs a parent turn that spawns a child, waits for it to finish, then runs a second parent turn that collects the summary. It needs a `llama-server` on port 1234 with a tool-calling model loaded. Put `--base-url` and `--model` after `--` to use another OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example subagent --features "provider-llamacpp plugin-subagent"
@@ -135,11 +101,86 @@ Spawn log, 1 entr(ies)
   parent session "unset", worktree "none"
 ```
 
-The reply wording and the thinking-block counts depend on the model; this output came from `google/gemma-4-12b-qat`.
+The reply wording and the thinking block counts depend on the model.
+
+## Feature and entry type
+
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-subagent` |
+| Entry type | `SubagentPlugin` |
+| Supporting types | `SubagentSpec`, `SubagentResult`, `SubagentRunner`, `WorktreeConfig` |
+| Plugin name | `"subagent-delegation"` |
+| Attachment | `register_plugin` |
+| Needs | A `SubagentRunner`, a running Tokio runtime when a child starts, and `git` on the path when a worktree is requested |
+
+## Hooks
+
+`SubagentPlugin` acts on `on_stream_chunk` only. Tool calls with other names pass through.
+
+- `spawn_subagent` builds a `SubagentSpec` from the call arguments, starts the child on a background Tokio task, and replaces the block with a `ToolResult` holding the child id. Ids look like `sub-<n>`. Spawning does not block.
+- `collect_subagent` takes `subagent_id`, waits until that child finishes, and replaces the block with a `ToolResult` holding `SubagentResult::summary`. On failure the output is the error text.
+
+`spawn_subagent` arguments:
+
+| Argument | Required | Meaning |
+|---|---|---|
+| `task` | yes | What the child should do. Must not be blank. |
+| `name` | no | A label for the child. Default is the empty string. |
+| `tool_scope` | no | Array of tool names for the child. Non-string entries are ignored. The default, an empty array, means unrestricted. The plugin passes it to the runner and does not enforce it. |
+| `worktree` | no | An object with a string `path` and an optional string `branch`. |
+| `session_id` | no | The parent session id, kept in the spawn log. |
+
+When `worktree` is set, the plugin first runs `git worktree add <path>` (or `git worktree add -b <branch> <path>`) in the process working directory. The runner reads the path from `spec.worktree`. The plugin never removes the worktree. After collecting, you can remove it using `SubagentResult::worktree_path`.
+
+`SubagentResult` has `subagent_id`, `summary`, `worktree_path` and `exit_ok`. The `collect_subagent` tool result carries only `summary`.
+
+On a current-thread Tokio runtime, collecting blocks the only thread the child can run on. The child must already have delivered its result before the collect call. `examples/subagent.rs` waits for delivery before the parent collects.
+
+Direct methods: `spawn_subagent(spec)`, `collect(id)`, `pending_len()`, `max_pending()`, `spawn_count()`, `spawns()` and `worktree_args(config)`, which returns the `git worktree add` arguments without running them.
+
+## Configuration
+
+`SubagentPlugin` has no config struct. Its constructors take the settings.
+
+| Setting | Type | Default | Meaning |
+|---|---|---|---|
+| `runner` | `Arc<dyn SubagentRunner>` | required | Runs one child. |
+| `max_pending` | `usize` | `1024` | Limit on spawned children that are not yet collected. |
+
+- `SubagentPlugin::new(runner)` uses `DEFAULT_MAX_PENDING`, 1024.
+- `SubagentPlugin::with_max_pending(runner, max_pending)` sets the limit. Zero is rejected.
+- `MAX_SPAWN_LOG`, 4096, is fixed.
+
+## Caps and at-cap policy
+
+| Structure | Limit | At the limit | Usage gauge |
+|---|---|---|---|
+| Pending children | `DEFAULT_MAX_PENDING`, 1024, or `max_pending()` | `spawn_subagent` refuses the spawn. No pending child is dropped. | `pending_len()` against `max_pending()` |
+| Spawn log | `MAX_SPAWN_LOG`, 4096 entries | The oldest entry is dropped. | `spawns()` |
+
+- Each pending child keeps its result until `collect` takes it. Dropping one would lose a running child's result, so a full registry refuses instead. `collect` is what lowers `pending_len()`.
+- The spawn log holds `(parent_session_id, worktree_path)` for each spawn. It is a rolling sample, not an audit trail.
+- `spawn_count()` is a `u64` total of all spawns since the plugin was built. It is one integer and has no limit.
+
+## Errors
+
+A `spawn_subagent` call fails the stream with `CucaError::Plugin` carrying one of these:
+
+- `PluginError::Validation` when the arguments are not a JSON object, `task` is missing or blank, `worktree` is not an object, or `worktree.path` is missing.
+- `PluginError::NotSupported` when a requested worktree cannot be made: `git` cannot run, the directory is not a repository, or `git worktree add` fails.
+- `PluginError::Internal` when `max_pending` children already wait for collection. The message names the count and the limit.
+
+A `collect_subagent` call with no string `subagent_id` fails the stream with `PluginError::Validation`. Any other `collect` failure becomes the `ToolResult` text and the stream goes on:
+
+- `PluginError::NotSupported` for an unknown id.
+- `PluginError::Internal` when the background task ends without a result.
+
+`SubagentPlugin::with_max_pending` returns `PluginError::Validation` for a limit of zero.
 
 ## Related pages
 
-- [Plugins](@/plugins/_index.md) lists every plugin, its hooks and its caps.
-- [Memory discipline](@/concepts/memory-discipline.md) explains why a full registry refuses instead of evicting.
-- [Write a custom plugin](@/guides/custom-plugin.md) walks through the hook contract.
-- [Error types](@/reference/errors.md) lists `PluginError`.
+- [Plugins](@/plugins/_index.md): the hooks, their order and the error rules.
+- [Memory discipline](@/concepts/memory-discipline.md): why a full registry refuses instead of dropping.
+- [Write a custom plugin](@/guides/custom-plugin.md): the hook contract.
+- [Error types](@/reference/errors.md): `PluginError`.

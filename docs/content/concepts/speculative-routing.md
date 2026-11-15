@@ -1,6 +1,6 @@
 +++
 title = "Speculative fast/slow routing"
-description = "A deterministic classifier picks the tier, a validator polices the draft, and a latency deadline escalates mid-stream."
+description = "Answer easy turns with a fast model, and move to a slow one when the request looks hard, the draft looks wrong, or the fast model stalls."
 template = "page.html"
 weight = 4
 +++
@@ -9,16 +9,18 @@ weight = 4
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Route cheap turns to a fast model, and escalate to a slow one when the request looks hard, the draft looks wrong, or the fast tier stalls</dd>
+<dd>Route cheap turns to a fast model, and escalate to a slow one when the request looks hard, the draft looks wrong, or the fast model stalls</dd>
 <dt>You need</dt>
 <dd>Nothing running</dd>
 <dt>Read this if</dt>
-<dd>You want to know what triggers an escalation, and what a caller sees when one happens mid-stream</dd>
+<dd>You want to know what triggers an escalation, and what you see when one happens mid-stream</dd>
 </dl>
 
-The orchestrator pairs two models. One is cheap and quick, the other is expensive and capable. It decides which one answers, and it can change its mind while the fast one is already streaming. The feature is `service-speculative`, and [Speculative](@/services/speculative.md) is its reference page.
+Big models answer better and cost more time and money. Small models are quick and cheap, and they fail on hard tasks. Speculative routing uses both. A fast model starts the answer, and CUCA hands the turn to a slow model when it has a reason.
 
-## Three escalation triggers
+The orchestrator holds the pair. It decides which one answers, and it can change its mind while the fast one is already streaming. The feature is `service-speculative`, and [Speculative](@/services/speculative.md) is its reference page.
+
+## Three reasons to escalate
 
 <div class="dgm">
 <div class="dgm-scroll">
@@ -59,57 +61,80 @@ The orchestrator pairs two models. One is cheap and quick, the other is expensiv
   <text class="t-sm t-end" x="324" y="108">or rejection</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>The evaluator runs once, before anything is sent.</b> The vertical path is checked while the fast tier streams, so an escalation can land after the fast tier has already yielded blocks.</p>
+<p class="dgm-cap"><b>The evaluator runs once, before anything is sent.</b> The path from the fast tier to the slow tier is checked while the fast tier streams, so a switch can happen after some fast blocks have already arrived.</p>
 </div>
 
-The first trigger runs before dispatch: the evaluator calls the request `Slow` and the fast tier never starts. The other two run mid-stream: the latency deadline passes, or the validator rejects a draft block.
+1. The evaluator reads the request and calls it `Slow`. The fast model never starts.
+2. The fast model is too slow: the latency deadline passes.
+3. The validator rejects a block of the fast model's draft.
+
+The first happens before sending. The other two happen mid-stream.
 
 ## Classification is arithmetic
 
-`ComplexityEvaluator::evaluate` reads three signals off the request. Any one at or above its threshold routes the turn to the slow tier.
+`ComplexityEvaluator::evaluate` counts three things in the request. If any one reaches its threshold, the turn goes to the slow tier.
 
 | Signal | What it counts | Default |
 |---|---|---|
 | `slow_tool_call_depth` | messages holding at least one `ToolCall` or `ToolResult` block | `1` |
 | `slow_input_tokens` | approximate tokens across all blocks | `2_000` |
-| `slow_multi_file_threshold` | distinct path-like tokens in `Text` blocks, deduplicated per message, summed over messages | `3` |
+| `slow_multi_file_threshold` | distinct path-like words in `Text` blocks, counted once per message and summed | `3` |
 
-- Token estimates use four characters per token, floored, with a minimum of 1 per block. `Text`, `Thinking` and serialized `ToolCall` arguments are counted by characters. A `ToolResult` counts as 1 and an `ImageBase64` block as 0.
-- A tool depth of `1` means one tool round trip is enough. A turn that has used a tool has structure to maintain, and the fast tier is more likely to break it.
-- A token is path-like if it starts with `./` or `/`, or if its last dot suffix is one of 33 known source and config extensions. The list misclassifies: prose mentioning `README.md` counts as a file reference, and a real path with an unlisted extension does not.
+- A token is a small piece of text. CUCA estimates four characters per token, rounded down, with a minimum of 1 per block. `Text`, `Thinking` and `ToolCall` arguments count by characters. A `ToolResult` counts as 1 and an `ImageBase64` block as 0.
+- A tool depth of `1` means one tool round trip is enough. A turn that used a tool has structure to keep intact, and the fast model is more likely to break it.
+- A word is path-like if it starts with `./` or `/`, or if its last dot suffix is one of 33 known source and config extensions. The test is rough: prose that mentions `README.md` counts as a file, and a real path with an unlisted extension does not.
 
-A model call to classify the request would be more accurate. It would also cost a model call, add latency to the decision meant to reduce latency, and make routing differ between runs. Arithmetic on the request is cheap, exact and reproducible in a test. The orchestrator uses `ComplexityEvaluator::default()`.
+Asking a model to classify the request would be more accurate. It would also cost a model call, add delay to the decision meant to save delay, and give different routes on different runs. Arithmetic is cheap, exact and repeatable in a test. The orchestrator uses `ComplexityEvaluator::default()`.
 
 ## The latency deadline
 
-`latency_threshold_ms` is a deadline measured from the start of the fast tier's draft. The clock starts once and is never reset by a block arriving. The check runs when the fast stream returns `Pending`, and the comparison is strict: the swap fires when elapsed time is greater than the threshold.
+`latency_threshold_ms` is a deadline measured from the start of the fast model's draft. The clock starts once and a new block does not reset it. CUCA checks it when the fast stream has nothing ready. The switch happens when elapsed time is greater than the threshold.
 
-Nothing cancels the fast tier mid-token and nothing retracts what it already sent. A caller can receive several fast-tier blocks and then, in the same stream, blocks from the slow tier. The slow tier continues from the working request, not from the partial answer. The stream stays one `AgentResponseStream`, and the tier change is not visible in the block types.
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 150" role="img" aria-labelledby="swap-title swap-desc">
+  <title id="swap-title">A mid-stream switch from the fast tier to the slow tier</title>
+  <desc id="swap-desc">A time axis runs left to right. First the fast tier's blocks arrive. At the deadline, or when the validator rejects a block, the stream switches. Then the slow tier's blocks arrive. All of them reach the caller through one stream.</desc>
+  <text class="t-title" x="6" y="20">Time</text>
+  <text class="t-sm t-data" x="6" y="46">fast tier blocks, already delivered</text>
+  <text class="t-sm t-bnd" x="316" y="46">slow tier blocks, from the working request</text>
+  <rect class="bar bar-data" x="6" y="54" width="294" height="22" rx="3"/>
+  <rect class="bar bar-bnd" x="304" y="54" width="350" height="22" rx="3"/>
+  <path class="mark" d="M302 30 V92"/>
+  <text class="t-sm t-mid" x="302" y="108">deadline passed, or draft rejected</text>
+  <path class="ln" d="M6 120 H654"/>
+  <text class="t-ax" x="6" y="138">the caller reads one AgentResponseStream and sees no break</text>
+</svg>
+</div>
+<p class="dgm-cap"><b>Nothing the fast tier sent is taken back.</b> You can receive several fast blocks, then slow blocks in the same stream.</p>
+</div>
 
-A fast tier that never returns `Pending` is never checked, so the deadline is a guard on stalls and not a cap on total time.
+Nothing cancels the fast model mid-token and nothing retracts what it already sent. The slow model continues from the working request, not from the partial answer. The block types do not show which tier wrote a block.
 
-Buffering the fast output until the deadline and discarding it on a swap would turn every turn into request and response, which removes the reason to have a fast tier. Delivering what arrived is the trade the design makes. With a session store attached, each swap is recorded as `SessionEvent::ModelSwap` with the reason `latency_threshold` or `fallback_validation`.
+A fast stream that never has to wait is never checked. The deadline guards against stalls. It does not cap total time.
+
+Holding the fast output back until the deadline, then dropping it on a swap, would turn every turn into request and response. That removes the reason to have a fast tier. With a session store attached, each swap is recorded as `SessionEvent::ModelSwap` with the reason `latency_threshold` or `fallback_validation`.
 
 ## The validator checks structure
 
-The orchestrator always uses `JsonToolDraftValidator`; it has no setter for another. The validator checks three things:
+The orchestrator always uses `JsonToolDraftValidator`. It has no setter for another. It checks three things:
 
 - A `ToolCall` must have a non-empty id and a non-empty name.
 - A `ToolCall` whose arguments arrive as a JSON string must parse.
-- A `Text` block that parses as JSON must be a JSON object, not a bare scalar.
+- A `Text` block that parses as JSON must be a JSON object, not a bare value.
 
-It does not check that the tool exists, that the arguments match a schema, or that the answer is correct. Those belong to other tiers: `plugin-guardrails` validates against JSON Schema and `plugin-hitl` puts a human in the path. Tying escalation to policy would answer a policy failure with "ask a bigger model", which is the wrong remedy.
+It does not check that the tool exists, that the arguments match a schema, or that the answer is right. Those jobs belong to other features: `plugin-guardrails` checks against a JSON Schema, and `plugin-hitl` puts a human in the path. Answering a policy failure with "ask a bigger model" would be the wrong fix.
 
-Validation applies to blocks from both tiers. When a block is rejected and `fallback_on_tool_error` is set, the orchestrator appends the rejection to the working request as a `ToolResult` message and runs the slow tier again. For a rejected `ToolCall` the result carries that call's id. For any other block the id is empty.
+The validator checks blocks from both tiers. When it rejects a block and `fallback_on_tool_error` is set, the orchestrator adds the rejection to the working request as a `ToolResult` message and runs the slow tier again. For a rejected `ToolCall`, the result carries that call's id. For any other block the id is empty.
 
-The budget is two cascades per turn, shared across both tiers. Once it is spent, or when `fallback_on_tool_error` is unset, the rejection reaches the caller as `CucaError::Provider` with the reason. Its `provider` is the fast tier's endpoint for a draft rejection and the slow tier's for a slow rejection.
+Each turn has a budget of two such retries, shared by both tiers. When the budget is spent, or `fallback_on_tool_error` is unset, you get `CucaError::Provider` with the reason. Its `provider` is the fast tier's endpoint for a draft rejection and the slow tier's for a slow rejection.
 
 ## What has no default
 
-`SwappableModelPair` has no `Default`. The caller names all six fields: `fast_provider`, `fast_model_id`, `slow_provider`, `slow_model_id`, `latency_threshold_ms` and `fallback_on_tool_error`. No default answers "which model is your fast one", and a wrong guess spends the caller's money on the wrong tier.
+`SwappableModelPair` has no `Default`. You name all six fields: `fast_provider`, `fast_model_id`, `slow_provider`, `slow_model_id`, `latency_threshold_ms` and `fallback_on_tool_error`. No default can answer "which model is your fast one", and a wrong guess spends your money on the wrong tier.
 
 ## The client pool
 
-Each tier resolves to a `CucaClient` from a `ClientPool`, keyed by provider and base URL. The pool has no cap. It holds one entry per distinct endpoint a caller configures, which configuration sets and traffic does not. `ClientPool::len` reports the count. [Memory discipline](@/concepts/memory-discipline.md) explains the exception.
+Each tier gets a `CucaClient` from a `ClientPool`, keyed by provider and base URL. The pool has no size cap. It holds one client per distinct endpoint you configure, and `ClientPool::len` reports the count. [Memory discipline](@/concepts/memory-discipline.md) explains why this is allowed.
 
 Next page: [Memory discipline](@/concepts/memory-discipline.md).

@@ -1,6 +1,6 @@
 +++
 title = "Local (in-process)"
-description = "The provider-local adapter: a GGUF language model runs inside your process on the CPU, a GPU or both, with no server and no HTTP endpoint."
+description = "Run a language model inside your own program, on the CPU or a GPU, with no server and no HTTP endpoint. Start here for a first run, then pick a model, a GPU or a configuration."
 template = "section.html"
 sort_by = "weight"
 weight = 8
@@ -11,92 +11,99 @@ kicker = "Reference"
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Runs a GGUF language model of a supported architecture (see <a href="@/providers/local/models.md">Local models and formats</a>) on the CPU, a GPU or both inside your process, with no server and no HTTP endpoint.</dd>
+<dd>A language model, a GGUF file or a Hugging Face safetensors checkpoint, runs inside your program, on the CPU or a GPU. There is no server and no HTTP endpoint.</dd>
 <dt>You need</dt>
-<dd>The <code>provider-local</code> feature for the CPU, or <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> for a GPU. A GGUF file, a safetensors checkpoint, or disk for the one-time download (0.29 GB to 67.71 GB across the main-model presets, 2.84 GB for the default; a converted DeepSeek-V4.1 is about 507 GB, see <a href="@/providers/local/checkpoints.md#deepseek-v4-1">Local checkpoint conversion</a>). Memory of about the file size plus the K/V cache, split between RAM and VRAM as <a href="@/providers/local/placement.md">Hybrid placement</a> describes, or less for a mixture-of-experts model on <a href="@/providers/local/expert-tiers.md">tiered expert placement</a>.</dd>
+<dd>Rust 1.98, a C compiler and the <code>provider-local</code> feature. A GPU needs <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> instead. Disk for the model file: 2.84 GB for the default.</dd>
 <dt>Read this if</dt>
-<dd>You are routing requests through <code>ProviderEndpoint::Local</code>, or you want a model that needs no external service.</dd>
+<dd>You want a model that needs no external service, or you route requests through <code>ProviderEndpoint::Local</code>.</dd>
 </dl>
 
-`LocalModel::load` resolves the GGUF file, loads the weights, the tokenizer and the chat template, and starts one engine thread. `CucaClientBuilder::with_local_model` attaches the model to a client built for `ProviderEndpoint::Local`. This is the engine's library mode; the [server](@/server/_index.md) runs the same engine in server and balancer mode. The engine is pure Rust: no llama.cpp and no FFI written by cuca.
+`provider-local` runs a language model inside your own program. The model is a GGUF file, one file that holds the weights, the tokenizer and the chat template, or a Hugging Face safetensors checkpoint that CUCA converts once to a cached GGUF. See [Model files and downloads](@/providers/local/model-sources.md). You load it from Rust, send it a request and read the reply as a stream.
 
-A model need not fit one memory. `gpu_layers` splits the layers between the GPU and the CPU, `experts { host; }` computes a mixture of experts' experts on the CPU, and `experts { tiered ... }` leaves them in the file on disk behind RAM and VRAM caches. [Hybrid placement](@/providers/local/placement.md) maps every combination to VRAM, RAM and the SSD.
-
-## Endpoint
-
-| Fact | Value |
-|---|---|
-| Feature flag | `provider-local` (CPU, candle 0.11) |
-| GPU feature flags | `provider-local-vulkan`<br>`provider-local-metal`<br>`provider-local-cuda`<br>`provider-local-rocm` |
-| `ProviderEndpoint` variant | `Local` |
-| Base URL, route, auth header | none: there is no HTTP endpoint |
-| Attached with | `CucaClientBuilder::with_local_model`; `build` fails without it |
-| Network use | the one-time model download from Hugging Face, nothing else |
-| Models per client | one; `UnifiedRequest::model` is not used for routing |
-
-Each GPU feature enables `provider-local` and `provider-local-gpu`, the shared GPU engine, which selects no backend by itself. With the feature off, dispatching `ProviderEndpoint::Local` returns `CucaError::ProviderNotEnabled("provider-local")`.
-
-## Authentication
-
-There is no API key and no auth header. The one credential is the optional Hugging Face token (`hf_token`, anonymous when `None` or empty), sent as a bearer token on downloads. The pinned preset files download anonymously.
-
-## Entry points
-
-- `LocalModel::load(LocalModelConfig)` is async. It resolves or downloads the file, loads it and starts the thread named `cuca-local-engine`. The download, the hashing and the weight parsing run on that thread, so the call never blocks the async runtime.
-- `CucaClientBuilder::with_local_model(LocalModel)` attaches the model. `CucaClient::local_model()` returns `Option<&LocalModel>`.
-- `LocalModel` is cheap to clone. Every clone, and every client built from a clone, shares the one engine thread, which ends when the last clone is dropped.
-- `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`. `LocalModel::sampling()` returns the resolved sampling defaults.
-- `LocalModel::kv_cache_bytes()` returns the K/V block pool size in bytes. `LocalModel::weights_file_bytes()` returns the size of the GGUF the model runs from, every part of a split set added up, and `LocalModel::context_length()` the resolved context length. `LocalModel::serving_stats()` returns the scheduler counters (`ServingStats`).
-- `LocalModel::generate(UnifiedRequest)` runs one request without a client. It returns a `LocalGeneration`, a stream of `Result<MessageContentBlock, CucaError>` that keeps no copy of the blocks and runs no plugin hooks. After the stream ends, `LocalGeneration::report()` returns a `GenerationReport`: the exact `usage`, the prefix reuse as `prompt_cache`, the `finish_reason` (`stop` for the end token or a stop string, `length` when `max_tokens` or the context ran out) and `queue_secs`, the wait from dispatch to first admission. Dropping the `LocalGeneration` stops the request. The [server](@/server/_index.md) serves through this entry point.
-- `LocalModel::draft_stats()` returns the drafter counters. `LocalModel::expert_tier_stats()` and `LocalModel::expert_heat()` return the expert cache counters and the learned heat, `None` unless `LocalModelConfig::experts` is `ExpertPlacement::Tiered`. `LocalModel::engram_stats()` returns the Engram row cache counters (`EngramStats`), `None` unless the model has an Engram table. `LocalModel::layer_split()` returns `(layers on the GPU, layers in all)` under `gpu_layers`, else `None`.
-- `ModelSource::PRESETS`, `ModelSource::preset(name)`, `ModelSource::default_model()` and `ModelSource::hugging_face(repo, revision, file)` describe model sources. `ModelSource`, `LocalDevice`, `WeightQuant` and `EngramQuant` implement `FromStr`. `LocalModelConfig` and every type in it implement `serde::Deserialize`, which is how a KDL file fills them; see [KDL configuration](@/providers/local/configuration.md#kdl-configuration).
+The engine is written in Rust. It uses no llama.cpp and no FFI written by cuca. The [server](@/server/_index.md) runs the same engine behind an HTTP API.
 
 <div class="dgm">
 <div class="dgm-scroll">
-<svg viewBox="0 0 660 124" role="img" aria-labelledby="loc-title loc-desc">
-  <title id="loc-title">One request through the in-process engine</title>
-  <desc id="loc-desc">Five stages, left to right. CucaClient::generate_stream receives the UnifiedRequest. The chat template and the tokenizer turn it into prompt token ids. The job queue holds up to 16 waiting requests. The engine thread runs up to max_sequences requests at once, 4 by default, each step one forward pass over all of them: prefix reuse, prefill chunks and decode rows. A channel of up to 64 blocks carries Text, Thinking and ToolCall blocks back to the stream. Dropping the stream stops generation, and a full queue makes generate_stream wait.</desc>
+<svg viewBox="0 0 660 200" role="img" aria-labelledby="loc-title loc-desc">
+  <title id="loc-title">A local model runs inside your program</title>
+  <desc id="loc-desc">Four boxes in a row, left to right: your program, the LocalModel handle, the engine thread named cuca-local-engine, and the CPU or a GPU. Requests go left to right and content blocks stream back. Under the engine thread sits the model file in the cache directory, which the engine thread loads. A dashed arrow from Hugging Face to the model file is the one-time download and the only network use.</desc>
   <defs>
     <marker id="loc-arrow" viewBox="0 0 8 8" refX="7" refY="4"
             markerWidth="6" markerHeight="6" orient="auto">
       <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
     </marker>
   </defs>
-  <text class="t-title" x="6" y="20">One request through the local engine</text>
-  <rect class="blk" x="6" y="44" width="104" height="50" rx="6"/>
-  <text class="t-sm t-mid" x="58" y="67">CucaClient</text>
-  <text class="t-sm t-mid" x="58" y="81">generate_stream</text>
-  <rect class="blk" x="142" y="44" width="104" height="50" rx="6"/>
-  <text class="t-sm t-mid" x="194" y="67">chat template</text>
-  <text class="t-sm t-mid" x="194" y="81">and tokenizer</text>
-  <rect class="blk" x="278" y="44" width="104" height="50" rx="6"/>
-  <text class="t-sm t-mid" x="330" y="67">job queue</text>
-  <text class="t-sm t-mid" x="330" y="81">16 waiting</text>
-  <rect class="blk" x="414" y="44" width="104" height="50" rx="6"/>
-  <text class="t-sm t-mid" x="466" y="67">engine thread</text>
-  <text class="t-sm t-mid" x="466" y="81">batched steps</text>
-  <rect class="blk blk-data" x="550" y="44" width="104" height="50" rx="6"/>
-  <text class="t-sm t-mid t-data" x="602" y="67">block channel</text>
-  <text class="t-sm t-mid" x="602" y="81">64 blocks</text>
-  <path class="arw" d="M112 69 H138" marker-end="url(#loc-arrow)"/>
-  <path class="arw" d="M248 69 H274" marker-end="url(#loc-arrow)"/>
-  <path class="arw" d="M384 69 H410" marker-end="url(#loc-arrow)"/>
-  <path class="arw arw-data" d="M520 69 H546" marker-end="url(#loc-arrow)"/>
-  <text class="t-ax" x="6" y="114">dropping the stream stops generation; a full queue makes generate_stream wait</text>
+  <text class="t-title" x="6" y="20">Everything runs inside your process</text>
+  <rect class="blk" x="6" y="40" width="130" height="52" rx="6"/>
+  <text class="t-sm t-mid" x="71" y="63">your program</text>
+  <text class="t-sm t-mid" x="71" y="79">async Rust</text>
+  <rect class="blk" x="176" y="40" width="130" height="52" rx="6"/>
+  <text class="t-sm t-mid" x="241" y="63">LocalModel</text>
+  <text class="t-sm t-mid" x="241" y="79">shared handle</text>
+  <rect class="blk blk-ctl" x="346" y="40" width="130" height="52" rx="6"/>
+  <text class="t-sm t-mid t-ctl" x="411" y="63">engine thread</text>
+  <text class="t-sm t-mid" x="411" y="79">cuca-local-engine</text>
+  <rect class="blk" x="516" y="40" width="130" height="52" rx="6"/>
+  <text class="t-sm t-mid" x="581" y="63">CPU or a GPU</text>
+  <text class="t-sm t-mid" x="581" y="79">runs the model</text>
+  <path class="arw" d="M138 56 H174" marker-end="url(#loc-arrow)"/>
+  <path class="arw arw-data" d="M174 78 H138" marker-end="url(#loc-arrow)"/>
+  <path class="arw" d="M308 56 H344" marker-end="url(#loc-arrow)"/>
+  <path class="arw arw-data" d="M344 78 H308" marker-end="url(#loc-arrow)"/>
+  <path class="arw" d="M478 66 H514" marker-end="url(#loc-arrow)"/>
+  <rect class="blk" x="346" y="128" width="130" height="44" rx="6"/>
+  <text class="t-sm t-mid" x="411" y="147">model file</text>
+  <text class="t-sm t-mid" x="411" y="161">in the cache dir</text>
+  <path class="arw" d="M411 126 V94" marker-end="url(#loc-arrow)"/>
+  <text class="t-ax" x="419" y="114">loads</text>
+  <rect class="blk blk-bnd" x="176" y="128" width="130" height="44" rx="6"/>
+  <text class="t-sm t-mid t-bnd" x="241" y="147">Hugging Face</text>
+  <text class="t-sm t-mid" x="241" y="161">model host</text>
+  <path class="arw arw-bnd" d="M308 150 H344" marker-end="url(#loc-arrow)"/>
+  <text class="t-ax" x="6" y="192">dashed: the one-time download, the only network use</text>
 </svg>
 </div>
-<p class="dgm-cap"><b>One thread runs several requests in one forward pass per step.</b> Up to <code>max_sequences</code> requests run at once. A slow consumer stalls only its own request, through the bounded channel.</p>
+<p class="dgm-cap"><b>No server sits between your code and the model.</b> Your program calls a <code>LocalModel</code>, one engine thread runs the model on the CPU or a GPU, and content blocks stream back the same way. The network is used once, to download the file.</p>
 </div>
 
-## Example
+New to the words on this page? Read [How local inference works](@/providers/local/how-it-works.md) first or after the tutorial.
 
-The smallest stream: the default model, the `Local` variant and every other builder default.
+## Run your first local model
+
+This tutorial runs the default model, `gemma4-e2b-q4_0`, from a new Rust crate. It ends with a reply printed in your terminal.
+
+You need:
+
+- Rust 1.98 or newer.
+- A C compiler. See [Build requirements](@/providers/local/build-and-tests.md) if the build fails on a native dependency.
+- About 3 GB of free disk. The default model is a 2.84 GB download.
+- About 2 GB of RAM for the default model: 1.5 GB of weights and 481 MB of K/V cache. The K/V cache is the memory a model keeps for the text it has already read. `LocalModel::kv_cache_bytes` reports its size.
+
+### Step 1: add the crate
 
 ```bash,name=Runs the same on all three platforms
 cargo add cuca --path /path/to/cuca --features provider-local
 cargo add tokio --features rt,macros
 cargo add tokio-stream
 ```
+
+Result: `Cargo.toml` lists `cuca` with the `provider-local` feature.
+
+### Step 2: build for your CPU
+
+The CPU engine picks its fast code (SIMD kernels, which handle many numbers per instruction) when it compiles. A generic build is several times slower, so build for the machine you run on. The variable lasts for the current terminal session.
+
+```bash,name=Linux and macOS: build for the host CPU
+export RUSTFLAGS="-C target-cpu=native"
+```
+
+```powershell,name=Windows (PowerShell): build for the host CPU
+$env:RUSTFLAGS = "-C target-cpu=native"
+```
+
+### Step 3: write the program
+
+Put this in `src/main.rs`. It loads the default model, builds a client for `ProviderEndpoint::Local`, and prints the reply as it streams.
 
 ```rust,name=A first stream through the local engine
 use std::io::{Write, stdout};
@@ -133,23 +140,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 ```
 
-The reply depends on the model and the sampling seed. `examples/local_model.rs` is the runnable version: it prints download progress on stderr, `Thinking` blocks as they arrive, and `loaded on <device>`. Its flags and the KDL file that fills `LocalModelConfig` are on [KDL configuration](@/providers/local/configuration.md#kdl-configuration).
+### Step 4: run it
 
-candle selects its quantized SIMD kernels when it compiles, so build for the host CPU. A generic build is several times slower.
-
-```bash,name=Linux and macOS: build for the host CPU
-export RUSTFLAGS="-C target-cpu=native"
+```bash,name=Runs the same on all three platforms
+cargo run --release
 ```
 
-```powershell,name=Windows (PowerShell): build for the host CPU
-$env:RUSTFLAGS = "-C target-cpu=native"
-```
+Result: the first run downloads the default preset, a 2.84 GB model file, into the cache directory, checks its SHA-256 and loads it. Then one short answer prints, word by word as it is written. The words differ from run to run, because the reply depends on the model and the sampling seed. Later runs skip the download and only load the file.
+
+### Step 5: try the example and another model
+
+The repository has the same program with flags. Run it from a checkout of the repository:
 
 ```bash,name=Runs the same on all three platforms
 cargo run --release --example local_model --features provider-local
 ```
 
-To run another preset, pass a KDL file with `--config`:
+```text,name=What the example prints (numbers differ on your machine)
+<downloaded> / Some(<total>) bytes
+load: <seconds> s
+loaded on cpu
+<the reply>
+timing: <n> prompt tokens, first block after <s> s (~<r> prompt tokens/s); <n> completion tokens (<n> blocks), then <r> tokens/s after the first block
+```
+
+The download line appears on the first run only. Download progress, `load:`, `loaded on` and `timing:` go to stderr, and the reply goes to stdout.
+
+To run another preset, put its name in a KDL file and pass the file with `--config`. A model that reasons prints its reasoning first, dimmed, after `[thinking]`. Add `--thinking off` to skip it.
 
 ```kdl,name=qwen.kdl
 source "qwen3-0.6b-q8_0"
@@ -158,3 +175,43 @@ source "qwen3-0.6b-q8_0"
 ```bash,name=Runs the same on all three platforms
 cargo run --release --example local_model --features provider-local -- --config qwen.kdl
 ```
+
+Result: the example downloads the new file once, prints `loaded on cpu` and then the reply. `--prompt "Say hi"` changes the question. The other flags and every key of the file are on [Configuration](@/providers/local/configuration.md).
+
+## Where to go next
+
+- Learn the words and what happens to a request: [How local inference works](@/providers/local/how-it-works.md).
+- Pick another model, or load your own GGUF file or safetensors checkpoint: [Choose a model](@/providers/local/models.md). The presets range from 0.29 GB to 67.71 GB.
+- Run on a GPU: [Run on a GPU](@/providers/local/gpu.md).
+- The model is too big for your memory: [Fit a large model](@/providers/local/placement.md).
+- Send tools, switch thinking on or off, or stop on a string: [Requests, thinking and tool calls](@/providers/local/requests.md).
+- Change a setting or look up a default: [Configuration](@/providers/local/configuration.md).
+- Match an error message to its cause: [Limits and errors](@/providers/local/limits-and-errors.md).
+
+## Features and endpoint
+
+| Fact | Value |
+|---|---|
+| Feature flag | `provider-local` (CPU) |
+| GPU feature flags | `provider-local-vulkan`<br>`provider-local-metal`<br>`provider-local-cuda`<br>`provider-local-rocm` |
+| `ProviderEndpoint` variant | `Local` |
+| Base URL, route, auth header | none: there is no HTTP endpoint |
+| Attached with | `CucaClientBuilder::with_local_model`; `build` fails without it |
+| Network use | the one-time model download from Hugging Face, nothing else |
+| Models per client | one; `UnifiedRequest::model` is not used for routing |
+
+Each GPU feature turns on `provider-local` and `provider-local-gpu`, the shared GPU engine, which picks no backend by itself. With the feature off, dispatching `ProviderEndpoint::Local` returns `CucaError::ProviderNotEnabled("provider-local")`.
+
+There is no API key. The one credential is the optional Hugging Face token, `hf_token`, sent as a bearer token on downloads. It is anonymous when it is `None` or empty, and the pinned preset files download anonymously.
+
+## API at a glance
+
+- `LocalModel::load(LocalModelConfig)` is async. It finds or downloads the file, loads it and starts the engine thread, named `cuca-local-engine`. The download, the hashing and the weight parsing run on that thread, so the call never blocks your async runtime.
+- `CucaClientBuilder::with_local_model(LocalModel)` attaches the model to a client. `CucaClient::local_model()` returns `Option<&LocalModel>`.
+- `LocalModel` is cheap to clone. Every clone, and every client built from a clone, shares the one engine thread. The thread ends when the last clone is dropped.
+- `LocalModel::generate(UnifiedRequest)` runs one request without a client. It returns a `LocalGeneration`, a stream of `Result<MessageContentBlock, CucaError>`. It keeps no copy of the blocks and runs no plugin hooks. The [server](@/server/_index.md) serves through this entry point.
+- After the stream ends, `LocalGeneration::report()` returns a `GenerationReport`. It holds the exact `usage`, the prompt reuse as `prompt_cache`, the `finish_reason` and `queue_secs`, the wait from dispatch to first admission. `finish_reason` is `stop` for the end token or a stop string, and `length` when `max_tokens` or the context ran out. Dropping the `LocalGeneration` stops the request.
+- `LocalModel::capabilities()` returns `LocalCapabilities { reasoning, can_disable_thinking, tools }`: whether the model writes reasoning, whether a request can switch it off, and whether it has a tool call format the engine reads. `LocalModel::sampling()` returns the resolved sampling defaults.
+- `LocalModel::kv_cache_bytes()` returns the K/V cache size in bytes. `LocalModel::weights_file_bytes()` returns the size of the model file it runs from, every part of a split set added up. `LocalModel::context_length()` returns the resolved context length.
+- The other accessors return counters and layout facts: `serving_stats()`, `draft_stats()`, `expert_tier_stats()`, `engram_stats()` and `layer_split()`. The last three return `None` when the model has no such part. The fields are on [Configuration](@/providers/local/configuration.md) and [Limits and errors](@/providers/local/limits-and-errors.md).
+- `ModelSource::default_model()` and `ModelSource::preset(name)` pick a preset. `LocalModelConfig` also reads from a KDL file, with the field names as keys; see [Configuration](@/providers/local/configuration.md).

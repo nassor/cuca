@@ -32,7 +32,7 @@ You build a `UnifiedRequest`, and `CucaClient::generate_stream` returns a stream
 
 ## Local engine
 
-`provider-local` runs a GGUF model in Rust, with no llama.cpp and no FFI written by cuca: candle on the CPU, burn and CubeCL on a GPU through the `provider-local-vulkan`, `-metal`, `-cuda` or `-rocm` feature. It reads the architecture from the file and supports 20, among them Gemma 4, Qwen 3.5, Mistral Small 4 and DeepSeek-V4.1. A preset name downloads a pinned file, and a Hugging Face safetensors checkpoint is converted once to a cached GGUF. See [Local models and formats](https://nassor.github.io/cuca/providers/local/models/) and [Model sources](https://nassor.github.io/cuca/providers/local/model-sources/).
+`provider-local` runs a GGUF model in Rust, with no llama.cpp and no FFI written by cuca: candle on the CPU, burn and CubeCL on a GPU through the `provider-local-vulkan`, `-metal`, `-cuda` or `-rocm` feature. It reads the architecture from the file and supports 20, among them Gemma 4, Qwen 3.5, Mistral Small 4 and DeepSeek-V4.1. A preset name downloads a pinned file, and a Hugging Face safetensors checkpoint is converted once to a cached GGUF. See [Choose a model](https://nassor.github.io/cuca/providers/local/models/) and [Model files and downloads](https://nassor.github.io/cuca/providers/local/model-sources/).
 
 ### VRAM, RAM and SSD
 
@@ -57,7 +57,7 @@ experts { tiered device_bytes="4g" ram_bytes="12g"; }
 cargo run --release --example local_model --features provider-local-vulkan -- --config moe.kdl
 ```
 
-The same keys go in a `model` node of `cuca serve`'s file, and in library mode they are the fields of `LocalModelConfig`. On an RX 9070 XT (16 GB) with 125 GB of RAM, Muse Glimmer 30B (16.27 GB) decodes at 8.3 tokens/s with 38 of 52 layers on the GPU, against 3.5 on the CPU alone. DeepSeek-V4.1, a 507 GB converted set, runs from an NVMe SSD behind 90 GiB of expert cache in RAM: 2.15 tokens/s on the CPU alone, 1.96 with attention on the GPU in 12.5 GiB of VRAM. [Hybrid placement](https://nassor.github.io/cuca/providers/local/placement/) lists every combination and its measurements.
+The same keys go in a `model` node of `cuca serve`'s file, and in library mode they are the fields of `LocalModelConfig`. On an RX 9070 XT (16 GB) with 125 GB of RAM, Muse Glimmer 30B (16.27 GB) decodes at 8.3 tokens/s with 38 of 52 layers on the GPU, against 3.5 on the CPU alone. DeepSeek-V4.1, a 507 GB converted set, runs from an NVMe SSD behind 90 GiB of expert cache in RAM: 2.15 tokens/s on the CPU alone, 1.96 with attention on the GPU in 12.5 GiB of VRAM. [Fit a large model](https://nassor.github.io/cuca/providers/local/placement/) explains each option, and [Run DeepSeek-V4.1](https://nassor.github.io/cuca/providers/local/deepseek-v41/) walks through the largest model.
 
 ### Library mode
 

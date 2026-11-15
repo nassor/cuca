@@ -1,6 +1,6 @@
 +++
 title = "Guardrails"
-description = "The JSON Schema output guardrail plugin: schema keys, the retry protocol, and the tracked-call cap."
+description = "Check tool arguments and JSON replies against a JSON Schema, and tell the model what to fix."
 template = "page.html"
 weight = 5
 +++
@@ -9,75 +9,16 @@ weight = 5
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>JsonGuardrailPlugin</code> validates tool call arguments and JSON text responses against caller-registered JSON Schemas, and re-injects a diagnostic on failure instead of erroring the stream.</dd>
+<dd><code>JsonGuardrailPlugin</code> checks a tool call's arguments, and JSON text replies, against JSON Schemas you register. When a check fails, it tells the model what was wrong so it can retry.</dd>
 <dt>You need</dt>
-<dd>The <code>plugin-guardrails</code> feature.</dd>
+<dd>The <code>plugin-guardrails</code> feature. Nothing else runs.</dd>
 <dt>Read this if</dt>
-<dd>You are registering <code>JsonGuardrailPlugin</code> or reading its retry behavior.</dd>
+<dd>You want to be sure a tool call or structured reply has the shape your code expects.</dd>
 </dl>
 
-## Feature and entry type
+A JSON Schema is a JSON document that describes which JSON values are valid: required fields, types, patterns. Models sometimes send tool arguments that break the schema. This plugin catches that before your code runs the tool.
 
-| Item | Value |
-|---|---|
-| Feature flag | `plugin-guardrails` (enables `dep:jsonschema` and `dep:tracing`) |
-| Plugin name | `"json-guardrails"` |
-| Entry type | `JsonGuardrailPlugin` |
-| Attachment | `CucaClientBuilder::register_plugin` |
-| Needs | Nothing running; schemas come from a JSON file or from code |
-
-## Hooks
-
-`JsonGuardrailPlugin` acts on `on_stream_chunk`. It does not override `on_request` or `execute_local_tool`, and its `on_response_complete` is a no-op.
-
-- `ToolCall` blocks validate against the schema keyed by the tool name. A tool with no registered schema passes through unvalidated.
-- A failing `ToolCall` becomes a `ToolResult` carrying `{"error": ..., "tool": ..., "issues": [...]}`, so the model sees the diagnostic and can retry.
-- `Text` blocks that start with `{` (after leading whitespace) validate against the reserved `"response"` schema when one is registered. A failing text block is replaced with the same error JSON, with `error` always `"schema_validation_failed"` and `tool` set to `"response"`. Text blocks are not attempt-counted and emit no tracing event.
-- All other blocks pass through.
-- `JsonGuardrailPlugin::validate(tool_name, value)` is the direct check. It returns `Err` with one issue string per violation.
-
-### Retry protocol
-
-- The plugin counts attempts per tool call id. Each failing block increments the count, and a valid block for that id clears it.
-- `error` is `"schema_validation_failed"` while the count is at or below `max_attempts`, and `"guardrail_exhausted"` once it exceeds it. With `max_attempts` of `0`, the first failure is already `"guardrail_exhausted"`.
-- Each injected `ToolResult` emits a `tracing::warn!` event under target `cuca::guardrails` with fields `schema_name`, `error_type` and `attempt_count`.
-- `last_retry_event()` returns the most recent `(schema_name, error_type, attempt_count)`, or `None` before the first injection.
-
-## Configuration
-
-`JsonGuardrailPlugin` has no config struct. Two constructors set the schemas and the retry bound.
-
-| Constructor | Schemas | `max_attempts` |
-|---|---|---|
-| `JsonGuardrailPlugin::new(schema_path)` | A JSON object of tool name to JSON Schema, read from `schema_path`. | `3` |
-| `JsonGuardrailPlugin::with_schemas(schemas, max_attempts)` | A `HashMap<String, serde_json::Value>`. | caller-supplied (`u32`) |
-
-- Schemas are keyed by tool name. The reserved key `"response"` guards JSON text responses.
-- Every schema compiles at construction. The set is fixed afterward.
-
-## Caps and at-cap policy
-
-| Item | Value |
-|---|---|
-| Bound | `JsonGuardrailPlugin::MAX_TRACKED_CALLS`, 4096 tool call ids tracked for their attempt count. |
-| At the bound | The oldest tracked id is evicted, in insertion order. A reused evicted id starts again at attempt 1. |
-| Usage gauge | `JsonGuardrailPlugin::tracked_calls()`. |
-
-Only failing calls are tracked, and a valid block removes its id, so a model that passes its schema leaves `tracked_calls()` at `0`.
-
-## Errors
-
-The hook does not return validation failures. It re-injects them as `ToolResult` or `Text` blocks and returns `Ok(())`.
-
-| Variant | When |
-|---|---|
-| `Io` | `new` cannot open or read `schema_path`. |
-| `Validation` | `new` finds a document that is not a JSON object, or either constructor finds a schema that fails to compile. The `schema` field names the file path or the tool name. |
-| `Internal` | `on_stream_chunk` finds the attempts mutex or the retry-event mutex poisoned. |
-
-## Example
-
-`examples/guardrails.rs` runs one `book_flight` tool through three guardrails: a policy equal to the tool's schema, a policy that also requires a `passenger`, and that same policy with `max_attempts` of `0`.
+## Register it
 
 ```rust,name=Register a guardrail with a retry budget of three
 use std::collections::HashMap;
@@ -93,7 +34,108 @@ let client = CucaClient::builder()
     .build()?;
 ```
 
-The example needs a `llama-server` on port 1234 with a tool-calling model loaded. The flags `--base-url` and `--model`, written after `--`, retarget it at any OpenAI-compatible server.
+Expected effect: a `book_flight` call that breaks `schema` is replaced in the stream by a `ToolResult` such as `{"error":"schema_validation_failed","issues":[...],"tool":"book_flight"}`. The model reads it and can call the tool again. A valid call passes through unchanged.
+
+## How a failed check is handled
+
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 204" role="img" aria-labelledby="grd-title grd-desc">
+  <title id="grd-title">How a tool call is checked and retried.</title>
+  <desc id="grd-desc">A tool call from the model is checked against its schema. A valid call passes through and its attempt count is cleared. An invalid call is replaced by a ToolResult with the issues. While attempts are at or below max_attempts the error is schema_validation_failed, and the model can retry. Past max_attempts the error is guardrail_exhausted.</desc>
+  <defs>
+    <marker id="grd-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="6" y="20">on_stream_chunk for a ToolCall</text>
+  <rect class="blk blk-data" x="5" y="40" width="130" height="50" rx="6"/>
+  <text class="t-lbl t-mid" x="70" y="62">ToolCall</text>
+  <text class="t-sm t-mid" x="70" y="78">from the model</text>
+  <rect class="blk blk-ctl" x="190" y="40" width="130" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="255" y="62">check schema</text>
+  <text class="t-sm t-mid" x="255" y="78">by tool name</text>
+  <rect class="blk blk-data" x="400" y="40" width="130" height="50" rx="6"/>
+  <text class="t-lbl t-mid" x="465" y="62">valid</text>
+  <text class="t-sm t-mid" x="465" y="78">pass, clear count</text>
+  <rect class="blk blk-ctl" x="190" y="126" width="130" height="50" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="255" y="148">invalid</text>
+  <text class="t-sm t-mid" x="255" y="164">count attempt</text>
+  <rect class="blk blk-data" x="400" y="100" width="255" height="42" rx="6"/>
+  <text class="t-sm t-mid" x="527" y="117">attempts up to max_attempts</text>
+  <text class="t-sm t-mid t-data" x="527" y="132">schema_validation_failed</text>
+  <rect class="blk blk-data" x="400" y="152" width="255" height="42" rx="6"/>
+  <text class="t-sm t-mid" x="527" y="169">attempts over max_attempts</text>
+  <text class="t-sm t-mid t-data" x="527" y="184">guardrail_exhausted</text>
+  <path class="arw arw-data" d="M136 65 H188" marker-end="url(#grd-arrow)"/>
+  <path class="arw arw-data" d="M321 65 H398" marker-end="url(#grd-arrow)"/>
+  <path class="arw arw-ctl" d="M255 92 V124" marker-end="url(#grd-arrow)"/>
+  <path class="arw arw-data" d="M321 142 H350 V121 H398" marker-end="url(#grd-arrow)"/>
+  <path class="arw arw-data" d="M321 160 H350 V173 H398" marker-end="url(#grd-arrow)"/>
+</svg>
+</div>
+<p class="dgm-cap"><b>A failed check does not fail the stream.</b> A bad call becomes a ToolResult with the issues, and the model can send fixed arguments. After more than <code>max_attempts</code> failures for one call id, the error text changes to <code>guardrail_exhausted</code>.</p>
+</div>
+
+## Feature and entry type
+
+| Item | Value |
+|---|---|
+| Feature flag | `plugin-guardrails` |
+| Plugin name | `"json-guardrails"` |
+| Entry type | `JsonGuardrailPlugin` |
+| Attachment | `CucaClientBuilder::register_plugin` |
+| Needs | Schemas from a JSON file or from code |
+
+## Hooks
+
+`JsonGuardrailPlugin` acts on `on_stream_chunk` only. `on_request` and `on_response_complete` do nothing.
+
+- A `ToolCall` is checked against the schema registered under its tool name. A tool with no schema passes through unchecked.
+- A failing `ToolCall` becomes a `ToolResult` holding `{"error": ..., "tool": ..., "issues": [...]}`.
+- A `Text` block that starts with `{` (after any spaces) is checked against the schema registered as `"response"`, if there is one. A failing block is replaced by the same error JSON, with `error` always `"schema_validation_failed"` and `tool` set to `"response"`. Text blocks are not counted as attempts.
+- Other blocks pass through.
+- `JsonGuardrailPlugin::validate(tool_name, value)` checks a value directly. It returns `Err` with one issue string per violation.
+
+### Retries
+
+- The plugin counts failed attempts per tool call id. A valid block for that id clears the count.
+- `error` is `"schema_validation_failed"` while the count is at or below `max_attempts`, and `"guardrail_exhausted"` above it. With `max_attempts` of `0`, the first failure is already `"guardrail_exhausted"`.
+- Each injected `ToolResult` logs a `tracing::warn!` event under target `cuca::guardrails`, with fields `schema_name`, `error_type` and `attempt_count`.
+- `last_retry_event()` returns the latest `(schema_name, error_type, attempt_count)`, or `None` before the first one.
+
+## Configuration
+
+`JsonGuardrailPlugin` has no config struct. Two constructors set the schemas and the retry limit:
+
+- `JsonGuardrailPlugin::new(schema_path)` reads the schemas from a JSON file, an object of tool name to JSON Schema. `max_attempts` is `3`.
+- `JsonGuardrailPlugin::with_schemas(schemas, max_attempts)` takes a `HashMap<String, serde_json::Value>`. You pass `max_attempts` as a `u32`.
+- Schemas are keyed by tool name. The key `"response"` is reserved for JSON text replies.
+- Every schema is compiled when you construct the plugin. The set cannot change afterward.
+
+## Caps and at-cap policy
+
+| Item | Value |
+|---|---|
+| Limit | `JsonGuardrailPlugin::MAX_TRACKED_CALLS`, 4096 tool call ids tracked for attempt counts. |
+| At the limit | The oldest tracked id is evicted. If that id comes back, it starts again at attempt 1. |
+| Usage gauge | `JsonGuardrailPlugin::tracked_calls()` |
+
+Only failing calls are tracked, and a valid block removes its id. A model that passes its schema leaves `tracked_calls()` at `0`.
+
+## Errors
+
+Validation failures are not returned as errors. They go back to the model as blocks, and the hook returns `Ok(())`.
+
+| Variant | When |
+|---|---|
+| `Io` | `new` cannot open or read `schema_path`. |
+| `Validation` | `new` finds a document that is not a JSON object, or a constructor finds a schema that does not compile. The `schema` field names the file path or the tool name. |
+| `Internal` | `on_stream_chunk` finds its attempts lock or its retry-event lock poisoned. |
+
+## Run the example
+
+`examples/guardrails.rs` runs one `book_flight` tool through three policies: one equal to the tool's schema, one that also requires a `passenger`, and the same with `max_attempts` of `0`. It needs a `llama-server` on port 1234 with a tool-calling model loaded. Put `--base-url` and `--model` after `--` to use another OpenAI-compatible server.
 
 ```bash,name=Runs the same on all three platforms
 cargo run --example guardrails --features "provider-llamacpp plugin-guardrails"
@@ -125,10 +167,10 @@ Same policy, retry budget 0: "Book a flight to Faro for 2026-05-20 with the book
   last_retry_event: schema "book_flight", error "guardrail_exhausted", attempt 1
 ```
 
-Both diagnostics carry the same `issues`, so the retry budget is the only change between the last two turns. The tool-call ids and thinking counts depend on the model, as does whether it emits a valid ISO date; the diagnostic shapes and attempt counts do not. The output above came from `google/gemma-4-12b-qat`.
+Tool call ids and thinking counts depend on the model. The error shapes and attempt counts do not.
 
 ## Related pages
 
-- [Plugins](@/plugins/_index.md): hook order, error handling and the plugin tier rules.
+- [Plugins](@/plugins/_index.md): the hooks, their order and the error rules.
 - [Error types](@/reference/errors.md): `PluginError` and `CucaError`.
 - [Write a custom plugin](@/guides/custom-plugin.md): the hook contract the guardrails follow.

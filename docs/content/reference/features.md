@@ -1,6 +1,6 @@
 +++
 title = "The feature matrix"
-description = "Every Cargo feature, what each one enables, the optional dependencies they own, and the gate that fails a build with no provider."
+description = "Every Cargo feature of cuca: what it is for, what it turns on, which recipe to copy, and the C compiler and download notes."
 template = "page.html"
 weight = 1
 +++
@@ -9,269 +9,235 @@ weight = 1
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd>Thirty-five opt-in features: eight providers, five <code>provider-local</code> GPU features, twelve plugins, seven services, the <code>config-kdl</code> reader and two server features</dd>
+<dd>Thirty-five opt-in features: eight providers, five local GPU features, twelve plugins, seven services, the <code>config-kdl</code> reader and two server features</dd>
 <dt>You need</dt>
 <dd>At least one <code>provider-*</code> feature; the build stops without one</dd>
 <dt>Read this if</dt>
-<dd>You are choosing a feature list, or tracing which crate a feature pulls in</dd>
+<dd>You are choosing a feature list, or you want to know what a feature pulls into your build</dd>
 </dl>
 
-`default = []`. Every feature below is off until you enable it. The source of truth is the `[features]` table in `Cargo.toml`.
+Every feature is off until you turn it on (`default = []`). A feature adds code and dependencies only when it is on, so a small feature list means a small, fast build. The `[features]` table in `Cargo.toml` is the source of truth.
+
+## Which features do I need
+
+Pick the row that matches what you want to do. Add plugin and service features to any row.
+
+| I want to | Features |
+|---|---|
+| Stream from a `llama-server` (the quick start) | `provider-llamacpp` |
+| Call OpenAI, Anthropic, Gemini or DeepSeek | `provider-openai`, `provider-anthropic`, `provider-gemini` or `provider-deepseek` |
+| Call vLLM or LM Studio | `provider-vllm` or `provider-lmstudio` |
+| Run a language model inside my program, on the CPU | `provider-local` |
+| Run it on a GPU | `provider-local-vulkan` (Windows, Linux), `provider-local-metal` (macOS), `provider-local-cuda` or `provider-local-rocm` |
+| Serve the local model over an OpenAI-compatible HTTP API | `server` plus a GPU feature if you want one, for example `server,provider-local-vulkan` |
+| Add a terminal dashboard for the server | `server-tui` |
+| Read a KDL settings file in my own program | `config-kdl` |
+| Let the model call tools through MCP | any provider plus `plugin-mcp` |
+
+In `Cargo.toml`:
+
+```toml,name=A provider and two plugins
+[dependencies]
+cuca = { version = "0.8", default-features = false, features = ["provider-openai", "plugin-memory", "plugin-guardrails"] }
+```
+
+In a cargo command, name the features every time:
+
+```bash,name=Runs the same on all three platforms
+cargo run --release --example local_model --features provider-local-vulkan
+```
 
 ## The provider gate
 
-A build with none of the eight provider features stops at a `compile_error!` in `src/lib.rs`:
+With no provider feature on, the build stops with this message:
 
-```text,name=The compile error verbatim
+```text,name=The compile error
 CUCA requires one provider-* feature; enable the adapter for the backend you use.
 ```
 
-The gate is a `#[cfg(not(any(...)))]` over `provider-openai`, `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm`, `provider-lmstudio` and `provider-local`. The five GPU features are not providers and do not satisfy it. CI asserts that `cargo check --no-default-features` fails.
+Eight features satisfy the gate: `provider-openai`, `provider-anthropic`, `provider-deepseek`, `provider-gemini`, `provider-llamacpp`, `provider-vllm`, `provider-lmstudio` and `provider-local`. The five GPU features enable `provider-local`, so they satisfy it too. `server` and `server-tui` also enable `provider-local`.
+
+## How the features relate
+
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 296" role="img" aria-labelledby="featx-title featx-desc">
+  <title id="featx-title">The feature tiers of cuca and which feature turns on which.</title>
+  <desc id="featx-desc">Top row: the core, twelve plugins and seven services. Three services turn on a plugin. Middle row: seven HTTP providers, the in-process provider-local, and the GPU features that turn on provider-local. Bottom row: provider-local turns on config-kdl, and the server features turn on provider-local and config-kdl.</desc>
+  <defs>
+    <marker id="featx-arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="6" y="20">Arrows read "turns on"</text>
+  <rect class="blk" x="6" y="36" width="170" height="62" rx="6"/>
+  <text class="t-lbl" x="18" y="58">core</text>
+  <text class="t-sm" x="18" y="74">no feature needed</text>
+  <text class="t-sm" x="18" y="88">types, client, SSE</text>
+  <rect class="blk blk-ctl" x="236" y="36" width="170" height="62" rx="6"/>
+  <text class="t-lbl t-ctl" x="248" y="58">plugin-* (12)</text>
+  <text class="t-sm" x="248" y="74">hooks on every request</text>
+  <text class="t-sm" x="248" y="88">no plugin edges</text>
+  <rect class="blk blk-ctl" x="466" y="36" width="170" height="62" rx="6"/>
+  <text class="t-lbl t-ctl" x="478" y="58">service-* (7)</text>
+  <text class="t-sm" x="478" y="74">called directly</text>
+  <text class="t-sm" x="478" y="88">3 turn on a plugin</text>
+  <path class="arw" d="M464 67 H408" marker-end="url(#featx-arrow)"/>
+  <rect class="blk blk-bnd" x="6" y="126" width="170" height="62" rx="6"/>
+  <text class="t-lbl t-bnd" x="18" y="148">7 HTTP providers</text>
+  <text class="t-sm" x="18" y="164">openai, anthropic, ...</text>
+  <text class="t-sm" x="18" y="178">reqwest with rustls</text>
+  <rect class="blk blk-bnd" x="236" y="126" width="170" height="62" rx="6"/>
+  <text class="t-lbl t-bnd" x="248" y="148">provider-local</text>
+  <text class="t-sm" x="248" y="164">in-process, CPU</text>
+  <text class="t-sm" x="248" y="178">turns on config-kdl</text>
+  <rect class="blk blk-bnd" x="466" y="126" width="170" height="62" rx="6"/>
+  <text class="t-lbl t-bnd" x="478" y="148">provider-local-gpu</text>
+  <text class="t-sm" x="478" y="164">+ vulkan, metal,</text>
+  <text class="t-sm" x="478" y="178">cuda, rocm (5 total)</text>
+  <path class="arw" d="M464 157 H408" marker-end="url(#featx-arrow)"/>
+  <rect class="blk" x="236" y="216" width="170" height="62" rx="6"/>
+  <text class="t-lbl" x="248" y="238">config-kdl</text>
+  <text class="t-sm" x="248" y="254">KDL file reader</text>
+  <rect class="blk" x="466" y="216" width="170" height="62" rx="6"/>
+  <text class="t-lbl" x="478" y="238">server, server-tui</text>
+  <text class="t-sm" x="478" y="254">turn on provider-local</text>
+  <text class="t-sm" x="478" y="268">and config-kdl</text>
+  <path class="arw" d="M321 190 V214" marker-end="url(#featx-arrow)"/>
+  <path class="arw" d="M464 247 H408" marker-end="url(#featx-arrow)"/>
+</svg>
+</div>
+<p class="dgm-cap"><b>Features stack in one direction.</b> A service may turn on a plugin, and a plugin never names a service. Plugins never turn on other plugins, and services never turn on other services.</p>
+</div>
+
+The three service to plugin edges are `service-entity-extraction` and `service-vector-store` turning on `plugin-memory`, and `service-replay` turning on `plugin-session-log`. `ModelOrchestrator::with_session_store` exists only when `service-speculative` and `plugin-session-log` are both on. That link is not a Cargo feature edge.
 
 ## Provider features
 
-Eight features: seven HTTP adapters and one in-process engine. Each `dep:` entry is an optional dependency the feature turns on.
+Eight features: seven HTTP adapters and one in-process engine. [Providers](@/providers/_index.md) has one page for each.
 
-| Feature | Enables |
-|---|---|
-| `provider-openai` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-anthropic` | `dep:reqwest`, `dep:tokio-stream`, `dep:sha2`, `dep:getrandom`, `dep:base64`, `reqwest/rustls` |
-| `provider-gemini` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-deepseek` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-llamacpp` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-vllm` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-lmstudio` | `dep:reqwest`, `dep:tokio-stream`, `reqwest/rustls` |
-| `provider-local` | `config-kdl`, `dep:candle-core`, `dep:candle-nn`, `dep:half`, `dep:minijinja`, `dep:minijinja-contrib`, `dep:reqwest`, `dep:sha2`, `dep:sysinfo`, `dep:tokio`, `dep:tokenizers`, `dep:unicode-general-category`, `dep:wide`, `reqwest/rustls`, `serde_json/preserve_order` |
+| Feature | What it is for | Pulls in |
+|---|---|---|
+| `provider-openai` | OpenAI Chat Completions | `reqwest`, `tokio-stream` |
+| `provider-anthropic` | Anthropic Messages, with API key, bearer token or OAuth PKCE | `reqwest`, `tokio-stream`, `sha2`, `getrandom`, `base64` |
+| `provider-gemini` | Google Gemini | `reqwest`, `tokio-stream` |
+| `provider-deepseek` | DeepSeek, native and Anthropic bridge routes | `reqwest`, `tokio-stream` |
+| `provider-llamacpp` | `llama-server` | `reqwest`, `tokio-stream` |
+| `provider-vllm` | vLLM | `reqwest`, `tokio-stream` |
+| `provider-lmstudio` | LM Studio | `reqwest`, `tokio-stream` |
+| `provider-local` | Inference inside your process on the CPU, from a GGUF file or a Hugging Face safetensors checkpoint, no HTTP and no llama.cpp | `config-kdl`, `candle-core`, `candle-nn`, `half`, `minijinja`, `minijinja-contrib`, `reqwest`, `sha2`, `sysinfo`, `tokio`, `tokenizers`, `unicode-general-category`, `wide` |
 
-`provider-local` does not use `tokio-stream`: its stream is a plain mpsc receiver. It uses `reqwest` only for the one-time model download, `sysinfo` only for the free-space check of the converter's output volume, and `tokenizers` only for the converter's DeepSeek-V4.1 Engram token map; the engine's own tokenizer is hand-written. `serde_json/preserve_order` keeps JSON maps in the order the caller wrote them, which chat templates see.
+Every `reqwest` entry turns on its `rustls` TLS backend, so no feature needs OpenSSL. `provider-local` uses `reqwest` only to download model files, `sha2` to check them, and `sysinfo` to check free disk space when it converts a checkpoint.
 
 ## Local GPU features
 
-Five features extend `provider-local`. None is a provider.
+Five features extend `provider-local`. None is a provider on its own. See [Run on a GPU](@/providers/local/gpu.md).
 
-| Feature | Enables |
-|---|---|
-| `provider-local-gpu` | `provider-local`, `dep:burn`, `dep:burn-cubecl`, `dep:cubecl` |
-| `provider-local-vulkan` | `provider-local-gpu`, `burn/vulkan` |
-| `provider-local-metal` | `provider-local-gpu`, `burn/metal` |
-| `provider-local-cuda` | `provider-local-gpu`, `burn/cuda` |
-| `provider-local-rocm` | `provider-local-gpu`, `burn/rocm` |
+| Feature | What it is for | Pulls in |
+|---|---|---|
+| `provider-local-gpu` | the shared GPU engine; picks no backend by itself | `provider-local`, `burn`, `burn-cubecl`, `cubecl` |
+| `provider-local-vulkan` | Vulkan GPUs (Windows, Linux) | `provider-local-gpu`, `burn/vulkan` |
+| `provider-local-metal` | Apple GPUs | `provider-local-gpu`, `burn/metal` |
+| `provider-local-cuda` | NVIDIA GPUs through CUDA | `provider-local-gpu`, `burn/cuda` |
+| `provider-local-rocm` | AMD GPUs through ROCm (Linux, Windows) | `provider-local-gpu`, `burn/rocm` |
 
-- `provider-local-gpu` is the shared GPU engine. It selects no backend by itself; each backend feature enables it.
-- `provider-local` alone runs the model on the CPU.
-- `LocalDevice` and `GpuAdapter` exist in every `provider-local` build. Selecting a backend whose feature is off makes `LocalModel::load` fail with `CucaError::Config`.
-- `provider-local-cuda` and `provider-local-rocm` link a prebuilt LLVM that `tracel-llvm-bundler` downloads on the first build, so they need network access once. ROCm builds on Linux and on Windows. `provider-local-vulkan` and `provider-local-metal` need no download.
+- `LocalDevice` and `GpuAdapter` exist in every `provider-local` build. Choosing a backend whose feature is off makes `LocalModel::load` fail with `CucaError::Config`.
+- A GPU feature alone does not move the model: set `device` in the model configuration. See [Configuration](@/providers/local/configuration.md).
 
 ## Plugin features
 
-Twelve features. Each plugin implements `CucaPlugin` and runs on the request pipeline.
+Twelve features. A plugin implements `CucaPlugin` and runs as a hook on every request. [Plugins](@/plugins/_index.md) has one page for each.
 
-| Feature | Enables |
-|---|---|
-| `plugin-mcp` | `dep:rmcp`, `dep:tokio` |
-| `plugin-sandbox` | `dep:wasmtime`, `dep:base64`, `wasmtime/wat` |
-| `plugin-memory` | `dep:tiktoken-rs` |
-| `plugin-guardrails` | `dep:jsonschema`, `dep:tracing` |
-| `plugin-subagent` | `dep:tokio` |
-| `plugin-hitl` | `dep:tokio` |
-| `plugin-web-search` | `dep:reqwest`, `dep:tokio`, `reqwest/rustls` |
-| `plugin-skills` | nothing |
-| `plugin-telemetry` | `dep:opentelemetry`, `dep:opentelemetry_sdk`, `dep:tracing` |
-| `plugin-session-log` | `dep:postcard` |
-| `plugin-cost` | `dep:tiktoken-rs` |
-| `plugin-redaction` | `dep:tracing` |
-
-No plugin feature enables another plugin feature, and none names a service: the tier is flat.
+| Feature | What it is for | Pulls in |
+|---|---|---|
+| `plugin-mcp` | call tools on MCP servers over a child process or Streamable HTTP | `rmcp`, `tokio` |
+| `plugin-sandbox` | run WebAssembly tool code with a fuel, memory and time limit | `wasmtime`, `base64` |
+| `plugin-memory` | keep long chats inside the context window, plus a memory graph | `tiktoken-rs` |
+| `plugin-guardrails` | check tool-call arguments against a JSON schema | `jsonschema`, `tracing` |
+| `plugin-subagent` | let the model start a sub-agent as a tool call | `tokio` |
+| `plugin-hitl` | ask a human to approve risky tool calls | `tokio` |
+| `plugin-web-search` | web search and page extraction as tools | `reqwest`, `tokio` |
+| `plugin-skills` | reusable agent skills from `SKILL.md` files | nothing |
+| `plugin-telemetry` | OpenTelemetry traces and metrics | `opentelemetry`, `opentelemetry_sdk`, `tracing` |
+| `plugin-session-log` | an append-only log of every session | `postcard` |
+| `plugin-cost` | token and currency ledger with a hard budget cap | `tiktoken-rs` |
+| `plugin-redaction` | scrub PII and secrets from outgoing requests | `tracing` |
 
 ## Service features
 
-Seven features. A service is driven by direct method calls and never implements `CucaPlugin`.
+Seven features. A service is a type you call yourself; it never implements `CucaPlugin`. [Services](@/services/_index.md) has one page for each.
 
-| Feature | Enables |
-|---|---|
-| `service-entity-extraction` | `plugin-memory` |
-| `service-speculative` | `dep:tokio`, `dep:tokio-stream` |
-| `service-replay` | `plugin-session-log` |
-| `service-prompt-cache` | `dep:sha2`, `dep:postcard` |
-| `service-rate-limit` | `dep:tokio` |
-| `service-vector-store` | `plugin-memory`, `dep:wide` |
-| `service-scheduler` | `dep:tokio`, `dep:tracing` |
-
-## Configuration feature
-
-One feature, `config-kdl = ["dep:kdl"]`. It compiles the KDL reader of `cuca::config`: `from_kdl_str`, `from_kdl_str_with_vars`, `load_kdl_str` and `load_kdl_file`. `provider-local` and `server` enable it, so a build with either has the reader. The `cuca::config` helpers (`one_or_many`, `from_str`, `size`, `duration`, `ConfigValue`) compile in every build. See [Configuration files](@/reference/environment.md).
-
-## Server features
-
-Two features, described under [Server](@/server/_index.md). Neither is a provider; `server` enables `provider-local` and `config-kdl`, so it satisfies the provider gate.
-
-| Feature | Enables |
-|---|---|
-| `server` | `provider-local`, `config-kdl`, `dep:axum`, `dep:clap`, `dep:tracing`, `dep:tracing-subscriber`, `dep:sysinfo`, `dep:nvml-wrapper`, `dep:wmi`, `dep:winreg`, `dep:getrandom`, `dep:tokio-stream`, `tokio/net`, `tokio/rt-multi-thread`, `tokio/signal`, `tokio/io-util` |
-| `server-tui` | `server`, `dep:ratatui`, `dep:crossterm` |
-
-## Feature edges
-
-Three hard edges, all service to plugin:
-
-- `service-entity-extraction = ["plugin-memory"]`
-- `service-replay = ["plugin-session-log"]`
-- `service-vector-store = ["plugin-memory", "dep:wide"]`
-
-One optional edge, not a Cargo feature: `ModelOrchestrator::with_session_store` exists only when `service-speculative` and `plugin-session-log` are both enabled.
-
-`service-prompt-cache`, `service-rate-limit` and `service-scheduler` declare no plugin dependency. A plugin never depends on, or names, a service.
-
-## Unconditional dependencies
-
-Five crates compile in every build. They carry the public wire types, the SSE parser and the response stream contract.
-
-| Crate | Version | Features |
+| Feature | What it is for | Pulls in |
 |---|---|---|
-| `bytes` | `1` | default |
-| `futures-core` | `0.3` | default |
-| `memchr` | `2` | default |
-| `serde` | `1` | `derive` |
-| `serde_json` | `1` | default; `provider-local` adds `preserve_order` |
+| `service-entity-extraction` | pull entities and relationships out of text into a memory graph | `plugin-memory` |
+| `service-speculative` | a fast model answers first and a slow model checks | `tokio`, `tokio-stream` |
+| `service-replay` | replay a recorded session as a response stream | `plugin-session-log` |
+| `service-prompt-cache` | a local response cache keyed by the request | `sha2`, `postcard` |
+| `service-rate-limit` | a token bucket plus a concurrency cap | `tokio` |
+| `service-vector-store` | an in-memory vector store for recalled turns | `plugin-memory`, `wide` |
+| `service-scheduler` | a priority scheduler and dispatcher over several backends | `tokio`, `tracing` |
 
-## Optional dependencies
+## Configuration and server features
 
-| Crate | Version | Declared features | Owned by |
-|---|---|---|---|
-| `reqwest` | `0.13` | `json`, `stream`, `form`; no defaults | the eight `provider-*`, `plugin-web-search` |
-| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `process`; no defaults (`server` adds `net`, `rt-multi-thread`, `signal`, `io-util`) | `provider-local`, `plugin-mcp`, `plugin-subagent`, `plugin-hitl`, `plugin-web-search`, `service-speculative`, `service-rate-limit`, `service-scheduler` |
-| `tokio-stream` | `0.1` | default | the seven HTTP `provider-*`, `service-speculative`, `server` |
-| `sha2` | `0.11` | default | `provider-anthropic`, `provider-local`, `service-prompt-cache` |
-| `getrandom` | `0.4` | default | `provider-anthropic`, `server` (request ids) |
-| `base64` | `0.23` | none | `provider-anthropic`, `plugin-sandbox` |
-| `rmcp` | `3` | `client`, `transport-child-process`, `transport-streamable-http-client-reqwest` | `plugin-mcp` |
-| `wasmtime` | `48` | default, plus `wat` | `plugin-sandbox` |
-| `tiktoken-rs` | `0.12` | default | `plugin-memory`, `plugin-cost` |
-| `jsonschema` | `0.52` | no defaults | `plugin-guardrails` |
-| `opentelemetry` | `0.32` | default | `plugin-telemetry` |
-| `opentelemetry_sdk` | `0.32` | `metrics`, `testing` | `plugin-telemetry` |
-| `tracing` | `0.1` | default | `plugin-guardrails`, `plugin-telemetry`, `plugin-redaction`, `service-scheduler`, `server` |
-| `postcard` | `1` | `use-std`; no defaults | `plugin-session-log`, `service-prompt-cache` |
-| `wide` | `1.7` | default | `provider-local` (the row-batched quantized matmul), `service-vector-store` |
-| `candle-core` | `0.11.0` | no defaults | `provider-local` |
-| `candle-nn` | `0.11.0` | no defaults | `provider-local` |
-| `half` | `2` | default | `provider-local` |
-| `minijinja` | `2.24` | `loader` | `provider-local` |
-| `minijinja-contrib` | `2.24` | `pycompat` | `provider-local` |
-| `unicode-general-category` | `1` | default | `provider-local` (the byte-level BPE pre-tokenizers) |
-| `tokenizers` | `0.22` | `onig`; no defaults | `provider-local` (the converter's Engram token map) |
-| `burn` | `0.22` | `std`, `fusion`, `autotune`, `extension`, `cubecl`; no defaults | `provider-local-gpu` (backends `burn/vulkan`, `burn/metal`, `burn/cuda`, `burn/rocm`) |
-| `burn-cubecl` | `0.22` | `std`, `fusion`, `autotune`; no defaults | `provider-local-gpu` |
-| `cubecl` | `0.11` | `stdlib`; no defaults | `provider-local-gpu` |
-| `axum` | `0.8` | `tokio`, `http1`, `json`, `query`, `matched-path`; no defaults | `server` |
-| `clap` | `4` | `derive` | `server` |
-| `tracing-subscriber` | `0.3` | `env-filter`, `json` | `server` |
-| `sysinfo` | `0.40` | `system`, `disk`; no defaults | `provider-local` (the converter's free-space check), `server` |
-| `nvml-wrapper` | `0.13` | default | `server` (NVIDIA, loaded at run time) |
-| `wmi` | `0.18` | no defaults | `server`, Windows only (GPU counters) |
-| `winreg` | `0.56` | default | `server`, Windows only (adapter table) |
-| `kdl` | `6.7` | `span`; no defaults | `config-kdl` (the KDL parser with source spans; its own `serde` mapping stays off) |
-| `ratatui` | `0.30` | default | `server-tui` |
-| `crossterm` | `0.29` | default | `server-tui` |
-
-### Why some defaults are off
-
-- `reqwest` has no defaults, so TLS arrives only through the `reqwest/rustls` entry that every `provider-*` feature and `plugin-web-search` carries.
-- `jsonschema` has no defaults because guardrails compiles inline schemas only and needs no `$ref` retrieval.
-- `postcard` has no defaults because its default `heapless-cas` feature pulls in `heapless`, which the crate never uses. `use-std` supplies the std buffer and COBS helpers.
-- `burn`, `burn-cubecl` and `cubecl` have no defaults because `burn`'s defaults enable the optimizer and autodiff, which inference never uses.
-
-### C compilers and downloads
-
-- `candle-core` hard-depends on `tokenizers[onig]`, so `provider-local` compiles C through `onig_sys` and needs a C compiler. `provider-local` also names `tokenizers` itself, with the same features.
-- The Vulkan and Metal backends are Rust (wgpu: SPIR-V, MSL). Every GPU feature still compiles C, because CubeCL's runtime pulls an embedded store (`turso`) that builds C through `cc`.
-- On Windows, a dependency's build script runs the SDK resource compiler (`rc.exe`; `windres` on the GNU target) for the GPU features.
-- `provider-local-cuda` and `provider-local-rocm` pull CubeCL's LLVM backend. Its build script, `tracel-llvm-bundler`, downloads a prebuilt LLVM on the first build (network needed once, then cached) and links it statically.
-- docs.rs builds have no network, so the `[package.metadata.docs.rs]` feature list names every feature except those two: thirty-three of the thirty-five.
-
-### Dev dependencies
-
-| Crate | Version | Features |
+| Feature | What it is for | Pulls in |
 |---|---|---|
-| `ctor` | `1.0.13` | default |
-| `rmcp` | `3` | `transport-io` |
-| `tokio` | `1` | `rt`, `time`, `macros`, `sync`, `net`, `io-util`, `process`, `io-std` |
-| `tokio-stream` | `0.1` | default |
-| `schemars` | `1` | default |
-| `divan` | `0.1` | default |
+| `config-kdl` | read a settings file in KDL: `from_kdl_str`, `from_kdl_str_with_vars`, `load_kdl_str`, `load_kdl_file` | `kdl` |
+| `server` | the `cuca` binary: `cuca serve` and `cuca balance`; an OpenAI-compatible HTTP API, stats and metrics | `provider-local`, `config-kdl`, `axum`, `clap`, `tracing`, `tracing-subscriber`, `sysinfo`, `nvml-wrapper`, `getrandom`, `tokio-stream`; on Windows also `wmi` and `winreg` |
+| `server-tui` | `cuca tui`, a live terminal dashboard | `server`, `ratatui`, `crossterm` |
 
-## Feature-conditional modules
+The `cuca::config` helpers `one_or_many`, `from_str`, `size`, `duration` and `ConfigValue` compile in every build. [Configuration files](@/reference/environment.md) describes the KDL reader. [Server](@/server/_index.md) describes the binary.
 
-| Module | Gate |
+## Build notes
+
+- `provider-local` compiles some C code, so it needs a C compiler. Every GPU feature also compiles C.
+- On Windows, the GPU features run the SDK resource compiler (`rc.exe`, or `windres` on the GNU target) in a build script.
+- `provider-local-cuda` and `provider-local-rocm` download a prebuilt LLVM on the first build, so they need network access once. The download is cached. `provider-local-vulkan` and `provider-local-metal` need no download.
+- docs.rs builds have no network, so the docs.rs feature list names every feature except those two: thirty-three of the thirty-five.
+- Publishing and CI use the same list, `ALL_NO_LLVM`. Do not build with `--all-features`; on Windows it fails to link.
+- `provider-local` turns on `serde_json/preserve_order`, so JSON maps keep the order the caller wrote them. Chat templates see that order.
+
+## Modules that depend on features
+
+| Module | Present when |
 |---|---|
 | `export` | `plugin-memory` or `service-prompt-cache` |
 | `cost_otel` | `plugin-cost` and `plugin-telemetry` |
+| `server` | `server` |
 
-Every other public module compiles unconditionally: `types`, `error`, `config`, `request`, `session`, `sse`, `plugin`, `plugins`, `services`, `client`. The `plugins` and `services` modules are always present. Their submodules are individually gated, so each is empty when none of its features is on. The `provider` module is `pub(crate)`.
+Every other public module compiles in every build. `plugins` and `services` always exist, and each of their submodules is empty unless its feature is on. See [The public API surface](@/reference/public-api.md).
 
-## Crate metadata
+## Always-on dependencies
 
-| Field | Value |
+Five crates compile in every build. They carry the wire types, the SSE parser and the response stream.
+
+| Crate | Features |
 |---|---|
-| Package name | `cuca` |
-| Version | `0.8.0` |
-| Edition | `2024` |
-| `rust-version` | `1.98` |
-| Pinned toolchain | `1.98.0`, from `rust-toolchain.toml` |
-| License | `Apache-2.0` |
-| `[lib] doctest` | `false` |
-| Binary targets | `cuca` (`src/bin/cuca.rs`, requires `server`) |
+| `bytes` | default |
+| `futures-core` | default |
+| `memchr` | default |
+| `serde` | `derive` |
+| `serde_json` | default |
 
-`doctest = false` because the doctest pass does a plain library build that the provider gate rejects, and the crate has no doctests.
+## Examples
 
-## Example targets
+There are 24 examples in `examples/`. Run one with `cargo run --example <name> --features <list>`. All but `local_model` need `provider-llamacpp`, because they stream from a local `llama-server`.
 
-Twenty-four examples. All but `local_model` require `provider-llamacpp`. Run one with `cargo run --example <name> --features <list>`.
-
-| Example | Required features |
+| Example | Features |
 |---|---|
 | `llamacpp_gemma`, `stream_all_blocks`, `custom_plugin` | `provider-llamacpp` |
 | `local_model` | `provider-local` |
-| `cost` | `provider-llamacpp`, `plugin-cost` |
-| `cost_otel` | `provider-llamacpp`, `plugin-cost`, `plugin-telemetry` |
-| `entity_extraction` | `provider-llamacpp`, `service-entity-extraction` |
-| `guardrails` | `provider-llamacpp`, `plugin-guardrails` |
-| `hitl` | `provider-llamacpp`, `plugin-hitl` |
-| `mcp` | `provider-llamacpp`, `plugin-mcp` |
-| `memory` | `provider-llamacpp`, `plugin-memory` |
-| `prompt_cache` | `provider-llamacpp`, `service-prompt-cache` |
-| `rate_limit` | `provider-llamacpp`, `service-rate-limit` |
-| `redaction` | `provider-llamacpp`, `plugin-redaction` |
-| `replay` | `provider-llamacpp`, `service-replay` |
-| `sandbox` | `provider-llamacpp`, `plugin-sandbox` |
-| `session_log` | `provider-llamacpp`, `plugin-session-log` |
-| `skills` | `provider-llamacpp`, `plugin-skills` |
-| `scheduler` | `provider-llamacpp`, `service-scheduler` |
-| `speculative` | `provider-llamacpp`, `service-speculative` |
-| `subagent` | `provider-llamacpp`, `plugin-subagent` |
-| `telemetry` | `provider-llamacpp`, `plugin-telemetry` |
-| `vector_store` | `provider-llamacpp`, `service-vector-store` |
-| `web_search` | `provider-llamacpp`, `plugin-web-search` |
+| `cost`, `cost_otel` | `provider-llamacpp`, `plugin-cost`; `cost_otel` also `plugin-telemetry` |
+| `guardrails`, `hitl`, `mcp`, `memory`, `redaction`, `sandbox`, `session_log`, `skills`, `subagent`, `telemetry`, `web_search` | `provider-llamacpp` plus the plugin feature with the same name, such as `plugin-hitl` for `hitl` (`session_log` uses `plugin-session-log`, `web_search` uses `plugin-web-search`) |
+| `entity_extraction`, `prompt_cache`, `rate_limit`, `replay`, `scheduler`, `speculative`, `vector_store` | `provider-llamacpp` plus the service feature with the same name, such as `service-rate-limit` for `rate_limit` |
 
-Examples live in `examples/<name>.rs`.
+`benches/vector_store.rs` is a Divan benchmark. It needs `provider-openai` and `service-vector-store`.
 
-## Bench target
+## Crate facts
 
-`benches/vector_store.rs` is a Divan benchmark with `harness = false`. It requires `provider-openai` and `service-vector-store`. No CI job runs it.
-
-## Feature combinations CI verifies
-
-| Job | Command |
+| Field | Value |
 |---|---|
-| `fmt` | `cargo fmt --all --check` |
-| `clippy` | `cargo clippy --all-targets <features> -- -D warnings`, with `<features>` one of `--no-default-features --features provider-openai` and `--no-default-features --features $ALL_NO_LLVM` |
-| `no_provider` | `cargo check --no-default-features`, asserted to fail |
-| `test` | `cargo test <features>` over the same two legs as `clippy`, with `CARGO_PROFILE_DEV_DEBUG=0` |
-| `doc` | `cargo doc --no-deps --no-default-features --features "$ALL_NO_LLVM"` |
-| `local_gpu_llvm` | `cargo check --all-targets --no-default-features --features provider-local-cuda,provider-local-rocm`; the only job that downloads the LLVM bundle |
-| `plugin_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<plugin>`, once per plugin feature (twelve) |
-| `service_solo` | `cargo check --all-targets --no-default-features --features provider-openai,<service>`, once per service feature (seven) |
-| `server_solo` | `cargo check --all-targets --no-default-features --features <feature>`, once for `server` and once for `server-tui`, plus the leg `provider-openai,config-kdl`, which checks the KDL reader without `provider-local` |
-| `plugin_layering` | greps asserting no file under `src/plugins/` names a `service-` feature, a `crate::services` path, or a `plugins::` path for `prompt_cache`, `entity_extraction`, `replay` or `rate_limit` |
-
-All jobs run on `ubuntu-latest`. `ALL_NO_LLVM` is a top-level `env` entry in `.github/workflows/ci.yml`, the same list as the docs.rs feature set: every feature except `provider-local-cuda` and `provider-local-rocm`. The run steps expand it as `$ALL_NO_LLVM`.
+| Package | `cuca`, version `0.8.0` |
+| Edition | `2024` |
+| Minimum Rust | `1.98`; `rust-toolchain.toml` pins `1.98.0` |
+| License | `Apache-2.0` |
+| Binary | `cuca` (`src/bin/cuca.rs`), needs `server` |

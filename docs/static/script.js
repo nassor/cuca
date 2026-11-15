@@ -38,6 +38,29 @@
   // --------------------------------------------------------------------------
   const prismIds = { shellscript: 'bash' };
 
+  // Prism ships no KDL grammar, and every config sample on the site is KDL
+  // (KDL 2: `#true`/`#false`/`#null` keywords, `/-` slashdash comments, raw
+  // strings `#"..."#`). The order matters: Prism tries the patterns in turn,
+  // so comments and strings claim their text before names and numbers.
+  if (window.Prism) {
+    Prism.languages.kdl = {
+      comment: [
+        { pattern: /\/\*[\s\S]*?\*\//, greedy: true },
+        { pattern: /\/\/.*/, greedy: true },
+        { pattern: /\/-/, alias: 'operator' },
+      ],
+      string: [
+        { pattern: /(#+)"[\s\S]*?"\1/, greedy: true },
+        { pattern: /"(?:\\[\s\S]|[^\\"])*"/, greedy: true },
+      ],
+      boolean: /#(?:true|false|null|inf|-inf|nan)\b/,
+      'attr-name': /[A-Za-z_][\w.-]*(?==)/,
+      number: { pattern: /(^|[\s=(])[+-]?(?:0x[\da-fA-F_]+|0o[0-7_]+|0b[01_]+|\d[\d_]*(?:\.\d[\d_]*)?(?:[eE][+-]?\d+)?)\b/, lookbehind: true },
+      tag: { pattern: /(^|[{;]\s*|^\s*)[A-Za-z_][\w.-]*/m, lookbehind: true },
+      punctuation: /[{};=()]/,
+    };
+  }
+
   document.querySelectorAll('pre > code[data-lang]').forEach((code) => {
     const lang = prismIds[code.dataset.lang] || code.dataset.lang;
     if (lang && !code.classList.contains(`language-${lang}`)) {
@@ -587,6 +610,7 @@
       shellscript: 'Bash',
       powershell: 'PowerShell',
       json: 'JSON',
+      kdl: 'KDL',
       toml: 'TOML',
       text: 'Text',
       plain: 'Text',

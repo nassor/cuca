@@ -1,127 +1,63 @@
 +++
-title = "Local configuration"
-description = "The LocalModelConfig, SamplingConfig and BatchingConfig fields with their defaults, valid ranges and KDL spelling, the cache directory and token rules, and the local_model example's flags."
+title = "Configuration"
+description = "Every LocalModelConfig, SamplingConfig, BatchingConfig and EngramCache key with its default and range, the KDL forms, the cache directory and the local_model example flags."
 template = "page.html"
-weight = 1
+weight = 5
 +++
 
-# Local configuration
+# Configuration
 
 <dl class="page-facts">
 <dt>In one line</dt>
-<dd><code>LocalModelConfig</code> holds the model source, cache, context length, sampling, device, drafter, expert placement, Engram cache, batching and offload; <code>SamplingConfig</code> and <code>BatchingConfig</code> hold the sampler and scheduler settings.</dd>
+<dd>One <code>LocalModelConfig</code> holds every setting of a local model. You fill it from a KDL file or from Rust, and both use the same names.</dd>
 <dt>You need</dt>
 <dd>The <code>provider-local</code> feature. Entry points are on <a href="@/providers/local/_index.md">Local (in-process)</a>.</dd>
 <dt>Read this if</dt>
-<dd>You need a field default, a valid range, or the KDL key of a field.</dd>
+<dd>You need a key, its default, its valid range, or its KDL spelling.</dd>
 </dl>
-
-## LocalModelConfig
-
-All fields are public. `LocalModel::load` validates the configuration before it starts the engine thread and returns `CucaError::Config` for a field outside its range. The struct also deserializes from KDL with the field names as keys; see [KDL configuration](#kdl-configuration).
-
-| Field | Default | Meaning |
-|---|---|---|
-| `source` | `ModelSource::default_model()` | where the GGUF file comes from; see [Model sources](@/providers/local/model-sources.md) |
-| `cache_dir` | `None` | download cache; `None` is the platform cache directory; see [Cache directory and token](#cache-directory-and-token) |
-| `hf_token` | `None` | Hugging Face token; `None` or an empty string downloads anonymously |
-| `context_length` | `None` | prompt plus completion tokens per request; sizes the K/V pool |
-| `sampling` | `SamplingConfig::default()` | sampler defaults you set; see [SamplingConfig](#samplingconfig) |
-| `chat_template` | `None` | Jinja text that replaces the GGUF's chat template; see [Chat templates](@/providers/local/chat-templates.md#where-the-template-comes-from) |
-| `chat_template_file` | `None` | path of a file holding that Jinja text, read at load |
-| `device` | `LocalDevice::Cpu` | where the forward pass runs |
-| `drafter` | `None` | `Option<DrafterSource>`: a draft model for speculative decoding |
-| `draft_tokens` | `5` | most tokens a drafter proposes per round, `1..=16`; checked only with a drafter |
-| `experts` | `ExpertPlacement::Resident` | where a mixture-of-experts model's experts live |
-| `convert` | `ConvertConfig::default()` | `quant` and `engram_quant` of a converted checkpoint |
-| `batching` | `BatchingConfig::default()` | how concurrent requests share the engine; see [BatchingConfig](#batchingconfig) |
-| `shards` | `[]` | more GPUs to split the model over (tensor parallelism) |
-| `gpu_layers` | `None` | layers to run on the GPU, the rest on the CPU |
-| `engram` | `EngramCache::default()` | row cache and reader threads of an Engram table; see [Engram cache](#engram-cache) |
-| `shard_dirs` | `[]` | extra directories searched for the parts of a split GGUF set |
-| `on_download_progress` | `None` | download and conversion progress observer |
-
-- `source` defaults to the preset `gemma4-e2b-q4_0`.
-- `context_length: None` resolves to the smaller of 8,192 and the model's own maximum. An explicit value must be at least 1 and at most the model's maximum.
-- `device` needs the matching cargo feature for a GPU, else `load` fails with `CucaError::Config` naming it. In KDL it is a string such as `device "vulkan:0"`; further GPUs go in `shards`. See [Devices and GPU features](@/providers/local/gpu.md#devices-and-gpu-features).
-- `chat_template` also replaces the template a preset pins. Everything derived from the template follows it. `chat_template_file` is the same override read from a file: `chat_template` wins over it, and it wins over a preset's pinned template. A file that cannot be read fails `load` with `CucaError::Io` naming it. A template that does not compile, or cannot render a one-message conversation, fails `load` with `CucaError::Config`.
-- `drafter` takes a `DrafterSource::File(ModelSource)` or `DrafterSource::InTrunk`; in KDL `drafter "in-trunk"` or a source in any form of `source`. The pairings and limits are on [Speculative decoding](@/providers/local/drafting.md). `DrafterSource::InTrunk` needs the CPU. For DeepSeek-V4.1 the `File` source is the model's own checkpoint source, which converts to the DSpark drafter's file; it runs on the CPU only.
-- `experts` matters only for a model with experts. `Tiered` needs a RAM budget on the CPU; on a GPU it needs a device budget, a RAM budget or both, and a RAM budget alone is host-tiered: the CPU computes the experts from the RAM tier. `Host` needs a GPU. KDL forms are `experts "resident"`, `experts { host; }`, `experts { host layers=4; }` and `experts { tiered ram_bytes="4g"; }`, where a size is an integer or a string with a `k`, `m` or `g` suffix; see [Tiered expert placement](@/providers/local/expert-tiers.md) and [Run on a GPU](@/providers/local/gpu.md).
-- `convert` applies to `ModelSource::Checkpoint` and `ModelSource::Dir` only. `WeightQuant` is `f16`, `q8_0` (default) or `q4_0`. `EngramQuant` is `q8_0` (default), `q4_0` or `bf16` and applies to DeepSeek-V4.1's Engram table only. A non-default `engram_quant` converts and caches next to the default one; see [DeepSeek-V4.1](@/providers/local/checkpoints.md#deepseek-v4-1).
-- `shards` makes the model run on `1 + shards.len()` devices, `device` being the first. Every device is a GPU of one backend, there is no `drafter`, `experts` is `Resident`, and the model must be splittable; see [Tensor parallelism](@/providers/local/gpu.md#tensor-parallelism).
-- `gpu_layers: Some(n)` runs the last `n` layers and the output head on `device` and the rest on the CPU. It needs a GPU `device`, no `shards` and no `drafter`; `n` may not exceed the model's layer count. `Some(0)` loads the model on the CPU, and `LocalModel::layer_split()` reports the split. See [Layer offload](@/providers/local/gpu.md#layer-offload-gpu-layers).
-- `shard_dirs` is searched after the directory of the named first part, for `ModelSource::File` naming a split set whose parts sit on different volumes; see [Split GGUF files](@/providers/local/model-sources.md#split-gguf-files).
-- `Debug` for `LocalModelConfig` prints `hf_token` as `<redacted>`.
-
-## SamplingConfig
-
-| Field | Default | Meaning |
-|---|---|---|
-| `temperature` | `None` (built-in `1.0`) | softmax temperature, finite and at least `0.0`; `Some(0.0)` is greedy |
-| `top_k` | `None` (built-in `64`) | keeps the `top_k` most likely tokens; `Some(0)` disables the filter |
-| `top_p` | `None` (built-in `0.95`) | nucleus threshold in `(0, 1]`; `Some(1.0)` disables the filter |
-| `seed` | `None` | fixed generator seed |
-
-The fields are `Option` so "set" and "default" can be told apart: `top_k: Some(64)` beats a model file that says 20, `None` does not.
-
-- Each of temperature, `top_k` and `top_p` resolves on its own, highest first: the request value (`set_temperature`, `set_top_k`, `set_top_p`), the `SamplingConfig` value, the model file's default, the built-in default (`SamplingConfig::DEFAULT_TEMPERATURE`, `DEFAULT_TOP_K`, `DEFAULT_TOP_P`). `LocalModel::sampling()` returns the resolved values.
-- The file defaults are the GGUF keys `general.sampling.temp`, `general.sampling.top_k` and `general.sampling.top_p`, the names llama.cpp reads. The checkpoint converter writes them from `generation_config.json`. A value the config would reject (a negative temperature, `top_p` outside `(0, 1]`) is ignored, and a `top_k` of zero or less disables the filter. The other `general.sampling.*` keys (`min_p`, repetition penalties, XTC, mirostat, `sequence`) name samplers the engine does not have and are not read.
-- With `seed: Some(n)`, every request restarts the generator from `n`, so equal prompts sample equal tokens. A request `seed` does the same for that request alone and wins over the config seed. With `None` the generator is seeded from the system once at load.
-- The sampler applies temperature, top-k, softmax and top-p in that order, then draws once. Temperature `0.0` takes the first maximum.
-
-## BatchingConfig
-
-In KDL: `batching max_sequences=8 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false`, any subset of the properties.
-
-| Field | Default | Meaning |
-|---|---|---|
-| `max_sequences` | `4` | requests that run at once, `1..=64` |
-| `kv_tokens` | `None` | positions in the shared K/V pool |
-| `max_step_tokens` | `None` | rows of one forward step across all requests |
-| `prefix_cache` | `true` | keep the K/V of finished requests for later prompts |
-
-- `kv_tokens: None` is twice `context_length`. An explicit value is at least `context_length + 16` and rounds up to whole blocks of 16. It is the K/V memory knob, reported by `LocalModel::kv_cache_bytes`: raising `max_sequences` does not raise it, and a pool too small for the running requests makes them wait or preempt each other. The cost per model is in [Local limits and errors](@/providers/local/limits-and-errors.md#limits).
-- `max_step_tokens` is at least `max_sequences` and at most 8,192. `None` is the prefill chunk of the context length, `clamp(2,097,152 / context_length, 16, 256)`, so 256 at 8,192 positions. With tiered experts under compressed sparse attention (DeepSeek-V4.1) it is 4,096, because a larger step reads fewer expert bytes per prompt token.
-- `prefix_cache: false` registers nothing in the prefix store, so every prompt prefills in full.
-- A drafter that reads every position of its sequence (the in-trunk head, the EAGLE and the DFlash drafters) forces `max_sequences` to 1. A Gemma 4 assistant drafts only while one request runs alone.
-- `LocalModel::serving_stats()` returns `ServingStats`. Gauges: `running`, `waiting`, `max_sequences`, `free_blocks`, `cached_blocks`, `used_blocks`, `total_blocks` and `snapshot_bytes`. Totals since load: `prefix_hit_tokens`, `preemptions`, `steps`, `batched_rows`, `prefill_rows` (the part of `batched_rows` that are prompt rows), `generated_tokens`, `admissions`, `queue_wait_ns` (the wait between dispatch and first admission, summed), `step_ns` (forward pass time, summed) and, for the last pass, `last_step_ns` and `last_step_rows`. `batched_rows > steps` means steps carried several rows. The counters are atomics the engine thread updates, so reading them never waits for a step.
-
-## Engram cache
-
-A model with an Engram table (DeepSeek-V4.1) reads rows of `per_layer_token_embd.weight` from the GGUF file. `EngramCache` sets how: a pool of reader threads reads the distinct rows of a forward pass sorted by file offset, and a row cache keeps the most recently used rows. In KDL: `engram ram_bytes="8g" reader_threads=32`, any subset; `ram_bytes` is an integer or a string with an optional `k`, `m` or `g` suffix (powers of 1024). The bounds and error messages are on [Local limits and errors](@/providers/local/limits-and-errors.md#engram-row-cache).
-
-| Field | Default | Meaning |
-|---|---|---|
-| `ram_bytes` | 4 GiB | bytes of RAM for cached rows, `1 MiB..=1 TiB` |
-| `reader_threads` | `16` | disk reader threads, `1..=64` |
-
-- The cache holds rows as the file stores them and counts 48 bytes of overhead per row against `ram_bytes`. At the bound it evicts the least recently used row. Its memory is allocated as it fills, so a short session does not pay for the bound.
-- A cache smaller than the distinct rows of one pass still gives correct output: rows evicted before use are read again. The values change speed, never the output.
-- `LocalModel::engram_stats()` returns `EngramStats`: `lookups`, `cache_hits`, `disk_reads`, `bytes_read`, `resident_rows`, `resident_bytes` and `capacity_rows`, and `hit_rate()`. A model without an Engram table ignores the setting.
 
 ## KDL configuration
 
-`cuca::config::load_kdl_file::<LocalModelConfig>(path)` reads a KDL file into a `LocalModelConfig`, and `load_kdl_str` does the same for text. Both need the `config-kdl` feature, which `provider-local` turns on. Every key is the field name; an unknown key fails with an error naming it.
+A KDL file is the usual way to configure a model. Each key is the name of a `LocalModelConfig` field. Lines that start with `//` are comments, so the commented keys below are alternatives you can switch on.
 
 ```kdl,name=local_model.kdl
+// Where the model comes from: a preset name, a model file, or a checkpoint.
 source "qwen3-0.6b-q8_0"
+// source file="/models/x.gguf"
+// source dir="/ckpt"
+// source "repo:revision:file"
+
+// Where it runs. A GPU needs its cargo feature, for example provider-local-vulkan.
 device "vulkan:0"
-shards "vulkan:1"
-gpu_layers 20
-context_length 8192
-cache_dir "D:/cuca-cache"
-hf_token "${HF_TOKEN:-}"
-chat_template_file "templates/x.jinja"
+// shards "vulkan:1"                 // split the model over more GPUs
+// gpu_layers 20                     // run only the last 20 layers on the GPU
+
+context_length 8192                  // prompt plus reply tokens per request
+cache_dir "D:/cuca-cache"            // downloads and conversions
+hf_token "${HF_TOKEN:-}"             // empty means an anonymous download
+// chat_template_file "templates/x.jinja"
+
 sampling temperature=0.7 top_k=40 top_p=0.9 seed=7
-batching max_sequences=8 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false
-experts { tiered ram_bytes="4g" device_bytes="6g" loader_threads=8; }
-engram ram_bytes="2g" reader_threads=8
-convert quant="q4_0" engram_quant="q8_0"
-drafter "in-trunk"
-draft_tokens 5
+batching max_sequences=8 kv_tokens=16384 max_step_tokens=256
+
+// A mixture of experts model: where its experts live.
+// experts "resident"
+// experts { host; }
+// experts { tiered ram_bytes="4g" device_bytes="6g" loader_threads=8; }
+
+// Speculative decoding.
+// drafter "in-trunk"
+// draft_tokens 5
+
+// DeepSeek-V4.1 and converted checkpoints.
+// engram ram_bytes="2g" reader_threads=8
+// convert quant="q4_0" engram_quant="q8_0"
+// shard_dirs "E:/parts" "F:/parts"
 ```
 
-`examples/configs/local_model.kdl` lists every key, all but `source` commented out.
+Not every combination of keys loads. `LocalModel::load` rejects the impossible ones with a `CucaError::Config`; the list is in [Limits and errors](@/providers/local/limits-and-errors.md#rejected-combinations).
+
+Load the file with `cuca::config::load_kdl_file`. It needs the `config-kdl` feature, which `provider-local` turns on. An unknown key fails with an error naming it.
 
 ```rust,name=Load a configuration file
 use std::path::Path;
@@ -131,22 +67,176 @@ let config: LocalModelConfig = cuca::config::load_kdl_file(Path::new("local_mode
 let model = cuca::LocalModel::load(config).await?;
 ```
 
-- `source` is a string (a preset name, `"repo:revision:file"` or `"repo:revision"`), `source file="/models/x.gguf"`, `source dir="/ckpt"`, `source { checkpoint repo=".." revision=".."; }` or `source { hugging_face repo=".." revision=".." file=".." sha256=".." { part file=".." sha256=".."; template repo=".." revision=".." file=".."; } }`. The string form never touches the file system. The forms are on [Model sources](@/providers/local/model-sources.md).
-- A list of devices is `device "vulkan:0"` plus `shards "vulkan:1" "vulkan:2"`. `shard_dirs` takes one or several directories the same way.
-- A byte count (`ram_bytes`, `device_bytes`) is an integer or a string such as `"512m"` or `"4g"`.
-- `${VAR}` and `${VAR:-default}` in the file text are replaced before parsing, from a top-level `variables { NAME "value" }` block first, then the process environment. `hf_token "${HF_TOKEN:-}"` reads the token from the environment and yields an empty token, an anonymous download, when it is unset. This is the only place cuca reads the environment for a setting.
-- `on_download_progress` has no KDL form; set it in Rust.
+`load_kdl_str` does the same for text you already hold. The Rust form of the same settings fills the struct directly. Every field has a default, so you name only the ones you change.
+
+```rust,name=The same settings in Rust
+use cuca::{BatchingConfig, LocalModel, LocalModelConfig, SamplingConfig};
+
+let config = LocalModelConfig {
+    source: "qwen3-0.6b-q8_0".parse()?,
+    device: "vulkan:0".parse()?,
+    context_length: Some(8192),
+    cache_dir: Some("D:/cuca-cache".into()),
+    hf_token: std::env::var("HF_TOKEN").ok(),
+    sampling: SamplingConfig {
+        temperature: Some(0.7),
+        top_k: Some(40),
+        top_p: Some(0.9),
+        seed: Some(7),
+    },
+    batching: BatchingConfig {
+        max_sequences: 8,
+        kv_tokens: Some(16384),
+        max_step_tokens: Some(256),
+        ..Default::default()
+    },
+    ..Default::default()
+};
+let model = LocalModel::load(config).await?;
+```
 
 The `cuca` binary reads the same keys inside the `model` nodes of its `serve` section; see [Model server](@/server/model-server.md).
 
+### KDL spelling
+
+- `source` is a string (a preset name, `"repo:revision:file"` or `"repo:revision"`), `source file="/models/x.gguf"`, `source dir="/ckpt"`, `source { checkpoint repo=".." revision=".."; }` or `source { hugging_face repo=".." revision=".." file=".." sha256=".." { part file=".." sha256=".."; template repo=".." revision=".." file=".."; } }`. The string form never touches the file system. The forms are explained on [Model files and downloads](@/providers/local/model-sources.md).
+- `device` is a string such as `"vulkan:0"`. A list of devices is `device "vulkan:0"` plus `shards "vulkan:1" "vulkan:2"`. `shard_dirs` takes one or several directories the same way.
+- A byte count (`ram_bytes`, `device_bytes`, `engram ram_bytes`) is an integer or a string with a `k`, `m` or `g` suffix, such as `"512m"` or `"4g"`. The suffixes are powers of 1024 and not case sensitive.
+- `${VAR}` and `${VAR:-default}` in the file are replaced before parsing, from a top-level `variables { NAME "value" }` block first, then from the process environment. `hf_token "${HF_TOKEN:-}"` reads the token from the environment and gives an empty token (an anonymous download) when it is unset. A `${VAR}` with no value and no default is a `CucaError::Config`. This is the only place cuca reads the environment for a setting.
+- `on_download_progress` has no KDL form. Set it in Rust.
+- A string that is no valid device, quantization or source is a `CucaError::Config`. For a source the message lists the preset names.
+
+## LocalModelConfig
+
+All fields are public. `LocalModel::load` checks the configuration before it starts the engine thread and returns `CucaError::Config` for a field outside its range.
+
+| Field | Default | Sets |
+|---|---|---|
+| `source` | preset `gemma4-e2b-q4_0` | the model to load; see [Model files and downloads](@/providers/local/model-sources.md) |
+| `cache_dir` | platform cache directory | where downloads and conversions are kept; see [Cache directory and token](#cache-directory-and-token) |
+| `hf_token` | none, anonymous | Hugging Face access token |
+| `context_length` | the smaller of 8,192 and the model's maximum | prompt plus reply tokens per request; sizes the K/V pool |
+| `sampling` | all fields unset | sampler defaults; see [SamplingConfig](#samplingconfig) |
+| `chat_template` | none | template text or built-in name that replaces the model's own template; see [Replace the chat template](@/providers/local/requests.md#replace-the-chat-template) |
+| `chat_template_file` | none | path of a file holding that template, read at load |
+| `device` | `cpu` | where the forward pass runs; see [Run on a GPU](@/providers/local/gpu.md) |
+| `shards` | none | more GPUs to split the model over (tensor parallelism) |
+| `gpu_layers` | none | how many layers run on the GPU, the rest on the CPU |
+| `experts` | `resident` | where a mixture of experts model keeps its experts |
+| `drafter` | none | a draft model for speculative decoding; see [Speculative decoding](@/providers/local/drafting.md) |
+| `draft_tokens` | 5 | most tokens the drafter proposes per round, 1 to 16 |
+| `convert` | `quant` `q8_0`, `engram_quant` `q8_0` | precision of a converted checkpoint |
+| `batching` | see [BatchingConfig](#batchingconfig) | how concurrent requests share the engine |
+| `engram` | 4 GiB, 16 threads | the row cache of an Engram table; see [Engram cache](#engram-cache) |
+| `shard_dirs` | none | extra directories searched for the parts of a split GGUF |
+| `on_download_progress` | none | download and conversion progress observer; Rust only |
+
+- `context_length`: an explicit value must be at least 1 and at most the model's own maximum, or the load fails with `context_length N exceeds the model maximum M`. The K/V memory it costs depends on the model; see [Limits and errors](@/providers/local/limits-and-errors.md#how-much-memory-a-model-needs).
+- `device`: `cpu`, `vulkan`, `vulkan:<n>` (the n-th discrete GPU), `vulkan:integrated:<n>`, `metal` in the same three forms, `cuda` or `cuda:<n>`, `rocm` or `rocm:<n>`. A GPU needs its cargo feature, or the load fails with `CucaError::Config` naming the feature. See [Run on a GPU](@/providers/local/gpu.md).
+- `shards`: the model runs on `1 + shards.len()` devices, `device` being the first. Every device is a GPU of the same backend, there is no `drafter`, `experts` is `resident`, and the model must be splittable. See [Run on a GPU](@/providers/local/gpu.md).
+- `gpu_layers`: runs the last `n` layers and the output head on `device`, the rest on the CPU. It needs a GPU `device`, no `shards` and no `drafter`, and `n` may not exceed the model's layer count. `0` loads the model on the CPU. `LocalModel::layer_split()` reports the split. See [Fit a large model](@/providers/local/placement.md).
+- `experts`: matters only for a mixture of experts model. KDL forms are `experts "resident"`, `experts { host; }`, `experts { host layers=4; }` and `experts { tiered ram_bytes="4g"; }`. `host` needs a GPU. `tiered` needs a RAM budget on the CPU, and on a GPU a device budget, a RAM budget or both. See [Tiered experts](@/providers/local/expert-tiers.md) and [Fit a large model](@/providers/local/placement.md).
+- `drafter`: `drafter "in-trunk"` uses the prediction head inside the model's own file and needs the CPU. Any source form of `source` names a separate drafter file. The pairings and limits are on [Speculative decoding](@/providers/local/drafting.md).
+- `chat_template` also replaces a template a preset pins, and it wins over `chat_template_file`.
+- `convert` applies to checkpoint sources only: `source dir=".."`, `source { checkpoint ..; }` and the `"repo:revision"` string. `quant` is `f16`, `q8_0` or `q4_0`. `engram_quant` is `q8_0`, `q4_0` or `bf16` and applies to DeepSeek-V4.1's Engram table only. A non-default value converts and caches next to the default one. See [Run DeepSeek-V4.1](@/providers/local/deepseek-v41.md).
+- `shard_dirs`: searched after the directory of the named first part, for a split GGUF whose parts sit on different volumes. See [Model files and downloads](@/providers/local/model-sources.md).
+- `Debug` for `LocalModelConfig` prints `hf_token` as `<redacted>`.
+
+## SamplingConfig
+
+`SamplingConfig` sets the sampler defaults for requests that do not set their own.
+
+| Field | Default | Range |
+|---|---|---|
+| `temperature` | unset, built-in `1.0` | finite and at least 0; `0.0` is greedy |
+| `top_k` | unset, built-in `64` | `0` turns the filter off |
+| `top_p` | unset, built-in `0.95` | above 0 up to 1; `1.0` turns the filter off |
+| `seed` | unset | any `u64` |
+
+The fields are optional so that "set" and "default" differ: `top_k: Some(64)` beats a model file that says 20, and `None` does not. `temperature`, `top_k` and `top_p` each resolve on their own, taking the first value that is set.
+
+<div class="dgm">
+<div class="dgm-scroll">
+<svg viewBox="0 0 660 156" role="img" aria-labelledby="samp-title samp-desc">
+  <title id="samp-title">Where a sampling value comes from, highest priority first</title>
+  <desc id="samp-desc">Four boxes from left to right. 1: the request, with temperature, top_k, top_p and seed. 2: the SamplingConfig in your configuration. 3: the model file's general.sampling keys for temperature, top_k and top_p. 4: the built-in defaults, temperature 1.0, top_k 64 and top_p 0.95. Each value takes the first one that is set. The seed comes only from the request or the configuration.</desc>
+  <defs>
+    <marker id="samp-arrow" viewBox="0 0 8 8" refX="7" refY="4"
+            markerWidth="6" markerHeight="6" orient="auto">
+      <path d="M0 0.6 L7 4 L0 7.4 z" fill="var(--muted-foreground)"/>
+    </marker>
+  </defs>
+  <text class="t-title" x="10" y="20">Sampling precedence</text>
+  <rect class="blk blk-data" x="10" y="38" width="136" height="80" rx="6"/>
+  <text class="t-lbl t-mid t-data" x="78" y="60">1 Request</text>
+  <text class="t-sm t-mid" x="78" y="80">temperature, top_k,</text>
+  <text class="t-sm t-mid" x="78" y="94">top_p, seed</text>
+  <path class="arw" d="M148 78 H176" marker-end="url(#samp-arrow)"/>
+  <rect class="blk blk-ctl" x="178" y="38" width="136" height="80" rx="6"/>
+  <text class="t-lbl t-mid t-ctl" x="246" y="60">2 SamplingConfig</text>
+  <text class="t-sm t-mid" x="246" y="80">the sampling key</text>
+  <text class="t-sm t-mid" x="246" y="94">of your config</text>
+  <path class="arw" d="M316 78 H344" marker-end="url(#samp-arrow)"/>
+  <rect class="blk" x="346" y="38" width="136" height="80" rx="6"/>
+  <text class="t-lbl t-mid" x="414" y="60">3 Model file</text>
+  <text class="t-sm t-mid" x="414" y="80">general.sampling.*</text>
+  <text class="t-sm t-mid" x="414" y="94">temp, top_k, top_p</text>
+  <path class="arw" d="M484 78 H512" marker-end="url(#samp-arrow)"/>
+  <rect class="blk" x="514" y="38" width="136" height="80" rx="6"/>
+  <text class="t-lbl t-mid" x="582" y="60">4 Built-in</text>
+  <text class="t-sm t-mid" x="582" y="80">temperature 1.0</text>
+  <text class="t-sm t-mid" x="582" y="94">top_k 64, top_p 0.95</text>
+  <text class="t-ax" x="10" y="144">each value takes the first one that is set, left to right</text>
+</svg>
+</div>
+<p class="dgm-cap"><b>The request wins, the built-in default comes last.</b> The seed has only two sources, the request and the configuration. <code>LocalModel::sampling()</code> returns the values the load resolved.</p>
+</div>
+
+- The file defaults are the GGUF keys `general.sampling.temp`, `general.sampling.top_k` and `general.sampling.top_p`, the names llama.cpp reads. The checkpoint converter writes them from `generation_config.json`.
+- A file value the config would reject (a negative temperature, a `top_p` outside 0 to 1) is ignored. A `top_k` of 0 or less turns the filter off.
+- The other `general.sampling.*` keys (`min_p`, repetition penalties, XTC, mirostat) name samplers the engine does not have, so they are not read.
+- With `seed: Some(n)`, every request restarts the generator from `n`, so equal prompts sample equal tokens. A request `seed` does the same for that request alone and wins over the config seed. With no seed, the generator is seeded from the system once at load.
+- The sampler applies temperature, top-k, softmax and top-p in that order, then draws one token. Temperature `0.0` takes the first maximum.
+
+## BatchingConfig
+
+`BatchingConfig` decides how many requests run at once and how big the shared K/V pool is. The K/V cache is the memory where the engine keeps each request's attention state so it does not recompute earlier tokens. In KDL: `batching max_sequences=8 kv_tokens=16384 max_step_tokens=256 prefix_cache=#false`, any subset of the keys.
+
+| Field | Default | Sets |
+|---|---|---|
+| `max_sequences` | 4 | requests that run at once, 1 to 64 |
+| `kv_tokens` | twice `context_length` | positions in the shared K/V pool |
+| `max_step_tokens` | the prefill chunk | rows of one forward step across all requests |
+| `prefix_cache` | `true` | keep the K/V of finished requests for later prompts |
+
+- `kv_tokens` is the K/V memory knob. An explicit value is at least `context_length + 16` and rounds up to whole blocks of 16. Raising `max_sequences` does not raise it. A pool too small for the running requests makes them wait or preempt each other. `LocalModel::kv_cache_bytes` reports the result.
+- `max_step_tokens` is at least `max_sequences` and at most 8,192. The default prefill chunk is `2,097,152 / context_length`, clamped to 16 to 256: 256 at 8,192 positions. With tiered experts under DeepSeek-V4.1 it is 4,096.
+- `prefix_cache: false` registers nothing in the prefix store, so every prompt prefills in full.
+- A drafter that reads every position of its sequence (the in-trunk head, EAGLE, DFlash and DSpark) forces `max_sequences` to 1. A Gemma 4 assistant drafts only while one request runs alone.
+- `LocalModel::serving_stats()` returns a `ServingStats` snapshot. The gauges are `running`, `waiting`, `max_sequences`, `free_blocks`, `cached_blocks`, `used_blocks`, `total_blocks` and `snapshot_bytes`. The totals since load are `prefix_hit_tokens`, `preemptions`, `steps`, `batched_rows`, `prefill_rows`, `generated_tokens`, `admissions`, `queue_wait_ns` and `step_ns`, and `last_step_ns` and `last_step_rows` describe the last pass. Reading them never waits for a step. Subtract two snapshots to get a rate.
+
+## Engram cache
+
+Only DeepSeek-V4.1 has an Engram table. It is too large for memory, so the engine reads the rows it needs from the model file with a pool of reader threads and keeps the recently used rows in a cache. A model without an Engram table ignores this setting. In KDL: `engram ram_bytes="8g" reader_threads=32`, any subset.
+
+| Field | Default | Range |
+|---|---|---|
+| `ram_bytes` | 4 GiB | 1 MiB to 1 TiB |
+| `reader_threads` | 16 | 1 to 64 |
+
+- A smaller cache is slower, never different: rows evicted before use are read again, and the output stays the same.
+- The cache grows as it fills, so a short session does not pay for the bound.
+- `LocalModel::engram_stats()` returns `EngramStats` (`lookups`, `cache_hits`, `disk_reads`, `bytes_read`, `resident_rows`, `resident_bytes`, `capacity_rows`, and `hit_rate()`), or `None` for a model without an Engram table.
+- A value outside the range fails the load; the messages are on [Limits and errors](@/providers/local/limits-and-errors.md#errors).
+
 ## Cache directory and token
 
-- `cache_dir: None` is the platform cache directory: `%LOCALAPPDATA%\cuca` on Windows (`%USERPROFILE%\AppData\Local\cuca` when that variable is unset), `~/Library/Caches/cuca` on macOS, `$XDG_CACHE_HOME/cuca` else `~/.cache/cuca` elsewhere. When no directory can be resolved, `load` fails with `CucaError::Config` asking for `cache_dir`.
-- `hf_token: None` or an empty string downloads anonymously; the library reads no `HF_TOKEN` variable. A token is sent as a bearer token on downloads, and `Debug` prints it as `<redacted>`.
+- `cache_dir: None` is the platform cache directory: `%LOCALAPPDATA%\cuca` on Windows (`%USERPROFILE%\AppData\Local\cuca` when that variable is unset), `~/Library/Caches/cuca` on macOS, and `$XDG_CACHE_HOME/cuca` else `~/.cache/cuca` elsewhere. When no directory can be resolved, `load` fails with `CucaError::Config` asking for `cache_dir`.
+- `hf_token: None` or an empty string downloads anonymously. The library reads no `HF_TOKEN` variable; a KDL file can take it from the environment with `hf_token "${HF_TOKEN:-}"`. A token is sent as a bearer token on downloads.
 
 ## The local_model example
 
-`examples/local_model.rs` takes the request on the command line and everything about the model from a `LocalModelConfig` file.
+`examples/local_model.rs` takes the request on the command line and everything about the model from a `LocalModelConfig` file. `examples/configs/local_model.kdl` lists every key, all but `source` commented out.
 
 | Flag | Meaning |
 |---|---|
@@ -165,4 +255,6 @@ $env:RUSTFLAGS = "-C target-cpu=native"
 cargo run --release --example local_model --features provider-local -- --config examples/configs/local_model.kdl --prompt "Say hi"
 ```
 
-The live tests read one `cuca-test.kdl` in the repository root; see [Build and test](@/providers/local/build-and-tests.md).
+On stderr the example prints `load: <seconds> s` and `loaded on <device>` before the reply, and a `timing:` line after it with the prompt tokens, the time to the first block and the tokens per second. The reply text goes to stdout and depends on the model.
+
+To run the live tests against a model, see [Integration tests](@/guides/integration-tests.md).

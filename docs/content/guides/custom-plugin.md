@@ -1,6 +1,6 @@
 +++
 title = "Write a custom plugin"
-description = "Pick the hook, implement CucaPlugin with interior mutability, register it on the builder, watch it fire."
+description = "Pick the hook, implement CucaPlugin with interior mutability, register it on the builder, and watch it run."
 template = "page.html"
 weight = 2
 +++
@@ -13,10 +13,10 @@ weight = 2
 <dt>You need</dt>
 <dd>A working stream, from <a href="@/quick-start/first-stream.md">Stream a first reply</a></dd>
 <dt>Read this if</dt>
-<dd>You want to observe, rewrite or intercept part of a turn without forking the crate</dd>
+<dd>You want to watch, rewrite or intercept part of a turn without forking the crate</dd>
 </dl>
 
-Goal: run your own code at a chosen point of every turn. The trait has five methods and only `name` is required, so a useful plugin is about thirty lines.
+Goal: run your own code at a chosen point of every turn. A plugin is a struct that implements the `CucaPlugin` trait. A hook is one of its methods, which the client calls at a fixed point of a turn. Only `name` is required, so a useful plugin is about thirty lines.
 
 ## Step 1: pick the hook
 
@@ -33,17 +33,17 @@ Choose by when your code must run.
 
 If no hook fits your capability, it belongs in the service tier, which is driven by direct method calls. See [Plugins and services](@/concepts/plugin-layering.md).
 
-Result: you know which of the four hooks you override.
+Result: you know which hooks you override.
 
 ## Step 2: keep state behind `&self`
 
-Every hook takes `&self`, because the client shares the plugin list as `Arc<dyn CucaPlugin>` across `await` points. Mutable state needs interior mutability: an `AtomicUsize` for a counter, a `Mutex` for anything larger.
+Every hook takes `&self`, because the client shares the plugin list as `Arc<dyn CucaPlugin>` across `await` points. State that changes needs interior mutability: an `AtomicUsize` for a counter, a `Mutex` for anything larger.
 
-Result: your struct holds its state in atomics or locks, and the trait bound `Send + Sync` holds.
+Result: your struct holds its state in atomics or locks, so the `Send + Sync` bound holds.
 
 ## Step 3: implement the trait
 
-The bundled example overrides two hooks and takes the defaults for the rest. It counts streamed blocks and prints the aggregate.
+The bundled example overrides two hooks and takes the defaults for the rest. It counts the streamed blocks and prints the total.
 
 ```rust,name=The whole plugin from examples/custom_plugin.rs
 #[derive(Default)]
@@ -76,7 +76,7 @@ impl CucaPlugin for BlockCounterPlugin {
 }
 ```
 
-`name` returns a `&'static str`. The client puts it on the `tracing` error event it emits when an `on_response_complete` hook fails, and only under `plugin-guardrails`. Make it unique and recognizable.
+`name` returns a `&'static str`. When an `on_response_complete` hook fails, the client puts the name on the `tracing` error event it emits, and only under `plugin-guardrails`. Make it unique and easy to recognize.
 
 Result: the plugin compiles against `cuca::plugin::CucaPlugin`.
 
@@ -90,7 +90,7 @@ let client = CucaClient::builder()
     .build()?;
 ```
 
-Call `register_plugin` once per plugin. Plugins run in registration order at every hook site, and `client.plugins()` returns them in that order.
+Call `register_plugin` once per plugin. Plugins run in registration order at every hook, and `client.plugins()` returns them in that order.
 
 Result: `client.plugins().len()` is the number of plugins you registered.
 
@@ -102,18 +102,18 @@ Start `llama-server` on port 1234 as in [Stream a first reply](@/quick-start/fir
 cargo run --example custom_plugin --features provider-llamacpp
 ```
 
-```text,name=Expected output (one run against gemma-4-12b-qat)
+```text,name=Expected output (the text, counts and duration depend on the model)
 CUCA most commonly refers to either the Credit Union of Central Alabama or the Center for Urban Community Action, depending on the context.
 [example-block-counter] model=google/gemma-4-12b-qat duration=81.89s completion_tokens=1991 blocks=1991
 ```
 
-Result: the reply streams, then one summary line prints. The reply text, the counts and the duration depend on the model. This model reasons before it answers and the example sets no `max_tokens`, so both counts are large.
+Result: the reply streams, then one summary line prints. A model that reasons before it answers produces large counts, because the example sets no `max_tokens`.
 
 Reading the summary:
 
 - `completion_tokens` is the server's count from its final usage frame.
-- `blocks` counts every block your hook saw, and a text delta carries about one token, so the two roughly agree for a text-only reply.
-- They diverge once the reply carries an `ImageBase64` or `ToolResult` block, which count as blocks but not as tokens.
+- `blocks` counts every block your hook saw. A text delta carries about one token, so the two roughly agree for a text-only reply.
+- They differ once the reply carries an `ImageBase64` or `ToolResult` block, which count as blocks but not as tokens.
 - A server that reports no usage leaves `completion_tokens` at one per `Text`, `Thinking` and `ToolCall` block, and `UnifiedResponse::usage` at `None`.
 
 ## If your plugin answers tool calls
@@ -128,7 +128,7 @@ Return `Ok(None)` for a tool call you do not handle, so the next plugin gets its
 
 ## If your plugin holds state that grows
 
-State whose size follows traffic needs a bound, a stated policy at the bound, and a way to read current usage. The existing structures and the reasoning for each policy are in [Memory discipline](@/concepts/memory-discipline.md).
+State whose size follows traffic needs a bound, a stated policy at the bound, and a way to read current usage. [Memory discipline](@/concepts/memory-discipline.md) shows the existing structures and the policy of each.
 
 ## If your plugin stores session records
 
