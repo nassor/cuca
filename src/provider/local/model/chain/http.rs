@@ -43,6 +43,9 @@ impl HttpTransport {
         };
         let client = crate::tls::http_client_builder()
             .connect_timeout(CONNECT_TIMEOUT)
+            // reqwest 0.13 already defaults to it; a frame is one small
+            // write each way and must not wait for an ACK (Nagle).
+            .tcp_nodelay(true)
             // Passes are far apart, and the runtime drives no connection
             // between calls, so an idle connection would die unnoticed and
             // fail the next pass: every call opens its own (a TCP handshake

@@ -49,6 +49,10 @@
 
 - Balancer: the speculation penalty is removed. An upstream with a drafter no longer adds 2 to
   its load score; speed weighting stays.
+- The model server and the balancer set `TCP_NODELAY` on every accepted connection (axum leaves
+  Nagle's algorithm on), so Nagle's algorithm cannot hold back a small trailing segment of a
+  response, such as a layer-stage reply or one streamed token, until the peer acknowledges the
+  one before it. The layer-stage client sets it explicitly (reqwest's default is on).
 
 ## 0.9.1 - 2026-11-15
 

@@ -113,6 +113,21 @@ pub(crate) async fn shutdown_signal() {
     }
 }
 
+/// `listener` with `TCP_NODELAY` set on every accepted connection. axum
+/// leaves Nagle's algorithm on, which holds back the small trailing segment
+/// of a response (a layer-stage reply, one SSE event) until the peer
+/// acknowledges the one before it.
+pub(crate) fn nodelay(
+    listener: tokio::net::TcpListener,
+) -> impl axum::serve::Listener<Io = tokio::net::TcpStream, Addr = SocketAddr> {
+    use axum::serve::ListenerExt as _;
+    listener.tap_io(|stream| {
+        if let Err(e) = stream.set_nodelay(true) {
+            tracing::debug!("cannot set TCP_NODELAY on an accepted connection: {e}");
+        }
+    })
+}
+
 pub(crate) fn join_error(what: &str, error: &tokio::task::JoinError) -> ServerError {
     ServerError::Io(format!("{what} task failed: {error}"))
 }
@@ -158,7 +173,7 @@ async fn serve_until(
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let app = http::router(Arc::clone(&state));
     let mut server = tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(nodelay(listener), app)
             .with_graceful_shutdown(async {
                 let _ = stop_rx.await;
             })
@@ -311,8 +326,20 @@ async fn serve_and_balance(
 
 #[cfg(test)]
 mod tests {
+    use axum::serve::Listener as _;
+
     use super::*;
     use crate::{LocalModelConfig, ModelSource};
+
+    #[tokio::test]
+    async fn accepted_connections_have_nodelay() {
+        let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = bound.local_addr().unwrap();
+        let mut listener = nodelay(bound);
+        let _client = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (stream, _) = listener.accept().await;
+        assert!(stream.nodelay().unwrap());
+    }
 
     fn serve_at(listen: &str) -> ServerConfig {
         let model = ModelSpec::new(

@@ -118,7 +118,7 @@ pub(crate) async fn balance_until(
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let app = proxy::router(Arc::clone(&state));
     let mut server = tokio::spawn(async move {
-        axum::serve(listener, app)
+        axum::serve(super::nodelay(listener), app)
             .with_graceful_shutdown(async {
                 let _ = stop_rx.await;
             })
