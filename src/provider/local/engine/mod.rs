@@ -890,6 +890,12 @@ impl Engine {
         self.model.engram_counters()
     }
 
+    /// The call counters of the remote stages (empty unless this engine
+    /// coordinates a chain), with their names.
+    pub(crate) fn stage_counters(&self) -> Vec<(String, Arc<super::model::chain::StageCounters>)> {
+        self.model.stage_counters()
+    }
+
     /// What identifies this model's file and cache layout to a peer, see
     /// [`model_fingerprint`].
     pub(crate) fn fingerprint(&self) -> u64 {
@@ -1162,7 +1168,7 @@ impl Engine {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use crate::provider::local::model::chain::StageTransport;
+    use crate::provider::local::model::chain::{StageCounters, StageTransport};
     use crate::provider::local::model::tiny::{TinyModel, VOCAB, load_sized};
 
     /// Vocabulary of the tiny model: ids 1 (`<eos>`), 3 (`<turn|>`) and 4
@@ -1404,6 +1410,7 @@ pub(crate) mod testing {
         /// The call after which the worker has restarted; `usize::MAX` for
         /// none.
         pub(crate) restart_at: Arc<AtomicUsize>,
+        stats: Arc<StageCounters>,
     }
 
     impl Loopback {
@@ -1414,6 +1421,7 @@ pub(crate) mod testing {
                 calls: Arc::default(),
                 fail_at: Arc::new(AtomicUsize::new(usize::MAX)),
                 restart_at: Arc::new(AtomicUsize::new(usize::MAX)),
+                stats: Arc::default(),
             }
         }
     }
@@ -1426,6 +1434,7 @@ pub(crate) mod testing {
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .push(frame.first().copied().unwrap_or(0));
             if n == self.fail_at.load(Ordering::SeqCst) {
+                self.stats.record_error(frame.len());
                 return Err(local_err("stage loopback: the connection dropped"));
             }
             let mut worker = self
@@ -1436,11 +1445,21 @@ pub(crate) mod testing {
                 let open = worker.foreign_open(0x5EED);
                 worker.stage_call(&open)?;
             }
-            worker.stage_call(&frame)
+            let started = std::time::Instant::now();
+            let reply = worker.stage_call(&frame).inspect_err(|_| {
+                self.stats.record_error(frame.len());
+            })?;
+            let wall = started.elapsed();
+            self.stats.record(wall, wall, frame.len(), reply.len());
+            Ok(reply)
         }
 
         fn name(&self) -> String {
             "stage loopback".to_owned()
+        }
+
+        fn counters(&self) -> Arc<StageCounters> {
+            Arc::clone(&self.stats)
         }
     }
 
@@ -4306,6 +4325,37 @@ mod tests {
             assert_eq!(usage(&got), usage(&want), "{label}");
         }
         assert_eq!(used_blocks(&chain), 0, "{what}");
+    }
+
+    /// A chain counts every call of each remote stage: as many as the
+    /// transport saw, with the bytes both ways and the compute time, and
+    /// the model without remote stages counts none.
+    #[test]
+    fn a_chain_counts_the_calls_of_each_remote_stage() {
+        let llama = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let (n, cuts) = cuts_of(&llama);
+        let bounds: Vec<usize> = if n >= 3 {
+            vec![cuts[0], cuts[1]]
+        } else {
+            vec![cuts[0]]
+        };
+        let (mut chain, handles) = chain_over(&llama, 96, &bounds);
+        let _ = run(&mut chain, &long_prompt(40), Some(6));
+        let stages = chain.stage_counters();
+        assert_eq!(stages.len(), bounds.len());
+        for ((name, counters), seen) in stages.iter().zip(&handles.calls) {
+            let s = counters.snapshot(name.clone());
+            assert_eq!(name, "stage loopback");
+            assert_eq!(s.calls as usize, seen.load(Ordering::SeqCst));
+            assert!(s.calls > 1, "an open and at least one pass");
+            assert_eq!(s.errors, 0);
+            assert!(s.sent_bytes > 0 && s.received_bytes > 0);
+            assert!(s.compute_ns > 0 && s.compute_ns <= s.wall_ns);
+        }
+        assert!(engine(&llama, 96, 0.0, None).stage_counters().is_empty());
     }
 
     /// A model whose first layers run on workers answers what the whole model

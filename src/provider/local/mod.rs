@@ -261,6 +261,7 @@ use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use self::chat::{ChatFormat, ChatTemplate, chat_prompt};
+pub use self::model::chain::StageStats;
 pub use self::model::engram_io::EngramStats;
 pub use self::model::tier::{ExpertHeat, ExpertTierStats};
 use self::tokenizer::Tokenizer;
@@ -1608,6 +1609,25 @@ pub struct StageRange {
     pub layers: usize,
 }
 
+/// The response header in which a stage worker's server reports, in
+/// nanoseconds, how long its engine thread took to answer a frame (see
+/// [`StageReply::compute`]); the coordinator subtracts it from the call's
+/// wall time to get the network share ([`StageStats`]). Optional: a worker
+/// that omits it counts as zero compute.
+pub const STAGE_COMPUTE_HEADER: &str = "x-cuca-stage-compute-ns";
+
+/// A layer-stage worker's answer to one frame, see [`LocalModel::stage_call`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StageReply {
+    /// The reply frame, the body of the HTTP answer.
+    pub frame: Vec<u8>,
+    /// How long the engine thread took to answer, from taking the frame off
+    /// its queue: the worker's own compute, without the queue wait and the
+    /// network.
+    pub compute: Duration,
+}
+
 /// Configuration for [`LocalModel::load`].
 ///
 /// With the `config-kdl` feature (on with `provider-local`) the whole struct
@@ -1856,6 +1876,9 @@ struct LocalModelInner {
     /// Counters of the Engram table's row cache; `None` for a model without
     /// an Engram table.
     engram: Option<Arc<model::engram_io::EngramCounters>>,
+    /// The remote stages' call counters with their names (empty unless the
+    /// model coordinates layer stages), see [`LocalModel::stage_stats`].
+    stages: Vec<(String, Arc<model::chain::StageCounters>)>,
     /// Layers on the GPU and in all when the model runs split over the CPU
     /// and the GPU ([`LocalModelConfig::gpu_layers`]).
     layer_split: Option<(usize, usize)>,
@@ -2213,6 +2236,19 @@ impl LocalModel {
         self.inner.engram.as_ref().map(|c| c.snapshot())
     }
 
+    /// What this coordinator measured of each remote layer stage
+    /// ([`LocalModelConfig::remote_stages`]), in layer order: calls, wall
+    /// time, the compute time the worker reported, and bytes, cumulative
+    /// since load (see [`StageStats`]). Empty unless the model coordinates
+    /// layer stages.
+    pub fn stage_stats(&self) -> Vec<StageStats> {
+        self.inner
+            .stages
+            .iter()
+            .map(|(name, counters)| counters.snapshot(name.clone()))
+            .collect()
+    }
+
     /// Load the model described by `config`: resolve or download the file,
     /// read the weights, tokenizer and chat template, and start the engine
     /// thread.
@@ -2308,6 +2344,7 @@ impl LocalModel {
                                 serving: engine.serving_counters(),
                                 tiers: engine.expert_tiers(),
                                 engram: engine.engram_counters(),
+                                stages: engine.stage_counters(),
                                 layer_split: engine.layer_split(),
                                 tokenizer,
                                 template,
@@ -3112,7 +3149,9 @@ impl LocalModel {
     /// Answer one frame of a layer-stage coordinator (the body of `POST
     /// /cuca/v1/stage`): an `open` that starts a session, a forward pass of
     /// this worker's layers, or a snapshot, restore or prefetch call. The
-    /// frame is opaque to the caller.
+    /// frame is opaque to the caller. The reply carries how long the engine
+    /// thread took to answer, which the server sends back in
+    /// [`STAGE_COMPUTE_HEADER`].
     ///
     /// # Errors
     ///
@@ -3120,8 +3159,15 @@ impl LocalModel {
     /// worker (another file, layers, sizing or session) or a model that is
     /// not a stage; [`CucaError::Provider`] for a malformed frame, a failed
     /// pass or an engine that has shut down.
-    pub async fn stage_call(&self, frame: Vec<u8>) -> Result<Vec<u8>, CucaError> {
-        self.call(move |engine| engine.stage_call(&frame)).await?
+    pub async fn stage_call(&self, frame: Vec<u8>) -> Result<StageReply, CucaError> {
+        self.call(move |engine| {
+            let started = std::time::Instant::now();
+            engine.stage_call(&frame).map(|reply| StageReply {
+                frame: reply,
+                compute: started.elapsed(),
+            })
+        })
+        .await?
     }
 
     /// Run `f` on the engine thread and return its result. The call waits in
@@ -4337,6 +4383,7 @@ source {
                 .stage_call(open_frame(&open))
                 .await
                 .unwrap()
+                .frame
                 .is_empty()
         );
         let err = worker

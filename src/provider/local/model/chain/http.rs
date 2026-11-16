@@ -1,11 +1,12 @@
 //! The HTTP transport of a layer stage: one `POST` per frame to the worker's
 //! model server.
 
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use super::StageTransport;
+use super::{StageCounters, StageTransport};
 use crate::error::CucaError;
-use crate::provider::local::RemoteStage;
+use crate::provider::local::{RemoteStage, STAGE_COMPUTE_HEADER};
 
 /// How long a connect may take before the stage counts as unreachable.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -24,6 +25,7 @@ pub(crate) struct HttpTransport {
     timeout: Duration,
     client: reqwest::Client,
     rt: tokio::runtime::Runtime,
+    stats: Arc<StageCounters>,
 }
 
 impl HttpTransport {
@@ -60,6 +62,7 @@ impl HttpTransport {
             timeout: stage.timeout,
             client,
             rt,
+            stats: Arc::default(),
         })
     }
 
@@ -96,7 +99,9 @@ impl HttpTransport {
 
 impl StageTransport for HttpTransport {
     fn call(&self, frame: Vec<u8>) -> Result<Vec<u8>, CucaError> {
-        self.rt.block_on(async {
+        let sent = frame.len();
+        let started = Instant::now();
+        let outcome = self.rt.block_on(async {
             let mut request = self
                 .client
                 .post(&self.endpoint)
@@ -108,17 +113,38 @@ impl StageTransport for HttpTransport {
             }
             let response = request.send().await.map_err(|e| self.transport_err(&e))?;
             let status = response.status();
+            let compute = response
+                .headers()
+                .get(STAGE_COMPUTE_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<u64>().ok())
+                .map_or(Duration::ZERO, Duration::from_nanos);
             let body = response.bytes().await.map_err(|e| self.transport_err(&e))?;
             if status.is_success() {
-                Ok(body.to_vec())
+                Ok((body, compute))
             } else {
                 Err(self.status_err(status, &body))
             }
-        })
+        });
+        match outcome {
+            Ok((body, compute)) => {
+                self.stats
+                    .record(started.elapsed(), compute, sent, body.len());
+                Ok(body.to_vec())
+            }
+            Err(e) => {
+                self.stats.record_error(sent);
+                Err(e)
+            }
+        }
     }
 
     fn name(&self) -> String {
         format!("stage {}", self.url)
+    }
+
+    fn counters(&self) -> Arc<StageCounters> {
+        Arc::clone(&self.stats)
     }
 }
 
@@ -164,6 +190,8 @@ mod tests {
     /// What the responder does after reading the request.
     enum Reply {
         Answer(u16, Vec<u8>),
+        /// A 200 whose headers report the nanoseconds the worker computed.
+        Computed(Vec<u8>, u64),
         /// Never answers; holds the connection open for the given time.
         Hang(Duration),
     }
@@ -224,6 +252,15 @@ mod tests {
                     Reply::Answer(status, payload) => {
                         let head = format!(
                             "HTTP/1.1 {status} X\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                            payload.len()
+                        );
+                        sock.write_all(head.as_bytes()).await.unwrap();
+                        sock.write_all(&payload).await.unwrap();
+                        sock.shutdown().await.unwrap();
+                    }
+                    Reply::Computed(payload, ns) => {
+                        let head = format!(
+                            "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n{STAGE_COMPUTE_HEADER}: {ns}\r\nconnection: close\r\n\r\n",
                             payload.len()
                         );
                         sock.write_all(head.as_bytes()).await.unwrap();
@@ -303,6 +340,35 @@ mod tests {
             Some("application/octet-stream")
         );
         assert_eq!(seen.header("authorization"), None);
+    }
+
+    #[test]
+    fn calls_count_time_bytes_and_the_workers_compute() {
+        let (url, _seen, handle) = serve(Reply::Computed(vec![9; 40], 1_500_000));
+        let t = HttpTransport::new(&stage(&url)).unwrap();
+        t.call(vec![1; 100]).unwrap();
+        handle.join().unwrap();
+        let s = t.counters().snapshot(t.name());
+        assert_eq!((s.calls, s.errors), (1, 0));
+        assert_eq!((s.sent_bytes, s.received_bytes), (100, 40));
+        assert_eq!(s.compute_ns, 1_500_000);
+        assert!(s.wall_ns > 0);
+        assert_eq!(s.network_ns(), s.wall_ns.saturating_sub(1_500_000));
+
+        // A worker that reports nothing counts no compute; a refused call
+        // counts as an error and adds no time.
+        let (url, _seen, handle) = serve(Reply::Answer(200, vec![1]));
+        let t = HttpTransport::new(&stage(&url)).unwrap();
+        t.call(vec![1]).unwrap();
+        handle.join().unwrap();
+        let s = t.counters().snapshot(t.name());
+        assert_eq!((s.calls, s.compute_ns), (1, 0));
+        let (url, _seen, handle) = serve(Reply::Answer(500, Vec::new()));
+        let t = HttpTransport::new(&stage(&url)).unwrap();
+        t.call(vec![1; 7]).unwrap_err();
+        handle.join().unwrap();
+        let s = t.counters().snapshot(t.name());
+        assert_eq!((s.calls, s.errors, s.wall_ns, s.sent_bytes), (0, 1, 0, 7));
     }
 
     #[test]

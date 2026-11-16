@@ -165,7 +165,8 @@ pub use crate::provider::local::{
     ExpertTierStats, ExpertTiers, GenerationReport, GpuAdapter, KvExport, KvExportConfig, KvImport,
     LocalCapabilities, LocalDevice, LocalGeneration, LocalModel, LocalModelConfig, ModelPart,
     ModelPreset, ModelSource, ModelTemplate, PresetPart, PresetTemplate, PromptTokens, RemoteStage,
-    SamplingConfig, ServingStats, StageRange, WeightQuant,
+    STAGE_COMPUTE_HEADER, SamplingConfig, ServingStats, StageRange, StageReply, StageStats,
+    WeightQuant,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,

@@ -3,15 +3,16 @@
 //!
 //! Bounds: every metric is a fixed set of atomics created at startup. The
 //! only labels are the model name (at most [`MAX_MODELS`](super::MAX_MODELS)
-//! values), the status code (a fixed list), a GPU index and the bucket bound,
-//! so the series count does not grow with traffic.
+//! values), the status code (a fixed list), a GPU index, the index of a
+//! remote layer stage (at most `MAX_REMOTE_STAGES` per model) and the bucket
+//! bound, so the series count does not grow with traffic.
 
 use std::fmt::{Display, Write as _};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::stats::ModelState;
-use crate::ServingStats;
 use crate::sysmon::SystemSnapshot;
+use crate::{ServingStats, StageStats};
 
 /// Buckets of time-to-first-token histograms, seconds (vLLM's).
 pub const TTFT_BUCKETS: &[f64] = &[
@@ -253,12 +254,90 @@ pub struct ModelView<'a> {
     pub kv_bytes: u64,
     /// Size of the GGUF the model runs from (`0` until ready).
     pub weights_bytes: u64,
+    /// What a coordinator measured of each remote layer stage, in layer
+    /// order (empty unless the model is a coordinator).
+    pub stages: Vec<StageStats>,
 }
 
 /// A per-model sample read from the engine's counters; `None` until the
 /// model is ready.
 fn serving(f: fn(&ServingStats) -> u64) -> impl Fn(&ModelView<'_>) -> Option<u64> {
     move |m| m.serving.as_ref().map(f)
+}
+
+/// The series of the remote layer stages: calls, time split into the
+/// worker's compute and the rest (the network), and bytes, one set per model
+/// and stage index.
+fn render_stages(x: &mut Exposition, models: &[ModelView<'_>]) {
+    x.family(
+        "cuca_stage_calls_total",
+        "counter",
+        "Calls answered by a remote layer stage.",
+    );
+    for (m, i, s) in stage_rows(models) {
+        x.sample(
+            "cuca_stage_calls_total",
+            &format!("model=\"{}\",stage=\"{i}\"", escape(m.name)),
+            s.calls,
+        );
+    }
+    x.family(
+        "cuca_stage_errors_total",
+        "counter",
+        "Calls to a remote layer stage that failed.",
+    );
+    for (m, i, s) in stage_rows(models) {
+        x.sample(
+            "cuca_stage_errors_total",
+            &format!("model=\"{}\",stage=\"{i}\"", escape(m.name)),
+            s.errors,
+        );
+    }
+    x.family(
+        "cuca_stage_seconds_total",
+        "counter",
+        "Seconds the answered calls to a remote layer stage took, by part: compute (what the worker reported computing) and network (the rest of the call: transfer, HTTP handling, the worker's queue).",
+    );
+    for (m, i, s) in stage_rows(models) {
+        let labels = format!("model=\"{}\",stage=\"{i}\"", escape(m.name));
+        x.sample(
+            "cuca_stage_seconds_total",
+            &format!("{labels},part=\"compute\""),
+            s.compute_ns as f64 / 1e9,
+        );
+        x.sample(
+            "cuca_stage_seconds_total",
+            &format!("{labels},part=\"network\""),
+            s.network_ns() as f64 / 1e9,
+        );
+    }
+    x.family(
+        "cuca_stage_bytes_total",
+        "counter",
+        "Bytes of frames exchanged with a remote layer stage, by direction.",
+    );
+    for (m, i, s) in stage_rows(models) {
+        let labels = format!("model=\"{}\",stage=\"{i}\"", escape(m.name));
+        x.sample(
+            "cuca_stage_bytes_total",
+            &format!("{labels},direction=\"sent\""),
+            s.sent_bytes,
+        );
+        x.sample(
+            "cuca_stage_bytes_total",
+            &format!("{labels},direction=\"received\""),
+            s.received_bytes,
+        );
+    }
+}
+
+/// Every remote stage of every model, with the stage's index.
+fn stage_rows<'a, 'b>(
+    models: &'b [ModelView<'a>],
+) -> impl Iterator<Item = (&'b ModelView<'a>, usize, &'b StageStats)> {
+    models
+        .iter()
+        .flat_map(|m| m.stages.iter().enumerate().map(move |(i, s)| (m, i, s)))
 }
 
 /// Escape a label value per the exposition format.
@@ -642,6 +721,7 @@ pub fn render(
         "Tokens the engine generated.",
         serving(|s| s.generated_tokens),
     );
+    render_stages(&mut x, models);
 
     render_system(&mut x, system);
     x.out
@@ -864,6 +944,7 @@ mod tests {
             serving: Some(ServingStats::default()),
             kv_bytes: 7,
             weights_bytes: 9,
+            stages: Vec::new(),
         }];
         let text = render(
             &models,
@@ -901,6 +982,7 @@ mod tests {
             serving: None,
             kv_bytes: 0,
             weights_bytes: 0,
+            stages: Vec::new(),
         }];
         let text = render(
             &models,
@@ -940,6 +1022,48 @@ mod tests {
             let line =
                 format!("cuca_kv_imports_total{{model=\"m\",outcome=\"{outcome}\"}} {count}\n");
             assert!(text.contains(&line), "{line}{text}");
+        }
+    }
+
+    #[test]
+    fn stage_series_split_the_time_into_compute_and_network() {
+        let metrics = ModelMetrics::default();
+        let models = [ModelView {
+            name: "m",
+            state: ModelState::Ready,
+            metrics: &metrics,
+            serving: None,
+            kv_bytes: 0,
+            weights_bytes: 0,
+            stages: vec![
+                StageStats {
+                    name: "stage http://a".to_owned(),
+                    calls: 4,
+                    errors: 1,
+                    wall_ns: 5_000_000_000,
+                    compute_ns: 3_000_000_000,
+                    sent_bytes: 100,
+                    received_bytes: 60,
+                },
+                StageStats::default(),
+            ],
+        }];
+        let text = render(
+            &models,
+            &ServerMetrics::default(),
+            &SystemSnapshot::default(),
+            0.0,
+        );
+        for line in [
+            "cuca_stage_calls_total{model=\"m\",stage=\"0\"} 4\n",
+            "cuca_stage_calls_total{model=\"m\",stage=\"1\"} 0\n",
+            "cuca_stage_errors_total{model=\"m\",stage=\"0\"} 1\n",
+            "cuca_stage_seconds_total{model=\"m\",stage=\"0\",part=\"compute\"} 3\n",
+            "cuca_stage_seconds_total{model=\"m\",stage=\"0\",part=\"network\"} 2\n",
+            "cuca_stage_bytes_total{model=\"m\",stage=\"0\",direction=\"sent\"} 100\n",
+            "cuca_stage_bytes_total{model=\"m\",stage=\"0\",direction=\"received\"} 60\n",
+        ] {
+            assert!(text.contains(line), "{line}{text}");
         }
     }
 }

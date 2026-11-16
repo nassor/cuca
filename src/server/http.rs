@@ -31,7 +31,7 @@ use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
 use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
-use axum::http::{HeaderMap, HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -53,7 +53,7 @@ use super::openai::{
 use super::registry::{LoadedModel, ModelSlot, ResolveError, SlotStatus};
 use super::state::{RequestTracker, ServerState};
 use super::stats::ModelState;
-use crate::{CucaError, LocalGeneration};
+use crate::{CucaError, LocalGeneration, STAGE_COMPUTE_HEADER};
 
 /// Largest accepted request body.
 pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -434,11 +434,19 @@ async fn stage_frame(
         .ok_or_else(|| ApiError::model_unavailable(slot))?;
     match loaded.model.stage_call(body.to_vec()).await {
         Ok(reply) => {
-            let mut response = Response::new(axum::body::Body::from(reply));
-            response.headers_mut().insert(
+            let compute = reply.compute.as_nanos().to_string();
+            let mut response = Response::new(axum::body::Body::from(reply.frame));
+            let headers = response.headers_mut();
+            headers.insert(
                 CONTENT_TYPE,
                 HeaderValue::from_static("application/octet-stream"),
             );
+            if let (Ok(name), Ok(value)) = (
+                HeaderName::from_bytes(STAGE_COMPUTE_HEADER.as_bytes()),
+                HeaderValue::from_str(&compute),
+            ) {
+                headers.insert(name, value);
+            }
             Ok(response)
         }
         Err(CucaError::Config(message)) => Err(ApiError::new(
@@ -481,6 +489,7 @@ async fn prometheus(State(state): State<Arc<ServerState>>) -> Response {
                 serving: ready.map(|m| m.model.serving_stats()),
                 kv_bytes: ready.map_or(0, |m| m.kv_bytes),
                 weights_bytes: ready.map_or(0, |m| m.weights_bytes),
+                stages: ready.map_or_else(Vec::new, |m| m.model.stage_stats()),
             }
         })
         .collect();
@@ -1082,6 +1091,32 @@ mod tests {
         assert_eq!(
             chat_text(&coordinator).await["usage"],
             chat_text(&single).await["usage"]
+        );
+
+        // The coordinator counted its calls, and the compute time came back
+        // in the worker's header.
+        let metrics = get(&format!("{coordinator}/metrics"), None)
+            .await
+            .text()
+            .await
+            .unwrap();
+        let value = |series: &str| -> f64 {
+            metrics
+                .lines()
+                .find_map(|l| l.strip_prefix(series))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{series} is missing:\n{metrics}"))
+        };
+        assert!(value("cuca_stage_calls_total{model=\"m\",stage=\"0\"} ") > 1.0);
+        assert_eq!(
+            value("cuca_stage_errors_total{model=\"m\",stage=\"0\"} "),
+            0.0
+        );
+        assert!(value("cuca_stage_seconds_total{model=\"m\",stage=\"0\",part=\"compute\"} ") > 0.0);
+        assert!(value("cuca_stage_seconds_total{model=\"m\",stage=\"0\",part=\"network\"} ") > 0.0);
+        assert!(value("cuca_stage_bytes_total{model=\"m\",stage=\"0\",direction=\"sent\"} ") > 0.0);
+        assert!(
+            value("cuca_stage_bytes_total{model=\"m\",stage=\"0\",direction=\"received\"} ") > 0.0
         );
 
         let models: Value = get(&format!("{worker}/v1/models"), Some("stage-key"))

@@ -961,6 +961,15 @@ impl Model {
         }
     }
 
+    /// The call counters of the remote stages, in layer order with their
+    /// names; empty unless the model is a chain.
+    pub(crate) fn stage_counters(&self) -> Vec<(String, std::sync::Arc<chain::StageCounters>)> {
+        match self {
+            Model::Chain(m) => m.stage_counters(),
+            _ => Vec::new(),
+        }
+    }
+
     /// Hint that the rows of `tokens` (the next ones of the sequence in
     /// `slot`, whose earlier tokens are `history`) will be looked up soon: a
     /// model with an Engram table starts reading their table rows in the

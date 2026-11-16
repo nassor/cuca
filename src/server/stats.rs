@@ -184,6 +184,30 @@ pub struct RequestStats {
     pub rate_per_s: f64,
 }
 
+/// What a coordinator measured of one remote layer stage, cumulative since
+/// load (the means are over every answered call).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StageCallStats {
+    /// The stage in messages: `stage {url}`.
+    pub name: String,
+    /// Calls answered.
+    pub calls: u64,
+    /// Calls that failed.
+    pub errors: u64,
+    /// Mean time of an answered call, milliseconds (`compute + network`).
+    pub mean_call_ms: f64,
+    /// Mean time the worker reported computing per call, milliseconds.
+    pub mean_compute_ms: f64,
+    /// Mean time of a call outside the worker's compute (transfer, HTTP
+    /// handling and the worker's queue), milliseconds.
+    pub mean_network_ms: f64,
+    /// Bytes of frames sent.
+    pub sent_bytes: u64,
+    /// Bytes of frames received.
+    pub received_bytes: u64,
+}
+
 /// One loaded (or loading) model.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -243,6 +267,9 @@ pub struct ModelStats {
     pub requests: RequestStats,
     /// Latencies of this model's requests over the window.
     pub latency: LatencyStats,
+    /// The remote layer stages of a coordinator, in layer order (empty
+    /// otherwise).
+    pub stages: Vec<StageCallStats>,
 }
 
 /// How bad a [`Diagnosis`] is.

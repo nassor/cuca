@@ -23,7 +23,7 @@ use super::registry::{ModelSlot, SlotStatus};
 use super::state::ServerState;
 use super::stats::{
     ExpertTierRates, KvStats, ModelMemory, ModelState, ModelStats, NodeInfo, NodeRole,
-    RequestStats, StatsSnapshot, TokensPerSecond,
+    RequestStats, StageCallStats, StatsSnapshot, TokensPerSecond,
 };
 use crate::sysmon::SystemSnapshot;
 use crate::{DraftStats, ExpertTierStats, ServingStats};
@@ -361,6 +361,24 @@ fn model_stats(
             device_resident_bytes: tier.device_resident_bytes,
         }
     });
+    stats.stages = loaded
+        .model
+        .stage_stats()
+        .into_iter()
+        .map(|s| {
+            let calls = s.calls as f64;
+            StageCallStats {
+                mean_call_ms: ratio(s.wall_ns as f64, calls) / 1e6,
+                mean_compute_ms: ratio(s.compute_ns as f64, calls) / 1e6,
+                mean_network_ms: ratio(s.network_ns() as f64, calls) / 1e6,
+                name: s.name,
+                calls: s.calls,
+                errors: s.errors,
+                sent_bytes: s.sent_bytes,
+                received_bytes: s.received_bytes,
+            }
+        })
+        .collect();
     if let Some(drafter) = &mut stats.drafter {
         drafter.acceptance_ratio = rates.draft_acceptance;
     }

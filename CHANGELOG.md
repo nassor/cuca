@@ -31,6 +31,14 @@
   `shards`, `gpu_layers` or `kv_export`; the Gemma 4 assistant is the only drafter a coordinator
   takes. A failed call fails the step and the next request reopens the workers. Library:
   `RemoteStage` and `StageRange` in `LocalModelConfig`.
+- Layer-stage measurement: a coordinator counts, per remote stage, the calls, their wall time,
+  the compute time the worker reports and the bytes both ways. The worker's server sends its
+  engine thread's time in an `x-cuca-stage-compute-ns` response header; the network share is the
+  wall time minus it, the worker's queue wait included. Library: `LocalModel::stage_stats`
+  (`StageStats`), `StageReply` (what `LocalModel::stage_call` now returns instead of the bare
+  frame) and `STAGE_COMPUTE_HEADER`. Metrics: `cuca_stage_calls_total{model,stage}`,
+  `cuca_stage_errors_total`, `cuca_stage_seconds_total{part="compute|network"}` and
+  `cuca_stage_bytes_total{direction}`. The stats snapshot gains `stages` per model.
 - Balancer: a `disaggregate` section with `prefill` and `decode` pools. A request sent to a decode
   node carries `x-cuca-prefill` naming a prefill node, chosen by the routing policy; the balancer
   drops any such header from clients. Prefill nodes take no chat request while another healthy

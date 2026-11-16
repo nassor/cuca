@@ -49,8 +49,11 @@ use crate::provider::local::stageframe::{
 };
 
 mod http;
+mod stats;
 
 pub(crate) use http::HttpTransport;
+pub(crate) use stats::StageCounters;
+pub use stats::StageStats;
 
 /// How the coordinator reaches one remote stage: one frame out, one frame
 /// back (the protocol of [`stageframe`](crate::provider::local::stageframe)).
@@ -67,6 +70,10 @@ pub(crate) trait StageTransport: Send {
 
     /// What messages call the stage: `stage {url}` for an HTTP stage.
     fn name(&self) -> String;
+
+    /// The counters of this stage's calls: the transport records every call
+    /// it makes (wall time, the compute time the worker reports, bytes).
+    fn counters(&self) -> Arc<StageCounters>;
 }
 
 /// What the stages must agree on with the coordinator, as the first call of
@@ -416,6 +423,15 @@ impl ChainModel {
     /// Whether the model has recurrent layers.
     pub(crate) fn is_hybrid(&self) -> bool {
         self.hybrid
+    }
+
+    /// The call counters of every remote stage, in layer order, with the
+    /// stage's name.
+    pub(crate) fn stage_counters(&self) -> Vec<(String, Arc<StageCounters>)> {
+        self.remotes
+            .iter()
+            .map(|r| (r.transport.name(), r.transport.counters()))
+            .collect()
     }
 
     /// One row for a hybrid or hyper-connection model: nothing drafts on a
