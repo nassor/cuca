@@ -14,7 +14,7 @@ use std::time::Instant;
 
 use tokio::task::{JoinHandle, JoinSet};
 
-use super::config::ModelSpec;
+use super::config::{KvImportConfig, ModelSpec};
 use super::error::ServerError;
 use super::metrics::ModelMetrics;
 use super::openai::unix_secs;
@@ -73,6 +73,8 @@ pub struct ModelSlot {
     pub drafter: Option<DrafterStats>,
     /// Its counters and histograms.
     pub metrics: ModelMetrics,
+    /// Where this model may import K/V rows from, when configured.
+    pub kv_import: Option<KvImportConfig>,
     status: RwLock<SlotStatus>,
     progress: LoadProgress,
 }
@@ -89,6 +91,7 @@ impl ModelSlot {
                 acceptance_ratio: None,
             }),
             metrics: ModelMetrics::default(),
+            kv_import: spec.kv_import.clone(),
             status: RwLock::new(SlotStatus::Loading),
             progress: LoadProgress::default(),
         }
@@ -165,6 +168,30 @@ impl ModelRegistry {
         Arc::new(Self {
             slots: specs.iter().map(|s| Arc::new(ModelSlot::new(s))).collect(),
         })
+    }
+
+    /// A registry of one model, `name`, ready on `model` (server tests that
+    /// serve a tiny in-process model without loading a file).
+    #[cfg(test)]
+    pub(crate) fn ready(name: &str, model: LocalModel) -> Arc<Self> {
+        let spec = ModelSpec::new(Some(name.to_string()), crate::LocalModelConfig::default());
+        Self::ready_spec(&spec, model)
+    }
+
+    /// [`ModelRegistry::ready`] for a model with the settings of `spec`
+    /// (its `kv_import`, for instance).
+    #[cfg(test)]
+    pub(crate) fn ready_spec(spec: &ModelSpec, model: LocalModel) -> Arc<Self> {
+        let slot = Arc::new(ModelSlot::new(spec));
+        slot.set(SlotStatus::Ready(Arc::new(LoadedModel {
+            context_length: model.context_length(),
+            kv_bytes: model.kv_cache_bytes(),
+            weights_bytes: model.weights_file_bytes(),
+            capabilities: model.capabilities(),
+            loaded_at: unix_secs(),
+            model,
+        })));
+        Arc::new(Self { slots: vec![slot] })
     }
 
     /// A registry for `specs` and the task that loads them all concurrently.
@@ -320,5 +347,33 @@ mod tests {
         slot.progress.total.store(200, Ordering::Relaxed);
         slot.progress.done.store(50, Ordering::Relaxed);
         assert_eq!(slot.load_progress(), Some(0.25));
+    }
+
+    /// `ready` serves a tiny in-process model: the slot reads `Ready` with
+    /// the model's figures and the model answers a request.
+    #[tokio::test]
+    async fn a_ready_registry_holds_an_in_process_model() {
+        use crate::UnifiedRequest;
+        use crate::provider::local::engine::testing::{engine_at, tiny_file, tiny_local_model};
+        use tokio_stream::StreamExt;
+
+        let file = tiny_file();
+        let model = tiny_local_model(file.path.clone(), 32, |path| engine_at(path, 32)).await;
+        let r = ModelRegistry::ready("m", model);
+        assert!(r.all_ready());
+        let slot = r.resolve(Some("m")).unwrap();
+        assert_eq!(&*slot.name, "m");
+        let loaded = slot.ready().expect("the slot is ready");
+        assert_eq!(loaded.context_length, 32);
+        assert!(loaded.kv_bytes > 0);
+        let request = UnifiedRequest::new("m")
+            .add_user_message("abcd")
+            .set_temperature(0.0)
+            .set_max_tokens(2);
+        let mut generation = loaded.model.generate(request).await.unwrap();
+        while let Some(item) = generation.next().await {
+            item.unwrap();
+        }
+        assert!(generation.report().usage.is_some());
     }
 }

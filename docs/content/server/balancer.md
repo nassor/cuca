@@ -203,9 +203,8 @@ The candidates are the healthy upstreams whose last `/v1/models` lists the model
 
 Each candidate has a load score: the requests the balancer has outstanding to it, plus the requests it reports waiting for that model, plus its running fraction of `max_sequences`. The last term stays below one request and breaks ties. Without a snapshot only the first term counts.
 
-Two rules adjust the score when the upstream has the stats API:
+One rule adjusts the score when the upstream has the stats API:
 
-- A busy drafter. An engine with a [drafter](@/local/drafting.md) speculates only while one request runs alone, so a second request switches speculation off for both. When the upstream's snapshot shows a drafter for the model and the score is above zero, 2 is added. Prefix affinity then passes a busy drafter upstream over while another candidate is idle.
 - Speed. The balancer remembers each upstream's speed for a model as `1 / latency.itl.mean` from its snapshot, and keeps it while the latency window is empty. A candidate slower than the fastest scores `(score + 1) * fastest / speed - 1`, so an idle upstream at a third of the fastest speed scores 2. An upstream with no finished request yet counts as the fastest.
 
 | Policy | Picks |
@@ -223,6 +222,30 @@ The prefix key is the canonical text of the leading `system` and `developer` mes
 The balancer hashes the model and the key together with each candidate's id (`host:port`) and picks the highest weight. This is rendezvous hashing. A weight depends only on the key and that candidate. When an upstream leaves, only the keys it held move, and when it returns they move back. The other upstreams keep their conversations and their caches.
 
 The target is passed over when it is much busier than the rest. When its score is above `2 * min_score + 2`, where `min_score` is the lowest score among the candidates, the request goes to the least-loaded candidate instead. `cuca_balancer_affinity_fallbacks_total` counts these.
+
+## Disaggregated prefill
+
+A `disaggregate` section splits the upstreams into prefill and decode nodes. A prompt is then computed on one machine and decoded on another: the decode node imports the prompt's K/V rows from a prefill node before it generates.
+
+```kdl
+balance {
+    upstreams "http://gpu-box:8000" "http://ram-1:8000" "http://ram-2:8000"
+    disaggregate {
+        prefill "http://gpu-box:8000"
+        decode "http://ram-1:8000" "http://ram-2:8000"
+    }
+}
+```
+
+Every URL in `prefill` and `decode` must also be in `upstreams`, and no upstream may be in both pools. An upstream in neither pool keeps the whole job. An invalid section is a configuration error at startup.
+
+- Roles. Routing treats the prefill nodes as helpers: they take no chat request while another healthy upstream serves the model. The policy picks among the whole and decode nodes as usual.
+- The header. A request sent to a decode node carries `x-cuca-prefill` with the base URL of a prefill node, chosen by the same policy among the healthy prefill nodes serving the model, so affinity keeps a conversation on the prefill node that cached it. The decode node imports from that peer when it lists it in its `kv_import` section. The balancer drops any `x-cuca-prefill` a client sends, so a client cannot name a peer.
+- Retries. A request retried on another upstream gets a new choice for that upstream: a decode node gets a header, any other node none.
+- No healthy prefill node. The request still goes to the decode node, without the header, and the decode node prefills it itself.
+- Only prefill nodes serve the model. When no other healthy upstream serves the model, the prefill nodes answer whole requests, without the header.
+
+Three counters show which case happened: `cuca_balancer_prefill_assigned_total` (a decode node got a prefill peer), `cuca_balancer_prefill_unassigned_total` (a decode node got none) and `cuca_balancer_prefill_whole_total` (a prefill node served a whole request).
 
 ## Proxying
 
@@ -268,6 +291,6 @@ Other routes are not proxied. `/v1/completions` is absent for the reason given o
 
 ## What was tested
 
-Two model servers with `stats_api #true` (Qwen3-0.6B Q8_0, CPU, Windows) behind one balancer. A streamed completion went through. A repeated conversation prefix reached the same upstream, and the second request had `cached_tokens` above zero. Eight concurrent distinct requests split four and four. With one upstream killed, requests kept succeeding on the other and the stats reported `upstream_down`. The other policies, the affinity fallback, the drafter and speed rules and the API keys are covered by automated tests with mock upstreams, not by a live run.
+Two model servers with `stats_api #true` (Qwen3-0.6B Q8_0, CPU, Windows) behind one balancer. A streamed completion went through. A repeated conversation prefix reached the same upstream, and the second request had `cached_tokens` above zero. Eight concurrent distinct requests split four and four. With one upstream killed, requests kept succeeding on the other and the stats reported `upstream_down`. The other policies, the affinity fallback, the speed rule and the API keys are covered by automated tests with mock upstreams, not by a live run.
 
 `cuca run` with one model (Qwen3-0.6B Q8_0, CPU, Windows) and no `upstreams`: the balancer port answered a chat completion from the local model, and Ctrl-C stopped both listeners with exit status 0. With Gemma 4 E2B Q4_K_M and its MTP drafter, the server's snapshot reported the drafter with `draft_tokens` 5 and an `acceptance_ratio` of 0.86 after two requests.

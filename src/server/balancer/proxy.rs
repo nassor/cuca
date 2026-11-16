@@ -47,13 +47,15 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tracing::Span;
 
+use super::config::Role;
 use super::metrics as balancer_metrics;
 use super::routing::{Decision, NoCandidate, prefix_key, resolve_model};
 use super::snapshot;
 use super::state::{BalancerState, as_views, decision_slot};
 use super::upstream::{Upstream, short_error};
 use crate::server::http::{
-    ApiError, RequestCtx, StreamQuery, bearer_matches, body_rejection, stats_events, trace_request,
+    ApiError, PREFILL_HEADER, RequestCtx, StreamQuery, bearer_matches, body_rejection,
+    stats_events, trace_request,
 };
 use crate::server::latency::{Outcome, RequestRecord};
 
@@ -538,13 +540,34 @@ fn passthrough_headers(from: &HeaderMap) -> HeaderMap {
     out
 }
 
-/// Send the request to `upstream`.
+/// The prefill node for a request headed to a decode node: the policy's
+/// pick among the healthy prefill nodes serving the model, as its base URL.
+/// `None` when there is none; the decode node then prefills itself.
+fn assign_prefill(state: &BalancerState, routed: &Routed) -> Option<String> {
+    let candidates = state.prefill_candidates(&routed.model);
+    let url = state
+        .router
+        .choose(&routed.model, routed.key.as_deref(), &candidates)
+        .map(|(index, _)| state.upstreams[index].url.clone());
+    let counter = if url.is_some() {
+        &state.metrics.prefill_assigned
+    } else {
+        &state.metrics.prefill_unassigned
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    url
+}
+
+/// Send the request to `upstream`. Only the headers named here go along, so
+/// a client's own [`PREFILL_HEADER`] never reaches a model server: the
+/// balancer alone names the prefill peer.
 async fn send(
     state: &BalancerState,
     upstream: &Upstream,
     headers: &HeaderMap,
     body: Bytes,
     request_id: &str,
+    prefill: Option<&str>,
 ) -> Result<reqwest::Response, reqwest::Error> {
     let mut req = state
         .client
@@ -560,6 +583,9 @@ async fn send(
         .body(body);
     if let Some(accept) = headers.get(ACCEPT) {
         req = req.header(ACCEPT, accept);
+    }
+    if let Some(peer) = prefill.and_then(|url| HeaderValue::from_str(url).ok()) {
+        req = req.header(HeaderName::from_static(PREFILL_HEADER), peer);
     }
     if let Some(key) = &state.upstream_key {
         req = req.bearer_auth(key);
@@ -610,7 +636,24 @@ async fn forward(
             decision,
             retries,
         );
-        match send(&state, &upstream, &headers, routed.body.clone(), &ctx.id).await {
+        let prefill = match upstream.role {
+            Role::Decode => assign_prefill(&state, &routed),
+            Role::Prefill => {
+                state.metrics.prefill_whole.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+            Role::Whole => None,
+        };
+        match send(
+            &state,
+            &upstream,
+            &headers,
+            routed.body.clone(),
+            &ctx.id,
+            prefill.as_deref(),
+        )
+        .await
+        {
             Err(error) if error.is_connect() => {
                 upstream.eject(short_error(&error));
                 tracker.finish(502, Outcome::ServerError);

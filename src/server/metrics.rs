@@ -163,6 +163,10 @@ impl StatusCounters {
     }
 }
 
+/// The outcomes of a remote prefill in the order of
+/// [`ModelMetrics::kv_imports`]: the `outcome` label values.
+pub(crate) const KV_IMPORT_OUTCOMES: [&str; 5] = ["ok", "skipped", "drafter", "unlisted", "failed"];
+
 /// The metrics of one model.
 #[derive(Debug)]
 pub struct ModelMetrics {
@@ -186,6 +190,19 @@ pub struct ModelMetrics {
     pub e2e: Histogram,
     /// Wait for admission to the engine.
     pub queue: Histogram,
+    /// K/V exports served.
+    pub kv_exports: AtomicU64,
+    /// Prompt tokens exported.
+    pub kv_export_tokens: AtomicU64,
+    /// Bytes of frames exported.
+    pub kv_export_bytes: AtomicU64,
+    /// Requests that named a prefill node, by outcome
+    /// ([`KV_IMPORT_OUTCOMES`] order).
+    pub kv_imports: [AtomicU64; 5],
+    /// Prompt tokens imported.
+    pub kv_import_tokens: AtomicU64,
+    /// Bytes of frames imported.
+    pub kv_import_bytes: AtomicU64,
 }
 
 impl Default for ModelMetrics {
@@ -201,6 +218,12 @@ impl Default for ModelMetrics {
             itl: Histogram::new(ITL_BUCKETS),
             e2e: Histogram::new(E2E_BUCKETS),
             queue: Histogram::new(QUEUE_BUCKETS),
+            kv_exports: AtomicU64::new(0),
+            kv_export_tokens: AtomicU64::new(0),
+            kv_export_bytes: AtomicU64::new(0),
+            kv_imports: Default::default(),
+            kv_import_tokens: AtomicU64::new(0),
+            kv_import_bytes: AtomicU64::new(0),
         }
     }
 }
@@ -424,6 +447,55 @@ pub fn render(
         "cuca_request_queue_seconds",
         "Time from arrival to admission to the engine.",
         |m| &m.queue,
+    );
+    x.per_model(
+        models,
+        "cuca_kv_exports_total",
+        "counter",
+        "K/V exports served to decode nodes.",
+        |m| Some(m.metrics.kv_exports.load(Ordering::Relaxed)),
+    );
+    x.per_model(
+        models,
+        "cuca_kv_export_tokens_total",
+        "counter",
+        "Prompt tokens whose K/V rows were exported.",
+        |m| Some(m.metrics.kv_export_tokens.load(Ordering::Relaxed)),
+    );
+    x.per_model(
+        models,
+        "cuca_kv_export_bytes_total",
+        "counter",
+        "Bytes of K/V frames sent by exports.",
+        |m| Some(m.metrics.kv_export_bytes.load(Ordering::Relaxed)),
+    );
+    x.family(
+        "cuca_kv_imports_total",
+        "counter",
+        "Requests that named a prefill node, by outcome: ok (rows imported), skipped (prompt too short), drafter (the drafter replays the prompt), unlisted (peer not in kv_import) or failed.",
+    );
+    for m in models {
+        for (outcome, counter) in KV_IMPORT_OUTCOMES.iter().zip(&m.metrics.kv_imports) {
+            x.sample(
+                "cuca_kv_imports_total",
+                &format!("model=\"{}\",outcome=\"{outcome}\"", escape(m.name)),
+                counter.load(Ordering::Relaxed),
+            );
+        }
+    }
+    x.per_model(
+        models,
+        "cuca_kv_import_tokens_total",
+        "counter",
+        "Prompt tokens whose K/V rows were imported from a prefill node.",
+        |m| Some(m.metrics.kv_import_tokens.load(Ordering::Relaxed)),
+    );
+    x.per_model(
+        models,
+        "cuca_kv_import_bytes_total",
+        "counter",
+        "Bytes of K/V frames received by imports.",
+        |m| Some(m.metrics.kv_import_bytes.load(Ordering::Relaxed)),
     );
 
     x.per_model(
@@ -810,5 +882,64 @@ mod tests {
         assert!(text.contains(r#"cuca_model_ready{model="we\"ird\\name"} 1"#));
         assert!(text.contains(r#"cuca_kv_cache_bytes{model="we\"ird\\name"} 7"#));
         assert!(text.contains("cuca_uptime_seconds 1.5"));
+    }
+
+    #[test]
+    fn kv_transfer_counters_render_per_model_and_outcome() {
+        let metrics = ModelMetrics::default();
+        metrics.kv_exports.fetch_add(2, Ordering::Relaxed);
+        metrics.kv_export_tokens.fetch_add(2048, Ordering::Relaxed);
+        metrics.kv_export_bytes.fetch_add(99, Ordering::Relaxed);
+        metrics.kv_imports[0].fetch_add(3, Ordering::Relaxed);
+        metrics.kv_imports[4].fetch_add(1, Ordering::Relaxed);
+        metrics.kv_import_tokens.fetch_add(4096, Ordering::Relaxed);
+        metrics.kv_import_bytes.fetch_add(77, Ordering::Relaxed);
+        let models = [ModelView {
+            name: "m",
+            state: ModelState::Ready,
+            metrics: &metrics,
+            serving: None,
+            kv_bytes: 0,
+            weights_bytes: 0,
+        }];
+        let text = render(
+            &models,
+            &ServerMetrics::default(),
+            &SystemSnapshot::default(),
+            0.0,
+        );
+        for family in [
+            "cuca_kv_exports_total",
+            "cuca_kv_export_tokens_total",
+            "cuca_kv_export_bytes_total",
+            "cuca_kv_imports_total",
+            "cuca_kv_import_tokens_total",
+            "cuca_kv_import_bytes_total",
+        ] {
+            assert!(text.contains(&format!("# HELP {family} ")), "{family}");
+            assert!(
+                text.contains(&format!("# TYPE {family} counter")),
+                "{family}"
+            );
+        }
+        assert!(
+            text.contains("cuca_kv_exports_total{model=\"m\"} 2\n"),
+            "{text}"
+        );
+        assert!(text.contains("cuca_kv_export_tokens_total{model=\"m\"} 2048\n"));
+        assert!(text.contains("cuca_kv_export_bytes_total{model=\"m\"} 99\n"));
+        assert!(text.contains("cuca_kv_import_tokens_total{model=\"m\"} 4096\n"));
+        assert!(text.contains("cuca_kv_import_bytes_total{model=\"m\"} 77\n"));
+        for (outcome, count) in [
+            ("ok", 3),
+            ("skipped", 0),
+            ("drafter", 0),
+            ("unlisted", 0),
+            ("failed", 1),
+        ] {
+            let line =
+                format!("cuca_kv_imports_total{{model=\"m\",outcome=\"{outcome}\"}} {count}\n");
+            assert!(text.contains(&line), "{line}{text}");
+        }
     }
 }

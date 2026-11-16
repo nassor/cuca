@@ -473,7 +473,7 @@ struct CompState {
 
 /// What the hyper-connection path keeps next to the layers.
 pub(super) struct HyperModel {
-    spec: HyperSpec,
+    pub(super) spec: HyperSpec,
     ropes: Vec<Rope>,
     /// The cache simulates the quantization the model trained with.
     qdq: bool,
@@ -631,7 +631,7 @@ impl Rope {
 }
 
 /// The row of position/row `i` of a paged pool of rows of `width` floats.
-fn pool_row(table: &[u32], i: usize, width: usize) -> Option<usize> {
+pub(super) fn pool_row(table: &[u32], i: usize, width: usize) -> Option<usize> {
     let b = *table.get(i / BLOCK_SIZE)?;
     (b != NO_BLOCK).then(|| (b as usize * BLOCK_SIZE + i % BLOCK_SIZE) * width)
 }
@@ -657,13 +657,32 @@ struct Shared {
 
 impl Transformer {
     /// The hyper-connection layers over the concatenated rows `embeddings` of
-    /// the sequences `segs` describe: the stream after the last layer
-    /// collapsed to one `(1, t, n_embd)` hidden state, or, on a [`Front`]
-    /// (no LM head), the stream `(1, t, S * n_embd)` and the pre weights
-    /// `(1, t, S)` its last layer's FFN predicted.
+    /// the sequences `segs` describe, from the embeddings of the stage that
+    /// starts at layer 0 ([`Transformer::hyper_trunk_from`] for a later one).
     pub(super) fn hyper_trunk(
         &self,
         embeddings: Vec<f32>,
+        segs: &[Seg<'_>],
+    ) -> candle_core::Result<TrunkOut> {
+        let hy = self
+            .hyper
+            .as_ref()
+            .ok_or_else(|| msg("hyper-connection pass without hyper-connections"))?;
+        let (stream, pre_mix) = start_streams(&embeddings, hy.spec.streams, self.hp.n_embd);
+        self.hyper_trunk_from(stream, pre_mix, segs)
+    }
+
+    /// The hyper-connection layers of the range over the residual streams
+    /// `stream` (`(t, S * n_embd)` row-major) and the pre weights `pre_mix`
+    /// (`(t, S)`) of the rows of `segs`: the stream after the last layer
+    /// collapsed to one `(1, t, n_embd)` hidden state, or, on a stage that
+    /// ends before the last layer (no LM head), the stream `(1, t, S *
+    /// n_embd)` and the pre weights `(1, t, S)` its last layer's FFN
+    /// predicted.
+    pub(super) fn hyper_trunk_from(
+        &self,
+        mut stream: Vec<f32>,
+        mut pre_mix: Vec<f32>,
         segs: &[Seg<'_>],
     ) -> candle_core::Result<TrunkOut> {
         let hp = &self.hp;
@@ -672,8 +691,7 @@ impl Transformer {
             .as_ref()
             .ok_or_else(|| msg("hyper-connection pass without hyper-connections"))?;
         let (s, d) = (hy.spec.streams, hp.n_embd);
-        let t = embeddings.len() / d;
-        let (mut stream, mut pre_mix) = start_streams(&embeddings, s, d);
+        let t = stream.len() / (s * d);
         let mut rows = RowMap {
             seg: Vec::with_capacity(t),
             pos: Vec::with_capacity(t),
@@ -705,19 +723,26 @@ impl Transformer {
         let mut shared = Shared::default();
         // Every engram layer's rows depend on token ids only: start reading
         // them all now, so the reads of the later layers overlap the compute
-        // of the earlier ones.
+        // of the earlier ones. The layers outside the range belong to other
+        // stages.
         let mut engram_ids: Vec<Vec<u64>> = Vec::new();
         if let (Some(es), Some(source)) = (hp.engram.as_ref(), hy.engram.as_deref()) {
-            for ordinal in 0..es.layers.len() {
-                let ids = self.engram_row_ids(es, ordinal, t, segs)?;
-                source.prefetch(&ids);
-                engram_ids.push(ids);
+            for (ordinal, &il) in es.layers.iter().enumerate() {
+                if (self.first..self.end).contains(&il) {
+                    let ids = self.engram_row_ids(es, ordinal, t, segs)?;
+                    source.prefetch(&ids);
+                    engram_ids.push(ids);
+                } else {
+                    engram_ids.push(Vec::new());
+                }
             }
         }
         let mut captured: Vec<Vec<Vec<f32>>> = vec![Vec::new(); segs.len()];
-        for il in 0..self.layers.len() {
-            if let (Some(hc), Some(es)) = (self.layers[il].hc.as_deref(), hp.engram.as_ref())
-                && let Some(eng) = &hc.engram
+        for il in self.first..self.end {
+            if let (Some(hc), Some(es)) = (
+                self.layers[il - self.first].hc.as_deref(),
+                hp.engram.as_ref(),
+            ) && let Some(eng) = &hc.engram
             {
                 self.engram_layer(eng, es, &engram_ids[eng.ordinal], &mut stream)?;
             }
@@ -737,9 +762,9 @@ impl Transformer {
             }
             self.hyper_layer(il, &mut stream, &mut pre_mix, &mut shared, &rows, segs)?;
         }
-        // A front (the first layers of an offloaded model) hands the stream
-        // and the pre weights its last FFN predicted to the layers after it.
-        if self.lm_head.is_none() {
+        // A stage that ends before the last layer hands the stream and the
+        // pre weights its last FFN predicted to the layers after it.
+        if self.end < hp.n_layer {
             return Ok((
                 Tensor::from_vec(stream, (1, t, s * d), &Device::Cpu)?,
                 Some(Tensor::from_vec(pre_mix, (1, t, s), &Device::Cpu)?),
@@ -861,8 +886,10 @@ impl Transformer {
         };
         let cols = es.cols();
         let mut ids = vec![0u64; tokens.len() * cols];
-        for ordinal in 0..es.layers.len() {
-            if engram::sequence_row_ids(es, ordinal, tokens, history, &mut ids).is_ok() {
+        for (ordinal, &il) in es.layers.iter().enumerate() {
+            if (self.first..self.end).contains(&il)
+                && engram::sequence_row_ids(es, ordinal, tokens, history, &mut ids).is_ok()
+            {
                 source.prefetch(&ids);
             }
         }
@@ -890,7 +917,7 @@ impl Transformer {
             .hyper
             .as_ref()
             .ok_or_else(|| msg("no hyper-connections"))?;
-        let lw: &LayerWeights = &self.layers[il];
+        let lw: &LayerWeights = &self.layers[il - self.first];
         let (Some(hc), Mixer::Csa(cw)) = (lw.hc.as_deref(), &lw.mixer) else {
             return Err(msg(format!("layer {il} has no hyper-connection weights")));
         };

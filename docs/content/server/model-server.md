@@ -183,6 +183,8 @@ A `model` node holds a [`LocalModelConfig`](@/local/configuration.md). Its keys 
 - `cache_dir`: default the platform cache directory. Where models download and convert.
 - `chat_template_file`: default the model's template. A Jinja file that replaces the template.
 - `convert`: default `quant="q8_0"`. Checkpoint conversion: `quant` is `f16`, `q8_0` or `q4_0`.
+- `kv_export`: none by default. Lets this model serve the K/V rows of prompts to decode nodes; takes `max_exports=2` (1 to 16 exports at once), or write it bare. Not with `shards`. See [K/V transfer](#k-v-transfer-between-servers).
+- `kv_import`: none by default. Lets the model take a prompt's K/V rows from a prefill node a [balancer](@/server/balancer.md#disaggregated-prefill) names. Takes `peers` (one or more base URLs, at most 16; the model only accepts a node listed here), `min_tokens` (default 1024, at least 16: shorter prompts are prefilled locally) and `timeout` (default `"120s"`, 1 s to 1 h). It is a server key, not part of the `LocalModelConfig`, and cannot be combined with `shards`.
 - `drafter`, `draft_tokens`: none by default. `"in-trunk"` or a source for a drafter file; tokens drafted per round, 1 to 16.
 
 A device whose Cargo feature is off fails the load with a configuration error. The other keys (`sampling`, `engram`, `hf_token`, `shard_dirs`, `chat_template`) are listed on [Configuration files](@/reference/environment.md).
@@ -206,6 +208,8 @@ Without an argument the name is the preset name, else the file stem, the checkpo
 | `GET /version` | `{"version": "..."}` |
 | `GET /v1/models` | the ready models: `id`, `object`, `created`, `owned_by` (`cuca`) and `max_model_len` |
 | `POST /v1/chat/completions` | a chat completion, or an SSE stream with `"stream": true` |
+| `POST /cuca/v1/kv/export` | the K/V rows of a prompt, streamed to a decode node; see [K/V transfer](#k-v-transfer-between-servers) |
+| `POST /cuca/v1/stage`, `POST /cuca/v1/stage/{model}` | one frame of a layer-stage call, answered by a worker; see [Layer stages](#layer-stages) |
 | `GET /metrics` | Prometheus text, see [Stats API and metrics](@/server/stats-and-metrics.md) |
 | `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `stats_api #true` |
 
@@ -259,6 +263,52 @@ A generation that fails after the stream began sends an error object as one even
 ### Request ids and logs
 
 Every response has an `x-request-id` header. An incoming one is kept when it is up to 128 printable ASCII characters. Otherwise the server makes one. Each request has a tracing span `http` and one `info` line when it finishes, described under [logs](@/server/stats-and-metrics.md#logs).
+
+## K/V transfer between servers
+
+Two servers that run the same model file can split a request: one prefills the prompt and the other decodes. The balancer's [`disaggregate`](@/server/balancer.md#disaggregated-prefill) section decides who does what; the servers need two settings.
+
+- The prefill node adds `kv_export` to the model. It then serves `POST /cuca/v1/kv/export` (behind the API key like every route but `/health`). The body is JSON: `{"model": "m", "fingerprint": "<16 hex digits>", "from": 0, "ids": [...]}`, the token ids of the prompt and how many leading tokens the caller already holds. The node prefills the prompt as a request would, reusing its own prefix cache, and answers `200 application/octet-stream` with the K/V rows of the prompt up to its last whole block, streamed in frames. Errors: `409 kv_fingerprint_mismatch` (not the same file and cache layout), `409 kv_export_disabled` (no `kv_export`), `503 kv_export_busy` (all export slots in use), `400` for a prompt the context cannot hold or an empty range.
+- The decode node adds `kv_import` with the prefill node's URL in `peers`. A request that carries `x-cuca-prefill` (the balancer sets it, and drops any value a client sends) names the peer. Without `kv_import` the header is ignored. Otherwise the node asks the peer for the rows its prefix cache lacks and files them in its own cache, then runs the request, which reads them as a cache hit.
+
+The transfer never fails a request. The decode node prefills the prompt itself when the named URL is not in `peers`, when the prompt has fewer than `min_tokens` tokens beyond its own cache, when the model's drafter replays every position, or when the exchange fails (peer down, a different model file, a timeout, a broken stream; the cause is logged as a warning). `cuca_kv_imports_total{outcome}` counts each case as `ok`, `skipped`, `drafter`, `unlisted` or `failed`; the other `cuca_kv_*` series count tokens and bytes, see [Stats API and metrics](@/server/stats-and-metrics.md).
+
+## Layer stages
+
+A model too large for one machine can run its layers on several. A coordinator hands the first layers to workers and runs the remaining layers and the output head itself. Both sides are `model` nodes of a `serve` section.
+
+A worker holds layers `first` to `first + layers` and serves no chat:
+
+```kdl,name=stage-worker.kdl
+serve {
+    listen "0.0.0.0:8000"
+    api_key "${STAGE_KEY}"
+    model "m" {
+        source "qwen3-0.6b-q8_0"
+        stage first=0 layers=14
+    }
+}
+```
+
+The coordinator lists the workers in layer order from layer 0. The layers left over and the head run on its own `device`:
+
+```kdl,name=stage-coordinator.kdl
+serve {
+    model "m" {
+        source "qwen3-0.6b-q8_0"
+        remote_stage url="http://box-a:8000" layers=14 api_key="${STAGE_KEY}"
+    }
+}
+```
+
+- Start the workers first. The coordinator opens every worker when it loads, so a load fails naming the worker that is unreachable or does not match (another model file, another `context_length`, another `batching` size).
+- Every call goes through the coordinator. It sends each worker the tokens and the hidden state the previous stage produced, and the workers never talk to each other. The last stage holds the output head, so the coordinator alone samples.
+- A worker keeps the K/V cache and the recurrent state of its own layers. The coordinator's prefix cache works as before: a repeated prompt reads its cached prefix on every stage.
+- A failed call fails the step and the requests running in it. The coordinator reopens the workers before its next step, so the next request runs.
+- A worker's `/v1/models` is empty, so a balancer never routes chat to it. A chat request naming it is a 400.
+- `POST /cuca/v1/stage`, or `/cuca/v1/stage/{model}` when `remote_stage` sets `model`, takes the frame as an `application/octet-stream` body and answers the reply frame. It needs the API key like the other routes, and it accepts up to 1 GiB (`MAX_STAGE_BODY_BYTES`), the rows of one forward pass. A frame for a worker whose configuration differs from the coordinator's is a 409 `stage_mismatch`; any other failure is a 500 `stage_failed`.
+
+The keys, their limits and the boundaries a model allows are on [Configuration](@/local/configuration.md).
 
 ## Errors
 

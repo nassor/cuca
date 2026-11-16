@@ -23,6 +23,13 @@ serve {
     model "chat" {
         source "qwen3-0.6b-q8_0"
         batching max_sequences=8
+        // A decode node behind a balancer's `disaggregate` section takes
+        // prompts' K/V rows from these prefill nodes (not with `shards`):
+        // kv_import {
+        //     peers "http://10.0.0.1:8000"
+        //     min_tokens 1024
+        //     timeout "120s"
+        // }
     }
     // Layer offload: the last 20 layers on the GPU, the first ones on the CPU.
     model {
@@ -46,4 +53,10 @@ balance {
     policy "prefix-affinity"
     health_interval "1s"
     stats_api #true
+    // Prefill on one machine, decode on others: every URL is also in
+    // `upstreams`, the decode nodes name the prefill nodes in `kv_import`.
+    // disaggregate {
+    //     prefill "http://10.0.0.1:8000"
+    //     decode "http://10.0.0.2:8000"
+    // }
 }

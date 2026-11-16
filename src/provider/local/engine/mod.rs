@@ -20,24 +20,28 @@
 //!    recurrent state is not positional: the engine keeps a snapshot of it at
 //!    a block boundary of every prompt it prefills (the end of its last
 //!    complete message) and resumes only from prefixes it has one for. An
-//!    in-trunk head, an EAGLE or a DFlash drafter keeps the pairs (positions)
-//!    the shared tokens still determine (`Drafter::truncate`, which also drops
-//!    the rows it holds back) and re-observes the replayed rows;
-//!    it serves one sequence at a time.
+//!    in-trunk head, an EAGLE, a DFlash or a DSpark drafter keeps the pairs
+//!    (positions) the shared tokens still determine (`Drafter::truncate`,
+//!    which also drops the rows it holds back) and re-observes the replayed
+//!    rows; it keeps one such cache per state slot (`Engine::drafters`, forks
+//!    of one set of weights), and a prompt takes the free slot whose cache
+//!    shares the longest prefix with it.
 //! 2. **Prefill** in chunks of [`prefill_chunk`] tokens, interleaved with the
 //!    decode rows of the other sequences within the step's row budget; only
-//!    the last chunk computes logits. An in-trunk head, an EAGLE or a DFlash
-//!    drafter takes the hidden rows of every position (`Drafter::observe`).
+//!    the last chunk computes logits. An in-trunk head, an EAGLE, a DFlash or
+//!    a DSpark drafter takes the hidden rows of every position
+//!    (`Drafter::observe`).
 //! 3. **Decode**: sample, stop on an end-of-generation id, feed the id through
 //!    the [`OutputParser`], cut its text at the first stop string of the job
 //!    (`StopMatcher`; thinking and tool calls pass through, and text a stop
 //!    string might still begin is held back) and queue every resulting block
 //!    for the stream (`try_send`: a slow consumer stalls its own sequence
-//!    only), then run the model one token further (a round: for a lone
-//!    sequence draft, verify one batch, roll back the rejected positions, hand
-//!    the kept rows to the in-trunk head, the EAGLE or the DFlash drafter:
-//!    observed at once after a round that drafted, held back (`Drafter::defer`)
-//!    after one that did not, until a round drafts again). Generation stops at the
+//!    only), then run the model one token further (a round: draft, verify in
+//!    the step's shared batch, roll back the rejected positions, hand the
+//!    kept rows to the sequence's in-trunk head, EAGLE, DFlash or DSpark
+//!    drafter: observed at once after a round that drafted, held back
+//!    (`Drafter::defer`) after one that did not, until a round drafts
+//!    again). Generation stops at the
 //!    end-of-generation id, at a stop string, at `max_tokens`, or when the
 //!    context is full; held text is released at every end but a stop string.
 //! 4. **Usage**: exact prompt and completion token counts are recorded in the
@@ -50,6 +54,7 @@
 //! consistent with the ids it processed, so its work is reusable.
 
 mod scheduler;
+mod stage;
 mod stop;
 
 use std::collections::VecDeque;
@@ -60,15 +65,17 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::provider::local::gguf;
 use tokio::sync::mpsc;
 
-use self::scheduler::{Sequence, SnapshotStore, StepBufs};
+pub(crate) use self::scheduler::ExportReady;
+use self::scheduler::{Export, Import, Sequence, SnapshotStore, StepBufs};
 use super::chat::{ChatFormat, ChatTemplate, expand_template_name};
 use super::model::Model;
 use super::model::arch::Arch;
 use super::model::err as local_err;
 use super::model::mtp::Drafter;
-use super::model::paged::{KvPools, Sizing};
+use super::model::paged::{KvLayout, KvPools, Sizing};
 #[cfg(test)]
 use super::model::prefill_chunk;
+use super::model::split::LayerRange;
 use super::sampler::{SplitMix64, random_seed};
 use super::sampling::{FileSampling, Sampling};
 use super::tokenizer::Tokenizer;
@@ -112,6 +119,15 @@ pub(crate) struct Job {
     pub(crate) queued_at: std::time::Instant,
 }
 
+/// What the engine thread receives: a request, or a call to run on the
+/// engine itself (the K/V transfer and stage endpoints read and change
+/// engine state, which only this thread may touch). Both wait in the same
+/// queue: a call behind a full queue of requests waits like one.
+pub(crate) enum Msg {
+    Job(Job),
+    Call(Box<dyn FnOnce(&mut Engine) + Send + 'static>),
+}
+
 /// The resolved [`BatchingConfig`](super::BatchingConfig): what the scheduler
 /// runs with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,31 +164,53 @@ pub(crate) struct Engine {
     free_slots: Vec<usize>,
     /// Recurrent-state snapshots of block-aligned prefixes (hybrid models).
     snapshots: SnapshotStore,
-    /// The ids of the last sequence a drafter that observes every position
-    /// served: its cache holds pairs for them.
-    drafter_ids: Vec<u32>,
+    /// The ids of the last sequence each state slot served, for a drafter
+    /// that observes every position: the slot's drafter cache holds pairs
+    /// for them.
+    drafter_ids: Vec<Vec<u32>>,
     /// Sampling generator when no fixed seed is configured.
     rng: SplitMix64,
     /// Generator of tool-call ids.
     id_rng: SplitMix64,
-    /// The multi-token-prediction drafter, when one is configured.
-    drafter: Option<Drafter>,
+    /// The multi-token-prediction drafters: none, one shared assistant
+    /// (reads the target's K/V, holds no state), or one drafter per state
+    /// slot (an observing drafter keeps a cache per sequence).
+    drafters: Vec<Drafter>,
     /// Most tokens drafted per verification round.
     draft_tokens: usize,
     /// Speculation counters shared with `LocalModel::draft_stats`.
     stats: Arc<DraftCounters>,
     /// Scheduler counters shared with `LocalModel::serving_stats`.
     serving: Arc<ServingCounters>,
-    /// Cost-aware on/off switch of speculation, kept across requests.
-    governor: Governor,
-    /// Measured costs that set each round's draft length, kept across
-    /// requests.
-    cost: CostModel,
+    /// Cost-aware on/off switch of speculation per concurrency class
+    /// ([`spec_class`]), kept across requests.
+    governor: [Governor; SPEC_CLASSES],
+    /// Measured costs that set each round's draft length per concurrency
+    /// class, kept across requests.
+    cost: [CostModel; SPEC_CLASSES],
     /// Scratch the scheduler refills every step.
     bufs: StepBufs,
     /// Size in bytes of the GGUF file the model was read from (`0` for an
     /// engine not built by [`Engine::open`]).
     file_bytes: u64,
+    /// What identifies the model's file and cache layout to a peer that
+    /// transfers K/V ([`model_fingerprint`]); `0` for an engine not built by
+    /// [`Engine::open`].
+    fingerprint: u64,
+    /// Most K/V exports (running and leased) at once; `None` when the model
+    /// does not export ([`LocalModelConfig::kv_export`]).
+    max_exports: Option<usize>,
+    /// Prefixes whose blocks a peer is reading.
+    exports: Vec<Export>,
+    /// Prefixes being imported from a peer.
+    imports: Vec<Import>,
+    /// The id of the next export or import.
+    next_transfer: u64,
+    /// What the model was sized for, as a layer-stage peer must agree on it.
+    sizing: Sizing,
+    /// The state of a layer-stage worker ([`LocalModelConfig::stage`]);
+    /// `None` for every other engine.
+    stage: Option<stage::StageHost>,
     /// The ids the last sequence that ended held (empty after a failure).
     #[cfg(test)]
     last_ids: Vec<u32>,
@@ -486,6 +524,18 @@ impl Governor {
     }
 }
 
+/// Concurrency classes of the speculation [`Governor`] and [`CostModel`]: a
+/// round's cost and the benefit of drafting depend on how many sequences
+/// share the step, so each class measures its own.
+pub(super) const SPEC_CLASSES: usize = 7;
+
+/// The class of a step with `decoding` decoding sequences: 1, 2, 3 to 4, 5 to
+/// 8, 9 to 16, 17 to 32, and 33 or more (at most 64) sequences.
+pub(super) fn spec_class(decoding: usize) -> usize {
+    ((usize::BITS - decoding.max(1).saturating_sub(1).leading_zeros()) as usize)
+        .min(SPEC_CLASSES - 1)
+}
+
 /// Speculation counters, updated by the engine thread and read by
 /// `LocalModel::draft_stats`.
 #[derive(Debug, Default)]
@@ -593,9 +643,8 @@ impl Engine {
         let hp = super::model::read_hparams(&content)?;
         let context_length = super::resolve_context_length(config.context_length, hp.n_ctx_train);
         // A separate drafter file is indexed before the model loads: its
-        // architecture says whether it observes every position of its one
-        // sequence like an in-trunk head does (`file_drafter_observes`), and
-        // an EAGLE drafter runs on the CPU only.
+        // architecture says which drafter to open, and an EAGLE drafter runs
+        // on the CPU only.
         let file_drafter = match drafter {
             Some(ResolvedDrafter::File(dp)) => Some(open_gguf(dp, &config.shard_dirs)?),
             _ => None,
@@ -607,23 +656,70 @@ impl Engine {
                 config.device
             )));
         }
-        let observing =
-            matches!(drafter, Some(ResolvedDrafter::InTrunk)) || file_drafter_observes(file_arch);
+        stage::check_stages(&hp, config, file_arch)?;
         // Tiered experts make a prefill step's cost the experts it touches, so
         // a model that can run big steps does (`prefill_rows`).
         let tiered = matches!(config.experts, super::ExpertPlacement::Tiered(_));
         let chunk = super::model::prefill_rows(&hp, context_length, tiered);
-        let (batching, sizing) = resolve_batching_with(config, context_length, observing, chunk)?;
-        let model = Model::load(
-            &content,
-            context_length,
-            config.device,
-            &config.shards,
-            &config.experts,
-            &sizing,
-            config.gpu_layers,
-            &config.engram,
-        )?;
+        let (batching, sizing) = resolve_batching_with(config, context_length, chunk)?;
+        let file_bytes = content
+            .files()
+            .iter()
+            .map(|f| std::fs::metadata(&f.path).map_or(0, |m| m.len()))
+            .sum();
+        let fingerprint_of = |tokenizer: &Tokenizer| {
+            model_fingerprint(
+                &content,
+                file_bytes,
+                hp.n_layer,
+                tokenizer.vocab_size(),
+                &KvLayout::sized(&hp, context_length, &sizing),
+            )
+        };
+        // A coordinator names the file to its workers (and a worker checks
+        // it) before any weights load; every other model reads the
+        // tokenizer after its drafter, as it always did.
+        let staged = config.stage.is_some() || !config.remote_stages.is_empty();
+        let early_tokenizer = if staged {
+            Some(Arc::new(Tokenizer::from_gguf(&content.metadata)?))
+        } else {
+            None
+        };
+        let early_fingerprint = early_tokenizer.as_deref().map_or(0, &fingerprint_of);
+        let model = match (&config.stage, config.remote_stages.is_empty()) {
+            (Some(stage), _) => Model::load_stage(
+                &content,
+                context_length,
+                config.device,
+                &config.experts,
+                &sizing,
+                &config.engram,
+                LayerRange {
+                    first: stage.first,
+                    end: stage.first + stage.layers,
+                },
+            )?,
+            (None, false) => Model::load_chain(
+                &content,
+                context_length,
+                config.device,
+                &config.experts,
+                &sizing,
+                &config.engram,
+                &config.remote_stages,
+                early_fingerprint,
+            )?,
+            (None, true) => Model::load(
+                &content,
+                context_length,
+                config.device,
+                &config.shards,
+                &config.experts,
+                &sizing,
+                config.gpu_layers,
+                &config.engram,
+            )?,
+        };
         let drafter = drafter
             .map(|source| match (source, &file_drafter) {
                 (ResolvedDrafter::File(_), Some(dc)) => match file_arch {
@@ -645,7 +741,19 @@ impl Engine {
                 (ResolvedDrafter::InTrunk, _) => Drafter::open_in_trunk(&content, &model),
             })
             .transpose()?;
-        let tokenizer = Arc::new(Tokenizer::from_gguf(&content.metadata)?);
+        let drafters = match drafter {
+            None => Vec::new(),
+            Some(d) => drafters_per_slot(d, batching.max_sequences)?,
+        };
+        let tokenizer = match early_tokenizer {
+            Some(tokenizer) => tokenizer,
+            None => Arc::new(Tokenizer::from_gguf(&content.metadata)?),
+        };
+        let fingerprint = if staged {
+            early_fingerprint
+        } else {
+            fingerprint_of(&tokenizer)
+        };
         let (format, template) = load_chat(&content, &tokenizer, chat_template)?;
 
         let mut engine = Self::new(
@@ -658,15 +766,23 @@ impl Engine {
             ),
             context_length,
             batching,
-            drafter,
+            drafters,
             config.draft_tokens,
             stats,
         );
-        engine.file_bytes = content
-            .files()
-            .iter()
-            .map(|f| std::fs::metadata(&f.path).map_or(0, |m| m.len()))
-            .sum();
+        engine.file_bytes = file_bytes;
+        engine.fingerprint = fingerprint;
+        engine.sizing = sizing;
+        engine.stage = config.stage.map(|s| {
+            stage::StageHost::new(
+                LayerRange {
+                    first: s.first,
+                    end: s.first + s.layers,
+                },
+                sizing.max_sequences,
+            )
+        });
+        engine.max_exports = config.kv_export.as_ref().map(|c| c.max_exports);
         Ok((engine, tokenizer, template, format))
     }
 
@@ -682,7 +798,7 @@ impl Engine {
         sampling: Sampling,
         context_length: usize,
         batching: Batching,
-        drafter: Option<Drafter>,
+        drafters: Vec<Drafter>,
         draft_tokens: usize,
         stats: Arc<DraftCounters>,
     ) -> Self {
@@ -704,17 +820,24 @@ impl Engine {
             draining: Vec::new(),
             free_slots: (0..batching.max_sequences).rev().collect(),
             snapshots: SnapshotStore::new(batching.max_sequences + 4),
-            drafter_ids: Vec::new(),
+            drafter_ids: vec![Vec::new(); batching.max_sequences],
             rng: SplitMix64(random_seed()),
             id_rng: SplitMix64(random_seed()),
-            drafter,
+            drafters,
             draft_tokens,
             bufs: StepBufs::default(),
             file_bytes: 0,
+            fingerprint: 0,
+            max_exports: None,
+            exports: Vec::new(),
+            imports: Vec::new(),
+            next_transfer: 0,
+            sizing: Sizing::single(context_length),
+            stage: None,
             stats,
             serving,
-            governor: Governor::default(),
-            cost: CostModel::default(),
+            governor: std::array::from_fn(|_| Governor::default()),
+            cost: std::array::from_fn(|_| CostModel::default()),
             #[cfg(test)]
             last_ids: Vec::new(),
         };
@@ -765,6 +888,12 @@ impl Engine {
     /// without an Engram table.
     pub(crate) fn engram_counters(&self) -> Option<Arc<super::model::engram_io::EngramCounters>> {
         self.model.engram_counters()
+    }
+
+    /// What identifies this model's file and cache layout to a peer, see
+    /// [`model_fingerprint`].
+    pub(crate) fn fingerprint(&self) -> u64 {
+        self.fingerprint
     }
 }
 
@@ -833,14 +962,8 @@ fn load_chat(
 fn resolve_batching(
     config: &LocalModelConfig,
     context_length: usize,
-    observing: bool,
 ) -> Result<(Batching, Sizing), CucaError> {
-    resolve_batching_with(
-        config,
-        context_length,
-        observing,
-        prefill_chunk(context_length),
-    )
+    resolve_batching_with(config, context_length, prefill_chunk(context_length))
 }
 
 /// Positions beyond one context that the default K/V pool of a model on a GPU
@@ -871,7 +994,6 @@ fn default_kv_tokens(context_length: usize, device: LocalDevice) -> usize {
 fn resolve_batching_with(
     config: &LocalModelConfig,
     context_length: usize,
-    observing: bool,
     chunk: usize,
 ) -> Result<(Batching, Sizing), CucaError> {
     use super::model::paged::BLOCK_SIZE;
@@ -886,9 +1008,7 @@ fn resolve_batching_with(
             )));
         }
     };
-    // A drafter that observes every position in order (the in-trunk head, an
-    // EAGLE or a DFlash drafter) serves one sequence.
-    let max_sequences = if observing { 1 } else { b.max_sequences };
+    let max_sequences = b.max_sequences;
     let max_step_tokens = b
         .max_step_tokens
         .unwrap_or_else(|| chunk.max(max_sequences));
@@ -917,11 +1037,94 @@ fn architecture_of(content: &gguf::Content) -> &str {
         .map_or("", String::as_str)
 }
 
-/// Whether a drafter file of architecture `arch` takes the trunk's rows of
-/// every position ([`Drafter::observes`]), so that the engine serves one
-/// sequence at a time.
-fn file_drafter_observes(arch: &str) -> bool {
-    arch == super::model::cpu::dflash::ARCH || arch == Arch::Mistral4Eagle.name()
+/// FNV-1a over 64 bits.
+struct Fnv(u64);
+
+impl Fnv {
+    const BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0100_0000_01b3;
+
+    fn new() -> Self {
+        Self(Self::BASIS)
+    }
+
+    fn bytes(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(Self::PRIME);
+        }
+    }
+
+    fn u64(&mut self, v: u64) {
+        self.bytes(&v.to_le_bytes());
+    }
+
+    /// A string with its length, so neighbouring strings cannot run together.
+    fn str(&mut self, s: &str) {
+        self.u64(s.len() as u64);
+        self.bytes(s.as_bytes());
+    }
+}
+
+/// What two nodes must share to exchange K/V rows: a 64-bit FNV-1a hash of
+/// the wire version, the architecture, the bytes of the model files, the
+/// layer count, the vocabulary size, every tensor's name, shape and type
+/// (sorted by name) and every K/V group of the cache layout (window, stride,
+/// kind, layers). The pool sizes are left out: nodes may size `kv_tokens`
+/// differently.
+fn model_fingerprint(
+    content: &gguf::Content,
+    file_bytes: u64,
+    n_layer: usize,
+    vocab: usize,
+    layout: &super::model::paged::KvLayout,
+) -> u64 {
+    let mut h = Fnv::new();
+    h.u64(u64::from(super::wire::WIRE_VERSION));
+    h.str(architecture_of(content));
+    h.u64(file_bytes);
+    h.u64(n_layer as u64);
+    h.u64(vocab as u64);
+    let mut names: Vec<&String> = content.tensor_infos.keys().collect();
+    names.sort();
+    for name in names {
+        let info = &content.tensor_infos[name];
+        h.str(name);
+        for &d in info.shape.dims() {
+            h.u64(d as u64);
+        }
+        h.str(&format!("{:?}", info.dtype));
+    }
+    for g in &layout.groups {
+        h.u64(g.window.map_or(0, |w| w as u64 + 1));
+        h.u64(g.stride as u64);
+        h.u64(u64::from(g.compressed));
+        h.u64(g.layers.len() as u64);
+        for &l in &g.layers {
+            h.u64(l as u64);
+        }
+    }
+    h.0
+}
+
+/// One drafter per state slot: an assistant reads the target's K/V and holds
+/// no state, so one serves every slot; a drafter that observes every position
+/// keeps a cache per sequence, so `max_sequences` of them (`drafter` and its
+/// forks, which share its weights) serve the slots by index.
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] when a fork cannot allocate its cache.
+fn drafters_per_slot(drafter: Drafter, max_sequences: usize) -> Result<Vec<Drafter>, CucaError> {
+    if !drafter.observes() {
+        return Ok(vec![drafter]);
+    }
+    let forks = (1..max_sequences)
+        .map(|_| drafter.fork())
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut all = Vec::with_capacity(max_sequences);
+    all.push(drafter);
+    all.extend(forks);
+    Ok(all)
 }
 
 fn saturating_u32(n: usize) -> u32 {
@@ -932,10 +1135,34 @@ fn saturating_u64(n: u128) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
 
+#[cfg(test)]
+impl Engine {
+    /// Install `drafter` the way [`Engine::open`] does: one shared
+    /// assistant, or one drafter per state slot.
+    fn set_drafter(&mut self, drafter: Drafter) {
+        self.drafters = drafters_per_slot(drafter, self.batching.max_sequences).unwrap();
+    }
+
+    /// Make every concurrency class draft the full cap whatever the tiny
+    /// drafter's confidence and the tiny model's timings.
+    fn force_speculation(&mut self) {
+        self.governor = std::array::from_fn(|_| Governor::always_speculating());
+        self.cost = std::array::from_fn(|_| CostModel::always_drafting());
+    }
+
+    /// An engine that exports up to `max` prefixes at once, as a configured
+    /// `kv_export` does.
+    pub(crate) fn with_exports(mut self, max: usize) -> Self {
+        self.max_exports = Some(max);
+        self
+    }
+}
+
 /// Fixtures shared by the engine tests and the `LocalModel` tests.
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
+    use crate::provider::local::model::chain::StageTransport;
     use crate::provider::local::model::tiny::{TinyModel, VOCAB, load_sized};
 
     /// Vocabulary of the tiny model: ids 1 (`<eos>`), 3 (`<turn|>`) and 4
@@ -1017,7 +1244,26 @@ pub(crate) mod testing {
         kv_tokens: Option<usize>,
         max_step: Option<usize>,
     ) -> Engine {
-        let tokenizer = Arc::new(tiny_tokenizer());
+        let (sizing, max_step_tokens) =
+            tiny_sizing(context_length, max_sequences, kv_tokens, max_step);
+        let model = Model::Cpu(load_sized(model, context_length, &sizing));
+        engine_over(
+            model,
+            context_length,
+            temperature,
+            seed,
+            sizing,
+            max_step_tokens,
+        )
+    }
+
+    /// The sizing an engine over the tiny model gets, and its step size.
+    pub(crate) fn tiny_sizing(
+        context_length: usize,
+        max_sequences: usize,
+        kv_tokens: Option<usize>,
+        max_step: Option<usize>,
+    ) -> (Sizing, usize) {
         let max_step_tokens =
             max_step.unwrap_or_else(|| prefill_chunk(context_length).max(max_sequences));
         let sizing = Sizing {
@@ -1027,8 +1273,20 @@ pub(crate) mod testing {
                 .min(prefill_chunk(context_length))
                 .max(crate::provider::local::model::cpu::MAX_VERIFY_ROWS),
         };
-        let model = Model::Cpu(load_sized(model, context_length, &sizing));
-        Engine::new(
+        (sizing, max_step_tokens)
+    }
+
+    /// An engine over the loaded `model`, which was sized with `sizing`.
+    pub(crate) fn engine_over(
+        model: Model,
+        context_length: usize,
+        temperature: f32,
+        seed: Option<u64>,
+        sizing: Sizing,
+        max_step_tokens: usize,
+    ) -> Engine {
+        let tokenizer = Arc::new(tiny_tokenizer());
+        let mut e = Engine::new(
             model,
             Arc::clone(&tokenizer),
             tiny_format(&tokenizer),
@@ -1040,18 +1298,154 @@ pub(crate) mod testing {
             },
             context_length,
             Batching {
-                max_sequences,
+                max_sequences: sizing.max_sequences,
                 max_step_tokens,
                 prefill_chunk: prefill_chunk(context_length),
                 prefix_cache: true,
             },
-            None,
+            Vec::new(),
             0,
             Arc::default(),
+        );
+        e.sizing = sizing;
+        e
+    }
+
+    /// A layer-stage worker over the layers `range` of the tiny model,
+    /// sized as [`engine_sized`] sizes `max_sequences` sequences.
+    pub(crate) fn stage_worker(
+        file: &TinyModel,
+        context_length: usize,
+        range: LayerRange,
+        max_sequences: usize,
+    ) -> Engine {
+        let (sizing, max_step_tokens) = tiny_sizing(context_length, max_sequences, None, None);
+        let content = gguf::Content::open(&file.path).unwrap();
+        let model = Model::load_stage(
+            &content,
+            context_length,
+            LocalDevice::Cpu,
+            &super::super::ExpertPlacement::Resident,
+            &sizing,
+            &super::super::EngramCache::default(),
+            range,
+        )
+        .unwrap();
+        let mut e = engine_over(model, context_length, 0.0, None, sizing, max_step_tokens);
+        e.stage = Some(stage::StageHost::new(range, max_sequences));
+        e
+    }
+
+    /// An engine whose first layers run on the workers behind `links`
+    /// (consecutive ranges from layer 0, in order) and whose last layers run
+    /// here.
+    pub(crate) fn chain_engine(
+        file: &TinyModel,
+        context_length: usize,
+        links: Vec<(LayerRange, Box<dyn StageTransport>)>,
+        temperature: f32,
+        seed: Option<u64>,
+        max_sequences: usize,
+    ) -> Engine {
+        let (sizing, max_step_tokens) = tiny_sizing(context_length, max_sequences, None, None);
+        let content = gguf::Content::open(&file.path).unwrap();
+        let model = Model::chain_of(
+            &content,
+            context_length,
+            LocalDevice::Cpu,
+            &super::super::ExpertPlacement::Resident,
+            &sizing,
+            &super::super::EngramCache::default(),
+            links,
+            0,
+        )
+        .unwrap();
+        engine_over(
+            model,
+            context_length,
+            temperature,
+            seed,
+            sizing,
+            max_step_tokens,
         )
     }
 
-    /// [`engine`] with a drafter proposing `draft_tokens` per round.
+    /// [`chain_engine`] drafting with the Gemma 4 assistant in `drafter`,
+    /// `draft_tokens` per round, and a governor and cost model that always
+    /// draft the full cap.
+    pub(crate) fn chain_engine_with_drafter(
+        file: &TinyModel,
+        drafter: &TinyModel,
+        context_length: usize,
+        links: Vec<(LayerRange, Box<dyn StageTransport>)>,
+        draft_tokens: usize,
+    ) -> Engine {
+        let mut e = chain_engine(file, context_length, links, 0.0, None, 1);
+        let content = gguf::Content::open(&drafter.path).unwrap();
+        e.set_drafter(Drafter::open(&content, &e.model, context_length).unwrap());
+        e.draft_tokens = draft_tokens;
+        e.force_speculation();
+        e
+    }
+
+    /// A transport that answers with a worker engine of this process. It
+    /// records the op of every frame and fails the call number `fail_at`
+    /// (counting from 0) once; at the call number `restart_at` the worker is
+    /// first opened by another session, as if it restarted (what it held is
+    /// gone), and the call then meets it.
+    pub(crate) struct Loopback {
+        worker: Arc<std::sync::Mutex<Engine>>,
+        /// The op byte of every frame sent, in order.
+        pub(crate) ops: Arc<std::sync::Mutex<Vec<u8>>>,
+        /// Calls made so far.
+        pub(crate) calls: Arc<AtomicUsize>,
+        /// The call to fail; `usize::MAX` for none.
+        pub(crate) fail_at: Arc<AtomicUsize>,
+        /// The call after which the worker has restarted; `usize::MAX` for
+        /// none.
+        pub(crate) restart_at: Arc<AtomicUsize>,
+    }
+
+    impl Loopback {
+        pub(crate) fn new(worker: Engine) -> Self {
+            Self {
+                worker: Arc::new(std::sync::Mutex::new(worker)),
+                ops: Arc::default(),
+                calls: Arc::default(),
+                fail_at: Arc::new(AtomicUsize::new(usize::MAX)),
+                restart_at: Arc::new(AtomicUsize::new(usize::MAX)),
+            }
+        }
+    }
+
+    impl StageTransport for Loopback {
+        fn call(&self, frame: Vec<u8>) -> Result<Vec<u8>, CucaError> {
+            let n = self.calls.fetch_add(1, Ordering::SeqCst);
+            self.ops
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(frame.first().copied().unwrap_or(0));
+            if n == self.fail_at.load(Ordering::SeqCst) {
+                return Err(local_err("stage loopback: the connection dropped"));
+            }
+            let mut worker = self
+                .worker
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if n == self.restart_at.load(Ordering::SeqCst) {
+                let open = worker.foreign_open(0x5EED);
+                worker.stage_call(&open)?;
+            }
+            worker.stage_call(&frame)
+        }
+
+        fn name(&self) -> String {
+            "stage loopback".to_owned()
+        }
+    }
+
+    /// [`engine`] with a drafter proposing `draft_tokens` per round, over
+    /// `max_sequences` slots.
     pub(crate) fn engine_with_drafter(
         model: &TinyModel,
         drafter: &TinyModel,
@@ -1059,10 +1453,18 @@ pub(crate) mod testing {
         temperature: f32,
         seed: Option<u64>,
         draft_tokens: usize,
+        max_sequences: usize,
     ) -> Engine {
-        let mut e = engine(model, context_length, temperature, seed);
+        let mut e = engine_sized(
+            model,
+            context_length,
+            temperature,
+            seed,
+            max_sequences,
+            None,
+        );
         let content = gguf::Content::open(&drafter.path).unwrap();
-        e.drafter = Some(Drafter::open(&content, &e.model, context_length).unwrap());
+        e.set_drafter(Drafter::open(&content, &e.model, context_length).unwrap());
         e.draft_tokens = draft_tokens;
         e
     }
@@ -1077,13 +1479,20 @@ pub(crate) mod testing {
         temperature: f32,
         seed: Option<u64>,
         draft_tokens: usize,
+        max_sequences: usize,
     ) -> Engine {
-        let mut e = engine(model, context_length, temperature, seed);
+        let mut e = engine_sized(
+            model,
+            context_length,
+            temperature,
+            seed,
+            max_sequences,
+            None,
+        );
         let content = gguf::Content::open(&model.path).unwrap();
-        e.drafter = Some(Drafter::open_in_trunk(&content, &e.model).unwrap());
+        e.set_drafter(Drafter::open_in_trunk(&content, &e.model).unwrap());
         e.draft_tokens = draft_tokens;
-        e.governor = Governor::always_speculating();
-        e.cost = CostModel::always_drafting();
+        e.force_speculation();
         e
     }
 
@@ -1097,13 +1506,20 @@ pub(crate) mod testing {
         temperature: f32,
         seed: Option<u64>,
         draft_tokens: usize,
+        max_sequences: usize,
     ) -> Engine {
-        let mut e = engine(model, context_length, temperature, seed);
+        let mut e = engine_sized(
+            model,
+            context_length,
+            temperature,
+            seed,
+            max_sequences,
+            None,
+        );
         let content = gguf::Content::open(&eagle.path).unwrap();
-        e.drafter = Some(Drafter::open_eagle(&content, &e.model).unwrap());
+        e.set_drafter(Drafter::open_eagle(&content, &e.model).unwrap());
         e.draft_tokens = draft_tokens;
-        e.governor = Governor::always_speculating();
-        e.cost = CostModel::always_drafting();
+        e.force_speculation();
         e
     }
 
@@ -1117,13 +1533,20 @@ pub(crate) mod testing {
         temperature: f32,
         seed: Option<u64>,
         draft_tokens: usize,
+        max_sequences: usize,
     ) -> Engine {
-        let mut e = engine(model, context_length, temperature, seed);
+        let mut e = engine_sized(
+            model,
+            context_length,
+            temperature,
+            seed,
+            max_sequences,
+            None,
+        );
         let content = gguf::Content::open(&drafter.path).unwrap();
-        e.drafter = Some(Drafter::open_dflash(&content, &e.model, context_length).unwrap());
+        e.set_drafter(Drafter::open_dflash(&content, &e.model, context_length).unwrap());
         e.draft_tokens = draft_tokens;
-        e.governor = Governor::always_speculating();
-        e.cost = CostModel::always_drafting();
+        e.force_speculation();
         e
     }
 
@@ -1136,14 +1559,144 @@ pub(crate) mod testing {
         temperature: f32,
         seed: Option<u64>,
         draft_tokens: usize,
+        max_sequences: usize,
     ) -> Engine {
-        let mut e = engine(model, context_length, temperature, seed);
+        let mut e = engine_sized(
+            model,
+            context_length,
+            temperature,
+            seed,
+            max_sequences,
+            None,
+        );
         let content = gguf::Content::open(&drafter.path).unwrap();
-        e.drafter = Some(Drafter::open_dspark(&content, &e.model, context_length).unwrap());
+        e.set_drafter(Drafter::open_dspark(&content, &e.model, context_length).unwrap());
         e.draft_tokens = draft_tokens;
-        e.governor = Governor::always_speculating();
-        e.cost = CostModel::always_drafting();
+        e.force_speculation();
         e
+    }
+
+    /// A tiny model file (the Gemma 4 fixture, a context of 32) for a test
+    /// outside this tier that serves it through [`tiny_local_model`].
+    #[cfg(feature = "server")]
+    pub(crate) fn tiny_file() -> TinyModel {
+        crate::provider::local::model::tiny::write_tiny_model()
+    }
+
+    /// A template that renders the first message's content after `<bos>`.
+    pub(crate) const TINY_TEMPLATE: &str = "{{ bos_token }}{{ messages[0]['content'] }}";
+
+    /// An engine over the tiny model file at `path`, which stays the
+    /// caller's: the file is not deleted when the engine goes. Build it on
+    /// the engine thread, from the path.
+    pub(crate) fn engine_at(path: &Path, context_length: usize) -> Engine {
+        let tiny = TinyModel {
+            path: path.to_path_buf(),
+        };
+        let engine = engine(&tiny, context_length, 0.0, None);
+        // `tiny` would delete the file on drop; the caller still owns it.
+        std::mem::forget(tiny);
+        engine
+    }
+
+    /// [`stage_worker`] over the tiny model file at `path`, which stays the
+    /// caller's (build it on the engine thread, from the path).
+    pub(crate) fn stage_worker_at(
+        path: &Path,
+        context_length: usize,
+        range: LayerRange,
+        max_sequences: usize,
+    ) -> Engine {
+        let tiny = TinyModel {
+            path: path.to_path_buf(),
+        };
+        let engine = stage_worker(&tiny, context_length, range, max_sequences);
+        // `tiny` would delete the file on drop; the caller still owns it.
+        std::mem::forget(tiny);
+        engine
+    }
+
+    /// A tiny Llama model file with `context` positions, for the server's
+    /// layer-stage tests (any cut of it is legal).
+    #[cfg(feature = "server")]
+    pub(crate) fn tiny_llama_file(context: usize) -> TinyModel {
+        use crate::provider::local::model::tiny::{TinySpec, write_spec};
+        write_spec(&TinySpec {
+            context,
+            ..TinySpec::llama()
+        })
+    }
+
+    /// [`stage_worker_at`] over the layers `first..end`.
+    #[cfg(feature = "server")]
+    pub(crate) fn stage_worker_layers_at(
+        path: &Path,
+        context_length: usize,
+        first: usize,
+        end: usize,
+    ) -> Engine {
+        stage_worker_at(path, context_length, LayerRange { first, end }, 1)
+    }
+
+    /// A chain engine over the tiny model file at `path` whose remote stages
+    /// are the workers `stages` name, each reached over HTTP through the
+    /// production transport, holding `layers` layers in order from layer 0.
+    /// Build it on the engine thread, which the transport's runtime needs.
+    #[cfg(feature = "server")]
+    pub(crate) fn http_chain_at(
+        path: &Path,
+        context_length: usize,
+        stages: &[super::super::RemoteStage],
+    ) -> Engine {
+        use crate::provider::local::model::chain::HttpTransport;
+        let mut first = 0;
+        let links: Vec<(LayerRange, Box<dyn StageTransport>)> = stages
+            .iter()
+            .map(|stage| {
+                let range = LayerRange {
+                    first,
+                    end: first + stage.layers,
+                };
+                first = range.end;
+                let transport = HttpTransport::new(stage).expect("the transport builds");
+                (range, Box::new(transport) as Box<dyn StageTransport>)
+            })
+            .collect();
+        let tiny = TinyModel {
+            path: path.to_path_buf(),
+        };
+        let engine = chain_engine(&tiny, context_length, links, 0.0, None, 1);
+        // `tiny` would delete the file on drop; the caller still owns it.
+        std::mem::forget(tiny);
+        engine
+    }
+
+    /// A ready [`LocalModel`] over the engine `build` makes from the tiny
+    /// model file at `path` (on the engine thread), whose context is
+    /// `context_length`, with the tiny tokenizer and [`TINY_TEMPLATE`].
+    pub(crate) async fn tiny_local_model(
+        path: PathBuf,
+        context_length: usize,
+        build: impl FnOnce(&Path) -> Engine + Send + 'static,
+    ) -> super::super::LocalModel {
+        super::super::LocalModel::start(Arc::default(), move || {
+            let tokenizer = Arc::new(tiny_tokenizer());
+            let template = ChatTemplate::new(
+                TINY_TEMPLATE.to_string(),
+                "<bos>".to_string(),
+                "<eos>".to_string(),
+            )?;
+            let engine = build(&path);
+            assert_eq!(
+                engine.context_length(),
+                context_length,
+                "the engine's context"
+            );
+            let format = tiny_format(&tokenizer);
+            Ok((engine, tokenizer, template, format))
+        })
+        .await
+        .expect("tiny engine starts")
     }
 
     /// A job with every optional setting at its default.
@@ -1173,8 +1726,8 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use super::testing::{
-        engine, engine_in_trunk, engine_with_dflash, engine_with_drafter, engine_with_dspark,
-        engine_with_eagle,
+        engine, engine_in_trunk, engine_sized, engine_with_dflash, engine_with_drafter,
+        engine_with_dspark, engine_with_eagle,
     };
     use super::*;
     use crate::provider::local::model::tiny::{
@@ -1182,6 +1735,7 @@ mod tests {
     };
     use crate::provider::local::model::tiny::{TinyDflash, write_tiny_dflash};
     use crate::provider::local::model::tiny::{TinyQwen35, TinySpec, write_qwen35, write_spec};
+    use crate::provider::local::stageframe;
     use crate::request::PromptCacheUsage;
 
     struct Outcome {
@@ -1711,7 +2265,7 @@ mod tests {
         for k in [1usize, 2, 4, 8] {
             for prompt in prompts {
                 let mut plain = engine(&model, 32, 0.0, None);
-                let mut spec = engine_with_drafter(&model, &drafter, 32, 0.0, None, k);
+                let mut spec = engine_with_drafter(&model, &drafter, 32, 0.0, None, k, 1);
                 let expected = run(&mut plain, prompt, None);
                 let got = run(&mut spec, prompt, None);
                 let what = format!("k {k}, prompt {prompt:?}");
@@ -1734,14 +2288,14 @@ mod tests {
         let drafter = write_tiny_drafter();
         for max in [1u32, 2, 3, 7] {
             let mut plain = engine(&model, 32, 0.0, None);
-            let mut spec = engine_with_drafter(&model, &drafter, 32, 0.0, None, 4);
+            let mut spec = engine_with_drafter(&model, &drafter, 32, 0.0, None, 4, 1);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
             assert_same_reply(&a, &b, &format!("max {max}"));
         }
         // A context that fills up mid-round.
         let mut plain = engine(&model, 12, 0.0, None);
-        let mut spec = engine_with_drafter(&model, &drafter, 12, 0.0, None, 8);
+        let mut spec = engine_with_drafter(&model, &drafter, 12, 0.0, None, 8, 1);
         let a = run(&mut plain, &PROMPT, None);
         let b = run(&mut spec, &PROMPT, None);
         assert_eq!(text(&a), text(&b));
@@ -1755,7 +2309,7 @@ mod tests {
         let model = write_tiny_model();
         let drafter = write_tiny_drafter();
         let run_once = || {
-            let mut e = engine_with_drafter(&model, &drafter, 32, 1.0, Some(5), 3);
+            let mut e = engine_with_drafter(&model, &drafter, 32, 1.0, Some(5), 3, 1);
             let out = run(&mut e, &PROMPT, None);
             (
                 text(&out),
@@ -1787,7 +2341,7 @@ mod tests {
         let config = |props: &str| {
             crate::config::load_kdl_str::<LocalModelConfig>(&format!("batching {props}")).unwrap()
         };
-        let (batching, sizing) = resolve_batching(&config(""), 1000, false).unwrap();
+        let (batching, sizing) = resolve_batching(&config(""), 1000).unwrap();
         assert_eq!(
             batching,
             Batching {
@@ -1807,25 +2361,22 @@ mod tests {
         assert_eq!(sizing.max_sequences, 4);
         // An explicit pool rounds up to blocks and holds at least a context
         // and a block.
-        let (_, sizing) = resolve_batching(&config("kv_tokens=1016"), 1000, false).unwrap();
+        let (_, sizing) = resolve_batching(&config("kv_tokens=1016"), 1000).unwrap();
         assert_eq!(sizing.kv_tokens, 1024);
-        let err = resolve_batching(&config("kv_tokens=1015"), 1000, false).unwrap_err();
+        let err = resolve_batching(&config("kv_tokens=1015"), 1000).unwrap_err();
         assert!(
             matches!(&err, CucaError::Config(m) if m.contains("kv_tokens")),
             "{err}"
         );
         // A very long context shrinks the prefill chunk below the sequences.
-        let (batching, _) = resolve_batching(&config("max_sequences=64"), 131_072, false).unwrap();
+        let (batching, _) = resolve_batching(&config("max_sequences=64"), 131_072).unwrap();
         assert_eq!(batching.max_step_tokens, 64);
-        // The in-trunk head serves one sequence.
-        let (batching, sizing) = resolve_batching(&config("max_sequences=8"), 1000, true).unwrap();
-        assert_eq!((batching.max_sequences, sizing.max_sequences), (1, 1));
-        let (batching, _) = resolve_batching(
-            &config("prefix_cache=#false max_step_tokens=32"),
-            1000,
-            false,
-        )
-        .unwrap();
+        // A drafter that observes every position keeps the configured
+        // sequences (it forks one cache per state slot).
+        let (batching, sizing) = resolve_batching(&config("max_sequences=8"), 1000).unwrap();
+        assert_eq!((batching.max_sequences, sizing.max_sequences), (8, 8));
+        let (batching, _) =
+            resolve_batching(&config("prefix_cache=#false max_step_tokens=32"), 1000).unwrap();
         assert_eq!(
             (batching.max_step_tokens, batching.prefix_cache),
             (32, false)
@@ -1954,8 +2505,8 @@ mod tests {
 
     /// The committed pairs of the in-trunk head of `e`.
     fn head_len(e: &Engine) -> usize {
-        match &e.drafter {
-            Some(drafter @ Drafter::InTrunk(head, _)) => head.len() + drafter.pending(),
+        match e.drafters.as_slice() {
+            [drafter @ Drafter::InTrunk(head, _), ..] => head.len() + drafter.pending(),
             _ => panic!("the engine has no in-trunk head"),
         }
     }
@@ -1989,7 +2540,7 @@ mod tests {
         for k in [1usize, 2, 4, 8] {
             for prompt in prompts {
                 let mut plain = engine(model, 32, 0.0, None);
-                let mut spec = engine_in_trunk(model, 32, 0.0, None, k);
+                let mut spec = engine_in_trunk(model, 32, 0.0, None, k, 1);
                 let expected = run(&mut plain, prompt, None);
                 let got = run(&mut spec, prompt, None);
                 let what = format!("k {k}, prompt {prompt:?}");
@@ -2031,7 +2582,7 @@ mod tests {
             for max in 1..=10u32 {
                 for k in [1usize, 2, 4, 8] {
                     let mut plain = engine(&model, 16, 0.0, None);
-                    let mut spec = engine_with_eagle(&model, &eagle, 16, 0.0, None, k);
+                    let mut spec = engine_with_eagle(&model, &eagle, 16, 0.0, None, k, 1);
                     let a = run(&mut plain, prompt, Some(max));
                     let b = run(&mut spec, prompt, Some(max));
                     let what = format!("k {k}, prompt {prompt:?}, max {max}");
@@ -2062,7 +2613,7 @@ mod tests {
                 let stop: String = chars[at..at + 2].iter().collect();
                 for k in [1usize, 2, 4, 8] {
                     let mut plain = engine(&model, 16, 0.0, None);
-                    let mut spec = engine_with_eagle(&model, &eagle, 16, 0.0, None, k);
+                    let mut spec = engine_with_eagle(&model, &eagle, 16, 0.0, None, k, 1);
                     let with_stop = |e: &mut Engine| {
                         run_with(e, &prompt, Some(10), |job| job.stop = vec![stop.clone()])
                     };
@@ -2084,7 +2635,7 @@ mod tests {
         let model = write_qwen35(&TinyQwen35::default());
         for max in [1u32, 2, 3, 7] {
             let mut plain = engine(&model, 32, 0.0, None);
-            let mut spec = engine_in_trunk(&model, 32, 0.0, None, 4);
+            let mut spec = engine_in_trunk(&model, 32, 0.0, None, 4, 1);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
             assert_same_reply(&a, &b, &format!("max {max}"));
@@ -2103,7 +2654,7 @@ mod tests {
                 &[2u32, 13, 12, 11, 10][..],
             ] {
                 let mut plain = engine(&model, ctx, 0.0, None);
-                let mut spec = engine_in_trunk(&model, ctx, 0.0, None, 8);
+                let mut spec = engine_in_trunk(&model, ctx, 0.0, None, 8, 1);
                 let a = run(&mut plain, prompt, None);
                 let b = run(&mut spec, prompt, None);
                 assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
@@ -2137,7 +2688,7 @@ mod tests {
         first[19] = 3;
         let mut second = first[..30].to_vec();
         second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
-        let mut warm = engine_in_trunk(model, 128, 0.0, None, 3);
+        let mut warm = engine_in_trunk(model, 128, 0.0, None, 3, 1);
         let a = run(&mut warm, &first, Some(6));
         assert_eq!(usage(&a), (0, 40));
         assert_eq!(head_len(&warm), warm.last_ids.len() - 1);
@@ -2146,7 +2697,7 @@ mod tests {
         let b = run(&mut warm, &second, Some(6));
         assert_eq!(usage(&b), (16, 24));
         let cold = run(
-            &mut engine_in_trunk(model, 128, 0.0, None, 3),
+            &mut engine_in_trunk(model, 128, 0.0, None, 3, 1),
             &second,
             Some(6),
         );
@@ -2187,7 +2738,7 @@ mod tests {
     #[test]
     fn in_trunk_head_recovers_from_a_failed_request() {
         let model = write_qwen35(&TinyQwen35::default());
-        let mut e = engine_in_trunk(&model, 32, 0.0, None, 3);
+        let mut e = engine_in_trunk(&model, 32, 0.0, None, 3, 1);
         let prompt = [2u32, 9, 10, 3, 11, 12, 13];
         let before = run(&mut e, &prompt, Some(4));
         let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
@@ -2203,7 +2754,7 @@ mod tests {
     #[test]
     fn in_trunk_head_with_sampling_is_reproducible_for_a_seed() {
         let model = write_qwen35(&TinyQwen35::default());
-        seeded_run_is_reproducible(|| engine_in_trunk(&model, 32, 1.0, Some(5), 3));
+        seeded_run_is_reproducible(|| engine_in_trunk(&model, 32, 1.0, Some(5), 3, 1));
     }
 
     /// The default context length is the model's maximum when that is below
@@ -2345,8 +2896,8 @@ mod tests {
 
     /// The committed pairs of the EAGLE drafter of `e`.
     fn eagle_len(e: &Engine) -> usize {
-        match &e.drafter {
-            Some(drafter @ Drafter::Eagle(head, _)) => head.len() + drafter.pending(),
+        match e.drafters.as_slice() {
+            [drafter @ Drafter::Eagle(head, _), ..] => head.len() + drafter.pending(),
             _ => panic!("the engine has no EAGLE drafter"),
         }
     }
@@ -2369,7 +2920,7 @@ mod tests {
         for k in [1usize, 2, 4, 8] {
             for prompt in prompts {
                 let mut plain = engine(&model, 32, 0.0, None);
-                let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, k);
+                let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, k, 1);
                 let expected = run(&mut plain, prompt, None);
                 let got = run(&mut spec, prompt, None);
                 let what = format!("k {k}, prompt {prompt:?}");
@@ -2395,7 +2946,7 @@ mod tests {
         let (model, eagle) = (mistral4(32), eagle());
         for max in [1u32, 2, 3, 7] {
             let mut plain = engine(&model, 32, 0.0, None);
-            let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, 4);
+            let mut spec = engine_with_eagle(&model, &eagle, 32, 0.0, None, 4, 1);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
             assert_same_reply(&a, &b, &format!("max {max}"));
@@ -2413,7 +2964,7 @@ mod tests {
                 &[2u32, 13, 12, 11, 10][..],
             ] {
                 let mut plain = engine(&model, ctx, 0.0, None);
-                let mut spec = engine_with_eagle(&model, &eagle, ctx, 0.0, None, 8);
+                let mut spec = engine_with_eagle(&model, &eagle, ctx, 0.0, None, 8, 1);
                 let a = run(&mut plain, prompt, None);
                 let b = run(&mut spec, prompt, None);
                 assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
@@ -2440,11 +2991,11 @@ mod tests {
         first[19] = 3;
         let mut second = first[..30].to_vec();
         second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
-        let kv_of = |e: &Engine| match &e.drafter {
-            Some(Drafter::Eagle(head, _)) => head.kv_prefix(),
+        let kv_of = |e: &Engine| match e.drafters.as_slice() {
+            [Drafter::Eagle(head, _), ..] => head.kv_prefix(),
             _ => panic!("the engine has no EAGLE drafter"),
         };
-        let mut warm = engine_with_eagle(&model, &eagle, 128, 0.0, None, 3);
+        let mut warm = engine_with_eagle(&model, &eagle, 128, 0.0, None, 3, 1);
         let a = run(&mut warm, &first, Some(6));
         assert_eq!(usage(&a), (0, 40));
         assert_eq!(eagle_len(&warm), warm.last_ids.len() - 1);
@@ -2452,7 +3003,7 @@ mod tests {
         // Resumes from the first shared block: 16 of the 30 shared tokens.
         let b = run(&mut warm, &second, Some(6));
         assert_eq!(usage(&b), (16, 24));
-        let mut cold_engine = engine_with_eagle(&model, &eagle, 128, 0.0, None, 3);
+        let mut cold_engine = engine_with_eagle(&model, &eagle, 128, 0.0, None, 3, 1);
         let cold = run(&mut cold_engine, &second, Some(6));
         let plain = run(&mut engine(&model, 128, 0.0, None), &second, Some(6));
         assert_eq!(text(&b), text(&cold));
@@ -2494,7 +3045,7 @@ mod tests {
     #[test]
     fn eagle_recovers_from_a_failed_request() {
         let (model, eagle) = (mistral4(32), eagle());
-        let mut e = engine_with_eagle(&model, &eagle, 32, 0.0, None, 3);
+        let mut e = engine_with_eagle(&model, &eagle, 32, 0.0, None, 3, 1);
         let prompt = [2u32, 9, 10, 3, 11, 12, 13];
         let before = run(&mut e, &prompt, Some(4));
         let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
@@ -2510,28 +3061,22 @@ mod tests {
     #[test]
     fn eagle_with_sampling_is_reproducible_for_a_seed() {
         let (model, eagle) = (mistral4(32), eagle());
-        seeded_run_is_reproducible(|| engine_with_eagle(&model, &eagle, 32, 1.0, Some(5), 3));
+        seeded_run_is_reproducible(|| engine_with_eagle(&model, &eagle, 32, 1.0, Some(5), 3, 1));
     }
 
-    /// The engine recognises an EAGLE file by its architecture, serves one
-    /// sequence at a time with it, pairs it with a `mistral4` target only,
-    /// and refuses a GPU before loading anything.
+    /// The engine recognises an EAGLE file by its architecture, keeps one
+    /// drafter cache per sequence with it, pairs it with a `mistral4` target
+    /// only, and refuses a GPU before loading anything.
     #[test]
-    fn the_eagle_drafter_serves_one_mistral4_sequence_on_the_cpu() {
+    fn the_eagle_drafter_serves_mistral4_sequences_on_the_cpu() {
         use crate::provider::local::model::mtp::Drafter;
         let (model, eagle) = (mistral4(32), eagle());
         let header =
             |m: &crate::provider::local::model::tiny::TinyModel| open_gguf(&m.path, &[]).unwrap();
-        // A file whose drafter takes every position's row (EAGLE, DFlash)
-        // pins the engine to one sequence; a plain assistant does not.
-        let observes = |m: &crate::provider::local::model::tiny::TinyModel| {
-            file_drafter_observes(architecture_of(&header(m)))
-        };
         assert_eq!(architecture_of(&header(&eagle)), Arch::Mistral4Eagle.name());
-        assert!(observes(&eagle));
-        assert!(!observes(&write_tiny_drafter()));
-        assert!(!observes(&model));
 
+        // The configured sequences all run: the drafter forks one cache per
+        // state slot instead of pinning the engine to one sequence.
         let config = LocalModelConfig {
             batching: super::super::BatchingConfig {
                 max_sequences: 4,
@@ -2539,20 +3084,10 @@ mod tests {
             },
             ..LocalModelConfig::default()
         };
-        assert_eq!(
-            resolve_batching(&config, 32, observes(&eagle))
-                .unwrap()
-                .0
-                .max_sequences,
-            1
-        );
-        assert_eq!(
-            resolve_batching(&config, 32, observes(&write_tiny_drafter()))
-                .unwrap()
-                .0
-                .max_sequences,
-            4
-        );
+        assert_eq!(resolve_batching(&config, 32).unwrap().0.max_sequences, 4);
+        let e = engine_with_eagle(&model, &eagle, 32, 0.0, None, 3, 4);
+        assert_eq!(e.drafters.len(), 4);
+        assert!(e.drafters.iter().all(Drafter::observes));
 
         // Another target model is refused, loudly.
         let gemma = engine(&write_tiny_model(), 32, 0.0, None);
@@ -2600,8 +3135,8 @@ mod tests {
 
     /// The positions `lo..hi` the DFlash drafter of `e` holds context for.
     fn dflash_held(e: &Engine) -> (usize, usize) {
-        match &e.drafter {
-            Some(drafter @ Drafter::Dflash(net, _)) => {
+        match e.drafters.as_slice() {
+            [drafter @ Drafter::Dflash(net, _), ..] => {
                 let (lo, hi) = net.held();
                 (lo, hi + drafter.pending())
             }
@@ -2640,7 +3175,7 @@ mod tests {
             for k in [1usize, 2, 4, 15] {
                 for prompt in prompts {
                     let mut plain = engine(&model, 32, 0.0, None);
-                    let mut spec = engine_with_dflash(&model, &drafter, 32, 0.0, None, k);
+                    let mut spec = engine_with_dflash(&model, &drafter, 32, 0.0, None, k, 1);
                     let expected = run(&mut plain, prompt, None);
                     let got = run(&mut spec, prompt, None);
                     let what = format!("block {block} window {window:?} k {k} prompt {prompt:?}");
@@ -2665,7 +3200,7 @@ mod tests {
         let drafter = write_tiny_dflash(&TinyDflash::default());
         for max in [1u32, 2, 3, 7] {
             let mut plain = engine(&model, 32, 0.0, None);
-            let mut spec = engine_with_dflash(&model, &drafter, 32, 0.0, None, 4);
+            let mut spec = engine_with_dflash(&model, &drafter, 32, 0.0, None, 4, 1);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
             assert_same_reply(&a, &b, &format!("max {max}"));
@@ -2683,7 +3218,7 @@ mod tests {
                 &[2u32, 13, 12, 11, 10][..],
             ] {
                 let mut plain = engine(&model, ctx, 0.0, None);
-                let mut spec = engine_with_dflash(&model, &drafter, ctx, 0.0, None, 8);
+                let mut spec = engine_with_dflash(&model, &drafter, ctx, 0.0, None, 8, 1);
                 let a = run(&mut plain, prompt, None);
                 let b = run(&mut spec, prompt, None);
                 assert_eq!(text(&a), text(&b), "ctx {ctx}, prompt {prompt:?}");
@@ -2709,7 +3244,7 @@ mod tests {
         let first = long_prompt(40);
         let mut second = first[..30].to_vec();
         second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
-        let mut warm = engine_with_dflash(&model, &drafter, 128, 0.0, None, 3);
+        let mut warm = engine_with_dflash(&model, &drafter, 128, 0.0, None, 3, 1);
         let a = run(&mut warm, &first, Some(6));
         assert_eq!(usage(&a), (0, 40));
         assert_eq!(dflash_held(&warm).1, warm.last_ids.len());
@@ -2718,7 +3253,7 @@ mod tests {
         let b = run(&mut warm, &second, Some(6));
         assert_eq!(usage(&b), (16, 24));
         let cold = run(
-            &mut engine_with_dflash(&model, &drafter, 128, 0.0, None, 3),
+            &mut engine_with_dflash(&model, &drafter, 128, 0.0, None, 3, 1),
             &second,
             Some(6),
         );
@@ -2757,7 +3292,7 @@ mod tests {
     fn dflash_drafter_recovers_from_a_failed_request() {
         let model = muse_target(32);
         let drafter = write_tiny_dflash(&TinyDflash::default());
-        let mut e = engine_with_dflash(&model, &drafter, 32, 0.0, None, 3);
+        let mut e = engine_with_dflash(&model, &drafter, 32, 0.0, None, 3, 1);
         let prompt = [2u32, 9, 10, 3, 11, 12, 13];
         let before = run(&mut e, &prompt, Some(4));
         let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
@@ -2774,7 +3309,7 @@ mod tests {
     fn dflash_drafter_with_sampling_is_reproducible_for_a_seed() {
         let model = muse_target(32);
         let drafter = write_tiny_dflash(&TinyDflash::default());
-        seeded_run_is_reproducible(|| engine_with_dflash(&model, &drafter, 32, 1.0, Some(5), 3));
+        seeded_run_is_reproducible(|| engine_with_dflash(&model, &drafter, 32, 1.0, Some(5), 3, 1));
     }
 
     /// The measured cost model and governor (no test freeze) price a block
@@ -2786,16 +3321,16 @@ mod tests {
         let drafter = write_tiny_dflash(&TinyDflash::default());
         let prompt = long_prompt(20);
         let mut plain = engine(&model, 128, 0.0, None);
-        let mut spec = engine_with_dflash(&model, &drafter, 128, 0.0, None, 7);
-        spec.governor = Governor::default();
-        spec.cost = CostModel::default();
+        let mut spec = engine_with_dflash(&model, &drafter, 128, 0.0, None, 7, 1);
+        spec.governor = std::array::from_fn(|_| Governor::default());
+        spec.cost = std::array::from_fn(|_| CostModel::default());
         for _ in 0..6 {
             let a = run(&mut plain, &prompt, Some(24));
             let b = run(&mut spec, &prompt, Some(24));
             assert_eq!(text(&a), text(&b));
         }
         // Drafted rounds were measured: one pass each (not one per draft).
-        assert!(spec.cost.draft.n > 0, "the cost model measured drafting");
+        assert!(spec.cost[0].draft.n > 0, "the cost model measured drafting");
         assert!(spec.stats.snapshot().drafted > 0);
     }
 
@@ -2820,8 +3355,8 @@ mod tests {
 
     /// The positions the DSpark drafter of `e` holds context for.
     fn dspark_held(e: &Engine) -> (usize, usize) {
-        match &e.drafter {
-            Some(drafter @ Drafter::Dspark(net, _)) => {
+        match e.drafters.as_slice() {
+            [drafter @ Drafter::Dspark(net, _), ..] => {
                 let (lo, hi) = net.held();
                 (lo, hi + drafter.pending())
             }
@@ -2857,7 +3392,7 @@ mod tests {
             for k in [1usize, 2, 4, 5, 16] {
                 for prompt in prompts {
                     let mut plain = engine(&model, 96, 0.0, None);
-                    let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, k);
+                    let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, k, 1);
                     let expected = run(&mut plain, prompt, None);
                     let got = run(&mut spec, prompt, None);
                     let what = format!("mxfp4 {mxfp4} k {k} prompt {prompt:?}");
@@ -2883,7 +3418,7 @@ mod tests {
         let drafter = write_tiny_dspark(&TinyDspark::default());
         for max in [1u32, 2, 3, 7] {
             let mut plain = engine(&model, 96, 0.0, None);
-            let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, 4);
+            let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, 4, 1);
             let a = run(&mut plain, &PROMPT, Some(max));
             let b = run(&mut spec, &PROMPT, Some(max));
             assert_same_reply(&a, &b, &format!("max {max}"));
@@ -2891,7 +3426,7 @@ mod tests {
         }
         for ctx in [12usize, 14, 20] {
             let mut plain = engine(&model, ctx, 0.0, None);
-            let mut spec = engine_with_dspark(&model, &drafter, ctx, 0.0, None, 5);
+            let mut spec = engine_with_dspark(&model, &drafter, ctx, 0.0, None, 5, 1);
             let a = run(&mut plain, &PROMPT, None);
             let b = run(&mut spec, &PROMPT, None);
             assert_same_reply(&a, &b, &format!("ctx {ctx}"));
@@ -2906,7 +3441,7 @@ mod tests {
         let first = long_prompt(40);
         let mut second = first[..36].to_vec();
         second.extend_from_slice(&[10, 11, 12, 13, 14, 15]);
-        let mut warm = engine_with_dspark(&model, &drafter, 96, 0.0, None, 4);
+        let mut warm = engine_with_dspark(&model, &drafter, 96, 0.0, None, 4, 1);
         run(&mut warm, &first, Some(8));
         assert_eq!(dspark_held(&warm).1, warm.last_ids.len());
         let w = run(&mut warm, &second, Some(10));
@@ -2920,7 +3455,7 @@ mod tests {
         use crate::provider::local::model::tiny::{TinyDspark, write_tiny_dspark};
         let model = ds41();
         let drafter = write_tiny_dspark(&TinyDspark::default());
-        let mut e = engine_with_dspark(&model, &drafter, 96, 0.0, None, 3);
+        let mut e = engine_with_dspark(&model, &drafter, 96, 0.0, None, 3, 1);
         let prompt = [2u32, 9, 10, 3, 11, 12, 13];
         let before = run(&mut e, &prompt, Some(4));
         let out = run(&mut e, &[2, 9, 10, 3, 99], Some(2));
@@ -2942,7 +3477,7 @@ mod tests {
         let mut drafted = 0;
         for seed in 1..25u64 {
             let run_once = || {
-                let mut e = engine_with_dspark(&model, &drafter, 96, 1.0, Some(seed), 3);
+                let mut e = engine_with_dspark(&model, &drafter, 96, 1.0, Some(seed), 3, 1);
                 let out = run(&mut e, &long_prompt(12), None);
                 (text(&out), completion_tokens(&out), e.stats.snapshot())
             };
@@ -2962,15 +3497,15 @@ mod tests {
         let drafter = write_tiny_dspark(&TinyDspark::default());
         let prompt = long_prompt(20);
         let mut plain = engine(&model, 96, 0.0, None);
-        let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, 5);
-        spec.governor = Governor::default();
-        spec.cost = CostModel::default();
+        let mut spec = engine_with_dspark(&model, &drafter, 96, 0.0, None, 5, 1);
+        spec.governor = std::array::from_fn(|_| Governor::default());
+        spec.cost = std::array::from_fn(|_| CostModel::default());
         for _ in 0..6 {
             let a = run(&mut plain, &prompt, Some(24));
             let b = run(&mut spec, &prompt, Some(24));
             assert_eq!(text(&a), text(&b));
         }
-        assert!(spec.cost.draft.n > 0, "the cost model measured drafting");
+        assert!(spec.cost[0].draft.n > 0, "the cost model measured drafting");
         assert!(spec.stats.snapshot().drafted > 0);
     }
 
@@ -2983,21 +3518,19 @@ mod tests {
         let dspark = write_tiny_dspark(&TinyDspark::default());
         let content = gguf::Content::open(&dspark.path).unwrap();
         assert!(is_dspark(&content.metadata));
-        assert!(file_drafter_observes(architecture_of(&content)));
+        assert_eq!(architecture_of(&content), "dflash");
         let dflash = write_tiny_dflash(&TinyDflash::default());
         let content = gguf::Content::open(&dflash.path).unwrap();
         assert!(!is_dspark(&content.metadata));
     }
 
-    /// A `dflash` file observes every position of one sequence, so the
-    /// engine serves one at a time whatever batch size is configured;
-    /// `Engine::open` dispatches a drafter file on its architecture, and a
-    /// `dflash` file is refused as a main model. (The tiny GGUFs carry no
-    /// tokenizer, so what is checked is everything `open` does before it.)
+    /// A `dflash` file keeps the configured batch size (its drafter forks one
+    /// cache per state slot); `Engine::open` dispatches a drafter file on its
+    /// architecture, and a `dflash` file is refused as a main model. (The
+    /// tiny GGUFs carry no tokenizer, so what is checked is everything `open`
+    /// does before it.)
     #[test]
     fn a_dflash_file_is_dispatched_by_its_architecture() {
-        assert!(file_drafter_observes("dflash"));
-        assert!(!file_drafter_observes("gemma4-assistant"));
         let config = LocalModelConfig {
             context_length: Some(32),
             batching: super::super::BatchingConfig {
@@ -3007,9 +3540,8 @@ mod tests {
             draft_tokens: 4,
             ..LocalModelConfig::default()
         };
-        let (batching, sizing) =
-            resolve_batching(&config, 32, file_drafter_observes("dflash")).unwrap();
-        assert_eq!((batching.max_sequences, sizing.max_sequences), (1, 1));
+        let (batching, sizing) = resolve_batching(&config, 32).unwrap();
+        assert_eq!((batching.max_sequences, sizing.max_sequences), (4, 4));
 
         let model = muse_target(32);
         let open = |drafter: &crate::provider::local::model::tiny::TinyModel| {
@@ -3047,20 +3579,20 @@ mod tests {
     /// The committed pair count and latent K/V rows of the EAGLE drafter of
     /// `e`: what the drafter has taken into its cache, not what it holds back.
     fn eagle_cache(e: &Engine) -> (usize, Vec<Vec<f32>>) {
-        match &e.drafter {
-            Some(Drafter::Eagle(head, _)) => (head.len(), head.kv_prefix()),
+        match e.drafters.as_slice() {
+            [Drafter::Eagle(head, _), ..] => (head.len(), head.kv_prefix()),
             _ => panic!("the engine has no EAGLE drafter"),
         }
     }
 
     /// Rows the drafter of `e` holds back.
     fn pending(e: &Engine) -> usize {
-        e.drafter.as_ref().expect("a drafter").pending()
+        e.drafters[0].pending()
     }
 
     /// Make the drafter of `e` take the rows it holds back into its cache.
     fn catch_up(e: &mut Engine) {
-        let drafter = e.drafter.as_mut().expect("a drafter");
+        let drafter = &mut e.drafters[0];
         drafter.catch_up(&e.model).unwrap();
     }
 
@@ -3076,23 +3608,18 @@ mod tests {
         let tokens: Vec<u32> = (0..n).map(|i| (i * 5 % 13 + 3) as u32).collect();
         let hidden = Lcg(9).values(n * N_EMBD, 1.0);
         let rows = |a: usize, b: usize| (&tokens[a..b], &hidden[a * N_EMBD..b * N_EMBD]);
-        let fresh = || engine_with_eagle(&model, &eagle, 128, 0.0, None, 3);
+        let fresh = || engine_with_eagle(&model, &eagle, 128, 0.0, None, 3, 1);
 
         let mut eager = fresh();
         let (t, h) = rows(0, n);
-        eager
-            .drafter
-            .as_mut()
-            .unwrap()
-            .observe(&eager.model, 0, t, h)
-            .unwrap();
+        eager.drafters[0].observe(&eager.model, 0, t, h).unwrap();
         let want = eagle_cache(&eager);
         assert_eq!(want.0, n - 1);
 
         // A prompt of four rows, then rounds of one or three rows.
         for cap in [None, Some(7), Some(1)] {
             let mut lazy = fresh();
-            let d = lazy.drafter.as_mut().unwrap();
+            let d = &mut lazy.drafters[0];
             if let Some(cap) = cap {
                 d.set_lag_cap(cap);
             }
@@ -3122,7 +3649,7 @@ mod tests {
         // the replay from an earlier position replaces the ones it covers:
         // the result is a cold drafter over the final sequence.
         let mut lazy = fresh();
-        let d = lazy.drafter.as_mut().unwrap();
+        let d = &mut lazy.drafters[0];
         let (t, h) = rows(0, 4);
         d.observe(&lazy.model, 0, t, h).unwrap();
         for at in 4..30 {
@@ -3142,16 +3669,14 @@ mod tests {
         seq_tokens.extend_from_slice(&replay_tokens);
         let mut seq_hidden = hidden[..16 * N_EMBD].to_vec();
         seq_hidden.extend_from_slice(&replay_hidden);
-        cold.drafter
-            .as_mut()
-            .unwrap()
+        cold.drafters[0]
             .observe(&cold.model, 0, &seq_tokens, &seq_hidden)
             .unwrap();
         assert!(eagle_cache(&lazy) == eagle_cache(&cold));
 
         // A round that does not follow the held rows takes them first.
         let mut gap = fresh();
-        let d = gap.drafter.as_mut().unwrap();
+        let d = &mut gap.drafters[0];
         let (t, h) = rows(0, 4);
         d.observe(&gap.model, 0, t, h).unwrap();
         let (t, h) = rows(4, 12);
@@ -3161,7 +3686,7 @@ mod tests {
         assert_eq!(d.pending(), 1);
         catch_up(&mut gap);
         let mut skipped = fresh();
-        let d = skipped.drafter.as_mut().unwrap();
+        let d = &mut skipped.drafters[0];
         let (t, h) = rows(0, 12);
         d.observe(&skipped.model, 0, t, h).unwrap();
         let (t, h) = rows(30, 31);
@@ -3171,7 +3696,7 @@ mod tests {
         // Truncating below the held rows empties them, and a reset forgets
         // them with everything else.
         let mut gone = fresh();
-        let d = gone.drafter.as_mut().unwrap();
+        let d = &mut gone.drafters[0];
         let (t, h) = rows(0, 4);
         d.observe(&gone.model, 0, t, h).unwrap();
         let (t, h) = rows(4, 9);
@@ -3188,8 +3713,8 @@ mod tests {
 
     /// The committed pairs and K/V rows of the in-trunk head of `e`.
     fn head_cache(e: &Engine) -> (usize, Vec<Vec<f32>>) {
-        match &e.drafter {
-            Some(Drafter::InTrunk(head, _)) => (head.len(), head.kv_prefix()),
+        match e.drafters.as_slice() {
+            [Drafter::InTrunk(head, _), ..] => (head.len(), head.kv_prefix()),
             _ => panic!("the engine has no in-trunk head"),
         }
     }
@@ -3197,8 +3722,8 @@ mod tests {
     /// The positions the DFlash drafter of `e` holds context for (`hi`) and
     /// its whole ring: the first held position and every K and V row.
     fn dflash_cache(e: &Engine) -> (usize, Vec<Vec<f32>>) {
-        match &e.drafter {
-            Some(Drafter::Dflash(net, _)) => {
+        match e.drafters.as_slice() {
+            [Drafter::Dflash(net, _), ..] => {
                 let (lo, hi, mut rows, v) = net.snapshot();
                 rows.extend(v);
                 rows.push(vec![lo as f32]);
@@ -3238,21 +3763,21 @@ mod tests {
             Upkeep {
                 name: "EAGLE",
                 plain: Box::new(|| engine(&mistral, 128, 0.0, None)),
-                spec: Box::new(|| engine_with_eagle(&mistral, &eagle, 128, 0.0, None, 3)),
+                spec: Box::new(|| engine_with_eagle(&mistral, &eagle, 128, 0.0, None, 3, 1)),
                 cache: eagle_cache,
                 behind: 1,
             },
             Upkeep {
                 name: "in-trunk head",
                 plain: Box::new(|| engine(&qwen, 128, 0.0, None)),
-                spec: Box::new(|| engine_in_trunk(&qwen, 128, 0.0, None, 3)),
+                spec: Box::new(|| engine_in_trunk(&qwen, 128, 0.0, None, 3, 1)),
                 cache: head_cache,
                 behind: 1,
             },
             Upkeep {
                 name: "DFlash",
                 plain: Box::new(|| engine(&muse, 128, 0.0, None)),
-                spec: Box::new(|| engine_with_dflash(&muse, &dflash, 128, 0.0, None, 3)),
+                spec: Box::new(|| engine_with_dflash(&muse, &dflash, 128, 0.0, None, 3, 1)),
                 cache: dflash_cache,
                 behind: 0,
             },
@@ -3283,7 +3808,7 @@ mod tests {
         for forced in [0u32, 1, 3, 10, 30, 1000] {
             let what = format!("{name}, {forced} plain rounds");
             let mut lazy = (case.spec)();
-            lazy.governor = Governor {
+            lazy.governor[0] = Governor {
                 forced,
                 forced_spec: false,
                 ..Governor::always_speculating()
@@ -3292,7 +3817,7 @@ mod tests {
             assert_eq!(text(&b), text(&expected), "{what}");
             assert_eq!(lazy.last_ids, plain.last_ids, "{what}");
             assert_eq!(
-                lazy.drafter.as_ref().expect("a drafter").stale_drafts(),
+                lazy.drafters[0].stale_drafts(),
                 0,
                 "{what}: a round drafted before the drafter caught up"
             );
@@ -3321,12 +3846,8 @@ mod tests {
             // proposes what the lazy one proposes and the rounds are the
             // same ones.
             let mut reference = (case.spec)();
-            reference
-                .drafter
-                .as_mut()
-                .expect("a drafter")
-                .set_eager(true);
-            reference.governor = Governor {
+            reference.drafters[0].set_eager(true);
+            reference.governor[0] = Governor {
                 forced,
                 forced_spec: false,
                 ..Governor::always_speculating()
@@ -3348,14 +3869,14 @@ mod tests {
         // The next request replays the cached ids from the rows still held:
         // the drafter ends as one that never deferred.
         let mut lazy = (case.spec)();
-        lazy.governor = Governor {
+        lazy.governor[0] = Governor {
             forced: 1000,
             forced_spec: false,
             ..Governor::always_speculating()
         };
         run(&mut lazy, &prompt, Some(48));
         assert!(pending(&lazy) > 0, "{name}");
-        lazy.governor = Governor::always_speculating();
+        lazy.governor[0] = Governor::always_speculating();
         let mut extended = lazy.last_ids.clone();
         extended.extend([15, 14, 13]);
         let c = run(&mut lazy, &extended, Some(20));
@@ -3365,5 +3886,903 @@ mod tests {
         assert_eq!(text(&d), text(&expected), "{name}");
         catch_up(&mut lazy);
         assert!((case.cache)(&lazy) == (case.cache)(&eager), "{name}");
+    }
+
+    // ---- K/V transfer ------------------------------------------------------
+
+    /// Export the prefix of `prompt` (from `from`) out of `p`: the lease, every
+    /// frame the peer reads (the rows, the snapshot of a hybrid model, the
+    /// end) and the receiver whose drop ends the lease.
+    fn export_frames(
+        p: &mut Engine,
+        prompt: &[u32],
+        from: usize,
+    ) -> (
+        ExportReady,
+        Vec<Vec<u8>>,
+        tokio::sync::oneshot::Receiver<()>,
+    ) {
+        use tokio::sync::oneshot::{self, error::TryRecvError};
+        let (alive_tx, alive_rx) = oneshot::channel::<()>();
+        let (reply_tx, mut reply_rx) = oneshot::channel();
+        p.export_begin(prompt.to_vec(), from, alive_tx, reply_tx)
+            .unwrap();
+        let mut turns = 0;
+        let ready: ExportReady = loop {
+            match reply_rx.try_recv() {
+                Ok(reply) => break reply.unwrap(),
+                Err(TryRecvError::Empty) => {
+                    turns += 1;
+                    assert!(turns < 10_000, "the export never finished");
+                    p.turn();
+                }
+                Err(e) => panic!("the export's reply: {e}"),
+            }
+        };
+        let mut frames = Vec::new();
+        let mut a = ready.from;
+        while a < ready.to {
+            let b = (a + ready.chunk).min(ready.to);
+            frames.push(p.export_rows(ready.id, a, b).unwrap());
+            a = b;
+        }
+        if ready.snapshot {
+            frames.push(p.export_snapshot(ready.id).unwrap());
+        }
+        frames.push(crate::provider::local::kvframe::end_frame());
+        (ready, frames, alive_rx)
+    }
+
+    /// Engine D imports what engine P exports for `prompt` and then serves
+    /// the prompt: it reads the whole imported prefix, re-exports exactly the
+    /// rows it took in, and replies what a fresh engine replies.
+    fn imported_prefix_equals_local_prefill(
+        name: &str,
+        model: &crate::provider::local::model::tiny::TinyModel,
+        ctx: usize,
+        len: usize,
+    ) {
+        let prompt = long_prompt(len);
+        let make = || engine_sized(model, ctx, 0.0, None, 2, None).with_exports(2);
+        let mut fresh = make();
+        let want = run(&mut fresh, &prompt, Some(10));
+
+        let mut p = make();
+        let (ready, frames, p_alive) = export_frames(&mut p, &prompt, 0);
+        assert!(ready.to > 0 && ready.to < prompt.len(), "{name}: {ready:?}");
+
+        let mut d = make();
+        let (d_alive, _d_keep) = tokio::sync::oneshot::channel::<()>();
+        let id = d
+            .import_begin(prompt.clone(), 0, ready.to, d_alive)
+            .unwrap();
+        for (i, frame) in frames.iter().enumerate() {
+            let ended = d.import_frame(id, frame).unwrap();
+            assert_eq!(ended, i + 1 == frames.len(), "{name}: frame {i}");
+        }
+        assert!(d.imports.is_empty(), "{name}");
+        assert_eq!(used_blocks(&d), 0, "{name}: the import is filed, not held");
+        assert_eq!(d.kv_hit(&prompt), ready.to, "{name}");
+
+        // What D holds is what P sent, row for row (a window group sends only
+        // its window).
+        let (again, again_frames, d_alive_again) = export_frames(&mut d, &prompt, 0);
+        assert_eq!((again.from, again.to), (ready.from, ready.to), "{name}");
+        assert!(again_frames == frames, "{name}: D re-exports other rows");
+        drop(d_alive_again);
+        d.turn();
+        assert!(d.exports.is_empty(), "{name}");
+
+        let got = run(&mut d, &prompt, Some(10));
+        assert_eq!(
+            usage(&got),
+            (ready.to as u32, (prompt.len() - ready.to) as u32),
+            "{name}: D read the imported prefix"
+        );
+        assert_eq!(text(&got), text(&want), "{name}");
+        assert_eq!(d.last_ids, fresh.last_ids, "{name}");
+
+        // The lease ends with its handle, its blocks cached.
+        assert_eq!(p.exports.len(), 1, "{name}");
+        drop(p_alive);
+        p.turn();
+        assert!(p.exports.is_empty(), "{name}");
+        assert_eq!(used_blocks(&p), 0, "{name}");
+    }
+
+    #[test]
+    fn an_imported_prefix_decodes_like_a_local_prefill() {
+        use crate::provider::local::model::tiny::{TinyDeepseek41, write_deepseek41};
+        for spec in TinySpec::all() {
+            let name = spec.arch;
+            let model = write_spec(&TinySpec {
+                context: 128,
+                ..spec
+            });
+            imported_prefix_equals_local_prefill(name, &model, 128, 100);
+        }
+        imported_prefix_equals_local_prefill("gemma4", &write_tiny_model(), 32, 28);
+        imported_prefix_equals_local_prefill("qwen35", &hybrid_model(), 128, 100);
+        imported_prefix_equals_local_prefill("mistral4", &mistral4(128), 128, 100);
+        let ds41 = write_deepseek41(&TinyDeepseek41 {
+            meta: vec![("context_length".into(), gguf::Value::U32(128))],
+            ..TinyDeepseek41::default()
+        });
+        imported_prefix_equals_local_prefill("deepseek41", &ds41, 128, 100);
+    }
+
+    /// A second import carries only what the first left: `from` is what the
+    /// store holds, and the prefix ends where the whole prompt's does.
+    #[test]
+    fn an_import_starts_after_the_prefix_the_store_holds() {
+        let model = write_spec(&TinySpec {
+            context: 160,
+            ..TinySpec::llama()
+        });
+        let make = || engine_sized(&model, 160, 0.0, None, 2, None).with_exports(2);
+        let long = long_prompt(130);
+        let mut fresh = make();
+        let want = run(&mut fresh, &long, Some(8));
+
+        let mut p = make();
+        let mut d = make();
+        // First 64 tokens of the prompt, then the whole prompt.
+        let first = &long[..65];
+        for (prompt, expect_from) in [(first, 0), (&long[..], 64)] {
+            let from = d.kv_hit(prompt);
+            assert_eq!(from, expect_from);
+            let (ready, frames, _alive) = export_frames(&mut p, prompt, from);
+            assert_eq!(ready.from, from);
+            let (d_alive, _d_keep) = tokio::sync::oneshot::channel::<()>();
+            let id = d
+                .import_begin(prompt.to_vec(), from, ready.to, d_alive)
+                .unwrap();
+            for frame in &frames {
+                d.import_frame(id, frame).unwrap();
+            }
+        }
+        let got = run(&mut d, &long, Some(8));
+        assert_eq!(usage(&got).0, 128);
+        assert_eq!(text(&got), text(&want));
+    }
+
+    #[test]
+    fn an_export_is_refused_when_it_cannot_run() {
+        use tokio::sync::oneshot;
+        let model = write_spec(&TinySpec {
+            context: 128,
+            ..TinySpec::llama()
+        });
+        let prompt = long_prompt(100);
+        let try_export = |e: &mut Engine, ids: Vec<u32>, from: usize| {
+            let (alive, _alive_rx) = oneshot::channel();
+            let (reply, _reply_rx) = oneshot::channel();
+            e.export_begin(ids, from, alive, reply)
+        };
+        // Not configured.
+        let mut plain = engine_sized(&model, 128, 0.0, None, 2, None);
+        let err = try_export(&mut plain, prompt.clone(), 0).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("kv_export")),
+            "{err}"
+        );
+        let mut e = engine_sized(&model, 128, 0.0, None, 2, None).with_exports(1);
+        // The prompt ends at 96; an unaligned or empty range, a prompt the
+        // context cannot hold, and an empty one.
+        for from in [8, 96, 200] {
+            let err = try_export(&mut e, prompt.clone(), from).unwrap_err();
+            assert!(
+                err.to_string().contains("nothing to export"),
+                "{from}: {err}"
+            );
+        }
+        let err = try_export(&mut e, long_prompt(128), 0).unwrap_err();
+        assert!(err.to_string().contains("context_length"), "{err}");
+        let err = try_export(&mut e, Vec::new(), 0).unwrap_err();
+        assert!(err.to_string().contains("context_length"), "{err}");
+        // One slot: the first export runs, the second is refused.
+        let (alive, _keep_alive) = oneshot::channel();
+        let (reply, _keep_reply) = oneshot::channel();
+        e.export_begin(prompt.clone(), 0, alive, reply).unwrap();
+        let err = try_export(&mut e, prompt, 0).unwrap_err();
+        assert!(err.to_string().contains("busy"), "{err}");
+    }
+
+    #[test]
+    fn a_bad_frame_ends_an_import_and_gives_its_blocks_back() {
+        use crate::provider::local::kvframe;
+        let model = write_spec(&TinySpec {
+            context: 128,
+            ..TinySpec::llama()
+        });
+        let prompt = long_prompt(100);
+        let mut p = engine_sized(&model, 128, 0.0, None, 2, None).with_exports(1);
+        let (ready, frames, _alive) = export_frames(&mut p, &prompt, 0);
+        let mut d = engine_sized(&model, 128, 0.0, None, 2, None);
+        let begin = |d: &mut Engine| {
+            let (alive, keep) = tokio::sync::oneshot::channel();
+            let id = d.import_begin(prompt.clone(), 0, ready.to, alive).unwrap();
+            (id, keep)
+        };
+        // An end before the rows.
+        let (id, _keep) = begin(&mut d);
+        assert!(used_blocks(&d) > 0, "the import holds its blocks");
+        let err = d.import_frame(id, &kvframe::end_frame()).unwrap_err();
+        assert!(err.to_string().contains("ended at position 0"), "{err}");
+        assert!(d.imports.is_empty());
+        assert_eq!(used_blocks(&d), 0);
+        // Rows twice: the second does not follow the first.
+        let (id, _keep) = begin(&mut d);
+        assert!(!d.import_frame(id, &frames[0]).unwrap());
+        let err = d.import_frame(id, &frames[0]).unwrap_err();
+        assert!(err.to_string().contains("do not follow"), "{err}");
+        assert_eq!(used_blocks(&d), 0);
+        // Nothing was filed: a request reads nothing.
+        assert_eq!(d.kv_hit(&prompt), 0);
+        // A frame of an import that is gone, and a malformed one.
+        assert!(d.import_frame(id, &frames[0]).is_err());
+        let (id, _keep) = begin(&mut d);
+        assert!(d.import_frame(id, &[2, 1, 2]).is_err());
+        assert_eq!(used_blocks(&d), 0);
+        // A dropped handle gives the blocks back at the next turn.
+        let (_id, keep) = begin(&mut d);
+        assert!(used_blocks(&d) > 0);
+        drop(keep);
+        d.turn();
+        assert!(d.imports.is_empty());
+        assert_eq!(used_blocks(&d), 0);
+    }
+
+    /// The fingerprint follows the file and the cache layout: the same file
+    /// twice gives the same value, another model or a changed layout another.
+    #[test]
+    fn the_fingerprint_follows_the_file_and_the_cache_layout() {
+        let fingerprint =
+            |model: &crate::provider::local::model::tiny::TinyModel,
+             edit: &dyn Fn(&mut crate::provider::local::model::paged::KvLayout)| {
+                let content = gguf::Content::open(&model.path).unwrap();
+                let hp = super::super::model::read_hparams(&content).unwrap();
+                let e = engine(model, 32, 0.0, None);
+                let mut layout = e.model.kv_layout().clone();
+                edit(&mut layout);
+                let bytes = std::fs::metadata(&model.path).unwrap().len();
+                model_fingerprint(&content, bytes, hp.n_layer, 16, &layout)
+            };
+        let llama = write_spec(&TinySpec::llama());
+        let gemma3 = write_spec(&TinySpec::gemma3());
+        let none = |_: &mut crate::provider::local::model::paged::KvLayout| {};
+        let base = fingerprint(&llama, &none);
+        assert_eq!(base, fingerprint(&llama, &none));
+        assert_ne!(base, fingerprint(&gemma3, &none));
+        // Another group layout of the same file (window, stride, layers).
+        assert_ne!(
+            base,
+            fingerprint(&llama, &|l| l.groups[0].window = Some(64))
+        );
+        assert_ne!(base, fingerprint(&llama, &|l| l.groups[0].stride = 2));
+        assert_ne!(
+            base,
+            fingerprint(&llama, &|l| l.groups[0]
+                .layers
+                .pop()
+                .map(drop)
+                .unwrap_or(()))
+        );
+        // The pool sizes are not part of it.
+        assert_eq!(
+            base,
+            fingerprint(&llama, &|l| l.blocks.iter_mut().for_each(|b| *b += 3))
+        );
+    }
+
+    /// A snapshot that does not fit the model fails a hybrid model's import
+    /// when it arrives: nothing is filed, and the blocks are given back.
+    #[test]
+    fn a_snapshot_that_does_not_fit_fails_the_import() {
+        use crate::provider::local::kvframe;
+        use crate::provider::local::model::transfer::DeltaRows;
+        let model = hybrid_model();
+        let prompt = long_prompt(100);
+        let mut p = engine_sized(&model, 128, 0.0, None, 2, None).with_exports(1);
+        let (ready, frames, _alive) = export_frames(&mut p, &prompt, 0);
+        assert!(ready.snapshot);
+        let snapshot = frames
+            .iter()
+            .find(|f| kvframe::parse(f).is_ok_and(|(kind, _)| kind == kvframe::SNAPSHOT))
+            .expect("a hybrid export carries its snapshot");
+        let (_, payload) = kvframe::parse(snapshot).unwrap();
+        let layers = kvframe::decode_snapshot(payload).unwrap();
+        assert!(!layers.is_empty());
+
+        let mut d = engine_sized(&model, 128, 0.0, None, 2, None);
+        let (alive, _keep) = tokio::sync::oneshot::channel::<()>();
+        let id = d.import_begin(prompt.clone(), 0, ready.to, alive).unwrap();
+        for frame in frames
+            .iter()
+            .take_while(|f| f.as_slice() != snapshot.as_slice())
+        {
+            assert!(!d.import_frame(id, frame).unwrap());
+        }
+        // Right count of layers, wrong sizes.
+        let wrong: Vec<DeltaRows> = layers
+            .iter()
+            .map(|_| DeltaRows {
+                conv: vec![0.0; 3],
+                s: vec![0.0; 5],
+            })
+            .collect();
+        let err = d
+            .import_frame(id, &kvframe::snapshot_frame(&wrong))
+            .unwrap_err();
+        assert!(err.to_string().contains("does not fit"), "{err}");
+        assert!(d.imports.is_empty());
+        assert_eq!(used_blocks(&d), 0);
+        assert_eq!(d.kv_hit(&prompt), 0, "nothing was filed");
+    }
+
+    /// A call that panics fails the running sequences and resets the pools
+    /// like a step that panics, and the engine keeps serving.
+    #[test]
+    fn a_panicking_call_does_not_end_the_engine() {
+        let model = write_spec(&TinySpec {
+            context: 128,
+            ..TinySpec::llama()
+        });
+        let mut e = engine_sized(&model, 128, 0.0, None, 2, None);
+        let prompt = long_prompt(20);
+        let want = run(&mut e, &prompt, Some(6));
+        e.receive(Msg::Call(Box::new(|_| panic!("a call that panics"))));
+        let again = run(&mut e, &prompt, Some(6));
+        assert_eq!(text(&again), text(&want));
+        // The pools were reset: the prompt is no longer cached.
+        assert_eq!(usage(&again).0, 0);
+    }
+
+    /// The handles on the loopback transports of a chain engine, one per
+    /// remote stage.
+    #[derive(Default)]
+    struct Links {
+        ops: Vec<Arc<std::sync::Mutex<Vec<u8>>>>,
+        calls: Vec<Arc<AtomicUsize>>,
+        fail_at: Vec<Arc<AtomicUsize>>,
+        restart_at: Vec<Arc<AtomicUsize>>,
+    }
+
+    /// A chain engine over `file` whose remote stages hold the layers up to
+    /// each of `bounds` in turn (a worker engine of this process behind
+    /// each), and the layers after the last here.
+    fn chain_over(
+        file: &crate::provider::local::model::tiny::TinyModel,
+        context: usize,
+        bounds: &[usize],
+    ) -> (Engine, Links) {
+        use super::testing::{Loopback, chain_engine, stage_worker};
+        use crate::provider::local::model::chain::StageTransport;
+        let mut first = 0;
+        let mut links = Vec::new();
+        let mut handles = Links::default();
+        for &end in bounds {
+            let range = LayerRange { first, end };
+            let transport = Loopback::new(stage_worker(file, context, range, 1));
+            handles.ops.push(Arc::clone(&transport.ops));
+            handles.calls.push(Arc::clone(&transport.calls));
+            handles.fail_at.push(Arc::clone(&transport.fail_at));
+            handles.restart_at.push(Arc::clone(&transport.restart_at));
+            links.push((range, Box::new(transport) as Box<dyn StageTransport>));
+            first = end;
+        }
+        (chain_engine(file, context, links, 0.0, None, 1), handles)
+    }
+
+    /// The layer count and the legal stage boundaries of `file`.
+    fn cuts_of(file: &crate::provider::local::model::tiny::TinyModel) -> (usize, Vec<usize>) {
+        let content = gguf::Content::open(&file.path).unwrap();
+        let hp = crate::provider::local::model::read_hparams(&content).unwrap();
+        (
+            hp.n_layer,
+            crate::provider::local::model::split::legal_cuts(&hp),
+        )
+    }
+
+    /// A chain over `bounds` answers as the whole model does, for every
+    /// prompt of `prompts`, in the same order: the same text, the same usage
+    /// and cache hits.
+    fn chain_equals_whole(
+        what: &str,
+        file: &crate::provider::local::model::tiny::TinyModel,
+        context: usize,
+        bounds: &[usize],
+        prompts: &[Vec<u32>],
+    ) {
+        let (mut chain, _) = chain_over(file, context, bounds);
+        let mut whole = engine(file, context, 0.0, None);
+        for (i, prompt) in prompts.iter().enumerate() {
+            let got = run(&mut chain, prompt, Some(8));
+            let want = run(&mut whole, prompt, Some(8));
+            let label = format!("{what}, stages {bounds:?}, prompt {i}");
+            assert!(got.items.iter().all(Result::is_ok), "{label}");
+            assert!(!text(&want).is_empty(), "{label}: the reply is empty");
+            assert_same_reply(&got, &want, &label);
+            assert_eq!(usage(&got), usage(&want), "{label}");
+        }
+        assert_eq!(used_blocks(&chain), 0, "{what}");
+    }
+
+    /// A model whose first layers run on workers answers what the whole model
+    /// does: attention-only (one and two remote stages, a prefix hit on the
+    /// second turn), Gemma 4 (shared K/V rows cross the cut; the assistant
+    /// drafts against the last stage), the hybrid Qwen 3.5 (a second turn
+    /// restores the recurrent state from snapshots the workers took) and the
+    /// hyper-connection DeepSeek-V4.1.
+    #[test]
+    fn a_chain_over_loopback_stages_equals_the_whole_model() {
+        let llama = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let (n, cuts) = cuts_of(&llama);
+        assert!(n >= 2);
+        let prompts = [long_prompt(40), long_prompt(33), long_prompt(25)];
+        chain_equals_whole("llama", &llama, 96, &[cuts[0]], &prompts);
+        if n >= 3 {
+            chain_equals_whole("llama", &llama, 96, &[cuts[0], cuts[1]], &prompts);
+        }
+
+        // Gemma 4: every cut, the shared layers' K/V rows crossing it.
+        let gemma = write_tiny_model();
+        let (_, cuts) = cuts_of(&gemma);
+        let prompts = [PROMPT.to_vec(), vec![2, 9, 9, 9, 10]];
+        for &cut in &cuts {
+            chain_equals_whole("gemma4", &gemma, 32, &[cut], &prompts);
+        }
+        let drafter = write_tiny_drafter();
+        for k in [1usize, 4] {
+            let (n, cuts) = cuts_of(&gemma);
+            // The assistant reads the K/V of the last sliding and the last
+            // full layer's sources: the last stage must hold both, so the
+            // first cut leaves it the most layers.
+            let first = cuts[0];
+            assert!(first < n);
+            let range = LayerRange {
+                first: 0,
+                end: first,
+            };
+            let link: Box<dyn crate::provider::local::model::chain::StageTransport> = Box::new(
+                super::testing::Loopback::new(super::testing::stage_worker(&gemma, 32, range, 1)),
+            );
+            let mut spec = super::testing::chain_engine_with_drafter(
+                &gemma,
+                &drafter,
+                32,
+                vec![(range, link)],
+                k,
+            );
+            let mut plain = engine(&gemma, 32, 0.0, None);
+            for prompt in &prompts {
+                let got = run(&mut spec, prompt, None);
+                let want = run(&mut plain, prompt, None);
+                assert_same_reply(&got, &want, &format!("gemma4 assistant, k {k}"));
+            }
+            assert!(
+                spec.stats.snapshot().drafted > 0,
+                "the assistant drafted against the last stage"
+            );
+        }
+
+        // Qwen 3.5: the snapshots a restore reads are the workers' as well.
+        let qwen = hybrid_model();
+        let (_, cuts) = cuts_of(&qwen);
+        let mut first = long_prompt(40);
+        first[19] = 3;
+        let mut second = first[..30].to_vec();
+        second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
+        let prompts = [first.clone(), second, {
+            let mut extended = first;
+            extended.extend([15, 14, 13]);
+            extended
+        }];
+        let (mut chain, _) = chain_over(&qwen, 128, &[cuts[0]]);
+        let mut whole = engine(&qwen, 128, 0.0, None);
+        for (i, prompt) in prompts.iter().enumerate() {
+            let got = run(&mut chain, prompt, Some(5));
+            let want = run(&mut whole, prompt, Some(5));
+            assert_same_reply(&got, &want, &format!("qwen35, turn {i}"));
+            assert_eq!(usage(&got), usage(&want), "qwen35, turn {i}");
+            if i > 0 {
+                assert!(usage(&got).0 > 0, "turn {i} restored a snapshot");
+            }
+        }
+        assert!(chain.snapshots.len() > 0, "the chain kept snapshots");
+
+        // DeepSeek-V4.1: hyper-connection streams cross the cut.
+        let deepseek = write_deepseek41(&TinyDeepseek41::default());
+        let (_, cuts) = cuts_of(&deepseek);
+        let prompts = [long_prompt(70), long_prompt(70)];
+        for &cut in &cuts {
+            chain_equals_whole("deepseek41", &deepseek, 96, &[cut], &prompts);
+        }
+    }
+
+    /// A stage that fails a call fails the step that made it, and the engine
+    /// fails the running request and empties its pools like any failed pass;
+    /// the next request finds the stages opened again under a new session and
+    /// answers as a fresh engine does.
+    #[test]
+    fn a_failed_stage_fails_the_step_and_the_next_request_reopens() {
+        use stageframe::{OP_FORWARD, OP_OPEN};
+        for model in [
+            write_spec(&TinySpec {
+                context: 96,
+                ..TinySpec::llama()
+            }),
+            hybrid_model(),
+        ] {
+            let (_, cuts) = cuts_of(&model);
+            let prompt = long_prompt(40);
+            let want = run(&mut engine(&model, 96, 0.0, None), &prompt, Some(8));
+            let opened = |links: &Links| {
+                links.ops[0]
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|&&op| op == OP_OPEN)
+                    .count()
+            };
+            // The stage fails the first, the second and the third call of
+            // the request (a hybrid model's first is the state restore, its
+            // third a snapshot).
+            for offset in 0..3 {
+                let (mut chain, links) = chain_over(&model, 96, &[cuts[0]]);
+                assert_eq!(opened(&links), 1, "one session at load");
+                let at = links.calls[0].load(Ordering::SeqCst) + offset;
+                links.fail_at[0].store(at, Ordering::SeqCst);
+                let failed = run(&mut chain, &prompt, Some(8));
+                let reached = links.calls[0].load(Ordering::SeqCst) > at;
+                assert!(reached || offset == 2, "the request makes {offset} calls");
+                if reached {
+                    assert!(
+                        failed.items.iter().any(Result::is_err),
+                        "offset {offset}: the request fails"
+                    );
+                    // A failed snapshot call (a hybrid model's third) breaks
+                    // the stages without failing a call: the running request
+                    // is told why at its next pass, not by a position error
+                    // from a worker that was reopened under it.
+                    assert!(
+                        failed.items.iter().any(
+                            |i| matches!(i, Err(e) if e.to_string().contains("connection dropped"))
+                        ),
+                        "offset {offset}: the stage's error reaches the request"
+                    );
+                    assert_eq!(used_blocks(&chain), 0, "the pools were reset");
+                    assert_eq!(chain.snapshots.len(), 0);
+                }
+
+                let again = run(&mut chain, &prompt, Some(8));
+                assert!(again.items.iter().all(Result::is_ok), "offset {offset}");
+                assert_same_reply(
+                    &again,
+                    &want,
+                    &format!("offset {offset}, after the failure"),
+                );
+                if reached {
+                    assert_eq!(usage(&again).0, 0, "nothing is cached after a failure");
+                    assert_eq!(
+                        opened(&links),
+                        2,
+                        "the stage was opened once more (offset {offset})"
+                    );
+                    let ops = links.ops[0].lock().unwrap();
+                    let last_open = ops.iter().rposition(|&op| op == OP_OPEN).unwrap();
+                    assert!(
+                        ops[last_open..].contains(&OP_FORWARD),
+                        "the stage serves passes after the reopen"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A worker another session opened under a running request (what a
+    /// restarted worker looks like to its coordinator: it forgot the
+    /// session and what it held) fails the request with a provider error
+    /// that names the stage and says the sequence's state is lost, not with
+    /// the worker's configuration error; the next request opens the stages
+    /// again and answers as a fresh engine does.
+    #[test]
+    fn a_worker_that_restarts_under_a_request_fails_it_as_a_provider_error() {
+        use stageframe::OP_OPEN;
+        for model in [
+            write_spec(&TinySpec {
+                context: 96,
+                ..TinySpec::llama()
+            }),
+            hybrid_model(),
+        ] {
+            let (_, cuts) = cuts_of(&model);
+            let prompt = long_prompt(40);
+            let want = run(&mut engine(&model, 96, 0.0, None), &prompt, Some(8));
+            // The first, the second and the third call of the request (a
+            // hybrid model's first is the state restore, its third a
+            // snapshot).
+            for offset in 0..3 {
+                let (mut chain, links) = chain_over(&model, 96, &[cuts[0]]);
+                let at = links.calls[0].load(Ordering::SeqCst) + offset;
+                links.restart_at[0].store(at, Ordering::SeqCst);
+                let failed = run(&mut chain, &prompt, Some(8));
+                let reached = links.calls[0].load(Ordering::SeqCst) > at;
+                assert!(reached || offset == 2, "the request makes {offset} calls");
+                if reached {
+                    let errors: Vec<&CucaError> = failed
+                        .items
+                        .iter()
+                        .filter_map(|i| i.as_ref().err())
+                        .collect();
+                    assert!(!errors.is_empty(), "offset {offset}: the request fails");
+                    for e in errors {
+                        assert!(
+                            matches!(e, CucaError::Provider { .. }),
+                            "offset {offset}: a provider error, got {e:?}"
+                        );
+                        let text = e.to_string();
+                        assert!(
+                            text.contains(
+                                "stage loopback restarted and lost this sequence's state"
+                            ),
+                            "offset {offset}: {text}"
+                        );
+                        assert!(!text.contains("belongs to another session"), "{text}");
+                    }
+                    assert_eq!(used_blocks(&chain), 0, "the pools were reset");
+                }
+                let again = run(&mut chain, &prompt, Some(8));
+                assert!(again.items.iter().all(Result::is_ok), "offset {offset}");
+                assert_same_reply(
+                    &again,
+                    &want,
+                    &format!("offset {offset}, after the restart"),
+                );
+                if reached {
+                    let ops = links.ops[0].lock().unwrap();
+                    let opens = ops.iter().filter(|&&op| op == OP_OPEN).count();
+                    assert_eq!(opens, 2, "the stage was opened once more (offset {offset})");
+                }
+            }
+        }
+    }
+
+    /// A coordinator whose worker refuses its `open` (here: another sizing)
+    /// fails the load with the worker's configuration error, named as the
+    /// worker's: only the calls of an open session turn a mismatch into a
+    /// restart.
+    #[test]
+    fn a_worker_that_does_not_match_fails_the_load_as_a_configuration_error() {
+        use super::testing::{Loopback, stage_worker, tiny_sizing};
+        use crate::provider::local::model::chain::StageTransport;
+        let file = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let (_, cuts) = cuts_of(&file);
+        let range = LayerRange {
+            first: 0,
+            end: cuts[0],
+        };
+        let link: Box<dyn StageTransport> =
+            Box::new(Loopback::new(stage_worker(&file, 96, range, 1)));
+        let content = gguf::Content::open(&file.path).unwrap();
+        let (sizing, _) = tiny_sizing(96, 2, None, None);
+        let Err(e) = Model::chain_of(
+            &content,
+            96,
+            LocalDevice::Cpu,
+            &crate::provider::local::ExpertPlacement::Resident,
+            &sizing,
+            &crate::provider::local::EngramCache::default(),
+            vec![(range, link)],
+            0,
+        ) else {
+            panic!("the chain loaded against a worker of another sizing");
+        };
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("max_sequences is 1 here and 2 at the caller")),
+            "{e:?}"
+        );
+    }
+
+    /// An `open` frame for the worker `e` that matches it, to alter.
+    fn open_for(e: &Engine, first: usize, end: usize) -> stageframe::Open {
+        stageframe::Open {
+            fingerprint: e.fingerprint,
+            first: first as u32,
+            end: end as u32,
+            context_length: e.context_length as u64,
+            max_sequences: e.sizing.max_sequences as u64,
+            kv_tokens: e.sizing.kv_tokens as u64,
+            max_rows: e.sizing.max_rows as u64,
+            session: 5,
+        }
+    }
+
+    /// A worker opens only for a caller that holds the same file, wants its
+    /// layers and sized its pools as it did, names each difference, and
+    /// serves nobody but the session it opened.
+    #[test]
+    fn a_stage_worker_checks_the_caller_and_the_session() {
+        use stageframe::{Open, open_frame, prefetch_frame, snapshot_frame};
+        let file = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let mut worker =
+            super::testing::stage_worker(&file, 96, LayerRange { first: 0, end: 1 }, 1);
+        assert!(worker.is_stage());
+        let good = open_for(&worker, 0, 1);
+        let refused = |worker: &mut Engine, open: Open| match worker.stage_call(&open_frame(&open))
+        {
+            Err(CucaError::Config(m)) => m,
+            other => panic!("expected a mismatch, got {other:?}"),
+        };
+        let cases: [(Open, &str); 7] = [
+            (
+                Open {
+                    first: 1,
+                    end: 2,
+                    ..good
+                },
+                "this stage holds layers 0..1, the caller wants 1..2",
+            ),
+            (
+                Open { end: 2, ..good },
+                "this stage holds layers 0..1, the caller wants 0..2",
+            ),
+            (
+                Open {
+                    context_length: 64,
+                    ..good
+                },
+                "context_length is 96 here and 64 at the caller",
+            ),
+            (
+                Open {
+                    max_sequences: 3,
+                    ..good
+                },
+                "max_sequences is 1 here and 3 at the caller",
+            ),
+            (
+                Open {
+                    kv_tokens: good.kv_tokens + 16,
+                    ..good
+                },
+                "kv_tokens is",
+            ),
+            (
+                Open {
+                    max_rows: good.max_rows + 1,
+                    ..good
+                },
+                "max_rows is",
+            ),
+            (
+                Open {
+                    fingerprint: 77,
+                    ..good
+                },
+                "the caller's model is not the same file",
+            ),
+        ];
+        for (open, want) in cases {
+            let message = refused(&mut worker, open);
+            assert!(message.contains(want), "{message}");
+        }
+
+        // Nothing opened yet: no session matches.
+        let m = match worker.stage_call(&snapshot_frame(5, &[], 0, 1)) {
+            Err(CucaError::Config(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(m.contains("another session"), "{m}");
+        worker.stage_call(&open_frame(&good)).unwrap();
+        // Another session's calls are refused; the opened one's are served.
+        let m = match worker.stage_call(&prefetch_frame(6, 0, &[1, 2])) {
+            Err(CucaError::Config(m)) => m,
+            other => panic!("{other:?}"),
+        };
+        assert!(m.contains("another session"), "{m}");
+        worker.stage_call(&prefetch_frame(5, 0, &[1, 2])).unwrap();
+        // A slot the worker does not have, and a snapshot of a model with
+        // no recurrent state.
+        assert!(worker.stage_call(&prefetch_frame(5, 9, &[1])).is_err());
+        assert!(worker.stage_call(&snapshot_frame(5, &[], 0, 1)).is_err());
+        // A frame that is not one.
+        assert!(worker.stage_call(&[]).is_err());
+        assert!(worker.stage_call(&[99, 0, 0]).is_err());
+
+        // An engine that is not a stage answers no stage call.
+        let mut plain = engine(&file, 96, 0.0, None);
+        assert!(!plain.is_stage());
+        assert!(matches!(
+            plain.stage_call(&open_frame(&good)),
+            Err(CucaError::Config(m)) if m.contains("not a layer stage")
+        ));
+    }
+
+    /// The stage boundaries and drafters a stage configuration may use are
+    /// checked against the model: layers that are no cut, a worker that
+    /// would hold the head, remote stages that leave no layer, and drafter
+    /// files that cannot pair with a chain.
+    #[test]
+    fn stage_configuration_is_checked_against_the_model() {
+        use crate::provider::local::{RemoteStage, StageRange};
+        let hp_of = |file: &crate::provider::local::model::tiny::TinyModel| {
+            let content = gguf::Content::open(&file.path).unwrap();
+            crate::provider::local::model::read_hparams(&content).unwrap()
+        };
+        let remote = |layers: usize| RemoteStage {
+            url: "http://127.0.0.1:1".into(),
+            layers,
+            ..RemoteStage::default()
+        };
+        let check = |hp: &_, config: LocalModelConfig, drafter: &str| {
+            stage::check_stages(hp, &config, drafter)
+        };
+        let message = |r: Result<(), CucaError>| match r {
+            Err(CucaError::Config(m)) => m,
+            other => panic!("expected a configuration error, got {other:?}"),
+        };
+        let llama = hp_of(&write_spec(&TinySpec::llama()));
+        let n = llama.n_layer;
+        let stage = |first, layers| LocalModelConfig {
+            stage: Some(StageRange { first, layers }),
+            ..LocalModelConfig::default()
+        };
+        let remotes = |layers: &[usize]| LocalModelConfig {
+            remote_stages: layers.iter().map(|&l| remote(l)).collect(),
+            ..LocalModelConfig::default()
+        };
+        check(&llama, stage(0, 1), "").unwrap();
+        check(&llama, remotes(&[1]), "").unwrap();
+        check(&llama, LocalModelConfig::default(), "").unwrap();
+        let m = message(check(&llama, stage(0, n), ""));
+        assert!(
+            m.contains(&format!(
+                "stage 0..{n} must end before the last layer of `llama` ({n} layers)"
+            )),
+            "{m}"
+        );
+        let m = message(check(&llama, remotes(&[n]), ""));
+        assert!(m.contains(&format!("the remote stages hold {n} of the {n} layers of `llama`: the last stage needs at least one")), "{m}");
+        let m = message(check(&llama, remotes(&[1]), "mistral4-eagle"));
+        assert!(
+            m.contains("the mistral4-eagle drafter cannot be combined with `remote_stage`"),
+            "{m}"
+        );
+        let m = message(check(&llama, remotes(&[1]), "dflash"));
+        assert!(
+            m.contains("the dflash drafter cannot be combined with `remote_stage`"),
+            "{m}"
+        );
+
+        // A boundary inside the compressed attention's reach is no cut.
+        let ds = hp_of(&write_deepseek41(&TinyDeepseek41::default()));
+        let legal = crate::provider::local::model::split::legal_cuts(&ds);
+        let bad = (1..ds.n_layer)
+            .find(|b| !legal.contains(b))
+            .expect("an illegal cut");
+        let m = message(check(&ds, remotes(&[bad]), ""));
+        assert!(
+            m.contains(&format!(
+                "a stage boundary at layer {bad} cuts `deepseek41`"
+            )),
+            "{m}"
+        );
+        assert!(m.contains("legal boundaries: "), "{m}");
+        let m = message(check(&ds, stage(0, bad), ""));
+        assert!(
+            m.contains(&format!("a stage boundary at layer {bad}")),
+            "{m}"
+        );
+        check(&ds, remotes(&[legal[0]]), "").unwrap();
     }
 }

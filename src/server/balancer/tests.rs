@@ -19,12 +19,12 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 
-use super::config::BalancerConfig;
+use super::config::{BalancerConfig, Disaggregate};
 use super::proxy;
 use super::routing::Policy;
 use super::state::BalancerState;
 use super::upstream::{Upstream, spawn_poller};
-use crate::server::stats::{DrafterStats, LatencyStats, ModelStats, Quantiles, StatsSnapshot};
+use crate::server::stats::{LatencyStats, ModelStats, Quantiles, StatsSnapshot};
 use crate::sysmon::SystemSampler;
 
 /// A fake model server.
@@ -36,6 +36,8 @@ struct Mock {
     chat_status: Arc<AtomicU16>,
     hits: Arc<AtomicUsize>,
     auth_seen: Arc<Mutex<Option<String>>>,
+    /// The `x-cuca-prefill` value of the last chat request.
+    prefill_seen: Arc<Mutex<Option<String>>>,
     stats: Option<Value>,
     /// Set when a streaming response was dropped by the balancer.
     stream_dropped: Arc<AtomicBool>,
@@ -50,6 +52,7 @@ impl Mock {
             chat_status: Arc::new(AtomicU16::new(200)),
             hits: Arc::new(AtomicUsize::new(0)),
             auth_seen: Arc::new(Mutex::new(None)),
+            prefill_seen: Arc::new(Mutex::new(None)),
             stats: None,
             stream_dropped: Arc::new(AtomicBool::new(false)),
         }
@@ -99,6 +102,10 @@ async fn mock_chat(State(m): State<Mock>, headers: HeaderMap, body: Bytes) -> Re
     m.hits.fetch_add(1, Ordering::Relaxed);
     *m.auth_seen.lock().unwrap() = headers
         .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    *m.prefill_seen.lock().unwrap() = headers
+        .get("x-cuca-prefill")
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let status = m.chat_status.load(Ordering::Relaxed);
@@ -179,6 +186,8 @@ struct Options {
     /// URLs the balancer treats as healthy without polling them.
     forced: Vec<(String, &'static str)>,
     stats_api: bool,
+    /// `(prefill URLs, decode URLs)`, each among the upstreams.
+    disaggregate: Option<(Vec<String>, Vec<String>)>,
 }
 
 impl Default for Options {
@@ -189,6 +198,7 @@ impl Default for Options {
             upstream_key: None,
             forced: Vec::new(),
             stats_api: true,
+            disaggregate: None,
         }
     }
 }
@@ -204,14 +214,19 @@ async fn balancer(polled: &[String], options: Options) -> Harness {
     config.api_key = options.api_key.map(str::to_string);
     config.upstream_api_key = options.upstream_key.map(str::to_string);
     config.stats_api = options.stats_api;
+    config.disaggregate = options
+        .disaggregate
+        .map(|(prefill, decode)| Disaggregate { prefill, decode });
     let resolved = config.resolve_upstreams().unwrap();
+    let roles = config.resolve_roles().unwrap();
     let client = crate::tls::http_client_builder()
         .connect_timeout(Duration::from_secs(1))
         .build()
         .unwrap();
     let upstreams: Vec<Arc<Upstream>> = resolved
         .into_iter()
-        .map(|(id, url)| Arc::new(Upstream::new(&id, url, Duration::from_secs(60))))
+        .zip(roles)
+        .map(|((id, url), role)| Arc::new(Upstream::new(&id, url, Duration::from_secs(60), role)))
         .collect();
     let key: Option<Arc<str>> = config.upstream_api_key.as_deref().map(Arc::from);
     for (i, u) in upstreams.iter().enumerate() {
@@ -623,40 +638,6 @@ async fn the_stats_snapshot_is_a_balancer_view_with_nested_upstream_snapshots() 
 }
 
 #[tokio::test]
-async fn a_busy_drafter_upstream_is_passed_over_for_an_idle_one() {
-    let busy_drafter = StatsSnapshot {
-        models: vec![ModelStats {
-            name: "m".into(),
-            state: crate::server::stats::ModelState::Ready,
-            max_sequences: 4,
-            running: 1,
-            drafter: Some(DrafterStats::default()),
-            ..ModelStats::default()
-        }],
-        ..StatsSnapshot::default()
-    };
-    let mut with_stats = Mock::new("a", &["m"]);
-    with_stats.stats = Some(serde_json::to_value(&busy_drafter).unwrap());
-    let (ua, a) = with_stats.spawn().await;
-    let (ub, b) = Mock::new("b", &["m"]).spawn().await;
-    let h = balancer(&[ua, ub], Options::default()).await;
-    h.until("both healthy and a's snapshot", |s| {
-        s.healthy_count() == 2 && s.upstreams[0].snapshot(Duration::from_secs(5)).is_some()
-    })
-    .await;
-    for i in 0..20 {
-        h.chat(body("m", &format!("conversation {i}"))).await;
-    }
-    assert_eq!(
-        (
-            a.hits.load(Ordering::Relaxed),
-            b.hits.load(Ordering::Relaxed)
-        ),
-        (0, 20)
-    );
-}
-
-#[tokio::test]
 async fn least_loaded_prefers_the_faster_upstream() {
     let with_itl = |name: &'static str, mean: f64| {
         let snapshot = StatsSnapshot {
@@ -824,4 +805,134 @@ async fn the_balancer_measures_inter_event_latency_of_a_streamed_reply() {
             .count,
         1
     );
+}
+
+fn split(prefill: &str, decode: &str) -> Options {
+    Options {
+        disaggregate: Some((vec![prefill.to_string()], vec![decode.to_string()])),
+        ..Options::default()
+    }
+}
+
+fn prefill_counter(h: &Harness, which: fn(&BalancerState) -> &std::sync::atomic::AtomicU64) -> u64 {
+    which(&h.state).load(Ordering::Relaxed)
+}
+
+#[tokio::test]
+async fn a_decode_upstream_is_told_its_prefill_node_and_the_prefill_node_gets_no_chat() {
+    let (up, p) = Mock::new("p", &["m"]).spawn().await;
+    let (ud, d) = Mock::new("d", &["m"]).spawn().await;
+    let h = balancer(&[up.clone(), ud.clone()], split(&up, &ud)).await;
+    h.until("both healthy", |s| s.healthy_count() == 2).await;
+
+    for i in 0..5 {
+        assert_eq!(
+            answered_by(h.chat(body("m", &format!("c{i}"))).await).await,
+            "d"
+        );
+        assert_eq!(d.prefill_seen.lock().unwrap().as_deref(), Some(up.as_str()));
+    }
+    assert_eq!(p.hits.load(Ordering::Relaxed), 0);
+    assert_eq!(prefill_counter(&h, |s| &s.metrics.prefill_assigned), 5);
+    assert_eq!(prefill_counter(&h, |s| &s.metrics.prefill_unassigned), 0);
+    assert_eq!(prefill_counter(&h, |s| &s.metrics.prefill_whole), 0);
+    let metrics = h.get("/metrics").await.text().await.unwrap();
+    assert!(metrics.contains("# TYPE cuca_balancer_prefill_assigned_total counter"));
+    assert!(
+        metrics.contains("cuca_balancer_prefill_assigned_total 5"),
+        "{metrics}"
+    );
+    assert!(metrics.contains("cuca_balancer_prefill_unassigned_total 0"));
+    assert!(metrics.contains("cuca_balancer_prefill_whole_total 0"));
+}
+
+#[tokio::test]
+async fn a_client_cannot_name_the_prefill_peer() {
+    let (up, _) = Mock::new("p", &["m"]).spawn().await;
+    let (ud, d) = Mock::new("d", &["m"]).spawn().await;
+    let (uw, w) = Mock::new("w", &["m"]).spawn().await;
+    let post = |h: &Harness| {
+        h.client
+            .post(format!("{}/v1/chat/completions", h.base))
+            .header("x-cuca-prefill", "http://evil.example:1")
+            .json(&body("m", "hello"))
+            .send()
+    };
+
+    // Without disaggregation no upstream sees the header.
+    let h = balancer(std::slice::from_ref(&uw), Options::default()).await;
+    h.until("healthy", |s| s.healthy_count() == 1).await;
+    assert_eq!(post(&h).await.unwrap().status(), 200);
+    assert_eq!(*w.prefill_seen.lock().unwrap(), None);
+
+    // With it, a decode node sees the balancer's choice, not the client's.
+    let h = balancer(&[up.clone(), ud.clone()], split(&up, &ud)).await;
+    h.until("both healthy", |s| s.healthy_count() == 2).await;
+    assert_eq!(post(&h).await.unwrap().status(), 200);
+    assert_eq!(d.prefill_seen.lock().unwrap().as_deref(), Some(up.as_str()));
+}
+
+#[tokio::test]
+async fn prefill_nodes_serve_whole_requests_when_no_other_upstream_has_the_model() {
+    let (up, p) = Mock::new("p", &["m"]).spawn().await;
+    let (ud, d) = Mock::new("d", &["m"]).spawn().await;
+    let h = balancer(&[up.clone(), ud.clone()], split(&up, &ud)).await;
+    h.until("both healthy", |s| s.healthy_count() == 2).await;
+    d.healthy.store(false, Ordering::Relaxed);
+    h.until("the decode node ejected", |s| s.healthy_count() == 1)
+        .await;
+
+    assert_eq!(answered_by(h.chat(body("m", "alone")).await).await, "p");
+    assert_eq!(*p.prefill_seen.lock().unwrap(), None);
+    assert_eq!(d.hits.load(Ordering::Relaxed), 0);
+    assert_eq!(prefill_counter(&h, |s| &s.metrics.prefill_whole), 1);
+    assert_eq!(prefill_counter(&h, |s| &s.metrics.prefill_assigned), 0);
+}
+
+#[tokio::test]
+async fn a_decode_node_prefills_itself_when_no_prefill_node_is_healthy() {
+    let (up, p) = Mock::new("p", &["m"]).spawn().await;
+    let (ud, d) = Mock::new("d", &["m"]).spawn().await;
+    let h = balancer(&[up.clone(), ud.clone()], split(&up, &ud)).await;
+    h.until("both healthy", |s| s.healthy_count() == 2).await;
+    p.healthy.store(false, Ordering::Relaxed);
+    h.until("the prefill node ejected", |s| s.healthy_count() == 1)
+        .await;
+
+    assert_eq!(answered_by(h.chat(body("m", "alone")).await).await, "d");
+    assert_eq!(*d.prefill_seen.lock().unwrap(), None);
+    assert_eq!(p.hits.load(Ordering::Relaxed), 0);
+    assert_eq!(prefill_counter(&h, |s| &s.metrics.prefill_unassigned), 1);
+    assert_eq!(prefill_counter(&h, |s| &s.metrics.prefill_assigned), 0);
+}
+
+#[tokio::test]
+async fn a_retry_off_a_decode_node_sends_no_prefill_header() {
+    let (up, _) = Mock::new("p", &["m"]).spawn().await;
+    let (uw, w) = Mock::new("w", &["m"]).spawn().await;
+    // A decode node nothing listens on.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}", l.local_addr().unwrap())
+    };
+    let h = balancer(
+        &[up.clone(), uw.clone()],
+        Options {
+            forced: vec![(dead.clone(), "m")],
+            ..split(&up, &dead)
+        },
+    )
+    .await;
+    h.until("every upstream healthy", |s| s.healthy_count() == 3)
+        .await;
+
+    for i in 0..20 {
+        assert_eq!(
+            answered_by(h.chat(body("m", &format!("c{i}"))).await).await,
+            "w"
+        );
+        assert_eq!(*w.prefill_seen.lock().unwrap(), None);
+    }
+    assert!(h.state.metrics.retries.load(Ordering::Relaxed) >= 1);
+    assert!(prefill_counter(&h, |s| &s.metrics.prefill_assigned) >= 1);
 }

@@ -22,13 +22,14 @@
 //!
 //! # How a pass runs
 //!
-//! [`SplitModel::forward_batch`] runs the CPU half ([`Transformer`] with a
-//! [`Front`]: embeddings, per-layer inputs and the first layers, no LM head)
-//! over the rows of every sequence of the batch, then hands the residual
-//! stream `[rows, n_embd]` (and the per-layer inputs) to the GPU half
-//! ([`GpuTransformer`] with a [`Back`]: the last layers and the head). The
-//! hidden state crosses the boundary once per pass: one host read of the
-//! CPU half's output and one upload; nothing else moves between the halves.
+//! [`SplitModel::forward_batch`] runs the CPU half ([`Transformer`] over the
+//! layers `0..first`, a [`Part`]: embeddings, per-layer inputs and the first
+//! layers, no LM head) over the rows of every sequence of the batch, then
+//! hands the residual stream `[rows, n_embd]` (and the per-layer inputs) to
+//! the GPU half ([`GpuTransformer`] over `first..n_layer`: the last layers and
+//! the head) in a [`Carry`]. The hidden state crosses the boundary once per
+//! pass: one host read of the CPU half's output and one upload; nothing else
+//! moves between the halves.
 //!
 //! The paged K/V cache is one [`KvLayout`](super::paged::KvLayout): both
 //! halves build the same groups and block counts from the same
@@ -46,9 +47,28 @@
 //! returns the rows it cached for it in every pass ([`MirrorRows`], read back
 //! from its own pool through the block tables, `[n_kv_head, rows, head_dim]`
 //! keys and values per sequence), and the GPU half writes them into a mirror
-//! pool of its own under the same tables ([`mirrored`] lists the layers). They
+//! pool of its own under the same tables ([`mirrors`] lists the layers). They
 //! ride the same host-to-device crossing as the hidden state. The mirror
 //! pools are not counted in `kv_cache_bytes`, which counts each layer once.
+//!
+//! A K/V transfer ([`transfer`](super::transfer)) exports each layer's rows
+//! from the half that owns the layer, merged in layout order (the mirror
+//! pools copy the CPU half's, so they are not exported), and imports a
+//! mirrored layer's rows into both the CPU pool and the GPU half's mirror
+//! pool. A recurrent-state transfer lists the CPU half's delta-net layers,
+//! then the GPU half's.
+//!
+//! # Stages
+//!
+//! The two halves are the two-stage case of a model run as a chain of stages,
+//! each an engine over a [`LayerRange`] with the [`Part`] that says which K/V
+//! rows cross its edges: `forward_stage(batch, input)` takes the [`Carry`] of
+//! the stage before (none for the stage that embeds) and returns the [`Carry`]
+//! for the stage after, or, from the stage that ends at the last layer, the
+//! logits ([`StageOut`]). A middle stage forwards the K/V rows it received
+//! for layers a later stage reads ([`passes`]). The stages need not be on one
+//! machine: [`chain`](super::chain) runs the first ones on other machines.
+//! [`legal_cuts`] lists where a model can be cut.
 //!
 //! # Experts
 //!
@@ -66,7 +86,12 @@
 //! Tensor parallelism (`shards`) and a drafter are rejected by
 //! `LocalModel::load` with a [`CucaError::Config`].
 
+use std::sync::Arc;
+
+use super::cpu::Forward;
+use super::engram::RowSource;
 use super::params::Hparams;
+use super::tier::TierShared;
 use crate::error::CucaError;
 
 /// Where the layers of an offloaded model run.
@@ -157,16 +182,97 @@ pub(crate) fn legal_gpu_layers(hp: &Hparams) -> Vec<usize> {
     legal
 }
 
-/// The K/V-owning layers before `first` whose cache a layer from `first` on
-/// reads (the shared-K/V layers of Gemma 4 that sit on the other side of the
-/// boundary from their source), ascending.
-#[cfg(any(feature = "provider-local-gpu", test))]
-pub(crate) fn mirrored(hp: &Hparams, first: usize) -> Vec<usize> {
+/// Every `first` that [`legal_cut`] allows, ascending: where a stage of a
+/// model can begin after another. Layer `0` and `n_layer` are no cuts.
+pub(crate) fn legal_cuts(hp: &Hparams) -> Vec<usize> {
+    (1..hp.n_layer)
+        .filter(|&first| legal_cut(hp, first))
+        .collect()
+}
+
+/// The layers `first..end` of a model: one engine's share of it. `first == 0`
+/// embeds the tokens, `end == n_layer` holds the final norm and the head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LayerRange {
+    pub(crate) first: usize,
+    pub(crate) end: usize,
+}
+
+impl LayerRange {
+    /// Every layer of `hp`.
+    pub(crate) fn whole(hp: &Hparams) -> Self {
+        Self {
+            first: 0,
+            end: hp.n_layer,
+        }
+    }
+
+    /// Whether layer `il` is in the range.
+    pub(crate) fn contains(self, il: usize) -> bool {
+        (self.first..self.end).contains(&il)
+    }
+
+    /// Layers in the range.
+    pub(crate) fn len(self) -> usize {
+        self.end - self.first
+    }
+}
+
+/// What an engine that runs only some layers of a model needs besides the
+/// range: how it shares its counters with the other engines of the model and
+/// which K/V rows cross its edges.
+pub(crate) struct Part {
+    pub(crate) range: LayerRange,
+    /// The expert-tier counters and heat shared with the other engines'
+    /// expert stores, so that one set of statistics covers the whole model.
+    pub(crate) shared: Option<Arc<TierShared>>,
+    /// The K/V-owning layers in the range that a layer after it reads the
+    /// K/V of ([`exports`]): the pass returns their new rows.
+    pub(crate) export: Vec<usize>,
+    /// The K/V-owning layers before the range that a layer in it reads
+    /// ([`mirrors`]): the engine keeps a pool for each, filled from the rows
+    /// the previous stage returned.
+    pub(crate) mirror: Vec<usize>,
+    /// The Engram table the other engines share (`None`: this engine opens
+    /// its own, or the model has none), so that its row cache and counters
+    /// are single.
+    pub(crate) engram: Option<Arc<dyn RowSource>>,
+}
+
+/// What a stage hands to the stage after it: the residual stream and, for
+/// Gemma 4, the per-layer inputs every layer reads.
+pub(crate) struct Carry {
+    /// `[rows, n_embd]` row-major (`[rows, streams * n_embd]`, the
+    /// hyper-connection streams, for a model that has them).
+    pub(crate) hidden: Vec<f32>,
+    /// `[rows, n_layer, ple_dim]` row-major, `(ctx + tok) / sqrt(2)`: the
+    /// first stage computes it and every later stage passes it on.
+    pub(crate) per_layer: Option<Vec<f32>>,
+    /// `[rows, streams]`: the pre weights the layers after the stage start
+    /// from (hyper-connection models).
+    pub(crate) pre: Option<Vec<f32>>,
+    /// The rows the pass wrote into the cache of every layer of
+    /// [`Part::export`], and the rows of [`passes`] the stage received.
+    pub(crate) kv: Vec<MirrorRows>,
+}
+
+/// What one forward pass of a stage returns.
+pub(crate) enum StageOut {
+    /// The stage is not the last: what the next one starts from.
+    Carry(Carry),
+    /// The stage holds the head: the logits and hidden rows of every sequence.
+    Done(Vec<Forward>),
+}
+
+/// The K/V-owning layers in `range` that a layer at or after `range.end`
+/// reads the K/V of (the shared-K/V layers of Gemma 4 on a later stage),
+/// ascending.
+pub(crate) fn exports(hp: &Hparams, range: LayerRange) -> Vec<usize> {
     let mut sources: Vec<usize> = hp
         .layers
         .iter()
         .enumerate()
-        .filter(|(il, spec)| *il >= first && spec.kv_source < first)
+        .filter(|(il, spec)| *il >= range.end && range.contains(spec.kv_source))
         .map(|(_, spec)| spec.kv_source)
         .collect();
     sources.sort_unstable();
@@ -174,9 +280,53 @@ pub(crate) fn mirrored(hp: &Hparams, first: usize) -> Vec<usize> {
     sources
 }
 
-/// The rows a CPU layer cached in one pass for the GPU layers that read its
-/// K/V ([`mirrored`]).
-#[cfg(feature = "provider-local-gpu")]
+/// The K/V-owning layers before `range.first` whose cache a layer in `range`
+/// reads, ascending.
+pub(crate) fn mirrors(hp: &Hparams, range: LayerRange) -> Vec<usize> {
+    let mut sources: Vec<usize> = hp
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(il, spec)| range.contains(*il) && spec.kv_source < range.first)
+        .map(|(_, spec)| spec.kv_source)
+        .collect();
+    sources.sort_unstable();
+    sources.dedup();
+    sources
+}
+
+/// The K/V-owning layers before `range.first` whose cache a layer at or after
+/// `range.end` reads, ascending: a stage in the middle of the model forwards
+/// the rows it received for them unchanged.
+pub(crate) fn passes(hp: &Hparams, range: LayerRange) -> Vec<usize> {
+    let mut sources: Vec<usize> = hp
+        .layers
+        .iter()
+        .enumerate()
+        .filter(|(il, spec)| *il >= range.end && spec.kv_source < range.first)
+        .map(|(_, spec)| spec.kv_source)
+        .collect();
+    sources.sort_unstable();
+    sources.dedup();
+    sources
+}
+
+/// The K/V-owning layers before `first` whose cache a layer from `first` on
+/// reads (the shared-K/V layers of Gemma 4 that sit on the other side of the
+/// boundary from their source), ascending.
+#[cfg(test)]
+pub(crate) fn mirrored(hp: &Hparams, first: usize) -> Vec<usize> {
+    mirrors(
+        hp,
+        LayerRange {
+            first,
+            end: hp.n_layer,
+        },
+    )
+}
+
+/// The rows a layer cached in one pass for the layers of other stages that
+/// read its K/V ([`exports`]).
 pub(crate) struct MirrorRows {
     /// The layer that owns the cache.
     pub(crate) layer: usize,
@@ -195,13 +345,14 @@ mod model {
 
     use crate::provider::local::gguf;
 
-    use super::super::cpu::{Forward, Front, Transformer};
+    use super::super::cpu::{Forward, Transformer};
     use super::super::delta::DeltaState;
-    use super::super::gpu::{Back, GpuSnapshot, GpuTransformer};
-    use super::super::paged::{KvLayout, Sizing};
+    use super::super::gpu::{GpuSnapshot, GpuTransformer};
+    use super::super::paged::{BlockTable, KvLayout, Sizing};
     use super::super::tier::TierShared;
-    use super::super::{Batch, read_hparams};
-    use super::{Hparams, mirrored};
+    use super::super::transfer::{DeltaRows, PoolRows, entries};
+    use super::super::{Batch, err, read_hparams};
+    use super::{Hparams, LayerRange, Part, StageOut, exports, mirrors};
     use crate::error::CucaError;
     use crate::provider::local::{EngramCache, ExpertPlacement, ExpertTiers, LocalDevice};
 
@@ -298,7 +449,7 @@ mod model {
         ///
         /// # Errors
         ///
-        /// As [`Transformer::load_front`] and [`GpuTransformer::load_back`].
+        /// As [`Transformer::load_range`] and [`GpuTransformer::load_range`].
         pub(crate) fn load(
             content: &gguf::Content,
             context_length: usize,
@@ -338,32 +489,43 @@ mod model {
         ) -> Result<Self, CucaError> {
             let hp = read_hparams(content)?;
             let (cpu_experts, gpu_experts, shared) = place_experts(&hp, experts, first)?;
-            let mirror = mirrored(&hp, first);
+            let (head, tail) = (
+                LayerRange {
+                    first: 0,
+                    end: first,
+                },
+                LayerRange {
+                    first,
+                    end: hp.n_layer,
+                },
+            );
             // One table for both halves: one row cache, one set of counters.
             let engram_rows = super::super::engram::open_table(content, &hp, engram)?;
-            let front = Transformer::load_front(
+            let front = Transformer::load_range(
                 content,
                 context_length,
                 &cpu_experts,
                 sizing,
-                &Front {
-                    layers: first,
+                &Part {
+                    range: head,
                     shared: shared.clone(),
-                    export: mirror.clone(),
+                    export: exports(&hp, head),
+                    mirror: Vec::new(),
                     engram: engram_rows.clone(),
                 },
                 dequantize,
             )?;
-            let back = GpuTransformer::load_back(
+            let back = GpuTransformer::load_range(
                 content,
                 context_length,
                 device,
                 &gpu_experts,
                 sizing,
-                &Back {
-                    first,
+                &Part {
+                    range: tail,
                     shared: shared.clone(),
-                    mirror,
+                    export: Vec::new(),
+                    mirror: mirrors(&hp, tail),
                     engram: engram_rows,
                 },
             )?;
@@ -404,10 +566,14 @@ mod model {
             &mut self,
             batch: &Batch<'_>,
         ) -> Result<Vec<Forward>, CucaError> {
-            let out = self.front.forward_front(batch)?;
-            let result = self
-                .back
-                .forward_back(batch, out.hidden, out.per_layer, out.pre, &out.kv);
+            let StageOut::Carry(carry) = self.front.forward_stage(batch, None)? else {
+                return Err(err("the CPU half returned logits"));
+            };
+            let result = match self.back.forward_stage(batch, Some(carry)) {
+                Ok(StageOut::Done(outs)) => Ok(outs),
+                Ok(StageOut::Carry(_)) => Err(err("the GPU half returned no logits")),
+                Err(e) => Err(e),
+            };
             if result.is_err() {
                 for row in &batch.rows {
                     self.front.reset_slot(row.state.0);
@@ -427,10 +593,11 @@ mod model {
         }
 
         /// Start reading the engram rows of the next `tokens` of a sequence.
-        /// Both halves share one table and the CPU half asks for the rows of
-        /// every engram layer, so it alone does.
+        /// Both halves share one table and each asks for the rows of the
+        /// Engram layers in its own range, so nothing is read twice.
         pub(crate) fn engram_prefetch(&self, history: &[u32], tokens: &[u32]) {
             self.front.engram_prefetch(history, tokens);
+            self.back.engram_prefetch(history, tokens);
         }
 
         /// The counters of the engram table both halves read.
@@ -506,12 +673,117 @@ mod model {
             self.front.reset_slot(slot);
             self.back.reset_slot(slot);
         }
+
+        /// See [`Model::export_rows`](super::super::Model::export_rows): the
+        /// CPU half's entries (the layers before the cut) and the GPU half's
+        /// (the layers from it on), merged in layout order. The GPU half does
+        /// not export its mirror pools, which copy the CPU half's.
+        ///
+        /// # Errors
+        ///
+        /// As the halves' `export_rows`.
+        pub(crate) fn export_rows(
+            &self,
+            tables: &[BlockTable],
+            from: usize,
+            to: usize,
+            end: usize,
+        ) -> Result<Vec<PoolRows>, CucaError> {
+            let layout = self.kv_layout();
+            let mut front = self
+                .front
+                .export_rows(tables, from, to, end)?
+                .into_iter()
+                .peekable();
+            let mut back = self
+                .back
+                .export_rows(tables, from, to, end)?
+                .into_iter()
+                .peekable();
+            let mut out = Vec::with_capacity(front.len() + back.len());
+            for (gi, il) in entries(layout) {
+                let compressed = layout.groups[gi].compressed;
+                let half = if il < self.first {
+                    &mut front
+                } else {
+                    &mut back
+                };
+                if let Some(rows) = half.next_if(|r| r.layer == il && r.compressed == compressed) {
+                    out.push(rows);
+                }
+            }
+            Ok(out)
+        }
+
+        /// See [`Model::import_rows`](super::super::Model::import_rows): the
+        /// CPU half writes the entries of its layers, the GPU half those of
+        /// its own and the mirror pools of the CPU layers its layers read
+        /// (a mirrored layer's entry reaches both), and the indexes written
+        /// by either are returned. A rejected transfer may leave rows in
+        /// blocks the caller has not named yet.
+        ///
+        /// # Errors
+        ///
+        /// As the halves' `import_rows`.
+        pub(crate) fn import_rows(
+            &mut self,
+            tables: &[BlockTable],
+            from: usize,
+            to: usize,
+            end: usize,
+            rows: &[PoolRows],
+        ) -> Result<Vec<usize>, CucaError> {
+            let mut written = self.front.import_rows(tables, from, to, end, rows)?;
+            written.extend(self.back.import_rows(tables, from, to, end, rows)?);
+            Ok(written)
+        }
+
+        /// The state of every delta-net layer of `snapshot`, ascending: the
+        /// CPU half's layers, then the GPU half's.
+        ///
+        /// # Errors
+        ///
+        /// As the halves' `snapshot_export`.
+        pub(crate) fn snapshot_export(
+            &self,
+            snapshot: &SplitSnapshot,
+        ) -> Result<Vec<DeltaRows>, CucaError> {
+            let mut rows = self.front.snapshot_export(&snapshot.front)?;
+            rows.extend(self.back.snapshot_export(&snapshot.back)?);
+            Ok(rows)
+        }
+
+        /// A snapshot of both halves holding `rows`, one per delta-net layer,
+        /// ascending.
+        ///
+        /// # Errors
+        ///
+        /// [`CucaError::Provider`] when `rows` do not fit the recurrent layers
+        /// of the halves, or as the halves' `snapshot_import`.
+        pub(crate) fn snapshot_import(
+            &self,
+            mut rows: Vec<DeltaRows>,
+        ) -> Result<SplitSnapshot, CucaError> {
+            let on_cpu = self.back.delta_layers_before_first();
+            if rows.len() < on_cpu {
+                return Err(err(
+                    "the snapshot does not fit this model's recurrent state",
+                ));
+            }
+            let on_gpu = rows.split_off(on_cpu);
+            Ok(SplitSnapshot {
+                front: self.front.snapshot_import(rows)?,
+                back: self.back.snapshot_import(on_gpu)?,
+            })
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tiny::{TinyOptions, TinySpec, write_spec, write_tiny_model_with};
+    use super::super::cpu::{Hidden, Transformer};
+    use super::super::tiny::{TinyOptions, TinySpec, VOCAB, write_spec, write_tiny_model_with};
+    use super::super::{Batch, SeqRows, Want};
     use super::*;
     use crate::provider::local::gguf;
 
@@ -620,5 +892,342 @@ mod tests {
             crossing += usize::from(!mirror.is_empty());
         }
         assert!(crossing > 0, "some split crosses a shared cache");
+    }
+
+    /// What a stage reads of the layers before it and what a later stage
+    /// reads of it, for every cut of the tiny Gemma 4 (whose shared-K/V
+    /// layers read the K/V of earlier ones): `exports` of a range are the
+    /// `mirrors` of the layers after it, `passes` are the sources a stage
+    /// forwards untouched.
+    #[test]
+    fn stage_sets_follow_the_kv_sources() {
+        let hp = hparams(&write_tiny_model_with(TinyOptions::default()));
+        let n = hp.n_layer;
+        let mut crossing = 0;
+        for a in 1..n {
+            for b in a + 1..=n {
+                let middle = LayerRange { first: a, end: b };
+                let head = LayerRange { first: 0, end: a };
+                for il in 0..n {
+                    let source = hp.layers[il].kv_source;
+                    let reads_before = il >= b && source < a;
+                    assert_eq!(
+                        passes(&hp, middle).contains(&source) && il >= b,
+                        reads_before,
+                        "{a}..{b}: layer {il}"
+                    );
+                }
+                let mirror = mirrors(&hp, middle);
+                assert!(mirror.iter().all(|&s| s < a));
+                assert!(passes(&hp, middle).iter().all(|&s| s < a));
+                let from_head = exports(&hp, head);
+                assert!(from_head.iter().all(|&s| hp.layers[s].owns_kv(s)));
+                // What the head exports is read by the later layers only.
+                assert!(
+                    from_head
+                        .iter()
+                        .all(|&s| { (a..n).any(|il| hp.layers[il].kv_source == s) })
+                );
+                crossing += passes(&hp, middle).len();
+            }
+        }
+        assert!(crossing > 0, "some stage forwards rows it does not read");
+        for first in 1..n {
+            let tail = LayerRange { first, end: n };
+            assert_eq!(mirrors(&hp, tail), mirrored(&hp, first));
+            assert_eq!(
+                mirrors(&hp, tail),
+                exports(
+                    &hp,
+                    LayerRange {
+                        first: 0,
+                        end: first
+                    }
+                )
+            );
+            assert!(
+                passes(&hp, tail).is_empty(),
+                "the last stage forwards nothing"
+            );
+        }
+        assert_eq!(legal_cuts(&hp), (1..n).collect::<Vec<_>>());
+    }
+
+    /// A stage that reads the K/V of an earlier layer (or forwards it) fails
+    /// on a carry without those rows instead of reading a pool nobody wrote.
+    #[test]
+    fn a_carry_without_the_rows_a_stage_needs_is_refused() {
+        use super::super::StateSlot;
+        use super::super::paged::{KvPools, Sizing};
+        use crate::provider::local::ExpertPlacement;
+        let file = write_tiny_model_with(TinyOptions::default());
+        let content = gguf::Content::open(&file.path).unwrap();
+        let hp = super::super::read_hparams(&content).unwrap();
+        let n = hp.n_layer;
+        let first = (1..n)
+            .find(|&f| !mirrored(&hp, f).is_empty())
+            .expect("a cut that crosses a shared cache");
+        let sizing = Sizing {
+            max_sequences: 1,
+            kv_tokens: 64,
+            max_rows: 16,
+        };
+        let load = |range: LayerRange| {
+            let part = Part {
+                range,
+                shared: None,
+                export: exports(&hp, range),
+                mirror: mirrors(&hp, range),
+                engram: None,
+            };
+            Transformer::load_range(
+                &content,
+                32,
+                &ExpertPlacement::Resident,
+                &sizing,
+                &part,
+                false,
+            )
+            .unwrap()
+        };
+        let mut head = load(LayerRange {
+            first: 0,
+            end: first,
+        });
+        let mut tail = load(LayerRange { first, end: n });
+        let mut pools = KvPools::new(head.kv_layout());
+        let mut seq = pools.seq();
+        pools.reserve(&mut seq, 6).unwrap();
+        let tokens = [3u32, 5, 7, 1, 9, 2];
+        let batch = Batch {
+            rows: vec![SeqRows {
+                history: &[],
+                tokens: &tokens,
+                start_pos: 0,
+                tables: &seq.tables,
+                state: StateSlot(0),
+                want: Want::Last,
+                hidden: Hidden::None,
+            }],
+            exact: true,
+        };
+        let carry = |head: &mut Transformer| match head.forward_stage(&batch, None).unwrap() {
+            StageOut::Carry(c) => c,
+            StageOut::Done(_) => panic!("the head stage holds no logits"),
+        };
+        let mut bare = carry(&mut head);
+        assert!(!bare.kv.is_empty(), "the cut crosses a shared cache");
+        bare.kv.clear();
+        let Err(e) = tail.forward_stage(&batch, Some(bare)) else {
+            panic!("a carry without the rows was accepted");
+        };
+        assert!(e.to_string().contains("holds no K/V rows for layer"), "{e}");
+        // The complete carry runs.
+        let whole = carry(&mut head);
+        assert!(matches!(
+            tail.forward_stage(&batch, Some(whole)).unwrap(),
+            StageOut::Done(_)
+        ));
+    }
+
+    type Rows = Vec<(Option<Vec<f32>>, Option<Vec<f32>>)>;
+
+    /// The steps the stage tests run over two sequences: a prefill, decode
+    /// rows, a verification-shaped call (`Want::All` over a few rows) and
+    /// every `Hidden` the stages can carry.
+    fn stage_steps() -> Vec<Vec<(usize, usize, Want, Hidden)>> {
+        vec![
+            vec![
+                (0, 13, Want::None, Hidden::None),
+                (1, 6, Want::Last, Hidden::PostNorm),
+            ],
+            vec![
+                (0, 7, Want::Last, Hidden::PostNormAll),
+                (1, 1, Want::Last, Hidden::None),
+            ],
+            vec![
+                (0, 1, Want::Last, Hidden::PostNorm),
+                (1, 4, Want::All, Hidden::PostNorm),
+            ],
+            vec![
+                (0, 5, Want::All, Hidden::PostNormAll),
+                (1, 1, Want::Last, Hidden::PostNormAll),
+            ],
+            vec![(1, 2, Want::None, Hidden::PostNormAll)],
+        ]
+    }
+
+    /// Run the steps through `models`: one model is a whole pass, several are
+    /// chained stages, each handing its carry on. Returns the logits and the
+    /// hidden rows of every sequence of every step.
+    fn drive_stages(models: &mut [Transformer], exact: bool) -> Vec<Rows> {
+        use super::super::StateSlot;
+        use super::super::paged::KvPools;
+        let layout = models[0].kv_layout().clone();
+        let mut pools = KvPools::new(&layout);
+        let mut seqs: Vec<_> = (0..2).map(|_| pools.seq()).collect();
+        let mut ids: Vec<Vec<u32>> = vec![Vec::new(); 2];
+        let mut out = Vec::new();
+        for step in stage_steps() {
+            let tokens: Vec<Vec<u32>> = step
+                .iter()
+                .map(|&(i, n, ..)| {
+                    (ids[i].len()..ids[i].len() + n)
+                        .map(|p| ((p * 5 + 3 + i) % VOCAB) as u32)
+                        .collect()
+                })
+                .collect();
+            for (&(i, ..), tokens) in step.iter().zip(&tokens) {
+                pools
+                    .reserve(&mut seqs[i], ids[i].len() + tokens.len())
+                    .unwrap();
+            }
+            let batch = Batch {
+                rows: step
+                    .iter()
+                    .zip(&tokens)
+                    .map(|(&(i, _, want, hidden), tokens)| SeqRows {
+                        history: &ids[i],
+                        tokens,
+                        start_pos: ids[i].len(),
+                        tables: &seqs[i].tables,
+                        state: StateSlot(i),
+                        want,
+                        hidden,
+                    })
+                    .collect(),
+                exact,
+            };
+            let forwards = if let [whole] = models {
+                whole.forward_batch(&batch).unwrap()
+            } else {
+                let mut carry = None;
+                let mut done = None;
+                for stage in models.iter_mut() {
+                    match stage.forward_stage(&batch, carry.take()).unwrap() {
+                        StageOut::Carry(c) => carry = Some(c),
+                        StageOut::Done(f) => done = Some(f),
+                    }
+                }
+                done.expect("the last stage answers with logits")
+            };
+            out.push(forwards.into_iter().map(|f| (f.logits, f.hidden)).collect());
+            drop(batch);
+            for (&(i, ..), tokens) in step.iter().zip(&tokens) {
+                ids[i].extend_from_slice(tokens);
+            }
+        }
+        out
+    }
+
+    /// `model` cut into stages equals the whole model bit for bit: every
+    /// legal two-way cut and every legal three-way cut, in exact and in
+    /// batch-shaped arithmetic.
+    fn check_stages(model: &super::super::tiny::TinyModel, context: usize, what: &str) {
+        use super::super::paged::Sizing;
+        use crate::provider::local::{EngramCache, ExpertPlacement};
+        let content = gguf::Content::open(&model.path).unwrap();
+        let hp = super::super::read_hparams(&content).unwrap();
+        let sizing = Sizing {
+            max_sequences: 2,
+            kv_tokens: 2 * context,
+            max_rows: 16,
+        };
+        let load_range = |range: LayerRange| {
+            let part = Part {
+                range,
+                shared: None,
+                export: exports(&hp, range),
+                mirror: mirrors(&hp, range),
+                engram: None,
+            };
+            Transformer::load_range(
+                &content,
+                context,
+                &ExpertPlacement::Resident,
+                &sizing,
+                &part,
+                false,
+            )
+            .unwrap()
+        };
+        let whole = || {
+            Transformer::load_placed(
+                &content,
+                context,
+                &ExpertPlacement::Resident,
+                &sizing,
+                &EngramCache::default(),
+            )
+            .unwrap()
+        };
+        let n = hp.n_layer;
+        let cuts = legal_cuts(&hp);
+        assert!(!cuts.is_empty(), "{what}: no legal cut");
+        let mut plans: Vec<Vec<usize>> = cuts.iter().map(|&c| vec![0, c, n]).collect();
+        for (i, &a) in cuts.iter().enumerate() {
+            plans.extend(cuts[i + 1..].iter().map(|&b| vec![0, a, b, n]));
+        }
+        for exact in [true, false] {
+            let want = drive_stages(&mut [whole()], exact);
+            assert!(
+                want.iter().flatten().any(|(logits, _)| logits.is_some()),
+                "{what}: the reference produces logits"
+            );
+            for plan in &plans {
+                let mut stages: Vec<Transformer> = plan
+                    .windows(2)
+                    .map(|w| {
+                        load_range(LayerRange {
+                            first: w[0],
+                            end: w[1],
+                        })
+                    })
+                    .collect();
+                let have = drive_stages(&mut stages, exact);
+                assert!(have == want, "{what}: stages {plan:?} (exact {exact})");
+            }
+        }
+    }
+
+    /// A model cut into stages at any legal layer boundary computes what the
+    /// whole model does: the stages hand over the residual stream, the
+    /// per-layer inputs, the hyper-connection streams and the K/V rows of the
+    /// shared layers, and each holds only its layers' state.
+    #[test]
+    fn cpu_stages_equal_the_whole_model_at_every_cut() {
+        use super::super::tiny::{
+            CONTEXT, TinyDeepseek41, TinyGemma4Moe, TinyMistral4, TinyQwen35, write_deepseek41,
+            write_gemma4_moe, write_mistral4, write_qwen35,
+        };
+        for spec in TinySpec::all() {
+            check_stages(&write_spec(&spec), CONTEXT, spec.arch);
+        }
+        check_stages(
+            &write_tiny_model_with(TinyOptions::default()),
+            CONTEXT,
+            "gemma4",
+        );
+        check_stages(
+            &write_gemma4_moe(&TinyGemma4Moe::default()),
+            CONTEXT,
+            "gemma4 moe",
+        );
+        check_stages(&write_qwen35(&TinyQwen35::default()), CONTEXT, "qwen35");
+        check_stages(
+            &write_mistral4(&TinyMistral4::default()),
+            CONTEXT,
+            "mistral4",
+        );
+        for candidates in [Some(3), None] {
+            check_stages(
+                &write_deepseek41(&TinyDeepseek41 {
+                    candidates,
+                    ..TinyDeepseek41::default()
+                }),
+                32,
+                "deepseek41",
+            );
+        }
     }
 }

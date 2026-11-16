@@ -76,7 +76,7 @@ The target decides every token. At temperature 0, a draft is accepted only when 
 
 ### When it pays
 
-Speculation pays when the target is limited by reading its weights, which is the case when one request runs alone. A drafter speculates only while one request runs alone and none waits. With several requests running, the engine batches their decode rows instead, and that already shares the weight reads.
+Speculation pays when the target is limited by reading its weights, which is the case when one request runs alone. With several requests running, the engine already batches their decode rows, which shares the weight reads, so drafting gains less there. Each running request drafts and verifies in the shared step. The engine measures speculation separately for each number of requests decoding together (1, 2, 3 to 4, 5 to 8, up to 33 to 64) and drafts only in the sizes where it measures a gain. A step in which a request prefills does not draft.
 
 ## Turn it on
 
@@ -140,11 +140,11 @@ Each drafter works with one family of target. Use the pair in the same bullet.
 A checkpoint source is `repo:revision`, a Hugging Face safetensors checkpoint. The engine converts it once, in process, and caches the result. DSpark and DeepSeek-V4.1 are on [Run DeepSeek-V4.1](@/local/deepseek-v41.md). The checkpoint classes are on [Model files and downloads](@/local/model-sources.md).
 
 - The Gemma 4 assistant is a four-layer decoder that reads the target's K/V cache (the model's memory of past tokens), so it adds no cache memory.
-- The Qwen 3.5 head is a prediction head already inside the model file. Nothing more is downloaded. It keeps a K/V cache of its own, 4 KB per context position for the 0.8B model.
-- EAGLE is converted from a 392 MB FP8 download to a 0.4 GB GGUF at the default `convert.quant` of `q8_0`. It keeps 2.5 KB of K/V cache per context position.
-- DFlash proposes a whole block of tokens in one pass instead of one pass per token. The checkpoint converts to about 1.4 GB at `q4_0` or 2.7 GB at the default `q8_0`. It keeps a ring of the last 2,048 positions, 82 MB at any context length. Muse Glimmer takes at most 15 drafts.
+- The Qwen 3.5 head is a prediction head already inside the model file. Nothing more is downloaded. It keeps a K/V cache of its own per request slot, 4 KB per context position for the 0.8B model.
+- EAGLE is converted from a 392 MB FP8 download to a 0.4 GB GGUF at the default `convert.quant` of `q8_0`. It keeps 2.5 KB of K/V cache per context position and request slot.
+- DFlash proposes a whole block of tokens in one pass instead of one pass per token. The checkpoint converts to about 1.4 GB at `q4_0` or 2.7 GB at the default `q8_0`. It keeps a ring of the last 2,048 positions per request slot, 82 MB at any context length. Muse Glimmer takes at most 15 drafts.
 - DSpark is a block drafter like DFlash, with stages of the DeepSeek-V4.1 kind. Its converted file is 7.91 GB at the default precision.
-- The Qwen head, EAGLE, DFlash and DSpark follow every position of one sequence, so with them the engine runs one request at a time (`batching.max_sequences` counts as 1).
+- The Qwen head, EAGLE, DFlash and DSpark follow every position of their sequence, so each request slot keeps a cache of its own over the drafter's shared weights, and the cache memory above is multiplied by `batching.max_sequences`. A new request takes the free slot whose cache shares the longest prefix with its prompt.
 
 ## Draft length and counters
 

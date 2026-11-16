@@ -67,6 +67,7 @@ pub(crate) async fn balance_until(
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), ServerError> {
     let resolved = config.resolve_upstreams()?;
+    let roles = config.resolve_roles()?;
     let listener = tokio::net::TcpListener::bind(config.listen)
         .await
         .map_err(|e| ServerError::Io(format!("cannot bind {}: {e}", config.listen)))?;
@@ -81,7 +82,8 @@ pub(crate) async fn balance_until(
 
     let upstreams: Vec<Arc<Upstream>> = resolved
         .into_iter()
-        .map(|(id, url)| Arc::new(Upstream::new(&id, url, config.latency_window)))
+        .zip(roles)
+        .map(|((id, url), role)| Arc::new(Upstream::new(&id, url, config.latency_window, role)))
         .collect();
     let upstream_key: Option<Arc<str>> = config.upstream_api_key.as_deref().map(Arc::from);
     let pollers: Vec<_> = upstreams

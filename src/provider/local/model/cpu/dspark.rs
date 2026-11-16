@@ -221,8 +221,9 @@ struct Stage {
     ffn: FfnWeights,
 }
 
-/// A DSpark drafter and its context rings; see the [module docs](self).
-pub(crate) struct DsparkNet {
+/// The weights of a DSpark drafter, shared by every fork of it
+/// ([`DsparkNet::fork`]).
+struct DsparkWeights {
     geo: Geometry,
     spec: HyperSpec,
     set: LayerSet,
@@ -239,6 +240,11 @@ pub(crate) struct DsparkNet {
     conf: Vec<f32>,
     rope: Rope,
     qdq: bool,
+}
+
+/// A DSpark drafter and its context rings; see the [module docs](self).
+pub(crate) struct DsparkNet {
+    w: Arc<DsparkWeights>,
     /// Slots of each stage's ring.
     cap: usize,
     lo: usize,
@@ -340,24 +346,26 @@ impl DsparkNet {
         let cap = geo.window.min(context_length).max(1);
         Ok(Self {
             ring: vec![vec![0.0; cap * geo.head_dim]; geo.n_stage],
-            rope: Rope {
-                half: table.half,
-                cos: table.cos,
-                sin: table.sin,
-            },
-            qdq: !qdq_disabled(),
-            geo,
-            spec,
-            set,
-            feature_width,
-            fc,
-            enc_norm,
-            out_norm,
-            stages,
-            markov_in,
-            markov_out,
-            markov_rank,
-            conf,
+            w: Arc::new(DsparkWeights {
+                rope: Rope {
+                    half: table.half,
+                    cos: table.cos,
+                    sin: table.sin,
+                },
+                qdq: !qdq_disabled(),
+                geo,
+                spec,
+                set,
+                feature_width,
+                fc,
+                enc_norm,
+                out_norm,
+                stages,
+                markov_in,
+                markov_out,
+                markov_rank,
+                conf,
+            }),
             cap,
             lo: 0,
             hi: 0,
@@ -367,12 +375,12 @@ impl DsparkNet {
     /// The target layers whose inputs the drafter reads, as the set to ask a
     /// forward pass for ([`Hidden::Layers`](super::Hidden)).
     pub(crate) fn features(&self) -> LayerSet {
-        self.set
+        self.w.set
     }
 
     /// Floats of one feature row.
     pub(crate) fn feature_width(&self) -> usize {
-        self.feature_width
+        self.w.feature_width
     }
 
     /// The positions the rings hold, as `lo..hi`.
@@ -387,6 +395,18 @@ impl DsparkNet {
         self.lo = self.lo.min(self.hi);
     }
 
+    /// A drafter over the same weights with empty rings of its own: what a
+    /// second sequence needs when it is drafted for beside this one.
+    pub(crate) fn fork(&self) -> Result<Self, CucaError> {
+        Ok(Self {
+            w: Arc::clone(&self.w),
+            cap: self.cap,
+            lo: 0,
+            hi: 0,
+            ring: self.ring.iter().map(|r| vec![0.0; r.len()]).collect(),
+        })
+    }
+
     /// Take the feature rows `feats` of the positions `pos..` into the rings.
     ///
     /// # Errors
@@ -394,7 +414,7 @@ impl DsparkNet {
     /// [`CucaError::Provider`] for a length that is not whole feature rows,
     /// positions beyond the context or a failed projection.
     pub(crate) fn observe(&mut self, pos: usize, feats: &[f32]) -> Result<(), CucaError> {
-        let width = self.feature_width;
+        let width = self.w.feature_width;
         if feats.is_empty() || !feats.len().is_multiple_of(width) {
             return Err(err(format!(
                 "DSpark observe: {} floats are not whole rows of {width}",
@@ -402,7 +422,7 @@ impl DsparkNet {
             )));
         }
         let rows = feats.len() / width;
-        if (pos + rows + self.geo.block_size) * self.rope.half > self.rope.cos.len() {
+        if (pos + rows + self.w.geo.block_size) * self.w.rope.half > self.w.rope.cos.len() {
             return Err(err(format!(
                 "DSpark observe: positions up to {} exceed the context",
                 pos + rows
@@ -412,16 +432,16 @@ impl DsparkNet {
         let skip = rows.saturating_sub(self.cap);
         let first = pos + skip;
         let m = rows - skip;
-        let (d, hd) = (self.geo.n_embd, self.geo.head_dim);
+        let (d, hd) = (self.w.geo.n_embd, self.w.geo.head_dim);
         let main = self.main_rows(&feats[skip * width..]).map_err(candle_err)?;
-        let mut keys = Vec::with_capacity(self.stages.len());
-        for st in &self.stages {
+        let mut keys = Vec::with_capacity(self.w.stages.len());
+        for st in &self.w.stages {
             let mut kv = mm(&st.kv, &main, d).map_err(candle_err)?;
             let mut row = vec![0f32; hd];
             for (r, k) in kv.chunks_exact_mut(hd).enumerate() {
-                rms_row(k, &st.kv_norm, self.geo.eps, &mut row);
-                self.rope.tail(&mut row, first + r, false);
-                if self.qdq {
+                rms_row(k, &st.kv_norm, self.w.geo.eps, &mut row);
+                self.w.rope.tail(&mut row, first + r, false);
+                if self.w.qdq {
                     kvquant::qdq_fp8_ue8m0(&mut row, 32);
                 }
                 k.copy_from_slice(&row);
@@ -449,11 +469,11 @@ impl DsparkNet {
 
     /// `main_x = norm(fc * features)` of every feature row.
     fn main_rows(&self, feats: &[f32]) -> candle_core::Result<Vec<f32>> {
-        let d = self.geo.n_embd;
-        let mut x = mm(&self.fc, feats, self.feature_width)?;
+        let d = self.w.geo.n_embd;
+        let mut x = mm(&self.w.fc, feats, self.w.feature_width)?;
         let mut row = vec![0f32; d];
         for r in x.chunks_exact_mut(d) {
-            rms_row(r, &self.enc_norm, self.geo.eps, &mut row);
+            rms_row(r, &self.w.enc_norm, self.w.geo.eps, &mut row);
             r.copy_from_slice(&row);
         }
         Ok(x)
@@ -496,16 +516,20 @@ impl DsparkNet {
         k: usize,
         pick: &mut dyn FnMut(&mut [f32]) -> Option<u32>,
     ) -> Result<(Vec<u32>, Vec<f32>), CucaError> {
-        let k = k.min(self.geo.block_size);
+        let k = k.min(self.w.geo.block_size);
         if k == 0 || len == 0 || self.hi != len || self.lo >= self.hi {
             return Ok((Vec::new(), Vec::new()));
         }
-        let (n, d, s) = (self.geo.block_size, self.geo.n_embd, self.spec.streams);
-        let mut ids = vec![self.geo.mask_token; n];
+        let (n, d, s) = (
+            self.w.geo.block_size,
+            self.w.geo.n_embd,
+            self.w.spec.streams,
+        );
+        let mut ids = vec![self.w.geo.mask_token; n];
         ids[0] = first;
         let embeddings = target.embedding_rows(&ids)?;
         let (mut stream, mut pre_mix) = start_streams(&embeddings, s, d);
-        for il in 0..self.stages.len() {
+        for il in 0..self.w.stages.len() {
             self.stage(il, &mut stream, &mut pre_mix, len)
                 .map_err(candle_err)?;
         }
@@ -521,7 +545,7 @@ impl DsparkNet {
         }
         let mut normed = vec![0f32; n * d];
         for (x, out) in hidden.chunks_exact(d).zip(normed.chunks_exact_mut(d)) {
-            rms_row(x, &self.out_norm, self.geo.eps, out);
+            rms_row(x, &self.w.out_norm, self.w.geo.eps, out);
         }
         let normed = Tensor::from_vec(normed, (1, n, d), &Device::Cpu).map_err(candle_err)?;
         let mut logits = target
@@ -534,13 +558,14 @@ impl DsparkNet {
         let mut confidence = Vec::with_capacity(k);
         let mut previous = first;
         for (i, row) in logits.chunks_exact_mut(vocab).enumerate().take(k) {
-            let embed = self.markov_in.rows(&[previous], 1.0)?;
-            let bias = mm(&self.markov_out, &embed, self.markov_rank).map_err(candle_err)?;
+            let embed = self.w.markov_in.rows(&[previous], 1.0)?;
+            let bias = mm(&self.w.markov_out, &embed, self.w.markov_rank).map_err(candle_err)?;
             for (l, b) in row.iter_mut().zip(&bias) {
                 *l += b;
             }
             confidence.push(
-                dot(&self.conf[..d], &hidden[i * d..(i + 1) * d]) + dot(&self.conf[d..], &embed),
+                dot(&self.w.conf[..d], &hidden[i * d..(i + 1) * d])
+                    + dot(&self.w.conf[d..], &embed),
             );
             let Some(token) = pick(row) else {
                 confidence.pop();
@@ -562,10 +587,10 @@ impl DsparkNet {
         pre_mix: &mut [f32],
         len: usize,
     ) -> candle_core::Result<()> {
-        let st = &self.stages[il];
+        let st = &self.w.stages[il];
         st.hc.run(
-            &self.spec,
-            self.geo.eps,
+            &self.w.spec,
+            self.w.geo.eps,
             stream,
             pre_mix,
             |h| self.attention(il, h, len),
@@ -577,12 +602,12 @@ impl DsparkNet {
     /// `(rows, n_embd)` at positions `len..`: every row reads the ring (the
     /// `window` positions before `len`) and all block rows.
     fn attention(&self, il: usize, h: &[f32], len: usize) -> candle_core::Result<Vec<f32>> {
-        let st = &self.stages[il];
-        let g = &self.geo;
+        let st = &self.w.stages[il];
+        let g = &self.w.geo;
         let (d, nh, hd) = (g.n_embd, g.n_head, g.head_dim);
         let t = h.len() / d;
         let eps = g.eps;
-        let rope = &self.rope;
+        let rope = &self.w.rope;
 
         let qa = mm(&st.q_a, h, d)?;
         let mut qn = vec![0f32; t * g.q_lora];
@@ -605,7 +630,7 @@ impl DsparkNet {
             let mut v = vec![0f32; hd];
             rms_row(row, &st.kv_norm, eps, &mut v);
             rope.tail(&mut v, len + r, false);
-            if self.qdq {
+            if self.w.qdq {
                 kvquant::qdq_fp8_ue8m0(&mut v, 32);
             }
             row.copy_from_slice(&v);
@@ -655,7 +680,7 @@ impl DsparkNet {
             for head in row.chunks_exact_mut(hd) {
                 rope.tail(head, len + r, true);
             }
-            if self.qdq {
+            if self.w.qdq {
                 kvquant::qdq_fp8_ue8m0(row, 32);
             }
         });

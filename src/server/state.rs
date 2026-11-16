@@ -10,6 +10,7 @@ use tracing::Span;
 
 use super::collector::StatsCollector;
 use super::config::ServerConfig;
+use super::error::ServerError;
 use super::latency::{LatencyTracker, MAX_RECORDS, Outcome, RequestRecord};
 use super::metrics::ServerMetrics;
 use super::registry::{ModelRegistry, ModelSlot};
@@ -45,6 +46,8 @@ pub struct ServerState {
     pub node_id: String,
     /// Stats streams open now (bounded by `http::MAX_STATS_STREAMS`).
     pub stats_streams: AtomicUsize,
+    /// The client of K/V imports from peer servers (see [`peer_client`]).
+    pub peer_client: reqwest::Client,
 }
 
 impl ServerState {
@@ -55,6 +58,7 @@ impl ServerState {
         listen: SocketAddr,
         registry: Arc<ModelRegistry>,
         system: SystemSampler,
+        peer_client: reqwest::Client,
     ) -> Self {
         let host = sysinfo::System::host_name().unwrap_or_else(|_| "localhost".to_string());
         Self {
@@ -70,8 +74,23 @@ impl ServerState {
             started_unix_ms: crate::sysmon::now_ms(),
             node_id: format!("{host}:{}", listen.port()),
             stats_streams: AtomicUsize::new(0),
+            peer_client,
         }
     }
+}
+
+/// The client of K/V imports from peer servers: a 3 s connect timeout and
+/// no redirects, so a peer cannot send the request elsewhere.
+///
+/// # Errors
+///
+/// [`ServerError::Io`] when the client cannot be built.
+pub(crate) fn peer_client() -> Result<reqwest::Client, ServerError> {
+    crate::tls::http_client_builder()
+        .connect_timeout(Duration::from_secs(3))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| ServerError::Io(format!("cannot build the HTTP client: {e}")))
 }
 
 /// Follows one chat request from arrival to its last byte and, however it

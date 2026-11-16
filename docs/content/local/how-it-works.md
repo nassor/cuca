@@ -136,7 +136,7 @@ The engine does not finish one request before it starts the next. Each step is o
 - `max_sequences` requests run at once: 4 by default, 1 to 64. The rest wait in the queue.
 - A step has at most `max_step_tokens` rows. The default is the prefill chunk: 256 rows at 8,192 positions of context.
 - The K/V pool does not grow with `max_sequences`. When it is full, the engine evicts cached blocks that no request uses, least recently used first. Then it preempts the youngest running request, which goes back to the front of the queue and reads its prompt again, mostly from the blocks it left in the cache. The oldest running request is never preempted.
-- A drafter that reads every position of its sequence (see [Speculative decoding](@/local/drafting.md)) limits the engine to one request at a time.
+- A drafter that reads every position of its sequence (see [Speculative decoding](@/local/drafting.md)) keeps one cache per request slot, so its cache memory grows with `max_sequences`.
 
 The `batching` keys are in [Configuration](@/local/configuration.md). The caps and what happens at each are in [Limits and errors](@/local/limits-and-errors.md).
 

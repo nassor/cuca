@@ -79,8 +79,9 @@ use super::{
 };
 use crate::error::CucaError;
 
-/// An EAGLE drafter and its K/V cache; see the [module docs](self).
-pub(crate) struct EagleHead {
+/// The weights of an EAGLE drafter, shared by every fork of it
+/// ([`EagleHead::fork`]).
+pub(crate) struct EagleWeights {
     /// `nextn.eh_proj`: `2 * n_embd -> n_embd` over `[embedding | hidden]`.
     eh_proj: QMatMul,
     /// `output_norm`: the drafter's own final norm.
@@ -90,6 +91,11 @@ pub(crate) struct EagleHead {
     /// else the layers read is the target's, which [`Transformer::load_eagle`]
     /// checked equal.
     hp: Hparams,
+}
+
+/// An EAGLE drafter and its K/V cache; see the [module docs](self).
+pub(crate) struct EagleHead {
+    w: Arc<EagleWeights>,
     /// The latent K/V of every layer: slot `s` holds the entry of pair
     /// `pairs[s]`; slots past `pairs.len()` are scratch.
     kv: Vec<Arc<KvLayer>>,
@@ -113,7 +119,7 @@ impl EagleHead {
     pub(crate) fn kv_prefix(&self) -> Vec<Vec<f32>> {
         self.kv
             .iter()
-            .zip(&self.hp.layers)
+            .zip(&self.w.hp.layers)
             .map(|(layer, spec)| layer.lock().k[..self.log.pairs.len() * spec.head_dim].to_vec())
             .collect()
     }
@@ -123,11 +129,36 @@ impl EagleHead {
         self.log.truncate(shared);
     }
 
+    /// The empty cache of a head with `capacity` slots: the latent rows of
+    /// every layer of `hp`, the identity block table over them and the pair
+    /// log.
+    fn cache(hp: &Hparams, capacity: usize) -> (Vec<Arc<KvLayer>>, BlockTable, PairLog) {
+        let blocks = capacity.div_ceil(BLOCK_SIZE);
+        let kv = hp
+            .layers
+            .iter()
+            .map(|spec| KvLayer::zeros(spec, blocks))
+            .collect();
+        (kv, (0..blocks as u32).collect(), PairLog::new(capacity))
+    }
+
+    /// A head over the same weights with an empty cache of its own: what a
+    /// second sequence needs when it is drafted for beside this one.
+    pub(crate) fn fork(&self) -> Result<Self, CucaError> {
+        let (kv, table, log) = Self::cache(&self.w.hp, self.log.capacity);
+        Ok(Self {
+            w: Arc::clone(&self.w),
+            kv,
+            table,
+            log,
+        })
+    }
+
     /// The attention call of layer `il`: `t` rows from slot `slot`, the first
     /// at RoPE position `rope_start`.
     fn call(&self, il: usize, slot: usize, rope_start: usize, t: usize) -> AttnCall<'_> {
         AttnCall {
-            spec: &self.hp.layers[il],
+            spec: &self.w.hp.layers[il],
             offset: 0,
             start: slot,
             rope_start,
@@ -181,9 +212,7 @@ impl Transformer {
         let eh_proj = loader.matmul(name::EAGLE_EH_PROJ, &[n, 2 * n])?;
         let norm = loader.vector(name::OUTPUT_NORM, n)?;
         let capacity = self.context_length;
-        let blocks = capacity.div_ceil(BLOCK_SIZE);
         let mut layers = Vec::with_capacity(hp.n_layer);
-        let mut kv = Vec::with_capacity(hp.n_layer);
         for (il, spec) in hp.layers.iter().enumerate() {
             let layout = LayerLayout::read(&hp, il, spec, content)?;
             let layer = load_layer(&mut loader, &hp, il, spec, &layout, None)?;
@@ -195,16 +224,18 @@ impl Transformer {
                 )));
             }
             layers.push(layer);
-            kv.push(KvLayer::zeros(spec, blocks));
         }
+        let (kv, table, log) = EagleHead::cache(&hp, capacity);
         Ok(EagleHead {
-            eh_proj,
-            norm,
-            layers,
-            hp,
+            w: Arc::new(EagleWeights {
+                eh_proj,
+                norm,
+                layers,
+                hp,
+            }),
             kv,
-            table: (0..blocks as u32).collect(),
-            log: PairLog::new(capacity),
+            table,
+            log,
         })
     }
 
@@ -222,7 +253,7 @@ impl Transformer {
         let dev = &Device::Cpu;
         let e = Tensor::from_vec(emb, (1, m, d), dev)?;
         let h = Tensor::from_vec(hidden.to_vec(), (1, m, d), dev)?;
-        head.eh_proj.forward(&Tensor::cat(&[&e, &h], 2)?)
+        head.w.eh_proj.forward(&Tensor::cat(&[&e, &h], 2)?)
     }
 
     /// Layer `il` of the drafter over `x` with the attention call `call`.
@@ -233,7 +264,7 @@ impl Transformer {
         x: &Tensor,
         call: &AttnCall<'_>,
     ) -> candle_core::Result<Tensor> {
-        let lw = &head.layers[il];
+        let lw = &head.w.layers[il];
         let Mixer::Mla(mw) = &lw.mixer else {
             return Err(candle_core::Error::msg(
                 "an EAGLE layer is latent attention",
@@ -287,14 +318,14 @@ impl Transformer {
         first: usize,
     ) -> candle_core::Result<()> {
         let m = emb.len() / self.hp.n_embd;
-        let Some(last) = head.layers.len().checked_sub(1) else {
+        let Some(last) = head.w.layers.len().checked_sub(1) else {
             return Err(candle_core::Error::msg("an EAGLE drafter has no layers"));
         };
         let mut x = self.eagle_input(head, emb, hidden)?;
         for il in 0..last {
             x = self.eagle_layer(head, il, &x, &head.call(il, slot, first, m))?;
         }
-        let lw = &head.layers[last];
+        let lw = &head.w.layers[last];
         let Mixer::Mla(mw) = &lw.mixer else {
             return Err(candle_core::Error::msg(
                 "an EAGLE layer is latent attention",
@@ -365,10 +396,10 @@ impl Transformer {
         j: usize,
     ) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
         let mut x = self.eagle_input(head, emb, hidden)?;
-        for il in 0..head.layers.len() {
+        for il in 0..head.w.layers.len() {
             x = self.eagle_layer(head, il, &x, &head.call(il, slot, j, 1))?;
         }
-        let normed = rms(&x, &head.norm, self.hp.eps as f32)?;
+        let normed = rms(&x, &head.w.norm, self.hp.eps as f32)?;
         let logits = self.head_rows(&normed, self.vocab)?;
         Ok((
             logits.flatten_all()?.to_vec1::<f32>()?,
@@ -645,12 +676,12 @@ mod tests {
 
         let emb = m.embedding_rows(&tokens[1..]).unwrap();
         let mut x = m.eagle_input(&full, emb, &hidden[..(n - 1) * D]).unwrap();
-        for il in 0..full.layers.len() {
+        for il in 0..full.w.layers.len() {
             x = m
                 .eagle_layer(&full, il, &x, &full.call(il, 0, 0, n - 1))
                 .unwrap();
         }
-        for il in 0..quick.layers.len() {
+        for il in 0..quick.w.layers.len() {
             assert_eq!(quick.kv[il].lock().k, full.kv[il].lock().k, "layer {il}");
         }
         assert!(quick.kv[0].lock().k.iter().any(|&v| v != 0.0));

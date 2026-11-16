@@ -14,11 +14,7 @@
 //! Each candidate has a load score (see [`load_score`]):
 //! `in_flight + waiting + running / max_sequences`, where `in_flight` is what
 //! the balancer has outstanding to that upstream and the rest is what the
-//! upstream last reported. An upstream that already has a request for a
-//! model it runs with a drafter adds [`SPECULATION_PENALTY`]: the engine
-//! speculates only while one request runs alone, so a second request there
-//! switches speculation off for both. The penalty needs the upstream's stats
-//! API (`stats_api #true`); without a snapshot there is none.
+//! upstream last reported.
 //!
 //! Then the candidate's speed counts ([`weighted_score`]): a candidate
 //! slower than the fastest one for the model scores
@@ -167,12 +163,9 @@ pub fn resolve_model(
 /// The load score of an upstream for `model`: the balancer's in-flight
 /// requests, plus the requests the upstream reports waiting (for that model
 /// when its snapshot lists it, else all), plus its running fraction of
-/// `max_sequences` as a tie-breaker below one request, plus
-/// [`SPECULATION_PENALTY`] when the score is above zero and the snapshot
-/// reports a drafter for `model`.
+/// `max_sequences` as a tie-breaker below one request.
 pub fn load_score(in_flight: u64, snapshot: Option<&StatsSnapshot>, model: &str) -> f64 {
     let mut score = in_flight as f64;
-    let mut drafter = false;
     if let Some(snapshot) = snapshot {
         let listed = snapshot.models.iter().any(|m| m.name == model);
         let (mut waiting, mut running, mut slots) = (0u64, 0u64, 0u64);
@@ -184,15 +177,11 @@ pub fn load_score(in_flight: u64, snapshot: Option<&StatsSnapshot>, model: &str)
             waiting += m.waiting;
             running += m.running;
             slots += m.max_sequences;
-            drafter |= m.name == model && m.drafter.is_some();
         }
         score += waiting as f64;
         if slots > 0 {
             score += running as f64 / slots as f64;
         }
-    }
-    if drafter && score > 0.0 {
-        score += SPECULATION_PENALTY;
     }
     score
 }
@@ -232,13 +221,6 @@ impl Decision {
         }
     }
 }
-
-/// Added to the score of an upstream that already has a request when the
-/// model has a drafter there: a second request switches speculation off
-/// for both. Equal to the constant of [`fallback_limit`], so a busy
-/// drafter upstream is always passed over while another upstream is idle,
-/// and keeps its affinity when every candidate is loaded.
-pub const SPECULATION_PENALTY: f64 = 2.0;
 
 /// A candidate's score once its speed counts: the requests it would hold
 /// including the new one, scaled by how much slower it is than the
@@ -418,7 +400,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::server::stats::{DrafterStats, ModelStats};
+    use crate::server::stats::ModelStats;
 
     fn cands<'a>(ids: &'a [&'a str], scores: &[f64]) -> Vec<Candidate<'a>> {
         ids.iter()
@@ -631,27 +613,6 @@ mod tests {
         assert_eq!(load_score(1, Some(&snap), "m"), 1.0 + 3.0 + 0.5);
         // A model the snapshot does not list sums every model.
         assert_eq!(load_score(0, Some(&snap), "x"), 12.0 + 6.0 / 8.0);
-    }
-
-    #[test]
-    fn a_busy_drafter_upstream_takes_the_speculation_penalty() {
-        let snap = |running| StatsSnapshot {
-            models: vec![ModelStats {
-                name: "m".into(),
-                running,
-                max_sequences: 4,
-                drafter: Some(DrafterStats::default()),
-                ..ModelStats::default()
-            }],
-            ..StatsSnapshot::default()
-        };
-        let (idle, busy) = (snap(0), snap(1));
-        assert_eq!(load_score(0, Some(&idle), "m"), 0.0, "idle: no penalty");
-        assert_eq!(load_score(1, Some(&idle), "m"), 3.0);
-        assert!(load_score(1, Some(&idle), "m") > fallback_limit(0.0));
-        assert_eq!(load_score(0, Some(&busy), "m"), 2.25);
-        // The drafter belongs to `m`: another model name sums without it.
-        assert_eq!(load_score(0, Some(&busy), "x"), 0.25);
     }
 
     #[test]

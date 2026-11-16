@@ -7,6 +7,7 @@
 //! | `GET /version` | the cuca version |
 //! | `GET /v1/models` | the ready models, with vLLM's `max_model_len` |
 //! | `POST /v1/chat/completions` | non-streaming JSON or SSE (`stream: true`) |
+//! | `POST /cuca/v1/kv/export` | streams the K/V rows of a prompt to a decode node (see [`kv`](super::kv)) |
 //! | `GET /metrics` | Prometheus text |
 //! | `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `stats_api #true` |
 //!
@@ -28,9 +29,9 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Extension, Query, Request, State};
+use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
 use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
-use axum::http::{HeaderValue, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
@@ -60,6 +61,12 @@ pub const MAX_BODY_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_STATS_STREAMS: usize = 64;
 /// Events buffered between the engine and the socket of one chat stream.
 pub const SSE_BUFFER: usize = 32;
+/// Set by the balancer on a request routed to a decode node: the base URL of
+/// the prefill node that should compute its prompt's K/V rows.
+pub(crate) const PREFILL_HEADER: &str = "x-cuca-prefill";
+/// Largest accepted body of a layer-stage call: the hidden states and K/V
+/// rows of one forward pass, which `max_step_tokens` bounds.
+pub const MAX_STAGE_BODY_BYTES: usize = 1 << 30;
 
 /// An error answered as OpenAI's error body,
 /// `{"error":{"message","type","param","code"}}`.
@@ -124,7 +131,7 @@ impl ApiError {
         )
     }
 
-    fn model_unavailable(slot: &ModelSlot) -> Self {
+    pub(crate) fn model_unavailable(slot: &ModelSlot) -> Self {
         let message = match slot.status() {
             SlotStatus::Failed(error) => format!("model `{}` failed to load: {error}", slot.name),
             _ => format!("model `{}` is still loading", slot.name),
@@ -232,6 +239,15 @@ pub fn router(state: Arc<ServerState>) -> Router {
         .route("/version", get(version))
         .route("/v1/models", get(models))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/cuca/v1/kv/export", post(super::kv::export))
+        .route(
+            "/cuca/v1/stage",
+            post(stage_only).layer(DefaultBodyLimit::max(MAX_STAGE_BODY_BYTES)),
+        )
+        .route(
+            "/cuca/v1/stage/{model}",
+            post(stage_named).layer(DefaultBodyLimit::max(MAX_STAGE_BODY_BYTES)),
+        )
         .route("/metrics", get(prometheus));
     if state.stats_api {
         app = app
@@ -370,11 +386,74 @@ async fn models(State(state): State<Arc<ServerState>>) -> Json<Value> {
         .slots()
         .iter()
         .filter_map(|slot| {
+            // A layer-stage worker serves stage calls only: keeping it out
+            // of the list keeps a balancer from routing chat to it.
             slot.ready()
+                .filter(|m| !m.model.is_stage())
                 .map(|m| ModelCard::new(slot.name.to_string(), m.loaded_at, m.context_length))
         })
         .collect();
     Json(model_list(cards))
+}
+
+/// `POST /cuca/v1/stage`: one frame for the only model, a layer-stage worker.
+async fn stage_only(
+    State(state): State<Arc<ServerState>>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    stage_frame(&state, None, body).await
+}
+
+/// `POST /cuca/v1/stage/{model}`: one frame for the named model.
+async fn stage_named(
+    State(state): State<Arc<ServerState>>,
+    Path(model): Path<String>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    stage_frame(&state, Some(&model), body).await
+}
+
+/// Run a coordinator's frame on the worker model and answer its reply frame.
+/// A frame the worker cannot take because its configuration differs from the
+/// coordinator's is a 409, the one status the coordinator reads as a
+/// mismatch; any other failure is a 500.
+async fn stage_frame(
+    state: &ServerState,
+    model: Option<&str>,
+    body: Bytes,
+) -> Result<Response, ApiError> {
+    let slot = state.registry.resolve(model).map_err(|e| match e {
+        ResolveError::Missing => {
+            ApiError::invalid_request("the model is part of the path: several models are loaded")
+                .param("model")
+        }
+        ResolveError::Unknown(name) => ApiError::model_not_found(&name),
+    })?;
+    let loaded = slot
+        .ready()
+        .ok_or_else(|| ApiError::model_unavailable(slot))?;
+    match loaded.model.stage_call(body.to_vec()).await {
+        Ok(reply) => {
+            let mut response = Response::new(axum::body::Body::from(reply));
+            response.headers_mut().insert(
+                CONTENT_TYPE,
+                HeaderValue::from_static("application/octet-stream"),
+            );
+            Ok(response)
+        }
+        Err(CucaError::Config(message)) => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "stage_mismatch",
+            message,
+        )),
+        Err(error) => Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "server_error",
+            "stage_failed",
+            error.to_string(),
+        )),
+    }
 }
 
 async fn prometheus(State(state): State<Arc<ServerState>>) -> Response {
@@ -497,6 +576,10 @@ struct Prepared {
     request: crate::UnifiedRequest,
     options: RequestOptions,
     stream: bool,
+    /// The prefill node the balancer named (`x-cuca-prefill`).
+    prefill: Option<String>,
+    /// The request's `Authorization`, sent on to that peer.
+    authorization: Option<HeaderValue>,
 }
 
 /// Parse the body, select the model, and map the request.
@@ -526,21 +609,29 @@ fn prepare(state: &ServerState, body: Result<Bytes, BytesRejection>) -> Result<P
         request,
         options,
         stream,
+        prefill: None,
+        authorization: None,
     })
 }
 
 async fn chat_completions(
     State(state): State<Arc<ServerState>>,
     Extension(ctx): Extension<RequestCtx>,
+    headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Response, ApiError> {
-    let prepared = match prepare(&state, body) {
+    let mut prepared = match prepare(&state, body) {
         Ok(prepared) => prepared,
         Err(error) => {
             state.metrics.rejected.inc(error.status.as_u16());
             return Err(error);
         }
     };
+    prepared.prefill = headers
+        .get(PREFILL_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    prepared.authorization = headers.get(AUTHORIZATION).cloned();
     run(state, ctx, prepared).await
 }
 
@@ -555,12 +646,38 @@ async fn run(
         request,
         options,
         stream,
+        prefill,
+        authorization,
     } = prepared;
     let model = slot.name.to_string();
+    let (kv_state, kv_slot) = (Arc::clone(&state), Arc::clone(&slot));
     let tracker = RequestTracker::start(state, slot, ctx.id, ctx.span.clone(), ctx.arrived);
+    // The prompt is tokenized here so that a decode node can fetch its K/V
+    // rows from the prefill node the balancer named before the engine sees
+    // the request. Without a `kv_import` section the header is ignored.
+    let prompt = match loaded.model.tokenize(&request) {
+        Ok(prompt) => prompt,
+        Err(error) => {
+            let error = ApiError::from_dispatch(&error);
+            tracker.finish(error.status.as_u16(), error.outcome(), None);
+            return Err(error);
+        }
+    };
+    if let (Some(peer), Some(cfg)) = (&prefill, &kv_slot.kv_import) {
+        super::kv::remote_prefill(
+            &kv_state,
+            &kv_slot,
+            &loaded,
+            cfg,
+            peer,
+            &prompt,
+            authorization.as_ref(),
+        )
+        .await;
+    }
     // Dispatch waits when the engine's queue is full; a client that goes
     // away meanwhile cancels this future and the tracker records it.
-    let generation = match loaded.model.generate(request).await {
+    let generation = match loaded.model.generate_tokens(request, prompt).await {
         Ok(generation) => generation,
         Err(error) => {
             let error = ApiError::from_dispatch(&error);
@@ -728,6 +845,7 @@ mod tests {
             addr,
             registry,
             SystemSampler::start(Duration::from_secs(1)),
+            crate::server::state::peer_client().unwrap(),
         ));
         tokio::spawn(async move {
             let _ = axum::serve(listener, router(state)).await;
@@ -878,5 +996,169 @@ mod tests {
         assert!(constant_time_eq(b"secret", b"secret"));
         assert!(!constant_time_eq(b"secret", b"secreT"));
         assert!(!constant_time_eq(b"secret", b"secre"));
+    }
+
+    /// A server over the tiny model `build` makes, named `m`, listening on a
+    /// free port; returns its base URL and the model's fingerprint.
+    async fn tiny_node(
+        path: &std::path::Path,
+        api_key: Option<&str>,
+        build: impl FnOnce(&std::path::Path) -> crate::provider::local::engine::Engine + Send + 'static,
+    ) -> (String, u64) {
+        use crate::provider::local::engine::testing::tiny_local_model;
+        let model = tiny_local_model(path.to_path_buf(), 96, build).await;
+        let fingerprint = model.fingerprint();
+        let spec = ModelSpec::new(Some("m".into()), LocalModelConfig::default());
+        let mut config = ServerConfig::new("127.0.0.1:0".parse().unwrap(), vec![spec.clone()]);
+        config.api_key = api_key.map(str::to_string);
+        let registry = ModelRegistry::ready_spec(&spec, model);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr: SocketAddr = listener.local_addr().unwrap();
+        let state = Arc::new(ServerState::new(
+            &config,
+            addr,
+            registry,
+            SystemSampler::start(Duration::from_secs(1)),
+            crate::server::state::peer_client().unwrap(),
+        ));
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router(state)).await;
+        });
+        (format!("http://{addr}"), fingerprint)
+    }
+
+    async fn chat_text(base: &str) -> Value {
+        let response = post_chat(
+            base,
+            &json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "abcdefgabcdefgabcdefg"}],
+                "temperature": 0,
+                "max_tokens": 4,
+            })
+            .to_string(),
+        )
+        .await;
+        assert_eq!(response.status(), 200);
+        response.json().await.unwrap()
+    }
+
+    /// A coordinator whose first layer runs on a worker server answers what
+    /// one process does; the worker lists no model, refuses chat, and turns
+    /// a frame for a different configuration away with a 409.
+    #[tokio::test]
+    async fn a_coordinator_over_a_worker_server_answers_like_one_process() {
+        use crate::RemoteStage;
+        use crate::provider::local::engine::testing::{
+            engine_at, http_chain_at, stage_worker_layers_at, tiny_llama_file, tiny_sizing,
+        };
+        use crate::provider::local::stageframe::{Open, open_frame};
+
+        let file = tiny_llama_file(96);
+        let (worker, fingerprint) = tiny_node(&file.path, Some("stage-key"), |path| {
+            stage_worker_layers_at(path, 96, 0, 1)
+        })
+        .await;
+        let stage = RemoteStage {
+            url: worker.clone(),
+            layers: 1,
+            api_key: Some("stage-key".into()),
+            ..RemoteStage::default()
+        };
+        let (coordinator, _) = tiny_node(&file.path, None, move |path| {
+            http_chain_at(path, 96, &[stage])
+        })
+        .await;
+        let (single, _) = tiny_node(&file.path, None, |path| engine_at(path, 96)).await;
+
+        let want = chat_text(&single).await;
+        let got = chat_text(&coordinator).await;
+        assert_eq!(
+            got["choices"][0]["message"]["content"],
+            want["choices"][0]["message"]["content"]
+        );
+        assert_eq!(got["usage"], want["usage"]);
+        // A second turn of the same prompt reuses the cache on both sides.
+        assert_eq!(
+            chat_text(&coordinator).await["usage"],
+            chat_text(&single).await["usage"]
+        );
+
+        let models: Value = get(&format!("{worker}/v1/models"), Some("stage-key"))
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(models["data"], json!([]));
+        let models: Value = get(&format!("{coordinator}/v1/models"), None)
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(models["data"][0]["id"], "m");
+
+        // Chat to a worker is a client error, not a 500.
+        let refused = crate::tls::http_client()
+            .post(format!("{worker}/v1/chat/completions"))
+            .bearer_auth("stage-key")
+            .json(&json!({"model": "m", "messages": [{"role": "user", "content": "abcd"}]}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), 400);
+        let body: Value = refused.json().await.unwrap();
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("layer stage"),
+            "{body}"
+        );
+
+        // The stage route needs the key like the others.
+        let post_frame = |key: Option<&str>, frame: Vec<u8>| {
+            let mut request = crate::tls::http_client()
+                .post(format!("{worker}/cuca/v1/stage"))
+                .header("content-type", "application/octet-stream")
+                .body(frame);
+            if let Some(key) = key {
+                request = request.bearer_auth(key);
+            }
+            request.send()
+        };
+        let (sizing, _) = tiny_sizing(96, 1, None, None);
+        let open = Open {
+            fingerprint,
+            first: 0,
+            end: 1,
+            context_length: 95,
+            max_sequences: 1,
+            kv_tokens: sizing.kv_tokens as u64,
+            max_rows: sizing.max_rows as u64,
+            session: 9,
+        };
+        assert_eq!(
+            post_frame(None, open_frame(&open)).await.unwrap().status(),
+            401
+        );
+        let mismatch = post_frame(Some("stage-key"), open_frame(&open))
+            .await
+            .unwrap();
+        assert_eq!(mismatch.status(), 409);
+        let body: Value = mismatch.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "stage_mismatch");
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("context_length"),
+            "{body}"
+        );
+
+        // The stage route has its own, larger body limit.
+        let big = post_frame(Some("stage-key"), vec![0u8; MAX_BODY_BYTES + 1])
+            .await
+            .unwrap();
+        assert_ne!(big.status(), 413);
     }
 }

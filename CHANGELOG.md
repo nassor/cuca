@@ -1,5 +1,47 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `provider-local`: speculation with several running sequences. The in-trunk head, EAGLE, DFlash
+  and DSpark no longer force `batching.max_sequences` to 1: each request slot keeps a drafter
+  cache of its own over the shared weights (cache memory grows with `max_sequences`), and a new
+  request takes the free slot whose cache shares the longest prefix with its prompt. Every
+  running request drafts and verifies in the shared step. A governor per number of requests
+  decoding together (1, 2, 3 to 4, 5 to 8, up to 33 to 64) drafts only where speculation measures
+  a gain. Drafts never preempt a request, and no step drafts while a request prefills. The Gemma 4
+  assistant drafts under the same rules.
+- K/V transfer between two servers that run the same model file, so one machine prefills and
+  another decodes. `kv_export` on a local model (`max_exports` 1 to 16, default 2, not with
+  `shards`) serves a prompt's K/V rows; `kv_import` on a served model (`peers`, `min_tokens`
+  default 1024, `timeout` default 120 s) fetches them before it generates. `POST
+  /cuca/v1/kv/export` streams the frames; a request's `x-cuca-prefill` header names the peer. The
+  import never fails a request: an unlisted peer, a short prompt, a replaying drafter or a failed
+  exchange all prefill locally. Library: `LocalModel::kv_export`, `kv_import`, `kv_hit`,
+  `tokenize`, `generate_tokens` and `fingerprint`, with `KvExportConfig`. Metrics:
+  `cuca_kv_exports_total`, `cuca_kv_export_tokens_total`, `cuca_kv_export_bytes_total`,
+  `cuca_kv_imports_total{outcome}`, `cuca_kv_import_tokens_total` and
+  `cuca_kv_import_bytes_total`.
+- Layer stages: a model's layers can run on several machines. A worker `model` node takes `stage
+  first=0 layers=14` and serves `POST /cuca/v1/stage` (and `/cuca/v1/stage/{model}`, 1 GiB body
+  limit, 409 `stage_mismatch`, 500 `stage_failed`); a coordinator lists `remote_stage url=...
+  layers=14 [model] [api_key] [timeout]` nodes in layer order, runs the remaining layers and the
+  head itself, and relays every hidden state. Workers list no model in `/v1/models`. Not with
+  `shards`, `gpu_layers` or `kv_export`; the Gemma 4 assistant is the only drafter a coordinator
+  takes. A failed call fails the step and the next request reopens the workers. Library:
+  `RemoteStage` and `StageRange` in `LocalModelConfig`.
+- Balancer: a `disaggregate` section with `prefill` and `decode` pools. A request sent to a decode
+  node carries `x-cuca-prefill` naming a prefill node, chosen by the routing policy; the balancer
+  drops any such header from clients. Prefill nodes take no chat request while another healthy
+  upstream serves the model. Counters: `cuca_balancer_prefill_assigned_total`,
+  `cuca_balancer_prefill_unassigned_total` and `cuca_balancer_prefill_whole_total`.
+
+### Changed
+
+- Balancer: the speculation penalty is removed. An upstream with a drafter no longer adds 2 to
+  its load score; speed weighting stays.
+
 ## 0.9.1 - 2026-11-15
 
 ### Added

@@ -48,6 +48,7 @@ use std::sync::{Mutex, PoisonError};
 
 use super::params::DeltaSpec;
 use super::pool::for_each;
+use super::transfer::DeltaRows;
 
 /// The l2 normalisation epsilon of the query and key (the reference
 /// implementation's fixed value, independent of the RMSNorm epsilon).
@@ -90,6 +91,22 @@ impl DeltaState {
     fn clear(&mut self) {
         self.conv.fill(0.0);
         self.s.fill(0.0);
+    }
+
+    /// The state as flat rows, for a transfer.
+    pub(crate) fn to_rows(&self) -> DeltaRows {
+        DeltaRows {
+            conv: self.conv.clone(),
+            s: self.s.clone(),
+        }
+    }
+
+    /// The state a [`DeltaState::to_rows`] made.
+    pub(crate) fn from_rows(rows: DeltaRows) -> Self {
+        Self {
+            conv: rows.conv,
+            s: rows.s,
+        }
     }
 
     /// Overwrite with `other`, reusing this state's allocation.

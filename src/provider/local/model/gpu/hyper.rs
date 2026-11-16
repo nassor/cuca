@@ -31,14 +31,16 @@
 
 use burn::tensor::{Device, Int, Tensor, TensorData};
 
-use super::super::cpu::Forward;
 use super::super::csa::{Candidates, CsaGlobals, CsaSpec, EngramSpec, HyperSpec};
 use super::super::engram::{self, RowSource};
 use super::super::engram_io::EngramCounters;
 use super::super::paged::{BLOCK_SIZE, KvLayout, NO_BLOCK};
 use super::super::params::{Hparams, LayerSpec};
 use super::super::{csa_kernel, hc_kernel, qdq_kernel, topk_kernel};
-use super::{Cut, LayerWeights, Mixer, Seg, Weight, WeightReader, Weights, err, linear, name, rms};
+use super::{
+    BlockWrite, Cut, LayerRange, LayerWeights, Mixer, Ran, Seg, Weight, WeightReader, Weights, err,
+    linear, name, read_f32, rms,
+};
 use crate::error::CucaError;
 
 // ---- weights --------------------------------------------------------------
@@ -299,20 +301,21 @@ pub(super) struct HyperState {
 }
 
 impl HyperState {
-    /// Zeroed pools on `device` for the groups of `layout`.
+    /// Zeroed pools on `device` for the groups of `layout`, for the layers of
+    /// `range` (a layer outside it runs elsewhere).
     pub(super) fn new(
         hp: &Hparams,
         layout: &KvLayout,
         device: &Device,
         slots: usize,
-        first: usize,
+        range: LayerRange,
     ) -> Result<Self, CucaError> {
         let mut window = Vec::with_capacity(hp.n_layer);
         let mut compressed = Vec::with_capacity(hp.n_layer);
         let limit = super::MAX_PART_BYTES;
         for (il, spec) in hp.layers.iter().enumerate() {
-            // A layer before `first` runs elsewhere.
-            window.push(match layout.layer_group[il].filter(|_| spec.owns_kv(il) && il >= first) {
+            // A layer outside the range runs elsewhere.
+            window.push(match layout.layer_group[il].filter(|_| spec.owns_kv(il) && range.contains(il)) {
                 Some(g) => {
                     let rows = layout.blocks[g] * BLOCK_SIZE;
                     if rows * spec.head_dim * 4 > limit {
@@ -327,7 +330,7 @@ impl HyperState {
             });
             compressed.push(
                 match (
-                    spec.csa.filter(|c| c.owns_kv && il >= first),
+                    spec.csa.filter(|c| c.owns_kv && range.contains(il)),
                     layout.csa_group[il],
                 ) {
                     (Some(c), Some(g)) => {
@@ -398,6 +401,122 @@ impl HyperState {
                 s.end = s.staged_end;
             }
         }
+    }
+}
+
+// ---- K/V transfer -----------------------------------------------------------
+
+/// Rows of a window or compressed pool in transit, see
+/// [`transfer`](super::super::transfer): one head of `width` floats per row,
+/// so the canonical `[n_kv_head][rows][head_dim]` layout is `[rows][width]`
+/// here, and a position's pool row is `block * BLOCK_SIZE + row` as in the
+/// CPU engine's pool of one head. A window pool holds no separate values
+/// (a position's key row is also its value), which is the canonical empty `v`
+/// of a `kv_is_value` layer.
+impl HyperState {
+    /// The pool of layer `il`'s window rows or, with `compressed`, of its
+    /// compressed rows.
+    fn rows_pool(&self, il: usize, compressed: bool) -> Option<&Tensor<2>> {
+        let pools = if compressed {
+            &self.compressed
+        } else {
+            &self.window
+        };
+        pools.get(il)?.as_ref()
+    }
+
+    /// Floats per row of that pool; `None` when this device holds none (a
+    /// layer before `first`, or one that owns no such rows).
+    pub(super) fn row_width(&self, il: usize, compressed: bool) -> Option<usize> {
+        self.rows_pool(il, compressed).map(|pool| pool.dims()[1])
+    }
+
+    /// The rows the block runs `runs` name in that pool, `[rows][width]`
+    /// row-major.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a layer without that pool or a failed
+    /// device read.
+    pub(super) fn read_rows(
+        &self,
+        il: usize,
+        compressed: bool,
+        runs: &[BlockWrite],
+        device: &Device,
+    ) -> Result<Vec<f32>, CucaError> {
+        let pool = self
+            .rows_pool(il, compressed)
+            .ok_or_else(|| err(format!("layer {il} has no pool of these rows")))?;
+        // Pool rows are below the pool size, which fits an i32.
+        let rows: Vec<i32> = runs
+            .iter()
+            .flat_map(|r| {
+                let at = r.block * BLOCK_SIZE;
+                at + r.r0..at + r.r1
+            })
+            .map(|row| row as i32)
+            .collect();
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let n = rows.len();
+        let idx = Tensor::<1, Int>::from_data(TensorData::new(rows, [n]), device);
+        read_f32(pool.clone().select(0, idx), "K/V rows")
+    }
+
+    /// Write `rows` (`[rows][width]`, one row per row of `runs`, in order)
+    /// into that pool.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a layer without that pool or `rows` of
+    /// the wrong size (the pool is as it was).
+    pub(super) fn write_rows(
+        &mut self,
+        il: usize,
+        compressed: bool,
+        runs: &[BlockWrite],
+        rows: &[f32],
+        device: &Device,
+    ) -> Result<(), CucaError> {
+        let pools = if compressed {
+            &mut self.compressed
+        } else {
+            &mut self.window
+        };
+        let slot = pools
+            .get_mut(il)
+            .ok_or_else(|| err(format!("layer {il} has no pool of these rows")))?;
+        let width = slot
+            .as_ref()
+            .map(|pool| pool.dims()[1])
+            .ok_or_else(|| err(format!("layer {il} has no pool of these rows")))?;
+        let n: usize = runs.iter().map(|r| r.r1 - r.r0).sum();
+        if rows.len() != n * width {
+            return Err(err(format!(
+                "layer {il}: {} values for {n} rows of {width}",
+                rows.len()
+            )));
+        }
+        if n == 0 {
+            return Ok(());
+        }
+        // Taken out of the slot, so that the assignments own the only handle
+        // to the pool and write in place.
+        let Some(mut pool) = slot.take() else {
+            return Err(err(format!("layer {il} has no pool of these rows")));
+        };
+        let values = Tensor::<2>::from_data(TensorData::new(rows.to_vec(), [n, width]), device);
+        for r in runs {
+            let at = r.block * BLOCK_SIZE;
+            pool = pool.slice_assign(
+                [at + r.r0..at + r.r1, 0..width],
+                values.clone().narrow(0, r.off, r.r1 - r.r0),
+            );
+        }
+        *slot = Some(pool);
+        Ok(())
     }
 }
 
@@ -569,9 +688,9 @@ impl Weights {
         }
         distinct(&win_dest, "window")?;
         let mut cmp: Vec<Option<CmpPlan>> = (0..layout.groups.len()).map(|_| None).collect();
-        // The groups the layers this device holds read (a layer before
-        // `first` runs elsewhere, with its own state).
-        let used: Vec<usize> = layout.csa_group[self.first..]
+        // The groups the layers this device holds read (a layer outside the
+        // range runs elsewhere, with its own state).
+        let used: Vec<usize> = layout.csa_group[self.first..self.end]
             .iter()
             .flatten()
             .copied()
@@ -666,14 +785,15 @@ impl Weights {
     }
 
     /// The layers over the concatenated rows `embeddings` of `segs`, then
-    /// the final norm and the LM head over the rows the sequences want.
+    /// the final norm and the LM head over the rows the sequences want, or
+    /// (a stage before the last) the streams for the next stage.
     pub(super) fn run_hyper(
         &self,
         state: &mut HyperState,
         layout: &KvLayout,
         embeddings: Vec<f32>,
         segs: &[Seg<'_>],
-    ) -> Result<Vec<Forward>, CucaError> {
+    ) -> Result<Ran, CucaError> {
         let hy = self.hyper()?;
         let (s, d) = (hy.spec.streams, self.hp.n_embd);
         let t = embeddings.len() / d;
@@ -699,7 +819,7 @@ impl Weights {
         stream: Vec<f32>,
         pre: Vec<f32>,
         segs: &[Seg<'_>],
-    ) -> Result<Vec<Forward>, CucaError> {
+    ) -> Result<Ran, CucaError> {
         let hy = self.hyper()?;
         let s = hy.spec.streams;
         let t = pre.len() / s;
@@ -731,7 +851,7 @@ impl Weights {
         mut stream: Tensor<2>,
         mut pre: Tensor<2>,
         segs: &[Seg<'_>],
-    ) -> Result<Vec<Forward>, CucaError> {
+    ) -> Result<Ran, CucaError> {
         let hp = &self.hp;
         let hy = self.hyper()?;
         let pass = self.hyper_pass(state, layout, segs)?;
@@ -741,15 +861,27 @@ impl Weights {
             slot.staged_end = seg.start + seg.t;
         }
         let mut shared = Shared::default();
-        for il in self.first..hp.n_layer {
+        for il in self.first..self.end {
             let (next, coeffs) = self.hyper_layer(il, state, &pass, stream, pre, &mut shared)?;
             stream = next;
             pre = coeffs;
         }
-        let x = hc_kernel::hc_collapse(stream, pre, &hc_shape(hp, hy));
-        let outs = self.finish(x, segs)?;
+        let ran = if self.end == hp.n_layer {
+            let x = hc_kernel::hc_collapse(stream, pre, &hc_shape(hp, hy));
+            Ran::Done(self.finish(x, segs)?)
+        } else {
+            // The next stage collapses with the pre weights, the first
+            // `streams` columns of the coefficients.
+            let s = hy.spec.streams;
+            Ran::Rows {
+                hidden: read_f32(stream, "the hyper-connection streams")?,
+                pre: Some(read_f32(pre.narrow(1, 0, s), "the pre weights")?),
+                per_layer: None,
+                kv: Vec::new(),
+            }
+        };
         state.commit(segs.iter().map(|s| s.slot));
-        Ok(outs)
+        Ok(ran)
     }
 
     /// One layer: attention then FFN between their hyper-connection collapse

@@ -105,7 +105,7 @@ provider-lmstudio = ["dep:reqwest", "dep:tokio-stream", "reqwest/rustls-no-provi
 # no HTTP endpoint, no llama.cpp. reqwest is used only for the one-time model download
 # (a private client, not the CucaClient HTTP client); sha2 verifies the downloaded file;
 # fs4 answers the converter's free-space preflight.
-provider-local = ["config-kdl", "dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:fs4", "dep:tokio", "dep:tokenizers", "dep:unicode-general-category", "dep:wide", "reqwest/rustls-no-provider", "dep:rustls", "serde_json/preserve_order"]
+provider-local = ["config-kdl", "dep:candle-core", "dep:candle-nn", "dep:half", "dep:minijinja", "dep:minijinja-contrib", "dep:reqwest", "dep:sha2", "dep:fs4", "dep:tokio", "tokio/net", "dep:tokenizers", "dep:unicode-general-category", "dep:wide", "reqwest/rustls-no-provider", "dep:rustls", "serde_json/preserve_order"]
 # provider-local GPU backends (burn 0.22 / CubeCL). provider-local-gpu is the shared
 # engine; it selects no backend by itself and is enabled by each backend feature.
 # The graphics backends are Rust (wgpu: SPIR-V for vulkan, MSL for metal), but

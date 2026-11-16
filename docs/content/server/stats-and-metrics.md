@@ -229,6 +229,9 @@ Label values:
 | `cuca_request_queue_seconds{model}` | histogram | arrival to admission by the engine |
 | `cuca_requests_running{model}`, `cuca_requests_waiting{model}`, `cuca_max_sequences{model}` | gauge | engine slots |
 | `cuca_kv_cache_usage_ratio{model}`, `cuca_kv_cache_blocks_total{model}`, `cuca_kv_cache_blocks_cached{model}`, `cuca_kv_cache_bytes{model}` | gauge | the K/V pool |
+| `cuca_kv_exports_total{model}`, `cuca_kv_export_tokens_total{model}`, `cuca_kv_export_bytes_total{model}` | counter | K/V exports served to decode nodes: exports, prompt tokens and frame bytes |
+| `cuca_kv_imports_total{model,outcome}` | counter | requests that named a prefill node, by outcome: `ok`, `skipped` (prompt too short), `drafter` (the drafter replays the prompt), `unlisted` (peer not in `kv_import`), `failed` |
+| `cuca_kv_import_tokens_total{model}`, `cuca_kv_import_bytes_total{model}` | counter | prompt tokens and frame bytes imported from prefill nodes |
 | `cuca_model_weights_bytes{model}` | gauge | the size of the model file it runs from |
 | `cuca_prefix_cache_hit_tokens_total{model}` | counter | prompt tokens served from the prefix store |
 | `cuca_preemptions_total{model}` | counter | sequences preempted for blocks |
@@ -271,6 +274,9 @@ A GPU series is absent for a GPU that does not report that figure.
 | `cuca_balancer_request_e2e_seconds{upstream}` | histogram | arrival to the end of the body |
 | `cuca_balancer_retries_total` | counter | attempts repeated on another upstream |
 | `cuca_balancer_affinity_fallbacks_total` | counter | affinity targets passed over |
+| `cuca_balancer_prefill_assigned_total` | counter | requests sent to a decode node with a prefill node named |
+| `cuca_balancer_prefill_unassigned_total` | counter | requests sent to a decode node while no prefill node was healthy |
+| `cuca_balancer_prefill_whole_total` | counter | requests a prefill node served whole, for want of another upstream |
 | `cuca_balancer_decisions_total{decision}` | counter | `affinity`, `fallback`, `least_loaded` or `round_robin`, per attempt |
 
 The system metrics above follow.

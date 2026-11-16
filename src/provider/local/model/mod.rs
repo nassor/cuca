@@ -162,7 +162,8 @@
 //!   engine drafts with it, adds its block's quantized weights (21.7 MB for
 //!   the 0.8B model) and a K/V cache of one attention layer
 //!   (`2 * 4 * n_kv_head * head_dim` bytes per position, 4 KB for the 0.8B
-//!   model: 33.5 MB at 8192 positions); see [`cpu::NextnHead`].
+//!   model: 33.5 MB at 8192 positions) for each state slot (the engine forks
+//!   the head once per `max_sequences`); see [`cpu::NextnHead`].
 //! - RoPE cos/sin tables are built once for `context_length` positions, one
 //!   pair per distinct rotary embedding.
 //! - A prefill call processes at most [`prefill_chunk`] tokens, which bounds
@@ -170,6 +171,7 @@
 //!   full-attention layer to `n_head * 8 MB`.
 
 pub(crate) mod arch;
+pub(crate) mod chain;
 pub(crate) mod cpu;
 pub(crate) mod csa;
 #[cfg(feature = "provider-local-gpu")]
@@ -316,6 +318,9 @@ pub(crate) enum RecurrentSnapshot {
     /// Both halves of a model with layers offloaded to the GPU.
     #[cfg(feature = "provider-local-gpu")]
     Split(split::SplitSnapshot),
+    /// The local stage's and every worker's state of a model whose first
+    /// layers run on other machines ([`chain`]).
+    Chain(chain::ChainSnapshot),
 }
 
 impl RecurrentSnapshot {
@@ -327,6 +332,7 @@ impl RecurrentSnapshot {
             RecurrentSnapshot::Gpu(snapshot) => snapshot.bytes(),
             #[cfg(feature = "provider-local-gpu")]
             RecurrentSnapshot::Split(snapshot) => snapshot.bytes(),
+            RecurrentSnapshot::Chain(snapshot) => snapshot.bytes(),
         }
     }
 }
@@ -494,9 +500,17 @@ fn cpu_experts(experts: &ExpertPlacement) -> ExpertPlacement {
     }
 }
 
+/// Whether an Engram layer of `hp` is in `range`.
+fn holds_engram(hp: &Hparams, range: split::LayerRange) -> bool {
+    hp.engram
+        .as_ref()
+        .is_some_and(|es| es.layers.iter().any(|&il| range.contains(il)))
+}
+
 /// The loaded model on the device `LocalModelConfig::device` selected: candle
 /// on the CPU, burn on a GPU, or both with some layers offloaded to the GPU
-/// ([`split`]). All expose the same calls the engine makes.
+/// ([`split`]), or with the first layers on other machines ([`chain`]). All
+/// expose the same calls the engine makes.
 // One `Model` exists per engine, so the size gap between the variants costs
 // nothing worth a box.
 #[allow(clippy::large_enum_variant)]
@@ -506,6 +520,8 @@ pub(crate) enum Model {
     Gpu(gpu::GpuTransformer),
     #[cfg(feature = "provider-local-gpu")]
     Split(split::SplitModel),
+    /// The last layers here, the first on remote stages.
+    Chain(chain::ChainModel),
 }
 
 /// Run `$call` with `$m` bound to the engine of whichever device the model
@@ -518,9 +534,13 @@ macro_rules! on_model {
             Model::Gpu($m) => $call,
             #[cfg(feature = "provider-local-gpu")]
             Model::Split($m) => $call,
+            Model::Chain($m) => $call,
         }
     };
 }
+
+// After `on_model!`, which it uses.
+pub(crate) mod transfer;
 
 impl Model {
     /// Load the model from the GGUF file at `path`, whose index `content` was
@@ -667,6 +687,248 @@ impl Model {
         }
     }
 
+    /// Load the layers `range` of the model only, onto `device`: a stage
+    /// worker's model ([`chain`]). Besides the layers it keeps the K/V pools
+    /// and the recurrent state of nothing else, and the rows of the layers it
+    /// exports to later stages come back with every pass.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] for a `device` compiled out or a range that is
+    /// no part of the model; otherwise as [`Model::load`].
+    pub(crate) fn load_stage(
+        content: &gguf::Content,
+        context_length: usize,
+        device: LocalDevice,
+        experts: &ExpertPlacement,
+        sizing: &paged::Sizing,
+        engram: &EngramCache,
+        range: split::LayerRange,
+    ) -> Result<Self, CucaError> {
+        Self::load_part(
+            content,
+            context_length,
+            device,
+            experts,
+            sizing,
+            engram,
+            range,
+            true,
+        )
+    }
+
+    /// The layers `range` on `device`; `exports` says whether later stages
+    /// read the K/V of its layers (a worker: they do; the last stage: no
+    /// stage follows it).
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the load's independent inputs; a struct would only rename them"
+    )]
+    fn load_part(
+        content: &gguf::Content,
+        context_length: usize,
+        device: LocalDevice,
+        experts: &ExpertPlacement,
+        sizing: &paged::Sizing,
+        engram: &EngramCache,
+        range: split::LayerRange,
+        exports: bool,
+    ) -> Result<Self, CucaError> {
+        let hp = read_hparams(content)?;
+        let part = split::Part {
+            range,
+            shared: None,
+            export: if exports {
+                split::exports(&hp, range)
+            } else {
+                Vec::new()
+            },
+            mirror: split::mirrors(&hp, range),
+            engram: if holds_engram(&hp, range) {
+                self::engram::open_table(content, &hp, engram)?
+            } else {
+                None
+            },
+        };
+        match device {
+            LocalDevice::Cpu => Ok(Model::Cpu(cpu::Transformer::load_range(
+                content,
+                context_length,
+                experts,
+                sizing,
+                &part,
+                false,
+            )?)),
+            #[cfg(feature = "provider-local-gpu")]
+            device => Ok(Model::Gpu(gpu::GpuTransformer::load_range(
+                content,
+                context_length,
+                device,
+                experts,
+                sizing,
+                &part,
+            )?)),
+            #[cfg(not(feature = "provider-local-gpu"))]
+            device => Err(super::device_unavailable(device).unwrap_or_else(|| {
+                CucaError::Config(format!("device {device:?} is not available"))
+            })),
+        }
+    }
+
+    /// The model of a coordinator: the last layers on `device`, the first on
+    /// the workers `remotes` describe (consecutive ranges from layer 0, in
+    /// order), with a session opened on each ([`chain`]).
+    ///
+    /// # Errors
+    ///
+    /// The first worker's refusal (unreachable, another file, range or
+    /// sizing), a range that leaves the local stage no layer, or as
+    /// [`Model::load`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the load's independent inputs; a struct would only rename them"
+    )]
+    pub(crate) fn load_chain(
+        content: &gguf::Content,
+        context_length: usize,
+        device: LocalDevice,
+        experts: &ExpertPlacement,
+        sizing: &paged::Sizing,
+        engram: &EngramCache,
+        remotes: &[super::RemoteStage],
+        fingerprint: u64,
+    ) -> Result<Self, CucaError> {
+        let mut first = 0;
+        let mut links: Vec<(split::LayerRange, Box<dyn chain::StageTransport>)> = Vec::new();
+        for stage in remotes {
+            let range = split::LayerRange {
+                first,
+                end: first + stage.layers,
+            };
+            links.push((range, Box::new(chain::HttpTransport::new(stage)?)));
+            first = range.end;
+        }
+        Self::chain_of(
+            content,
+            context_length,
+            device,
+            experts,
+            sizing,
+            engram,
+            links,
+            fingerprint,
+        )
+    }
+
+    /// [`Model::load_chain`] over transports the caller built (the engine
+    /// tests run the workers in process).
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::load_chain`].
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the load's independent inputs; a struct would only rename them"
+    )]
+    pub(crate) fn chain_of(
+        content: &gguf::Content,
+        context_length: usize,
+        device: LocalDevice,
+        experts: &ExpertPlacement,
+        sizing: &paged::Sizing,
+        engram: &EngramCache,
+        links: Vec<(split::LayerRange, Box<dyn chain::StageTransport>)>,
+        fingerprint: u64,
+    ) -> Result<Self, CucaError> {
+        let hp = read_hparams(content)?;
+        let Some(first) = links.last().map(|(range, _)| range.end) else {
+            return Err(CucaError::Config(
+                "a chain needs at least one remote stage".into(),
+            ));
+        };
+        let range = split::LayerRange {
+            first,
+            end: hp.n_layer,
+        };
+        let local = Self::load_part(
+            content,
+            context_length,
+            device,
+            experts,
+            sizing,
+            engram,
+            range,
+            false,
+        )?;
+        let links = links
+            .into_iter()
+            .map(|(range, transport)| (range, transport, holds_engram(&hp, range)))
+            .collect();
+        Ok(Model::Chain(chain::ChainModel::connect(
+            local,
+            links,
+            hp.behavior.hyper_connections,
+            chain::Agreement {
+                fingerprint,
+                context_length,
+                max_sequences: sizing.max_sequences,
+                kv_tokens: sizing.kv_tokens,
+                max_rows: sizing.max_rows,
+            },
+        )?))
+    }
+
+    /// [`Model::forward_batch`] for a stage worker's model: the rows through
+    /// its layers, from the previous stage's carry (`None` for the stage
+    /// that embeds), returning the carry for the next stage.
+    ///
+    /// # Errors
+    ///
+    /// As [`cpu::Transformer::forward_stage`]; [`CucaError::Provider`] for a
+    /// model that is not a single-device stage.
+    pub(crate) fn forward_stage(
+        &mut self,
+        batch: &Batch<'_>,
+        input: Option<split::Carry>,
+    ) -> Result<split::StageOut, CucaError> {
+        match self {
+            Model::Cpu(m) => m.forward_stage(batch, input),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(m) => m.forward_stage(batch, input),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(_) => Err(err("a split model is not a layer stage")),
+            Model::Chain(_) => Err(err("a chain is not a layer stage")),
+        }
+    }
+
+    /// The zero recurrent state at position 0 for `slot` (a sequence start,
+    /// or after a failed pass), on a model that is not a chain's.
+    pub(crate) fn reset_slot(&mut self, slot: StateSlot) {
+        on_model!(self, m => m.reset_slot(slot.0));
+    }
+
+    /// The CPU engine that runs the layers a drafter reads the K/V of: the
+    /// model itself, or the last stage of a chain.
+    pub(crate) fn local_cpu(&self) -> Option<&cpu::Transformer> {
+        match self {
+            Model::Cpu(m) => Some(m),
+            Model::Chain(m) => m.local().local_cpu(),
+            #[cfg(feature = "provider-local-gpu")]
+            _ => None,
+        }
+    }
+
+    /// The GPU engine that runs the layers a drafter reads the K/V of: the
+    /// model itself, or the last stage of a chain.
+    #[cfg(feature = "provider-local-gpu")]
+    pub(crate) fn local_gpu(&self) -> Option<&gpu::GpuTransformer> {
+        match self {
+            Model::Gpu(m) => Some(m),
+            Model::Chain(m) => m.local().local_gpu(),
+            _ => None,
+        }
+    }
+
     /// Layers on the GPU and layers in all when layers are offloaded
     /// ([`split`]); `None` for a model on one device.
     pub(crate) fn layer_split(&self) -> Option<(usize, usize)> {
@@ -676,6 +938,7 @@ impl Model {
             Model::Gpu(_) => None,
             #[cfg(feature = "provider-local-gpu")]
             Model::Split(m) => Some((m.gpu_layers(), m.n_layer())),
+            Model::Chain(_) => None,
         }
     }
 
@@ -694,20 +957,23 @@ impl Model {
             Model::Gpu(m) => m.engram_counters(),
             #[cfg(feature = "provider-local-gpu")]
             Model::Split(m) => m.engram_counters(),
+            Model::Chain(m) => m.engram_counters(),
         }
     }
 
-    /// Hint that the rows of `tokens` (the next ones of a sequence whose
-    /// earlier tokens are `history`) will be looked up soon: a model with an
-    /// Engram table starts reading their table rows in the background. Changes
-    /// no output.
-    pub(crate) fn engram_prefetch(&self, history: &[u32], tokens: &[u32]) {
+    /// Hint that the rows of `tokens` (the next ones of the sequence in
+    /// `slot`, whose earlier tokens are `history`) will be looked up soon: a
+    /// model with an Engram table starts reading their table rows in the
+    /// background, and so do the stages of a chain that run an Engram layer.
+    /// Changes no output.
+    pub(crate) fn engram_prefetch(&self, slot: StateSlot, history: &[u32], tokens: &[u32]) {
         match self {
             Model::Cpu(m) => m.engram_prefetch(history, tokens),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.engram_prefetch(history, tokens),
             #[cfg(feature = "provider-local-gpu")]
             Model::Split(m) => m.engram_prefetch(history, tokens),
+            Model::Chain(m) => m.engram_prefetch(slot, history, tokens),
         }
     }
 
@@ -766,6 +1032,7 @@ impl Model {
             Model::Gpu(m) => m.snapshot(slot.0).map(RecurrentSnapshot::Gpu),
             #[cfg(feature = "provider-local-gpu")]
             Model::Split(m) => m.snapshot(slot.0).map(RecurrentSnapshot::Split),
+            Model::Chain(m) => m.snapshot(slot.0),
         }
     }
 
@@ -787,6 +1054,7 @@ impl Model {
             return Ok(());
         }
         match (self, snapshot) {
+            (Model::Chain(m), snapshot) => m.restore(slot.0, snapshot, len),
             (Model::Cpu(m), None) => {
                 m.reset_slot(slot.0);
                 Ok(())
@@ -810,7 +1078,6 @@ impl Model {
             (Model::Split(m), Some(RecurrentSnapshot::Split(snapshot))) => {
                 m.restore(slot.0, snapshot, len)
             }
-            #[cfg(feature = "provider-local-gpu")]
             _ => Err(err("the snapshot comes from another device")),
         }
     }

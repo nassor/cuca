@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::time::{Duration, Instant};
 
-use super::config::BalancerConfig;
+use super::config::{BalancerConfig, Role};
 use super::routing::{Candidate, Decision, Router, UpstreamView, load_score, weighted_score};
 use super::upstream::Upstream;
 use crate::server::latency::{LatencyTracker, MAX_RECORDS};
@@ -23,6 +23,12 @@ pub struct BalancerMetrics {
     pub retries: AtomicU64,
     /// Affinity targets passed over for being too loaded.
     pub fallbacks: AtomicU64,
+    /// Requests sent to a decode node with a prefill node named.
+    pub prefill_assigned: AtomicU64,
+    /// Requests sent to a decode node while no prefill node was healthy.
+    pub prefill_unassigned: AtomicU64,
+    /// Requests a prefill node served whole, for want of another upstream.
+    pub prefill_whole: AtomicU64,
     /// Routing decisions by kind (see [`Decision`]).
     pub decisions: [AtomicU64; 4],
     /// Time to the first body byte, over all upstreams.
@@ -38,6 +44,9 @@ impl Default for BalancerMetrics {
             rejected: StatusCounters::default(),
             retries: AtomicU64::new(0),
             fallbacks: AtomicU64::new(0),
+            prefill_assigned: AtomicU64::new(0),
+            prefill_unassigned: AtomicU64::new(0),
+            prefill_whole: AtomicU64::new(0),
             decisions: Default::default(),
             ttft: Histogram::new(TTFT_BUCKETS),
             e2e: Histogram::new(E2E_BUCKETS),
@@ -152,15 +161,25 @@ impl BalancerState {
 
     /// The healthy upstreams of `model` that are not in `exclude`, with their
     /// load scores weighted by their speeds ([`weighted_score`]), in
-    /// configuration order.
+    /// configuration order. [`Role::Prefill`] upstreams are left out unless no
+    /// other upstream qualifies.
     pub fn candidates<'a>(&'a self, model: &str, exclude: &[usize]) -> Vec<Candidate<'a>> {
         let now = Instant::now();
-        let scored: Vec<(Candidate<'a>, Option<f64>)> = self
+        let serves = |(i, u): &(usize, &Arc<Upstream>)| {
+            !exclude.contains(i) && self.is_healthy(u, now) && u.models().iter().any(|m| m == model)
+        };
+        let mut chosen: Vec<(usize, &Arc<Upstream>)> = self
             .upstreams
             .iter()
             .enumerate()
-            .filter(|(i, u)| !exclude.contains(i) && self.is_healthy(u, now))
-            .filter(|(_, u)| u.models().iter().any(|m| m == model))
+            .filter(|entry| serves(entry) && entry.1.role != Role::Prefill)
+            .collect();
+        if chosen.is_empty() {
+            // Only prefill nodes are left: they serve whole requests.
+            chosen = self.upstreams.iter().enumerate().filter(serves).collect();
+        }
+        let scored: Vec<(Candidate<'a>, Option<f64>)> = chosen
+            .into_iter()
             .map(|(index, u)| {
                 let candidate = Candidate {
                     index,
@@ -183,6 +202,30 @@ impl BalancerState {
             .map(|(mut candidate, speed)| {
                 candidate.score = weighted_score(candidate.score, speed, fastest);
                 candidate
+            })
+            .collect()
+    }
+
+    /// The healthy [`Role::Prefill`] upstreams of `model`, scored by load
+    /// alone: the nodes a decode node may import its prompt's K/V rows from.
+    pub fn prefill_candidates<'a>(&'a self, model: &str) -> Vec<Candidate<'a>> {
+        let now = Instant::now();
+        self.upstreams
+            .iter()
+            .enumerate()
+            .filter(|(_, u)| {
+                u.role == Role::Prefill
+                    && self.is_healthy(u, now)
+                    && u.models().iter().any(|m| m == model)
+            })
+            .map(|(index, u)| Candidate {
+                index,
+                id: &u.id,
+                score: load_score(
+                    u.in_flight.load(std::sync::atomic::Ordering::Relaxed),
+                    u.snapshot(self.snapshot_max_age()).as_deref(),
+                    model,
+                ),
             })
             .collect()
     }

@@ -74,7 +74,9 @@
 //! Like the in-trunk head it keeps a K/V cache of its own over every trunk
 //! position, is fed by [`Drafter::observe`] with the trunk's final-norm
 //! hidden rows, follows [`Drafter::truncate`] and [`Drafter::reset`] by the
-//! same pair rule, serves one sequence at a time, and runs on the CPU only.
+//! same pair rule, runs on the CPU only, and forks per state slot
+//! ([`Drafter::fork`]: the weights are shared, each fork has a cache of its
+//! own), so every running sequence has a drafter.
 //! See [`super::cpu::EagleHead`] for the semantics (embedding first, then the
 //! hidden row; RoPE position of the hidden row), the cost of committing a
 //! pair, and the memory.
@@ -118,7 +120,7 @@ use super::cpu::{EagleHead, Hidden, NextnHead, Transformer};
 #[cfg(feature = "provider-local-gpu")]
 use super::gpu::GpuDrafter;
 use super::paged::BlockTable;
-use super::{Model, err, prefill_chunk};
+use super::{Model, candle_err, err, prefill_chunk};
 use crate::error::CucaError;
 
 /// Most positions a lazy drafter holds unobserved ([`Lag`]).
@@ -167,6 +169,23 @@ impl Lag {
             rows: Vec::new(),
             #[cfg(test)]
             eager: false,
+            #[cfg(test)]
+            stale_drafts: std::cell::Cell::new(0),
+        }
+    }
+
+    /// An empty lag of the same shape: what a fork of the drafter starts
+    /// with.
+    fn fresh(&self) -> Self {
+        Self {
+            chunk: self.chunk,
+            max_rows: self.max_rows,
+            pos: 0,
+            width: self.width,
+            tokens: Vec::new(),
+            rows: Vec::new(),
+            #[cfg(test)]
+            eager: self.eager,
             #[cfg(test)]
             stale_drafts: std::cell::Cell::new(0),
         }
@@ -277,38 +296,40 @@ impl Drafter {
                 target.arch().name()
             )));
         }
-        match target {
-            Model::Cpu(target) => {
-                let net = Transformer::load_drafter(content, context_length)?;
-                if net.n_embd_out() != target.n_embd() {
-                    return Err(err(format!(
-                        "drafter hidden width {} differs from the target's {}: it was trained for another model size",
-                        net.n_embd_out(),
-                        target.n_embd()
-                    )));
-                }
-                if net.vocab() != target.vocab() {
-                    return Err(err(format!(
-                        "drafter vocabulary {} differs from the target's {}",
-                        net.vocab(),
-                        target.vocab()
-                    )));
-                }
-                // The target must have the caches a draft reads.
-                target.ext_kv(&vec![Vec::new(); target.kv_layout().groups.len()])?;
-                Ok(Self::Cpu { net })
+        if let Some(target) = target.local_cpu() {
+            let net = Transformer::load_drafter(content, context_length)?;
+            if net.n_embd_out() != target.n_embd() {
+                return Err(err(format!(
+                    "drafter hidden width {} differs from the target's {}: it was trained for another model size",
+                    net.n_embd_out(),
+                    target.n_embd()
+                )));
             }
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(target) => Ok(Self::Gpu(GpuDrafter::open(
+            if net.vocab() != target.vocab() {
+                return Err(err(format!(
+                    "drafter vocabulary {} differs from the target's {}",
+                    net.vocab(),
+                    target.vocab()
+                )));
+            }
+            // The target must have the caches a draft reads, and the token
+            // embedding the drafter's input starts from (the last stage of a
+            // chain holds it only with a tied head).
+            target.ext_kv(&vec![Vec::new(); target.kv_layout().groups.len()])?;
+            target.embedding_row(0)?;
+            return Ok(Self::Cpu { net });
+        }
+        #[cfg(feature = "provider-local-gpu")]
+        if let Some(target) = target.local_gpu() {
+            return Ok(Self::Gpu(GpuDrafter::open(
                 content,
                 target,
                 context_length,
-            )?)),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(_) => Err(CucaError::Config(
-                "a drafter cannot be combined with `gpu_layers`".into(),
-            )),
+            )?));
         }
+        Err(CucaError::Config(
+            "a drafter cannot be combined with `gpu_layers`".into(),
+        ))
     }
 
     /// The prediction head embedded in `target`'s own file (`content` is its
@@ -334,6 +355,9 @@ impl Drafter {
             #[cfg(feature = "provider-local-gpu")]
             Model::Split(_) => Err(CucaError::Config(
                 "the in-trunk prediction head runs on the CPU only: it cannot be combined with `gpu_layers`".into(),
+            )),
+            Model::Chain(_) => Err(CucaError::Config(
+                "the in-trunk prediction head cannot be combined with `remote_stage`".into(),
             )),
         }
     }
@@ -367,6 +391,9 @@ impl Drafter {
                 "the EAGLE drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
                     .into(),
             )),
+            Model::Chain(_) => Err(CucaError::Config(
+                "the EAGLE drafter cannot be combined with `remote_stage`".into(),
+            )),
         }
     }
 
@@ -395,6 +422,9 @@ impl Drafter {
             Model::Split(_) => Err(CucaError::Config(
                 "the DFlash drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
                     .into(),
+            )),
+            Model::Chain(_) => Err(CucaError::Config(
+                "the DFlash drafter cannot be combined with `remote_stage`".into(),
             )),
         }
     }
@@ -426,6 +456,9 @@ impl Drafter {
                 "the DSpark drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
                     .into(),
             )),
+            Model::Chain(_) => Err(CucaError::Config(
+                "the DSpark drafter cannot be combined with `remote_stage`".into(),
+            )),
         }
     }
 
@@ -436,6 +469,31 @@ impl Drafter {
             self,
             Self::InTrunk(..) | Self::Eagle(..) | Self::Dflash(..) | Self::Dspark(..)
         )
+    }
+
+    /// A drafter over the same weights with an empty cache of its own, for
+    /// the next sequence a drafter that observes every position serves. The
+    /// assistants read the target's K/V and hold no state to fork.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for an assistant, or a failed allocation.
+    pub(crate) fn fork(&self) -> Result<Self, CucaError> {
+        match self {
+            Self::InTrunk(head, lag) => {
+                Ok(Self::InTrunk(head.fork().map_err(candle_err)?, lag.fresh()))
+            }
+            Self::Eagle(head, lag) => Ok(Self::Eagle(head.fork()?, lag.fresh())),
+            Self::Dflash(net, lag) => Ok(Self::Dflash(net.fork()?, lag.fresh())),
+            Self::Dspark(net, lag) => Ok(Self::Dspark(net.fork()?, lag.fresh())),
+            Self::Cpu { .. } => Err(err(
+                "a drafter that reads the target's K/V holds no state to fork",
+            )),
+            #[cfg(feature = "provider-local-gpu")]
+            Self::Gpu(_) => Err(err(
+                "a drafter that reads the target's K/V holds no state to fork",
+            )),
+        }
     }
 
     /// The unobserved rows of a drafter that defers its upkeep, `None` for
@@ -738,7 +796,10 @@ impl Drafter {
                 .set(lag.stale_drafts.get() + usize::from(!lag.is_empty()));
         }
         match (self, target) {
-            (Self::Cpu { net }, Model::Cpu(target)) => {
+            (Self::Cpu { net }, _) => {
+                let Some(target) = target.local_cpu() else {
+                    return Err(err("the drafter and its target run on different devices"));
+                };
                 let ext = target.ext_kv(tables)?;
                 let mut drafts = Vec::with_capacity(k);
                 let mut hidden = hidden.to_vec();
@@ -763,10 +824,12 @@ impl Drafter {
             (Self::Dflash(net, _), Model::Cpu(target)) => net.draft(target, first, len, k, pick),
             (Self::Dspark(net, _), Model::Cpu(target)) => net.draft(target, first, len, k, pick),
             #[cfg(feature = "provider-local-gpu")]
-            (Self::Gpu(drafter), Model::Gpu(target)) => {
+            (Self::Gpu(drafter), _) => {
+                let Some(target) = target.local_gpu() else {
+                    return Err(err("the drafter and its target run on different devices"));
+                };
                 drafter.draft(target, tables, hidden, first, len, k, pick)
             }
-            #[cfg(feature = "provider-local-gpu")]
             _ => Err(err("the drafter and its target run on different devices")),
         }
     }

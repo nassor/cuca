@@ -52,6 +52,7 @@ use serde::de::Error as _;
 use serde::{Deserialize, Deserializer};
 
 use super::balancer::BalancerConfig;
+use super::balancer::config::normalize_upstream;
 use super::error::ServerError;
 use super::telemetry::LogConfig;
 use crate::config::ConfigValue;
@@ -191,6 +192,11 @@ impl ServerConfig {
                 )));
             }
         }
+        for spec in &self.models {
+            if let Some(kv) = &spec.kv_import {
+                kv.validate(&spec.name, &spec.config)?;
+            }
+        }
         if self.api_key.as_deref() == Some("") {
             return Err(ServerError::Config("api_key is empty".into()));
         }
@@ -214,6 +220,109 @@ pub struct ModelSpec {
     /// What [`LocalModel::load`](crate::LocalModel::load) receives (the
     /// server adds the download-progress callback).
     pub config: LocalModelConfig,
+    /// Prefill peers this model may import K/V rows from; `None` never
+    /// imports. A `kv_import` child of the `model` node, kept out of the
+    /// [`LocalModelConfig`] because it is about the server's peers.
+    pub kv_import: Option<KvImportConfig>,
+}
+
+/// The `kv_import` child of a `model` node: where a request may have its
+/// prompt prefilled, for models that decode behind a balancer's
+/// `disaggregate` section.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvImportConfig {
+    /// Base URLs of the prefill nodes this model accepts as a peer, at
+    /// least one, at most [`KvImportConfig::MAX_PEERS`]; stored normalized
+    /// (no trailing slash).
+    #[serde(deserialize_with = "normalized_peers")]
+    pub peers: Vec<String>,
+    /// Prompts with fewer tokens beyond the local prefix cache than this are
+    /// prefilled locally, at least [`KvImportConfig::MIN_MIN_TOKENS`].
+    pub min_tokens: usize,
+    /// How long the exchange with a peer may take, 1 s to 1 h (`"120s"`).
+    #[serde(deserialize_with = "crate::config::duration")]
+    pub timeout: Duration,
+}
+
+impl KvImportConfig {
+    /// Default [`KvImportConfig::min_tokens`].
+    pub const DEFAULT_MIN_TOKENS: usize = 1024;
+    /// Smallest accepted [`KvImportConfig::min_tokens`].
+    pub const MIN_MIN_TOKENS: usize = 16;
+    /// Default [`KvImportConfig::timeout`].
+    pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(120);
+    /// Most peers one model lists.
+    pub const MAX_PEERS: usize = 16;
+
+    fn validate(&self, model: &str, local: &LocalModelConfig) -> Result<(), ServerError> {
+        let bad = |why: String| ServerError::Config(format!("model `{model}`: kv_import {why}"));
+        if self.peers.is_empty() {
+            return Err(bad("needs at least one peer".into()));
+        }
+        if self.peers.len() > Self::MAX_PEERS {
+            return Err(bad(format!(
+                "has {} peers; at most {}",
+                self.peers.len(),
+                Self::MAX_PEERS
+            )));
+        }
+        for peer in &self.peers {
+            normalize_upstream(peer).map_err(|e| match e {
+                ServerError::Config(why) => bad(format!("peer {why}")),
+                other => other,
+            })?;
+        }
+        if self.min_tokens < Self::MIN_MIN_TOKENS {
+            return Err(bad(format!(
+                "min_tokens must be at least {}, got {}",
+                Self::MIN_MIN_TOKENS,
+                self.min_tokens
+            )));
+        }
+        if !(Duration::from_secs(1)..=Duration::from_secs(3600)).contains(&self.timeout) {
+            return Err(bad("timeout must be between 1s and 1h".into()));
+        }
+        if !local.shards.is_empty() {
+            return Err(ServerError::Config(format!(
+                "model `{model}`: kv_import cannot be combined with tensor parallelism (`shards`)"
+            )));
+        }
+        if local.stage.is_some() {
+            return Err(bad("cannot be combined with layer stages (`stage`)".into()));
+        }
+        if !local.remote_stages.is_empty() {
+            return Err(bad(
+                "cannot be combined with layer stages (`remote_stage`)".into()
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Default for KvImportConfig {
+    fn default() -> Self {
+        Self {
+            peers: Vec::new(),
+            min_tokens: Self::DEFAULT_MIN_TOKENS,
+            timeout: Self::DEFAULT_TIMEOUT,
+        }
+    }
+}
+
+/// One or several peer URLs, each as its normalized base URL.
+fn normalized_peers<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    let raw: Vec<String> = crate::config::one_or_many(deserializer)?;
+    raw.iter()
+        .map(|peer| {
+            normalize_upstream(peer)
+                .map(|(_, url)| url)
+                .map_err(|e| match e {
+                    ServerError::Config(why) => D::Error::custom(format!("peer {why}")),
+                    other => D::Error::custom(other),
+                })
+        })
+        .collect()
 }
 
 impl ModelSpec {
@@ -222,7 +331,11 @@ impl ModelSpec {
     /// name of a checkpoint, the directory name of a checkpoint directory.
     pub fn new(name: Option<String>, config: LocalModelConfig) -> Self {
         let name = name.unwrap_or_else(|| default_name(&config.source));
-        Self { name, config }
+        Self {
+            name,
+            config,
+            kv_import: None,
+        }
     }
 
     /// The source as a short label for logs and the stats API.
@@ -313,13 +426,24 @@ impl<'de> Deserialize<'de> for ModelSpec {
                 .get("source")
                 .map(|s| s.as_str().map_or_else(|| s.to_string(), str::to_string))
         });
+        let kv_import = match table.remove("kv_import") {
+            None => None,
+            Some(value) => Some(KvImportConfig::deserialize(value).map_err(|e| {
+                D::Error::custom(match &label {
+                    Some(label) => format!("model `{label}`: kv_import: {e}"),
+                    None => format!("model: kv_import: {e}"),
+                })
+            })?),
+        };
         let config = LocalModelConfig::deserialize(ConfigValue::Object(table)).map_err(|e| {
             D::Error::custom(match &label {
                 Some(label) => format!("model `{label}`: {e}"),
                 None => format!("model: {e}"),
             })
         })?;
-        Ok(Self::new(name, config))
+        let mut spec = Self::new(name, config);
+        spec.kv_import = kv_import;
+        Ok(spec)
     }
 }
 
@@ -448,5 +572,112 @@ serve {
         let config = ServerConfig::new(listen, vec![one.clone(), one]);
         let err = config.validate().unwrap_err().to_string();
         assert!(err.contains("qwen3-0.6b-q8_0"), "{err}");
+    }
+
+    fn kv_model(import: &str, extra: &str) -> Result<ServerConfig, ServerError> {
+        serve(&format!(
+            r#"serve {{ model "m" {{ source "qwen3-0.6b-q8_0"; {extra} kv_import {{ {import} }}; }}; }}"#
+        ))
+    }
+
+    fn kv_error(import: &str, extra: &str) -> String {
+        match kv_model(import, extra) {
+            Err(e) => e.to_string(),
+            Ok(config) => config.validate().unwrap_err().to_string(),
+        }
+    }
+
+    #[test]
+    fn kv_import_parses_with_defaults_and_normalized_peers() {
+        let config = kv_model(
+            r#"peers "http://10.0.0.1:8000/" "https://gpu.example/x/""#,
+            "",
+        )
+        .unwrap();
+        config.validate().unwrap();
+        let kv = config.models[0].kv_import.as_ref().unwrap();
+        assert_eq!(kv.peers, ["http://10.0.0.1:8000", "https://gpu.example/x"]);
+        assert_eq!(kv.min_tokens, KvImportConfig::DEFAULT_MIN_TOKENS);
+        assert_eq!(kv.timeout, KvImportConfig::DEFAULT_TIMEOUT);
+
+        let config = kv_model(r#"peers "http://p:1"; min_tokens 16; timeout "30s""#, "").unwrap();
+        config.validate().unwrap();
+        let kv = config.models[0].kv_import.as_ref().unwrap();
+        assert_eq!((kv.min_tokens, kv.timeout), (16, Duration::from_secs(30)));
+        assert!(spec("m").kv_import.is_none());
+    }
+
+    #[test]
+    fn kv_import_rejects_bad_settings() {
+        let e = kv_error("", "");
+        assert!(
+            e.contains("model `m`: kv_import needs at least one peer"),
+            "{e}"
+        );
+        let many: String = (0..17).map(|i| format!(r#""http://h{i}:1" "#)).collect();
+        let e = kv_error(&format!("peers {many}"), "");
+        assert!(
+            e.contains("model `m`: kv_import has 17 peers; at most 16"),
+            "{e}"
+        );
+        let e = kv_error(r#"peers "10.0.0.1:8000""#, "");
+        assert!(e.contains("10.0.0.1:8000"), "{e}");
+        let e = kv_error(r#"peers "http://p:1"; min_tokens 15"#, "");
+        assert!(
+            e.contains("model `m`: kv_import min_tokens must be at least 16, got 15"),
+            "{e}"
+        );
+        let e = kv_error(r#"peers "http://p:1"; timeout "500ms""#, "");
+        assert!(
+            e.contains("model `m`: kv_import timeout must be between 1s and 1h"),
+            "{e}"
+        );
+        let e = kv_error(r#"peers "http://p:1"; timeout "2h""#, "");
+        assert!(
+            e.contains("kv_import timeout must be between 1s and 1h"),
+            "{e}"
+        );
+        let e = kv_error(r#"peers "http://p:1""#, r#"shards "vulkan:1";"#);
+        assert!(
+            e.contains(
+                "model `m`: kv_import cannot be combined with tensor parallelism (`shards`)"
+            ),
+            "{e}"
+        );
+        let e = kv_error(r#"peer "http://p:1""#, "");
+        assert!(e.contains("unknown field `peer`"), "{e}");
+    }
+
+    #[test]
+    fn kv_import_cannot_be_combined_with_layer_stages() {
+        let e = kv_error(r#"peers "http://p:1""#, "stage first=0 layers=2;");
+        assert!(
+            e.contains("model `m`: kv_import cannot be combined with layer stages (`stage`)"),
+            "{e}"
+        );
+        let e = kv_error(
+            r#"peers "http://p:1""#,
+            r#"remote_stage url="http://w:1" layers=2;"#,
+        );
+        assert!(
+            e.contains(
+                "model `m`: kv_import cannot be combined with layer stages (`remote_stage`)"
+            ),
+            "{e}"
+        );
+    }
+
+    #[test]
+    fn validate_checks_the_peers_of_a_configuration_built_in_code() {
+        let mut m = spec("m");
+        m.kv_import = Some(KvImportConfig {
+            peers: vec!["10.0.0.1:8000".into()],
+            ..KvImportConfig::default()
+        });
+        let e = ServerConfig::new(ServerConfig::DEFAULT_LISTEN, vec![m])
+            .validate()
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("model `m`: kv_import peer"), "{e}");
     }
 }

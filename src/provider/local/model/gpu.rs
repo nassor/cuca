@@ -200,10 +200,12 @@
 //!
 //! # Layer offload
 //!
-//! [`GpuTransformer::load_back`] loads the last layers and the head
-//! ([`Back`]); [`GpuTransformer::forward_back`] takes the residual stream the
-//! CPU layers produced and the rows of the K/V sources it holds
-//! ([`MirrorRows`](super::split::MirrorRows)); see [`split`](super::split).
+//! [`GpuTransformer::load_range`] loads the layers `first..end` of a model
+//! ([`StagePart`]): the first layers embed, the last hold the final norm and the
+//! head, and [`GpuTransformer::forward_stage`] takes the previous stage's
+//! [`Carry`] (the residual stream and the rows of the K/V sources it holds,
+//! [`MirrorRows`](super::split::MirrorRows)) and returns the next one, or the
+//! logits from the last; see [`split`](super::split).
 //!
 //! # Speculative drafting
 //!
@@ -324,11 +326,12 @@ use super::paged_kernel::{self, PagedCall};
 use super::params::{DeltaSpec, Hparams, LayerSpec, MlaSpec, MoeSpec};
 use super::quant::{RowTable, dequant_row};
 use super::rope::{RopeKind, RopeSpec};
-use super::split::MirrorRows;
+use super::split::{Carry, LayerRange, MirrorRows, Part as StagePart, StageOut, passes};
 use super::tier::{
     BuildFn, ExpertSlice, ExpertStore, LayerExperts, SlotTable, TierShared, add, sub, tier_slots,
 };
 use super::tp::{self, Collective, Cut, Tp};
+use super::transfer::{DeltaRows, MISMATCH, PoolRows, entries, group_rows};
 use super::{Batch, Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
 use crate::error::CucaError;
 use crate::provider::local::{
@@ -1769,6 +1772,28 @@ impl KvPool {
         self.v = values;
         self
     }
+
+    /// The rows `writes` name, the inverse of [`KvPool::write`] for one
+    /// sequence: keys and values (none for a pool that holds no values) as
+    /// `[1, n_kv, rows, width]`, the rows of the blocks one after the other.
+    fn read(&self, writes: &[BlockWrite]) -> (Tensor<4>, Option<Tensor<4>>) {
+        let rows = |pool: &Tensor<4>| {
+            let mut parts: Vec<Tensor<4>> = writes
+                .iter()
+                .map(|w| {
+                    pool.clone()
+                        .narrow(0, w.block, 1)
+                        .narrow(2, w.r0, w.r1 - w.r0)
+                })
+                .collect();
+            if parts.len() == 1 {
+                parts.swap_remove(0)
+            } else {
+                Tensor::cat(parts, 2)
+            }
+        };
+        (rows(&self.k), self.v.as_ref().map(rows))
+    }
 }
 
 /// Take the pool of layer `il` out of `kv`; put it back after [`KvPool::write`].
@@ -1776,6 +1801,24 @@ fn take_pool(kv: &mut KvLayers, il: usize) -> Result<KvPool, CucaError> {
     kv.get_mut(il)
         .and_then(Option::take)
         .ok_or_else(|| err(format!("layer {il} owns no K/V cache")))
+}
+
+/// What a pass over the layers of one load produced.
+enum Ran {
+    /// The last layer of the model ran: the logits and hidden rows.
+    Done(Vec<Forward>),
+    /// The layers after the range run elsewhere: what the next stage starts
+    /// from.
+    Rows {
+        /// The residual stream `[rows, width]`.
+        hidden: Vec<f32>,
+        /// The pre weights `[rows, streams]` (hyper-connection models).
+        pre: Option<Vec<f32>>,
+        /// The per-layer inputs, when this stage computed them.
+        per_layer: Option<Vec<f32>>,
+        /// The new rows of the layers a later stage reads.
+        kv: Vec<MirrorRows>,
+    },
 }
 
 /// The RoPE rows of the new positions: `[1, 1, t, n_dims / 2]`.
@@ -2028,11 +2071,15 @@ struct Weights {
     hp: Hparams,
     device: Device,
     ple: Option<PleWeights>,
-    /// The layers `first..hp.n_layer`: a model offloaded in part to the CPU
-    /// (see [`split`](super::split)) holds the last layers only.
+    /// The layers `first..end`: a model offloaded in part to the CPU or to
+    /// other machines (see [`split`](super::split)) holds some layers only.
     layers: Vec<LayerWeights>,
-    /// Index of the first layer in `layers` (0 unless layers are offloaded).
+    /// Index of the first layer in `layers` (0 unless the first layers run
+    /// elsewhere).
     first: usize,
+    /// One past the last layer this device runs (`hp.n_layer` unless the
+    /// last layers run elsewhere).
+    end: usize,
     /// `None` on every shard but the first.
     head: Option<Head>,
     ropes: Vec<RopeTable>,
@@ -2101,6 +2148,14 @@ pub(crate) struct GpuTransformer {
     hybrid: bool,
     /// The pools and compressor state of a hyper-connection model.
     hyper: Option<hyper::HyperState>,
+    /// The layers this load runs.
+    range: LayerRange,
+    /// The K/V-owning layers of the range that a later stage reads
+    /// ([`StagePart::export`]).
+    export: Vec<usize>,
+    /// The layers before the range whose pools this load mirrors
+    /// ([`StagePart::mirror`]).
+    mirror: Vec<usize>,
     /// Counters and heat of the expert tiers, with `ExpertPlacement::Tiered`.
     tiers: Option<Arc<TierShared>>,
 }
@@ -2177,13 +2232,13 @@ impl Weights {
         tp: Tp,
         context_length: usize,
         tiers: Option<&TierPlan>,
-        first: usize,
+        range: LayerRange,
         engram: Option<Arc<dyn RowSource>>,
     ) -> Result<Self, CucaError> {
         let content = reader.content;
         let device = reader.device.clone();
         let n_embd = hp.n_embd;
-        let head = if tp.shard == 0 {
+        let head = if tp.shard == 0 && range.end == hp.n_layer {
             let vocab = *tensor_info(content, name::TOKEN_EMBD)?
                 .shape
                 .dims()
@@ -2201,7 +2256,7 @@ impl Weights {
         } else {
             None
         };
-        let ple = match hp.ple_dim.filter(|_| first == 0) {
+        let ple = match hp.ple_dim.filter(|_| range.first == 0) {
             Some(dim) => {
                 let row_len = hp.n_layer * dim;
                 Some(PleWeights {
@@ -2223,8 +2278,8 @@ impl Weights {
             })
             .collect();
 
-        let mut layers = Vec::with_capacity(hp.n_layer - first);
-        for il in first..hp.n_layer {
+        let mut layers = Vec::with_capacity(range.len());
+        for il in range.first..range.end {
             let spec = &hp.layers[il];
             let layout = LayerLayout::read(hp, il, spec, content)?;
             layers.push(load_layer(reader, hp, tp, il, spec, &layout, tiers)?);
@@ -2234,7 +2289,8 @@ impl Weights {
             device,
             ple,
             layers,
-            first,
+            first: range.first,
+            end: range.end,
             head,
             ropes,
             hyper: hp
@@ -2281,7 +2337,7 @@ fn alloc_pools(
     hp: &Hparams,
     layout: &KvLayout,
     device: &Device,
-    first: usize,
+    range: LayerRange,
     mirror: &[usize],
 ) -> Result<KvLayers, CucaError> {
     let mut kv: KvLayers = Vec::with_capacity(hp.n_layer);
@@ -2292,8 +2348,8 @@ fn alloc_pools(
             continue;
         }
         // A layer before `first` runs elsewhere; only the pools of those
-        // whose K/V a later layer reads exist here (see [`Back::mirror`]).
-        if (il < first && !mirror.contains(&il)) || !spec.owns_kv(il) {
+        // whose K/V a later layer reads exist here (see [`StagePart::mirror`]).
+        if (!range.contains(il) && !mirror.contains(&il)) || !spec.owns_kv(il) {
             kv.push(None);
             continue;
         }
@@ -2319,10 +2375,16 @@ fn tier_layout(
     content: &gguf::Content,
     hp: &Hparams,
     spec: MoeSpec,
-    first: usize,
+    range: LayerRange,
 ) -> Result<Vec<LayerExperts>, CucaError> {
     let mut layers = Vec::new();
-    for (il, layer_spec) in hp.layers.iter().enumerate().skip(first) {
+    for (il, layer_spec) in hp
+        .layers
+        .iter()
+        .enumerate()
+        .skip(range.first)
+        .take(range.len())
+    {
         let Ffn::Moe { ff, fused, .. } = LayerLayout::read(hp, il, layer_spec, content)?.ffn else {
             continue;
         };
@@ -2407,7 +2469,7 @@ fn open_tiers(
     content: &gguf::Content,
     hp: &Hparams,
     tiers: &ExpertTiers,
-    first: usize,
+    range: LayerRange,
     shared: Option<Arc<TierShared>>,
 ) -> Result<TierPlan, CucaError> {
     let spec = hp.moe.ok_or_else(|| {
@@ -2416,7 +2478,7 @@ fn open_tiers(
             hp.arch.name()
         ))
     })?;
-    let layers = tier_layout(content, hp, spec, first)?;
+    let layers = tier_layout(content, hp, spec, range)?;
     let per_expert: usize = layers.iter().map(|l| l.stored_bytes).sum();
     let device_slots = tier_slots(
         "device",
@@ -2447,24 +2509,6 @@ fn open_tiers(
         store: Arc::new(store),
         device_slots,
     })
-}
-
-/// The last layers of a model whose first layers run on the CPU (layer
-/// offload, see [`split`](super::split)).
-pub(crate) struct Back {
-    /// The first layer this device holds, `1..n_layer`.
-    pub(crate) first: usize,
-    /// The expert-tier counters and heat shared with the CPU half's expert
-    /// store, so that one set of statistics covers the whole model.
-    pub(crate) shared: Option<Arc<TierShared>>,
-    /// The K/V-owning layers before `first` whose K/V a layer from `first`
-    /// on reads (Gemma 4's shared layers): the CPU computes them and hands
-    /// each pass's new rows over ([`MirrorRows`]), written into a pool this
-    /// device holds for them under the same block tables.
-    pub(crate) mirror: Vec<usize>,
-    /// The Engram table the CPU half shares (`None` for a model without
-    /// one), so that its row cache and counters are single.
-    pub(crate) engram: Option<Arc<dyn RowSource>>,
 }
 
 impl GpuTransformer {
@@ -2530,22 +2574,25 @@ impl GpuTransformer {
         )
     }
 
-    /// Load the last layers of the model (`back.first..`, with the final
-    /// norm and the LM head) onto `device` for layer offload (see
-    /// [`split`](super::split)): the layers before them run elsewhere and
-    /// hand their output to [`GpuTransformer::forward_back`]. The K/V pools,
-    /// recurrent states and expert tiers cover those layers only.
+    /// Load the layers `part.range` of the model onto `device`, for layer
+    /// offload or a stage of a model spread over machines (see
+    /// [`split`](super::split)): `first == 0` embeds the tokens, the layers
+    /// before `first` run elsewhere and hand their output to
+    /// [`GpuTransformer::forward_stage`], and `end == n_layer` holds the final
+    /// norm and the LM head. The K/V pools, recurrent states and expert tiers
+    /// cover those layers (and the mirror pools of `part.mirror`) only.
     ///
     /// # Errors
     ///
-    /// As [`GpuTransformer::load_placed`].
-    pub(crate) fn load_back(
+    /// As [`GpuTransformer::load_placed`]; [`CucaError::Config`] for a range
+    /// that is empty or past the model's layers.
+    pub(crate) fn load_range(
         content: &gguf::Content,
         context_length: usize,
         device: LocalDevice,
         experts: &ExpertPlacement,
         sizing: &Sizing,
-        back: &Back,
+        part: &StagePart,
     ) -> Result<Self, CucaError> {
         Self::load_part(
             content,
@@ -2554,9 +2601,9 @@ impl GpuTransformer {
             &[],
             experts,
             sizing,
-            Some(back),
+            Some(part),
             false,
-            // A model with an Engram table gets it from `back`.
+            // A model with an Engram table gets it from `part`.
             &EngramCache::default(),
         )
     }
@@ -2596,7 +2643,7 @@ impl GpuTransformer {
         shards: &[LocalDevice],
         experts: &ExpertPlacement,
         sizing: &Sizing,
-        back: Option<&Back>,
+        part: Option<&StagePart>,
         host_exact: bool,
         engram: &EngramCache,
     ) -> Result<Self, CucaError> {
@@ -2626,17 +2673,33 @@ impl GpuTransformer {
             .collect::<Result<Vec<_>, _>>()?;
 
         // Every shard cuts equal shapes, so one plan serves all.
-        let first = back.map_or(0, |b| b.first);
+        let range = part.map_or_else(|| LayerRange::whole(&hp), |p| p.range);
+        if range.first >= range.end || range.end > hp.n_layer {
+            return Err(CucaError::Config(format!(
+                "the layers {}..{} are not part of the {} layers of `{}`",
+                range.first,
+                range.end,
+                hp.n_layer,
+                hp.arch.name()
+            )));
+        }
+        let mirror: &[usize] = part.map_or(&[][..], |p| &p.mirror);
         // Tiers without a device tier: the experts stay behind the RAM tier
         // and the CPU computes them.
         let host_tiers = match experts {
             ExpertPlacement::Tiered(t) if t.device_bytes == 0 => {
-                if first != 0 {
+                if range != LayerRange::whole(&hp) {
                     return Err(CucaError::Config(
                         "experts.device_bytes must be greater than 0 with gpu_layers: host-tiered experts serve a model that runs on one device".into(),
                     ));
                 }
-                Some(open_expert_store(content, &hp, t, hp.n_layer, None)?)
+                Some(open_expert_store(
+                    content,
+                    &hp,
+                    t,
+                    range.first..range.end,
+                    None,
+                )?)
             }
             _ => None,
         };
@@ -2670,13 +2733,13 @@ impl GpuTransformer {
             ExpertPlacement::Tiered(_) if host_tiers.is_some() => None,
             ExpertPlacement::Tiered(t) => Some((
                 t,
-                open_tiers(content, &hp, t, first, back.and_then(|b| b.shared.clone()))?,
+                open_tiers(content, &hp, t, range, part.and_then(|p| p.shared.clone()))?,
             )),
         };
 
         let embed = RowTable::open(content, name::TOKEN_EMBD, "embedding table", hp.n_embd)?;
         let vocab = embed.rows;
-        let ple_table = match hp.ple_dim {
+        let ple_table = match hp.ple_dim.filter(|_| range.first == 0) {
             Some(dim) => Some(RowTable::open(
                 content,
                 name::PER_LAYER_TOKEN_EMBD,
@@ -2686,7 +2749,7 @@ impl GpuTransformer {
             None => None,
         };
 
-        let engram_rows = match back.and_then(|b| b.engram.clone()) {
+        let engram_rows = match part.and_then(|p| p.engram.clone()) {
             Some(shared) => Some(shared),
             None => engram::open_table(content, &hp, engram)?,
         };
@@ -2702,7 +2765,7 @@ impl GpuTransformer {
                     tp,
                     context_length,
                     plan,
-                    first,
+                    range,
                     engram_rows.clone(),
                 )
             });
@@ -2721,13 +2784,7 @@ impl GpuTransformer {
             .iter()
             .map(|w| {
                 persistent(&w.device, (), |()| {
-                    alloc_pools(
-                        &w.hp,
-                        &layout,
-                        &w.device,
-                        first,
-                        back.map_or(&[][..], |b| &b.mirror),
-                    )
+                    alloc_pools(&w.hp, &layout, &w.device, range, mirror)
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
@@ -2739,12 +2796,12 @@ impl GpuTransformer {
                 &layout,
                 &weights[0].device,
                 sizing.max_sequences,
-                first,
+                range,
             )?),
             None => None,
         };
-        // One zero state per delta-net layer, shared by every empty slot
-        // (the states are immutable); a hybrid model is never split.
+        // One zero state per delta-net layer of the range, shared by every
+        // empty slot (the states are immutable).
         let zero: Vec<Option<DeltaState>> = weights[0]
             .hp
             .layers
@@ -2752,7 +2809,7 @@ impl GpuTransformer {
             .enumerate()
             .map(|(il, spec)| {
                 spec.delta()
-                    .filter(|_| il >= first)
+                    .filter(|_| range.contains(il))
                     .map(|d| DeltaState::zeros(d, &weights[0].device))
             })
             .collect();
@@ -2784,6 +2841,9 @@ impl GpuTransformer {
             zero,
             hybrid,
             hyper,
+            range,
+            export: part.map_or_else(Vec::new, |p| p.export.clone()),
+            mirror: mirror.to_vec(),
             tiers: match &host_tiers {
                 Some(store) => Some(Arc::clone(store.shared())),
                 None => tiers.map(|(_, plan)| Arc::clone(plan.store.shared())),
@@ -2835,56 +2895,95 @@ impl GpuTransformer {
     /// failed device operation (the slots of every sequence of the step are
     /// then reset); [`CucaError::Io`] when an embedding row cannot be read.
     pub(crate) fn forward_batch(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
-        let (tokens, segs) = self.plan_batch(batch)?;
-        let hp = &self.weights[0].hp;
-        let mut embeddings = self
-            .embed
-            .get_mut()
-            .map_err(|_| err("the embedding table lock is poisoned"))?
-            .rows(&tokens, hp.embd_scale)?;
-        hp.norm_embeddings(&mut embeddings);
-        let per_layer = match (&mut self.ple_table, hp.ple_dim) {
-            (Some(table), Some(dim)) => Some(table.rows(&tokens, (dim as f32).sqrt())?),
-            _ => None,
-        };
-        let outs = self.forward_layers(embeddings, per_layer, &segs);
-        self.settle(&segs, outs)
+        match self.forward_stage(batch, None)? {
+            StageOut::Done(outs) => Ok(outs),
+            StageOut::Carry(_) => Err(err(
+                "this load runs part of the model, so a pass returns the carry of its last layer, not logits: use forward_stage",
+            )),
+        }
     }
 
-    /// [`GpuTransformer::forward_batch`] for the last layers of an offloaded
-    /// model ([`GpuTransformer::load_back`]): `hidden` is the residual
-    /// stream `[rows, n_embd]` the layers before them produced on the CPU
-    /// and `per_layer` Gemma 4's per-layer inputs `[rows, n_layer,
-    /// ple_dim]`; the hidden state crosses to the device once per call.
+    /// [`GpuTransformer::forward_batch`] for a load of the layers
+    /// `first..end` ([`GpuTransformer::load_range`]). The first stage
+    /// (`first == 0`) takes no `input` and embeds the tokens; a later one
+    /// takes the [`Carry`] of the stage before it: the residual stream
+    /// `[rows, n_embd]` (the hyper-connection streams and their pre weights
+    /// for a model that has them), Gemma 4's per-layer inputs `[rows,
+    /// n_layer, ple_dim]` and the rows of the K/V sources the stage reads
+    /// from before its range, which it writes into its mirror pools. The
+    /// hidden state crosses to the device once per call. The last stage
+    /// (`end == n_layer`) returns the logits and hidden rows; any other
+    /// returns its own carry: the residual stream, the per-layer inputs, the
+    /// new rows of the layers a later stage reads ([`StagePart::export`]) and the
+    /// incoming rows that stage reads too.
     ///
     /// # Errors
     ///
-    /// As [`GpuTransformer::forward_batch`]; [`CucaError::Provider`] when
-    /// `hidden` does not hold one row per token of the batch.
-    pub(crate) fn forward_back(
+    /// As [`GpuTransformer::forward_batch`]; [`CucaError::Provider`] for an
+    /// input the stage does not take, or a `hidden` that does not hold one
+    /// row per token of the batch.
+    pub(crate) fn forward_stage(
         &mut self,
         batch: &Batch<'_>,
-        hidden: Vec<f32>,
-        per_layer: Option<Vec<f32>>,
-        pre: Option<Vec<f32>>,
-        mirror: &[MirrorRows],
-    ) -> Result<Vec<Forward>, CucaError> {
+        input: Option<Carry>,
+    ) -> Result<StageOut, CucaError> {
         let (tokens, segs) = self.plan_batch(batch)?;
-        // A hyper-connection model hands over its residual streams.
-        let n_embd = self.weights[0].hp.n_embd;
-        let width = self.weights[0]
-            .hyper
-            .as_ref()
-            .map_or(n_embd, |h| h.spec.streams * n_embd);
-        if hidden.len() != tokens.len() * width {
-            return Err(err(format!(
-                "the hidden state holds {} values for {} rows of {width}",
-                hidden.len(),
-                tokens.len()
-            )));
-        }
-        let outs = self.back_layers(hidden, per_layer, pre, mirror, &segs);
-        self.settle(&segs, outs)
+        let ran = match (self.range.first, input) {
+            (0, None) => {
+                let hp = &self.weights[0].hp;
+                let mut embeddings = self
+                    .embed
+                    .get_mut()
+                    .map_err(|_| err("the embedding table lock is poisoned"))?
+                    .rows(&tokens, hp.embd_scale)?;
+                hp.norm_embeddings(&mut embeddings);
+                let per_layer = match (&mut self.ple_table, hp.ple_dim) {
+                    (Some(table), Some(dim)) => Some(table.rows(&tokens, (dim as f32).sqrt())?),
+                    _ => None,
+                };
+                let outs = self.forward_layers(embeddings, per_layer, &segs);
+                self.settle(&segs, outs)?
+            }
+            (0, Some(_)) => {
+                return Err(err("the first stage embeds the tokens and takes no carry"));
+            }
+            (_, None) => {
+                return Err(err(
+                    "a stage after the first needs the carry of the stage before it",
+                ));
+            }
+            (_, Some(carry)) => {
+                // A hyper-connection model hands over its residual streams.
+                let n_embd = self.weights[0].hp.n_embd;
+                let width = self.weights[0]
+                    .hyper
+                    .as_ref()
+                    .map_or(n_embd, |h| h.spec.streams * n_embd);
+                if carry.hidden.len() != tokens.len() * width {
+                    return Err(err(format!(
+                        "the hidden state holds {} values for {} rows of {width}",
+                        carry.hidden.len(),
+                        tokens.len()
+                    )));
+                }
+                let outs = self.carried_layers(carry, &segs);
+                self.settle(&segs, outs)?
+            }
+        };
+        Ok(match ran {
+            Ran::Done(outs) => StageOut::Done(outs),
+            Ran::Rows {
+                hidden,
+                pre,
+                per_layer,
+                kv,
+            } => StageOut::Carry(Carry {
+                hidden,
+                per_layer,
+                pre,
+                kv,
+            }),
+        })
     }
 
     /// Check the batch and describe its sequences: the concatenated tokens
@@ -2954,11 +3053,7 @@ impl GpuTransformer {
     /// of every sequence of the step (a half-advanced state cannot be
     /// repaired; the CPU engine does the same), a finished one moves it to
     /// the end of the sequence's rows.
-    fn settle(
-        &mut self,
-        segs: &[Seg<'_>],
-        outs: Result<Vec<Forward>, CucaError>,
-    ) -> Result<Vec<Forward>, CucaError> {
+    fn settle<T>(&mut self, segs: &[Seg<'_>], outs: Result<T, CucaError>) -> Result<T, CucaError> {
         let outs = match outs {
             Ok(outs) => outs,
             Err(e) => {
@@ -2978,36 +3073,85 @@ impl GpuTransformer {
         Ok(outs)
     }
 
-    /// The layers this load holds over the residual stream `hidden` of the
-    /// sequences `segs` describe, then the final norm and the LM head.
-    fn back_layers(
-        &mut self,
-        hidden: Vec<f32>,
-        per_layer: Option<Vec<f32>>,
-        pre: Option<Vec<f32>>,
-        mirror: &[MirrorRows],
-        segs: &[Seg<'_>],
-    ) -> Result<Vec<Forward>, CucaError> {
-        if let (Some(state), [weights]) = (&mut self.hyper, self.weights.as_slice()) {
-            let pre = pre.ok_or_else(|| err("a hyper-connection back needs the pre weights"))?;
-            return weights.run_hyper_offloaded(state, &self.layout, hidden, pre, segs);
+    /// The layers this load holds over the carry of the stage before: its
+    /// residual stream (uploaded once), Gemma 4's per-layer inputs and the
+    /// rows of the K/V sources before the range, which go into the mirror
+    /// pools. The carried rows that a layer after the range reads go on
+    /// unchanged, and so do the per-layer inputs.
+    fn carried_layers(&mut self, carry: Carry, segs: &[Seg<'_>]) -> Result<Ran, CucaError> {
+        let Carry {
+            hidden,
+            per_layer,
+            pre,
+            kv: rows,
+        } = carry;
+        let n_layer = self.weights[0].hp.n_layer;
+        let ahead = passes(&self.weights[0].hp, self.range);
+        // Every layer this stage reads or forwards needs its rows: a pool
+        // that was never written would give wrong logits, not an error.
+        for il in self.mirror.iter().chain(&ahead) {
+            if !rows.iter().any(|m| m.layer == *il) {
+                return Err(err(format!(
+                    "the carry holds no K/V rows for layer {il}, which this stage reads or forwards"
+                )));
+            }
         }
-        let ([weights], [kv]) = (self.weights.as_slice(), self.kv.as_mut_slice()) else {
-            return Err(err(
-                "layer offload cannot be combined with tensor parallelism",
-            ));
+        let (mut write, mut forward) = (Vec::new(), Vec::new());
+        for m in rows {
+            let on = ahead.contains(&m.layer);
+            if self.mirror.contains(&m.layer) || !on {
+                if on {
+                    forward.push(MirrorRows {
+                        layer: m.layer,
+                        seqs: m.seqs.clone(),
+                    });
+                }
+                write.push(m);
+            } else {
+                forward.push(m);
+            }
+        }
+        let keep = if self.range.end < n_layer {
+            per_layer.clone()
+        } else {
+            None
         };
-        let hp = &weights.hp;
-        let t = hidden.len() / hp.n_embd;
-        let x = Tensor::<2>::from_data(TensorData::new(hidden, [t, hp.n_embd]), &weights.device);
-        let ple = match (per_layer, hp.ple_dim) {
-            (Some(rows), Some(dim)) => Some(Tensor::<3>::from_data(
-                TensorData::new(rows, [t, hp.n_layer, dim]),
-                &weights.device,
-            )),
-            _ => None,
+        let mut ran = if let (Some(state), [weights]) = (&mut self.hyper, self.weights.as_slice()) {
+            let pre = pre.ok_or_else(|| err("a hyper-connection stage needs the pre weights"))?;
+            weights.run_hyper_offloaded(state, &self.layout, hidden, pre, segs)?
+        } else {
+            let ([weights], [kv]) = (self.weights.as_slice(), self.kv.as_mut_slice()) else {
+                return Err(err(
+                    "layer offload cannot be combined with tensor parallelism",
+                ));
+            };
+            let hp = &weights.hp;
+            let t = hidden.len() / hp.n_embd;
+            let x =
+                Tensor::<2>::from_data(TensorData::new(hidden, [t, hp.n_embd]), &weights.device);
+            let ple = match (per_layer, hp.ple_dim) {
+                (Some(rows), Some(dim)) => Some(Tensor::<3>::from_data(
+                    TensorData::new(rows, [t, hp.n_layer, dim]),
+                    &weights.device,
+                )),
+                _ => None,
+            };
+            weights.run_layers(
+                x,
+                ple,
+                &write,
+                &self.export,
+                kv,
+                &self.layout,
+                &mut self.slots,
+                segs,
+            )?
         };
-        weights.run_layers(x, ple, mirror, kv, &self.layout, &mut self.slots, segs)
+        if let Ran::Rows { per_layer, kv, .. } = &mut ran {
+            kv.extend(forward);
+            *per_layer = keep;
+        }
+        Ok(ran)
     }
 
     /// The layers over the concatenated rows `embeddings` of the sequences
@@ -3029,7 +3173,7 @@ impl GpuTransformer {
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
         segs: &[Seg<'_>],
-    ) -> Result<Vec<Forward>, CucaError> {
+    ) -> Result<Ran, CucaError> {
         if let (Some(state), [weights]) = (&mut self.hyper, self.weights.as_slice()) {
             return weights.run_hyper(state, &self.layout, embeddings, segs);
         }
@@ -3038,6 +3182,7 @@ impl GpuTransformer {
                 kv,
                 &self.layout,
                 &mut self.slots,
+                &self.export,
                 embeddings,
                 per_layer,
                 segs,
@@ -3102,7 +3247,7 @@ impl GpuTransformer {
         let Some(x) = xs.into_iter().next() else {
             return Err(err("a model without devices"));
         };
-        self.weights[0].finish(x, segs)
+        Ok(Ran::Done(self.weights[0].finish(x, segs)?))
     }
 
     /// Vocabulary size.
@@ -3278,17 +3423,12 @@ impl GpuTransformer {
         snapshot: &GpuSnapshot,
         len: usize,
     ) -> Result<(), CucaError> {
-        let fits = snapshot.layers.len() == self.zero.len()
-            && snapshot
-                .layers
-                .iter()
-                .zip(&self.zero)
-                .all(|(a, b)| a.is_some() == b.is_some());
+        let fits = self.snapshot_fits(snapshot);
         let state = self
             .slots
             .get_mut(slot)
             .filter(|_| fits)
-            .ok_or_else(|| err("the snapshot does not fit this model's recurrent state"))?;
+            .ok_or_else(|| err(SNAPSHOT_MISMATCH))?;
         state.layers.clone_from(&snapshot.layers);
         state.len = len;
         Ok(())
@@ -3310,6 +3450,390 @@ impl GpuTransformer {
         } else {
             usize::MAX
         }
+    }
+}
+
+// ---- K/V transfer ----------------------------------------------------------
+
+/// One entry of a K/V transfer ([`transfer`](super::transfer)) as this
+/// device holds it.
+struct TransferEntry {
+    /// Position among the layout's entries, and so in the rows of a
+    /// transfer.
+    entry: usize,
+    layer: usize,
+    compressed: bool,
+    /// K/V heads and floats per row of the pool: one head of the row width
+    /// for the pools of a hyper-connection model.
+    n_kv: usize,
+    width: usize,
+    /// The entry carries values next to its keys.
+    values: bool,
+    /// The whole blocks of the entry's rows, in order; none when the group
+    /// carries no rows in this chunk.
+    runs: Vec<BlockWrite>,
+}
+
+impl TransferEntry {
+    /// Floats of the entry's `k` (and of its `v`, with `values`).
+    fn floats(&self) -> usize {
+        self.n_kv * self.runs.len() * BLOCK_SIZE * self.width
+    }
+}
+
+/// The blocks of the group rows `rows` in `table`, as whole-block writes
+/// numbered in order.
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] for rows off the block boundaries or a table
+/// without a block (a released or out-of-pool id) for one of them.
+fn block_runs(
+    table: &[u32],
+    rows: &Range<usize>,
+    n_blocks: usize,
+) -> Result<Vec<BlockWrite>, CucaError> {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !rows.start.is_multiple_of(BLOCK_SIZE) || !rows.end.is_multiple_of(BLOCK_SIZE) {
+        return Err(err(format!(
+            "K/V rows {}..{} are not whole blocks",
+            rows.start, rows.end
+        )));
+    }
+    (rows.start / BLOCK_SIZE..rows.end / BLOCK_SIZE)
+        .enumerate()
+        .map(|(j, bi)| match table.get(bi) {
+            Some(&block) if block != NO_BLOCK && (block as usize) < n_blocks => Ok(BlockWrite {
+                block: block as usize,
+                r0: 0,
+                r1: BLOCK_SIZE,
+                off: j * BLOCK_SIZE,
+            }),
+            _ => Err(err(format!(
+                "the block table holds no block {bi} of the K/V rows {}..{}",
+                rows.start, rows.end
+            ))),
+        })
+        .collect()
+}
+
+/// Why a snapshot or its rows do not belong to a model.
+const SNAPSHOT_MISMATCH: &str = "the snapshot does not fit this model's recurrent state";
+
+/// K/V rows and recurrent state in transit, see
+/// [`transfer`](super::transfer): the pool rows of a block-aligned range of a
+/// sequence, read out of and written into the device pools in the canonical
+/// layout.
+///
+/// The device pools hold the rows the CPU engine's do, in the same order and
+/// with the same contents: `[n_blocks, n_kv_head, BLOCK_SIZE, head_dim]`
+/// attention pools (the CPU pool is the same `[block][head][row][dim]`
+/// array, and a split model already moves such rows from the CPU half to
+/// the mirror pools), latent rows `[c | k_rot]`, and the hyper-connection
+/// window and compressed pools of one head (`[blocks * BLOCK_SIZE, width]`,
+/// compressed rows `[latent | index key]`). No device pool holds a separate
+/// value for a `kv_is_value` layer: only the hyper-connection layers set it,
+/// and their window pool is one tensor whose row is the key and the value.
+impl GpuTransformer {
+    /// The weights of the one device the model runs on.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] with tensor parallelism.
+    fn transfer_weights(&self) -> Result<&Weights, CucaError> {
+        match self.weights.as_slice() {
+            [only] => Ok(only),
+            _ => Err(err("K/V transfer is not available with tensor parallelism")),
+        }
+    }
+
+    /// The entries of a transfer of `from..to` of a prefix ending at `end`
+    /// whose layer this device holds a pool for, from layer `min_layer` on.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a table that lacks a block of the rows.
+    fn transfer_entries(
+        &self,
+        tables: &[BlockTable],
+        (from, to, end): (usize, usize, usize),
+        min_layer: usize,
+    ) -> Result<Vec<TransferEntry>, CucaError> {
+        let layout = &self.layout;
+        let mut out = Vec::new();
+        for (entry, (gi, il)) in entries(layout).enumerate() {
+            if il < min_layer {
+                continue;
+            }
+            let g = &layout.groups[gi];
+            let (n_kv, width, values) = match &self.hyper {
+                Some(hy) => match hy.row_width(il, g.compressed) {
+                    Some(width) => (1, width, false),
+                    None => continue,
+                },
+                None => {
+                    let Some(pool) = self
+                        .kv
+                        .first()
+                        .and_then(|kv| kv.get(il))
+                        .and_then(Option::as_ref)
+                    else {
+                        continue;
+                    };
+                    let [_, n_kv, _, width] = pool.k.dims();
+                    let value_is_key = self
+                        .weights
+                        .first()
+                        .and_then(|w| w.hp.layers.get(il))
+                        .is_some_and(|spec| spec.kv_is_value);
+                    (n_kv, width, pool.v.is_some() && !value_is_key)
+                }
+            };
+            let table = tables
+                .get(gi)
+                .ok_or_else(|| err(format!("no block table for K/V group {gi}")))?;
+            let rows = group_rows(g, from, to, end);
+            out.push(TransferEntry {
+                entry,
+                layer: il,
+                compressed: g.compressed,
+                n_kv,
+                width,
+                values,
+                runs: block_runs(table, &rows, layout.blocks[gi])?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// See [`Model::export_rows`](super::Model::export_rows): the entries of
+    /// the layers this device owns a pool for, in layout order. The mirror
+    /// pools of a split model (layers before the first this device runs)
+    /// copy the CPU half's, which exports its own.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a table that lacks a block of the rows,
+    /// tensor parallelism or a failed device read.
+    pub(crate) fn export_rows(
+        &self,
+        tables: &[BlockTable],
+        from: usize,
+        to: usize,
+        end: usize,
+    ) -> Result<Vec<PoolRows>, CucaError> {
+        let w = self.transfer_weights()?;
+        let mut out = Vec::new();
+        for e in self.transfer_entries(tables, (from, to, end), w.first)? {
+            let (k, v) = match &self.hyper {
+                Some(hy) => (
+                    hy.read_rows(e.layer, e.compressed, &e.runs, &w.device)?,
+                    Vec::new(),
+                ),
+                None => self.read_blocks(&e, &w.device)?,
+            };
+            out.push(PoolRows {
+                layer: e.layer,
+                compressed: e.compressed,
+                k,
+                v,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The keys and values of the blocks of `e` in its attention pool,
+    /// `[n_kv_head][rows][head_dim]` each (no values when the entry has
+    /// none).
+    fn read_blocks(
+        &self,
+        e: &TransferEntry,
+        device: &Device,
+    ) -> Result<(Vec<f32>, Vec<f32>), CucaError> {
+        if e.runs.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let pool = self
+            .kv
+            .first()
+            .and_then(|kv| kv.get(e.layer))
+            .and_then(Option::as_ref)
+            .ok_or_else(|| err(format!("layer {} holds no K/V pool", e.layer)))?;
+        let n = e.runs.len();
+        // Block ids are below the pool size, which fits an i32.
+        let ids: Vec<i32> = e.runs.iter().map(|r| r.block as i32).collect();
+        let idx = Tensor::<1, Int>::from_data(TensorData::new(ids, [n]), device);
+        let read = |pool: &Tensor<4>, what: &str| {
+            read_f32(
+                pool.clone()
+                    .select(0, idx.clone())
+                    .swap_dims(0, 1)
+                    .reshape([e.n_kv, n * BLOCK_SIZE, e.width]),
+                what,
+            )
+        };
+        let k = read(&pool.k, "keys")?;
+        let v = match (&pool.v, e.values) {
+            (Some(v), true) => read(v, "values")?,
+            _ => Vec::new(),
+        };
+        Ok((k, v))
+    }
+
+    /// See [`Model::import_rows`](super::Model::import_rows): writes the
+    /// entries of `rows` (one per entry of the layout) whose layer this
+    /// device holds a pool for, mirror pools included, and returns their
+    /// indexes in `rows`. An entry without rows (a window group before its
+    /// window) is written when its layer has a pool, with nothing to do. A
+    /// layer whose value is its key writes no values.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for entries whose lengths do not fit the
+    /// pools, a table that lacks a block of the rows or tensor parallelism;
+    /// every entry is checked before the first write.
+    pub(crate) fn import_rows(
+        &mut self,
+        tables: &[BlockTable],
+        from: usize,
+        to: usize,
+        end: usize,
+        rows: &[PoolRows],
+    ) -> Result<Vec<usize>, CucaError> {
+        let device = self.transfer_weights()?.device.clone();
+        let plan = self.transfer_entries(tables, (from, to, end), 0)?;
+        for e in &plan {
+            let row = rows.get(e.entry).ok_or_else(|| err(MISMATCH))?;
+            if row.k.len() != e.floats() || row.v.len() != if e.values { e.floats() } else { 0 } {
+                return Err(err(MISMATCH));
+            }
+        }
+        let mut written = Vec::with_capacity(plan.len());
+        for e in plan {
+            if !e.runs.is_empty() {
+                let row = rows.get(e.entry).ok_or_else(|| err(MISMATCH))?;
+                self.write_entry(&e, row, &device)?;
+            }
+            written.push(e.entry);
+        }
+        Ok(written)
+    }
+
+    /// Write the rows of `row` into the blocks of `e` of its pool.
+    fn write_entry(
+        &mut self,
+        e: &TransferEntry,
+        row: &PoolRows,
+        device: &Device,
+    ) -> Result<(), CucaError> {
+        if let Some(hy) = &mut self.hyper {
+            return hy.write_rows(e.layer, e.compressed, &e.runs, &row.k, device);
+        }
+        let shape = [1, e.n_kv, e.runs.len() * BLOCK_SIZE, e.width];
+        let upload =
+            |rows: &[f32]| Tensor::<4>::from_data(TensorData::new(rows.to_vec(), shape), device);
+        let k = upload(&row.k);
+        let v = e.values.then(|| upload(&row.v));
+        let kv = self
+            .kv
+            .first_mut()
+            .ok_or_else(|| err("the model holds no K/V pools"))?;
+        let pool = take_pool(kv, e.layer)?.write(&e.runs, 0, &k, v.as_ref());
+        if let Some(slot) = kv.get_mut(e.layer) {
+            *slot = Some(pool);
+        }
+        Ok(())
+    }
+
+    /// Whether `snapshot` has this model's recurrent layers.
+    fn snapshot_fits(&self, snapshot: &GpuSnapshot) -> bool {
+        snapshot.layers.len() == self.zero.len()
+            && snapshot
+                .layers
+                .iter()
+                .zip(&self.zero)
+                .all(|(a, b)| a.is_some() == b.is_some())
+    }
+
+    /// The delta-net layers before the first layer this device runs: the CPU
+    /// half's, on a split model.
+    pub(crate) fn delta_layers_before_first(&self) -> usize {
+        self.weights.first().map_or(0, |w| {
+            w.hp.layers
+                .iter()
+                .take(w.first)
+                .filter(|spec| spec.delta().is_some())
+                .count()
+        })
+    }
+
+    /// The state of every delta-net layer of `snapshot`, ascending, read off
+    /// the device: the convolution window `[conv_kernel - 1, conv_dim]` and
+    /// the matrices of the value heads, flat, as the CPU engine lays them
+    /// out.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a snapshot of another model or a failed
+    /// device read.
+    pub(crate) fn snapshot_export(
+        &self,
+        snapshot: &GpuSnapshot,
+    ) -> Result<Vec<DeltaRows>, CucaError> {
+        if !self.snapshot_fits(snapshot) {
+            return Err(err(SNAPSHOT_MISMATCH));
+        }
+        snapshot
+            .layers
+            .iter()
+            .flatten()
+            .map(|state| {
+                Ok(DeltaRows {
+                    conv: read_f32(state.conv.clone(), "the convolution state")?,
+                    s: read_f32(state.s.clone(), "the recurrent state")?,
+                })
+            })
+            .collect()
+    }
+
+    /// A snapshot holding `rows`, one per delta-net layer, ascending,
+    /// uploaded with the dimensions of the zero states.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when the count or a length does not fit the
+    /// model's recurrent layers, or an upload fails.
+    pub(crate) fn snapshot_import(&self, rows: Vec<DeltaRows>) -> Result<GpuSnapshot, CucaError> {
+        let device = &self
+            .weights
+            .first()
+            .ok_or_else(|| err("the model holds no weights"))?
+            .device;
+        let mut rows = rows.into_iter();
+        let mut layers = Vec::with_capacity(self.zero.len());
+        for zero in &self.zero {
+            let Some(zero) = zero else {
+                layers.push(None);
+                continue;
+            };
+            let row = rows.next().ok_or_else(|| err(SNAPSHOT_MISMATCH))?;
+            let (conv_dims, s_dims) = (zero.conv.dims(), zero.s.dims());
+            if row.conv.len() != conv_dims.iter().product::<usize>()
+                || row.s.len() != s_dims.iter().product::<usize>()
+            {
+                return Err(err(SNAPSHOT_MISMATCH));
+            }
+            layers.push(Some(DeltaState {
+                conv: Tensor::from_data(TensorData::new(row.conv, conv_dims), device),
+                s: Tensor::from_data(TensorData::new(row.s, s_dims), device),
+            }));
+        }
+        if rows.next().is_some() {
+            return Err(err(SNAPSHOT_MISMATCH));
+        }
+        Ok(GpuSnapshot { layers })
     }
 }
 
@@ -3507,7 +4031,15 @@ impl GpuDrafter {
             Ok::<_, CucaError>((
                 reader.matrix("nextn.pre_projection.weight", n_embd, 2 * n_embd_out)?,
                 reader.matrix("nextn.post_projection.weight", n_embd_out, n_embd)?,
-                Weights::load(reader, &hp, Tp::SOLO, context_length, None, 0, None)?,
+                Weights::load(
+                    reader,
+                    &hp,
+                    Tp::SOLO,
+                    context_length,
+                    None,
+                    LayerRange::whole(&hp),
+                    None,
+                )?,
             ))
         })?;
         let vocab = net.head_parts()?.lm_head.rows();
@@ -4034,27 +4566,33 @@ impl Weights {
 
     /// The layers over the concatenated rows `embeddings` of the sequences
     /// `segs` describe, then the final norm and the LM head over the rows
-    /// the sequences want (the whole model on this one device).
+    /// the sequences want (the whole model on this one device), or the
+    /// stage's carry (`export` lists the layers whose new rows it returns).
     ///
     /// # Errors
     ///
     /// [`CucaError::Provider`] when a block table lacks a block the pass
     /// reads or writes, a slot has no state or a device readback fails.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "the pools, the layout, the slots, the exported layers and the inputs are independent"
+    )]
     fn forward_layers(
         &self,
         kv: &mut KvLayers,
         layout: &KvLayout,
         slots: &mut [DeltaSlot],
+        export: &[usize],
         embeddings: Vec<f32>,
         per_layer: Option<Vec<f32>>,
         segs: &[Seg<'_>],
-    ) -> Result<Vec<Forward>, CucaError> {
+    ) -> Result<Ran, CucaError> {
         let (x, ple) = self.embed_input(embeddings, per_layer);
-        self.run_layers(x, ple, &[], kv, layout, slots, segs)
+        self.run_layers(x, ple, &[], export, kv, layout, slots, segs)
     }
 
-    /// Write the rows the CPU cached for the K/V sources it holds into the
-    /// mirror pools of this device ([`Back::mirror`]), through the blocks
+    /// Write the rows another stage cached for the K/V sources it holds into
+    /// the mirror pools of this device ([`StagePart::mirror`]), through the blocks
     /// each sequence's pass already resolved.
     ///
     /// # Errors
@@ -4121,34 +4659,92 @@ impl Weights {
         Ok(())
     }
 
-    /// The layers this device holds over the residual stream `x` of the
-    /// sequences `segs` describe (`ple` Gemma 4's per-layer inputs), then
-    /// the final norm and the LM head over the rows they want.
+    /// The new rows of the layers `export` in the pools `kv`, per sequence of
+    /// the pass: what a later stage mirrors ([`MirrorRows`]).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a layer without a pool or a sequence
+    /// without blocks for it, or a failed device read.
+    fn read_export(
+        &self,
+        pass: &Pass,
+        kv: &KvLayers,
+        export: &[usize],
+    ) -> Result<Vec<MirrorRows>, CucaError> {
+        export
+            .iter()
+            .map(|&il| {
+                let spec = self
+                    .hp
+                    .layers
+                    .get(il)
+                    .ok_or_else(|| err(format!("layer {il} does not exist")))?;
+                let pool = kv
+                    .get(il)
+                    .and_then(Option::as_ref)
+                    .ok_or_else(|| err(format!("layer {il} has no K/V pool to export")))?;
+                let mut seqs = Vec::with_capacity(pass.seqs.len());
+                for seq in &pass.seqs {
+                    let (k, v) = pool.read(&seq.visible(il, spec.window)?.1.writes);
+                    let v = match v {
+                        Some(v) => read_f32(v, "exported values")?,
+                        None => Vec::new(),
+                    };
+                    seqs.push((read_f32(k, "exported keys")?, v));
+                }
+                Ok(MirrorRows { layer: il, seqs })
+            })
+            .collect()
+    }
+
+    /// The layers `first..end` over the residual stream `x` of the sequences
+    /// `segs` describe (`ple` Gemma 4's per-layer inputs), then, from the
+    /// last layer of the model, the final norm and the LM head over the rows
+    /// they want, or else the stream and the new rows of the layers `export`
+    /// for the next stage.
     ///
     /// # Errors
     ///
     /// As [`Weights::forward_layers`].
     #[expect(
         clippy::too_many_arguments,
-        reason = "the residual stream, the mirrored K/V and the pass's state are independent inputs"
+        reason = "the residual stream, the mirrored and exported K/V and the pass's state are independent inputs"
     )]
     fn run_layers(
         &self,
         mut x: Tensor<2>,
         ple: Option<Tensor<3>>,
         mirror: &[MirrorRows],
+        export: &[usize],
         kv: &mut KvLayers,
         layout: &KvLayout,
         slots: &mut [DeltaSlot],
         segs: &[Seg<'_>],
-    ) -> Result<Vec<Forward>, CucaError> {
+    ) -> Result<Ran, CucaError> {
+        let more = self.end < self.hp.n_layer;
+        // The first stage computed the per-layer inputs: the later ones get
+        // them from its carry.
+        let per_layer = match (&ple, more && self.first == 0) {
+            (Some(ple), true) => Some(read_f32(ple.clone(), "per-layer inputs")?),
+            _ => None,
+        };
         let seqs = trunk_seqs(layout, segs);
         let pass = self.pass(ple, &seqs)?;
         self.write_mirror(&pass, kv, mirror)?;
-        for il in self.first..self.hp.n_layer {
+        for il in self.first..self.end {
             x = self.layer(il, x, &pass, kv, slots, None)?;
         }
-        self.finish(x, segs)
+        if !more {
+            return Ok(Ran::Done(self.finish(x, segs)?));
+        }
+        let rows = self.read_export(&pass, kv, export)?;
+        Ok(Ran::Rows {
+            hidden: read_f32(x, "the residual stream")?,
+            pre: None,
+            per_layer,
+            kv: rows,
+        })
     }
 
     /// The final norm and the LM head over the rows of `x` (one row per
@@ -5454,7 +6050,7 @@ mod tests {
         TinySpec, VOCAB, write_deepseek41, write_mistral4, write_qwen35, write_spec,
         write_tiny_model_with,
     };
-    use super::super::{SeqRows, StateSlot};
+    use super::super::{Model, SeqRows, StateSlot};
     use super::*;
 
     fn f16_bytes(v: f32) -> [u8; 2] {
@@ -6892,12 +7488,329 @@ mod tests {
         }
     }
 
+    /// The prefix of a prompt as one engine ships it ([`prefill_and_export`]).
+    struct Shipped {
+        /// `(from, to, entries)` of every chunk of the prefix.
+        chunks: Vec<(usize, usize, Vec<PoolRows>)>,
+        /// The recurrent state at the end of the prefix (hybrid models).
+        snapshot: Option<Vec<DeltaRows>>,
+        /// The logits of the row after the prefix, from this engine's own
+        /// prefill.
+        next: Vec<f32>,
+    }
+
+    /// Run `ids[from..to]` as the rows of the one sequence `seq` of `m`
+    /// (state slot 0), releasing the blocks that left the windows: the last
+    /// row's logits with `want`.
+    fn run_rows(
+        m: &mut Model,
+        pools: &mut KvPools,
+        seq: &mut SeqBlocks,
+        ids: &[u32],
+        (from, to): (usize, usize),
+        want: Want,
+    ) -> Option<Vec<f32>> {
+        pools.reserve(seq, to).unwrap();
+        let rows = vec![SeqRows {
+            history: &ids[..from],
+            tokens: &ids[from..to],
+            start_pos: from,
+            tables: &seq.tables,
+            state: StateSlot(0),
+            want,
+            hidden: Hidden::None,
+        }];
+        let logits = m
+            .forward_batch(&Batch { rows, exact: false })
+            .unwrap()
+            .swap_remove(0)
+            .logits;
+        seq.len = to;
+        pools.release_window(seq, to, None);
+        logits
+    }
+
+    /// Prefill `ids[..end]` on `m` in chunks of `unit` positions, read the
+    /// rows of every chunk out of its pools (and, of a hybrid model, the
+    /// recurrent state), then run the rest of the prompt for the logits of
+    /// the row after the prefix.
+    fn prefill_and_export(m: &mut Model, ids: &[u32], end: usize, unit: usize) -> Shipped {
+        let mut pools = KvPools::new(m.kv_layout());
+        let mut seq = pools.seq();
+        for from in (0..end).step_by(unit) {
+            run_rows(
+                m,
+                &mut pools,
+                &mut seq,
+                ids,
+                (from, from + unit),
+                Want::None,
+            );
+        }
+        let layout = m.kv_layout().clone();
+        let chunks: Vec<_> = (0..end)
+            .step_by(unit)
+            .map(|from| {
+                let rows = m.export_rows(&seq.tables, from, from + unit, end).unwrap();
+                assert_eq!(
+                    rows.len(),
+                    entries(&layout).count(),
+                    "one entry per K/V-owning layer"
+                );
+                (from, from + unit, rows)
+            })
+            .collect();
+        assert!(
+            chunks.iter().flat_map(|c| &c.2).any(|r| !r.k.is_empty()),
+            "the prefix carries rows"
+        );
+        let snapshot = m
+            .snapshot(StateSlot(0))
+            .map(|s| m.snapshot_export(&s).unwrap());
+        assert_eq!(snapshot.is_some(), m.is_hybrid());
+        let next = run_rows(m, &mut pools, &mut seq, ids, (end, ids.len()), Want::Last).unwrap();
+        Shipped {
+            chunks,
+            snapshot,
+            next,
+        }
+    }
+
+    /// File the shipped prefix in fresh pools of `m`, as the engine's import
+    /// does (blocks for `ids[..end]` from the store, the rows of every chunk
+    /// written, the recurrent state restored), then run the rest of the
+    /// prompt: the logits of the row after the prefix.
+    fn import_and_run(
+        m: &mut Model,
+        ids: &[u32],
+        end: usize,
+        shipped: &Shipped,
+        what: &str,
+    ) -> Vec<f32> {
+        let mut pools = KvPools::new(m.kv_layout());
+        let mut seq = pools.adopt(ids, 0, end).unwrap();
+        // Rows of the wrong size are rejected.
+        let bad = shipped.chunks.iter().find_map(|(from, to, rows)| {
+            let at = rows.iter().position(|r| !r.k.is_empty())?;
+            let mut bad = rows.clone();
+            bad[at].k.push(0.0);
+            Some((*from, *to, bad))
+        });
+        if let Some((from, to, bad)) = bad {
+            assert!(
+                m.import_rows(&seq.tables, from, to, end, &bad).is_err(),
+                "{what}: rows of the wrong size are rejected"
+            );
+        }
+        for (from, to, rows) in &shipped.chunks {
+            m.import_rows(&seq.tables, *from, *to, end, rows).unwrap();
+        }
+        seq.len = end;
+        if let Some(rows) = &shipped.snapshot {
+            let snapshot = m.snapshot_import(rows.clone()).unwrap();
+            m.restore(StateSlot(0), Some(&snapshot), end).unwrap();
+            // The state reads back as it was shipped.
+            let back = m.snapshot(StateSlot(0)).unwrap();
+            assert_eq!(&m.snapshot_export(&back).unwrap(), rows, "{what}: snapshot");
+            let mut bad = rows.clone();
+            bad[0].s.pop();
+            assert!(
+                m.snapshot_import(bad).is_err(),
+                "{what}: a state of the wrong size is rejected"
+            );
+            assert!(
+                m.snapshot_import(Vec::new()).is_err(),
+                "{what}: too few layers are rejected"
+            );
+        }
+        run_rows(m, &mut pools, &mut seq, ids, (end, ids.len()), Want::Last).unwrap()
+    }
+
+    /// The rows of the prefix of `ids` that one engine prefilled, imported
+    /// into another's pools, give the logits of a local prefill: CPU rows
+    /// into the GPU engine, GPU rows into the CPU engine, and both ways with
+    /// the model split over the CPU and the GPU at its legal cuts.
+    fn check_transfer(
+        model: &TinyModel,
+        device: LocalDevice,
+        label: &str,
+        ctx: usize,
+        ids: &[u32],
+    ) {
+        let content = content_of(model);
+        let hp = read_hparams(&content).unwrap();
+        let cpu = || {
+            Model::Cpu(super::super::cpu::without_qdq(|| {
+                Transformer::load_dequantized(&content, ctx).unwrap()
+            }))
+        };
+        let gpu =
+            || hyper::without_qdq(|| GpuTransformer::load(&content, ctx, device)).map(Model::Gpu);
+        let split = |first: usize| {
+            Model::Split(super::super::cpu::without_qdq(|| {
+                hyper::without_qdq(|| {
+                    SplitModel::load_with(
+                        &content,
+                        ctx,
+                        device,
+                        &ExpertPlacement::Resident,
+                        &Sizing::single(ctx),
+                        first,
+                        true,
+                        &EngramCache::default(),
+                    )
+                    .unwrap()
+                })
+            }))
+        };
+        let mut gpu_src = gpu().unwrap();
+        let mut cpu_src = cpu();
+        let layout = cpu_src.kv_layout().clone();
+        assert_eq!(
+            gpu_src.kv_layout().groups,
+            layout.groups,
+            "{label}: both engines group the pools alike"
+        );
+        let unit = BLOCK_SIZE * layout.step();
+        let end = (ids.len() - 1) / unit * unit;
+        assert!(end >= unit, "{label}: a prefix to ship");
+
+        let from_cpu = prefill_and_export(&mut cpu_src, ids, end, unit);
+        let from_gpu = prefill_and_export(&mut gpu_src, ids, end, unit);
+        drop((cpu_src, gpu_src));
+        let got = import_and_run(&mut gpu().unwrap(), ids, end, &from_cpu, label);
+        assert_rows_within(
+            &got,
+            &from_gpu.next,
+            1e-3,
+            &format!("{label}: CPU rows on the GPU"),
+        );
+        let got = import_and_run(&mut cpu(), ids, end, &from_gpu, label);
+        assert_rows_within(
+            &got,
+            &from_cpu.next,
+            1e-3,
+            &format!("{label}: GPU rows on the CPU"),
+        );
+
+        // A split model keeps some layers' pools on each device (and the
+        // mirror pools of the CPU layers the GPU layers read): every legal
+        // cut of the Gemma 4 model (whose shared K/V layers cross it), the
+        // middle one of the others.
+        let inner: Vec<usize> = super::super::split::legal_gpu_layers(&hp)
+            .into_iter()
+            .filter(|&g| 0 < g && g < hp.n_layer)
+            .collect();
+        let cuts: Vec<usize> = if label.starts_with("gemma4") {
+            inner
+        } else {
+            inner.get(inner.len() / 2).copied().into_iter().collect()
+        };
+        for gpu_layers in cuts {
+            let first = hp.n_layer - gpu_layers;
+            let at = format!("{label}, {gpu_layers} of {} layers on the GPU", hp.n_layer);
+            let mut split_src = split(first);
+            let from_split = prefill_and_export(&mut split_src, ids, end, unit);
+            drop(split_src);
+            let got = import_and_run(&mut split(first), ids, end, &from_cpu, &at);
+            assert_rows_within(
+                &got,
+                &from_split.next,
+                1e-3,
+                &format!("{at}: CPU rows on the split model"),
+            );
+            let got = import_and_run(&mut cpu(), ids, end, &from_split, &at);
+            assert_rows_within(
+                &got,
+                &from_cpu.next,
+                1e-3,
+                &format!("{at}: split rows on the CPU"),
+            );
+        }
+    }
+
+    /// K/V rows and recurrent state exported from one engine import into
+    /// the pools of another: the dense, windowed, MoE, Gemma 4, delta-net,
+    /// latent-attention and hyper-connection models (window, compressed and
+    /// latent pools), CPU to GPU and back, each against its engine's own
+    /// prefill of the same prompt.
+    #[test]
+    fn gpu_exported_rows_import_on_the_cpu_and_back() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        // The tiny models run 32 positions unless the file says more.
+        let context = |n: usize| ("context_length".to_string(), gguf::Value::U32(n as u32));
+        let long = stream(3, 100);
+        for spec in TinySpec::all() {
+            let label = spec.arch;
+            let wide = TinySpec {
+                context: 160,
+                ..spec
+            };
+            check_transfer(&write_spec(&wide), device, label, 160, &long);
+        }
+        check_transfer(
+            &write_tiny_model_with(TinyOptions::default()),
+            device,
+            "gemma4",
+            32,
+            &stream(3, 30),
+        );
+        for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
+            let wide = TinyQwen35 {
+                meta: vec![context(160)],
+                ..spec
+            };
+            check_transfer(&write_qwen35(&wide), device, label, 160, &long);
+        }
+        let latent = TinyMistral4 {
+            meta: vec![context(160)],
+            ..TinyMistral4::default()
+        };
+        check_transfer(&write_mistral4(&latent), device, "mistral4", 160, &long);
+        for (label, spec) in hyper_variants() {
+            check_transfer(
+                &write_deepseek41(&spec),
+                device,
+                label,
+                HYPER_CTX,
+                &hyper_prompt(90),
+            );
+        }
+
+        // Tensor parallelism has no K/V transfer.
+        if let Some(devices) = two_test_devices() {
+            // An FFN width that splits into multiples of 32 per shard.
+            let llama = TinySpec::llama();
+            let model = write_spec(&TinySpec {
+                ff: llama.ff.div_ceil(64) * 64,
+                ..llama
+            });
+            let mut sharded = GpuTransformer::load_placed(
+                &content_of(&model),
+                32,
+                devices[0],
+                &devices[1..2],
+                &ExpertPlacement::Resident,
+                &Sizing::single(32),
+                &EngramCache::default(),
+            )
+            .unwrap();
+            let tables = vec![vec![0u32]; sharded.kv_layout().groups.len()];
+            let e = sharded.export_rows(&tables, 0, 16, 16).unwrap_err();
+            assert!(e.to_string().contains("tensor parallelism"), "{e}");
+            let e = sharded.import_rows(&tables, 0, 16, 16, &[]).unwrap_err();
+            assert!(e.to_string().contains("tensor parallelism"), "{e}");
+        }
+    }
+
     /// Device bytes of one expert summed over the MoE layers of `model`, as
     /// the loader counts them.
     fn expert_device_bytes(model: &TinyModel) -> usize {
         let content = content_of(model);
         let hp = read_hparams(&content).unwrap();
-        let layers = tier_layout(&content, &hp, hp.moe.unwrap(), 0).unwrap();
+        let layers = tier_layout(&content, &hp, hp.moe.unwrap(), LayerRange::whole(&hp)).unwrap();
         layers.iter().map(|l| l.stored_bytes).sum()
     }
 
@@ -8961,8 +9874,7 @@ mod tests {
     /// rows, serves and equals the single-device logits.
     #[test]
     fn gpu_offload_serves_again_after_a_rejected_mirror_write() {
-        use super::super::cpu::Front;
-        use super::super::split::mirrored;
+        use super::super::split::{exports, mirrored, mirrors};
 
         let Some(device) = test_device() else {
             return;
@@ -8974,32 +9886,45 @@ mod tests {
         let first = (1..hp.n_layer)
             .find(|&f| !mirrored(&hp, f).is_empty())
             .expect("a split crossing a shared cache");
-        let mirror = mirrored(&hp, first);
         let sizing = Sizing::single(CTX);
-        let mut front = Transformer::load_front(
+        let carry = |out: StageOut| match out {
+            StageOut::Carry(carry) => carry,
+            StageOut::Done(_) => panic!("a stage before the last returns its carry"),
+        };
+        let before = LayerRange {
+            first: 0,
+            end: first,
+        };
+        let after = LayerRange {
+            first,
+            end: hp.n_layer,
+        };
+        let mut front = Transformer::load_range(
             &content,
             CTX,
             &ExpertPlacement::Resident,
             &sizing,
-            &Front {
-                layers: first,
+            &StagePart {
+                range: before,
                 shared: None,
-                export: mirror.clone(),
+                export: exports(&hp, before),
+                mirror: Vec::new(),
                 engram: None,
             },
             true,
         )
         .unwrap();
-        let mut back = GpuTransformer::load_back(
+        let mut back = GpuTransformer::load_range(
             &content,
             CTX,
             device,
             &ExpertPlacement::Resident,
             &sizing,
-            &Back {
-                first,
+            &StagePart {
+                range: after,
                 shared: None,
-                mirror,
+                export: Vec::new(),
+                mirror: mirrors(&hp, after),
                 engram: None,
             },
         )
@@ -9025,16 +9950,248 @@ mod tests {
             }],
             exact: false,
         };
-        let mut out = front.forward_front(&batch).unwrap();
+        let mut out = carry(front.forward_stage(&batch, None).unwrap());
         out.kv[0].seqs[0].0.pop();
-        let failed = back.forward_back(&batch, out.hidden, out.per_layer, out.pre, &out.kv);
+        let failed = back.forward_stage(&batch, Some(out));
         assert!(failed.is_err(), "rows of the wrong size are rejected");
-        let out = front.forward_front(&batch).unwrap();
-        let mut served = back
-            .forward_back(&batch, out.hidden, out.per_layer, out.pre, &out.kv)
-            .unwrap();
+        let out = carry(front.forward_stage(&batch, None).unwrap());
+        let StageOut::Done(mut served) = back.forward_stage(&batch, Some(out)).unwrap() else {
+            panic!("the last stage returns the logits");
+        };
         let got = served.swap_remove(0).logits.unwrap();
         assert_rows_within(&got, &want, 1e-4, "after a rejected mirror write");
+    }
+
+    /// One engine of a chain of stages in the tests (one per stage, so the
+    /// size gap costs nothing).
+    #[allow(clippy::large_enum_variant)]
+    enum Engine {
+        Cpu(Transformer),
+        Gpu(GpuTransformer),
+    }
+
+    impl Engine {
+        fn layout(&self) -> &KvLayout {
+            match self {
+                Engine::Cpu(m) => m.kv_layout(),
+                Engine::Gpu(m) => m.kv_layout(),
+            }
+        }
+
+        fn stage(&mut self, batch: &Batch<'_>, input: Option<Carry>) -> StageOut {
+            match self {
+                Engine::Cpu(m) => m.forward_stage(batch, input),
+                Engine::Gpu(m) => m.forward_stage(batch, input),
+            }
+            .unwrap()
+        }
+    }
+
+    /// What the stage that runs `range` of the model `hp` holds and hands on.
+    fn stage_part(hp: &Hparams, range: LayerRange) -> StagePart {
+        StagePart {
+            range,
+            shared: None,
+            export: super::super::split::exports(hp, range),
+            mirror: super::super::split::mirrors(hp, range),
+            engram: None,
+        }
+    }
+
+    /// Run `steps` (the rows of each step, over `tokens` per sequence)
+    /// through the chain `stages`, each over fresh block pools of its own,
+    /// every stage's carry feeding the next: the output of every sequence's
+    /// call, from the last stage, in order.
+    fn run_chain(stages: &mut [Engine], steps: &[Vec<Step>], tokens: &[Vec<u32>]) -> Vec<Forward> {
+        let mut pools: Vec<KvPools> = stages.iter().map(|s| KvPools::new(s.layout())).collect();
+        let mut seqs: Vec<Vec<SeqBlocks>> = pools
+            .iter()
+            .map(|p| tokens.iter().map(|_| p.seq()).collect())
+            .collect();
+        let mut at = vec![0usize; tokens.len()];
+        let mut out = Vec::new();
+        for rows_of_step in steps {
+            let mut carry = None;
+            let mut done = None;
+            for (si, stage) in stages.iter_mut().enumerate() {
+                for st in rows_of_step {
+                    pools[si]
+                        .reserve(&mut seqs[si][st.seq], at[st.seq] + st.n)
+                        .unwrap();
+                }
+                let rows: Vec<SeqRows<'_>> = rows_of_step
+                    .iter()
+                    .map(|st| SeqRows {
+                        history: &tokens[st.seq][..at[st.seq]],
+                        tokens: &tokens[st.seq][at[st.seq]..at[st.seq] + st.n],
+                        start_pos: at[st.seq],
+                        tables: &seqs[si][st.seq].tables,
+                        state: StateSlot(st.seq),
+                        want: st.want,
+                        hidden: st.hidden,
+                    })
+                    .collect();
+                match stage.stage(&Batch { rows, exact: false }, carry.take()) {
+                    StageOut::Carry(c) => carry = Some(c),
+                    StageOut::Done(o) => done = Some(o),
+                }
+            }
+            let outs = done.expect("the last stage returns the logits");
+            assert_eq!(outs.len(), rows_of_step.len());
+            for (st, o) in rows_of_step.iter().zip(outs) {
+                out.push(o);
+                at[st.seq] += st.n;
+            }
+        }
+        out
+    }
+
+    /// The steps of the hyper-connection stage test: a prefill, decode steps
+    /// and a second sequence prefilling next to decoding ones.
+    fn hyper_steps() -> Vec<Vec<Step>> {
+        let (last, all) = (Want::Last, Want::All);
+        let (plain, post, post_all) = (Hidden::None, Hidden::PostNorm, Hidden::PostNormAll);
+        vec![
+            vec![step(0, 21, last, plain)],
+            vec![step(0, 1, last, post)],
+            vec![step(1, 30, all, post_all)],
+            vec![step(0, 1, last, plain), step(1, 1, last, plain)],
+            vec![step(0, 14, all, plain), step(1, 3, last, plain)],
+            vec![step(0, 1, last, plain), step(1, 1, last, plain)],
+        ]
+    }
+
+    /// Chains of stages equal the model on one device: the GPU stage then
+    /// a CPU stage at the legal cuts (the first, the middle and the last
+    /// for the Gemma 4 model, whose shared K/V layers cross them), and a CPU
+    /// stage, a GPU stage and a CPU stage at a pair of cuts, over `steps`
+    /// (prefill, decode, every logits and hidden row), within `tol` of the
+    /// logits' scale. The CPU stages hold their weights dequantized so that
+    /// all of them compute the same values.
+    fn check_stages(
+        model: &TinyModel,
+        device: LocalDevice,
+        label: &str,
+        (ctx, tol): (usize, f32),
+        (steps, tokens): (&[Vec<Step>], &[Vec<u32>]),
+    ) {
+        let content = content_of(model);
+        let hp = read_hparams(&content).unwrap();
+        let sizing = Sizing {
+            max_sequences: 2,
+            kv_tokens: 2 * ctx,
+            max_rows: 32,
+        };
+        let cpu = |range: LayerRange| {
+            Engine::Cpu(super::super::cpu::without_qdq(|| {
+                Transformer::load_range(
+                    &content,
+                    ctx,
+                    &ExpertPlacement::Resident,
+                    &sizing,
+                    &stage_part(&hp, range),
+                    true,
+                )
+                .unwrap()
+            }))
+        };
+        let gpu = |range: LayerRange| {
+            Engine::Gpu(hyper::without_qdq(|| {
+                GpuTransformer::load_range(
+                    &content,
+                    ctx,
+                    device,
+                    &ExpertPlacement::Resident,
+                    &sizing,
+                    &stage_part(&hp, range),
+                )
+                .unwrap()
+            }))
+        };
+        let n = hp.n_layer;
+        let range = |first: usize, end: usize| LayerRange { first, end };
+        let want = run_chain(&mut [gpu(LayerRange::whole(&hp))], steps, tokens);
+        let check = |chain: &mut [Engine], what: String| {
+            let got = run_chain(chain, steps, tokens);
+            assert_eq!(got.len(), want.len(), "{label}: {what}");
+            for (call, (g, w)) in got.iter().zip(&want).enumerate() {
+                assert_forward_within(g, w, tol, &format!("{label}: {what}, call {call}"));
+            }
+        };
+
+        let cuts = super::super::split::legal_cuts(&hp);
+        let (Some(&low), Some(&high)) = (cuts.first(), cuts.last()) else {
+            return;
+        };
+        let heads: Vec<usize> = if label.starts_with("gemma4") {
+            cuts.clone()
+        } else {
+            vec![cuts[cuts.len() / 2]]
+        };
+        for a in heads {
+            check(
+                &mut [gpu(range(0, a)), cpu(range(a, n))],
+                format!("GPU 0..{a} then CPU {a}..{n}"),
+            );
+        }
+        let pairs: Vec<(usize, usize)> = if label.starts_with("gemma4") {
+            cuts.iter()
+                .flat_map(|&a| cuts.iter().filter(move |&&b| a < b).map(move |&b| (a, b)))
+                .collect()
+        } else if low < high {
+            vec![(low, high)]
+        } else {
+            Vec::new()
+        };
+        for (a, b) in pairs {
+            check(
+                &mut [cpu(range(0, a)), gpu(range(a, b)), cpu(range(b, n))],
+                format!("CPU 0..{a}, GPU {a}..{b}, CPU {b}..{n}"),
+            );
+        }
+    }
+
+    /// A model cut into stages that run on the CPU and the GPU gives the
+    /// logits of the model on one GPU, through the carry of each stage
+    /// (the residual stream, Gemma 4's per-layer inputs, the K/V rows of the
+    /// shared layers, the hyper-connection streams): dense, windowed, MoE,
+    /// Gemma 4, delta-net, latent-attention and hyper-connection models.
+    /// (The Gemma 4 mixture of experts has no GPU engine to compare with.)
+    #[test]
+    fn gpu_stages_match_single_device() {
+        let Some(device) = test_device() else {
+            return;
+        };
+        let steps = sharded_steps();
+        let tokens: Vec<Vec<u32>> = (0..2).map(|s| stream(s, 24)).collect();
+        let input = (steps.as_slice(), tokens.as_slice());
+        for spec in TinySpec::all() {
+            check_stages(&write_spec(&spec), device, spec.arch, (32, 1e-4), input);
+        }
+        check_stages(
+            &write_tiny_model_with(TinyOptions::default()),
+            device,
+            "gemma4",
+            (32, 1e-4),
+            input,
+        );
+        for (label, spec) in [("qwen35", tiny_qwen35()), ("qwen35moe", tiny_qwen35moe())] {
+            check_stages(&write_qwen35(&spec), device, label, (32, 1e-4), input);
+        }
+        for (label, spec) in mistral4_variants() {
+            check_stages(&write_mistral4(&spec), device, label, (32, 1e-4), input);
+        }
+        let hyper_tokens: Vec<Vec<u32>> = vec![hyper_prompt(40), hyper_prompt(50)[10..].to_vec()];
+        let hyper_steps = hyper_steps();
+        for (label, spec) in hyper_variants().into_iter().take(1) {
+            check_stages(
+                &write_deepseek41(&spec),
+                device,
+                label,
+                (HYPER_CTX, 1e-3),
+                (hyper_steps.as_slice(), hyper_tokens.as_slice()),
+            );
+        }
     }
 
     /// `model` split across `devices[0]` and `devices[1]` equals the same

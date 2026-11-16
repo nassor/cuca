@@ -64,6 +64,26 @@ pub fn render(state: &BalancerState) -> String {
         "",
         state.metrics.fallbacks.load(Ordering::Relaxed),
     );
+    for (name, help, counter) in [
+        (
+            "cuca_balancer_prefill_assigned_total",
+            "Requests sent to a decode node with a prefill node named.",
+            &state.metrics.prefill_assigned,
+        ),
+        (
+            "cuca_balancer_prefill_unassigned_total",
+            "Requests sent to a decode node while no prefill node was healthy.",
+            &state.metrics.prefill_unassigned,
+        ),
+        (
+            "cuca_balancer_prefill_whole_total",
+            "Requests a prefill node served whole, for want of another upstream.",
+            &state.metrics.prefill_whole,
+        ),
+    ] {
+        x.family(name, "counter", help);
+        x.sample(name, "", counter.load(Ordering::Relaxed));
+    }
     x.family(
         "cuca_balancer_decisions_total",
         "counter",

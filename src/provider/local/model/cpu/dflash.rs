@@ -93,6 +93,8 @@
 //! block; the oracle test compares both (a reference block of 16 rows and a
 //! shorter one).
 
+use std::sync::Arc;
+
 use crate::provider::local::gguf::{self, Value};
 use candle_core::{Device, Tensor};
 
@@ -278,8 +280,9 @@ struct DflashLayer {
     window: Option<usize>,
 }
 
-/// A DFlash drafter and its context cache; see the [module docs](self).
-pub(crate) struct DflashNet {
+/// The weights of a DFlash drafter, shared by every fork of it
+/// ([`DflashNet::fork`]).
+struct DflashWeights {
     geo: Geometry,
     /// The target layers, as the set a forward pass captures.
     layers_set: LayerSet,
@@ -292,6 +295,11 @@ pub(crate) struct DflashNet {
     /// RoPE cos/sin `(context_length + block_size, rope_dims / 2)`.
     cos: Tensor,
     sin: Tensor,
+}
+
+/// A DFlash drafter and its context cache; see the [module docs](self).
+pub(crate) struct DflashNet {
+    w: Arc<DflashWeights>,
     /// Slots of the context ring: position `p` lives in slot `p % cap`.
     cap: usize,
     /// The held positions are `lo..hi`.
@@ -430,15 +438,17 @@ impl DflashNet {
         let ring = geo.n_kv_head * cap * geo.head_dim;
         let n_layer = layers.len();
         Ok(Self {
-            geo,
-            layers_set,
-            feature_width,
-            fc,
-            enc_norm,
-            layers,
-            out_norm,
-            cos,
-            sin,
+            w: Arc::new(DflashWeights {
+                geo,
+                layers_set,
+                feature_width,
+                fc,
+                enc_norm,
+                layers,
+                out_norm,
+                cos,
+                sin,
+            }),
             cap,
             lo: 0,
             hi: 0,
@@ -450,13 +460,13 @@ impl DflashNet {
     /// The target layers whose outputs the drafter reads, as the set to ask
     /// a forward pass for ([`Hidden::Layers`](super::Hidden)).
     pub(crate) fn features(&self) -> LayerSet {
-        self.layers_set
+        self.w.layers_set
     }
 
     /// Floats of one feature row: the target layers' outputs one after the
     /// other.
     pub(crate) fn feature_width(&self) -> usize {
-        self.feature_width
+        self.w.feature_width
     }
 
     /// The positions the context cache holds, as `lo..hi`.
@@ -479,16 +489,30 @@ impl DflashNet {
         self.lo = self.lo.min(self.hi);
     }
 
+    /// A drafter over the same weights with an empty context cache of its
+    /// own: what a second sequence needs when it is drafted for beside this
+    /// one.
+    pub(crate) fn fork(&self) -> Result<Self, CucaError> {
+        Ok(Self {
+            w: Arc::clone(&self.w),
+            cap: self.cap,
+            lo: 0,
+            hi: 0,
+            k: self.k.iter().map(|l| vec![0.0; l.len()]).collect(),
+            v: self.v.iter().map(|l| vec![0.0; l.len()]).collect(),
+        })
+    }
+
     /// Rotate the rows `m` `(1, heads, t, head_dim)` held at positions
     /// `start..start + t`.
     fn rotate(&self, m: &Tensor, start: usize) -> candle_core::Result<Tensor> {
         let t = m.dim(2)?;
         apply_rope(
             m,
-            &self.cos.narrow(0, start, t)?,
-            &self.sin.narrow(0, start, t)?,
+            &self.w.cos.narrow(0, start, t)?,
+            &self.w.sin.narrow(0, start, t)?,
             RopeKind::Neox,
-            self.geo.rope_dims,
+            self.w.geo.rope_dims,
         )
     }
 
@@ -501,7 +525,7 @@ impl DflashNet {
     /// [`CucaError::Provider`] for a length that is not a whole number of
     /// feature rows, positions beyond the context or a failed projection.
     pub(crate) fn observe(&mut self, pos: usize, feats: &[f32]) -> Result<(), CucaError> {
-        let width = self.feature_width;
+        let width = self.w.feature_width;
         if feats.is_empty() || !feats.len().is_multiple_of(width) {
             return Err(err(format!(
                 "DFlash observe: {} floats are not whole rows of {width}",
@@ -509,7 +533,7 @@ impl DflashNet {
             )));
         }
         let rows = feats.len() / width;
-        if pos + rows + self.geo.block_size > self.cos.dim(0).map_err(candle_err)? {
+        if pos + rows + self.w.geo.block_size > self.w.cos.dim(0).map_err(candle_err)? {
             return Err(err(format!(
                 "DFlash observe: positions up to {} exceed the context",
                 pos + rows
@@ -529,10 +553,10 @@ impl DflashNet {
             self.lo = pos;
             self.hi = pos;
         }
-        let d = self.geo.head_dim;
+        let d = self.w.geo.head_dim;
         let m = rows - skip;
         for (il, (ks, vs)) in per_layer.iter().enumerate() {
-            for h in 0..self.geo.n_kv_head {
+            for h in 0..self.w.geo.n_kv_head {
                 for r in 0..m {
                     let slot = (first + r) % self.cap;
                     let dst = (h * self.cap + slot) * d;
@@ -554,11 +578,12 @@ impl DflashNet {
         feats: &[f32],
         first: usize,
     ) -> candle_core::Result<Vec<(Vec<f32>, Vec<f32>)>> {
-        let g = &self.geo;
-        let m = feats.len() / self.feature_width;
-        let x = Tensor::from_slice(feats, (1, m, self.feature_width), &Device::Cpu)?;
-        let ctx = rms(&self.fc.forward(&x)?, &self.enc_norm, g.eps)?;
-        self.layers
+        let g = &self.w.geo;
+        let m = feats.len() / self.w.feature_width;
+        let x = Tensor::from_slice(feats, (1, m, self.w.feature_width), &Device::Cpu)?;
+        let ctx = rms(&self.w.fc.forward(&x)?, &self.w.enc_norm, g.eps)?;
+        self.w
+            .layers
             .iter()
             .map(|lw| {
                 let k =
@@ -599,12 +624,12 @@ impl DflashNet {
         k: usize,
         pick: &mut dyn FnMut(&mut [f32]) -> Option<u32>,
     ) -> Result<Vec<u32>, CucaError> {
-        let k = k.min(self.geo.block_size - 1);
+        let k = k.min(self.w.geo.block_size - 1);
         if k == 0 || len == 0 || self.hi != len || self.lo >= self.hi {
             return Ok(Vec::new());
         }
         let rows = k + 1;
-        let mut ids = vec![self.geo.mask_token; rows];
+        let mut ids = vec![self.w.geo.mask_token; rows];
         ids[0] = first;
         let embeddings = target.embedding_rows(&ids)?;
         let mut logits = self
@@ -628,12 +653,12 @@ impl DflashNet {
         len: usize,
         k: usize,
     ) -> candle_core::Result<Vec<f32>> {
-        let g = &self.geo;
+        let g = &self.w.geo;
         let mut x = Tensor::from_vec(embeddings, (1, k + 1, g.n_embd), &Device::Cpu)?;
-        for (il, lw) in self.layers.iter().enumerate() {
+        for (il, lw) in self.w.layers.iter().enumerate() {
             x = self.block_layer(lw, il, &x, len)?;
         }
-        let normed = rms(&x, &self.out_norm, g.eps)?.narrow(1, 1, k)?;
+        let normed = rms(&x, &self.w.out_norm, g.eps)?.narrow(1, 1, k)?;
         let logits = target.head(&normed)?;
         logits.flatten_all()?.to_vec1::<f32>()
     }
@@ -647,7 +672,7 @@ impl DflashNet {
         x: &Tensor,
         len: usize,
     ) -> candle_core::Result<Tensor> {
-        let g = &self.geo;
+        let g = &self.w.geo;
         let b = x.dim(1)?;
         let (nh, nkv, d) = (g.n_head, g.n_kv_head, g.head_dim);
         let h = rms(x, &lw.attn_norm, g.eps)?;
@@ -718,7 +743,7 @@ impl DflashNet {
     /// The K and V rows `[n_kv_head][to - from][head_dim]` of the cached
     /// positions `from..to` of layer `il`.
     fn gather(&self, il: usize, from: usize, to: usize) -> (Vec<f32>, Vec<f32>) {
-        let (nkv, d) = (self.geo.n_kv_head, self.geo.head_dim);
+        let (nkv, d) = (self.w.geo.n_kv_head, self.w.geo.head_dim);
         let n = to - from;
         let mut ks = Vec::with_capacity(nkv * n * d);
         let mut vs = Vec::with_capacity(nkv * n * d);

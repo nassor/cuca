@@ -124,9 +124,10 @@
 //! - Prefill runs in chunks of at most 256 tokens (4,096 for tiered experts
 //!   under compressed sparse attention), bounding the score matrix,
 //!   and a step carries at most [`BatchingConfig::max_step_tokens`] rows in
-//!   all. An in-trunk drafter observes every position of its sequence, so
-//!   with one the engine serves one request at a time; a file drafter
-//!   speculates only while one request runs alone.
+//!   all. A drafter that observes every position of its sequence (the
+//!   in-trunk head, EAGLE, DFlash, DSpark) keeps one cache per state slot,
+//!   and every running sequence drafts in the shared step, except in a step
+//!   where a sequence prefills.
 //!
 //! # Determinism
 //!
@@ -197,8 +198,8 @@
 //! `mistral4-eagle` GGUF and drafts for a `mistral4` target on the CPU: two
 //! latent-attention layers over a dense FFN reading
 //! `fc(cat(embed(t[j+1]), h[j]))` with the target's embedding and LM head, a
-//! K/V cache of its own over every position (so one request at a time, like
-//! the in-trunk head), and a draft step that ranks the whole vocabulary.
+//! K/V cache of its own over every position (one per state slot, like the
+//! in-trunk head), and a draft step that ranks the whole vocabulary.
 //! Verification is unchanged, so greedy output equals plain decoding bit for
 //! bit; no speedup is claimed here: it is measured by `provider_local_mtp`.
 //!
@@ -233,13 +234,19 @@ mod chat;
 mod config_de;
 mod convert;
 mod download;
-mod engine;
+// The server's tests build ready models from its fixtures.
+pub(crate) mod engine;
 mod gguf;
+mod kv;
+pub(crate) mod kvframe;
 mod model;
 mod output;
 mod sampler;
 mod sampling;
+pub(crate) mod stageframe;
 mod tokenizer;
+pub use kv::{KvExport, KvImport};
+pub(crate) mod wire;
 
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -1177,9 +1184,9 @@ pub enum DrafterSource {
     /// Qwen 3.5 `*-MTP` files (for example `unsloth/Qwen3.5-0.8B-MTP-GGUF`)
     /// carry one extra block after their trunk that predicts the token after
     /// the next. It loads from the same file (nothing more to download),
-    /// keeps a K/V cache of its own (4 KB per context position for the 0.8B
-    /// model) and runs on the CPU only. A model whose file has no such block
-    /// fails to load with an error that says so.
+    /// keeps a K/V cache of its own per running sequence (4 KB per context
+    /// position for the 0.8B model) and runs on the CPU only. A model whose
+    /// file has no such block fails to load with an error that says so.
     InTrunk,
 }
 
@@ -1525,6 +1532,82 @@ impl EngramCache {
     }
 }
 
+/// Limits of K/V export, the serving of a prompt's K/V rows to a decode node
+/// (`kv_export` in KDL, bare or with `max_exports=2`).
+///
+/// A model without this setting refuses exports. The rows of an export stay
+/// leased (never evicted) until the peer has read them, so the setting bounds
+/// the pool the exports can hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct KvExportConfig {
+    /// Exports served at once, `1..=16` (default 2); a further one is
+    /// refused as busy.
+    pub max_exports: usize,
+}
+
+impl Default for KvExportConfig {
+    fn default() -> Self {
+        Self { max_exports: 2 }
+    }
+}
+
+/// One layer stage held by another machine, a `remote_stage` node of the
+/// coordinator: `remote_stage url="http://box-a:8000" layers=14`. The stages
+/// of a model are written in layer order from layer 0. `Debug` redacts
+/// `api_key`.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct RemoteStage {
+    /// Base URL of the worker's model server, `http://` or `https://`.
+    pub url: String,
+    /// Layers the worker holds, at least 1.
+    pub layers: usize,
+    /// The worker's model name when its server serves several; `None` posts
+    /// to the server's only model.
+    pub model: Option<String>,
+    /// Sent to the worker as `Authorization: Bearer <key>`.
+    pub api_key: Option<String>,
+    /// How long one call may take, 1 s to 1 h (default `"600s"`).
+    #[serde(deserialize_with = "crate::config::duration")]
+    pub timeout: Duration,
+}
+
+impl Default for RemoteStage {
+    fn default() -> Self {
+        Self {
+            url: String::new(),
+            layers: 0,
+            model: None,
+            api_key: None,
+            timeout: Duration::from_secs(600),
+        }
+    }
+}
+
+impl fmt::Debug for RemoteStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("RemoteStage")
+            .field("url", &self.url)
+            .field("layers", &self.layers)
+            .field("model", &self.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
+}
+
+/// The layers a stage worker holds, the `stage` node:
+/// `stage first=0 layers=14` is layers `0..14`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct StageRange {
+    /// The first layer held.
+    pub first: usize,
+    /// How many layers, from `first`.
+    pub layers: usize,
+}
+
 /// Configuration for [`LocalModel::load`].
 ///
 /// With the `config-kdl` feature (on with `provider-local`) the whole struct
@@ -1671,6 +1754,24 @@ pub struct LocalModelConfig {
     /// (`ModelSource::File` naming the first part).
     #[serde(deserialize_with = "crate::config::one_or_many")]
     pub shard_dirs: Vec<PathBuf>,
+    /// Serve K/V exports to decode nodes (see [`KvExportConfig`]); `None`
+    /// (the default) refuses them. In KDL `kv_export max_exports=2` or a bare
+    /// `kv_export`. Not with `shards` or layer stages.
+    pub kv_export: Option<KvExportConfig>,
+    /// Layer stages run on other machines, in layer order from layer 0: this
+    /// model runs the layers left over and the head on its
+    /// [`device`](Self::device), and calls each stage once per forward pass.
+    /// In KDL one `remote_stage url="http://box-a:8000" layers=14` node per
+    /// stage. See [`RemoteStage`].
+    #[serde(
+        rename = "remote_stage",
+        deserialize_with = "crate::config::one_or_many"
+    )]
+    pub remote_stages: Vec<RemoteStage>,
+    /// Makes this model a stage worker holding only these layers; it serves
+    /// stage calls and no chat requests. In KDL `stage first=0 layers=14`.
+    /// See [`StageRange`].
+    pub stage: Option<StageRange>,
 }
 
 impl Default for LocalModelConfig {
@@ -1694,6 +1795,9 @@ impl Default for LocalModelConfig {
             gpu_layers: None,
             engram: EngramCache::default(),
             shard_dirs: Vec::new(),
+            kv_export: None,
+            remote_stages: Vec::new(),
+            stage: None,
         }
     }
 }
@@ -1725,6 +1829,9 @@ impl fmt::Debug for LocalModelConfig {
             .field("gpu_layers", &self.gpu_layers)
             .field("engram", &self.engram)
             .field("shard_dirs", &self.shard_dirs)
+            .field("kv_export", &self.kv_export)
+            .field("remote_stages", &self.remote_stages)
+            .field("stage", &self.stage)
             .finish()
     }
 }
@@ -1732,7 +1839,7 @@ impl fmt::Debug for LocalModelConfig {
 /// State shared by every clone of a [`LocalModel`].
 struct LocalModelInner {
     /// Queue into the engine thread; dropping the last sender ends it.
-    jobs: mpsc::Sender<engine::Job>,
+    jobs: mpsc::Sender<engine::Msg>,
     tokenizer: Arc<Tokenizer>,
     template: ChatTemplate,
     format: ChatFormat,
@@ -1754,6 +1861,12 @@ struct LocalModelInner {
     layer_split: Option<(usize, usize)>,
     /// Size of the GGUF file, see [`LocalModel::weights_file_bytes`].
     file_bytes: u64,
+    /// See [`LocalModel::fingerprint`].
+    fingerprint: u64,
+    /// See [`LocalModel::imports_kv`].
+    imports_kv: bool,
+    /// See [`LocalModel::is_stage`].
+    is_stage: bool,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -2157,7 +2270,7 @@ impl LocalModel {
             + Send
             + 'static,
     {
-        let (jobs_tx, mut jobs_rx) = mpsc::channel::<engine::Job>(JOB_QUEUE);
+        let (jobs_tx, mut jobs_rx) = mpsc::channel::<engine::Msg>(JOB_QUEUE);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<Self, CucaError>>();
         std::thread::Builder::new()
             .name("cuca-local-engine".to_string())
@@ -2187,6 +2300,9 @@ impl LocalModel {
                                 context_length: engine.context_length(),
                                 kv_cache_bytes: engine.kv_cache_bytes(),
                                 file_bytes: engine.file_bytes(),
+                                fingerprint: engine.fingerprint(),
+                                imports_kv: engine.imports_kv(),
+                                is_stage: engine.is_stage(),
                                 sampling: engine.sampling().config(),
                                 draft_stats,
                                 serving: engine.serving_counters(),
@@ -2255,8 +2371,10 @@ fn validate(config: &LocalModelConfig) -> Result<(), CucaError> {
     if config.context_length == Some(0) {
         return Err(invalid("context_length must be at least 1"));
     }
+    validate_kv_export(config)?;
     validate_shards(config)?;
     validate_gpu_layers(config)?;
+    validate_stages(config)?;
     validate_batching(&config.batching)?;
     if let Some(temperature) = config.sampling.temperature {
         check_temperature("sampling.temperature", temperature)?;
@@ -2323,6 +2441,87 @@ fn validate_gpu_layers(config: &LocalModelConfig) -> Result<(), CucaError> {
     }
     if config.drafter.is_some() {
         return Err(invalid("gpu_layers cannot be combined with a `drafter`"));
+    }
+    Ok(())
+}
+
+/// The most remote stages one coordinator chains.
+const MAX_REMOTE_STAGES: usize = 16;
+/// The most K/V exports a model serves at once.
+const MAX_KV_EXPORTS: usize = 16;
+
+/// K/V export: a bounded number of leases, not with tensor parallelism.
+fn validate_kv_export(config: &LocalModelConfig) -> Result<(), CucaError> {
+    let Some(export) = &config.kv_export else {
+        return Ok(());
+    };
+    if !(1..=MAX_KV_EXPORTS).contains(&export.max_exports) {
+        return Err(invalid(format!(
+            "kv_export.max_exports must be in 1..={MAX_KV_EXPORTS}, got {}",
+            export.max_exports
+        )));
+    }
+    if !config.shards.is_empty() {
+        return Err(invalid(
+            "K/V transfer cannot be combined with tensor parallelism (`shards`)",
+        ));
+    }
+    Ok(())
+}
+
+/// Layer stages: a worker (`stage`) or a coordinator (`remote_stage`), with
+/// none of tensor parallelism, layer offload, K/V export or a drafter that
+/// would need the layers on one machine. What depends on the model's
+/// hyperparameters is checked when the file is read.
+fn validate_stages(config: &LocalModelConfig) -> Result<(), CucaError> {
+    if config.stage.is_none() && config.remote_stages.is_empty() {
+        return Ok(());
+    }
+    if config.stage.is_some() && !config.remote_stages.is_empty() {
+        return Err(invalid(
+            "a model is either a stage worker (`stage`) or the last stage (`remote_stage`), not both",
+        ));
+    }
+    if !config.shards.is_empty() {
+        return Err(invalid(
+            "layer stages cannot be combined with tensor parallelism (`shards`)",
+        ));
+    }
+    if config.gpu_layers.is_some() {
+        return Err(invalid("layer stages cannot be combined with `gpu_layers`"));
+    }
+    if config.kv_export.is_some() {
+        return Err(invalid("layer stages cannot be combined with `kv_export`"));
+    }
+    if config.stage.is_some() && config.drafter.is_some() {
+        return Err(invalid("a stage worker takes no `drafter`"));
+    }
+    if !config.remote_stages.is_empty() && config.drafter == Some(DrafterSource::InTrunk) {
+        return Err(invalid(
+            "`remote_stage` cannot be combined with `drafter \"in-trunk\"`",
+        ));
+    }
+    if config.remote_stages.len() > MAX_REMOTE_STAGES {
+        return Err(invalid(format!(
+            "at most {MAX_REMOTE_STAGES} remote stages"
+        )));
+    }
+    for stage in &config.remote_stages {
+        if stage.layers == 0 {
+            return Err(invalid("remote_stage.layers must be at least 1"));
+        }
+        if !(stage.url.starts_with("http://") || stage.url.starts_with("https://")) {
+            return Err(invalid(format!(
+                "remote_stage `{}`: expected http://host:port or https://host:port",
+                stage.url
+            )));
+        }
+        if !(Duration::from_secs(1)..=Duration::from_secs(3600)).contains(&stage.timeout) {
+            return Err(invalid(format!(
+                "remote_stage `{}`: timeout must be between 1s and 1h",
+                stage.url
+            )));
+        }
     }
     Ok(())
 }
@@ -2807,7 +3006,27 @@ impl LocalModel {
     /// The shared body of [`LocalModel::generate`] and
     /// `CucaClient::dispatch_local`.
     async fn dispatch(&self, req: UnifiedRequest) -> Result<ProviderDispatch, CucaError> {
+        let prompt = self.tokenize(&req)?;
+        self.dispatch_tokens(req, prompt).await
+    }
+
+    /// The prompt tokens `req` renders to: the first half of
+    /// [`LocalModel::generate`], for a caller that needs the tokens before
+    /// the request runs (K/V transfer: [`LocalModel::kv_hit`] and the peer's
+    /// export take them).
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] for an invalid `temperature` or `top_p`,
+    /// [`CucaError::Provider`] when the request cannot be rendered (an image
+    /// block) or the prompt has `context_length` or more tokens.
+    pub fn tokenize(&self, req: &UnifiedRequest) -> Result<PromptTokens, CucaError> {
         let inner = &self.inner;
+        if inner.is_stage {
+            return Err(CucaError::Config(
+                "this model is a layer stage: it serves stage calls only".into(),
+            ));
+        }
         if let Some(temperature) = req.temperature {
             check_temperature("temperature", temperature)?;
         }
@@ -2815,26 +3034,54 @@ impl LocalModel {
             check_top_p("top_p", top_p)?;
         }
 
-        let prompt = chat_prompt(&req)?;
+        let prompt = chat_prompt(req)?;
         let rendered = inner.template.render(&prompt)?;
-        let prompt_ids = inner.tokenizer.encode_prompt(&rendered);
-        if prompt_ids.len() >= inner.context_length {
+        let ids = inner.tokenizer.encode_prompt(&rendered);
+        if ids.len() >= inner.context_length {
             return Err(CucaError::provider(
                 ProviderEndpoint::Local,
                 format!(
                     "prompt has {} tokens; context_length is {}",
-                    prompt_ids.len(),
+                    ids.len(),
                     inner.context_length
                 ),
             ));
         }
+        Ok(PromptTokens {
+            ids,
+            start_in_thinking: inner.format.starts_in_thinking(&rendered),
+            enable_thinking: inner.template.thinking_enabled(&prompt),
+        })
+    }
 
+    /// Run `req` with the prompt [`LocalModel::tokenize`] made of it: the
+    /// second half of [`LocalModel::generate`]. `prompt` must come from
+    /// this request.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when the engine has shut down.
+    pub async fn generate_tokens(
+        &self,
+        req: UnifiedRequest,
+        prompt: PromptTokens,
+    ) -> Result<LocalGeneration, CucaError> {
+        let ProviderDispatch { stream, metadata } = self.dispatch_tokens(req, prompt).await?;
+        Ok(LocalGeneration { stream, metadata })
+    }
+
+    /// Queue the job of `req` over its tokenized `prompt`.
+    async fn dispatch_tokens(
+        &self,
+        req: UnifiedRequest,
+        prompt: PromptTokens,
+    ) -> Result<ProviderDispatch, CucaError> {
         let (events, rx) = mpsc::channel(EVENT_BUFFER);
         let metadata = ResponseMetadataHandle::empty();
         let job = engine::Job {
-            prompt_ids,
-            start_in_thinking: inner.format.starts_in_thinking(&rendered),
-            enable_thinking: inner.template.thinking_enabled(&prompt),
+            prompt_ids: prompt.ids,
+            start_in_thinking: prompt.start_in_thinking,
+            enable_thinking: prompt.enable_thinking,
             temperature: req.temperature,
             max_tokens: req.max_tokens,
             top_p: req.top_p,
@@ -2845,13 +3092,78 @@ impl LocalModel {
             metadata: metadata.clone(),
             queued_at: std::time::Instant::now(),
         };
-        inner.jobs.send(job).await.map_err(|_| {
-            CucaError::provider(ProviderEndpoint::Local, "local engine has shut down")
-        })?;
+        self.inner
+            .jobs
+            .send(engine::Msg::Job(job))
+            .await
+            .map_err(|_| shutdown())?;
         Ok(ProviderDispatch {
             stream: Box::pin(LocalStream { rx }),
             metadata,
         })
+    }
+
+    /// Whether this model is a layer-stage worker ([`LocalModelConfig::stage`]):
+    /// it serves [`LocalModel::stage_call`] only, no requests.
+    pub fn is_stage(&self) -> bool {
+        self.inner.is_stage
+    }
+
+    /// Answer one frame of a layer-stage coordinator (the body of `POST
+    /// /cuca/v1/stage`): an `open` that starts a session, a forward pass of
+    /// this worker's layers, or a snapshot, restore or prefetch call. The
+    /// frame is opaque to the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] for a coordinator that does not match this
+    /// worker (another file, layers, sizing or session) or a model that is
+    /// not a stage; [`CucaError::Provider`] for a malformed frame, a failed
+    /// pass or an engine that has shut down.
+    pub async fn stage_call(&self, frame: Vec<u8>) -> Result<Vec<u8>, CucaError> {
+        self.call(move |engine| engine.stage_call(&frame)).await?
+    }
+
+    /// Run `f` on the engine thread and return its result. The call waits in
+    /// the same queue as the requests, so behind a full queue of requests it
+    /// waits like one.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when the engine has shut down.
+    async fn call<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut engine::Engine) -> T + Send + 'static,
+    ) -> Result<T, CucaError> {
+        let (tx, rx) = oneshot::channel();
+        let call = engine::Msg::Call(Box::new(move |engine| {
+            let _ = tx.send(f(engine));
+        }));
+        self.inner.jobs.send(call).await.map_err(|_| shutdown())?;
+        rx.await.map_err(|_| shutdown())
+    }
+}
+
+/// The error of a call to an engine thread that has ended.
+fn shutdown() -> CucaError {
+    CucaError::provider(ProviderEndpoint::Local, "local engine has shut down")
+}
+
+/// The tokens of a request's prompt, from [`LocalModel::tokenize`]: what
+/// [`LocalModel::generate_tokens`] runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromptTokens {
+    ids: Vec<u32>,
+    /// The prompt ends inside an open reasoning channel.
+    start_in_thinking: bool,
+    /// The request enabled thinking.
+    enable_thinking: bool,
+}
+
+impl PromptTokens {
+    /// The prompt's token ids.
+    pub fn ids(&self) -> &[u32] {
+        &self.ids
     }
 }
 
@@ -2860,31 +3172,14 @@ mod tests {
     use tokio_stream::StreamExt;
 
     use super::*;
-    use crate::provider::local::engine::testing::{engine, tiny_format, tiny_tokenizer};
+    use crate::provider::local::engine::testing::{engine_at, tiny_local_model};
     use crate::provider::local::model::tiny::{TinyModel, TinySpec, write_spec, write_tiny_model};
 
-    /// A template that renders the first message's content after `<bos>`.
-    const TEMPLATE: &str = "{{ bos_token }}{{ messages[0]['content'] }}";
-
     async fn tiny_model(model: &TinyModel, context_length: usize) -> LocalModel {
-        let path = model.path.clone();
-        LocalModel::start(Arc::default(), move || {
-            let tokenizer = Arc::new(tiny_tokenizer());
-            let template = ChatTemplate::new(
-                TEMPLATE.to_string(),
-                "<bos>".to_string(),
-                "<eos>".to_string(),
-            )?;
-            // The engine must be built on the engine thread, from the path.
-            let tiny = TinyModel { path };
-            let engine = engine(&tiny, context_length, 0.0, None);
-            // `tiny` would delete the file on drop; the caller still owns it.
-            std::mem::forget(tiny);
-            let format = tiny_format(&tokenizer);
-            Ok((engine, tokenizer, template, format))
+        tiny_local_model(model.path.clone(), context_length, move |path| {
+            engine_at(path, context_length)
         })
         .await
-        .expect("tiny engine starts")
     }
 
     fn local_client(model: LocalModel) -> CucaClient {
@@ -3431,6 +3726,9 @@ convert quant="q4_0" engram_quant="bf16"
 drafter "in-trunk"
 draft_tokens 3
 shard_dirs "E:/parts" "F:/parts"
+kv_export max_exports=3
+remote_stage url="http://box-a:8000" layers=14
+stage first=2 layers=5
 "#)
         .unwrap();
         let expected = LocalModelConfig {
@@ -3470,6 +3768,16 @@ shard_dirs "E:/parts" "F:/parts"
             drafter: Some(DrafterSource::InTrunk),
             draft_tokens: 3,
             shard_dirs: vec![PathBuf::from("E:/parts"), PathBuf::from("F:/parts")],
+            kv_export: Some(KvExportConfig { max_exports: 3 }),
+            remote_stages: vec![RemoteStage {
+                url: "http://box-a:8000".into(),
+                layers: 14,
+                ..RemoteStage::default()
+            }],
+            stage: Some(StageRange {
+                first: 2,
+                layers: 5,
+            }),
             on_download_progress: None,
         };
         assert_same(&config, &expected);
@@ -3965,5 +4273,415 @@ source {
         while let Some(item) = stream.next().await {
             let _ = item;
         }
+    }
+
+    /// The reply text of a generation, and what the engine reported, once it
+    /// ended.
+    async fn reply_of(mut generation: LocalGeneration) -> (String, GenerationReport) {
+        let mut text = String::new();
+        while let Some(item) = generation.next().await {
+            if let MessageContentBlock::Text(t) = item.unwrap() {
+                text.push_str(&t);
+            }
+        }
+        let report = generation.report();
+        (text, report)
+    }
+
+    /// A stage worker answers the frames of a coordinator and no requests:
+    /// it refuses to tokenize and generate, opens only for a caller that
+    /// matches it, and a model that is not a stage answers no frame.
+    #[tokio::test]
+    async fn a_stage_worker_serves_frames_and_no_requests() {
+        use crate::provider::local::engine::testing::{stage_worker_at, tiny_sizing};
+        use crate::provider::local::model::split::LayerRange;
+        use crate::provider::local::stageframe::{Open, open_frame};
+
+        let file = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let range = LayerRange { first: 0, end: 1 };
+        let worker = tiny_local_model(file.path.clone(), 96, move |path| {
+            stage_worker_at(path, 96, range, 1)
+        })
+        .await;
+        assert!(worker.is_stage());
+
+        let request = UnifiedRequest::new("m").add_user_message("abcd");
+        let err = worker.tokenize(&request).unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("this model is a layer stage")),
+            "{err}"
+        );
+        let err = worker
+            .generate(request)
+            .await
+            .err()
+            .expect("generate fails");
+        assert!(matches!(err, CucaError::Config(_)), "{err}");
+
+        let (sizing, _) = tiny_sizing(96, 1, None, None);
+        let open = Open {
+            fingerprint: worker.fingerprint(),
+            first: 0,
+            end: 1,
+            context_length: 96,
+            max_sequences: 1,
+            kv_tokens: sizing.kv_tokens as u64,
+            max_rows: sizing.max_rows as u64,
+            session: 7,
+        };
+        assert!(
+            worker
+                .stage_call(open_frame(&open))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let err = worker
+            .stage_call(open_frame(&Open { end: 2, ..open }))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("this stage holds layers 0..1")),
+            "{err}"
+        );
+
+        let plain = tiny_model(&file, 96).await;
+        assert!(!plain.is_stage());
+        let err = plain.stage_call(open_frame(&open)).await.unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("not a layer stage")),
+            "{err}"
+        );
+    }
+
+    /// A prefix one local model exports and another imports is read from the
+    /// second one's store, and the reply is what a model that prefilled the
+    /// prompt itself gives.
+    #[tokio::test]
+    async fn a_prefix_moves_between_two_local_models() {
+        let file = write_spec(&TinySpec {
+            context: 128,
+            ..TinySpec::llama()
+        });
+        let request = || {
+            UnifiedRequest::new("m")
+                .add_user_message("abcdefg".repeat(15))
+                .set_temperature(0.0)
+                .set_max_tokens(6)
+        };
+        let p = tiny_local_model(file.path.clone(), 128, |path| {
+            engine_at(path, 128).with_exports(2)
+        })
+        .await;
+        let d = tiny_model(&file, 128).await;
+        let fresh = tiny_model(&file, 128).await;
+        let (want, _) = reply_of(fresh.generate(request()).await.unwrap()).await;
+
+        let prompt = d.tokenize(&request()).unwrap();
+        let ids = prompt.ids().to_vec();
+        assert!(d.imports_kv());
+        let have = d.kv_hit(ids.clone()).await.unwrap();
+        assert_eq!(have, 0);
+
+        // A model that does not export refuses; so does a stale range.
+        let err = d.kv_export(ids.clone(), 0).await.unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains("kv_export")),
+            "{err}"
+        );
+        let err = p.kv_export(ids.clone(), 8).await.unwrap_err();
+        assert!(err.to_string().contains("nothing to export"), "{err}");
+
+        let mut export = p.kv_export(ids.clone(), have).await.unwrap();
+        let (from, to) = export.range();
+        assert_eq!((from, to), (0, 96));
+        let mut import = d.kv_import(ids.clone(), from, to).await.unwrap();
+        let (mut frames, mut filed) = (0, false);
+        while let Some(frame) = export.next_frame().await {
+            filed = import.write_frame(&frame.unwrap()).await.unwrap();
+            frames += 1;
+        }
+        assert!(filed, "the end frame filed the prefix");
+        assert_eq!(frames, 3, "a header, one rows frame, the end");
+        assert!(export.next_frame().await.is_none());
+        assert!(import.write_frame(&kvframe::end_frame()).await.is_err());
+        assert_eq!(d.kv_hit(ids.clone()).await.unwrap(), to);
+
+        let generation = d.generate_tokens(request(), prompt).await.unwrap();
+        let (got, report) = reply_of(generation).await;
+        assert_eq!(
+            report.prompt_cache.map(|c| c.read_tokens),
+            Some(to as u32),
+            "the imported prefix was read"
+        );
+        assert_eq!(got, want);
+
+        // A header of another model or range, and a frame before the header,
+        // are refused; a refused import is over.
+        let d2 = tiny_model(&file, 128).await;
+        let header = |fingerprint: u64, to: usize| {
+            kvframe::header_frame(&kvframe::Header {
+                version: wire::WIRE_VERSION,
+                fingerprint,
+                from: 0,
+                to,
+                chunk: 256,
+                snapshot: false,
+            })
+        };
+        let mut import = d2.kv_import(ids.clone(), 0, 96).await.unwrap();
+        let err = import
+            .write_frame(&header(d2.fingerprint() ^ 1, 96))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not the same file"), "{err}");
+        assert!(
+            import
+                .write_frame(&header(d2.fingerprint(), 96))
+                .await
+                .is_err()
+        );
+        let mut import = d2.kv_import(ids.clone(), 0, 96).await.unwrap();
+        let err = import
+            .write_frame(&header(d2.fingerprint(), 64))
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("exports 0..64"), "{err}");
+        let mut import = d2.kv_import(ids.clone(), 0, 96).await.unwrap();
+        let err = import.write_frame(&kvframe::end_frame()).await.unwrap_err();
+        assert!(err.to_string().contains("before the header"), "{err}");
+        // A refused or finished import gives its blocks back at once; so
+        // does a dropped one.
+        let import = d2.kv_import(ids, 0, 96).await.unwrap();
+        drop(import);
+        let mut used = u64::MAX;
+        for _ in 0..200 {
+            // A call takes the engine through a turn, which collects what
+            // was dropped and publishes the gauges.
+            d2.kv_hit(vec![9, 9]).await.unwrap();
+            used = d2.serving_stats().used_blocks as u64;
+            if used == 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert_eq!(used, 0, "the imports gave their blocks back");
+    }
+}
+
+#[cfg(test)]
+mod distributed_config_tests {
+    use super::*;
+
+    fn parse(text: &str) -> LocalModelConfig {
+        crate::config::load_kdl_str(text).unwrap()
+    }
+
+    fn rejected(config: &LocalModelConfig, needle: &str) {
+        let err = validate_kv_export(config)
+            .and_then(|()| validate_stages(config))
+            .unwrap_err();
+        assert!(
+            matches!(&err, CucaError::Config(m) if m.contains(needle)),
+            "{needle}: {err}"
+        );
+    }
+
+    fn stage(url: &str, layers: usize) -> RemoteStage {
+        RemoteStage {
+            url: url.into(),
+            layers,
+            ..RemoteStage::default()
+        }
+    }
+
+    #[test]
+    fn kv_export_parses_with_properties_and_bare() {
+        assert!(parse("source \"qwen3-0.6b-q8_0\"\n").kv_export.is_none());
+        let bare = parse("source \"qwen3-0.6b-q8_0\"\nkv_export\n");
+        assert_eq!(bare.kv_export.unwrap().max_exports, 2);
+        let set = parse("source \"qwen3-0.6b-q8_0\"\nkv_export max_exports=5\n");
+        assert_eq!(set.kv_export.unwrap().max_exports, 5);
+        assert!(validate(&set).is_ok());
+    }
+
+    #[test]
+    fn kv_export_bounds_and_tensor_parallelism_are_rejected() {
+        for n in [0, 17] {
+            let c = LocalModelConfig {
+                kv_export: Some(KvExportConfig { max_exports: n }),
+                ..LocalModelConfig::default()
+            };
+            rejected(
+                &c,
+                &format!("kv_export.max_exports must be in 1..=16, got {n}"),
+            );
+        }
+        let c = LocalModelConfig {
+            kv_export: Some(KvExportConfig::default()),
+            shards: vec![LocalDevice::Cpu],
+            ..LocalModelConfig::default()
+        };
+        rejected(
+            &c,
+            "K/V transfer cannot be combined with tensor parallelism (`shards`)",
+        );
+        // Reported ahead of the device rules of `shards`.
+        assert!(matches!(
+            validate(&c),
+            Err(CucaError::Config(m)) if m.contains("K/V transfer")
+        ));
+    }
+
+    #[test]
+    fn stage_keys_parse_and_repeated_remote_stages_keep_their_order() {
+        let c = parse(
+            "source \"qwen3-0.6b-q8_0\"\n\
+             remote_stage url=\"http://box-a:8000\" layers=14\n\
+             remote_stage url=\"https://box-b:8000\" layers=7 model=\"m\" api_key=\"k\" timeout=\"30s\"\n",
+        );
+        assert_eq!(c.remote_stages.len(), 2);
+        assert_eq!(c.remote_stages[0].url, "http://box-a:8000");
+        assert_eq!(c.remote_stages[0].layers, 14);
+        assert_eq!(c.remote_stages[0].timeout, Duration::from_secs(600));
+        assert_eq!(c.remote_stages[0].model, None);
+        assert_eq!(c.remote_stages[1].url, "https://box-b:8000");
+        assert_eq!(c.remote_stages[1].model.as_deref(), Some("m"));
+        assert_eq!(c.remote_stages[1].api_key.as_deref(), Some("k"));
+        assert_eq!(c.remote_stages[1].timeout, Duration::from_secs(30));
+        validate_stages(&c).unwrap();
+
+        let one = parse("source \"qwen3-0.6b-q8_0\"\nremote_stage url=\"http://a:1\" layers=3\n");
+        assert_eq!(one.remote_stages.len(), 1);
+
+        let worker = parse("source \"qwen3-0.6b-q8_0\"\nstage first=0 layers=14\n");
+        assert_eq!(
+            worker.stage,
+            Some(StageRange {
+                first: 0,
+                layers: 14
+            })
+        );
+        validate_stages(&worker).unwrap();
+        assert!(parse("source \"qwen3-0.6b-q8_0\"\n").stage.is_none());
+    }
+
+    #[test]
+    fn the_remote_stage_debug_output_hides_the_api_key() {
+        let c = LocalModelConfig {
+            remote_stages: vec![RemoteStage {
+                api_key: Some("secret-key".into()),
+                ..stage("http://a:1", 2)
+            }],
+            ..LocalModelConfig::default()
+        };
+        let text = format!("{c:?}");
+        assert!(!text.contains("secret-key"), "{text}");
+        assert!(text.contains("<redacted>"), "{text}");
+    }
+
+    #[test]
+    fn invalid_stage_combinations_are_rejected_with_their_messages() {
+        let worker = || StageRange {
+            first: 0,
+            layers: 4,
+        };
+        let remote = || vec![stage("http://a:1", 4)];
+        let base = LocalModelConfig::default;
+
+        rejected(
+            &LocalModelConfig {
+                stage: Some(worker()),
+                remote_stages: remote(),
+                ..base()
+            },
+            "a model is either a stage worker (`stage`) or the last stage (`remote_stage`), not both",
+        );
+        rejected(
+            &LocalModelConfig {
+                stage: Some(worker()),
+                shards: vec![LocalDevice::Cpu],
+                ..base()
+            },
+            "layer stages cannot be combined with tensor parallelism (`shards`)",
+        );
+        rejected(
+            &LocalModelConfig {
+                remote_stages: remote(),
+                gpu_layers: Some(3),
+                ..base()
+            },
+            "layer stages cannot be combined with `gpu_layers`",
+        );
+        rejected(
+            &LocalModelConfig {
+                stage: Some(worker()),
+                kv_export: Some(KvExportConfig::default()),
+                ..base()
+            },
+            "layer stages cannot be combined with `kv_export`",
+        );
+        rejected(
+            &LocalModelConfig {
+                stage: Some(worker()),
+                drafter: Some(DrafterSource::InTrunk),
+                ..base()
+            },
+            "a stage worker takes no `drafter`",
+        );
+        rejected(
+            &LocalModelConfig {
+                remote_stages: remote(),
+                drafter: Some(DrafterSource::InTrunk),
+                ..base()
+            },
+            "`remote_stage` cannot be combined with `drafter \"in-trunk\"`",
+        );
+        rejected(
+            &LocalModelConfig {
+                remote_stages: (0..17)
+                    .map(|i| stage(&format!("http://h{i}:1"), 1))
+                    .collect(),
+                ..base()
+            },
+            "at most 16 remote stages",
+        );
+        rejected(
+            &LocalModelConfig {
+                remote_stages: vec![stage("http://a:1", 0)],
+                ..base()
+            },
+            "remote_stage.layers must be at least 1",
+        );
+        rejected(
+            &LocalModelConfig {
+                remote_stages: vec![stage("box-a:8000", 2)],
+                ..base()
+            },
+            "remote_stage `box-a:8000`: expected http://host:port or https://host:port",
+        );
+        for timeout in [Duration::from_millis(500), Duration::from_secs(3601)] {
+            rejected(
+                &LocalModelConfig {
+                    remote_stages: vec![RemoteStage {
+                        timeout,
+                        ..stage("http://a:1", 2)
+                    }],
+                    ..base()
+                },
+                "remote_stage `http://a:1`: timeout must be between 1s and 1h",
+            );
+        }
+        // A drafter file is fine for a coordinator here: that check needs
+        // the model's architecture.
+        let file = LocalModelConfig {
+            remote_stages: remote(),
+            drafter: Some(DrafterSource::File(ModelSource::default_model())),
+            ..base()
+        };
+        assert!(validate_stages(&file).is_ok());
     }
 }

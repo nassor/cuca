@@ -6,6 +6,7 @@
 //!     listen "127.0.0.1:8080"
 //!     upstreams "http://10.0.0.1:8000" "http://10.0.0.2:8000"
 //!     upstream_api_key "${API_KEY}"
+//!     disaggregate { prefill "http://10.0.0.1:8000"; decode "http://10.0.0.2:8000" }
 //!     api_key "${CLIENT_KEY}"
 //!     policy "prefix-affinity"
 //!     health_interval "1s"
@@ -50,12 +51,38 @@ pub struct BalancerConfig {
     /// The sliding window of the latency figures (`"60s"`).
     #[serde(deserialize_with = "crate::config::duration")]
     pub latency_window: Duration,
+    /// Prefill on some upstreams, decode on others (see [`Disaggregate`]).
+    pub disaggregate: Option<Disaggregate>,
 }
 
 impl<'de> Deserialize<'de> for Policy {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         crate::server::config::parsed(deserializer)
     }
+}
+
+/// What an upstream does for a request when the balancer disaggregates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    /// Prefills and decodes whole requests.
+    Whole,
+    /// Prefills for decode nodes; serves whole requests only when no other
+    /// healthy upstream serves the model.
+    Prefill,
+    /// Decodes, importing the prompt's K/V rows from a prefill node.
+    Decode,
+}
+
+/// The `disaggregate` section: which upstreams prefill and which decode.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct Disaggregate {
+    /// URLs of the prefill nodes; each also listed in `upstreams`.
+    #[serde(deserialize_with = "crate::config::one_or_many")]
+    pub prefill: Vec<String>,
+    /// URLs of the decode nodes; each also listed in `upstreams`.
+    #[serde(deserialize_with = "crate::config::one_or_many")]
+    pub decode: Vec<String>,
 }
 
 impl BalancerConfig {
@@ -78,6 +105,7 @@ impl BalancerConfig {
             policy: Policy::default(),
             health_interval: Self::DEFAULT_HEALTH_INTERVAL,
             latency_window: Self::DEFAULT_LATENCY_WINDOW,
+            disaggregate: None,
         }
     }
 
@@ -133,6 +161,51 @@ impl BalancerConfig {
             self.upstreams.insert(0, format!("http://{addr}"));
         }
     }
+
+    /// The role of every upstream, in the order of
+    /// [`resolve_upstreams`](Self::resolve_upstreams): all
+    /// [`Role::Whole`] without a `disaggregate` section.
+    ///
+    /// # Errors
+    ///
+    /// [`ServerError::Config`] for an invalid upstream list, a
+    /// `disaggregate` without both a prefill and a decode URL, a URL not
+    /// listed in `upstreams`, or an upstream in both pools.
+    pub fn resolve_roles(&self) -> Result<Vec<Role>, ServerError> {
+        let resolved = self.resolve_upstreams()?;
+        let mut roles = vec![Role::Whole; resolved.len()];
+        let Some(split) = &self.disaggregate else {
+            return Ok(roles);
+        };
+        if split.prefill.is_empty() || split.decode.is_empty() {
+            return Err(ServerError::Config(
+                "disaggregate needs at least one `prefill` and one `decode` upstream".into(),
+            ));
+        }
+        for (pool, role, raws) in [
+            ("prefill", Role::Prefill, &split.prefill),
+            ("decode", Role::Decode, &split.decode),
+        ] {
+            for raw in raws {
+                let (id, _) = normalize_upstream(raw)?;
+                let at = resolved
+                    .iter()
+                    .position(|(other, _)| *other == id)
+                    .ok_or_else(|| {
+                        ServerError::Config(format!(
+                            "disaggregate.{pool} `{raw}` is not listed in `upstreams`"
+                        ))
+                    })?;
+                if roles[at] != Role::Whole && roles[at] != role {
+                    return Err(ServerError::Config(format!(
+                        "upstream `{id}` is in both the prefill and the decode pool"
+                    )));
+                }
+                roles[at] = role;
+            }
+        }
+        Ok(roles)
+    }
 }
 
 impl Default for BalancerConfig {
@@ -142,7 +215,7 @@ impl Default for BalancerConfig {
 }
 
 /// `(host:port, base URL without a trailing slash)` of an upstream URL.
-fn normalize_upstream(raw: &str) -> Result<(String, String), ServerError> {
+pub(crate) fn normalize_upstream(raw: &str) -> Result<(String, String), ServerError> {
     let bad = |why: &str| ServerError::Config(format!("upstream `{raw}`: {why}"));
     let url = raw.trim().trim_end_matches('/');
     let rest = url
@@ -233,5 +306,67 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("expected a duration"), "{err}");
+    }
+
+    fn split(prefill: &[&str], decode: &[&str]) -> BalancerConfig {
+        let mut c = config(&["http://p:1", "http://d:1", "http://w:1"]);
+        c.disaggregate = Some(Disaggregate {
+            prefill: prefill.iter().map(|s| (*s).to_string()).collect(),
+            decode: decode.iter().map(|s| (*s).to_string()).collect(),
+        });
+        c
+    }
+
+    #[test]
+    fn roles_follow_the_disaggregate_pools_and_default_to_whole() {
+        assert_eq!(
+            config(&["http://a:1", "http://b:1"])
+                .resolve_roles()
+                .unwrap(),
+            [Role::Whole, Role::Whole]
+        );
+        let roles = split(&["http://p:1/"], &["http://d:1"])
+            .resolve_roles()
+            .unwrap();
+        assert_eq!(roles, [Role::Prefill, Role::Decode, Role::Whole]);
+
+        let parsed = balance(
+            r#"balance {
+                upstreams "http://p:1" "http://d:1" "http://e:1"
+                disaggregate { prefill "http://p:1"; decode "http://d:1" "http://e:1" }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.resolve_roles().unwrap(),
+            [Role::Prefill, Role::Decode, Role::Decode]
+        );
+    }
+
+    #[test]
+    fn a_disaggregate_needs_both_pools_listed_upstreams_and_no_overlap() {
+        let err = |c: BalancerConfig| c.resolve_roles().unwrap_err().to_string();
+        let e = err(split(&["http://p:1"], &[]));
+        assert!(
+            e.contains("disaggregate needs at least one `prefill` and one `decode` upstream"),
+            "{e}"
+        );
+        let e = err(split(&[], &["http://d:1"]));
+        assert!(e.contains("at least one `prefill` and one `decode`"), "{e}");
+        let e = err(split(&["http://x:1"], &["http://d:1"]));
+        assert!(
+            e.contains("disaggregate.prefill `http://x:1` is not listed in `upstreams`"),
+            "{e}"
+        );
+        let e = err(split(&["http://p:1"], &["http://y:1/"]));
+        assert!(
+            e.contains("disaggregate.decode `http://y:1/` is not listed in `upstreams`"),
+            "{e}"
+        );
+        let e = err(split(&["http://p:1", "http://d:1"], &["http://d:1/"]));
+        assert!(
+            e.contains("upstream `d:1` is in both the prefill and the decode pool"),
+            "{e}"
+        );
     }
 }

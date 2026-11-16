@@ -37,7 +37,7 @@ weight = 11
 
 - Requests start in arrival order while fewer than `max_sequences` run and the pool can hold their prompts. A preempted request goes back to the front of the queue and prefills again, mostly from blocks it left in the prefix cache.
 - A prefill chunk is 256 tokens at 8,192 positions, 64 at 32,768 and 16 at 131,072.
-- A drafter that reads every position of its sequence (the in-trunk head, EAGLE, DFlash, DSpark) serves one request at a time, and the Gemma 4 assistant speculates only while one request runs alone. See [Speculative decoding](@/local/drafting.md).
+- A drafter that reads every position of its sequence (the in-trunk head, EAGLE, DFlash, DSpark) keeps one cache per request slot, so its cache memory grows with `max_sequences`. Every running request drafts in the shared step, except in a step where a request prefills. See [Speculative decoding](@/local/drafting.md).
 
 ## How much memory a model needs
 

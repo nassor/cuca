@@ -78,6 +78,7 @@
 //! bookkeeping is 8 bytes per slot plus one hidden row (`4 * n_embd` bytes).
 
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use crate::provider::local::gguf;
 use candle_core::{DType, Device, Tensor};
@@ -95,9 +96,9 @@ use crate::error::CucaError;
 /// "Proposal vocabulary" in the [module docs](self).
 const PROPOSAL_ROWS: usize = 65_536;
 
-/// A multi-token-prediction head and its K/V cache; see the [module
-/// docs](self).
-pub(crate) struct NextnHead {
+/// The weights of a multi-token-prediction head, shared by every fork of it
+/// ([`NextnHead::fork`]).
+pub(crate) struct NextnWeights {
     /// `nextn.eh_proj`: `2 * n_embd -> n_embd`.
     eh_proj: QMatMul,
     enorm: Tensor,
@@ -106,12 +107,18 @@ pub(crate) struct NextnHead {
     /// The block's attention and FFN weights.
     block: LayerWeights,
     spec: LayerSpec,
-    /// K and V `(1, n_kv_head, context_length, head_dim)`: slot `s` holds the
-    /// entry of pair `pairs[s]`; slots past `pairs.len()` are scratch.
-    kv: (Tensor, Tensor),
     /// Rows of the LM head the draft steps rank: the first `vocab_rows` token
     /// ids.
     vocab_rows: usize,
+}
+
+/// A multi-token-prediction head and its K/V cache; see the [module
+/// docs](self).
+pub(crate) struct NextnHead {
+    w: Arc<NextnWeights>,
+    /// K and V `(1, n_kv_head, context_length, head_dim)`: slot `s` holds the
+    /// entry of pair `pairs[s]`; slots past `pairs.len()` are scratch.
+    kv: (Tensor, Tensor),
     /// The committed pairs and the tail; its capacity is the number of K/V
     /// slots.
     log: PairLog,
@@ -142,6 +149,16 @@ impl NextnHead {
     /// See [`PairLog::truncate`].
     pub(crate) fn truncate(&mut self, shared: usize) {
         self.log.truncate(shared);
+    }
+
+    /// A head over the same weights with an empty cache of its own: what a
+    /// second sequence needs when it is drafted for beside this one.
+    pub(crate) fn fork(&self) -> candle_core::Result<Self> {
+        Ok(Self {
+            w: Arc::clone(&self.w),
+            kv: (self.kv.0.zeros_like()?, self.kv.1.zeros_like()?),
+            log: PairLog::new(self.log.capacity),
+        })
     }
 }
 
@@ -203,14 +220,16 @@ impl Transformer {
         let shape = (1, spec.n_kv_head, capacity, spec.head_dim);
         let zeros = || Tensor::zeros(shape, DType::F32, &Device::Cpu).map_err(candle_err);
         Ok(NextnHead {
-            eh_proj,
-            enorm,
-            hnorm,
-            shared_head_norm,
-            block,
-            spec: spec.clone(),
+            w: Arc::new(NextnWeights {
+                eh_proj,
+                enorm,
+                hnorm,
+                shared_head_norm,
+                block,
+                spec: spec.clone(),
+                vocab_rows: self.vocab.min(PROPOSAL_ROWS),
+            }),
             kv: (zeros()?, zeros()?),
-            vocab_rows: self.vocab.min(PROPOSAL_ROWS),
             log: PairLog::new(capacity),
         })
     }
@@ -228,13 +247,13 @@ impl Transformer {
         let m = emb.len() / d;
         let eps = self.hp.eps as f32;
         let dev = &Device::Cpu;
-        let e = rms(&Tensor::from_vec(emb, (1, m, d), dev)?, &head.enorm, eps)?;
+        let e = rms(&Tensor::from_vec(emb, (1, m, d), dev)?, &head.w.enorm, eps)?;
         let h = rms(
             &Tensor::from_vec(hidden.to_vec(), (1, m, d), dev)?,
-            &head.hnorm,
+            &head.w.hnorm,
             eps,
         )?;
-        head.eh_proj.forward(&Tensor::cat(&[&e, &h], 2)?)
+        head.w.eh_proj.forward(&Tensor::cat(&[&e, &h], 2)?)
     }
 
     /// Commit the trunk rows `tokens[i]` at positions `pos + i`, whose
@@ -276,13 +295,13 @@ impl Transformer {
         slot: usize,
         first: usize,
     ) -> candle_core::Result<()> {
-        let Mixer::Attention(aw) = &head.block.mixer else {
+        let Mixer::Attention(aw) = &head.w.block.mixer else {
             return Err(candle_core::Error::msg("the head block is not attention"));
         };
-        let spec = &head.spec;
+        let spec = &head.w.spec;
         let m = emb.len() / self.hp.n_embd;
         let x = self.head_input(head, emb, hidden)?;
-        let h = match &head.block.attn_norm {
+        let h = match &head.w.block.attn_norm {
             Some(w) => rms(&x, w, self.hp.eps as f32)?,
             None => x.clone(),
         };
@@ -350,23 +369,23 @@ impl Transformer {
         slot: usize,
         j: usize,
     ) -> candle_core::Result<(Vec<f32>, Vec<f32>)> {
-        let Mixer::Attention(aw) = &head.block.mixer else {
+        let Mixer::Attention(aw) = &head.w.block.mixer else {
             return Err(candle_core::Error::msg("the head block is not attention"));
         };
         let x = self.head_input(head, emb, hidden)?;
         let call = AttnCall {
-            spec: &head.spec,
+            spec: &head.w.spec,
             offset: 0,
             start: slot,
             rope_start: j + 1,
             t: 1,
             kv: KvAccess::Slab(&head.kv),
         };
-        let y = self.block(&head.block, &x, None, 1, |h| {
+        let y = self.block(&head.w.block, &x, None, 1, |h| {
             self.attention_in(std::slice::from_ref(&call), aw, h)
         })?;
-        let normed = rms(&y, &head.shared_head_norm, self.hp.eps as f32)?;
-        let logits = self.head_rows(&normed, head.vocab_rows)?;
+        let normed = rms(&y, &head.w.shared_head_norm, self.hp.eps as f32)?;
+        let logits = self.head_rows(&normed, head.w.vocab_rows)?;
         Ok((
             logits.flatten_all()?.to_vec1::<f32>()?,
             normed.flatten_all()?.to_vec1::<f32>()?,
@@ -696,8 +715,8 @@ mod tests {
         let model = write_qwen35(&TinyQwen35::default());
         let (m, mut full) = production(&model);
         let (_, mut part) = production(&model);
-        assert_eq!(full.vocab_rows, VOCAB);
-        part.vocab_rows = 5;
+        assert_eq!(full.w.vocab_rows, VOCAB);
+        Arc::get_mut(&mut part.w).unwrap().vocab_rows = 5;
         let n = 6;
         let (tokens, hidden) = rows(n, 12);
         for head in [&mut full, &mut part] {

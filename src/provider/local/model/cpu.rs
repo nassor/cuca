@@ -41,7 +41,7 @@ use candle_nn::rotary_emb::{rope, rope_i};
 use super::arch::Act;
 use super::csa::Gating;
 use super::delta::{DeltaCell, DeltaKernel, DeltaState, Rows};
-use super::engram::{self, RowSource};
+use super::engram;
 use super::layout::{Ffn, LayerLayout, Qkv, ffn_norm_part, name, tensor_info};
 use super::moe::Routing;
 use super::moe::{route, route_with};
@@ -52,8 +52,7 @@ use super::params::{DeltaSpec, Hparams, LayerSpec, MlaSpec, MoeSpec};
 use super::qmm::QmmWeight;
 use super::quant::{RowTable, TokenEmbedding, dequant_row};
 use super::rope::RopeKind;
-#[cfg(feature = "provider-local-gpu")]
-use super::split::MirrorRows;
+use super::split::{Carry, LayerRange, MirrorRows, Part, StageOut, passes};
 use super::tier::{BuildFn, ExpertSlice, ExpertStore, LayerExperts, TierShared, add};
 use super::{
     Batch, Want, attention_mask, build_rope_tables, candle_err, check_context, err, read_hparams,
@@ -87,6 +86,7 @@ pub(super) mod paged_attn;
 mod pairs;
 #[cfg(test)]
 mod tier_tests;
+mod transfer;
 pub(crate) use eagle::EagleHead;
 pub(crate) use head::NextnHead;
 use paged_attn::{PoolShape, attend_paged_rows, gather, store_rows};
@@ -1006,9 +1006,9 @@ fn build_cpu_expert(
     })
 }
 
-/// The expert store of a tiered model (`ExpertPlacement::Tiered`): every
-/// MoE layer's experts located in the file, the RAM tier sized by `tiers`,
-/// warmed from `tiers.warm_from`.
+/// The expert store of a tiered model (`ExpertPlacement::Tiered`): the
+/// experts of every MoE layer in `layer_range` located in the file, the RAM
+/// tier sized by `tiers`, warmed from `tiers.warm_from`.
 ///
 /// # Errors
 ///
@@ -1019,7 +1019,7 @@ pub(crate) fn open_expert_store(
     content: &gguf::Content,
     hp: &Hparams,
     tiers: &ExpertTiers,
-    upto: usize,
+    layer_range: std::ops::Range<usize>,
     shared: Option<Arc<TierShared>>,
 ) -> Result<Arc<ExpertStore<CpuExpert>>, CucaError> {
     let spec = hp.moe.ok_or_else(|| {
@@ -1029,7 +1029,13 @@ pub(crate) fn open_expert_store(
         ))
     })?;
     let mut layers = Vec::new();
-    for (il, ls) in hp.layers.iter().enumerate().take(upto) {
+    for (il, ls) in hp
+        .layers
+        .iter()
+        .enumerate()
+        .skip(layer_range.start)
+        .take(layer_range.len())
+    {
         if let Ffn::Moe { ff, fused, .. } = LayerLayout::read(hp, il, ls, content)?.ffn {
             let slice = |part: &str, rows, cols| {
                 ExpertSlice::read(content, &name::blk(il, part), spec.n_expert, rows, cols)
@@ -1113,18 +1119,27 @@ pub(crate) struct Transformer {
     context_length: usize,
     vocab: usize,
     /// Token embedding table; `None` on a drafter, whose input is a hidden
-    /// state.
+    /// state, and on a stage that starts after layer 0.
     embed: Option<TokenEmbedding>,
     ple: Option<PleWeights>,
+    /// The layers of the range `first..end` the model holds: `layers[i]` is
+    /// layer `first + i`.
     layers: Vec<LayerWeights>,
+    /// The first layer the model runs; `0` unless it is a later stage.
+    first: usize,
+    /// One past the last layer it runs; `n_layer` unless it is an earlier
+    /// stage.
+    end: usize,
     output_norm: Tensor,
-    /// `None` on a [`Front`], whose layers hand their output to the model
-    /// that holds the head.
+    /// `None` on a stage that ends before the last layer: its layers hand
+    /// their output to the stage that holds the head.
     lm_head: Option<QMatMul>,
     /// Drafter projections between the target's hidden width and its own.
     nextn: Option<Nextn>,
     ropes: Vec<RopeTable>,
-    /// The paged K/V of every K/V-owning layer (`None` for the others).
+    /// The paged K/V of every layer that owns K/V in the range, and of the
+    /// layers before it that the range reads ([`Part::mirror`]), indexed by
+    /// layer (`None` for the others).
     kv: Vec<Option<Arc<KvLayer>>>,
     /// The hyper-connection path's state: compressed-row pools, rotary
     /// tables, compressor state ([`Behavior::hyper_connections`](super::arch::Behavior)).
@@ -1142,11 +1157,13 @@ pub(crate) struct Transformer {
     hybrid: bool,
     /// Counters and heat of the expert tiers (`ExpertPlacement::Tiered`).
     tiers: Option<Arc<TierShared>>,
-    /// K/V-owning layers whose new rows the layers after a [`Front`] read
-    /// (Gemma 4's shared-K/V layers on the GPU): [`Transformer::forward_front`]
-    /// returns them.
-    #[cfg(feature = "provider-local-gpu")]
+    /// K/V-owning layers of the range whose new rows a later stage reads
+    /// (Gemma 4's shared-K/V layers): [`Transformer::forward_stage`] returns
+    /// them.
     export: Vec<usize>,
+    /// The layers before the range whose rows the previous stage sends and a
+    /// later one reads ([`passes`]): forwarded unchanged.
+    passes: Vec<usize>,
 }
 
 /// Which hidden-state rows a forward pass returns next to the logits.
@@ -1263,6 +1280,18 @@ struct AttnCall<'a> {
     kv: KvAccess<'a>,
 }
 
+/// What a stage's layers start from: the embedded tokens of the stage that
+/// starts at layer 0, or the previous stage's output.
+enum Entry {
+    Embedded {
+        embeddings: Vec<f32>,
+        /// The per-layer-embedding token rows, before they merge with the
+        /// projected embeddings.
+        per_layer: Option<Vec<f32>>,
+    },
+    Carried(Carry),
+}
+
 /// One sequence's share of a forward step: its rows are `offset..offset + t`
 /// of the step's concatenated rows.
 struct Seg<'a> {
@@ -1290,43 +1319,6 @@ struct Seg<'a> {
 struct Nextn {
     pre: QMatMul,
     post: QMatMul,
-}
-
-/// The first `layers` layers of a model, run on the CPU while a GPU holds the
-/// rest and the LM head (layer offload, see [`split`](super::split)): the
-/// embeddings, the per-layer-embedding inputs and the layers `0..layers`, the
-/// weights, K/V pools and recurrent states of no other layer.
-#[cfg_attr(not(feature = "provider-local-gpu"), allow(dead_code))]
-pub(crate) struct Front {
-    /// Layers the CPU holds, `1..n_layer`.
-    pub(crate) layers: usize,
-    /// The expert-tier counters and heat shared with the other half's expert
-    /// store, so that one set of statistics covers the whole model.
-    pub(crate) shared: Option<Arc<TierShared>>,
-    /// The K/V-owning layers among `0..layers` that a layer after them
-    /// reads the K/V of ([`mirrored`](super::split::mirrored)).
-    pub(crate) export: Vec<usize>,
-    /// The Engram table the other half shares (`None`: this half opens its
-    /// own, or the model has none), so that its row cache and counters are
-    /// single.
-    pub(crate) engram: Option<Arc<dyn RowSource>>,
-}
-
-/// What a [`Front`] hands to the layers after it: the residual stream
-/// and, for Gemma 4, the per-layer inputs every layer reads.
-#[cfg(feature = "provider-local-gpu")]
-pub(crate) struct FrontOut {
-    /// `[rows, n_embd]` row-major (`[rows, streams * n_embd]`, the
-    /// hyper-connection streams, for a model that has them).
-    pub(crate) hidden: Vec<f32>,
-    /// `[rows, n_layer, ple_dim]` row-major, `(ctx + tok) / sqrt(2)`.
-    pub(crate) per_layer: Option<Vec<f32>>,
-    /// `[rows, streams]`: the pre weights the layers after the front start
-    /// from (hyper-connection models).
-    pub(crate) pre: Option<Vec<f32>>,
-    /// The rows the pass wrote into the cache of every layer of
-    /// [`Front::export`].
-    pub(crate) kv: Vec<MirrorRows>,
 }
 
 impl Transformer {
@@ -1374,20 +1366,23 @@ impl Transformer {
         )
     }
 
-    /// Load only the layers of `front` (and the embeddings) of the model,
-    /// with the experts of those layers placed as `experts` says;
-    /// `dequantize` holds every matmul weight as f32 (tests).
+    /// Load only the layers `part.range` of the model, with the experts of
+    /// those layers placed as `experts` says: a stage of a model that runs on
+    /// several engines (layer offload, layer stages). The embeddings load
+    /// only for a range that starts at layer 0, the final norm and the LM
+    /// head only for one that ends at the last layer. `dequantize` holds
+    /// every matmul weight as f32 (tests).
     ///
     /// # Errors
     ///
-    /// As [`Transformer::load_placed`].
-    #[cfg(feature = "provider-local-gpu")]
-    pub(crate) fn load_front(
+    /// As [`Transformer::load_placed`], plus [`CucaError::Provider`] for a
+    /// range that is empty or ends past the last layer.
+    pub(crate) fn load_range(
         content: &gguf::Content,
         context_length: usize,
         experts: &ExpertPlacement,
         sizing: &Sizing,
-        front: &Front,
+        part: &Part,
         dequantize: bool,
     ) -> Result<Self, CucaError> {
         Self::load_with(
@@ -1398,7 +1393,7 @@ impl Transformer {
             experts,
             sizing,
             &EngramCache::default(),
-            Some(front),
+            Some(part),
         )
     }
 
@@ -1468,7 +1463,7 @@ impl Transformer {
         experts: &ExpertPlacement,
         sizing: &Sizing,
         engram: &EngramCache,
-        front: Option<&Front>,
+        part: Option<&Part>,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
         match (drafter, hp.arch.is_drafter()) {
@@ -1493,7 +1488,17 @@ impl Transformer {
             _ => {}
         }
         check_context(&hp, context_length)?;
-        let upto = front.map_or(hp.n_layer, |f| f.layers);
+        let range = part.map_or_else(|| LayerRange::whole(&hp), |p| p.range);
+        if range.first >= range.end || range.end > hp.n_layer {
+            return Err(err(format!(
+                "the layers {}..{} are no part of the {} layers of `{}`",
+                range.first,
+                range.end,
+                hp.n_layer,
+                hp.arch.name()
+            )));
+        }
+        let mirror: &[usize] = part.map_or(&[], |p| p.mirror.as_slice());
         let store = match experts {
             ExpertPlacement::Resident => None,
             ExpertPlacement::Host { .. } => {
@@ -1510,8 +1515,8 @@ impl Transformer {
                 content,
                 &hp,
                 tiers,
-                upto,
-                front.and_then(|f| f.shared.clone()),
+                range.first..range.end,
+                part.and_then(|p| p.shared.clone()),
             )?),
         };
         let mut loader = Loader {
@@ -1530,29 +1535,42 @@ impl Transformer {
             .first()
             .ok_or_else(|| err(format!("tensor `{}`: scalar", name::TOKEN_EMBD)))?;
         let embd_shape = [vocab, n_embd];
-        let (embd_type, embd_bytes) = loader.raw(name::TOKEN_EMBD, &embd_shape)?;
-        let embd: Arc<[u8]> = Arc::from(embd_bytes);
-        let embed = if drafter {
-            None
+        // The table serves the lookup of the stage that embeds and the tied
+        // head of the stage that ends the model (which then also looks tokens
+        // up for a drafter that starts from a token's embedding); a stage
+        // that does neither does not read it.
+        let embeds = !drafter && range.first == 0;
+        let heads = range.end == hp.n_layer;
+        let table = if embeds || (heads && !loader.has(name::OUTPUT)) {
+            let (embd_type, embd_bytes) = loader.raw(name::TOKEN_EMBD, &embd_shape)?;
+            Some((embd_type, Arc::<[u8]>::from(embd_bytes)))
         } else {
-            Some(TokenEmbedding::new(
-                embd_type,
-                Arc::clone(&embd),
+            None
+        };
+        let embed = match &table {
+            Some((embd_type, embd)) if !drafter => Some(TokenEmbedding::new(
+                *embd_type,
+                Arc::clone(embd),
                 vocab,
                 n_embd,
-            )?)
+            )?),
+            _ => None,
         };
-        let lm_head = if front.is_some() {
+        let lm_head = if !heads {
             None
         } else if loader.has(name::OUTPUT) {
             Some(loader.matmul(name::OUTPUT, &[vocab, n_embd])?)
-        } else {
+        } else if let Some((embd_type, embd)) = table {
             Some(loader.to_matmul(embd_type, embd, &embd_shape, name::TOKEN_EMBD)?)
+        } else {
+            return Err(err("the token embedding table is missing"));
         };
         let output_norm = loader.vector(name::OUTPUT_NORM, n_embd)?;
 
+        // Only the stage that embeds computes the per-layer inputs; the
+        // stages after it receive them.
         let ple = match hp.ple_dim {
-            Some(dim) => {
+            Some(dim) if range.first == 0 => {
                 let row_len = hp.n_layer * dim;
                 Some(PleWeights {
                     table: RowTable::open(
@@ -1565,7 +1583,7 @@ impl Transformer {
                     proj_norm: loader.vector(name::PER_LAYER_PROJ_NORM, dim)?,
                 })
             }
-            None => None,
+            _ => None,
         };
 
         let rope_tables = build_rope_tables(content, &hp, context_length)?;
@@ -1581,31 +1599,40 @@ impl Transformer {
             .collect::<Result<Vec<_>, CucaError>>()?;
 
         let kv_layout = KvLayout::sized(&hp, context_length, sizing);
-        let mut layers = Vec::with_capacity(upto);
-        let mut kv_layers = Vec::with_capacity(upto);
-        let mut compressed = Vec::with_capacity(upto);
-        for (il, spec) in hp.layers.iter().enumerate().take(upto) {
-            let layout = LayerLayout::read(&hp, il, spec, content)?;
-            match kv_layout.layer_group[il].filter(|_| spec.owns_kv(il)) {
+        let mut layers = Vec::with_capacity(range.len());
+        let mut kv_layers = Vec::with_capacity(hp.n_layer);
+        let mut compressed = Vec::with_capacity(hp.n_layer);
+        for (il, spec) in hp.layers.iter().enumerate() {
+            let in_range = range.contains(il);
+            // The pools of the layers the range reads from before it exist
+            // too, filled from what the previous stage sends.
+            let held = in_range || mirror.contains(&il);
+            match kv_layout.layer_group[il].filter(|_| held && spec.owns_kv(il)) {
                 Some(g) => kv_layers.push(Some(KvLayer::zeros(spec, kv_layout.blocks[g]))),
                 None => kv_layers.push(None),
             }
             compressed.push(
-                match (spec.csa.filter(|c| c.owns_kv), kv_layout.csa_group[il]) {
+                match (
+                    spec.csa.filter(|c| held && c.owns_kv),
+                    kv_layout.csa_group[il],
+                ) {
                     (Some(c), Some(g)) => {
                         Some(KvLayer::compressed(c.row_width, kv_layout.blocks[g]))
                     }
                     _ => None,
                 },
             );
-            layers.push(load_layer(
-                &mut loader,
-                &hp,
-                il,
-                spec,
-                &layout,
-                store.as_ref(),
-            )?);
+            if in_range {
+                let layout = LayerLayout::read(&hp, il, spec, content)?;
+                layers.push(load_layer(
+                    &mut loader,
+                    &hp,
+                    il,
+                    spec,
+                    &layout,
+                    store.as_ref(),
+                )?);
+            }
         }
 
         let nextn = if drafter {
@@ -1617,9 +1644,17 @@ impl Transformer {
             None
         };
 
-        let engram_rows = match front.and_then(|f| f.engram.clone()) {
+        // The table opens only for a range that runs an Engram layer.
+        let engram_rows = match part.and_then(|p| p.engram.clone()) {
             Some(shared) => Some(shared),
-            None => engram::open_table(content, &hp, engram)?,
+            None if hp
+                .engram
+                .as_ref()
+                .is_some_and(|es| es.layers.iter().any(|&il| range.contains(il))) =>
+            {
+                engram::open_table(content, &hp, engram)?
+            }
+            None => None,
         };
         let hyper = hyper::HyperModel::new(
             &hp,
@@ -1634,6 +1669,7 @@ impl Transformer {
                 dw.set_slots(sizing.max_sequences);
             }
         }
+        let passes = passes(&hp, range);
         #[cfg(test)]
         let solo = Solo::new(&kv_layout);
         Ok(Self {
@@ -1643,6 +1679,8 @@ impl Transformer {
             embed,
             ple,
             layers,
+            first: range.first,
+            end: range.end,
             output_norm,
             lm_head,
             nextn,
@@ -1663,8 +1701,8 @@ impl Transformer {
                 .map(|_| Slot::default())
                 .collect(),
             tiers: store.map(|s| Arc::clone(s.shared())),
-            #[cfg(feature = "provider-local-gpu")]
-            export: front.map_or_else(Vec::new, |f| f.export.clone()),
+            export: part.map_or_else(Vec::new, |p| p.export.clone()),
+            passes,
         })
     }
 
@@ -1692,63 +1730,37 @@ impl Transformer {
     /// has no token embedding) or a failed pass; a hybrid model then drops
     /// the recurrent state of every slot in the step.
     pub(crate) fn forward_batch(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
-        self.run_batch(batch, |m, embeddings, per_layer, segs| {
-            m.forward_layers(embeddings, per_layer, segs)
-        })
+        match self.forward_stage(batch, None)? {
+            StageOut::Done(outs) => Ok(outs),
+            StageOut::Carry(_) => Err(err(format!(
+                "this model holds the layers {}..{} only: it runs through `forward_stage`",
+                self.first, self.end
+            ))),
+        }
     }
 
-    /// [`Transformer::forward_batch`] for a [`Front`]: the rows through the
-    /// layers it holds, returned as the residual stream (and the per-layer
-    /// inputs) for the model that holds the rest. The recurrent state of
-    /// its delta-net layers advances as in a whole pass.
+    /// [`Transformer::forward_batch`] for a model that holds the layers
+    /// `first..end` only (a stage, see [`split`](super::split)): the rows go
+    /// through those layers. The stage that starts at layer 0 embeds the
+    /// tokens (`input` is `None`); a later one starts from the previous
+    /// stage's [`Carry`] and writes the K/V rows in it into the pools of the
+    /// layers it mirrors. The stage that ends at the last layer returns the
+    /// logits and hidden rows; an earlier one the [`Carry`] for the stage
+    /// after it: the residual stream, the per-layer inputs, and the K/V rows
+    /// of the layers in [`Part::export`] next to the incoming rows the later
+    /// stages read ([`passes`]). The recurrent state of its delta-net layers
+    /// advances as in a whole pass.
     ///
     /// # Errors
     ///
-    /// As [`Transformer::forward_batch`].
-    #[cfg(feature = "provider-local-gpu")]
-    pub(crate) fn forward_front(&mut self, batch: &Batch<'_>) -> Result<FrontOut, CucaError> {
-        self.run_batch(batch, |m, embeddings, per_layer, segs| {
-            let (x, ple, _) = m.trunk(embeddings, per_layer, segs)?;
-            // The rows the pass just cached for the layers on the GPU that
-            // read the K/V of a layer here.
-            let mut kv = Vec::with_capacity(m.export.len());
-            for &il in &m.export {
-                let layer = m.cache(il)?;
-                let data = layer.lock();
-                let mut seqs = Vec::with_capacity(segs.len());
-                for seg in segs {
-                    let table = m.layout.layer_group[il]
-                        .and_then(|g| seg.tables.get(g))
-                        .ok_or_else(|| {
-                            candle_core::Error::msg("the sequence has no block table")
-                        })?;
-                    let (lo, hi) = (seg.start, seg.start + seg.t);
-                    seqs.push((
-                        gather(table, lo, hi, &data.k, layer.shape)?,
-                        gather(table, lo, hi, &data.v, layer.shape)?,
-                    ));
-                }
-                kv.push(MirrorRows { layer: il, seqs });
-            }
-            let flat = |t: Tensor| t.flatten_all().and_then(|t| t.to_vec1::<f32>());
-            let hyper = m.hyper.is_some();
-            Ok(FrontOut {
-                hidden: flat(x)?,
-                per_layer: ple.clone().filter(|_| !hyper).map(flat).transpose()?,
-                pre: ple.filter(|_| hyper).map(flat).transpose()?,
-                kv,
-            })
-        })
-    }
-
-    /// The body of a forward step: validate the batch, embed its rows, run
-    /// `pass(self, embeddings, per_layer, segs)` over them and keep the
-    /// recurrent-state bookkeeping of the sequences.
-    fn run_batch<R>(
+    /// As [`Transformer::forward_batch`], plus [`CucaError::Provider`] for a
+    /// `Carry` that does not fit the batch or the model, or one given to the
+    /// stage that embeds (or missing from a later one).
+    pub(crate) fn forward_stage(
         &mut self,
         batch: &Batch<'_>,
-        pass: impl FnOnce(&Self, Vec<f32>, Option<Vec<f32>>, &[Seg<'_>]) -> candle_core::Result<R>,
-    ) -> Result<R, CucaError> {
+        input: Option<Carry>,
+    ) -> Result<StageOut, CucaError> {
         let _exact = RowExact::enter(batch.exact);
         if batch.rows.is_empty() {
             return Err(err("a forward step requires at least one sequence"));
@@ -1803,11 +1815,31 @@ impl Transformer {
             });
             tokens.extend_from_slice(r.tokens);
         }
-        let mut embeddings = self.embedding_rows(&tokens)?;
-        self.hp.norm_embeddings(&mut embeddings);
-        let per_layer = match (&mut self.ple, self.hp.ple_dim) {
-            (Some(ple), Some(dim)) => Some(ple.table.rows(&tokens, (dim as f32).sqrt())?),
-            _ => None,
+        let entry = if self.first == 0 {
+            if input.is_some() {
+                return Err(err(
+                    "the stage that embeds the tokens takes no carried state",
+                ));
+            }
+            let mut embeddings = self.embedding_rows(&tokens)?;
+            self.hp.norm_embeddings(&mut embeddings);
+            let per_layer = match (&mut self.ple, self.hp.ple_dim) {
+                (Some(ple), Some(dim)) => Some(ple.table.rows(&tokens, (dim as f32).sqrt())?),
+                _ => None,
+            };
+            Entry::Embedded {
+                embeddings,
+                per_layer,
+            }
+        } else {
+            let carry = input.ok_or_else(|| {
+                err(format!(
+                    "the stage that starts at layer {} needs the output of the stage before it",
+                    self.first
+                ))
+            })?;
+            self.check_carry(&carry, &segs)?;
+            Entry::Carried(carry)
         };
         // The call that recorded rows for rollback is over once another one
         // starts. A hybrid model whose pass fails half-way holds recurrent
@@ -1817,8 +1849,8 @@ impl Transformer {
                 self.slots[seg.slot].verify = None;
             }
         }
-        let outs = match pass(self, embeddings, per_layer, &segs) {
-            Ok(outs) => outs,
+        let out = match self.stage_pass(entry, &segs) {
+            Ok(out) => out,
             Err(e) => {
                 for seg in &segs {
                     self.reset_slot(seg.slot);
@@ -1838,7 +1870,178 @@ impl Transformer {
                 }
             }
         }
-        Ok(outs)
+        Ok(out)
+    }
+
+    /// Whether `carry` fits a step over `segs` of this stage: the sizes of
+    /// the stream, the per-layer inputs, the pre weights and the K/V rows.
+    /// Everything is checked before anything is written.
+    fn check_carry(&self, carry: &Carry, segs: &[Seg<'_>]) -> Result<(), CucaError> {
+        let hp = &self.hp;
+        let rows: usize = segs.iter().map(|s| s.t).sum();
+        let streams = self.hyper.as_ref().map_or(1, |hy| hy.spec.streams);
+        let width = streams * hp.n_embd;
+        if carry.hidden.len() != rows * width {
+            return Err(err(format!(
+                "the hidden state holds {} values for {rows} rows of {width}",
+                carry.hidden.len()
+            )));
+        }
+        let per_layer = hp.ple_dim.map(|dim| rows * hp.n_layer * dim);
+        if carry.per_layer.as_ref().map(Vec::len) != per_layer {
+            return Err(err(format!(
+                "the per-layer inputs hold {:?} values, {per_layer:?} expected for {rows} rows",
+                carry.per_layer.as_ref().map(Vec::len)
+            )));
+        }
+        let pre = self.hyper.as_ref().map(|_| rows * streams);
+        if carry.pre.as_ref().map(Vec::len) != pre {
+            return Err(err(format!(
+                "the pre weights hold {:?} values, {pre:?} expected for {rows} rows",
+                carry.pre.as_ref().map(Vec::len)
+            )));
+        }
+        for m in &carry.kv {
+            let spec = hp
+                .layers
+                .get(m.layer)
+                .ok_or_else(|| err(format!("layer {} does not exist", m.layer)))?;
+            if m.seqs.len() != segs.len() {
+                return Err(err(format!(
+                    "layer {}: rows for {} sequences in a step of {}",
+                    m.layer,
+                    m.seqs.len(),
+                    segs.len()
+                )));
+            }
+            if !self.mirrors_layer(m.layer) {
+                if self.passes.contains(&m.layer) {
+                    continue;
+                }
+                return Err(err(format!("layer {} has no mirrored K/V pool", m.layer)));
+            }
+            for (seg, (k, v)) in segs.iter().zip(&m.seqs) {
+                let want = spec.n_kv_head * seg.t * spec.head_dim;
+                if k.len() != want || v.len() != want {
+                    return Err(err(format!(
+                        "layer {}: {} key and {} value values for {want} expected",
+                        m.layer,
+                        k.len(),
+                        v.len()
+                    )));
+                }
+            }
+        }
+        // Every layer this stage reads or forwards needs its rows: a pool
+        // that was never written would give wrong logits, not an error.
+        let needed = (0..self.first)
+            .filter(|&il| self.mirrors_layer(il))
+            .chain(self.passes.iter().copied());
+        for il in needed {
+            if !carry.kv.iter().any(|m| m.layer == il) {
+                return Err(err(format!(
+                    "the carry holds no K/V rows for layer {il}, which this stage reads or forwards"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether layer `il` is before the range and this model keeps a pool
+    /// for its K/V ([`Part::mirror`]).
+    fn mirrors_layer(&self, il: usize) -> bool {
+        il < self.first && self.kv.get(il).is_some_and(Option::is_some)
+    }
+
+    /// Write the rows a previous stage cached for the layers this stage
+    /// mirrors into their pools, under the block tables of `segs`.
+    fn write_mirror(&self, kv: &[MirrorRows], segs: &[Seg<'_>]) -> candle_core::Result<()> {
+        for m in kv.iter().filter(|m| self.mirrors_layer(m.layer)) {
+            let layer = self.cache(m.layer)?;
+            let mut data = layer.lock();
+            for (seg, (k, v)) in segs.iter().zip(&m.seqs) {
+                let table = self.layout.layer_group[m.layer]
+                    .and_then(|g| seg.tables.get(g))
+                    .ok_or_else(|| candle_core::Error::msg("the sequence has no block table"))?;
+                let KvData {
+                    k: pool_k,
+                    v: pool_v,
+                } = &mut *data;
+                store_rows(table, seg.start, seg.t, k, pool_k, layer.shape)?;
+                store_rows(table, seg.start, seg.t, v, pool_v, layer.shape)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The layers of the range over the rows of `entry` and what follows
+    /// them: the final norm and the head, or the carry for the next stage.
+    fn stage_pass(&self, entry: Entry, segs: &[Seg<'_>]) -> candle_core::Result<StageOut> {
+        let hp = &self.hp;
+        let dev = &Device::Cpu;
+        let mut incoming = Vec::new();
+        let (x, second, captured) = match entry {
+            Entry::Embedded {
+                embeddings,
+                per_layer,
+            } => self.trunk(embeddings, per_layer, segs)?,
+            Entry::Carried(carry) => {
+                self.write_mirror(&carry.kv, segs)?;
+                incoming = carry
+                    .kv
+                    .into_iter()
+                    .filter(|m| self.passes.contains(&m.layer))
+                    .collect();
+                let rows: usize = segs.iter().map(|s| s.t).sum();
+                if self.hyper.is_some() {
+                    let pre = carry
+                        .pre
+                        .ok_or_else(|| candle_core::Error::msg("the pre weights are missing"))?;
+                    self.hyper_trunk_from(carry.hidden, pre, segs)?
+                } else {
+                    let x = Tensor::from_vec(carry.hidden, (1, rows, hp.n_embd), dev)?;
+                    let ple = match (carry.per_layer, hp.ple_dim) {
+                        (Some(values), Some(dim)) => {
+                            Some(Tensor::from_vec(values, (1, rows, hp.n_layer, dim), dev)?)
+                        }
+                        _ => None,
+                    };
+                    self.trunk_from(x, ple, segs)?
+                }
+            }
+        };
+        if self.end == hp.n_layer {
+            return Ok(StageOut::Done(self.finish(&x, &captured, segs)?));
+        }
+        // The rows the pass just cached for the layers of later stages that
+        // read the K/V of a layer here, then the rows they read that an
+        // earlier stage computed.
+        let mut kv = Vec::with_capacity(self.export.len() + incoming.len());
+        for &il in &self.export {
+            let layer = self.cache(il)?;
+            let data = layer.lock();
+            let mut seqs = Vec::with_capacity(segs.len());
+            for seg in segs {
+                let table = self.layout.layer_group[il]
+                    .and_then(|g| seg.tables.get(g))
+                    .ok_or_else(|| candle_core::Error::msg("the sequence has no block table"))?;
+                let (lo, hi) = (seg.start, seg.start + seg.t);
+                seqs.push((
+                    gather(table, lo, hi, &data.k, layer.shape)?,
+                    gather(table, lo, hi, &data.v, layer.shape)?,
+                ));
+            }
+            kv.push(MirrorRows { layer: il, seqs });
+        }
+        kv.append(&mut incoming);
+        let flat = |t: Tensor| t.flatten_all().and_then(|t| t.to_vec1::<f32>());
+        let hyper = self.hyper.is_some();
+        Ok(StageOut::Carry(Carry {
+            hidden: flat(x)?,
+            per_layer: second.clone().filter(|_| !hyper).map(flat).transpose()?,
+            pre: second.filter(|_| hyper).map(flat).transpose()?,
+            kv,
+        }))
     }
 
     /// Copies of the recurrent state of every delta-net layer for `slot`
@@ -1886,7 +2089,12 @@ impl Transformer {
                         if sliding { "sliding-window" } else { "full" }
                     ))
                 })?;
-            let pool = self.cache(layer.kv_source).map_err(candle_err)?;
+            let pool = self.cache(layer.kv_source).map_err(|_| {
+                err(format!(
+                    "the drafter reads the K/V of layer {}, which this model does not hold: a layer stage keeps only the layers it runs and the K/V those read",
+                    layer.kv_source
+                ))
+            })?;
             let table = self.layout.layer_group[layer.kv_source]
                 .and_then(|g| tables.get(g))
                 .ok_or_else(|| err("the sequence has no block table for the drafter's layer"))?;
@@ -2129,7 +2337,8 @@ impl Transformer {
     /// through every layer this model holds: the residual stream `(1, t,
     /// n_embd)` after them, Gemma 4's per-layer inputs and, per sequence, the
     /// rows [`Hidden::Layers`] asked for (one `t * n_embd` vector per
-    /// captured layer).
+    /// captured layer). The stage that embeds runs this; a later one starts
+    /// from [`Transformer::trunk_from`].
     fn trunk(
         &self,
         embeddings: Vec<f32>,
@@ -2143,7 +2352,7 @@ impl Transformer {
         let dev = &Device::Cpu;
         let eps = hp.eps as f32;
         let t = embeddings.len() / hp.n_embd;
-        let mut x = Tensor::from_vec(embeddings, (1, t, hp.n_embd), dev)?;
+        let x = Tensor::from_vec(embeddings, (1, t, hp.n_embd), dev)?;
 
         // Gemma 4 per-layer inputs: projected embeddings merged with the
         // token-identity rows, `(ctx + tok) / sqrt(2)`.
@@ -2160,12 +2369,24 @@ impl Transformer {
             }
             _ => None,
         };
+        self.trunk_from(x, ple, segs)
+    }
 
+    /// The layers of the range over the residual stream `x` `(1, t, n_embd)`
+    /// (`ple` is Gemma 4's merged per-layer inputs, as [`Transformer::trunk`]
+    /// builds them or as the stage before this one sent them): what
+    /// [`Transformer::trunk`] returns.
+    fn trunk_from(
+        &self,
+        mut x: Tensor,
+        ple: Option<Tensor>,
+        segs: &[Seg<'_>],
+    ) -> candle_core::Result<TrunkOut> {
         // `Hidden::Layers`: the rows of each sequence after every layer of
         // its set, read as the layer finishes (the residual stream before
         // the final norm), per sequence and captured layer.
         let mut captured: Vec<Vec<Vec<f32>>> = vec![Vec::new(); segs.len()];
-        for il in 0..self.layers.len() {
+        for il in self.first..self.end {
             x = self.layer(il, &x, ple.as_ref(), segs, None)?;
             for (seg, rows) in segs.iter().zip(&mut captured) {
                 if let Hidden::Layers(set) = seg.hidden
@@ -2182,18 +2403,17 @@ impl Transformer {
         Ok((x, ple, captured))
     }
 
-    /// The layers over the concatenated rows `embeddings` of the sequences
-    /// `segs` describe, then the final norm and the LM head over the rows the
-    /// sequences want.
-    fn forward_layers(
+    /// The final norm and the LM head over the rows the sequences want, once
+    /// the layers produced the residual stream `x` (`captured` the rows
+    /// [`Hidden::Layers`] asked for).
+    fn finish(
         &self,
-        embeddings: Vec<f32>,
-        per_layer: Option<Vec<f32>>,
+        x: &Tensor,
+        captured: &[Vec<Vec<f32>>],
         segs: &[Seg<'_>],
     ) -> candle_core::Result<Vec<Forward>> {
         let hp = &self.hp;
         let eps = hp.eps as f32;
-        let (x, _, captured) = self.trunk(embeddings, per_layer, segs)?;
 
         // The final norm runs over every row of a sequence that wants all
         // logits or every position's hidden row, else over its last row
@@ -2201,7 +2421,7 @@ impl Transformer {
         // The selected rows of all sequences share one norm and one LM head
         // pass: the head is the largest matrix of a small model.
         let mut outs: Vec<Forward> = (0..segs.len()).map(|_| Forward::default()).collect();
-        for ((seg, layers), out) in segs.iter().zip(&captured).zip(&mut outs) {
+        for ((seg, layers), out) in segs.iter().zip(captured).zip(&mut outs) {
             if matches!(seg.hidden, Hidden::Layers(_)) {
                 out.hidden = Some(interleave_rows(layers, seg.t, hp.n_embd));
             }
@@ -2319,7 +2539,7 @@ impl Transformer {
         segs: &[Seg<'_>],
         ext: Option<(&ExtKv, usize)>,
     ) -> candle_core::Result<Tensor> {
-        let lw = &self.layers[il];
+        let lw = &self.layers[il - self.first];
         let t = x.dim(1)?;
         self.block(lw, x, ple.map(|p| (p, il)), t, |h| match &lw.mixer {
             Mixer::Attention(aw) => self.attention_in(&self.attn_calls(il, segs, ext)?, aw, h),

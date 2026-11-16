@@ -21,6 +21,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use tokio::task::JoinHandle;
 
+use super::config::Role;
 use crate::server::latency::LatencyTracker;
 use crate::server::metrics::{E2E_BUCKETS, Histogram, StatusCounters, TTFT_BUCKETS};
 use crate::server::stats::StatsSnapshot;
@@ -111,6 +112,8 @@ pub struct Upstream {
     pub id: Arc<str>,
     /// Base URL without a trailing slash.
     pub url: String,
+    /// What it does when the balancer disaggregates.
+    pub role: Role,
     /// Requests the balancer has outstanding to it.
     pub in_flight: AtomicU64,
     /// Requests routed to it since start.
@@ -130,8 +133,9 @@ pub struct Upstream {
 
 impl Upstream {
     /// An upstream at `url` (already normalized) known as `id`.
-    pub fn new(id: &str, url: String, latency_window: Duration) -> Self {
+    pub fn new(id: &str, url: String, latency_window: Duration, role: Role) -> Self {
         Self {
+            role,
             id: Arc::from(id),
             url,
             in_flight: AtomicU64::new(0),
@@ -392,7 +396,12 @@ mod tests {
     use super::*;
 
     fn upstream() -> Upstream {
-        Upstream::new("a:1", "http://a:1".into(), Duration::from_secs(60))
+        Upstream::new(
+            "a:1",
+            "http://a:1".into(),
+            Duration::from_secs(60),
+            Role::Whole,
+        )
     }
 
     #[test]

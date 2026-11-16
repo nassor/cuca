@@ -219,6 +219,13 @@ impl KvLayout {
         }
     }
 
+    /// The least common multiple of the groups' strides: a prefix that ends
+    /// at a multiple of `BLOCK_SIZE * step` positions ends at a block of
+    /// every group.
+    pub(crate) fn step(&self) -> usize {
+        self.groups.iter().map(|g| g.stride).fold(1, lcm)
+    }
+
     /// Bytes of K/V data the pools hold for `hp`: every block of a group
     /// stores [`BLOCK_SIZE`] positions of each of its layers (f32 keys and
     /// values).
@@ -579,6 +586,21 @@ impl KvPools {
             })
     }
 
+    /// Whether [`KvPools::reserve`] would give `seq` the blocks for positions
+    /// `0..upto`: every pool, a sliding group's too (`reserve` fills those
+    /// whether or not [`KvPools::can_give`] gates them), has the free and the
+    /// cached blocks (evicted on demand) the sequence still needs.
+    pub(crate) fn fits(&self, seq: &SeqBlocks, upto: usize) -> bool {
+        self.groups
+            .iter()
+            .zip(&self.pools)
+            .zip(&seq.tables)
+            .all(|((g, pool), table)| {
+                let s = pool.stats();
+                upto.div_ceil(g.span()).saturating_sub(table.len()) <= s.free + s.cached
+            })
+    }
+
     /// Counts of the full-attention pool.
     pub(crate) fn full_stats(&self) -> PoolStats {
         self.pools
@@ -605,6 +627,105 @@ impl KvPools {
             }
         }
         Ok(())
+    }
+
+    /// The least common multiple of the groups' strides, see
+    /// [`KvLayout::step`].
+    pub(crate) fn step(&self) -> usize {
+        self.groups.iter().map(|g| g.stride).fold(1, lcm)
+    }
+
+    /// Blocks for the imported prefix `ids[..to]`, whose first `from`
+    /// positions the store already holds: the blocks of that prefix (found
+    /// by [`KvPools::lookup`], referenced) and new, unnamed ones for the
+    /// rest, in every group. A sliding group gets blocks only for the window
+    /// before `to` (`NO_BLOCK` before it, and the held blocks that lie before
+    /// it are released).
+    ///
+    /// The caller writes the rows of `from..to` into the new blocks, sets
+    /// `seq.len = to` and files the sequence with [`KvPools::finish`]; an
+    /// abandoned import calls [`KvPools::release`]. Nothing is named before
+    /// that, so no block without its rows is ever found by a lookup.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when `from` and `to` are not multiples of
+    /// `BLOCK_SIZE * step`, `to` exceeds `ids`, the store no longer holds the
+    /// first `from` positions, or a pool lacks the blocks (the pools are as
+    /// they were).
+    pub(crate) fn adopt(
+        &mut self,
+        ids: &[u32],
+        from: usize,
+        to: usize,
+    ) -> Result<SeqBlocks, CucaError> {
+        let unit = BLOCK_SIZE * self.step();
+        if from > to || to > ids.len() || !from.is_multiple_of(unit) || !to.is_multiple_of(unit) {
+            return Err(super::err(format!(
+                "an import of {from}..{to} of {} tokens is not whole blocks of {unit} positions",
+                ids.len()
+            )));
+        }
+        let mut seq = if from == 0 {
+            self.seq()
+        } else {
+            let mut held = self.lookup(&ids[..=from]).into_seq();
+            if held.len != from {
+                self.release(&mut held);
+                return Err(super::err(format!(
+                    "the prefix store no longer holds the first {from} tokens"
+                )));
+            }
+            held
+        };
+        // The first block of a sliding group that holds rows of the import.
+        let first = |g: &KvGroup| {
+            g.window
+                .map_or(0, |w| to.saturating_sub(w - 1) / BLOCK_SIZE)
+        };
+        // Check every pool before taking a block, so a refusal changes
+        // nothing.
+        let short =
+            self.groups
+                .iter()
+                .zip(&self.pools)
+                .zip(&seq.tables)
+                .any(|((g, pool), table)| {
+                    let needed = (table.len().max(first(g))..to / g.span()).count();
+                    let s = pool.stats();
+                    needed > s.free + s.cached
+                });
+        if short {
+            self.release(&mut seq);
+            return Err(super::err("the K/V block pool is exhausted"));
+        }
+        let mut exhausted = false;
+        for ((g, pool), table) in self.groups.iter().zip(&mut self.pools).zip(&mut seq.tables) {
+            let first = first(g);
+            for slot in table.iter_mut().take(first) {
+                if *slot != NO_BLOCK {
+                    pool.release(*slot);
+                    *slot = NO_BLOCK;
+                }
+            }
+            while table.len() < to / g.span() {
+                if table.len() < first {
+                    table.push(NO_BLOCK);
+                } else if let Some(block) = pool.alloc() {
+                    table.push(block);
+                } else {
+                    exhausted = true;
+                    break;
+                }
+            }
+        }
+        if exhausted {
+            // Cannot happen after the check above; give back what was taken
+            // rather than keep a half-built table.
+            self.release(&mut seq);
+            return Err(super::err("the K/V block pool is exhausted"));
+        }
+        Ok(seq)
     }
 
     /// After `seq` accepted its first `len` positions: release the blocks of
@@ -1238,5 +1359,103 @@ mod tests {
         assert_eq!(p.truncate(&mut seq, 40), 32);
         assert_eq!(seq.tables[0].len(), 2);
         assert_eq!(seq.tables[1].len(), 1);
+    }
+
+    /// An imported prefix gets no block below the window of a sliding group,
+    /// and is named only once the caller files it.
+    #[test]
+    fn adopt_gives_a_sliding_group_only_the_blocks_of_its_window() {
+        let mut p = pools(&[(None, 16), (Some(20), 16)]);
+        let toks = ids(0, 100);
+        let mut seq = p.adopt(&toks, 0, 96).unwrap();
+        assert_eq!(seq.tables[0].len(), 6);
+        assert!(seq.tables[0].iter().all(|&b| b != NO_BLOCK));
+        // The window of the next query starts at 96 - 19 = 77, in block 4.
+        assert_eq!(&seq.tables[1][..4], &[NO_BLOCK; 4]);
+        assert!(seq.tables[1][4] != NO_BLOCK && seq.tables[1][5] != NO_BLOCK);
+        let stats = p.stats();
+        assert_eq!((stats[0].used, stats[1].used), (6, 2));
+
+        // Nothing is named before the rows are written: a lookup finds no
+        // block of the import.
+        assert_eq!(p.lookup(&toks).len, 0);
+
+        seq.len = 96;
+        p.finish(&mut seq, &toks[..96]);
+        let hit = p.lookup(&toks);
+        assert_eq!(hit.len, 96);
+        assert_eq!(&hit.tables[1][..4], &[NO_BLOCK; 4]);
+        // A shorter prefix whose window lies before the imported one finds
+        // no sliding block: it is not a hit, never a block without rows.
+        let short = p.lookup(&toks[..49]);
+        assert_eq!(short.len, 0);
+    }
+
+    /// An import that does not fit changes nothing, and one that is
+    /// abandoned gives every block back.
+    #[test]
+    fn a_failed_or_abandoned_adopt_leaves_the_pools_as_they_were() {
+        let mut p = pools(&[(None, 6)]);
+        let toks = ids(0, 96);
+        // Two cached blocks and three held by another sequence.
+        let mut cached = fill(&mut p, &toks[..32]);
+        p.finish(&mut cached, &toks[..32]);
+        let mut busy = fill(&mut p, &ids(500, 48));
+        let before = p.stats();
+        assert_eq!(
+            before[0],
+            PoolStats {
+                free: 1,
+                cached: 2,
+                used: 3
+            }
+        );
+        // 4 new blocks after the 2 of the store: not available.
+        let err = p.adopt(&toks, 32, 96).unwrap_err();
+        assert!(err.to_string().contains("exhausted"), "{err}");
+        assert_eq!(p.stats(), before);
+        // From 0: 6 blocks of which 1 is free and 2 cached.
+        assert!(p.adopt(&toks, 0, 96).is_err());
+        assert_eq!(p.stats(), before);
+        // Off the block boundaries and past the ids: refused, no change.
+        assert!(p.adopt(&toks, 0, 40).is_err());
+        assert!(p.adopt(&toks[..64], 0, 96).is_err());
+        // A prefix the store never held.
+        let other = ids(900, 96);
+        let err = p.adopt(&other, 32, 64).unwrap_err();
+        assert!(err.to_string().contains("no longer holds"), "{err}");
+        assert_eq!(p.stats(), before);
+
+        // Room for it once the other sequence leaves; abandoning frees it.
+        p.release(&mut busy);
+        let mut seq = p.adopt(&toks, 32, 80).unwrap();
+        assert_eq!(seq.tables[0].len(), 5);
+        p.release(&mut seq);
+        let stats = p.stats()[0];
+        assert_eq!(stats.used, 0);
+        assert_eq!(stats.free + stats.cached, 6);
+        // The blocks the abandoned import took were never named.
+        assert_eq!(p.lookup(&toks).len, 32);
+    }
+
+    /// A prefix imported behind blocks the store already holds is found in
+    /// full once filed, in whole blocks of every group.
+    #[test]
+    fn an_adopted_prefix_is_found_whole_after_finish() {
+        let mut p = strided_pools(&[(None, 1, 16), (None, 2, 16)]);
+        let toks = ids(0, 100);
+        let mut first = p.adopt(&toks, 0, 32).unwrap();
+        first.len = 32;
+        p.finish(&mut first, &toks[..32]);
+        assert_eq!(p.lookup(&toks).len, 32);
+        let mut rest = p.adopt(&toks, 32, 96).unwrap();
+        assert_eq!((rest.tables[0].len(), rest.tables[1].len()), (6, 3));
+        rest.len = 96;
+        p.finish(&mut rest, &toks[..96]);
+        let hit = p.lookup(&toks);
+        assert_eq!(hit.len, 96);
+        assert_eq!((hit.tables[0].len(), hit.tables[1].len()), (6, 3));
+        // Rows come in blocks of `16 * step`: 16 is not one.
+        assert!(p.adopt(&toks, 0, 16).is_err());
     }
 }

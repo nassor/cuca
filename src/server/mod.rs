@@ -61,6 +61,7 @@ pub mod config;
 pub mod diagnosis;
 pub mod error;
 pub mod http;
+pub(crate) mod kv;
 pub mod latency;
 pub mod metrics;
 pub mod openai;
@@ -133,6 +134,7 @@ async fn serve_until(
         .local_addr()
         .map_err(|e| ServerError::Io(format!("cannot read the bound address: {e}")))?;
 
+    let peer_client = state::peer_client()?;
     let system = SystemSampler::start(collector::SAMPLE_INTERVAL);
     let (registry, mut loader) = ModelRegistry::start(config.models.clone());
     let state = Arc::new(ServerState::new(
@@ -140,6 +142,7 @@ async fn serve_until(
         addr,
         Arc::clone(&registry),
         system,
+        peer_client,
     ));
     let sampler = collector::run_sampler(Arc::clone(&state));
 
@@ -229,7 +232,7 @@ fn colocate(serve: &ServerConfig, balance: &mut BalancerConfig) -> Result<(), Se
     };
     balance.add_local_upstream(SocketAddr::new(ip, serve.listen.port()));
     serve.validate()?;
-    balance.resolve_upstreams()?;
+    balance.resolve_roles()?;
     Ok(())
 }
 

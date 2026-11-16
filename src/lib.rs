@@ -162,9 +162,10 @@ pub use crate::plugins::web_search::{
 pub use crate::provider::local::{
     BatchingConfig, ConvertConfig, DownloadProgress, DownloadProgressCallback, DraftStats,
     DrafterSource, EngramCache, EngramQuant, EngramStats, ExpertHeat, ExpertPlacement,
-    ExpertTierStats, ExpertTiers, GenerationReport, GpuAdapter, LocalCapabilities, LocalDevice,
-    LocalGeneration, LocalModel, LocalModelConfig, ModelPart, ModelPreset, ModelSource,
-    ModelTemplate, PresetPart, PresetTemplate, SamplingConfig, ServingStats, WeightQuant,
+    ExpertTierStats, ExpertTiers, GenerationReport, GpuAdapter, KvExport, KvExportConfig, KvImport,
+    LocalCapabilities, LocalDevice, LocalGeneration, LocalModel, LocalModelConfig, ModelPart,
+    ModelPreset, ModelSource, ModelTemplate, PresetPart, PresetTemplate, PromptTokens, RemoteStage,
+    SamplingConfig, ServingStats, StageRange, WeightQuant,
 };
 pub use crate::request::{
     AgentResponseStream, PromptCacheBreakpoint, PromptCacheDirective, PromptCacheUsage,
