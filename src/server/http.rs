@@ -1196,4 +1196,113 @@ mod tests {
             .unwrap();
         assert_ne!(big.status(), 413);
     }
+
+    /// A TCP proxy to `target` that, once `armed`, cuts both connections
+    /// when the worker's next answer bytes arrive, instead of relaying them:
+    /// a worker that ran the frame and went away before its answer reached
+    /// the caller. Returns the proxy's base URL.
+    async fn lossy_proxy(target: SocketAddr, armed: Arc<std::sync::atomic::AtomicBool>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut client, _)) = listener.accept().await else {
+                    return;
+                };
+                let armed = Arc::clone(&armed);
+                tokio::spawn(async move {
+                    let Ok(mut upstream) = tokio::net::TcpStream::connect(target).await else {
+                        return;
+                    };
+                    let (mut from_client, mut to_client) = client.split();
+                    let (mut from_worker, mut to_worker) = upstream.split();
+                    let requests = tokio::io::copy(&mut from_client, &mut to_worker);
+                    let answers = async {
+                        let mut buf = [0u8; 16 * 1024];
+                        loop {
+                            let n = from_worker.read(&mut buf).await.unwrap_or(0);
+                            if n == 0 || armed.swap(false, Ordering::SeqCst) {
+                                break;
+                            }
+                            if to_client.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! {
+                        _ = requests => {}
+                        () = answers => {}
+                    }
+                });
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// An answer lost between the worker and the coordinator after the
+    /// worker ran the frame: the coordinator sends the frame again, the
+    /// worker answers from memory, and the request goes on as if nothing
+    /// happened. The retry shows in the metrics.
+    #[tokio::test]
+    async fn a_stage_answer_lost_on_the_wire_is_retried_and_the_reply_is_unchanged() {
+        use crate::RemoteStage;
+        use crate::provider::local::engine::testing::{
+            engine_at, http_chain_at, stage_worker_layers_at, tiny_llama_file,
+        };
+
+        let file = tiny_llama_file(96);
+        let (worker, _) = tiny_node(&file.path, Some("stage-key"), |path| {
+            stage_worker_layers_at(path, 96, 0, 1)
+        })
+        .await;
+        let worker_addr: SocketAddr = worker.trim_start_matches("http://").parse().unwrap();
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let proxy = lossy_proxy(worker_addr, Arc::clone(&armed)).await;
+        let stage = RemoteStage {
+            url: proxy,
+            layers: 1,
+            api_key: Some("stage-key".into()),
+            ..RemoteStage::default()
+        };
+        let (coordinator, _) = tiny_node(&file.path, None, move |path| {
+            http_chain_at(path, 96, &[stage])
+        })
+        .await;
+        let (single, _) = tiny_node(&file.path, None, |path| engine_at(path, 96)).await;
+
+        // A first turn over the intact wire, then a second with an answer
+        // lost; the single process answers both as the reference.
+        assert_eq!(
+            chat_text(&coordinator).await["choices"],
+            chat_text(&single).await["choices"]
+        );
+        armed.store(true, Ordering::SeqCst);
+        let got = chat_text(&coordinator).await;
+        let want = chat_text(&single).await;
+        assert!(!armed.load(Ordering::SeqCst), "an answer was cut");
+        assert_eq!(got["choices"], want["choices"]);
+        assert_eq!(got["usage"], want["usage"]);
+
+        let metrics = get(&format!("{coordinator}/metrics"), None)
+            .await
+            .text()
+            .await
+            .unwrap();
+        let value = |series: &str| -> f64 {
+            metrics
+                .lines()
+                .find_map(|l| l.strip_prefix(series))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{series} is missing:\n{metrics}"))
+        };
+        assert_eq!(
+            value("cuca_stage_retries_total{model=\"m\",stage=\"0\"} "),
+            1.0
+        );
+        assert_eq!(
+            value("cuca_stage_errors_total{model=\"m\",stage=\"0\"} "),
+            0.0
+        );
+    }
 }

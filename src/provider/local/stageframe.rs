@@ -8,19 +8,32 @@
 //! - open (1): `fingerprint u64`, `first u32`, `end u32`, `context_length
 //!   u64`, `max_sequences u64`, `kv_tokens u64`, `max_rows u64`, `session u64`;
 //!   answered by [`ok_reply`];
-//! - forward (2): `session u64`, `drops` (`count u32`, then `u64` each),
-//!   `exact u8`, `count u32` sequences, then per sequence `slot u32`,
+//! - forward (2): `session u64`, `seq u64`, `drops` (`count u32`, then `u64`
+//!   each), `exact u8`, `count u32` sequences, then per sequence `slot u32`,
 //!   `start_pos u64`, `hist_from u64`, `hist` and `tokens` as `u32` slices,
 //!   `want u8` (0 none, 1 last, 2 all), `hidden u8` (0 none, 1 post-norm, 2
 //!   post-norm of every row), `groups u32` and each block table as a `u32`
 //!   slice; then `has_carry u8` and, when set, the carry inline in the
 //!   encoding of [`carry_bytes`]; answered by [`carry_bytes`];
-//! - snapshot (3): `session u64`, `drops`, `slot u32`, `id u64`; answered by
-//!   [`bytes_reply`];
-//! - restore (4): `session u64`, `drops`, `slot u32`, `has_id u8`, `id u64`
-//!   (0 when absent), `len u64`; answered by [`ok_reply`];
-//! - prefetch (5): `session u64`, `slot u32`, `tokens` as a `u32` slice;
-//!   answered by [`ok_reply`].
+//! - snapshot (3): `session u64`, `seq u64`, `drops`, `slot u32`, `id u64`;
+//!   answered by [`bytes_reply`];
+//! - restore (4): `session u64`, `seq u64`, `drops`, `slot u32`, `has_id u8`,
+//!   `id u64` (0 when absent), `len u64`; answered by [`ok_reply`];
+//! - prefetch (5): `session u64`, `seq u64`, `slot u32`, `tokens` as a `u32`
+//!   slice; answered by [`ok_reply`].
+//!
+//! # Repeating a call
+//!
+//! A transport may send a frame again when it cannot tell whether the first
+//! attempt arrived (a connection that died before any answer came back). The
+//! `seq` of every call after `open` makes that safe: the coordinator numbers
+//! them 1, 2, 3, ... within a session, and a worker answers a call it already
+//! ran with the reply it kept, without running it again. That matters
+//! because a forward call is not repeatable on its own: a recurrent layer
+//! has advanced past the pass's start, so a hybrid model refuses a second
+//! run, and so does a hyper-connection model at an odd position (its
+//! compressor state sits at the pass's end). `open` is repeatable as it is:
+//! it resets the worker to the same state.
 //!
 //! Every count a decoder reads is checked against the bytes the frame still
 //! holds before anything is allocated for it.
@@ -79,6 +92,8 @@ pub(crate) struct StageSeq {
 /// A forward pass of a stage.
 pub(crate) struct ForwardCall {
     pub session: u64,
+    /// The call's number in the session, from 1.
+    pub seq: u64,
     /// Slots whose state the worker releases before the pass.
     pub drops: Vec<u64>,
     pub exact: bool,
@@ -93,12 +108,14 @@ pub(crate) enum Call {
     Forward(ForwardCall),
     Snapshot {
         session: u64,
+        seq: u64,
         drops: Vec<u64>,
         slot: u32,
         id: u64,
     },
     Restore {
         session: u64,
+        seq: u64,
         drops: Vec<u64>,
         slot: u32,
         id: Option<u64>,
@@ -106,6 +123,7 @@ pub(crate) enum Call {
     },
     Prefetch {
         session: u64,
+        seq: u64,
         slot: u32,
         tokens: Vec<u32>,
     },
@@ -326,6 +344,7 @@ pub(crate) fn forward_frame(call: &ForwardCall) -> Result<Vec<u8>, CucaError> {
     let mut w = Writer::new();
     w.put_u8(OP_FORWARD);
     w.put_u64(call.session);
+    w.put_u64(call.seq);
     put_drops(&mut w, &call.drops);
     w.put_u8(u8::from(call.exact));
     w.put_u32(count32(call.seqs.len()));
@@ -352,10 +371,11 @@ pub(crate) fn forward_frame(call: &ForwardCall) -> Result<Vec<u8>, CucaError> {
     Ok(w.into_bytes())
 }
 
-pub(crate) fn snapshot_frame(session: u64, drops: &[u64], slot: u32, id: u64) -> Vec<u8> {
+pub(crate) fn snapshot_frame(session: u64, seq: u64, drops: &[u64], slot: u32, id: u64) -> Vec<u8> {
     let mut w = Writer::new();
     w.put_u8(OP_SNAPSHOT);
     w.put_u64(session);
+    w.put_u64(seq);
     put_drops(&mut w, drops);
     w.put_u32(slot);
     w.put_u64(id);
@@ -364,6 +384,7 @@ pub(crate) fn snapshot_frame(session: u64, drops: &[u64], slot: u32, id: u64) ->
 
 pub(crate) fn restore_frame(
     session: u64,
+    seq: u64,
     drops: &[u64],
     slot: u32,
     id: Option<u64>,
@@ -372,6 +393,7 @@ pub(crate) fn restore_frame(
     let mut w = Writer::new();
     w.put_u8(OP_RESTORE);
     w.put_u64(session);
+    w.put_u64(seq);
     put_drops(&mut w, drops);
     w.put_u32(slot);
     w.put_u8(u8::from(id.is_some()));
@@ -380,10 +402,11 @@ pub(crate) fn restore_frame(
     w.into_bytes()
 }
 
-pub(crate) fn prefetch_frame(session: u64, slot: u32, tokens: &[u32]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(1 + 8 + 4 + 8 + 4 * tokens.len());
+pub(crate) fn prefetch_frame(session: u64, seq: u64, slot: u32, tokens: &[u32]) -> Vec<u8> {
+    let mut w = Writer::with_capacity(1 + 8 + 8 + 4 + 8 + 4 * tokens.len());
     w.put_u8(OP_PREFETCH);
     w.put_u64(session);
+    w.put_u64(seq);
     w.put_u32(slot);
     w.put_u32s(tokens);
     w.into_bytes()
@@ -431,6 +454,7 @@ fn decode_seq(r: &mut Reader<'_>) -> Result<StageSeq, CucaError> {
 
 fn decode_forward(r: &mut Reader<'_>) -> Result<ForwardCall, CucaError> {
     let session = r.get_u64()?;
+    let seq = r.get_u64()?;
     let drops = get_drops(r)?;
     let exact = match r.get_u8()? {
         0 => false,
@@ -459,6 +483,7 @@ fn decode_forward(r: &mut Reader<'_>) -> Result<ForwardCall, CucaError> {
     };
     Ok(ForwardCall {
         session,
+        seq,
         drops,
         exact,
         seqs,
@@ -479,11 +504,13 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, CucaError> {
         OP_FORWARD => Call::Forward(decode_forward(&mut r)?),
         OP_SNAPSHOT => {
             let session = r.get_u64()?;
+            let seq = r.get_u64()?;
             let drops = get_drops(&mut r)?;
             let slot = r.get_u32()?;
             let id = r.get_u64()?;
             Call::Snapshot {
                 session,
+                seq,
                 drops,
                 slot,
                 id,
@@ -491,6 +518,7 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, CucaError> {
         }
         OP_RESTORE => {
             let session = r.get_u64()?;
+            let seq = r.get_u64()?;
             let drops = get_drops(&mut r)?;
             let slot = r.get_u32()?;
             let has_id = match r.get_u8()? {
@@ -506,6 +534,7 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, CucaError> {
             let len = r.get_u64()?;
             Call::Restore {
                 session,
+                seq,
                 drops,
                 slot,
                 id: has_id.then_some(id),
@@ -514,10 +543,12 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, CucaError> {
         }
         OP_PREFETCH => {
             let session = r.get_u64()?;
+            let seq = r.get_u64()?;
             let slot = r.get_u32()?;
             let tokens = r.get_u32s()?;
             Call::Prefetch {
                 session,
+                seq,
                 slot,
                 tokens,
             }
@@ -591,6 +622,7 @@ mod tests {
     fn forward(carry: Option<Carry>) -> ForwardCall {
         ForwardCall {
             session: 77,
+            seq: 41,
             drops: vec![3, 5],
             exact: true,
             seqs: vec![
@@ -626,7 +658,7 @@ mod tests {
             let frame = forward_frame(&call).unwrap();
             assert_eq!(frame[0], OP_FORWARD);
             let got = decoded_forward(&frame);
-            assert_eq!(got.session, 77);
+            assert_eq!((got.session, got.seq), (77, 41));
             assert_eq!(got.drops, vec![3, 5]);
             assert!(got.exact);
             assert_eq!(got.seqs, call.seqs);
@@ -672,29 +704,31 @@ mod tests {
 
     #[test]
     fn snapshot_restore_and_prefetch_roundtrip() {
-        match decode(&snapshot_frame(9, &[1, 2, 3], 4, 0xabcd)) {
+        match decode(&snapshot_frame(9, 3, &[1, 2, 3], 4, 0xabcd)) {
             Ok(Call::Snapshot {
                 session,
+                seq,
                 drops,
                 slot,
                 id,
             }) => {
-                assert_eq!((session, slot, id), (9, 4, 0xabcd));
+                assert_eq!((session, seq, slot, id), (9, 3, 4, 0xabcd));
                 assert_eq!(drops, vec![1, 2, 3]);
             }
             _ => panic!("snapshot frame did not decode as snapshot"),
         }
 
         for id in [Some(12u64), None] {
-            match decode(&restore_frame(9, &[], 4, id, 321)) {
+            match decode(&restore_frame(9, 8, &[], 4, id, 321)) {
                 Ok(Call::Restore {
                     session,
+                    seq,
                     drops,
                     slot,
                     id: got,
                     len,
                 }) => {
-                    assert_eq!((session, slot, len), (9, 4, 321));
+                    assert_eq!((session, seq, slot, len), (9, 8, 4, 321));
                     assert!(drops.is_empty());
                     assert_eq!(got, id);
                 }
@@ -703,17 +737,18 @@ mod tests {
         }
         // A restore without an id still carries the id field, as 0.
         assert_eq!(
-            restore_frame(1, &[], 0, None, 0).len(),
-            1 + 8 + 4 + 4 + 1 + 8 + 8
+            restore_frame(1, 1, &[], 0, None, 0).len(),
+            1 + 8 + 8 + 4 + 4 + 1 + 8 + 8
         );
 
-        match decode(&prefetch_frame(9, 4, &[5, 6, 7])) {
+        match decode(&prefetch_frame(9, 2, 4, &[5, 6, 7])) {
             Ok(Call::Prefetch {
                 session,
+                seq,
                 slot,
                 tokens,
             }) => {
-                assert_eq!((session, slot), (9, 4));
+                assert_eq!((session, seq, slot), (9, 2, 4));
                 assert_eq!(tokens, vec![5, 6, 7]);
             }
             _ => panic!("prefetch frame did not decode as prefetch"),
@@ -745,10 +780,10 @@ mod tests {
             open_frame(&open()),
             forward_frame(&forward(Some(carry(true, true)))).unwrap(),
             forward_frame(&forward(None)).unwrap(),
-            snapshot_frame(9, &[1, 2], 4, 5),
-            restore_frame(9, &[1], 4, Some(5), 6),
-            restore_frame(9, &[], 4, None, 6),
-            prefetch_frame(9, 4, &[5, 6]),
+            snapshot_frame(9, 3, &[1, 2], 4, 5),
+            restore_frame(9, 4, &[1], 4, Some(5), 6),
+            restore_frame(9, 5, &[], 4, None, 6),
+            prefetch_frame(9, 6, 4, &[5, 6]),
         ]
     }
 
@@ -791,9 +826,9 @@ mod tests {
 
         // The `want` byte of the first sequence of a forward frame.
         let frame = forward_frame(&forward(None)).unwrap();
-        // op, session, drops (count + 2), exact, count, slot, pos, from,
+        // op, session, seq, drops (count + 2), exact, count, slot, pos, from,
         // hist (count + 3), tokens (count + 2).
-        let want_at = 1 + 8 + (4 + 16) + 1 + 4 + 4 + 8 + 8 + (8 + 12) + (8 + 8);
+        let want_at = 1 + 8 + 8 + (4 + 16) + 1 + 4 + 4 + 8 + 8 + (8 + 12) + (8 + 8);
         assert_eq!(frame[want_at], 1);
         let mut bad = frame.clone();
         bad[want_at] = 3;
@@ -802,7 +837,7 @@ mod tests {
         bad[want_at + 1] = 3;
         assert!(decode(&bad).is_err());
         let mut bad = frame;
-        bad[1 + 8 + (4 + 16)] = 2;
+        bad[1 + 8 + 8 + (4 + 16)] = 2;
         assert!(decode(&bad).is_err());
     }
 
@@ -812,6 +847,7 @@ mod tests {
         let mut w = Writer::new();
         w.put_u8(OP_FORWARD);
         w.put_u64(1);
+        w.put_u64(1);
         w.put_u32(0);
         w.put_u8(0);
         w.put_u32(u32::MAX);
@@ -820,6 +856,7 @@ mod tests {
         // Drops, groups and mirror layers likewise.
         let mut w = Writer::new();
         w.put_u8(OP_SNAPSHOT);
+        w.put_u64(1);
         w.put_u64(1);
         w.put_u32(u32::MAX);
         assert!(decode(&w.into_bytes()).is_err());
@@ -842,6 +879,7 @@ mod tests {
 
         let mut w = Writer::new();
         w.put_u8(OP_FORWARD);
+        w.put_u64(1);
         w.put_u64(1);
         w.put_u32(0);
         w.put_u8(0);

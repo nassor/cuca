@@ -374,6 +374,7 @@ fn model_stats(
                 name: s.name,
                 calls: s.calls,
                 errors: s.errors,
+                retries: s.retries,
                 sent_bytes: s.sent_bytes,
                 received_bytes: s.received_bytes,
             }

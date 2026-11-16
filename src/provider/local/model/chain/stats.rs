@@ -23,6 +23,10 @@ pub struct StageStats {
     /// Calls that failed (unreachable, refused, a non-2xx answer); their time
     /// is in none of the totals below.
     pub errors: u64,
+    /// Calls sent a second time because the connection failed before any
+    /// answer arrived (a pooled connection the server had closed); each
+    /// counts once, whether the second attempt was answered or not.
+    pub retries: u64,
     /// Total nanoseconds the answered calls took, from sending the frame to
     /// the whole answer.
     pub wall_ns: u64,
@@ -30,7 +34,7 @@ pub struct StageStats {
     /// worker that reports nothing (an older cuca) counts zero, so its calls
     /// show as all network.
     pub compute_ns: u64,
-    /// Bytes of frames sent.
+    /// Bytes of frames sent, a frame sent again counted again.
     pub sent_bytes: u64,
     /// Bytes of frames received.
     pub received_bytes: u64,
@@ -49,6 +53,7 @@ impl StageStats {
 pub(crate) struct StageCounters {
     calls: AtomicU64,
     errors: AtomicU64,
+    retries: AtomicU64,
     wall_ns: AtomicU64,
     compute_ns: AtomicU64,
     sent_bytes: AtomicU64,
@@ -77,12 +82,19 @@ impl StageCounters {
         self.sent_bytes.fetch_add(sent as u64, Ordering::Relaxed);
     }
 
+    /// Count one frame of `sent` bytes sent a second time.
+    pub(crate) fn record_retry(&self, sent: usize) {
+        self.retries.fetch_add(1, Ordering::Relaxed);
+        self.sent_bytes.fetch_add(sent as u64, Ordering::Relaxed);
+    }
+
     pub(crate) fn snapshot(&self, name: String) -> StageStats {
         let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
         StageStats {
             name,
             calls: get(&self.calls),
             errors: get(&self.errors),
+            retries: get(&self.retries),
             wall_ns: get(&self.wall_ns),
             compute_ns: get(&self.compute_ns),
             sent_bytes: get(&self.sent_bytes),
@@ -101,11 +113,12 @@ mod tests {
         c.record(Duration::from_millis(5), Duration::from_millis(3), 100, 40);
         c.record(Duration::from_millis(7), Duration::from_millis(4), 10, 4);
         c.record_error(8);
+        c.record_retry(2);
         let s = c.snapshot("stage x".to_owned());
-        assert_eq!((s.calls, s.errors), (2, 1));
+        assert_eq!((s.calls, s.errors, s.retries), (2, 1, 1));
         assert_eq!((s.wall_ns, s.compute_ns), (12_000_000, 7_000_000));
         assert_eq!(s.network_ns(), 5_000_000);
-        assert_eq!((s.sent_bytes, s.received_bytes), (118, 44));
+        assert_eq!((s.sent_bytes, s.received_bytes), (120, 44));
         assert_eq!(s.name, "stage x");
     }
 

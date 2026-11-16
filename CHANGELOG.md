@@ -37,8 +37,8 @@
   wall time minus it, the worker's queue wait included. Library: `LocalModel::stage_stats`
   (`StageStats`), `StageReply` (what `LocalModel::stage_call` now returns instead of the bare
   frame) and `STAGE_COMPUTE_HEADER`. Metrics: `cuca_stage_calls_total{model,stage}`,
-  `cuca_stage_errors_total`, `cuca_stage_seconds_total{part="compute|network"}` and
-  `cuca_stage_bytes_total{direction}`. The stats snapshot gains `stages` per model.
+  `cuca_stage_errors_total`, `cuca_stage_retries_total`, `cuca_stage_seconds_total{part="compute|network"}`
+  and `cuca_stage_bytes_total{direction}`. The stats snapshot gains `stages` per model.
 - Balancer: a `disaggregate` section with `prefill` and `decode` pools. A request sent to a decode
   node carries `x-cuca-prefill` naming a prefill node, chosen by the routing policy; the balancer
   drops any such header from clients. Prefill nodes take no chat request while another healthy
@@ -53,6 +53,15 @@
   Nagle's algorithm on), so Nagle's algorithm cannot hold back a small trailing segment of a
   response, such as a layer-stage reply or one streamed token, until the peer acknowledges the
   one before it. The layer-stage client sets it explicitly (reqwest's default is on).
+- Layer stages: the coordinator keeps its HTTP connection to each worker between calls instead of
+  opening one per call (30 s idle timeout, one connection per worker), which cut the network
+  share of a decode call from about 0.9 to 0.5 ms on loopback. A call that fails on a lost
+  connection before any answer arrives (a pooled connection the worker's side closed, or a worker
+  that died after running the frame) is sent again, once. Every call after `open` now carries its
+  number in the session, and a worker runs a call once and answers the same number again with the
+  reply it kept (one frame), so a repeat never runs a pass twice: a hybrid or hyper-connection
+  model would refuse the second run. The stage wire format changed with it: coordinators and
+  workers must run the same build. `LocalModel::stage_call`'s `StageReply::frame` is a `Bytes`.
 
 ## 0.9.1 - 2026-11-15
 

@@ -294,6 +294,18 @@ fn render_stages(x: &mut Exposition, models: &[ModelView<'_>]) {
         );
     }
     x.family(
+        "cuca_stage_retries_total",
+        "counter",
+        "Calls to a remote layer stage sent a second time because the connection failed before any answer arrived.",
+    );
+    for (m, i, s) in stage_rows(models) {
+        x.sample(
+            "cuca_stage_retries_total",
+            &format!("model=\"{}\",stage=\"{i}\"", escape(m.name)),
+            s.retries,
+        );
+    }
+    x.family(
         "cuca_stage_seconds_total",
         "counter",
         "Seconds the answered calls to a remote layer stage took, by part: compute (what the worker reported computing) and network (the rest of the call: transfer, HTTP handling, the worker's queue).",
@@ -1040,6 +1052,7 @@ mod tests {
                     name: "stage http://a".to_owned(),
                     calls: 4,
                     errors: 1,
+                    retries: 2,
                     wall_ns: 5_000_000_000,
                     compute_ns: 3_000_000_000,
                     sent_bytes: 100,
@@ -1058,6 +1071,7 @@ mod tests {
             "cuca_stage_calls_total{model=\"m\",stage=\"0\"} 4\n",
             "cuca_stage_calls_total{model=\"m\",stage=\"1\"} 0\n",
             "cuca_stage_errors_total{model=\"m\",stage=\"0\"} 1\n",
+            "cuca_stage_retries_total{model=\"m\",stage=\"0\"} 2\n",
             "cuca_stage_seconds_total{model=\"m\",stage=\"0\",part=\"compute\"} 3\n",
             "cuca_stage_seconds_total{model=\"m\",stage=\"0\",part=\"network\"} 2\n",
             "cuca_stage_bytes_total{model=\"m\",stage=\"0\",direction=\"sent\"} 100\n",

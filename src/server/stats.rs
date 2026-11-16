@@ -195,6 +195,9 @@ pub struct StageCallStats {
     pub calls: u64,
     /// Calls that failed.
     pub errors: u64,
+    /// Calls sent a second time after the connection failed before any
+    /// answer arrived.
+    pub retries: u64,
     /// Mean time of an answered call, milliseconds (`compute + network`).
     pub mean_call_ms: f64,
     /// Mean time the worker reported computing per call, milliseconds.

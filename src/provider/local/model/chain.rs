@@ -59,7 +59,11 @@ pub use stats::StageStats;
 /// back (the protocol of [`stageframe`](crate::provider::local::stageframe)).
 /// A call blocks the calling (engine) thread until the stage answers.
 pub(crate) trait StageTransport: Send {
-    /// Send `frame` and return the stage's answer.
+    /// Send `frame` and return the stage's answer. A transport that cannot
+    /// tell whether a frame arrived may send the same frame again, once: a
+    /// call of a session carries its number and the worker runs it once
+    /// (see [`stageframe`](crate::provider::local::stageframe)), answering
+    /// the second arrival with the first's reply.
     ///
     /// # Errors
     ///
@@ -100,6 +104,17 @@ struct Remote {
     engram: bool,
     /// Snapshot ids to release on the worker with its next call.
     pending: Mutex<Vec<u64>>,
+    /// The calls made in the session, which numbers the next one (see
+    /// [`stageframe`](crate::provider::local::stageframe): a call sent twice
+    /// runs once).
+    calls: AtomicU64,
+}
+
+impl Remote {
+    /// The number of the next call of the session, from 1.
+    fn next_seq(&self) -> u64 {
+        self.calls.fetch_add(1, Ordering::Relaxed) + 1
+    }
 }
 
 /// The model of a coordinator: remote stages, then a local stage that ends
@@ -209,6 +224,7 @@ impl ChainModel {
                     sent: vec![Vec::new(); max_sequences],
                     engram,
                     pending: Mutex::new(Vec::new()),
+                    calls: AtomicU64::new(0),
                 })
                 .collect(),
             local: Box::new(local),
@@ -245,6 +261,7 @@ impl ChainModel {
             remote.transport.call(frame)?;
             remote.sent.iter_mut().for_each(Vec::clear);
             lock(&remote.pending).clear();
+            remote.calls.store(0, Ordering::Relaxed);
         }
         lock(&self.drops).clear();
         for slot in 0..self.max_sequences {
@@ -371,6 +388,7 @@ impl ChainModel {
                 .collect();
             let frame = forward_frame(&ForwardCall {
                 session: self.session,
+                seq: remote.next_seq(),
                 drops,
                 exact: batch.exact,
                 seqs,
@@ -485,7 +503,13 @@ impl ChainModel {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let mut bytes = local.bytes();
         for remote in &self.remotes {
-            let frame = snapshot_frame(self.session, &self.take_drops(remote), slot as u32, id);
+            let frame = snapshot_frame(
+                self.session,
+                remote.next_seq(),
+                &self.take_drops(remote),
+                slot as u32,
+                id,
+            );
             match Self::session_call(remote, frame).and_then(|reply| decode_bytes_reply(&reply)) {
                 Ok(n) => bytes += usize::try_from(n).unwrap_or(usize::MAX),
                 Err(e) => {
@@ -551,6 +575,7 @@ impl ChainModel {
         for remote in &self.remotes {
             let frame = restore_frame(
                 self.session,
+                remote.next_seq(),
                 &self.take_drops(remote),
                 slot as u32,
                 held.map(|s| s.id),
@@ -570,7 +595,7 @@ impl ChainModel {
     pub(crate) fn engram_prefetch(&self, slot: StateSlot, history: &[u32], tokens: &[u32]) {
         if !self.dirty.load(Ordering::Relaxed) {
             for remote in self.remotes.iter().filter(|r| r.engram) {
-                let frame = prefetch_frame(self.session, slot.0 as u32, tokens);
+                let frame = prefetch_frame(self.session, remote.next_seq(), slot.0 as u32, tokens);
                 // A hint, but a worker that restarted is worth knowing: the
                 // sequences under way fail with the reason at their next pass.
                 if let Err(e) = Self::session_call(remote, frame)

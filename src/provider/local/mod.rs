@@ -1621,7 +1621,7 @@ pub const STAGE_COMPUTE_HEADER: &str = "x-cuca-stage-compute-ns";
 #[non_exhaustive]
 pub struct StageReply {
     /// The reply frame, the body of the HTTP answer.
-    pub frame: Vec<u8>,
+    pub frame: bytes::Bytes,
     /// How long the engine thread took to answer, from taking the frame off
     /// its queue: the worker's own compute, without the queue wait and the
     /// network.

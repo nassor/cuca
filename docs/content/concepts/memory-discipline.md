@@ -130,6 +130,7 @@ A model server and the balancer keep every structure that grows with traffic at 
 - Sample rings: 300 one-second samples per model and for the machine. At the cap the oldest sample drops. Read it with the `StatsSnapshot` rates.
 - Metrics: fixed counters. Labels are the model, status code, upstream, GPU and remote layer stage index. No series is added at run time. Read them at `/metrics`.
 - Request body: 32 MiB. Above it the server answers 413 `request_too_large`. The layer-stage routes take up to 1 GiB, the rows of one forward pass.
+- Layer-stage worker: the reply to its last call, one frame (at most what one forward pass carries, bounded by `max_step_tokens`), until the next call replaces it. A coordinator holds one pooled connection per remote stage.
 - Chat stream buffer: 32 events per request. At the cap the producer waits for the client. Read it with `cuca_response_stall_seconds_total`.
 - Stats streams: 64 open. At the cap the server answers 429 `too_many_streams`.
 - Models, upstreams: 16 per server, 256 per balancer. Above that, startup fails. Read them with `models` and `upstreams`.

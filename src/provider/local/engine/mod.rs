@@ -1394,14 +1394,21 @@ pub(crate) mod testing {
         e
     }
 
+    /// A frame the worker ran and what it answered, shared with a test.
+    pub(crate) type KeptCall = Arc<std::sync::Mutex<Option<(Vec<u8>, Vec<u8>)>>>;
+
     /// A transport that answers with a worker engine of this process. It
     /// records the op of every frame and fails the call number `fail_at`
     /// (counting from 0) once; at the call number `restart_at` the worker is
     /// first opened by another session, as if it restarted (what it held is
-    /// gone), and the call then meets it.
+    /// gone), and the call then meets it. At the call number `lose_reply_at`
+    /// (or at every call, with `lose_every_reply`) the worker runs the frame
+    /// and its answer is lost on the way, so the transport sends the same
+    /// frame again, once, as `HttpTransport` does.
     pub(crate) struct Loopback {
-        worker: Arc<std::sync::Mutex<Engine>>,
-        /// The op byte of every frame sent, in order.
+        pub(crate) worker: Arc<std::sync::Mutex<Engine>>,
+        /// The op byte of every frame sent, in order, a frame sent again
+        /// counted again.
         pub(crate) ops: Arc<std::sync::Mutex<Vec<u8>>>,
         /// Calls made so far.
         pub(crate) calls: Arc<AtomicUsize>,
@@ -1410,6 +1417,14 @@ pub(crate) mod testing {
         /// The call after which the worker has restarted; `usize::MAX` for
         /// none.
         pub(crate) restart_at: Arc<AtomicUsize>,
+        /// The call whose first answer is lost; `usize::MAX` for none.
+        pub(crate) lose_reply_at: Arc<AtomicUsize>,
+        /// Lose the first answer of every call.
+        pub(crate) lose_every_reply: Arc<std::sync::atomic::AtomicBool>,
+        /// The last frame the worker ran and what it answered, and the same
+        /// for the last forward frame.
+        pub(crate) last: KeptCall,
+        pub(crate) last_forward: KeptCall,
         stats: Arc<StageCounters>,
     }
 
@@ -1421,6 +1436,10 @@ pub(crate) mod testing {
                 calls: Arc::default(),
                 fail_at: Arc::new(AtomicUsize::new(usize::MAX)),
                 restart_at: Arc::new(AtomicUsize::new(usize::MAX)),
+                lose_reply_at: Arc::new(AtomicUsize::new(usize::MAX)),
+                lose_every_reply: Arc::default(),
+                last: Arc::default(),
+                last_forward: Arc::default(),
                 stats: Arc::default(),
             }
         }
@@ -1446,12 +1465,34 @@ pub(crate) mod testing {
                 worker.stage_call(&open)?;
             }
             let started = std::time::Instant::now();
-            let reply = worker.stage_call(&frame).inspect_err(|_| {
+            let mut result = worker.stage_call(&frame);
+            let lost = n == self.lose_reply_at.load(Ordering::SeqCst)
+                || self.lose_every_reply.load(Ordering::SeqCst);
+            if lost && result.is_ok() {
+                self.stats.record_retry(frame.len());
+                self.ops
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(frame.first().copied().unwrap_or(0));
+                result = worker.stage_call(&frame);
+            }
+            let reply = result.inspect_err(|_| {
                 self.stats.record_error(frame.len());
             })?;
             let wall = started.elapsed();
             self.stats.record(wall, wall, frame.len(), reply.len());
-            Ok(reply)
+            let kept = Some((frame.clone(), reply.to_vec()));
+            if frame.first() == Some(&crate::provider::local::stageframe::OP_FORWARD) {
+                *self
+                    .last_forward
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = kept.clone();
+            }
+            *self
+                .last
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = kept;
+            Ok(reply.to_vec())
         }
 
         fn name(&self) -> String {
@@ -4265,6 +4306,11 @@ mod tests {
         calls: Vec<Arc<AtomicUsize>>,
         fail_at: Vec<Arc<AtomicUsize>>,
         restart_at: Vec<Arc<AtomicUsize>>,
+        lose_reply_at: Vec<Arc<AtomicUsize>>,
+        lose_every_reply: Vec<Arc<std::sync::atomic::AtomicBool>>,
+        workers: Vec<Arc<std::sync::Mutex<Engine>>>,
+        last: Vec<super::testing::KeptCall>,
+        last_forward: Vec<super::testing::KeptCall>,
     }
 
     /// A chain engine over `file` whose remote stages hold the layers up to
@@ -4287,6 +4333,17 @@ mod tests {
             handles.calls.push(Arc::clone(&transport.calls));
             handles.fail_at.push(Arc::clone(&transport.fail_at));
             handles.restart_at.push(Arc::clone(&transport.restart_at));
+            handles
+                .lose_reply_at
+                .push(Arc::clone(&transport.lose_reply_at));
+            handles
+                .lose_every_reply
+                .push(Arc::clone(&transport.lose_every_reply));
+            handles.workers.push(Arc::clone(&transport.worker));
+            handles.last.push(Arc::clone(&transport.last));
+            handles
+                .last_forward
+                .push(Arc::clone(&transport.last_forward));
             links.push((range, Box::new(transport) as Box<dyn StageTransport>));
             first = end;
         }
@@ -4313,7 +4370,24 @@ mod tests {
         bounds: &[usize],
         prompts: &[Vec<u32>],
     ) {
-        let (mut chain, _) = chain_over(file, context, bounds);
+        chain_equals_whole_with(what, file, context, bounds, prompts, false);
+    }
+
+    /// [`chain_equals_whole`], with `lose_replies`: the transports lose the
+    /// first answer of every call after the load (the worker ran the frame
+    /// and the answer never came back) and send the frame again.
+    fn chain_equals_whole_with(
+        what: &str,
+        file: &crate::provider::local::model::tiny::TinyModel,
+        context: usize,
+        bounds: &[usize],
+        prompts: &[Vec<u32>],
+        lose_replies: bool,
+    ) {
+        let (mut chain, links) = chain_over(file, context, bounds);
+        for flag in &links.lose_every_reply {
+            flag.store(lose_replies, Ordering::SeqCst);
+        }
         let mut whole = engine(file, context, 0.0, None);
         for (i, prompt) in prompts.iter().enumerate() {
             let got = run(&mut chain, prompt, Some(8));
@@ -4325,6 +4399,128 @@ mod tests {
             assert_eq!(usage(&got), usage(&want), "{label}");
         }
         assert_eq!(used_blocks(&chain), 0, "{what}");
+        if lose_replies {
+            for ((name, counters), calls) in chain.stage_counters().iter().zip(&links.calls) {
+                let s = counters.snapshot(name.clone());
+                // Every call but the `open` of the load was sent twice.
+                let made = calls.load(Ordering::SeqCst) - 1;
+                assert!(made > 1, "{what}: the stage served calls");
+                assert_eq!(s.retries as usize, made, "{what}");
+                assert_eq!(s.errors, 0, "{what}");
+            }
+        }
+    }
+
+    /// A call whose answer is lost and sent again runs once on the worker,
+    /// so a chain whose every call is sent twice still answers as the whole
+    /// model does: attention-only, Gemma 4 (shared K/V rows), the hybrid
+    /// Qwen 3.5 (state restores and snapshots are calls too) and the
+    /// hyper-connection DeepSeek-V4.1 (whose compressor state a second run
+    /// of a pass would refuse at an odd position).
+    #[test]
+    fn a_lost_answer_leaves_the_chain_equal_to_the_whole_model() {
+        let llama = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let (n, cuts) = cuts_of(&llama);
+        let prompts = [long_prompt(40), long_prompt(33), long_prompt(25)];
+        chain_equals_whole_with("llama", &llama, 96, &[cuts[0]], &prompts, true);
+        if n >= 3 {
+            let bounds = [cuts[0], cuts[1]];
+            chain_equals_whole_with("llama", &llama, 96, &bounds, &prompts, true);
+        }
+
+        let gemma = write_tiny_model();
+        let (_, cuts) = cuts_of(&gemma);
+        let prompts = [PROMPT.to_vec(), vec![2, 9, 9, 9, 10]];
+        chain_equals_whole_with("gemma4", &gemma, 32, &[cuts[0]], &prompts, true);
+
+        let qwen = hybrid_model();
+        let (_, cuts) = cuts_of(&qwen);
+        let mut first = long_prompt(40);
+        first[19] = 3;
+        let mut second = first[..30].to_vec();
+        second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
+        let mut extended = first.clone();
+        extended.extend([15, 14, 13]);
+        let prompts = [first, second, extended];
+        chain_equals_whole_with("qwen35", &qwen, 128, &[cuts[0]], &prompts, true);
+
+        let deepseek = write_deepseek41(&TinyDeepseek41::default());
+        let (_, cuts) = cuts_of(&deepseek);
+        let prompts = [long_prompt(70), long_prompt(70)];
+        for &cut in &cuts {
+            chain_equals_whole_with("deepseek41", &deepseek, 96, &[cut], &prompts, true);
+        }
+    }
+
+    /// The worker answers a call it already ran from memory: the reply it
+    /// gave, byte for byte, and no state moves. A pass sent again under a
+    /// new number is a different matter: an attention-only model repeats it,
+    /// a hybrid model refuses it (its recurrent state is past the pass's
+    /// start), and a hyper-connection model repeats it or refuses it (its
+    /// compressor state is past an odd start), so only the numbering makes
+    /// a repeat succeed everywhere. A call no newer than the last, or
+    /// numbered 0, is refused.
+    #[test]
+    fn a_worker_answers_a_repeated_call_from_memory() {
+        use stageframe::{Call, decode, forward_frame};
+        let llama = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let hybrid = hybrid_model();
+        let deepseek = write_deepseek41(&TinyDeepseek41::default());
+        for (what, model, context) in [
+            ("llama", &llama, 96),
+            ("qwen35", &hybrid, 128),
+            ("deepseek41", &deepseek, 96),
+        ] {
+            let (_, cuts) = cuts_of(model);
+            let (mut chain, links) = chain_over(model, context, &[cuts[0]]);
+            let out = run(&mut chain, &long_prompt(40), Some(4));
+            assert!(out.items.iter().all(Result::is_ok), "{what}");
+            let mut worker = links.workers[0].lock().unwrap();
+
+            // Whatever the last call was, a repeat of it is answered alike.
+            let (frame, reply) = links.last[0].lock().unwrap().clone().unwrap();
+            let again = worker.stage_call(&frame).unwrap();
+            assert_eq!(&again[..], &reply[..], "{what}: the repeat is replayed");
+
+            // The last pass, sent as a call of its own, is not a repeat.
+            let (frame, reply) = links.last_forward[0].lock().unwrap().clone().unwrap();
+            let Ok(Call::Forward(mut call)) = decode(&frame) else {
+                panic!("{what}: not a forward frame");
+            };
+            let last_seq = call.seq;
+            call.seq = 1_000_000;
+            let rerun = worker.stage_call(&forward_frame(&call).unwrap());
+            match what {
+                // Attention only: positional K/V rows, the same pass again.
+                "llama" => assert_eq!(&rerun.unwrap()[..], &reply[..], "{what}"),
+                "qwen35" => {
+                    let e = rerun.unwrap_err().to_string();
+                    assert!(e.contains("recurrent state's position"), "{what}: {e}");
+                }
+                // Never a different answer: the same one, or a refusal.
+                _ => match rerun {
+                    Ok(r) => assert_eq!(&r[..], &reply[..], "{what}"),
+                    Err(e) => {
+                        let e = e.to_string();
+                        assert!(e.contains("compressor state"), "{what}: {e}");
+                    }
+                },
+            }
+
+            // Older and zero numbers are refused.
+            for seq in [0, last_seq - 1] {
+                call.seq = seq;
+                let e = worker.stage_call(&forward_frame(&call).unwrap());
+                let e = e.unwrap_err().to_string();
+                assert!(e.contains("not newer"), "{what}, call {seq}: {e}");
+            }
+        }
     }
 
     /// A chain counts every call of each remote stage: as many as the
@@ -4728,23 +4924,34 @@ mod tests {
         }
 
         // Nothing opened yet: no session matches.
-        let m = match worker.stage_call(&snapshot_frame(5, &[], 0, 1)) {
+        let m = match worker.stage_call(&snapshot_frame(5, 1, &[], 0, 1)) {
             Err(CucaError::Config(m)) => m,
             other => panic!("{other:?}"),
         };
         assert!(m.contains("another session"), "{m}");
         worker.stage_call(&open_frame(&good)).unwrap();
         // Another session's calls are refused; the opened one's are served.
-        let m = match worker.stage_call(&prefetch_frame(6, 0, &[1, 2])) {
+        let m = match worker.stage_call(&prefetch_frame(6, 1, 0, &[1, 2])) {
             Err(CucaError::Config(m)) => m,
             other => panic!("{other:?}"),
         };
         assert!(m.contains("another session"), "{m}");
-        worker.stage_call(&prefetch_frame(5, 0, &[1, 2])).unwrap();
+        worker
+            .stage_call(&prefetch_frame(5, 1, 0, &[1, 2]))
+            .unwrap();
+        // The same call again is answered, not run; opening again starts
+        // the numbering over.
+        worker
+            .stage_call(&prefetch_frame(5, 1, 0, &[1, 2]))
+            .unwrap();
+        worker.stage_call(&open_frame(&good)).unwrap();
+        worker
+            .stage_call(&prefetch_frame(5, 1, 0, &[1, 2]))
+            .unwrap();
         // A slot the worker does not have, and a snapshot of a model with
         // no recurrent state.
-        assert!(worker.stage_call(&prefetch_frame(5, 9, &[1])).is_err());
-        assert!(worker.stage_call(&snapshot_frame(5, &[], 0, 1)).is_err());
+        assert!(worker.stage_call(&prefetch_frame(5, 2, 9, &[1])).is_err());
+        assert!(worker.stage_call(&snapshot_frame(5, 2, &[], 0, 1)).is_err());
         // A frame that is not one.
         assert!(worker.stage_call(&[]).is_err());
         assert!(worker.stage_call(&[99, 0, 0]).is_err());

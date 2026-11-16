@@ -128,7 +128,7 @@ A model entry has:
 - Window figures: `prefix_hit_ratio`, `preemptions_per_min`, `tokens_per_s` (`prompt` counts tokens the engine computed, `generation` all generated tokens), `steps_per_s`, `rows_per_s`, `mean_rows_per_step`, `prefill_row_share`, `mean_step_ms`, `mean_queue_ms`. `last_step_ms` is the last forward pass.
 - `memory`: `weights_bytes` (the size of the model file it runs from), `kv_bytes`, `device`.
 - `expert_tiers` (tiered experts only): `disk_reads_per_s`, `read_bytes_per_s`, `hit_ratio`, `ram_resident_bytes`, `device_resident_bytes`.
-- `stages` (coordinators only): one entry per remote layer stage, in layer order, cumulative since load: `name`, `calls`, `errors`, `mean_call_ms`, `mean_compute_ms` (what the worker reported computing), `mean_network_ms` (the rest of a call: transfer, HTTP handling and the worker's queue), `sent_bytes`, `received_bytes`.
+- `stages` (coordinators only): one entry per remote layer stage, in layer order, cumulative since load: `name`, `calls`, `errors`, `retries` (calls sent a second time after the connection failed before any answer arrived), `mean_call_ms`, `mean_compute_ms` (what the worker reported computing), `mean_network_ms` (the rest of a call: transfer, HTTP handling and the worker's queue), `sent_bytes`, `received_bytes`.
 - `drafter` (models with a drafter only): `source` (`in-trunk` or the drafter file), `draft_tokens`, and `acceptance_ratio`, the share of drafted tokens the model accepted over the window. The ratio is `null` when the window has no drafts: the model is idle, or several requests run and speculation is off.
 - `requests` and `latency` for that model.
 
@@ -234,6 +234,7 @@ Label values:
 | `cuca_kv_imports_total{model,outcome}` | counter | requests that named a prefill node, by outcome: `ok`, `skipped` (prompt too short), `drafter` (the drafter replays the prompt), `unlisted` (peer not in `kv_import`), `failed` |
 | `cuca_kv_import_tokens_total{model}`, `cuca_kv_import_bytes_total{model}` | counter | prompt tokens and frame bytes imported from prefill nodes |
 | `cuca_stage_calls_total{model,stage}`, `cuca_stage_errors_total{model,stage}` | counter | calls a coordinator made to remote layer stage `stage` (its index from 0), answered and failed |
+| `cuca_stage_retries_total{model,stage}` | counter | calls sent a second time because the connection failed before any answer arrived; a pooled connection the worker's side had closed, or a worker that died after running the frame |
 | `cuca_stage_seconds_total{model,stage,part}` | counter | time of the answered calls: `part` `compute` is what the worker reported computing, `network` the rest of the call |
 | `cuca_stage_bytes_total{model,stage,direction}` | counter | frame bytes of a stage, `direction` `sent` or `received` |
 | `cuca_model_weights_bytes{model}` | gauge | the size of the model file it runs from |

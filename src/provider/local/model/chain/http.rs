@@ -1,8 +1,19 @@
 //! The HTTP transport of a layer stage: one `POST` per frame to the worker's
-//! model server.
+//! model server, over a connection kept between calls.
+//!
+//! The engine thread blocks on a current-thread runtime that drives the
+//! connections only while a call runs, so a connection that sits in the pool
+//! between two passes can be closed by the server (or a proxy in front of
+//! it) without the client noticing. The next call then fails on it before
+//! any answer arrives. The transport sends such a call again, once, on
+//! another connection: that is safe because the worker runs a numbered call
+//! once and answers a repeat with the reply it kept (see
+//! [`stageframe`](crate::provider::local::stageframe)).
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+use bytes::Bytes;
 
 use super::{StageCounters, StageTransport};
 use crate::error::CucaError;
@@ -10,6 +21,30 @@ use crate::provider::local::{RemoteStage, STAGE_COMPUTE_HEADER};
 
 /// How long a connect may take before the stage counts as unreachable.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// How long a connection may sit unused in the pool before the client drops
+/// it: under the idle timeouts servers and proxies commonly close at (nginx
+/// 75 s, cloud load balancers 60 s), so most connections are dropped here
+/// before the other end closes them. A shorter one (a server at 5 s) is the
+/// retry's case.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// A failed attempt: the error it becomes, and whether the connection was
+/// to blame (the call may then go again on another one).
+struct Failed {
+    error: CucaError,
+    stale: bool,
+}
+
+/// Whether `e`, from sending a request, says the connection failed before
+/// any answer arrived: a request error that is not a connect error (the
+/// stage is unreachable: a second attempt would only wait again) and not a
+/// timeout (the stage is slow, or gone: a second attempt would not help).
+/// The answer's head had not arrived, so a retried call never retries an
+/// answer that was under way.
+fn lost_connection(e: &reqwest::Error) -> bool {
+    e.is_request() && !e.is_connect() && !e.is_timeout()
+}
 
 /// Posts frames to `{url}/cuca/v1/stage[/{model}]` and blocks the calling
 /// thread on the answer. It owns a single-threaded runtime, so it must be
@@ -46,11 +81,10 @@ impl HttpTransport {
             // reqwest 0.13 already defaults to it; a frame is one small
             // write each way and must not wait for an ACK (Nagle).
             .tcp_nodelay(true)
-            // Passes are far apart, and the runtime drives no connection
-            // between calls, so an idle connection would die unnoticed and
-            // fail the next pass: every call opens its own (a TCP handshake
-            // costs nothing next to a forward pass).
-            .pool_max_idle_per_host(0)
+            // One call at a time: one connection is all the pool needs. A
+            // call that finds it closed is sent again (see the module docs).
+            .pool_max_idle_per_host(1)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| super::super::err(format!("stage {url}: cannot build client: {e}")))?;
@@ -98,35 +132,57 @@ impl HttpTransport {
             super::super::err(text)
         }
     }
+
+    /// One attempt: post `frame` and read the whole answer, with the compute
+    /// time the worker reported.
+    async fn attempt(&self, frame: &Bytes) -> Result<(Bytes, Duration), Failed> {
+        let mut request = self
+            .client
+            .post(&self.endpoint)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .timeout(self.timeout)
+            .body(frame.clone());
+        if let Some(key) = &self.key {
+            request = request.bearer_auth(key);
+        }
+        let response = request.send().await.map_err(|e| Failed {
+            stale: lost_connection(&e),
+            error: self.transport_err(&e),
+        })?;
+        let status = response.status();
+        let compute = response
+            .headers()
+            .get(STAGE_COMPUTE_HEADER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<u64>().ok())
+            .map_or(Duration::ZERO, Duration::from_nanos);
+        let body = response.bytes().await.map_err(|e| Failed {
+            stale: false,
+            error: self.transport_err(&e),
+        })?;
+        if status.is_success() {
+            Ok((body, compute))
+        } else {
+            Err(Failed {
+                stale: false,
+                error: self.status_err(status, &body),
+            })
+        }
+    }
 }
 
 impl StageTransport for HttpTransport {
     fn call(&self, frame: Vec<u8>) -> Result<Vec<u8>, CucaError> {
         let sent = frame.len();
+        let frame = Bytes::from(frame);
         let started = Instant::now();
         let outcome = self.rt.block_on(async {
-            let mut request = self
-                .client
-                .post(&self.endpoint)
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .timeout(self.timeout)
-                .body(frame);
-            if let Some(key) = &self.key {
-                request = request.bearer_auth(key);
-            }
-            let response = request.send().await.map_err(|e| self.transport_err(&e))?;
-            let status = response.status();
-            let compute = response
-                .headers()
-                .get(STAGE_COMPUTE_HEADER)
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .map_or(Duration::ZERO, Duration::from_nanos);
-            let body = response.bytes().await.map_err(|e| self.transport_err(&e))?;
-            if status.is_success() {
-                Ok((body, compute))
-            } else {
-                Err(self.status_err(status, &body))
+            match self.attempt(&frame).await {
+                Err(Failed { stale: true, .. }) => {
+                    self.stats.record_retry(sent);
+                    self.attempt(&frame).await
+                }
+                other => other,
             }
         });
         match outcome {
@@ -135,9 +191,9 @@ impl StageTransport for HttpTransport {
                     .record(started.elapsed(), compute, sent, body.len());
                 Ok(body.to_vec())
             }
-            Err(e) => {
+            Err(failed) => {
                 self.stats.record_error(sent);
-                Err(e)
+                Err(failed.error)
             }
         }
     }
@@ -317,6 +373,91 @@ mod tests {
         (url, handle)
     }
 
+    /// A responder that reads a request and closes the connection without
+    /// answering, `drops` times (what a server does that processed a frame
+    /// and died, or a pooled connection it had closed), then answers the next
+    /// request with its body. Returns the body of every request it read; it
+    /// stops after the answer, or when no connection comes within 1 s.
+    fn serve_dropping(drops: usize) -> (String, JoinHandle<Vec<Vec<u8>>>) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", std_listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::from_std(std_listener).unwrap();
+                let mut bodies = Vec::new();
+                loop {
+                    let next = tokio::time::timeout(Duration::from_secs(1), listener.accept());
+                    let Ok(Ok((mut sock, _))) = next.await else {
+                        break;
+                    };
+                    let seen = read_request(&mut sock).await;
+                    bodies.push(seen.body.clone());
+                    if bodies.len() <= drops {
+                        continue;
+                    }
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        seen.body.len()
+                    );
+                    sock.write_all(head.as_bytes()).await.unwrap();
+                    sock.write_all(&seen.body).await.unwrap();
+                    sock.shutdown().await.unwrap();
+                    break;
+                }
+                bodies
+            })
+        });
+        (url, handle)
+    }
+
+    /// A responder that echoes `requests` requests on the one connection it
+    /// accepts; returns how many connections came (one, if the client keeps
+    /// its connection between calls).
+    fn serve_keepalive(requests: usize) -> (String, JoinHandle<usize>) {
+        let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        std_listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", std_listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let listener = TcpListener::from_std(std_listener).unwrap();
+                let next = tokio::time::timeout(Duration::from_secs(3), listener.accept());
+                let Ok(Ok((mut sock, _))) = next.await else {
+                    return 0;
+                };
+                let mut accepted = 1;
+                for _ in 0..requests {
+                    let read =
+                        tokio::time::timeout(Duration::from_secs(3), read_request(&mut sock));
+                    let Ok(seen) = read.await else {
+                        break;
+                    };
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\n\r\n",
+                        seen.body.len()
+                    );
+                    sock.write_all(head.as_bytes()).await.unwrap();
+                    sock.write_all(&seen.body).await.unwrap();
+                    sock.flush().await.unwrap();
+                }
+                let more = tokio::time::timeout(Duration::from_millis(200), listener.accept());
+                if matches!(more.await, Ok(Ok(_))) {
+                    accepted += 1;
+                }
+                accepted
+            })
+        });
+        (url, handle)
+    }
+
     fn stage(url: &str) -> RemoteStage {
         RemoteStage {
             url: url.to_owned(),
@@ -444,6 +585,7 @@ mod tests {
         let t = HttpTransport::new(&stage(&format!("http://127.0.0.1:{port}"))).unwrap();
         let e = t.call(vec![1]).unwrap_err();
         assert!(matches!(e, CucaError::Provider { .. }), "{e}");
+        assert_eq!(t.counters().snapshot(t.name()).retries, 0, "no retry");
         assert!(e.to_string().contains("is not reachable"), "{e}");
     }
 
@@ -460,12 +602,14 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(4));
         assert!(matches!(e, CucaError::Provider { .. }), "{e}");
         assert!(e.to_string().contains("timed out after 1s"), "{e}");
+        assert_eq!(t.counters().snapshot(t.name()).retries, 0, "no retry");
         handle.join().unwrap();
     }
 
     /// Passes are seconds apart and a server may close an idle connection
-    /// between two of them. The transport opens a connection per call, so
-    /// the second call never meets the dead one a pool would hand it.
+    /// between two of them, which the client does not see until it sends on
+    /// it. The calls still succeed: on a new connection, whether the client
+    /// finds the old one dead before it writes or only after.
     #[test]
     fn calls_survive_a_server_that_closes_idle_connections() {
         let (url, handle) = serve_then_close(3);
@@ -478,6 +622,60 @@ mod tests {
             // Long enough for the close to reach the client's socket.
             std::thread::sleep(Duration::from_millis(300));
         }
-        assert_eq!(handle.join().unwrap(), 3, "one connection per call");
+        assert_eq!(handle.join().unwrap(), 3, "each connection served one call");
+        let s = t.counters().snapshot(t.name());
+        assert_eq!((s.calls, s.errors), (3, 0));
+        assert!(s.retries <= 2, "at most one retry per call: {}", s.retries);
+    }
+
+    /// The connection is kept between calls: three calls, one connection.
+    #[test]
+    fn calls_reuse_their_connection() {
+        let (url, handle) = serve_keepalive(3);
+        let t = HttpTransport::new(&stage(&url)).unwrap();
+        for frame in [vec![1u8, 2], vec![3], vec![4, 5, 6]] {
+            assert_eq!(t.call(frame.clone()).unwrap(), frame);
+        }
+        assert_eq!(handle.join().unwrap(), 1, "one connection for three calls");
+        assert_eq!(t.counters().snapshot(t.name()).retries, 0);
+    }
+
+    /// A connection that dies before any answer arrives (a server that
+    /// processed the frame and went down before it answered, or one that
+    /// closed the pooled connection) gets the same frame sent again, once.
+    #[test]
+    fn a_connection_that_dies_before_the_answer_gets_the_frame_again() {
+        let frame = vec![7u8, 8, 9, 10];
+        let (url, handle) = serve_dropping(1);
+        let t = HttpTransport::new(&stage(&url)).unwrap();
+        assert_eq!(t.call(frame.clone()).unwrap(), frame);
+        assert_eq!(handle.join().unwrap(), vec![frame.clone(), frame]);
+        let s = t.counters().snapshot(t.name());
+        assert_eq!((s.calls, s.errors, s.retries), (1, 0, 1));
+        assert_eq!(s.sent_bytes, 8, "both attempts count");
+        assert_eq!(s.received_bytes, 4);
+    }
+
+    /// The retry is one: a second failure is the call's error.
+    #[test]
+    fn a_second_failure_is_the_calls_error() {
+        let (url, handle) = serve_dropping(2);
+        let t = HttpTransport::new(&stage(&url)).unwrap();
+        let e = t.call(vec![1, 2]).unwrap_err();
+        assert!(matches!(e, CucaError::Provider { .. }), "{e}");
+        assert_eq!(handle.join().unwrap().len(), 2, "two attempts, no third");
+        let s = t.counters().snapshot(t.name());
+        assert_eq!((s.calls, s.errors, s.retries), (0, 1, 1));
+    }
+
+    /// An answer, even an error status, is final: it is no lost connection.
+    #[test]
+    fn an_answered_call_is_never_sent_again() {
+        let (url, seen, handle) = serve(Reply::Answer(500, Vec::new()));
+        let t = HttpTransport::new(&stage(&url)).unwrap();
+        t.call(vec![1]).unwrap_err();
+        handle.join().unwrap();
+        drop(seen);
+        assert_eq!(t.counters().snapshot(t.name()).retries, 0);
     }
 }
