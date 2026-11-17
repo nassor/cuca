@@ -46,7 +46,7 @@ use super::cpu::Forward;
 use super::paged::{BlockTable, KvLayout};
 use super::split::{Carry, LayerRange, StageOut};
 use super::transfer::{DeltaRows, PoolRows};
-use super::{Batch, Model, RecurrentSnapshot, StateSlot, StepHint, err};
+use super::{Batch, Model, RecurrentSnapshot, StateSlot, StepHint, Want, err};
 use crate::error::CucaError;
 use crate::provider::local::CarryDtype;
 use crate::provider::local::stageframe::{
@@ -167,6 +167,11 @@ pub(crate) struct ChainModel {
     /// stage's was taken back at once): a verification round rejected some
     /// drafts.
     rewinds: Vec<Option<usize>>,
+    /// Per state slot, the first position and the rows of its last forward
+    /// call when every stage recorded it for rollback (`Want::All` over 2 to
+    /// [`ChainModel::rollback_rows`] rows of a model with recurrent or
+    /// compressor state): the call a rewind may go back into.
+    verify: Vec<Option<(usize, usize)>>,
     /// Per state slot, the snapshot the last forward call took on the
     /// workers, until [`ChainModel::snapshot`] adds the local stage's.
     taken: Mutex<Vec<Option<Taken>>>,
@@ -279,6 +284,7 @@ impl ChainModel {
             cause: Mutex::new(None),
             restores: vec![None; max_sequences],
             rewinds: vec![None; max_sequences],
+            verify: vec![None; max_sequences],
             taken: Mutex::new(vec![None; max_sequences]),
         };
         chain.reopen()?;
@@ -315,6 +321,7 @@ impl ChainModel {
         self.pos.fill(0);
         self.restores.fill(None);
         self.rewinds.fill(None);
+        self.verify.fill(None);
         lock(&self.taken).fill(None);
         self.dirty.store(false, Ordering::Relaxed);
         Ok(())
@@ -533,6 +540,10 @@ impl ChainModel {
             self.pos[r.state.0] = end;
             self.restores[r.state.0] = None;
             self.rewinds[r.state.0] = None;
+            self.verify[r.state.0] = ((self.hybrid || self.stateful)
+                && r.want == Want::All
+                && (2..=self.rollback_rows()).contains(&r.tokens.len()))
+            .then_some((r.start_pos, r.tokens.len()));
             if let Some(id) = snapshot_ids[i] {
                 let taken = Taken {
                     id,
@@ -627,12 +638,14 @@ impl ChainModel {
 
     /// Take `slot` back to `len` positions. K/V is positional, so an
     /// attention-only model returns `len`. A model with recurrent or
-    /// compressor state can stay where it is, or go back to a position of
-    /// the slot's last verification call (`Want::All` over 2 to 17 rows):
-    /// the local stage goes back at once and the workers with the slot's
-    /// next forward call, which carries the position (`StageSeq::rewind`).
-    /// Any other position is 0, after which the engine recomputes or fails
-    /// the sequence.
+    /// compressor state can stay where it is, or go back into the slot's last
+    /// verification call (`Want::All` over 2 to 17 rows, see `verify`): the
+    /// local stage goes back at once and the workers with the slot's next
+    /// forward call, which carries the position (`StageSeq::rewind`). The
+    /// position must lie past the call's start, or at it when that is even: a
+    /// compressor's half-pooled pair cannot be restored at an odd start, and
+    /// the coordinator cannot see which stage holds one. Any other position
+    /// is 0, after which the engine recomputes or fails the sequence.
     pub(crate) fn rewind(&mut self, slot: usize, len: usize) -> usize {
         if !self.hybrid && !self.stateful {
             return len;
@@ -643,7 +656,11 @@ impl ChainModel {
         if slot >= self.max_sequences {
             return 0;
         }
-        if len > 0
+        let inside = self.verify[slot].is_some_and(|(first, rows)| {
+            len < first + rows
+                && (len > first || (len == first && (!self.stateful || len.is_multiple_of(2))))
+        });
+        if inside
             && len < self.pos[slot]
             && self.rollback_rows() > 1
             && self.local.rewind(StateSlot(slot), len) == len
@@ -655,6 +672,7 @@ impl ChainModel {
         self.local.reset_slot(StateSlot(slot));
         self.pos[slot] = 0;
         self.rewinds[slot] = None;
+        self.verify[slot] = None;
         0
     }
 
@@ -668,6 +686,9 @@ impl ChainModel {
         }
         if let Some(r) = self.rewinds.get_mut(slot) {
             *r = None;
+        }
+        if let Some(v) = self.verify.get_mut(slot) {
+            *v = None;
         }
     }
 
@@ -743,6 +764,7 @@ impl ChainModel {
                     len: len as u64,
                 });
                 self.rewinds[slot] = None;
+                self.verify[slot] = None;
                 self.pos[slot] = len;
             }
             Err(e) => self.break_with(e),

@@ -1662,6 +1662,7 @@ impl Transformer {
             compressed,
             sizing.max_sequences,
             engram_rows,
+            range,
         );
         let hybrid = hp.is_hybrid();
         for lw in &mut layers {

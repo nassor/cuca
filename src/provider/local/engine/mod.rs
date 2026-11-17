@@ -4847,22 +4847,29 @@ mod tests {
             let (_, cuts) = cuts_of(model);
             let mut plain = engine(model, 32, 0.0, None);
             let expected = run(&mut plain, &PROMPT, None);
-            // The hybrid chain accepts drafts and needs fewer calls.
-            let fails: &[usize] = if what == "eagle" {
-                &[3, 4, 5, 6]
-            } else {
-                &[2, 3, 4, 5]
+            // Every call a clean run makes, the open being call 0 (the hybrid
+            // chain accepts drafts and makes fewer than the EAGLE one).
+            let open = |what: &str| {
+                chain_drafting(model, drafter_file, 32, &[cuts[0]], 4, |c, m| {
+                    if what == "eagle" {
+                        Drafter::open_eagle(c, m)
+                    } else {
+                        Drafter::open_in_trunk(c, m)
+                    }
+                })
+                .unwrap()
             };
-            for &fail_at in fails {
-                let (mut spec, links) =
-                    chain_drafting(model, drafter_file, 32, &[cuts[0]], 4, |c, m| {
-                        if what == "eagle" {
-                            Drafter::open_eagle(c, m)
-                        } else {
-                            Drafter::open_in_trunk(c, m)
-                        }
-                    })
-                    .unwrap();
+            let (mut clean, clean_links) = open(what);
+            assert!(
+                run(&mut clean, &PROMPT, None)
+                    .items
+                    .iter()
+                    .all(Result::is_ok)
+            );
+            let calls = clean_links.calls[0].load(Ordering::SeqCst);
+            assert!(calls > 4, "{what}: {calls} calls");
+            for fail_at in 1..calls {
+                let (mut spec, links) = open(what);
                 // The open took call 0; fail a forward call of the first
                 // request.
                 links.fail_at[0].store(fail_at, Ordering::SeqCst);
@@ -4911,95 +4918,126 @@ mod tests {
         );
     }
 
+    /// The token at position `i` of the rollback tests.
+    fn rollback_token(i: usize) -> u32 {
+        ((i * 5 + 3) % 14 + 1) as u32
+    }
+
+    /// One forward call of slot 0 over `ids` from position `start` (its history
+    /// is the tokens before it); the last row's logits when it wants any.
+    fn rollback_step(
+        e: &mut Engine,
+        pools: &mut crate::provider::local::model::paged::KvPools,
+        seq: &mut crate::provider::local::model::paged::SeqBlocks,
+        ids: &[u32],
+        start: usize,
+        want: crate::provider::local::model::Want,
+    ) -> Vec<f32> {
+        use crate::provider::local::model::cpu::Hidden;
+        use crate::provider::local::model::{Batch, SeqRows, StateSlot};
+        pools.reserve(seq, start + ids.len()).unwrap();
+        let history: Vec<u32> = (0..start).map(rollback_token).collect();
+        let batch = Batch {
+            rows: vec![SeqRows {
+                history: &history,
+                tokens: ids,
+                start_pos: start,
+                tables: &seq.tables,
+                state: StateSlot(0),
+                want,
+                hidden: Hidden::None,
+            }],
+            exact: true,
+        };
+        let out = e.model.forward_batch(&batch).unwrap();
+        out[0].logits.clone().unwrap_or_default()
+    }
+
+    /// Prefill 6 tokens, verify 5 more in one `Want::All` call, then call
+    /// `rewind` on the engine's model with `keeps`, in order, and finish with
+    /// one call from the last position kept: its logits, and what each rewind
+    /// returned.
+    fn rollback_run(e: &mut Engine, keeps: &[usize]) -> (Vec<f32>, Vec<usize>) {
+        use crate::provider::local::model::paged::KvPools;
+        use crate::provider::local::model::{StateSlot, Want};
+        let layout = e.model.kv_layout().clone();
+        let mut pools = KvPools::new(&layout);
+        let mut seq = pools.seq();
+        let all: Vec<u32> = (0..14).map(rollback_token).collect();
+        rollback_step(e, &mut pools, &mut seq, &all[..6], 0, Want::Last);
+        rollback_step(e, &mut pools, &mut seq, &all[6..11], 6, Want::All);
+        let kept: Vec<usize> = keeps
+            .iter()
+            .map(|&k| e.model.rewind(StateSlot(0), k))
+            .collect();
+        let at = *kept.last().unwrap();
+        let logits = rollback_step(e, &mut pools, &mut seq, &all[at..at + 2], at, Want::Last);
+        (logits, kept)
+    }
+
     /// A verification round on a chain over recurrent or compressor state
     /// rolls back to every position of the call: the local stage at once,
     /// the workers with the next call's `rewind`, and the logits that follow
-    /// equal the whole model's, bit for bit.
+    /// equal the whole model's, bit for bit, with the workers cut anywhere:
+    /// one worker, two, and a coordinator that holds only an attention layer
+    /// of a hybrid model (or only layers with no compressor of a hyper one).
     #[test]
     fn a_chain_rolls_back_a_verification_round_like_the_whole_model() {
-        use crate::provider::local::model::cpu::Hidden;
-        use crate::provider::local::model::paged::KvPools;
         use crate::provider::local::model::tiny::{TinyDeepseek41, write_deepseek41};
-        use crate::provider::local::model::{Batch, SeqRows, StateSlot, Want};
-        fn step(
-            model: &mut Model,
-            pools: &mut KvPools,
-            seq: &mut crate::provider::local::model::paged::SeqBlocks,
-            ids: &[u32],
-            start: usize,
-            want: Want,
-        ) -> Vec<f32> {
-            pools.reserve(seq, start + ids.len()).unwrap();
-            let history = ids_before(start);
-            let batch = Batch {
-                rows: vec![SeqRows {
-                    history: &history,
-                    tokens: ids,
-                    start_pos: start,
-                    tables: &seq.tables,
-                    state: StateSlot(0),
-                    want,
-                    hidden: Hidden::None,
-                }],
-                exact: true,
-            };
-            let out = model.forward_batch(&batch).unwrap();
-            out[0].logits.clone().unwrap_or_default()
-        }
-        // The token at position `i`.
-        fn token(i: usize) -> u32 {
-            ((i * 5 + 3) % 14 + 1) as u32
-        }
-        fn ids_before(n: usize) -> Vec<u32> {
-            (0..n).map(token).collect()
-        }
-        let hybrid = hybrid_model();
+        let qwen = hybrid_model();
+        // Four layers, the last of them full attention: a coordinator cut at 3
+        // holds no delta-net layer.
+        let attention_last = hybrid(TinyQwen35 {
+            trunk_layers: 4,
+            interval: 4,
+            ..TinyQwen35::default()
+        });
         let hyper = write_deepseek41(&TinyDeepseek41::default());
-        for (what, file, context) in [("qwen35", &hybrid, 128), ("deepseek41", &hyper, 32)] {
+        for (what, file, context) in [
+            ("qwen35", &qwen, 128),
+            ("qwen35, attention last", &attention_last, 128),
+            ("deepseek41", &hyper, 32),
+        ] {
             let (_, cuts) = cuts_of(file);
+            let cut_sets = [
+                cuts[..1].to_vec(),
+                cuts[cuts.len() - 1..].to_vec(),
+                cuts[..2].to_vec(),
+            ];
             // The call at positions 6..11 verifies five rows; keep 6..=10
             // positions of it (11 is the whole call: nothing to undo).
             for keep in 6..=10usize {
-                let mut outputs = Vec::new();
-                for chained in [false, true] {
-                    let mut e = if chained {
-                        chain_over(file, context, &cuts[..1]).0
-                    } else {
-                        engine(file, context, 0.0, None)
-                    };
-                    let layout = e.model.kv_layout().clone();
-                    let mut pools = KvPools::new(&layout);
-                    let mut seq = pools.seq();
-                    let all: Vec<u32> = (0..14).map(token).collect();
-                    step(&mut e.model, &mut pools, &mut seq, &all[..6], 0, Want::Last);
-                    step(
-                        &mut e.model,
-                        &mut pools,
-                        &mut seq,
-                        &all[6..11],
-                        6,
-                        Want::All,
+                let (whole, kept) = rollback_run(&mut engine(file, context, 0.0, None), &[keep]);
+                assert_eq!(kept, [keep], "{what}, keep {keep}: the whole model");
+                assert!(!whole.is_empty(), "{what}: logits");
+                for bounds in &cut_sets {
+                    let mut e = chain_over(file, context, bounds).0;
+                    let (got, kept) = rollback_run(&mut e, &[keep]);
+                    assert_eq!(kept, [keep], "{what}, keep {keep}, cuts {bounds:?}");
+                    assert!(
+                        got == whole,
+                        "{what}, keep {keep}, cuts {bounds:?}: the chain's logits equal the whole model's"
                     );
-                    assert_eq!(
-                        e.model.rewind(StateSlot(0), keep),
-                        keep,
-                        "{what}, keep {keep}, chained {chained}"
-                    );
-                    outputs.push(step(
-                        &mut e.model,
-                        &mut pools,
-                        &mut seq,
-                        &all[keep..keep + 2],
-                        keep,
-                        Want::Last,
-                    ));
                 }
-                assert!(!outputs[0].is_empty(), "{what}: logits");
-                assert!(
-                    outputs[0] == outputs[1],
-                    "{what}, keep {keep}: the chain's logits equal the whole model's"
-                );
             }
+        }
+    }
+
+    /// A rewind to the start of a verification call empties the compressor's
+    /// pair log, and a second rewind to an odd position below it must still
+    /// reset, as the whole model does: the state of a half-pooled pair is
+    /// gone. Stages without a compressor layer go anywhere.
+    #[test]
+    fn a_second_rewind_to_an_odd_position_below_the_call_resets() {
+        use crate::provider::local::model::tiny::{TinyDeepseek41, write_deepseek41};
+        let hyper = write_deepseek41(&TinyDeepseek41::default());
+        let (_, cuts) = cuts_of(&hyper);
+        let (_, kept) = rollback_run(&mut engine(&hyper, 32, 0.0, None), &[6, 5]);
+        assert_eq!(kept, [6, 0], "the whole model");
+        for bounds in [&cuts[..1], &cuts[cuts.len() - 1..], &cuts[..2]] {
+            let mut e = chain_over(&hyper, 32, bounds).0;
+            let (_, kept) = rollback_run(&mut e, &[6, 5]);
+            assert_eq!(kept, [6, 0], "cuts {bounds:?}");
         }
     }
 

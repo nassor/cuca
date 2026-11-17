@@ -49,6 +49,7 @@ use super::super::paged::{BLOCK_SIZE, NO_BLOCK};
 use super::super::params::{Hparams, LayerSpec};
 use super::super::pool::{for_each, par_chunks, par_chunks_with};
 use super::super::rope::CosSin;
+use super::super::split::LayerRange;
 use super::{
     Hidden, KvLayer, LayerWeights, Loader, MAX_VERIFY_ROWS, Mixer, QMatMul, Seg, Transformer,
     TrunkOut,
@@ -482,6 +483,10 @@ pub(super) struct HyperModel {
     /// The ordinal of each ratio-2 cache owner among them.
     owners: Vec<Option<usize>>,
     n_owners: usize,
+    /// A layer of this stage's range owns a pairing compressor: the stage
+    /// holds a half-pooled pair that a rewind must restore. Without one only
+    /// the position goes back.
+    pools_pairs: bool,
     states: Mutex<Vec<CompState>>,
     /// `head_dim` of the pairing layers' rows.
     row_floats: usize,
@@ -496,6 +501,7 @@ impl HyperModel {
         ckv: Vec<Option<std::sync::Arc<KvLayer>>>,
         slots: usize,
         engram: Option<std::sync::Arc<dyn RowSource>>,
+        range: LayerRange,
     ) -> Option<Self> {
         let spec = hp.hyper?;
         let mut n_owners = 0;
@@ -508,7 +514,8 @@ impl HyperModel {
                     n_owners - 1
                 })
             })
-            .collect();
+            .collect::<Vec<_>>();
+        let pools_pairs = (range.first..range.end.min(owners.len())).any(|il| owners[il].is_some());
         Some(Self {
             spec,
             ropes: tables
@@ -523,6 +530,7 @@ impl HyperModel {
             ckv,
             owners,
             n_owners,
+            pools_pairs,
             states: Mutex::new((0..slots.max(1)).map(|_| CompState::default()).collect()),
             engram,
             row_floats: hp
@@ -566,14 +574,15 @@ impl HyperModel {
         if len >= s.end {
             return s.end;
         }
-        // The log holds the layers of this stage that pool pairs (the others'
-        // entries stay empty); a stage with none keeps no pooled pair, and
-        // only the position goes back.
-        let Some(rows) = s.log.iter().find(|l| !l.is_empty()) else {
+        if !self.pools_pairs {
             s.end = len;
             return len;
-        };
-        let n = rows.len() / (2 * self.row_floats.max(1));
+        }
+        // The log holds the layers of this stage that pool pairs (the others'
+        // entries stay empty; all of them are after a rewind to the start of
+        // the call, which then resets at an odd position).
+        let rows = s.log.iter().find(|l| !l.is_empty());
+        let n = rows.map_or(0, |l| l.len() / (2 * self.row_floats.max(1)));
         let first = s.end - n.min(s.end);
         if len % 2 == 1 && (len <= first || len > s.end) {
             *s = CompState::default();

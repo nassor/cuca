@@ -83,9 +83,9 @@
   (the drafter is then refused). The drafts and the number accepted equal what the same drafter
   does on one node, and the reply is plain greedy decoding's, also when answers are lost and sent
   again. Qwen 3.5 0.8B Q8_0 with its in-trunk head (`draft_tokens 3`) and one worker with 12
-  layers on the same machine: counting to 120 ran at 52 tokens per second without a drafter and
-  120 to 123 with it (one node: 53 and 125), with 61% fewer worker calls; a story went from 48 to
-  52 to 55 to 56, as on one node, because the governor stops drafting when it does not pay.
+  layers on the same machine, three runs: counting to 120 ran at 52 tokens per second without a
+  drafter and at 107 to 123 with it (one node: 53 and 114 to 127), with 59% to 61% fewer worker
+  calls; a story went from 48 to 52 to 55 to 56 (one node: 52 to 53, then 49 to 55).
   DFlash and DSpark stay refused (they read the hidden rows of several layers of the target, and a
   stage call returns none of a worker's). DeepSeek-V4.1 chains roll back at the model level, but
   no drafter pairs with it on a chain (the only one for it is DSpark).

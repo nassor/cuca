@@ -298,6 +298,10 @@ pub(super) struct HyperState {
     /// `[blocks * 16, head_dim + index_dim]`.
     compressed: Vec<Option<Tensor<2>>>,
     slots: Vec<CompSlot>,
+    /// A layer of this stage's range owns a pairing compressor (ratio 2): the
+    /// stage holds a half-pooled pair that a rewind must restore. Without
+    /// one only the position goes back.
+    pools_pairs: bool,
 }
 
 impl HyperState {
@@ -347,10 +351,17 @@ impl HyperState {
                 },
             );
         }
+        let pools_pairs = (range.first..range.end).any(|il| {
+            hp.layers
+                .get(il)
+                .and_then(|l| l.csa)
+                .is_some_and(|c| c.owns_kv && c.ratio == 2)
+        });
         Ok(Self {
             window,
             compressed,
             slots: (0..slots.max(1)).map(|_| CompSlot::default()).collect(),
+            pools_pairs,
         })
     }
 
@@ -371,12 +382,19 @@ impl HyperState {
         if len >= s.end {
             return s.end;
         }
-        // A stage whose layers pool no pair keeps no log: only the position
-        // goes back.
-        let Some(n) = s.log.iter().flatten().map(|l| l.dims()[0]).next() else {
+        if !self.pools_pairs {
             s.end = len;
             return len;
-        };
+        }
+        // After a rewind to the start of the call the log is empty, and an odd
+        // position then resets.
+        let n = s
+            .log
+            .iter()
+            .flatten()
+            .map(|l| l.dims()[0])
+            .next()
+            .unwrap_or(0);
         let first = s.end - n.min(s.end);
         if len % 2 == 1 && (len <= first || len > s.end) {
             *s = CompSlot::default();
