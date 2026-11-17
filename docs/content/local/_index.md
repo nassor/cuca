@@ -13,7 +13,7 @@ kicker = "Reference"
 <dt>In one line</dt>
 <dd>A language model, a GGUF file or a Hugging Face safetensors checkpoint, runs inside your program, on the CPU or a GPU. There is no server and no HTTP endpoint.</dd>
 <dt>You need</dt>
-<dd>Rust 1.98, a C compiler and the <code>provider-local</code> feature. A GPU needs <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> instead. Disk for the model file: 2.84 GB for the default.</dd>
+<dd>Rust 1.100, a C compiler and the <code>provider-local</code> feature. A GPU needs <code>provider-local-vulkan</code>, <code>provider-local-metal</code>, <code>provider-local-cuda</code> or <code>provider-local-rocm</code> instead. Disk for the model file: 2.84 GB for the default.</dd>
 <dt>Read this if</dt>
 <dd>You want a model that needs no external service, or you route requests through <code>ProviderEndpoint::Local</code>.</dd>
 </dl>
@@ -74,7 +74,7 @@ This tutorial runs the default model, `gemma4-e2b-q4_0`, from a new Rust crate. 
 
 You need:
 
-- Rust 1.98 or newer.
+- Rust 1.100 or newer.
 - A C compiler. See [Build requirements](@/local/build-and-tests.md) if the build fails on a native dependency.
 - About 3 GB of free disk. The default model is a 2.84 GB download.
 - About 2 GB of RAM for the default model: 1.5 GB of weights and 481 MB of K/V cache. The K/V cache is the memory a model keeps for the text it has already read. `LocalModel::kv_cache_bytes` reports its size.

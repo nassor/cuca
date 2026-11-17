@@ -12,7 +12,7 @@ kicker = "Compact Universal Client for Agents"
 <dt>In one line</dt>
 <dd>A Rust library, plus a <code>cuca</code> command, that talks to language models over the network or runs them itself</dd>
 <dt>You need</dt>
-<dd>Rust 1.98 or newer, and a checkout of the repository</dd>
+<dd>Rust 1.100 or newer, and a checkout of the repository</dd>
 <dt>Read this if</dt>
 <dd>You are deciding whether CUCA fits, or you want to know where to start</dd>
 </dl>

@@ -92,6 +92,7 @@
 
 ### Changed
 
+- MSRV and pinned toolchain are Rust 1.100 (`rust-version = "1.100"`, `rust-toolchain.toml` channel `1.100.0`).
 - The frame wire version is 4 (stage `open` answers with the worker's rollback rows, and a
   forward call can carry a `rewind`): a coordinator and a worker of different builds refuse each
   other at `open`.

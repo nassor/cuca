@@ -11,7 +11,7 @@ weight = 4
 <dt>In one line</dt>
 <dd>Build <code>cuca</code> with the <code>server</code> feature, run <code>cuca run</code> on a file with a <code>serve</code> section, and call it with curl or any OpenAI client</dd>
 <dt>You need</dt>
-<dd>Rust 1.98 or newer, a checkout of this repository, a C compiler (the <code>provider-local</code> build needs one), and about 0.7 GB of free disk and RAM for the model used here</dd>
+<dd>Rust 1.100 or newer, a checkout of this repository, a C compiler (the <code>provider-local</code> build needs one), and about 0.7 GB of free disk and RAM for the model used here</dd>
 <dt>Read this if</dt>
 <dd>You want a local endpoint for an editor, an agent framework or a test, with no llama.cpp or vLLM install</dd>
 </dl>

@@ -11,7 +11,7 @@ weight = 1
 <dt>In one line</dt>
 <dd>Point <code>cuca</code> at <code>llama-server</code> on port 1234 and run <code>cargo run --example llamacpp_gemma --features provider-llamacpp</code></dd>
 <dt>You need</dt>
-<dd>Rust 1.98 or newer, <code>git</code>, and <code>llama-server</code> from llama.cpp with a GGUF build of Gemma 4 E4B</dd>
+<dd>Rust 1.100 or newer, <code>git</code>, and <code>llama-server</code> from llama.cpp with a GGUF build of Gemma 4 E4B</dd>
 <dt>Read this if</dt>
 <dd>You want a reply streaming out of the crate before reading anything else</dd>
 </dl>
@@ -66,7 +66,7 @@ cd cuca
 cargo --version
 ```
 
-`cargo --version` must report 1.98.0 or newer. The repository pins `1.98.0` in `rust-toolchain.toml`, so a `rustup` toolchain installs it on the first cargo command in this directory.
+`cargo --version` must report 1.100.0 or newer. The repository pins `1.100.0` in `rust-toolchain.toml`, so a `rustup` toolchain installs it on the first cargo command in this directory.
 
 The crate turns every provider off by default, so a build with no provider feature fails on purpose. Try it:
 

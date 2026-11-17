@@ -2,7 +2,7 @@
 name = "cuca"
 version = "0.9.1"
 edition = "2024"
-rust-version = "1.98"
+rust-version = "1.100"
 description = "Compact Universal Client for Agents: an asynchronous LLM client that parses multi-modal SSE streams into typed blocks behind one unified request/response abstraction."
 repository = "https://github.com/nassor/cuca"
 homepage = "https://nassor.github.io/cuca/"
@@ -248,7 +248,7 @@ tracing = { version = "0.1", optional = true }
 # config-kdl: the KDL parser with source spans (positioned error messages).
 kdl = { version = "6.7", optional = true, default-features = false, features = ["span"] }
 # wide: portable SIMD, stable-only by construction (`std::simd` is nightly, and
-# this crate pins stable 1.98, forbids `unsafe` and reaches the vector units
+# this crate pins stable 1.100, forbids `unsafe` and reaches the vector units
 # through it): `f32x8` for the vector store's cosine scan, and the i16 multiply-add
 # and f32 lanes of provider-local's row-batched quantized matmul (`model/qmm.rs`).
 wide = { version = "1.7", optional = true }

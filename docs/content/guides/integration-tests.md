@@ -11,7 +11,7 @@ weight = 3
 <dt>In one line</dt>
 <dd>Write <code>cuca-test.kdl</code> at the repository root, run one <code>cargo test</code> command per suite, and read the lines it prints</dd>
 <dt>You need</dt>
-<dd>A checkout of this repository and Rust 1.98 or newer. The llama.cpp suite also needs <code>llama-server</code>. The local suites need a model, which they download on the first run</dd>
+<dd>A checkout of this repository and Rust 1.100 or newer. The llama.cpp suite also needs <code>llama-server</code>. The local suites need a model, which they download on the first run</dd>
 <dt>Read this if</dt>
 <dd>You change the crate and need the tests to exercise a real model instead of skipping</dd>
 </dl>

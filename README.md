@@ -8,7 +8,7 @@
 [![Crates.io](https://img.shields.io/crates/v/cuca.svg)](https://crates.io/crates/cuca)
 [![CI](https://github.com/nassor/cuca/actions/workflows/ci.yml/badge.svg)](https://github.com/nassor/cuca/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
-[![Rust](https://img.shields.io/badge/rust-1.98%2B-orange)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.100%2B-orange)](https://www.rust-lang.org)
 
 CUCA is a Rust crate for language models, used in two ways:
 
@@ -133,7 +133,7 @@ The same `cuca run --config cuca.kdl` starts it. A file with both sections runs 
 
 ## Quick start
 
-This streams a reply from a model served by llama.cpp through the client. Prerequisites: Rust 1.98 or newer, a checkout of this repository, and `llama-server` from llama.cpp with a Gemma 4 E4B GGUF file. About 15 minutes end to end. Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShell).
+This streams a reply from a model served by llama.cpp through the client. Prerequisites: Rust 1.100 or newer, a checkout of this repository, and `llama-server` from llama.cpp with a Gemma 4 E4B GGUF file. About 15 minutes end to end. Every `cargo` command below runs the same on Linux, macOS and Windows (PowerShell).
 
 1. Start the model server in its own terminal and leave it running. Replace `/path/to/model.gguf` with your GGUF file. The `google/gemma-4-e4b` repository on Hugging Face holds safetensors, so `llama-server -hf` cannot load it.
 

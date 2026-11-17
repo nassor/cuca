@@ -12,7 +12,7 @@ weight = 13
 <dt>In one line</dt>
 <dd><code>provider-local</code> needs a C compiler and a build for your own CPU. Each GPU feature adds a few more build needs, and the GPU driver is a system library the program loads when it runs.</dd>
 <dt>You need</dt>
-<dd>Rust 1.98, a C compiler and the <code>provider-local</code> feature.</dd>
+<dd>Rust 1.100, a C compiler and the <code>provider-local</code> feature.</dd>
 <dt>Read this if</dt>
 <dd>Your build fails on a native dependency, the engine runs slowly, or you want to run the local live tests.</dd>
 </dl>
