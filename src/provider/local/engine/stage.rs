@@ -333,22 +333,33 @@ impl Engine {
                 self.context_length, open.context_length
             )));
         }
-        for (what, here, there) in [
+        // The advice names a change that works: `max_rows` stops at the
+        // worker's own prefill chunk (4096 only with tiered experts on a
+        // compressed-attention mixture of experts, else at most 256), so a
+        // worker cannot always raise it, but the caller can lower its own.
+        for (what, here, there, fix) in [
             (
                 "batching.max_sequences",
                 sizing.max_sequences,
                 open.max_sequences,
+                "raise it here or lower it at the caller",
             ),
-            ("batching.kv_tokens", sizing.kv_tokens, open.kv_tokens),
+            (
+                "batching.kv_tokens",
+                sizing.kv_tokens,
+                open.kv_tokens,
+                "raise it here or lower it at the caller",
+            ),
             (
                 "max_rows (from batching.max_step_tokens)",
                 sizing.max_rows,
                 open.max_rows,
+                "lower `batching.max_step_tokens` at the caller (a worker's step also stops at its prefill chunk, which only tiered experts on a compressed-attention mixture of experts raise to 4096, so give both nodes the same `experts`)",
             ),
         ] {
             if (here as u64) < there {
                 return Err(CucaError::Config(format!(
-                    "{what} is {here} here and {there} at the caller: a worker needs at least the caller's value, so raise it here or lower it there"
+                    "{what} is {here} here and {there} at the caller: a worker needs at least the caller's value; {fix}"
                 )));
             }
         }

@@ -1027,7 +1027,12 @@ impl SamplingConfig {
 /// [`LocalDevice::Metal`]) uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GpuAdapter {
-    /// The adapter the graphics API reports first (wgpu's default choice).
+    /// The adapter wgpu prefers for high performance (a discrete GPU where
+    /// the machine has one). The backend does not report its type: see
+    /// [`GpuInfo`] for the name it resolved to. CubeCL also reads the
+    /// environment variable `CUBECL_WGPU_DEFAULT_DEVICE` (`DiscreteGpu(1)`,
+    /// `IntegratedGpu(0)`, `Cpu`), which replaces this choice; the crate
+    /// itself reads no environment variable.
     #[default]
     Default,
     /// The `n`-th discrete GPU, counting from 0.
