@@ -7903,29 +7903,22 @@ mod tests {
     /// resident run never reads the router output back, a tiered run does
     /// at every layer, which splits burn's fused elementwise kernels at
     /// different places, so they agree to float rounding (tiered placements
-    /// among themselves agree bit for bit). The bound is `5e-4` relative to
-    /// `1 + |logit|`. Over the tiny models the difference is 1e-6 to 3e-5 at
-    /// nearly every step; the tiny hybrid MoE model (`qwen35moe`) has one
-    /// sensitive step (the second of the greedy run, the second prompt
-    /// chunk) where the order of float accumulation, not the routing,
-    /// moves the logits about thirty times more, and by how much depends on
-    /// which matmul kernels burn's autotune picks for that shape. Host
-    /// against resident at that step: 1.6e-4 to 2.2e-4 on Windows Vulkan;
-    /// on Linux RADV (Mesa 26.0.8, Radeon AI PRO R9700) 3.5e-4 at the default
-    /// autotune level, 1.5e-4 and 3.0e-4 at `CUBECL_AUTOTUNE_LEVEL=minimal`,
-    /// 1.7e-4 and 1.8e-4 at `extensive`; on ROCm 1.0e-4 and 1.5e-4. Against
-    /// the dequantized CPU engine every GPU variant stays within 3.4e-4 at
-    /// that step (a resident GPU run alone is 3.4e-4 off on ROCm, 0.9e-4 on
-    /// RADV), so neither side is the outlier, and the other steps stay below
-    /// 3.5e-5. 3e-4 failed on RADV by 5e-5; 5e-4 keeps 1.4x over the worst
-    /// measured value and still sits 14x above the worst ordinary step.
+    /// among themselves agree bit for bit). The bound is `3e-4` relative to
+    /// `1 + |logit|`: the tiny hybrid MoE model has one sensitive step (the
+    /// second of the greedy run) where the order of float accumulation, not
+    /// the routing, moves the logits by far more than at the other steps.
     fn assert_close_logits(got: &[Vec<f32>], want: &[Vec<f32>], what: &str) {
+        assert_close_logits_within(got, want, 3e-4, what);
+    }
+
+    /// [`assert_close_logits`] to the relative bound `tol` (of `1 + |logit|`).
+    fn assert_close_logits_within(got: &[Vec<f32>], want: &[Vec<f32>], tol: f32, what: &str) {
         assert_eq!(got.len(), want.len(), "{what}");
         for (step, (g, w)) in got.iter().zip(want).enumerate() {
             assert_eq!(g.len(), w.len(), "{what}");
             for (i, (a, b)) in g.iter().zip(w).enumerate() {
                 assert!(
-                    (a - b).abs() <= 5e-4 * (1.0 + b.abs()),
+                    (a - b).abs() <= tol * (1.0 + b.abs()),
                     "{what}: step {step} logit {i}: {a} vs {b}"
                 );
             }
@@ -8063,9 +8056,28 @@ mod tests {
         );
     }
 
+    /// The relative bound of [`gpu_host_experts_match_gpu_resident`]. The
+    /// tiny hybrid MoE model (`qwen35moe`) has one sensitive logit vector,
+    /// the one after the last prompt token (the second step of the greedy
+    /// run): the order of float accumulation, not the routing, moves it
+    /// about thirty times more than any decode step (below 6.5e-5 in every
+    /// comparison measured), and by how much depends on how the prompt is
+    /// chunked and on which matmul kernels burn's autotune picks. Host
+    /// against resident there: 1.6e-4 to 2.2e-4 on Windows Vulkan; on Linux
+    /// RADV (Mesa 26.0.8, Radeon AI PRO R9700) 1.5e-4 to 3.9e-4 over six
+    /// chunkings of the 24-token prompt (24; 16+8 gives 3.5e-4, the failure
+    /// of the old `3e-4` bound; 8+16 gives 3.9e-4) and 1.5e-4 to 3.0e-4 over
+    /// `CUBECL_AUTOTUNE_LEVEL=minimal` and `extensive`; on ROCm 0.9e-4 to
+    /// 2.0e-4. Against the dequantized CPU engine every GPU variant is 0.2e-4
+    /// to 4.8e-4 off there (the resident run alone reaches 4.8e-4 on ROCm
+    /// and 1.6e-4 on RADV, the host run 3.2e-4 and 3.0e-4), so neither side
+    /// is the outlier and the host handoff loses nothing the resident kernels
+    /// keep. The other comparisons of this module keep `3e-4`.
+    const HOST_LOGIT_TOL: f32 = 5e-4;
+
     /// Host experts (`ExpertPlacement::Host`: the CPU computes the routed
     /// experts from RAM, the GPU everything else) give the resident GPU
-    /// logits to float rounding (`assert_close_logits`) for every MoE
+    /// logits to float rounding ([`HOST_LOGIT_TOL`]) for every MoE
     /// architecture, hosting every MoE layer or only the first one (the
     /// others stay on the device), and a model without experts is rejected.
     #[test]
@@ -8115,7 +8127,12 @@ mod tests {
                     .unwrap()
                 });
                 let got = greedy_run(&mut host);
-                assert_close_logits(&got, &want, &format!("{label} host {layers:?}"));
+                assert_close_logits_within(
+                    &got,
+                    &want,
+                    HOST_LOGIT_TOL,
+                    &format!("{label} host {layers:?}"),
+                );
             }
         }
         let dense = write_spec(&TinySpec::llama());
