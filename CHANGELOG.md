@@ -52,20 +52,25 @@
   fails the call on a finite value above 65504 instead of sending infinity. The coordinator's
   `open` names the type, the worker answers in it, and every carry names the type it is written
   in. Library: `CarryDtype` and `RemoteStage::carry`. Measured with Qwen3 0.6B (split at layer
-  14) and Qwen 3.5 0.8B (12): the bytes of a prefill call halve (883 KB to 442 KB, 664 KB to
-  332 KB) and so do those of a whole request (2.65 MB to 1.33 MB for a 3.8 KB prompt). On
-  loopback that changes nothing measurable (network share of a prefill call 0.44 to 0.46 ms at
-  `f32`, 0.39 at `bf16`, 0.48 to 0.59 at `f16`, with a 5 to 8 ms outlier in some runs of each);
-  behind a link throttled to 1 Gbit/s it goes from 7.5 ms to 3.5 to 4.2 ms, and at 100 Mbit/s
-  from 69 ms to 30 to 35 ms. Quality: the largest difference of any logit from the `f32`
-  chain's, until the first greedy token that differs, was 0.44 (`bf16`) and 0.55 (`f16`) on
-  Qwen3 0.6B (1.7% of the largest logit) and 0.32 and 0.34 on Qwen 3.5 0.8B (1.1%). That is the
-  engine's own noise floor, not the carry's rounding: perturbing the `f32` carry by 1 part in
-  10^7 gives 0.47 and 0.30, because the 8-bit activation quantization of the matmuls re-rounds.
-  Two prompts of 64 greedy tokens each: Qwen3 0.6B `f16` replied as `f32` did on both, `bf16`
-  on one (it chose other words from the 15th token); Qwen 3.5 0.8B replied differently on one
-  prompt with both types, at the same token and in the same way as with the 10^-7
-  perturbation, which is a near tie in its logits. The stage wire version is 3.
+  14) and Qwen 3.5 0.8B (12), both `q8_0` files: the bytes of a prefill call halve (883 KB to
+  442 KB, 664 KB to 332 KB; the first worker receives no hidden states, so for it that is its
+  replies, and token ids, block tables and headers do not shrink) and so do those of a whole
+  request (2.65 MB to 1.33 MB for a 3.8 KB prompt). On loopback that changes nothing measurable
+  (network share of a prefill call 0.44 to 0.46 ms at `f32`, 0.39 at `bf16`, 0.48 to 0.59 at
+  `f16`, with a 5 to 8 ms outlier in some runs of each); behind a loopback proxy paced to
+  1 Gbit/s (not a real link) it goes from 7.5 ms to 3.5 to 4.2 ms, and paced to 100 Mbit/s from
+  69 ms to 30 to 35 ms. Quality: the largest difference of any logit from the `f32` chain's,
+  until the first greedy token that differs, was 0.44 (`bf16`) and 0.55 (`f16`) on Qwen3 0.6B
+  (1.7% of the largest logit) and 0.32 and 0.34 on Qwen 3.5 0.8B (1.1%). With these quantized
+  weights that is the engine's own noise floor, not the carry's rounding: perturbing the `f32`
+  carry by 1 part in 10^7 gives 0.47 and 0.30, because the 8-bit activation quantization of the
+  matmuls re-rounds. Float-weight files were not measured. Two prompts of 64 greedy tokens
+  each: Qwen3 0.6B `f16` replied as `f32` did on both, `bf16` on one (it chose other words from
+  the 15th token, where the 10^-7 perturbation also diverges: a near tie, not a `bf16`
+  defect); Qwen 3.5 0.8B replied differently on one prompt with both types, at the same token
+  and in the same way as with the 10^-7 perturbation. The frame wire version, which stage calls
+  and K/V transfer share, is 3, so a K/V export and import between builds of the old and new
+  layout refuse each other too.
 
 ### Changed
 

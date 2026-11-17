@@ -1247,13 +1247,15 @@ mod tests {
     /// architecture the stage tests cover, including the per-layer inputs,
     /// shared K/V rows and hyper-connection streams a carry holds.
     ///
-    /// The bound is loose on purpose. The engine quantizes activations to
-    /// 8 bits for its matmuls, so any change of the carry, down to one bit
-    /// of one value, re-rolls the rounding of later layers and moves the
-    /// logits by about the same amount whatever the carry type (the
+    /// The bound is loose on purpose. The tiny models are quantized, and the
+    /// engine quantizes activations to 8 bits for its matmuls, so any change
+    /// of the carry, down to one bit of one value, re-rounds later layers and
+    /// moves the logits by about the same amount whatever the carry type (the
     /// tiny random models, with their sharp logits, see up to a quarter of
     /// the largest logit). What the bound catches is a carry that is wrong,
-    /// not one that is imprecise.
+    /// not one that is imprecise: by hand, a decoder that drops the
+    /// per-layer part, zeroes the pre part, swaps the mirrored K and V,
+    /// zeroes a 64th of the hidden values or scales them by 1.01 each fail it.
     #[test]
     fn reduced_carries_stay_near_the_whole_model() {
         use super::super::tiny::{
