@@ -76,7 +76,11 @@ pub(crate) const OP_FORWARD: u8 = 2;
 /// `open` by the call it was a reply to.
 pub(crate) const ANOTHER_SESSION: &str = "the stage belongs to another session";
 
-/// The first call of a session: what the worker must be and hold.
+/// The first call of a session: what the worker must be and hold. The
+/// worker's context length must equal `context_length`, and its
+/// `max_sequences`, `kv_tokens` and `max_rows` must each be at least the
+/// caller's, because the caller's block tables and slots index the worker's
+/// pools.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Open {
     /// Fingerprint of the model files the coordinator loaded.

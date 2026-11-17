@@ -302,7 +302,8 @@ serve {
 }
 ```
 
-- Start the workers first. The coordinator opens every worker when it loads, so a load fails naming the worker that is unreachable or does not match (another model file, another `context_length`, another `batching` size).
+- Start the workers first. The coordinator opens every worker when it loads, so a load fails naming the worker that is unreachable or does not match (another model file, another `context_length`, or a `batching` size below the coordinator's).
+- Size the pools alike, or leave them unset. A worker's `kv_tokens`, `max_sequences` and step size (`max_step_tokens`) must be at least the coordinator's, because the coordinator's block numbers and slots index the worker's pools; `context_length` must be equal. A node with `stage` or `remote_stage` that sets no `kv_tokens` takes the same default on every device, `context_length` plus at most 4,096 positions, so a CPU coordinator and a GPU worker open each other with no `batching` at all. (A lone CPU model holds twice the context, a CPU-only chain therefore a little less cache; set `kv_tokens` on every node for more.) A worker whose explicit `kv_tokens` is below the coordinator's fails the coordinator's load with `batching.kv_tokens is 12288 here and 16384 at the caller`, the first number being the worker's.
 - Every call goes through the coordinator. It sends each worker the tokens and the hidden state the previous stage produced, and the workers never talk to each other. The last stage holds the output head, so the coordinator alone samples.
 - A worker keeps the K/V cache and the recurrent state of its own layers. The coordinator's prefix cache works as before: a repeated prompt reads its cached prefix on every stage.
 - A failed call fails the step and the requests running in it. The coordinator reopens the workers before its next step, so the next request runs.

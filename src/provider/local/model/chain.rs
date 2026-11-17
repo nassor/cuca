@@ -92,7 +92,9 @@ pub(crate) trait StageTransport: Send {
 }
 
 /// What the stages must agree on with the coordinator, as the first call of
-/// a session carries it (the range and the session vary per stage).
+/// a session carries it (the range and the session vary per stage): the file
+/// and the context length exactly, and `max_sequences`, `kv_tokens` and
+/// `max_rows` as the least a worker may hold.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Agreement {
     /// [`model_fingerprint`](crate::provider::local::engine) of the files and

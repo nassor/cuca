@@ -214,11 +214,12 @@ The fields are optional so that "set" and "default" differ: `top_k: Some(64)` be
 | Field | Default | Sets |
 |---|---|---|
 | `max_sequences` | 4 | requests that run at once, 1 to 64 |
-| `kv_tokens` | CPU: twice `context_length`<br>GPU: `context_length` plus at most 4,096 | positions in the shared K/V pool |
+| `kv_tokens` | CPU: twice `context_length`<br>GPU, and any node of a layer-stage chain: `context_length` plus at most 4,096 | positions in the shared K/V pool |
 | `max_step_tokens` | the prefill chunk | rows of one forward step across all requests |
 | `prefix_cache` | `true` | keep the K/V of finished requests for later prompts |
 
 - `kv_tokens` is the K/V memory knob. An explicit value is at least `context_length + 16` and rounds up to whole blocks of 16. Raising `max_sequences` does not raise it. A pool too small for the running requests makes them wait or preempt each other. `LocalModel::kv_cache_bytes` reports the result.
+- In a [layer-stage chain](@/server/model-server.md#layer-stages) the coordinator's block numbers and slots index every worker's pools, so a worker needs `kv_tokens`, `max_sequences` and the step size (`max_step_tokens`) at least as large as its coordinator's, and an equal `context_length`. A node with `stage` or `remote_stage` takes the GPU default for `kv_tokens` on every device, so a CPU coordinator and a GPU worker that set nothing agree; a CPU-only chain therefore holds one context plus at most 4,096 positions where a lone CPU model holds twice the context (set `kv_tokens` on every node for more). A worker whose explicit value is below its coordinator's refuses the coordinator's `open`, and the coordinator's load fails with `batching.kv_tokens is N here and M at the caller`, `here` being the worker.
 - `max_step_tokens` is at least `max_sequences` and at most 8,192. The default prefill chunk is `2,097,152 / context_length`, clamped to 16 to 256: 256 at 8,192 positions. With tiered experts under DeepSeek-V4.1 it is 4,096.
 - `prefix_cache: false` registers nothing in the prefix store, so every prompt prefills in full.
 - A drafter that reads every position of its sequence (the in-trunk head, EAGLE, DFlash and DSpark) keeps one cache per request slot, so its cache memory grows with `max_sequences`. Every running request drafts in the shared step, except in a step where a request prefills.

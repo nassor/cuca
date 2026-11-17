@@ -12,10 +12,15 @@
 //! the recurrent-state snapshots the coordinator asked for.
 //!
 //! A session ties the worker to one coordinator: the first call (`open`)
-//! checks that both hold the same file, the same layers and the same sizing,
-//! resets everything and names the session; every other call must carry it,
-//! so a coordinator that lost its connection (and opened a new session
-//! elsewhere) cannot write into state it no longer owns.
+//! checks that both hold the same file, the same layers and the same context
+//! length, and that the worker's pools, state slots and rows per call
+//! (`batching.kv_tokens`, `batching.max_sequences`, the step size) are at
+//! least the coordinator's, because the coordinator's block tables and slots
+//! index them. It then resets everything and names the session; every other
+//! call must carry it, so a coordinator that lost its connection (and opened
+//! a new session elsewhere) cannot write into state it no longer owns. The
+//! unset `kv_tokens` of a node in a chain is the same on every device
+//! (`default_kv_tokens`), so two nodes that set nothing agree.
 //!
 //! The same `open` names the number type the session's carries travel in
 //! ([`CarryDtype`](crate::provider::local::CarryDtype)): the worker decodes
@@ -178,6 +183,12 @@ pub(super) fn check_stages(
     Ok(())
 }
 
+/// Whether `config` takes part in a layer-stage chain, as a worker (`stage`)
+/// or a coordinator (`remote_stage`).
+pub(super) fn is_staged(config: &LocalModelConfig) -> bool {
+    config.stage.is_some() || !config.remote_stages.is_empty()
+}
+
 impl Engine {
     /// Whether this engine is a layer-stage worker: it serves
     /// [`Engine::stage_call`] only.
@@ -309,15 +320,35 @@ impl Engine {
             )));
         }
         let sizing = self.sizing;
+        // The block tables are the caller's: its block ids index every
+        // stage's pools, and its slots and rows per call are what the worker
+        // runs. So the worker needs pools, slots and rows at least as large
+        // as the caller's, and nothing else of its sizing has to match
+        // (`KvLayout::new` grows every group's blocks with each of the
+        // three). The context length stays equal: the rope factors of a
+        // model with long and short sets depend on it.
+        if self.context_length as u64 != open.context_length {
+            return Err(CucaError::Config(format!(
+                "context_length is {} here and {} at the caller",
+                self.context_length, open.context_length
+            )));
+        }
         for (what, here, there) in [
-            ("context_length", self.context_length, open.context_length),
-            ("max_sequences", sizing.max_sequences, open.max_sequences),
-            ("kv_tokens", sizing.kv_tokens, open.kv_tokens),
-            ("max_rows", sizing.max_rows, open.max_rows),
+            (
+                "batching.max_sequences",
+                sizing.max_sequences,
+                open.max_sequences,
+            ),
+            ("batching.kv_tokens", sizing.kv_tokens, open.kv_tokens),
+            (
+                "max_rows (from batching.max_step_tokens)",
+                sizing.max_rows,
+                open.max_rows,
+            ),
         ] {
-            if here as u64 != there {
+            if (here as u64) < there {
                 return Err(CucaError::Config(format!(
-                    "{what} is {here} here and {there} at the caller"
+                    "{what} is {here} here and {there} at the caller: a worker needs at least the caller's value, so raise it here or lower it there"
                 )));
             }
         }

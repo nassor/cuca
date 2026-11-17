@@ -679,7 +679,7 @@ impl Engine {
         // A coordinator names the file to its workers (and a worker checks
         // it) before any weights load; every other model reads the
         // tokenizer after its drafter, as it always did.
-        let staged = config.stage.is_some() || !config.remote_stages.is_empty();
+        let staged = stage::is_staged(config);
         let early_tokenizer = if staged {
             Some(Arc::new(Tokenizer::from_gguf(&content.metadata)?))
         } else {
@@ -984,8 +984,16 @@ const GPU_PREFIX_SLACK: usize = 4096;
 /// The K/V pool size of `batching.kv_tokens = None` for a model of
 /// `context_length` positions on `device`: twice the context on the CPU, a
 /// context plus at most [`GPU_PREFIX_SLACK`] positions on a GPU.
-fn default_kv_tokens(context_length: usize, device: LocalDevice) -> usize {
-    if device == LocalDevice::Cpu {
+///
+/// A node of a layer-stage chain (`staged`: `stage` or `remote_stage`) takes
+/// the GPU size on every device. The nodes of a chain must agree on their
+/// pools (a worker's must hold at least the coordinator's), and a node knows
+/// its own device only, so a rule that depends on it would give a CPU
+/// coordinator 2 x context and a GPU worker one context plus 4096, which the
+/// worker refuses. The smaller rule is the one every device can hold, so
+/// the chain's default never raises a GPU node's memory.
+fn default_kv_tokens(context_length: usize, device: LocalDevice, staged: bool) -> usize {
+    if device == LocalDevice::Cpu && !staged {
         2 * context_length
     } else {
         context_length + context_length.min(GPU_PREFIX_SLACK)
@@ -1006,7 +1014,7 @@ fn resolve_batching_with(
     use super::model::paged::BLOCK_SIZE;
     let b = &config.batching;
     let kv_tokens = match b.kv_tokens {
-        None => default_kv_tokens(context_length, config.device),
+        None => default_kv_tokens(context_length, config.device, stage::is_staged(config)),
         Some(n) if n >= context_length + BLOCK_SIZE => n.div_ceil(BLOCK_SIZE) * BLOCK_SIZE,
         Some(n) => {
             return Err(CucaError::Config(format!(
@@ -1327,6 +1335,18 @@ pub(crate) mod testing {
         max_sequences: usize,
     ) -> Engine {
         let (sizing, max_step_tokens) = tiny_sizing(context_length, max_sequences, None, None);
+        stage_worker_sized(file, context_length, range, sizing, max_step_tokens)
+    }
+
+    /// [`stage_worker`] over pools sized as `sizing`, which a step of
+    /// `max_step_tokens` rows goes with.
+    pub(crate) fn stage_worker_sized(
+        file: &TinyModel,
+        context_length: usize,
+        range: LayerRange,
+        sizing: Sizing,
+        max_step_tokens: usize,
+    ) -> Engine {
         let content = gguf::Content::open(&file.path).unwrap();
         let model = Model::load_stage(
             &content,
@@ -1338,6 +1358,7 @@ pub(crate) mod testing {
             range,
         )
         .unwrap();
+        let max_sequences = sizing.max_sequences;
         let mut e = engine_over(model, context_length, 0.0, None, sizing, max_step_tokens);
         e.stage = Some(stage::StageHost::new(range, max_sequences));
         e
@@ -1355,6 +1376,30 @@ pub(crate) mod testing {
         max_sequences: usize,
     ) -> Engine {
         let (sizing, max_step_tokens) = tiny_sizing(context_length, max_sequences, None, None);
+        try_chain_engine(
+            file,
+            context_length,
+            links,
+            temperature,
+            seed,
+            sizing,
+            max_step_tokens,
+        )
+        .unwrap()
+    }
+
+    /// [`chain_engine`] over pools sized as `sizing`, which a step of
+    /// `max_step_tokens` rows goes with; a worker that refuses the
+    /// coordinator fails the load, and its error comes back.
+    pub(crate) fn try_chain_engine(
+        file: &TinyModel,
+        context_length: usize,
+        links: Vec<(LayerRange, Box<dyn StageTransport>)>,
+        temperature: f32,
+        seed: Option<u64>,
+        sizing: Sizing,
+        max_step_tokens: usize,
+    ) -> Result<Engine, CucaError> {
         let content = gguf::Content::open(&file.path).unwrap();
         let model = Model::chain_of(
             &content,
@@ -1366,16 +1411,15 @@ pub(crate) mod testing {
             links,
             true,
             0,
-        )
-        .unwrap();
-        engine_over(
+        )?;
+        Ok(engine_over(
             model,
             context_length,
             temperature,
             seed,
             sizing,
             max_step_tokens,
-        )
+        ))
     }
 
     /// [`chain_engine`] drafting with the Gemma 4 assistant in `drafter`,
@@ -2441,10 +2485,15 @@ mod tests {
         assert_eq!(sizing.kv_tokens, 2000, "twice the context by default");
         // A GPU keeps one context and at most 4096 positions of prefixes.
         let gpu = LocalDevice::Vulkan(super::super::GpuAdapter::Default);
-        assert_eq!(default_kv_tokens(1000, gpu), 2000);
-        assert_eq!(default_kv_tokens(8192, gpu), 12288);
-        assert_eq!(default_kv_tokens(32768, gpu), 36864);
-        assert_eq!(default_kv_tokens(8192, LocalDevice::Cpu), 16384);
+        assert_eq!(default_kv_tokens(1000, gpu, false), 2000);
+        assert_eq!(default_kv_tokens(8192, gpu, false), 12288);
+        assert_eq!(default_kv_tokens(32768, gpu, false), 36864);
+        assert_eq!(default_kv_tokens(8192, LocalDevice::Cpu, false), 16384);
+        // A node of a layer-stage chain takes that size on every device, so
+        // a CPU coordinator and a GPU worker that set nothing agree.
+        assert_eq!(default_kv_tokens(8192, LocalDevice::Cpu, true), 12288);
+        assert_eq!(default_kv_tokens(8192, gpu, true), 12288);
+        assert_eq!(default_kv_tokens(1000, LocalDevice::Cpu, true), 2000);
         assert_eq!(sizing.max_sequences, 4);
         // An explicit pool rounds up to blocks and holds at least a context
         // and a block.
@@ -5361,7 +5410,7 @@ mod tests {
             panic!("the chain loaded against a worker of another sizing");
         };
         assert!(
-            matches!(&e, CucaError::Config(m) if m.contains("max_sequences is 1 here and 2 at the caller")),
+            matches!(&e, CucaError::Config(m) if m.contains("batching.max_sequences is 1 here and 2 at the caller")),
             "{e:?}"
         );
     }
@@ -5455,21 +5504,21 @@ mod tests {
                     max_sequences: 3,
                     ..good
                 },
-                "max_sequences is 1 here and 3 at the caller",
+                "batching.max_sequences is 1 here and 3 at the caller",
             ),
             (
                 Open {
                     kv_tokens: good.kv_tokens + 16,
                     ..good
                 },
-                "kv_tokens is",
+                "batching.kv_tokens is 192 here and 208 at the caller",
             ),
             (
                 Open {
                     max_rows: good.max_rows + 1,
                     ..good
                 },
-                "max_rows is",
+                "max_rows (from batching.max_step_tokens) is",
             ),
             (
                 Open {
@@ -5600,5 +5649,219 @@ mod tests {
             "{m}"
         );
         check(&ds, remotes(&[legal[0]]), "").unwrap();
+    }
+
+    /// A worker opens for a coordinator whose `max_sequences`, `kv_tokens`
+    /// and rows per call are each at most its own because every group's pool
+    /// grows with each of the three: the worker then holds at least the
+    /// blocks the coordinator's tables name, which is all `stage_open` asks
+    /// of the pools.
+    #[test]
+    fn every_kv_group_grows_with_each_of_its_sizes() {
+        use crate::provider::local::model::paged::KvLayout;
+        let hp_of = |file: &crate::provider::local::model::tiny::TinyModel| {
+            let content = gguf::Content::open(&file.path).unwrap();
+            crate::provider::local::model::read_hparams(&content).unwrap()
+        };
+        let models = [
+            ("llama", hp_of(&write_spec(&TinySpec::llama()))),
+            ("gemma4", hp_of(&write_tiny_model())),
+            (
+                "deepseek41",
+                hp_of(&write_deepseek41(&TinyDeepseek41::default())),
+            ),
+        ];
+        let sequences = [1, 2, 4, 8];
+        let pools = [112, 160, 192, 320, 1024];
+        let rows = [16, 17, 64, 256, 4096];
+        for (what, hp) in &models {
+            let blocks = |s: usize, k: usize, r: usize| KvLayout::new(hp, 96, s, k, r).blocks;
+            let at_least =
+                |more: Vec<usize>, less: Vec<usize>| more.iter().zip(&less).all(|(m, l)| m >= l);
+            for (si, &s) in sequences.iter().enumerate() {
+                for (ki, &k) in pools.iter().enumerate() {
+                    for (ri, &r) in rows.iter().enumerate() {
+                        let here = blocks(s, k, r);
+                        if let Some(&more) = sequences.get(si + 1) {
+                            assert!(at_least(blocks(more, k, r), here.clone()), "{what}");
+                        }
+                        if let Some(&more) = pools.get(ki + 1) {
+                            assert!(at_least(blocks(s, more, r), here.clone()), "{what}");
+                        }
+                        if let Some(&more) = rows.get(ri + 1) {
+                            assert!(at_least(blocks(s, k, more), here), "{what}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A worker that holds more than its coordinator opens, and a chain over
+    /// it answers as the whole model; one that holds less is refused with
+    /// the key to change.
+    #[test]
+    fn a_worker_must_hold_at_least_what_the_coordinator_does() {
+        use super::testing::{Loopback, stage_worker_sized, try_chain_engine};
+        use crate::provider::local::model::chain::StageTransport;
+        use crate::provider::local::{BatchingConfig, RemoteStage, StageRange};
+        let file = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let (_, cuts) = cuts_of(&file);
+        let range = LayerRange {
+            first: 0,
+            end: cuts[0],
+        };
+        let worker_config = |kv_tokens, max_sequences| LocalModelConfig {
+            stage: Some(StageRange {
+                first: 0,
+                layers: cuts[0],
+            }),
+            batching: BatchingConfig {
+                kv_tokens: Some(kv_tokens),
+                max_sequences,
+                ..BatchingConfig::default()
+            },
+            ..LocalModelConfig::default()
+        };
+        let coordinator_config = |kv_tokens, max_sequences| LocalModelConfig {
+            remote_stages: vec![RemoteStage {
+                url: "http://127.0.0.1:1".into(),
+                layers: cuts[0],
+                ..RemoteStage::default()
+            }],
+            batching: BatchingConfig {
+                kv_tokens: Some(kv_tokens),
+                max_sequences,
+                ..BatchingConfig::default()
+            },
+            ..LocalModelConfig::default()
+        };
+        let chain = |worker: LocalModelConfig, coordinator: LocalModelConfig| {
+            let (worker_batching, worker_sizing) = resolve_batching(&worker, 96).unwrap();
+            let (batching, sizing) = resolve_batching(&coordinator, 96).unwrap();
+            let link: Box<dyn StageTransport> = Box::new(Loopback::new(stage_worker_sized(
+                &file,
+                96,
+                range,
+                worker_sizing,
+                worker_batching.max_step_tokens,
+            )));
+            try_chain_engine(
+                &file,
+                96,
+                vec![(range, link)],
+                0.0,
+                None,
+                sizing,
+                batching.max_step_tokens,
+            )
+        };
+
+        let mut chained = chain(worker_config(320, 2), coordinator_config(192, 1))
+            .unwrap_or_else(|e| panic!("a larger worker refused: {e}"));
+        let mut whole = engine(&file, 96, 0.0, None);
+        for prompt in [long_prompt(40), long_prompt(33)] {
+            let got = run(&mut chained, &prompt, Some(8));
+            let want = run(&mut whole, &prompt, Some(8));
+            assert!(got.items.iter().all(Result::is_ok));
+            assert_same_reply(&got, &want, "a larger worker");
+        }
+
+        for (worker, coordinator, key) in [
+            (
+                worker_config(192, 1),
+                coordinator_config(320, 1),
+                "batching.kv_tokens is 192 here and 320 at the caller",
+            ),
+            (
+                worker_config(320, 1),
+                coordinator_config(320, 2),
+                "batching.max_sequences is 1 here and 2 at the caller",
+            ),
+        ] {
+            let Err(e) = chain(worker, coordinator) else {
+                panic!("a smaller worker opened");
+            };
+            assert!(
+                matches!(&e, CucaError::Config(m) if m.contains(key)),
+                "{e:?}"
+            );
+        }
+    }
+
+    /// Nodes of a chain that set no `kv_tokens` agree whatever their
+    /// devices: a GPU worker and a CPU coordinator resolve the same pools
+    /// (they resolved 12288 and 16384 positions at a context of 8192, and
+    /// the worker refused the open), open each other, and answer as the
+    /// whole model.
+    #[test]
+    fn default_batching_opens_a_chain_across_devices() {
+        use super::testing::{Loopback, stage_worker_sized, try_chain_engine};
+        use crate::provider::local::model::chain::StageTransport;
+        use crate::provider::local::{GpuAdapter, RemoteStage, StageRange};
+        const CTX: usize = 8192;
+        let file = write_spec(&TinySpec {
+            context: CTX,
+            ..TinySpec::llama()
+        });
+        let (_, cuts) = cuts_of(&file);
+        let range = LayerRange {
+            first: 0,
+            end: cuts[0],
+        };
+        let worker_config = LocalModelConfig {
+            device: LocalDevice::Vulkan(GpuAdapter::Default),
+            stage: Some(StageRange {
+                first: 0,
+                layers: cuts[0],
+            }),
+            ..LocalModelConfig::default()
+        };
+        let coordinator_config = LocalModelConfig {
+            device: LocalDevice::Cpu,
+            remote_stages: vec![RemoteStage {
+                url: "http://127.0.0.1:1".into(),
+                layers: cuts[0],
+                ..RemoteStage::default()
+            }],
+            ..LocalModelConfig::default()
+        };
+        let (worker_batching, worker_sizing) = resolve_batching(&worker_config, CTX).unwrap();
+        let (batching, sizing) = resolve_batching(&coordinator_config, CTX).unwrap();
+        assert_eq!(worker_sizing, sizing);
+        assert_eq!(sizing.kv_tokens, 12288);
+        // Outside a chain the CPU keeps its twice-the-context default.
+        let alone = LocalModelConfig::default();
+        assert_eq!(resolve_batching(&alone, CTX).unwrap().1.kv_tokens, 16384);
+
+        // The pools are built on the CPU (no GPU here); the sizing is what
+        // the two devices resolved.
+        let link: Box<dyn StageTransport> = Box::new(Loopback::new(stage_worker_sized(
+            &file,
+            CTX,
+            range,
+            worker_sizing,
+            worker_batching.max_step_tokens,
+        )));
+        let mut chained = try_chain_engine(
+            &file,
+            CTX,
+            vec![(range, link)],
+            0.0,
+            None,
+            sizing,
+            batching.max_step_tokens,
+        )
+        .unwrap_or_else(|e| panic!("the GPU worker refused the CPU coordinator: {e}"));
+        let mut whole = engine(&file, CTX, 0.0, None);
+        for prompt in [long_prompt(40), long_prompt(33)] {
+            let got = run(&mut chained, &prompt, Some(8));
+            let want = run(&mut whole, &prompt, Some(8));
+            assert!(got.items.iter().all(Result::is_ok));
+            assert_same_reply(&got, &want, "default sizing across devices");
+        }
     }
 }

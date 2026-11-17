@@ -145,6 +145,19 @@
   `server` (axum's own). A frame on the stream is limited to 1 GiB before it is read, and a
   stream idle for 5 minutes is closed.
 
+### Fixed
+
+- Layer stages: a CPU coordinator and a GPU worker (or the reverse) failed at `open` with default
+  settings, `kv_tokens is 12288 here and 16384 at the caller`, because the K/V pool defaulted to
+  twice `context_length` on the CPU and to a context plus at most 4,096 positions on a GPU. A
+  model with `stage` or `remote_stage` now resolves an unset `batching.kv_tokens` the same on every
+  device (a context plus at most 4,096 positions), so nodes that set nothing open each other. A
+  CPU-only chain holds that size instead of twice the context; set `kv_tokens` on every node for
+  more. The worker's `open` check also relaxes from equal to at-least: `kv_tokens`,
+  `max_sequences` and the step size of a worker must be no smaller than the coordinator's (its
+  block tables and slots index them), and a worker that holds less names the key
+  (`batching.kv_tokens is N here and M at the caller`). `context_length` stays an exact match.
+
 ## 0.9.1 - 2026-11-15
 
 ### Added

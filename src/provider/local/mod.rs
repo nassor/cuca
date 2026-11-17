@@ -92,7 +92,7 @@
 //!   head_dim` bytes per block and layer that owns K/V ([`LocalModel::kv_cache_bytes`]),
 //!   in RAM or device memory. The pool is shared by every running sequence and
 //!   the cached prefixes: a full-attention group holds [`BatchingConfig::kv_tokens`]
-//!   positions (twice `context_length` by default on the CPU, one context plus at most 4096 positions on a GPU, whatever `max_sequences`
+//!   positions (twice `context_length` by default on the CPU, one context plus at most 4096 positions on a GPU and in a layer-stage chain on any device, whatever `max_sequences`
 //!   is), a sliding-window group `ceil((window - 1 + rows) / 16) + 2` blocks
 //!   per running sequence plus cached prefixes. When the pool is full a
 //!   running request that needs a block preempts the youngest one, which
@@ -1956,7 +1956,7 @@ struct LocalModelInner {
 ///   owns K/V (each layer's head count and head dimension come from the file;
 ///   [`LocalModel::kv_cache_bytes`] reports the total). The pool is shared by
 ///   all running sequences: a full-attention group holds
-///   [`BatchingConfig::kv_tokens`] positions (twice `context_length` on the CPU, one context plus at most 4096 on a GPU, by
+///   [`BatchingConfig::kv_tokens`] positions (twice `context_length` on the CPU, one context plus at most 4096 on a GPU and in a layer-stage chain on any device, by
 ///   default, however many sequences run), a sliding-window group its
 ///   window plus about 270 positions per running sequence plus cached
 ///   prefixes. At the default 8192 that is 481 MB for Gemma 4 E2B, 1.47 GB for
@@ -2145,8 +2145,11 @@ pub struct BatchingConfig {
     /// `max_sequences` windows plus cached prefixes). `None` (the default)
     /// is twice `context_length` on the CPU, and on a GPU `context_length`
     /// plus at most 4096 positions of cached prefixes (12288 at the default
-    /// 8192; device memory is scarcer); an explicit value is at least
-    /// `context_length + 16` and rounds up to whole blocks of 16. It is the
+    /// 8192; device memory is scarcer). A node of a layer-stage chain
+    /// (`stage` or `remote_stage`) takes the GPU size on every device, so
+    /// nodes that set nothing agree whatever their devices; an explicit
+    /// value is at least `context_length + 16` and rounds up to whole blocks
+    /// of 16, and a worker's must be at least its coordinator's. It is the
     /// K/V memory knob: [`LocalModel::kv_cache_bytes`] reports the result, and
     /// raising `max_sequences` does not raise it.
     pub kv_tokens: Option<usize>,
@@ -2181,7 +2184,7 @@ impl LocalModel {
     /// positions, `2 * 4 * 16 * n_kv_head * head_dim` bytes per block and layer
     /// that owns K/V. A full-attention group of layers holds
     /// [`BatchingConfig::kv_tokens`] positions, shared by every running
-    /// sequence (twice `context_length` by default on the CPU, one context plus at most 4096 positions on a GPU, whatever `max_sequences`
+    /// sequence (twice `context_length` by default on the CPU, one context plus at most 4096 positions on a GPU and in a layer-stage chain on any device, whatever `max_sequences`
     /// is); a sliding-window group `ceil((window - 1 + rows) / 16) + 2` blocks
     /// per running sequence (rows: one call's, at most 256) plus up to
     /// `kv_tokens - context_length` positions of cached prefixes (see the
