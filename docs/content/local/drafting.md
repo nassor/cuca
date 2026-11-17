@@ -146,6 +146,21 @@ A checkpoint source is `repo:revision`, a Hugging Face safetensors checkpoint. T
 - DSpark is a block drafter like DFlash, with stages of the DeepSeek-V4.1 kind. Its converted file is 7.91 GB at the default precision.
 - The Qwen head, EAGLE, DFlash and DSpark follow every position of their sequence, so each request slot keeps a cache of its own over the drafter's shared weights, and the cache memory above is multiplied by `batching.max_sequences`. A new request takes the free slot whose cache shares the longest prefix with its prompt.
 
+## Layer stages
+
+A model whose first layers run on workers (see [Layer stages](@/server/model-server.md#layer-stages)) drafts on the coordinator, which holds the last layers, the output head and the drafter. A round sends one verification pass of the pending token and the drafts over the network, the same single call per worker as a plain step, so an accepted draft saves a whole round trip. What a chain accepts:
+
+| Drafter | On a chain |
+|---|---|
+| Gemma 4 assistant | yes, it reads the K/V of the coordinator's own layers |
+| in-trunk head | yes, on a target with no recurrent state |
+| EAGLE | yes (Mistral Small 4 is attention only) |
+| DFlash, DSpark | no: they read the hidden rows of several layers of the target, and a worker returns none |
+
+- The drafter and the coordinator's layers run on the CPU. The last stage keeps the token embedding table for the drafter even when the model's output head is not tied to it.
+- A target with recurrent state (Qwen 3.5 and every `*-MTP` file the in-trunk head comes from) or compressor state (DeepSeek-V4.1) is refused: its workers cannot roll back the state of a rejected draft yet.
+- A failed call during a round fails that request, as any failed stage call does; the drafter is reset and the next request starts a new session.
+
 ## Draft length and counters
 
 - `draft_tokens` is how many tokens the drafter may propose per round. The default is 5, and the range is `1` to `16`. A different value fails the load with `draft_tokens must be in 1..=16, got N`. It is ignored without a drafter.
@@ -166,6 +181,9 @@ A drafter is built for one target. A wrong pair fails the load. The messages and
 - `drafter vocabulary N differs from the target's M`: the two models use different token lists. Use the drafter made for your model.
 - ``the `mistral4-eagle` drafter pairs with a `mistral4` model, not `<arch>` ``: EAGLE only pairs with Mistral Small 4. Use a `mistral4` target.
 - `the EAGLE drafter's <what> is X but the model's is Y: it was trained for another model`: a setting of the drafter differs from the target's. Use the drafter published for this model.
+- ``the dflash drafter reads the hidden rows of several layers of the target, and a stage call returns none of a worker's: it cannot be combined with `remote_stage` ``: DFlash and DSpark do not pair with layer stages. Run the model on one machine, or without a drafter.
+- ``<drafter> cannot be combined with `remote_stage` on a model with recurrent or compressor state: a rejected draft cannot be rolled back on the workers``: the target keeps state that cannot be undone on a worker (Qwen 3.5, DeepSeek-V4.1). Run without a drafter, or on one machine.
+- ``<drafter> starts from a token's embedding, which the last stage of this chain does not hold``: the coordinator could not load the token embedding table for the drafter.
 - `... runs on the CPU only ...` for the in-trunk head, EAGLE, DFlash or DSpark, and `DrafterSource::InTrunk runs on the CPU only, not on <device>`: these drafters cannot run on a GPU. Set `device "cpu"`, and drop `gpu_layers` and `shards`.
 - ``this `<arch>` file has no in-trunk multi-token-prediction head (...); use a separate drafter file instead``: the model file has no built-in head. Use a Qwen 3.5 `*-MTP` file, or a separate drafter.
 - ``the in-trunk multi-token-prediction head of `qwen35moe` has a mixture-of-experts FFN, which the head does not support; run without a drafter``: Qwen3.6-35B-A3B has a head that is not supported. Run without a drafter.

@@ -28,8 +28,8 @@
   limit, 409 `stage_mismatch`, 500 `stage_failed`); a coordinator lists `remote_stage url=...
   layers=14 [model] [api_key] [timeout]` nodes in layer order, runs the remaining layers and the
   head itself, and relays every hidden state. Workers list no model in `/v1/models`. Not with
-  `shards`, `gpu_layers` or `kv_export`; the Gemma 4 assistant is the only drafter a coordinator
-  takes. A failed call fails the step and the next request reopens the workers. Library:
+  `shards`, `gpu_layers` or `kv_export`; the Gemma 4 assistant is the drafter a coordinator
+  takes (see below for the others). A failed call fails the step and the next request reopens the workers. Library:
   `RemoteStage` and `StageRange` in `LocalModelConfig`.
 - Layer-stage measurement: a coordinator counts, per remote stage, the calls, their wall time,
   the compute time the worker reports and the bytes both ways. The worker's server sends its
@@ -71,6 +71,17 @@
   and in the same way as with the 10^-7 perturbation. The frame wire version, which stage calls
   and K/V transfer share, is 3, so a K/V export and import between builds of the old and new
   layout refuse each other too.
+- Layer stages: speculation on a chain. The in-trunk head and the EAGLE drafter now pair with a
+  coordinator, next to the Gemma 4 assistant, when the model's stages hold only positional state
+  (no recurrent or compressor state): the drafter and the coordinator's last stage run on the
+  CPU, the last stage keeps the token embedding table for the drafter even when the head is not
+  tied to it, and a round verifies the pending token and its drafts in one call per worker, as a
+  plain step costs, so an accepted draft saves a whole round trip. The drafts and the number
+  accepted equal what the same drafter does on one node, and the reply is plain greedy decoding's,
+  also when answers are lost and sent again. DFlash and DSpark stay refused (they read the hidden
+  rows of several layers of the target, and a stage call returns none of a worker's), and so is
+  any drafter on a model with recurrent or compressor state (Qwen 3.5, DeepSeek-V4.1): a rejected
+  draft cannot be rolled back on the workers yet. The messages name the cause.
 
 ### Changed
 

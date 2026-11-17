@@ -2570,11 +2570,6 @@ fn validate_stages(config: &LocalModelConfig) -> Result<(), CucaError> {
     if config.stage.is_some() && config.drafter.is_some() {
         return Err(invalid("a stage worker takes no `drafter`"));
     }
-    if !config.remote_stages.is_empty() && config.drafter == Some(DrafterSource::InTrunk) {
-        return Err(invalid(
-            "`remote_stage` cannot be combined with `drafter \"in-trunk\"`",
-        ));
-    }
     if config.remote_stages.len() > MAX_REMOTE_STAGES {
         return Err(invalid(format!(
             "at most {MAX_REMOTE_STAGES} remote stages"
@@ -4747,14 +4742,6 @@ mod distributed_config_tests {
                 ..base()
             },
             "a stage worker takes no `drafter`",
-        );
-        rejected(
-            &LocalModelConfig {
-                remote_stages: remote(),
-                drafter: Some(DrafterSource::InTrunk),
-                ..base()
-            },
-            "`remote_stage` cannot be combined with `drafter \"in-trunk\"`",
         );
         rejected(
             &LocalModelConfig {

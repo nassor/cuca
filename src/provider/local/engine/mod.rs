@@ -707,6 +707,7 @@ impl Engine {
                 &sizing,
                 &config.engram,
                 &config.remote_stages,
+                drafter.is_some(),
                 early_fingerprint,
             )?,
             (None, true) => Model::load(
@@ -1363,6 +1364,7 @@ pub(crate) mod testing {
             &sizing,
             &super::super::EngramCache::default(),
             links,
+            true,
             0,
         )
         .unwrap();
@@ -4700,6 +4702,169 @@ mod tests {
         }
     }
 
+    /// `spec` over a chain drafting with `open`, `k` tokens a round, the
+    /// governor and cost model forced to always draft.
+    fn chain_drafting(
+        file: &crate::provider::local::model::tiny::TinyModel,
+        drafter_file: &crate::provider::local::model::tiny::TinyModel,
+        context: usize,
+        bounds: &[usize],
+        k: usize,
+        open: impl FnOnce(&gguf::Content, &Model) -> Result<Drafter, CucaError>,
+    ) -> Result<(Engine, Links), CucaError> {
+        let (mut chain, links) = chain_over(file, context, bounds);
+        let content = gguf::Content::open(&drafter_file.path).unwrap();
+        chain.set_drafter(open(&content, &chain.model)?);
+        chain.draft_tokens = k;
+        chain.force_speculation();
+        Ok((chain, links))
+    }
+
+    /// Speculation on a chain whose stages hold only positional state: the
+    /// EAGLE head of a tiny `mistral4` and the in-trunk head of a tiny
+    /// attention-only `qwen35` draft against the coordinator's last stage,
+    /// one verification pass crosses the network for `k + 1` rows, and the
+    /// reply is plain greedy decoding's, with and without lost answers.
+    #[test]
+    fn speculation_on_a_chain_equals_plain_greedy() {
+        use crate::provider::local::model::tiny::{TinyQwen35, write_qwen35};
+        let mistral = mistral4(32);
+        let eagle_file = eagle();
+        let attention = write_qwen35(&TinyQwen35 {
+            interval: 1,
+            ..TinyQwen35::default()
+        });
+        let prompts: [&[u32]; 4] = [
+            &PROMPT,
+            &[2, 9, 9, 9, 10],
+            &[2, 13, 12, 11, 10, 9, 13],
+            &[2, 12, 10, 14, 13, 11, 9, 15, 10, 12, 14, 11],
+        ];
+        for what in ["eagle", "in-trunk"] {
+            let (file, drafter_file) = match what {
+                "eagle" => (&mistral, &eagle_file),
+                _ => (&attention, &attention),
+            };
+            let (_, cuts) = cuts_of(file);
+            let (mut drafted, mut accepted, mut single_accepted) = (0, 0, 0);
+            for lose in [false, true] {
+                for k in [1usize, 2, 4] {
+                    for prompt in prompts {
+                        let mut plain = engine(file, 32, 0.0, None);
+                        // The same drafter on one node: what a chain must
+                        // draft and accept, row for row.
+                        let mut single = if what == "eagle" {
+                            engine_with_eagle(file, drafter_file, 32, 0.0, None, k, 1)
+                        } else {
+                            engine_in_trunk(file, 32, 0.0, None, k, 1)
+                        };
+                        let (mut spec, links) =
+                            chain_drafting(file, drafter_file, 32, &[cuts[0]], k, |c, m| {
+                                if what == "eagle" {
+                                    Drafter::open_eagle(c, m)
+                                } else {
+                                    Drafter::open_in_trunk(c, m)
+                                }
+                            })
+                            .unwrap();
+                        links.lose_every_reply[0].store(lose, Ordering::SeqCst);
+                        let expected = run(&mut plain, prompt, None);
+                        let alone = run(&mut single, prompt, None);
+                        let got = run(&mut spec, prompt, None);
+                        let label = format!("{what}, k {k}, lose {lose}, prompt {prompt:?}");
+                        assert_same_reply(&got, &expected, &label);
+                        assert_same_reply(&alone, &expected, &label);
+                        assert_eq!(got.items.len(), expected.items.len(), "{label}");
+                        assert_eq!(spec.last_ids, plain.last_ids, "{label}");
+                        // The drafter saw every row the chain's last stage
+                        // produced (a head one pair behind the cache).
+                        let held = match what {
+                            "eagle" => eagle_len(&spec),
+                            _ => head_len(&spec),
+                        };
+                        assert_eq!(held, spec.last_ids.len() - 1, "{label}");
+                        let (stats, stats_alone) = (spec.stats.snapshot(), single.stats.snapshot());
+                        assert_eq!(
+                            (stats.drafted, stats.accepted),
+                            (stats_alone.drafted, stats_alone.accepted),
+                            "{label}: the chain drafts as one node does"
+                        );
+                        drafted += stats.drafted;
+                        accepted += stats.accepted;
+                        single_accepted += stats_alone.accepted;
+                        // A round verifies up to `k + 1` rows in one call:
+                        // fewer calls than tokens when drafts are accepted.
+                        if !lose && stats.accepted > 0 {
+                            let calls = links.calls[0].load(Ordering::SeqCst);
+                            assert!(
+                                calls < spec.last_ids.len(),
+                                "{label}: {calls} calls for {} tokens",
+                                spec.last_ids.len()
+                            );
+                        }
+                    }
+                }
+            }
+            assert!(drafted > 0, "{what}: the drafter proposed tokens");
+            // The tiny in-trunk head may agree with the trunk less than the
+            // EAGLE fixture does: the chain must accept exactly what one
+            // node does, and EAGLE must accept some.
+            assert_eq!(accepted, single_accepted, "{what}");
+            assert!(
+                accepted > 0 || what == "in-trunk",
+                "{what}: some drafts were accepted"
+            );
+        }
+    }
+
+    /// A stage that fails in the middle of a speculative round fails that
+    /// request and no other: the engine resets the drafter and the stages,
+    /// and the next request is plain greedy decoding's.
+    #[test]
+    fn a_failure_in_a_speculative_round_fails_one_request() {
+        let (model, eagle_file) = (mistral4(32), eagle());
+        let (_, cuts) = cuts_of(&model);
+        let mut plain = engine(&model, 32, 0.0, None);
+        let expected = run(&mut plain, &PROMPT, None);
+        for fail_at in [3usize, 4, 5, 6] {
+            let (mut spec, links) =
+                chain_drafting(&model, &eagle_file, 32, &[cuts[0]], 4, |c, m| {
+                    Drafter::open_eagle(c, m)
+                })
+                .unwrap();
+            // The open took call 0; fail a forward call of the first request.
+            links.fail_at[0].store(fail_at, Ordering::SeqCst);
+            let hit = run(&mut spec, &PROMPT, None);
+            assert!(
+                hit.items.iter().any(Result::is_err),
+                "call {fail_at} fails the request"
+            );
+            let again = run(&mut spec, &PROMPT, None);
+            assert!(again.items.iter().all(Result::is_ok), "fail_at {fail_at}");
+            assert_same_reply(&again, &expected, &format!("fail_at {fail_at}"));
+            assert_eq!(used_blocks(&spec), 0, "fail_at {fail_at}");
+        }
+    }
+
+    /// A chain over recurrent or compressor state refuses a drafter that
+    /// needs a rollback no worker can make, and the block drafters, which
+    /// read the hidden rows of layers a stage call does not return.
+    #[test]
+    fn a_chain_refuses_the_drafters_it_cannot_serve() {
+        use crate::provider::local::model::tiny::{TinyQwen35, write_qwen35};
+        let hybrid = write_qwen35(&TinyQwen35::default());
+        let (_, cuts) = cuts_of(&hybrid);
+        let Err(e) = chain_drafting(&hybrid, &hybrid, 32, &[cuts[0]], 2, |c, m| {
+            Drafter::open_in_trunk(c, m)
+        }) else {
+            panic!("a hybrid chain took the in-trunk head");
+        };
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("cannot be rolled back on the workers")),
+            "{e:?}"
+        );
+    }
+
     /// A model whose first layers run on workers answers what the whole model
     /// does: attention-only (one and two remote stages, a prefix hit on the
     /// second turn), Gemma 4 (shared K/V rows cross the cut; the assistant
@@ -4969,6 +5134,7 @@ mod tests {
             &sizing,
             &crate::provider::local::EngramCache::default(),
             vec![(range, link)],
+            false,
             0,
         ) else {
             panic!("the chain loaded against a worker of another sizing");
@@ -5181,14 +5347,14 @@ mod tests {
         );
         let m = message(check(&llama, remotes(&[n]), ""));
         assert!(m.contains(&format!("the remote stages hold {n} of the {n} layers of `llama`: the last stage needs at least one")), "{m}");
-        let m = message(check(&llama, remotes(&[1]), "mistral4-eagle"));
-        assert!(
-            m.contains("the mistral4-eagle drafter cannot be combined with `remote_stage`"),
-            "{m}"
-        );
+        // The EAGLE head pairs with a chain (checked when the drafter opens,
+        // where the workers' rollback is known); the block drafters read the
+        // hidden rows of several layers, which a stage call does not return.
+        check(&llama, remotes(&[1]), "mistral4-eagle").unwrap();
         let m = message(check(&llama, remotes(&[1]), "dflash"));
         assert!(
-            m.contains("the dflash drafter cannot be combined with `remote_stage`"),
+            m.contains("the dflash drafter reads the hidden rows of several layers of the target")
+                && m.contains("cannot be combined with `remote_stage`"),
             "{m}"
         );
 

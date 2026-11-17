@@ -571,15 +571,32 @@ impl ChainModel {
             .collect()
     }
 
-    /// One row for a hybrid or hyper-connection model: nothing drafts on a
-    /// chain, so no rollback call would have to cross the network. The local
-    /// stage's figure otherwise (K/V is positional).
+    /// One row for a hybrid or hyper-connection model: its workers hold
+    /// state that cannot be undone and no rollback call crosses the network
+    /// ([`ChainModel::check_drafter`] refuses a drafter, so nothing drafts).
+    /// The local stage's figure otherwise (K/V is positional).
     pub(crate) fn rollback_rows(&self) -> usize {
         if self.hybrid || self.stateful {
             1
         } else {
             self.local.rollback_rows()
         }
+    }
+
+    /// Whether a drafter that keeps a cache of its own (`what` names it) can
+    /// pair with this chain: a verification round must be able to roll the
+    /// stages' state back past the drafts it rejects.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Config`] when the chain can roll back only one row.
+    pub(crate) fn check_drafter(&self, what: &str) -> Result<(), CucaError> {
+        if self.rollback_rows() < 2 {
+            return Err(CucaError::Config(format!(
+                "{what} cannot be combined with `remote_stage` on a model with recurrent or compressor state: a rejected draft cannot be rolled back on the workers"
+            )));
+        }
+        Ok(())
     }
 
     /// Take `slot` back to `len` positions: an attention-only model keeps

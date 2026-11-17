@@ -2140,6 +2140,35 @@ impl Transformer {
             .rows(ids, self.hp.embd_scale)
     }
 
+    /// Load the token embedding table when this stage holds none (the last
+    /// stage of a chain with an untied head), so a drafter that starts from
+    /// a token's embedding can look it up. A no-op when it is loaded.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] when the file has no such table or it does
+    /// not fit the model's shape.
+    pub(crate) fn keep_embedding(&mut self, content: &gguf::Content) -> Result<(), CucaError> {
+        if self.embed.is_some() {
+            return Ok(());
+        }
+        let (vocab, n_embd) = (self.vocab, self.hp.n_embd);
+        let mut loader = Loader {
+            content,
+            reader: content.reader(),
+            dequantize: false,
+            requantize: false,
+        };
+        let (kind, bytes) = loader.raw(name::TOKEN_EMBD, &[vocab, n_embd])?;
+        self.embed = Some(TokenEmbedding::new(
+            kind,
+            Arc::<[u8]>::from(bytes),
+            vocab,
+            n_embd,
+        )?);
+        Ok(())
+    }
+
     /// The `n_embd`-wide embedding row of `token` ([`Transformer::embedding_rows`]).
     ///
     /// # Errors

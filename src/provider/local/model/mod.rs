@@ -812,6 +812,7 @@ impl Model {
         sizing: &paged::Sizing,
         engram: &EngramCache,
         remotes: &[super::RemoteStage],
+        embedding: bool,
         fingerprint: u64,
     ) -> Result<Self, CucaError> {
         let mut first = 0;
@@ -832,6 +833,7 @@ impl Model {
             sizing,
             engram,
             links,
+            embedding,
             fingerprint,
         )
     }
@@ -854,6 +856,7 @@ impl Model {
         sizing: &paged::Sizing,
         engram: &EngramCache,
         links: Vec<(split::LayerRange, Box<dyn chain::StageTransport>)>,
+        embedding: bool,
         fingerprint: u64,
     ) -> Result<Self, CucaError> {
         let hp = read_hparams(content)?;
@@ -866,7 +869,7 @@ impl Model {
             first,
             end: hp.n_layer,
         };
-        let local = Self::load_part(
+        let mut local = Self::load_part(
             content,
             context_length,
             device,
@@ -876,6 +879,11 @@ impl Model {
             range,
             false,
         )?;
+        // A drafter starts from a token's embedding: the last stage keeps
+        // the table even when its head is not tied to it.
+        if embedding && let Model::Cpu(stage) = &mut local {
+            stage.keep_embedding(content)?;
+        }
         let links = links
             .into_iter()
             .map(|(range, transport)| (range, transport, holds_engram(&hp, range)))

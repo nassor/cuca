@@ -47,7 +47,6 @@ use bytes::Bytes;
 
 use super::Engine;
 use crate::error::CucaError;
-use crate::provider::local::model::arch::Arch;
 use crate::provider::local::model::cpu::dflash;
 use crate::provider::local::model::err as local_err;
 use crate::provider::local::model::params::Hparams;
@@ -154,10 +153,11 @@ pub(super) fn check_stages(
             at += stage.layers;
             boundaries.push(at);
         }
-        if drafter_arch == Arch::Mistral4Eagle.name() || drafter_arch == dflash::ARCH {
-            return Err(CucaError::Config(format!(
-                "the {drafter_arch} drafter cannot be combined with `remote_stage`"
-            )));
+        if drafter_arch == dflash::ARCH {
+            return Err(CucaError::Config(
+                "the dflash drafter reads the hidden rows of several layers of the target, and a stage call returns none of a worker's: it cannot be combined with `remote_stage`"
+                    .into(),
+            ));
         }
     }
     let legal = legal_cuts(hp);

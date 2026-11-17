@@ -332,6 +332,54 @@ impl Drafter {
         ))
     }
 
+    /// The CPU engine a drafter that keeps a cache of its own pairs with: the
+    /// model itself, or the last stage of a chain whose workers can roll a
+    /// rejected draft back (`what` names the drafter in messages).
+    /// `needs_layers` is a drafter that reads the hidden rows of several
+    /// layers of the target, which a chain does not return from its workers.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a target on a GPU, [`CucaError::Config`]
+    /// for layer offload, a chain whose last stage is on a GPU, one whose
+    /// workers cannot roll back, or `needs_layers` on a chain.
+    fn head_target<'a>(
+        target: &'a Model,
+        what: &str,
+        needs_layers: bool,
+    ) -> Result<&'a Transformer, CucaError> {
+        match target {
+            Model::Cpu(target) => Ok(target),
+            Model::Chain(chain) => {
+                if needs_layers {
+                    return Err(CucaError::Config(format!(
+                        "{what} reads the hidden rows of several layers of the target, and a stage call returns none of a worker's: it cannot be combined with `remote_stage`"
+                    )));
+                }
+                chain.check_drafter(what)?;
+                let local = chain.local().local_cpu().ok_or_else(|| {
+                    CucaError::Config(format!(
+                        "{what} runs on the CPU only: the last stage of a chain must run on `LocalDevice::Cpu`"
+                    ))
+                })?;
+                local.embedding_row(0).map_err(|_| {
+                    CucaError::Config(format!(
+                        "{what} starts from a token's embedding, which the last stage of this chain does not hold"
+                    ))
+                })?;
+                Ok(local)
+            }
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Gpu(_) => Err(err(format!(
+                "{what} runs on the CPU only: use `LocalDevice::Cpu`"
+            ))),
+            #[cfg(feature = "provider-local-gpu")]
+            Model::Split(_) => Err(CucaError::Config(format!(
+                "{what} runs on the CPU only: it cannot be combined with `gpu_layers`"
+            ))),
+        }
+    }
+
     /// The prediction head embedded in `target`'s own file (`content` is its
     /// index, `path` its location).
     ///
@@ -343,23 +391,11 @@ impl Drafter {
         content: &gguf::Content,
         target: &Model,
     ) -> Result<Self, CucaError> {
-        match target {
-            Model::Cpu(target) => Ok(Self::InTrunk(
-                target.load_head(content)?,
-                Lag::new(target.context_length()),
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(_) => Err(err(
-                "the in-trunk prediction head runs on the CPU only: use `LocalDevice::Cpu`",
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(_) => Err(CucaError::Config(
-                "the in-trunk prediction head runs on the CPU only: it cannot be combined with `gpu_layers`".into(),
-            )),
-            Model::Chain(_) => Err(CucaError::Config(
-                "the in-trunk prediction head cannot be combined with `remote_stage`".into(),
-            )),
-        }
+        let cpu = Self::head_target(target, "the in-trunk prediction head", false)?;
+        Ok(Self::InTrunk(
+            cpu.load_head(content)?,
+            Lag::new(cpu.context_length()),
+        ))
     }
 
     /// The EAGLE drafter in the GGUF file at `path` (index `content`) for
@@ -377,24 +413,11 @@ impl Drafter {
                 target.arch().name()
             )));
         }
-        match target {
-            Model::Cpu(target) => Ok(Self::Eagle(
-                target.load_eagle(content)?,
-                Lag::new(target.context_length()),
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(_) => Err(err(
-                "the EAGLE drafter runs on the CPU only: use `LocalDevice::Cpu`",
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(_) => Err(CucaError::Config(
-                "the EAGLE drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
-                    .into(),
-            )),
-            Model::Chain(_) => Err(CucaError::Config(
-                "the EAGLE drafter cannot be combined with `remote_stage`".into(),
-            )),
-        }
+        let cpu = Self::head_target(target, "the EAGLE drafter", false)?;
+        Ok(Self::Eagle(
+            cpu.load_eagle(content)?,
+            Lag::new(cpu.context_length()),
+        ))
     }
 
     /// The DFlash block drafter at `path` (index `content`) for `target`.
@@ -409,24 +432,11 @@ impl Drafter {
         target: &Model,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        match target {
-            Model::Cpu(target) => Ok(Self::Dflash(
-                DflashNet::open(content, target, context_length)?,
-                Lag::new(context_length),
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(_) => Err(err(
-                "the DFlash drafter runs on the CPU only: use `LocalDevice::Cpu`",
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(_) => Err(CucaError::Config(
-                "the DFlash drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
-                    .into(),
-            )),
-            Model::Chain(_) => Err(CucaError::Config(
-                "the DFlash drafter cannot be combined with `remote_stage`".into(),
-            )),
-        }
+        let cpu = Self::head_target(target, "the DFlash drafter", true)?;
+        Ok(Self::Dflash(
+            DflashNet::open(content, cpu, context_length)?,
+            Lag::new(context_length),
+        ))
     }
 
     /// The DSpark block drafter in `content` for `target` (DeepSeek-V4.1; a
@@ -442,24 +452,11 @@ impl Drafter {
         target: &Model,
         context_length: usize,
     ) -> Result<Self, CucaError> {
-        match target {
-            Model::Cpu(target) => Ok(Self::Dspark(
-                DsparkNet::open(content, target, context_length)?,
-                Lag::new(context_length),
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Gpu(_) => Err(err(
-                "the DSpark drafter runs on the CPU only: use `LocalDevice::Cpu`",
-            )),
-            #[cfg(feature = "provider-local-gpu")]
-            Model::Split(_) => Err(CucaError::Config(
-                "the DSpark drafter runs on the CPU only: it cannot be combined with `gpu_layers`"
-                    .into(),
-            )),
-            Model::Chain(_) => Err(CucaError::Config(
-                "the DSpark drafter cannot be combined with `remote_stage`".into(),
-            )),
-        }
+        let cpu = Self::head_target(target, "the DSpark drafter", true)?;
+        Ok(Self::Dspark(
+            DsparkNet::open(content, cpu, context_length)?,
+            Lag::new(context_length),
+        ))
     }
 
     /// Whether the drafter needs the trunk's hidden row of every position
@@ -667,14 +664,12 @@ impl Drafter {
         tokens: &[u32],
         hidden: &[f32],
     ) -> Result<(), CucaError> {
-        match (self, target) {
-            (Self::InTrunk(head, _), Model::Cpu(target)) => {
+        match (self, target.local_cpu()) {
+            (Self::InTrunk(head, _), Some(target)) => {
                 target.head_observe(head, pos, tokens, hidden)
             }
-            (Self::Eagle(head, _), Model::Cpu(target)) => {
-                target.eagle_observe(head, pos, tokens, hidden)
-            }
-            (Self::Dflash(net, _), Model::Cpu(_)) => {
+            (Self::Eagle(head, _), Some(target)) => target.eagle_observe(head, pos, tokens, hidden),
+            (Self::Dflash(net, _), Some(_)) => {
                 if hidden.len() != tokens.len() * net.feature_width() {
                     return Err(err(format!(
                         "DFlash observe: {} tokens with {} feature floats, expected {} each",
@@ -685,7 +680,7 @@ impl Drafter {
                 }
                 net.observe(pos, hidden)
             }
-            (Self::Dspark(net, _), Model::Cpu(_)) => {
+            (Self::Dspark(net, _), Some(_)) => {
                 if hidden.len() != tokens.len() * net.feature_width() {
                     return Err(err(format!(
                         "DSpark observe: {} tokens with {} feature floats, expected {} each",
@@ -815,14 +810,30 @@ impl Drafter {
                 }
                 Ok(drafts)
             }
-            (Self::InTrunk(head, _), Model::Cpu(target)) => {
+            (Self::InTrunk(head, _), _) => {
+                let Some(target) = target.local_cpu() else {
+                    return Err(err("the drafter and its target run on different devices"));
+                };
                 target.head_draft(head, hidden, first, len, k, pick)
             }
-            (Self::Eagle(head, _), Model::Cpu(target)) => {
+            (Self::Eagle(head, _), _) => {
+                let Some(target) = target.local_cpu() else {
+                    return Err(err("the drafter and its target run on different devices"));
+                };
                 target.eagle_draft(head, hidden, first, len, k, pick)
             }
-            (Self::Dflash(net, _), Model::Cpu(target)) => net.draft(target, first, len, k, pick),
-            (Self::Dspark(net, _), Model::Cpu(target)) => net.draft(target, first, len, k, pick),
+            (Self::Dflash(net, _), _) => {
+                let Some(target) = target.local_cpu() else {
+                    return Err(err("the drafter and its target run on different devices"));
+                };
+                net.draft(target, first, len, k, pick)
+            }
+            (Self::Dspark(net, _), _) => {
+                let Some(target) = target.local_cpu() else {
+                    return Err(err("the drafter and its target run on different devices"));
+                };
+                net.draft(target, first, len, k, pick)
+            }
             #[cfg(feature = "provider-local-gpu")]
             (Self::Gpu(drafter), _) => {
                 let Some(target) = target.local_gpu() else {
@@ -830,7 +841,6 @@ impl Drafter {
                 };
                 drafter.draft(target, tables, hidden, first, len, k, pick)
             }
-            _ => Err(err("the drafter and its target run on different devices")),
         }
     }
 }
