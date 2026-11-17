@@ -3,24 +3,31 @@
 //!
 //! A coordinator posts one frame per call to a stage worker and reads one
 //! frame back. Every request frame starts with a `u8` op; the answer has no
-//! op (its shape follows from the request):
+//! op (its shape follows from the request). There are two calls: `open`,
+//! once per session, and `forward`, once per step. Everything else a step
+//! needs from a worker rides in the step's forward frame, so a step costs
+//! one round trip per stage:
 //!
 //! - open (1): `fingerprint u64`, `first u32`, `end u32`, `context_length
 //!   u64`, `max_sequences u64`, `kv_tokens u64`, `max_rows u64`, `session u64`;
 //!   answered by [`ok_reply`];
 //! - forward (2): `session u64`, `seq u64`, `drops` (`count u32`, then `u64`
-//!   each), `exact u8`, `count u32` sequences, then per sequence `slot u32`,
-//!   `start_pos u64`, `hist_from u64`, `hist` and `tokens` as `u32` slices,
-//!   `want u8` (0 none, 1 last, 2 all), `hidden u8` (0 none, 1 post-norm, 2
-//!   post-norm of every row), `groups u32` and each block table as a `u32`
-//!   slice; then `has_carry u8` and, when set, the carry inline in the
-//!   encoding of [`carry_bytes`]; answered by [`carry_bytes`];
-//! - snapshot (3): `session u64`, `seq u64`, `drops`, `slot u32`, `id u64`;
-//!   answered by [`bytes_reply`];
-//! - restore (4): `session u64`, `seq u64`, `drops`, `slot u32`, `has_id u8`,
-//!   `id u64` (0 when absent), `len u64`; answered by [`ok_reply`];
-//! - prefetch (5): `session u64`, `seq u64`, `slot u32`, `tokens` as a `u32`
-//!   slice; answered by [`ok_reply`].
+//!   each: recurrent-state snapshots the worker releases), `exact u8`,
+//!   `count u32` sequences, then per sequence `slot u32`, `start_pos u64`,
+//!   `hist_from u64`, `hist` and `tokens` as `u32` slices, `want u8` (0
+//!   none, 1 last, 2 all), `hidden u8` (0 none, 1 post-norm, 2 post-norm of
+//!   every row), `groups u32` and each block table as a `u32` slice, then
+//!   what the sequence asks of the worker around the pass: `restore u8`
+//!   (1: before the pass, make the slot's recurrent state a snapshot or the
+//!   zero state, `has_id u8`, `id u64` (0 when absent), `len u64`),
+//!   `snapshot u8` and `id u64` (1: after the pass, keep a copy of the
+//!   slot's recurrent state under that id), `prefetch` as a `u32` slice
+//!   (after the pass, start reading the Engram rows of these next tokens of
+//!   the slot); then `has_carry u8` and, when set, the carry inline (the
+//!   residual stream, the optional per-layer and pre inputs, and the mirrored
+//!   K/V rows); answered by the carry in the same encoding, then `count u32`
+//!   and one `u64` per snapshot taken, in sequence order: the bytes it holds
+//!   ([`forward_reply`]).
 //!
 //! # Repeating a call
 //!
@@ -47,9 +54,6 @@ use crate::error::CucaError;
 
 pub(crate) const OP_OPEN: u8 = 1;
 pub(crate) const OP_FORWARD: u8 = 2;
-pub(crate) const OP_SNAPSHOT: u8 = 3;
-pub(crate) const OP_RESTORE: u8 = 4;
-pub(crate) const OP_PREFETCH: u8 = 5;
 
 /// What a worker answers (a [`CucaError::Config`]) to a call of another
 /// session than the one it serves: a worker that restarted, or one a newer
@@ -87,6 +91,24 @@ pub(crate) struct StageSeq {
     pub hidden: Hidden,
     /// Per attention group, the block table of the sequence.
     pub tables: Vec<Vec<u32>>,
+    /// Before the pass: the recurrent state the slot starts from.
+    pub restore: Option<Restore>,
+    /// After the pass: keep a copy of the slot's recurrent state under this
+    /// id.
+    pub snapshot: Option<u64>,
+    /// After the pass: the next tokens of the slot, whose Engram rows the
+    /// worker starts reading.
+    pub prefetch: Vec<u32>,
+}
+
+/// The recurrent state a slot starts a pass from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Restore {
+    /// The snapshot the worker holds under this id; `None` is the zero
+    /// state.
+    pub id: Option<u64>,
+    /// The position the state sits at.
+    pub len: u64,
 }
 
 /// A forward pass of a stage.
@@ -106,27 +128,6 @@ pub(crate) struct ForwardCall {
 pub(crate) enum Call {
     Open(Open),
     Forward(ForwardCall),
-    Snapshot {
-        session: u64,
-        seq: u64,
-        drops: Vec<u64>,
-        slot: u32,
-        id: u64,
-    },
-    Restore {
-        session: u64,
-        seq: u64,
-        drops: Vec<u64>,
-        slot: u32,
-        id: Option<u64>,
-        len: u64,
-    },
-    Prefetch {
-        session: u64,
-        seq: u64,
-        slot: u32,
-        tokens: Vec<u32>,
-    },
 }
 
 /// A length as the `u32` a count field holds. A frame never holds 2^32
@@ -267,19 +268,22 @@ fn get_carry(r: &mut Reader<'_>) -> Result<Carry, CucaError> {
     })
 }
 
-/// The standalone encoding of a carry: the answer of a forward call.
+/// The standalone encoding of a carry: what a forward frame carries inline,
+/// and the first part of its answer.
+#[cfg(test)]
 pub(crate) fn carry_bytes(carry: &Carry) -> Vec<u8> {
     let mut w = Writer::new();
     put_carry(&mut w, carry);
     w.into_bytes()
 }
 
-/// The carry of a forward answer.
+/// The carry of a standalone carry encoding.
 ///
 /// # Errors
 ///
 /// [`CucaError::Provider`] for a truncated or malformed body, or one with
 /// bytes left over.
+#[cfg(test)]
 pub(crate) fn decode_carry(bytes: &[u8]) -> Result<Carry, CucaError> {
     let mut r = Reader::new(bytes);
     let carry = get_carry(&mut r)?;
@@ -287,24 +291,36 @@ pub(crate) fn decode_carry(bytes: &[u8]) -> Result<Carry, CucaError> {
     Ok(carry)
 }
 
-/// The answer of a snapshot call: the id of the snapshot or any `u64`.
-pub(crate) fn bytes_reply(n: u64) -> Vec<u8> {
-    n.to_le_bytes().to_vec()
+/// The answer of a forward call: the carry for the stage after, and the
+/// bytes of each snapshot the call took (one per sequence that asked for
+/// one, in sequence order).
+pub(crate) fn forward_reply(carry: &Carry, snapshot_bytes: &[u64]) -> Vec<u8> {
+    let mut w = Writer::new();
+    put_carry(&mut w, carry);
+    w.put_u32(count32(snapshot_bytes.len()));
+    for b in snapshot_bytes {
+        w.put_u64(*b);
+    }
+    w.into_bytes()
 }
 
-/// The value of [`bytes_reply`].
+/// The carry and the snapshot sizes of a forward answer.
 ///
 /// # Errors
 ///
-/// [`CucaError::Provider`] for a body that is not exactly 8 bytes.
-pub(crate) fn decode_bytes_reply(bytes: &[u8]) -> Result<u64, CucaError> {
+/// [`CucaError::Provider`] for a truncated or malformed body, or one with
+/// bytes left over.
+pub(crate) fn decode_forward_reply(bytes: &[u8]) -> Result<(Carry, Vec<u64>), CucaError> {
     let mut r = Reader::new(bytes);
-    let n = r.get_u64()?;
+    let carry = get_carry(&mut r)?;
+    let count = r.get_u32()?;
+    let n = bounded(&r, count, 8, "snapshot sizes")?;
+    let sizes = (0..n).map(|_| r.get_u64()).collect::<Result<Vec<_>, _>>()?;
     finish(&r)?;
-    Ok(n)
+    Ok((carry, sizes))
 }
 
-/// The (empty) answer of open, restore and prefetch.
+/// The (empty) answer of open.
 pub(crate) fn ok_reply() -> Vec<u8> {
     Vec::new()
 }
@@ -360,6 +376,18 @@ pub(crate) fn forward_frame(call: &ForwardCall) -> Result<Vec<u8>, CucaError> {
         for t in &s.tables {
             w.put_u32s(t);
         }
+        match s.restore {
+            Some(r) => {
+                w.put_u8(1);
+                w.put_u8(u8::from(r.id.is_some()));
+                w.put_u64(r.id.unwrap_or(0));
+                w.put_u64(r.len);
+            }
+            None => w.put_u8(0),
+        }
+        w.put_u8(u8::from(s.snapshot.is_some()));
+        w.put_u64(s.snapshot.unwrap_or(0));
+        w.put_u32s(&s.prefetch);
     }
     match &call.carry {
         Some(carry) => {
@@ -369,47 +397,6 @@ pub(crate) fn forward_frame(call: &ForwardCall) -> Result<Vec<u8>, CucaError> {
         None => w.put_u8(0),
     }
     Ok(w.into_bytes())
-}
-
-pub(crate) fn snapshot_frame(session: u64, seq: u64, drops: &[u64], slot: u32, id: u64) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_u8(OP_SNAPSHOT);
-    w.put_u64(session);
-    w.put_u64(seq);
-    put_drops(&mut w, drops);
-    w.put_u32(slot);
-    w.put_u64(id);
-    w.into_bytes()
-}
-
-pub(crate) fn restore_frame(
-    session: u64,
-    seq: u64,
-    drops: &[u64],
-    slot: u32,
-    id: Option<u64>,
-    len: u64,
-) -> Vec<u8> {
-    let mut w = Writer::new();
-    w.put_u8(OP_RESTORE);
-    w.put_u64(session);
-    w.put_u64(seq);
-    put_drops(&mut w, drops);
-    w.put_u32(slot);
-    w.put_u8(u8::from(id.is_some()));
-    w.put_u64(id.unwrap_or(0));
-    w.put_u64(len);
-    w.into_bytes()
-}
-
-pub(crate) fn prefetch_frame(session: u64, seq: u64, slot: u32, tokens: &[u32]) -> Vec<u8> {
-    let mut w = Writer::with_capacity(1 + 8 + 8 + 4 + 8 + 4 * tokens.len());
-    w.put_u8(OP_PREFETCH);
-    w.put_u64(session);
-    w.put_u64(seq);
-    w.put_u32(slot);
-    w.put_u32s(tokens);
-    w.into_bytes()
 }
 
 fn decode_open(r: &mut Reader<'_>) -> Result<Open, CucaError> {
@@ -440,6 +427,44 @@ fn decode_seq(r: &mut Reader<'_>) -> Result<StageSeq, CucaError> {
     for _ in 0..n_groups {
         tables.push(r.get_u32s()?);
     }
+    let restore = match r.get_u8()? {
+        0 => None,
+        1 => {
+            let has_id = match r.get_u8()? {
+                0 => false,
+                1 => true,
+                other => {
+                    return Err(local_err(format!(
+                        "stage frame has_id flag is {other}, not 0 or 1"
+                    )));
+                }
+            };
+            let id = r.get_u64()?;
+            let len = r.get_u64()?;
+            Some(Restore {
+                id: has_id.then_some(id),
+                len,
+            })
+        }
+        other => {
+            return Err(local_err(format!(
+                "stage frame restore flag is {other}, not 0 or 1"
+            )));
+        }
+    };
+    let snapshot = match r.get_u8()? {
+        0 => {
+            r.get_u64()?;
+            None
+        }
+        1 => Some(r.get_u64()?),
+        other => {
+            return Err(local_err(format!(
+                "stage frame snapshot flag is {other}, not 0 or 1"
+            )));
+        }
+    };
+    let prefetch = r.get_u32s()?;
     Ok(StageSeq {
         slot,
         start_pos,
@@ -449,6 +474,9 @@ fn decode_seq(r: &mut Reader<'_>) -> Result<StageSeq, CucaError> {
         want,
         hidden,
         tables,
+        restore,
+        snapshot,
+        prefetch,
     })
 }
 
@@ -466,8 +494,8 @@ fn decode_forward(r: &mut Reader<'_>) -> Result<ForwardCall, CucaError> {
         }
     };
     let count = r.get_u32()?;
-    // A sequence is at least its fixed fields and four empty counts.
-    let n_seqs = bounded(r, count, 42, "sequences")?;
+    // A sequence is at least its fixed fields, six empty counts and flags.
+    let n_seqs = bounded(r, count, 60, "sequences")?;
     let mut seqs = Vec::with_capacity(n_seqs);
     for _ in 0..n_seqs {
         seqs.push(decode_seq(r)?);
@@ -502,57 +530,6 @@ pub(crate) fn decode(frame: &[u8]) -> Result<Call, CucaError> {
     let call = match r.get_u8()? {
         OP_OPEN => Call::Open(decode_open(&mut r)?),
         OP_FORWARD => Call::Forward(decode_forward(&mut r)?),
-        OP_SNAPSHOT => {
-            let session = r.get_u64()?;
-            let seq = r.get_u64()?;
-            let drops = get_drops(&mut r)?;
-            let slot = r.get_u32()?;
-            let id = r.get_u64()?;
-            Call::Snapshot {
-                session,
-                seq,
-                drops,
-                slot,
-                id,
-            }
-        }
-        OP_RESTORE => {
-            let session = r.get_u64()?;
-            let seq = r.get_u64()?;
-            let drops = get_drops(&mut r)?;
-            let slot = r.get_u32()?;
-            let has_id = match r.get_u8()? {
-                0 => false,
-                1 => true,
-                other => {
-                    return Err(local_err(format!(
-                        "stage frame has_id flag is {other}, not 0 or 1"
-                    )));
-                }
-            };
-            let id = r.get_u64()?;
-            let len = r.get_u64()?;
-            Call::Restore {
-                session,
-                seq,
-                drops,
-                slot,
-                id: has_id.then_some(id),
-                len,
-            }
-        }
-        OP_PREFETCH => {
-            let session = r.get_u64()?;
-            let seq = r.get_u64()?;
-            let slot = r.get_u32()?;
-            let tokens = r.get_u32s()?;
-            Call::Prefetch {
-                session,
-                seq,
-                slot,
-                tokens,
-            }
-        }
         other => return Err(local_err(format!("unknown stage frame op {other}"))),
     };
     finish(&r)?;
@@ -587,6 +564,18 @@ mod tests {
             want,
             hidden,
             tables: vec![vec![0, 1, 2], vec![], vec![7]],
+            // Slot 0 restores the zero state and snapshots; slot 2 restores
+            // a snapshot and reads ahead; the others ask for nothing.
+            restore: match slot {
+                0 => Some(Restore { id: None, len: 0 }),
+                2 => Some(Restore {
+                    id: Some(12),
+                    len: 40,
+                }),
+                _ => None,
+            },
+            snapshot: (slot == 0).then_some(77),
+            prefetch: if slot == 2 { vec![4, 5, 6] } else { Vec::new() },
         }
     }
 
@@ -703,69 +692,21 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_restore_and_prefetch_roundtrip() {
-        match decode(&snapshot_frame(9, 3, &[1, 2, 3], 4, 0xabcd)) {
-            Ok(Call::Snapshot {
-                session,
-                seq,
-                drops,
-                slot,
-                id,
-            }) => {
-                assert_eq!((session, seq, slot, id), (9, 3, 4, 0xabcd));
-                assert_eq!(drops, vec![1, 2, 3]);
-            }
-            _ => panic!("snapshot frame did not decode as snapshot"),
+    fn a_forward_answer_roundtrips_its_carry_and_snapshot_sizes() {
+        let c = carry(true, false);
+        for sizes in [vec![], vec![5u64], vec![u64::MAX, 0, 7]] {
+            let (got, back) = decode_forward_reply(&forward_reply(&c, &sizes)).unwrap();
+            assert_carry_eq(&got, &c);
+            assert_eq!(back, sizes);
         }
-
-        for id in [Some(12u64), None] {
-            match decode(&restore_frame(9, 8, &[], 4, id, 321)) {
-                Ok(Call::Restore {
-                    session,
-                    seq,
-                    drops,
-                    slot,
-                    id: got,
-                    len,
-                }) => {
-                    assert_eq!((session, seq, slot, len), (9, 8, 4, 321));
-                    assert!(drops.is_empty());
-                    assert_eq!(got, id);
-                }
-                _ => panic!("restore frame did not decode as restore"),
-            }
-        }
-        // A restore without an id still carries the id field, as 0.
-        assert_eq!(
-            restore_frame(1, 1, &[], 0, None, 0).len(),
-            1 + 8 + 8 + 4 + 4 + 1 + 8 + 8
-        );
-
-        match decode(&prefetch_frame(9, 2, 4, &[5, 6, 7])) {
-            Ok(Call::Prefetch {
-                session,
-                seq,
-                slot,
-                tokens,
-            }) => {
-                assert_eq!((session, seq, slot), (9, 2, 4));
-                assert_eq!(tokens, vec![5, 6, 7]);
-            }
-            _ => panic!("prefetch frame did not decode as prefetch"),
-        }
-    }
-
-    #[test]
-    fn replies_roundtrip() {
         assert!(ok_reply().is_empty());
-        assert_eq!(
-            decode_bytes_reply(&bytes_reply(u64::MAX - 1)).unwrap(),
-            u64::MAX - 1
-        );
-        assert!(decode_bytes_reply(&[1, 2, 3]).is_err());
-        let mut long = bytes_reply(5);
+        // A carry alone, a truncated size list and trailing bytes are refused.
+        assert!(decode_forward_reply(&carry_bytes(&c)).is_err());
+        let reply = forward_reply(&c, &[1, 2]);
+        assert!(decode_forward_reply(&reply[..reply.len() - 1]).is_err());
+        let mut long = reply;
         long.push(0);
-        assert!(decode_bytes_reply(&long).is_err());
+        assert!(decode_forward_reply(&long).is_err());
     }
 
     #[test]
@@ -780,10 +721,6 @@ mod tests {
             open_frame(&open()),
             forward_frame(&forward(Some(carry(true, true)))).unwrap(),
             forward_frame(&forward(None)).unwrap(),
-            snapshot_frame(9, 3, &[1, 2], 4, 5),
-            restore_frame(9, 4, &[1], 4, Some(5), 6),
-            restore_frame(9, 5, &[], 4, None, 6),
-            prefetch_frame(9, 6, 4, &[5, 6]),
         ]
     }
 
@@ -821,7 +758,7 @@ mod tests {
     fn an_unknown_op_or_flag_is_refused() {
         assert!(decode(&[]).is_err());
         assert!(decode(&[0]).is_err());
-        assert!(decode(&[OP_PREFETCH + 1]).is_err());
+        assert!(decode(&[OP_FORWARD + 1]).is_err());
         assert!(decode(&[255]).is_err());
 
         // The `want` byte of the first sequence of a forward frame.
@@ -836,8 +773,24 @@ mod tests {
         let mut bad = frame.clone();
         bad[want_at + 1] = 3;
         assert!(decode(&bad).is_err());
-        let mut bad = frame;
+        let mut bad = frame.clone();
         bad[1 + 8 + 8 + (4 + 16)] = 2;
+        assert!(decode(&bad).is_err());
+
+        // The last sequence (slot 2) ends with: restore (flag, has_id, id,
+        // len: 18 bytes), snapshot (flag, id: 9), prefetch (count + 3: 20)
+        // and the `has_carry` byte.
+        let tail = frame.len() - 1 - 20 - 9;
+        assert_eq!(frame[tail], 0, "slot 2 asks for no snapshot");
+        assert_eq!(frame[tail - 18], 1, "slot 2 restores");
+        let mut bad = frame.clone();
+        bad[tail] = 2;
+        assert!(decode(&bad).is_err());
+        let mut bad = frame.clone();
+        bad[tail - 18] = 2;
+        assert!(decode(&bad).is_err());
+        let mut bad = frame;
+        bad[tail - 17] = 2;
         assert!(decode(&bad).is_err());
     }
 
@@ -853,13 +806,14 @@ mod tests {
         w.put_u32(u32::MAX);
         assert!(decode(&w.into_bytes()).is_err());
 
-        // Drops, groups and mirror layers likewise.
+        // Snapshot sizes of an answer likewise.
         let mut w = Writer::new();
-        w.put_u8(OP_SNAPSHOT);
-        w.put_u64(1);
-        w.put_u64(1);
+        w.put_f32s(&[]);
+        w.put_u8(0);
+        w.put_u8(0);
+        w.put_u32(0);
         w.put_u32(u32::MAX);
-        assert!(decode(&w.into_bytes()).is_err());
+        assert!(decode_forward_reply(&w.into_bytes()).is_err());
 
         let mut w = Writer::new();
         w.put_f32s(&[]);

@@ -1425,6 +1425,10 @@ pub(crate) mod testing {
         /// for the last forward frame.
         pub(crate) last: KeptCall,
         pub(crate) last_forward: KeptCall,
+        /// How many restores, snapshots and Engram prefetches the forward
+        /// frames asked for, one count per call (a frame sent again does not
+        /// count twice).
+        pub(crate) asked: Arc<std::sync::Mutex<(usize, usize, usize)>>,
         stats: Arc<StageCounters>,
     }
 
@@ -1440,6 +1444,7 @@ pub(crate) mod testing {
                 lose_every_reply: Arc::default(),
                 last: Arc::default(),
                 last_forward: Arc::default(),
+                asked: Arc::default(),
                 stats: Arc::default(),
             }
         }
@@ -1447,6 +1452,19 @@ pub(crate) mod testing {
 
     impl StageTransport for Loopback {
         fn call(&self, frame: Vec<u8>) -> Result<Vec<u8>, CucaError> {
+            if let Ok(crate::provider::local::stageframe::Call::Forward(call)) =
+                crate::provider::local::stageframe::decode(&frame)
+            {
+                let mut asked = self
+                    .asked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for s in &call.seqs {
+                    asked.0 += usize::from(s.restore.is_some());
+                    asked.1 += usize::from(s.snapshot.is_some());
+                    asked.2 += usize::from(!s.prefetch.is_empty());
+                }
+            }
             let n = self.calls.fetch_add(1, Ordering::SeqCst);
             self.ops
                 .lock()
@@ -4311,6 +4329,7 @@ mod tests {
         workers: Vec<Arc<std::sync::Mutex<Engine>>>,
         last: Vec<super::testing::KeptCall>,
         last_forward: Vec<super::testing::KeptCall>,
+        asked: Vec<Arc<std::sync::Mutex<(usize, usize, usize)>>>,
     }
 
     /// A chain engine over `file` whose remote stages hold the layers up to
@@ -4344,6 +4363,7 @@ mod tests {
             handles
                 .last_forward
                 .push(Arc::clone(&transport.last_forward));
+            handles.asked.push(Arc::clone(&transport.asked));
             links.push((range, Box::new(transport) as Box<dyn StageTransport>));
             first = end;
         }
@@ -4414,7 +4434,7 @@ mod tests {
     /// A call whose answer is lost and sent again runs once on the worker,
     /// so a chain whose every call is sent twice still answers as the whole
     /// model does: attention-only, Gemma 4 (shared K/V rows), the hybrid
-    /// Qwen 3.5 (state restores and snapshots are calls too) and the
+    /// Qwen 3.5 (the restores and snapshots ride in the forward calls) and the
     /// hyper-connection DeepSeek-V4.1 (whose compressor state a second run
     /// of a pass would refuse at an odd position).
     #[test]
@@ -4452,6 +4472,71 @@ mod tests {
         let prompts = [long_prompt(70), long_prompt(70)];
         for &cut in &cuts {
             chain_equals_whole_with("deepseek41", &deepseek, 96, &[cut], &prompts, true);
+        }
+    }
+
+    /// A step costs one call per remote stage: the restore a hybrid model's
+    /// sequence starts from, the snapshot it takes at a block boundary and
+    /// the Engram rows read ahead ride in the forward call. With chunks of
+    /// 16 tokens these cost extra calls of their own before (Qwen 3.5, a
+    /// 40-token prompt: 7 calls for 5 steps; DeepSeek-V4.1, 70 tokens: 12
+    /// calls for 8 steps).
+    #[test]
+    fn a_step_costs_one_call_per_stage() {
+        use stageframe::{OP_FORWARD, OP_OPEN};
+        let qwen = hybrid_model();
+        let deepseek = write_deepseek41(&TinyDeepseek41::default());
+        let mut first = long_prompt(40);
+        first[19] = 3;
+        let mut second = first[..30].to_vec();
+        second.extend([14, 15, 13, 12, 11, 10, 9, 12, 13, 14]);
+        let mut extended = first.clone();
+        extended.extend([15, 14, 13]);
+        for (what, model, context, prompts) in [
+            ("qwen35", &qwen, 128, vec![first, second, extended]),
+            (
+                "deepseek41",
+                &deepseek,
+                96,
+                vec![long_prompt(70), long_prompt(70)],
+            ),
+        ] {
+            let (_, cuts) = cuts_of(model);
+            // The first stage must hold an Engram layer (1 and 4).
+            let cut = *cuts.iter().find(|&&c| c > 1).unwrap_or(&cuts[0]);
+            let (mut chain, links) = chain_over(model, context, &[cut]);
+            chain.batching.prefill_chunk = 16;
+            let mut whole = engine(model, context, 0.0, None);
+            whole.batching.prefill_chunk = 16;
+            for (i, prompt) in prompts.iter().enumerate() {
+                let label = format!("{what}, prompt {i}");
+                let calls = links.calls[0].load(Ordering::SeqCst);
+                let steps = chain.serving.snapshot().steps;
+                let got = run(&mut chain, prompt, Some(8));
+                let want = run(&mut whole, prompt, Some(8));
+                assert_same_reply(&got, &want, &label);
+                assert_eq!(usage(&got), usage(&want), "{label}");
+                let calls = (links.calls[0].load(Ordering::SeqCst) - calls) as u64;
+                let steps = chain.serving.snapshot().steps - steps;
+                assert!(steps > 1, "{label}: the prompt takes several steps");
+                assert_eq!(calls, steps, "{label}: one call per step");
+            }
+            let ops = links.ops[0].lock().unwrap().clone();
+            assert_eq!(ops[0], OP_OPEN, "{what}");
+            assert!(
+                ops[1..].iter().all(|&op| op == OP_FORWARD),
+                "{what}: no call but forward after the open"
+            );
+            let (restores, snapshots, prefetches) = *links.asked[0].lock().unwrap();
+            if what == "qwen35" {
+                assert_eq!(restores, prompts.len(), "a restore per admission");
+                assert!(snapshots >= 1, "a snapshot at a block boundary");
+                assert!(chain.snapshots.len() > 0, "the chain kept it");
+                assert_eq!(prefetches, 0);
+            } else {
+                assert!(prefetches > 0, "Engram rows read ahead");
+                assert_eq!((restores, snapshots), (0, 0));
+            }
         }
     }
 
@@ -4675,8 +4760,7 @@ mod tests {
                     .count()
             };
             // The stage fails the first, the second and the third call of
-            // the request (a hybrid model's first is the state restore, its
-            // third a snapshot).
+            // the request (each a forward pass).
             for offset in 0..3 {
                 let (mut chain, links) = chain_over(&model, 96, &[cuts[0]]);
                 assert_eq!(opened(&links), 1, "one session at load");
@@ -4690,10 +4774,9 @@ mod tests {
                         failed.items.iter().any(Result::is_err),
                         "offset {offset}: the request fails"
                     );
-                    // A failed snapshot call (a hybrid model's third) breaks
-                    // the stages without failing a call: the running request
-                    // is told why at its next pass, not by a position error
-                    // from a worker that was reopened under it.
+                    // The running request is told why at its next pass, not
+                    // by a position error from a worker that was reopened
+                    // under it.
                     assert!(
                         failed.items.iter().any(
                             |i| matches!(i, Err(e) if e.to_string().contains("connection dropped"))
@@ -4748,9 +4831,8 @@ mod tests {
             let (_, cuts) = cuts_of(&model);
             let prompt = long_prompt(40);
             let want = run(&mut engine(&model, 96, 0.0, None), &prompt, Some(8));
-            // The first, the second and the third call of the request (a
-            // hybrid model's first is the state restore, its third a
-            // snapshot).
+            // The first, the second and the third call of the request (each
+            // a forward pass).
             for offset in 0..3 {
                 let (mut chain, links) = chain_over(&model, 96, &[cuts[0]]);
                 let at = links.calls[0].load(Ordering::SeqCst) + offset;
@@ -4855,7 +4937,35 @@ mod tests {
     /// serves nobody but the session it opened.
     #[test]
     fn a_stage_worker_checks_the_caller_and_the_session() {
-        use stageframe::{Open, open_frame, prefetch_frame, snapshot_frame};
+        use crate::provider::local::model::Want;
+        use crate::provider::local::model::cpu::Hidden;
+        use stageframe::{ForwardCall, Open, StageSeq, forward_frame, open_frame};
+        // A forward frame of `session` and call number `seq` over `slot`,
+        // asking for a snapshot or not; it is refused or fails before its
+        // pass has anything to run over.
+        let forward = |session: u64, seq: u64, slot: u32, snapshot: Option<u64>| {
+            forward_frame(&ForwardCall {
+                session,
+                seq,
+                drops: Vec::new(),
+                exact: true,
+                seqs: vec![StageSeq {
+                    slot,
+                    start_pos: 0,
+                    hist_from: 0,
+                    hist: Vec::new(),
+                    tokens: vec![1, 2],
+                    want: Want::None,
+                    hidden: Hidden::None,
+                    tables: Vec::new(),
+                    restore: None,
+                    snapshot,
+                    prefetch: Vec::new(),
+                }],
+                carry: None,
+            })
+            .unwrap()
+        };
         let file = write_spec(&TinySpec {
             context: 96,
             ..TinySpec::llama()
@@ -4924,34 +5034,32 @@ mod tests {
         }
 
         // Nothing opened yet: no session matches.
-        let m = match worker.stage_call(&snapshot_frame(5, 1, &[], 0, 1)) {
+        let m = match worker.stage_call(&forward(5, 1, 0, None)) {
             Err(CucaError::Config(m)) => m,
             other => panic!("{other:?}"),
         };
         assert!(m.contains("another session"), "{m}");
         worker.stage_call(&open_frame(&good)).unwrap();
-        // Another session's calls are refused; the opened one's are served.
-        let m = match worker.stage_call(&prefetch_frame(6, 1, 0, &[1, 2])) {
+        // Another session's calls are refused; the opened one's are served
+        // (they get as far as their own errors).
+        let m = match worker.stage_call(&forward(6, 1, 0, None)) {
             Err(CucaError::Config(m)) => m,
             other => panic!("{other:?}"),
         };
         assert!(m.contains("another session"), "{m}");
-        worker
-            .stage_call(&prefetch_frame(5, 1, 0, &[1, 2]))
-            .unwrap();
-        // The same call again is answered, not run; opening again starts
-        // the numbering over.
-        worker
-            .stage_call(&prefetch_frame(5, 1, 0, &[1, 2]))
-            .unwrap();
-        worker.stage_call(&open_frame(&good)).unwrap();
-        worker
-            .stage_call(&prefetch_frame(5, 1, 0, &[1, 2]))
-            .unwrap();
         // A slot the worker does not have, and a snapshot of a model with
-        // no recurrent state.
-        assert!(worker.stage_call(&prefetch_frame(5, 2, 9, &[1])).is_err());
-        assert!(worker.stage_call(&snapshot_frame(5, 2, &[], 0, 1)).is_err());
+        // no recurrent state: provider errors, from the opened session.
+        for (slot, snapshot, what) in [
+            (9, None, "out of range"),
+            (0, Some(1), "no recurrent state"),
+        ] {
+            match worker.stage_call(&forward(5, 1, slot, snapshot)) {
+                Err(CucaError::Provider { message, .. }) => {
+                    assert!(message.contains(what), "{message}");
+                }
+                other => panic!("{other:?}"),
+            }
+        }
         // A frame that is not one.
         assert!(worker.stage_call(&[]).is_err());
         assert!(worker.stage_call(&[99, 0, 0]).is_err());

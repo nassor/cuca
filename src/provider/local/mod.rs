@@ -3147,8 +3147,9 @@ impl LocalModel {
     }
 
     /// Answer one frame of a layer-stage coordinator (the body of `POST
-    /// /cuca/v1/stage`): an `open` that starts a session, a forward pass of
-    /// this worker's layers, or a snapshot, restore or prefetch call. The
+    /// /cuca/v1/stage`): an `open` that starts a session, or a forward pass
+    /// of this worker's layers (which also restores, snapshots and reads
+    /// Engram rows ahead as the frame asks). The
     /// frame is opaque to the caller. The reply carries how long the engine
     /// thread took to answer, which the server sends back in
     /// [`STAGE_COMPUTE_HEADER`].

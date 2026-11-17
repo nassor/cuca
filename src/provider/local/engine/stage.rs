@@ -17,6 +17,13 @@
 //! so a coordinator that lost its connection (and opened a new session
 //! elsewhere) cannot write into state it no longer owns.
 //!
+//! After `open` there is one call, `forward`, and a step costs one per stage.
+//! The frame carries what used to be calls of their own, for each sequence:
+//! the restore of its recurrent state (made before the pass, from a snapshot
+//! the worker holds or the zero state), the snapshot to keep after the pass
+//! (its size goes back in the reply), and the next tokens whose Engram rows
+//! the worker starts reading once the pass is done.
+//!
 //! Every call after `open` carries its number in the session. A transport
 //! that does not know whether a frame arrived sends it again, and the worker
 //! runs a call once: it keeps the reply to the last call and answers the same
@@ -208,33 +215,6 @@ impl Engine {
                 let (session, seq) = (call.session, call.seq);
                 self.once(session, seq, |engine| engine.stage_forward(call))
             }
-            Call::Snapshot {
-                session,
-                seq,
-                drops,
-                slot,
-                id,
-            } => self.once(session, seq, |engine| {
-                engine.stage_snapshot(session, &drops, slot, id)
-            }),
-            Call::Restore {
-                session,
-                seq,
-                drops,
-                slot,
-                id,
-                len,
-            } => self.once(session, seq, |engine| {
-                engine.stage_restore(session, &drops, slot, id, len)
-            }),
-            Call::Prefetch {
-                session,
-                seq,
-                slot,
-                tokens,
-            } => self.once(session, seq, |engine| {
-                engine.stage_prefetch(session, slot, &tokens)
-            }),
         }
     }
 
@@ -276,21 +256,17 @@ impl Engine {
         Ok(reply)
     }
 
-    /// `snapshot`: copy the recurrent state of a slot under the caller's id.
-    fn stage_snapshot(
-        &mut self,
-        session: u64,
-        drops: &[u64],
-        slot: u32,
-        id: u64,
-    ) -> Result<Vec<u8>, CucaError> {
-        let host = StageHost::enter(&mut self.stage, session, drops)?;
-        let slot = host.slot(slot)?;
+    /// Keep a copy of the recurrent state of `slot` under the caller's id,
+    /// and return the bytes it holds.
+    fn keep_snapshot(&mut self, slot: usize, id: u64) -> Result<u64, CucaError> {
         let snapshot = self
             .model
             .snapshot(StateSlot(slot))
             .ok_or_else(|| local_err("the stage holds no recurrent state to copy"))?;
         let bytes = snapshot.bytes() as u64;
+        let Some(host) = self.stage.as_mut() else {
+            return Err(CucaError::Config("this model is not a layer stage".into()));
+        };
         host.snapshots.retain(|(held, _)| *held != id);
         host.snapshots.push((id, snapshot));
         // The coordinator keeps at most a snapshot per slot and per
@@ -300,51 +276,7 @@ impl Engine {
         if host.snapshots.len() > cap {
             host.snapshots.drain(..host.snapshots.len() - cap);
         }
-        Ok(stageframe::bytes_reply(bytes))
-    }
-
-    /// `restore`: make a snapshot (or the zero state) the state of a slot,
-    /// at position `len`.
-    fn stage_restore(
-        &mut self,
-        session: u64,
-        drops: &[u64],
-        slot: u32,
-        id: Option<u64>,
-        len: u64,
-    ) -> Result<Vec<u8>, CucaError> {
-        let host = StageHost::enter(&mut self.stage, session, drops)?;
-        let slot = host.slot(slot)?;
-        let snapshot = match id {
-            None => None,
-            Some(id) => Some(
-                &host
-                    .snapshots
-                    .iter()
-                    .find(|(held, _)| *held == id)
-                    .ok_or_else(|| local_err(format!("the stage holds no snapshot {id}")))?
-                    .1,
-            ),
-        };
-        let len = usize::try_from(len)
-            .map_err(|_| local_err(format!("position {len} is out of range")))?;
-        self.model.restore(StateSlot(slot), snapshot, len)?;
-        Ok(stageframe::ok_reply())
-    }
-
-    /// `prefetch`: start reading the Engram rows of the next tokens of a
-    /// slot.
-    fn stage_prefetch(
-        &mut self,
-        session: u64,
-        slot: u32,
-        tokens: &[u32],
-    ) -> Result<Vec<u8>, CucaError> {
-        let host = StageHost::enter(&mut self.stage, session, &[])?;
-        let slot = host.slot(slot)?;
-        self.model
-            .engram_prefetch(StateSlot(slot), &host.history[slot], tokens);
-        Ok(stageframe::ok_reply())
+        Ok(bytes)
     }
 
     /// `open`: check the coordinator against this worker, then start the
@@ -377,7 +309,8 @@ impl Engine {
         }
         if open.fingerprint != self.fingerprint {
             return Err(CucaError::Config(
-                "the caller's model is not the same file".into(),
+                "the caller's model is not the same file (or its cuca speaks another wire version)"
+                    .into(),
             ));
         }
         if open.session == 0 {
@@ -394,13 +327,36 @@ impl Engine {
         Ok(stageframe::ok_reply())
     }
 
-    /// `forward`: bring each slot's token history to the call's start, run
-    /// the layers over the carry of the stage before, answer with the carry
-    /// for the stage after.
+    /// `forward`, for each sequence: make its recurrent state the snapshot
+    /// (or zero state) the call names, bring its token history to the call's
+    /// start, run the layers over the carry of the stage before, then keep
+    /// the snapshots the call asks for, start reading the Engram rows of the
+    /// next tokens it names, and answer with the carry for the stage after
+    /// and the snapshots' sizes.
     fn stage_forward(&mut self, call: ForwardCall) -> Result<Vec<u8>, CucaError> {
+        let hybrid = self.model.is_hybrid();
         let host = StageHost::enter(&mut self.stage, call.session, &call.drops)?;
         for seq in &call.seqs {
             let slot = host.slot(seq.slot)?;
+            if seq.snapshot.is_some() && !hybrid {
+                return Err(local_err("the stage holds no recurrent state to copy"));
+            }
+            if let Some(restore) = seq.restore {
+                let snapshot = match restore.id {
+                    None => None,
+                    Some(id) => Some(
+                        &host
+                            .snapshots
+                            .iter()
+                            .find(|(held, _)| *held == id)
+                            .ok_or_else(|| local_err(format!("the stage holds no snapshot {id}")))?
+                            .1,
+                    ),
+                };
+                let len = usize::try_from(restore.len)
+                    .map_err(|_| local_err(format!("position {} is out of range", restore.len)))?;
+                self.model.restore(StateSlot(slot), snapshot, len)?;
+            }
             let held = &mut host.history[slot];
             let from = usize::try_from(seq.hist_from).unwrap_or(usize::MAX);
             if from > held.len() {
@@ -443,8 +399,21 @@ impl Engine {
                 host.history[seq.slot as usize].extend_from_slice(&seq.tokens);
             }
         }
+        let mut sizes = Vec::new();
+        for seq in &call.seqs {
+            let slot = seq.slot as usize;
+            if let Some(id) = seq.snapshot {
+                sizes.push(self.keep_snapshot(slot, id)?);
+            }
+            if !seq.prefetch.is_empty()
+                && let Some(host) = self.stage.as_ref()
+            {
+                self.model
+                    .engram_prefetch(&host.history[slot], &seq.prefetch);
+            }
+        }
         match out {
-            StageOut::Carry(carry) => Ok(stageframe::carry_bytes(&carry)),
+            StageOut::Carry(carry) => Ok(stageframe::forward_reply(&carry, &sizes)),
             StageOut::Done(_) => Err(local_err("a stage worker holds no head")),
         }
     }

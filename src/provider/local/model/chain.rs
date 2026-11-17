@@ -22,7 +22,10 @@
 //!   it);
 //! - the position of each slot (`pos`), for the rollback it can answer;
 //! - the ids of the recurrent-state snapshots the workers hold for it, freed
-//!   when the [`ChainSnapshot`] is dropped.
+//!   when the [`ChainSnapshot`] is dropped;
+//! - the restores still to be told to the workers (`restores`) and the
+//!   snapshots their last call took (`taken`): both ride in forward calls,
+//!   so a step costs one call per stage.
 //!
 //! # Failure
 //!
@@ -41,11 +44,11 @@ use super::cpu::Forward;
 use super::paged::{BlockTable, KvLayout};
 use super::split::{Carry, LayerRange, StageOut};
 use super::transfer::{DeltaRows, PoolRows};
-use super::{Batch, Model, RecurrentSnapshot, StateSlot, err};
+use super::{Batch, Model, RecurrentSnapshot, StateSlot, StepHint, err};
 use crate::error::CucaError;
 use crate::provider::local::stageframe::{
-    ANOTHER_SESSION, ForwardCall, Open, StageSeq, decode_bytes_reply, decode_carry, forward_frame,
-    open_frame, prefetch_frame, restore_frame, snapshot_frame,
+    ANOTHER_SESSION, ForwardCall, Open, Restore, StageSeq, decode_forward_reply, forward_frame,
+    open_frame,
 };
 
 mod http;
@@ -142,6 +145,24 @@ pub(crate) struct ChainModel {
     /// Why the stages were last marked dirty: what a sequence whose state
     /// they lost is told.
     cause: Mutex<Option<CucaError>>,
+    /// Per state slot, the restore the next forward call of the slot tells
+    /// the workers to make before its pass (the local stage's was made at
+    /// once).
+    restores: Vec<Option<Restore>>,
+    /// Per state slot, the snapshot the last forward call took on the
+    /// workers, until [`ChainModel::snapshot`] adds the local stage's.
+    taken: Mutex<Vec<Option<Taken>>>,
+}
+
+/// A snapshot the workers took during a forward call, which the snapshot of
+/// the local stage completes.
+#[derive(Debug, Clone, Copy)]
+struct Taken {
+    id: u64,
+    /// The position the slot sat at after the pass.
+    pos: usize,
+    /// The bytes the workers hold for it.
+    remote_bytes: usize,
 }
 
 /// The recurrent state of a [`ChainModel`] slot at one position: the local
@@ -236,6 +257,8 @@ impl ChainModel {
             next_id: AtomicU64::new(1),
             dirty: AtomicBool::new(true),
             cause: Mutex::new(None),
+            restores: vec![None; max_sequences],
+            taken: Mutex::new(vec![None; max_sequences]),
         };
         chain.reopen()?;
         Ok(chain)
@@ -268,14 +291,29 @@ impl ChainModel {
             self.local.reset_slot(StateSlot(slot));
         }
         self.pos.fill(0);
+        self.restores.fill(None);
+        lock(&self.taken).fill(None);
         self.dirty.store(false, Ordering::Relaxed);
         Ok(())
     }
 
     /// The snapshot ids to tell `remote` to drop: what was dropped since any
-    /// stage was told, shared out to every stage's list.
+    /// stage was told, shared out to every stage's list. An id a pending
+    /// restore names waits until the restore has been made: the snapshot may
+    /// be let go of before the call that restores it.
     fn take_drops(&self, remote: &Remote) -> Vec<u64> {
-        let fresh = std::mem::take(&mut *lock(&self.drops));
+        let mut fresh = std::mem::take(&mut *lock(&self.drops));
+        let wanted = |id: &u64| {
+            self.restores
+                .iter()
+                .flatten()
+                .any(|r| r.id.as_ref() == Some(id))
+        };
+        if fresh.iter().any(wanted) {
+            let (held, free): (Vec<u64>, Vec<u64>) = fresh.into_iter().partition(wanted);
+            lock(&self.drops).extend(held);
+            fresh = free;
+        }
         if !fresh.is_empty() {
             for r in &self.remotes {
                 lock(&r.pending).extend_from_slice(&fresh);
@@ -289,11 +327,26 @@ impl ChainModel {
     ///
     /// # Errors
     ///
+    /// As [`ChainModel::forward_batch_hinting`].
+    pub(crate) fn forward_batch(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
+        self.forward_batch_hinting(batch, &[])
+    }
+
+    /// [`Model::forward_batch_hinting`]: one call per remote stage carries
+    /// the step's rows, the restores made since the last call of each slot,
+    /// the snapshots the hints ask for and the Engram rows to read ahead.
+    ///
+    /// # Errors
+    ///
     /// A failed stage call, a refused frame or a failed local pass. The model
     /// then resets its own state of every sequence of the step and reopens
     /// the stages on its next call.
-    pub(crate) fn forward_batch(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
-        let result = self.run(batch);
+    pub(crate) fn forward_batch_hinting(
+        &mut self,
+        batch: &Batch<'_>,
+        hints: &[StepHint<'_>],
+    ) -> Result<Vec<Forward>, CucaError> {
+        let result = self.run(batch, hints);
         if let Err(e) = &result {
             self.break_with(e);
             for row in &batch.rows {
@@ -339,7 +392,11 @@ impl ChainModel {
         })
     }
 
-    fn run(&mut self, batch: &Batch<'_>) -> Result<Vec<Forward>, CucaError> {
+    fn run(
+        &mut self,
+        batch: &Batch<'_>,
+        hints: &[StepHint<'_>],
+    ) -> Result<Vec<Forward>, CucaError> {
         // After a break, a sequence that is under way has lost what the
         // workers held of it (recurrent state, and the K/V rows of a worker
         // that restarted): it fails with the cause instead of running on a
@@ -365,6 +422,19 @@ impl ChainModel {
                 )));
             }
         }
+        let hint_of = |slot: StateSlot| hints.iter().find(|h| h.slot == slot);
+        // The ids the workers keep this step's snapshots under: only a model
+        // with recurrent state has any to take.
+        let snapshot_ids: Vec<Option<u64>> = batch
+            .rows
+            .iter()
+            .map(|r| {
+                hint_of(r.state)
+                    .filter(|h| h.snapshot && self.hybrid)
+                    .map(|_| self.next_id.fetch_add(1, Ordering::Relaxed))
+            })
+            .collect();
+        let mut remote_bytes = vec![0usize; batch.rows.len()];
         let mut carry: Option<Carry> = None;
         for k in 0..self.remotes.len() {
             let drops = self.take_drops(&self.remotes[k]);
@@ -372,7 +442,8 @@ impl ChainModel {
             let seqs = batch
                 .rows
                 .iter()
-                .map(|r| {
+                .zip(&snapshot_ids)
+                .map(|(r, &snapshot)| {
                     let from = common_prefix(&remote.sent[r.state.0], r.history);
                     StageSeq {
                         slot: r.state.0 as u32,
@@ -383,6 +454,12 @@ impl ChainModel {
                         want: r.want,
                         hidden: r.hidden,
                         tables: r.tables.to_vec(),
+                        restore: self.restores[r.state.0],
+                        snapshot,
+                        prefetch: match hint_of(r.state) {
+                            Some(h) if remote.engram => h.next.to_vec(),
+                            _ => Vec::new(),
+                        },
                     }
                 })
                 .collect();
@@ -395,7 +472,23 @@ impl ChainModel {
                 carry: carry.take(),
             })?;
             let reply = Self::session_call(remote, frame)?;
-            carry = Some(decode_carry(&reply)?);
+            let (next, sizes) = decode_forward_reply(&reply)?;
+            let asked = snapshot_ids.iter().flatten().count();
+            if sizes.len() != asked {
+                return Err(err(format!(
+                    "{} took {} snapshots, {asked} were asked",
+                    remote.transport.name(),
+                    sizes.len()
+                )));
+            }
+            let rows_with_snapshot = snapshot_ids
+                .iter()
+                .enumerate()
+                .filter_map(|(i, id)| id.map(|_| i));
+            for (i, bytes) in rows_with_snapshot.zip(sizes) {
+                remote_bytes[i] += usize::try_from(bytes).unwrap_or(usize::MAX);
+            }
+            carry = Some(next);
             for r in &batch.rows {
                 let held = &mut remote.sent[r.state.0];
                 held.clear();
@@ -407,8 +500,23 @@ impl ChainModel {
             StageOut::Done(outs) => outs,
             StageOut::Carry(_) => return Err(err("the last stage returned no logits")),
         };
-        for r in &batch.rows {
-            self.pos[r.state.0] = r.start_pos + r.tokens.len();
+        for h in hints.iter().filter(|h| !h.next.is_empty()) {
+            self.local.engram_prefetch(h.history, h.next);
+        }
+        for (i, r) in batch.rows.iter().enumerate() {
+            let end = r.start_pos + r.tokens.len();
+            self.pos[r.state.0] = end;
+            self.restores[r.state.0] = None;
+            if let Some(id) = snapshot_ids[i] {
+                let taken = Taken {
+                    id,
+                    pos: end,
+                    remote_bytes: remote_bytes[i],
+                };
+                if let Some(old) = lock(&self.taken)[r.state.0].replace(taken) {
+                    lock(&self.drops).push(old.id);
+                }
+            }
         }
         Ok(outs)
     }
@@ -493,33 +601,27 @@ impl ChainModel {
     }
 
     /// A copy of the recurrent state of `slot` on every stage: the workers
-    /// keep theirs under a new id. `None` for an attention-only model, a
-    /// broken session or a stage that cannot copy.
+    /// took theirs, under a new id, during the forward call whose hint asked
+    /// for it ([`StepHint::snapshot`]), and this adds the local stage's.
+    /// `None` for an attention-only model, a broken session, a slot whose
+    /// last call asked for no snapshot or one that is not at the position it
+    /// took it at, and a stage that cannot copy.
     pub(crate) fn snapshot(&self, slot: usize) -> Option<RecurrentSnapshot> {
         if !self.hybrid || self.dirty.load(Ordering::Relaxed) {
             return None;
         }
-        let local = self.local.snapshot(StateSlot(slot))?;
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let mut bytes = local.bytes();
-        for remote in &self.remotes {
-            let frame = snapshot_frame(
-                self.session,
-                remote.next_seq(),
-                &self.take_drops(remote),
-                slot as u32,
-                id,
-            );
-            match Self::session_call(remote, frame).and_then(|reply| decode_bytes_reply(&reply)) {
-                Ok(n) => bytes += usize::try_from(n).unwrap_or(usize::MAX),
-                Err(e) => {
-                    self.break_with(&e);
-                    return None;
-                }
-            }
-        }
+        let taken = lock(&self.taken).get_mut(slot)?.take()?;
+        let local = (self.pos.get(slot) == Some(&taken.pos))
+            .then(|| self.local.snapshot(StateSlot(slot)))
+            .flatten();
+        let Some(local) = local else {
+            // The workers hold a copy nobody will use.
+            lock(&self.drops).push(taken.id);
+            return None;
+        };
+        let bytes = local.bytes() + taken.remote_bytes;
         Some(RecurrentSnapshot::Chain(ChainSnapshot {
-            id,
+            id: taken.id,
             session: self.session,
             local: Box::new(local),
             bytes,
@@ -528,7 +630,8 @@ impl ChainModel {
     }
 
     /// Make `snapshot` (or, for `None`, the zero state) the state of `slot`
-    /// on every stage, at position `len`.
+    /// at position `len`: the local stage's at once, the workers' with the
+    /// slot's next forward call.
     ///
     /// # Errors
     ///
@@ -559,54 +662,20 @@ impl ChainModel {
                 "the snapshot predates the last reconnection of the stages",
             ));
         }
-        let outcome = self.restore_stages(slot, held, len);
-        if let Err(e) = &outcome {
-            self.break_with(e);
+        let outcome = self
+            .local
+            .restore(StateSlot(slot), held.map(|s| &*s.local), len);
+        match &outcome {
+            Ok(()) => {
+                self.restores[slot] = Some(Restore {
+                    id: held.map(|s| s.id),
+                    len: len as u64,
+                });
+                self.pos[slot] = len;
+            }
+            Err(e) => self.break_with(e),
         }
         outcome
-    }
-
-    fn restore_stages(
-        &mut self,
-        slot: usize,
-        held: Option<&ChainSnapshot>,
-        len: usize,
-    ) -> Result<(), CucaError> {
-        for remote in &self.remotes {
-            let frame = restore_frame(
-                self.session,
-                remote.next_seq(),
-                &self.take_drops(remote),
-                slot as u32,
-                held.map(|s| s.id),
-                len as u64,
-            );
-            Self::session_call(remote, frame)?;
-        }
-        self.local
-            .restore(StateSlot(slot), held.map(|s| &*s.local), len)?;
-        self.pos[slot] = len;
-        Ok(())
-    }
-
-    /// Start reading the Engram rows of the next `tokens` of the sequence in
-    /// `slot`: on every stage that runs an Engram layer. A hint: a stage that
-    /// cannot be reached is not an error here, the next pass reports it.
-    pub(crate) fn engram_prefetch(&self, slot: StateSlot, history: &[u32], tokens: &[u32]) {
-        if !self.dirty.load(Ordering::Relaxed) {
-            for remote in self.remotes.iter().filter(|r| r.engram) {
-                let frame = prefetch_frame(self.session, remote.next_seq(), slot.0 as u32, tokens);
-                // A hint, but a worker that restarted is worth knowing: the
-                // sequences under way fail with the reason at their next pass.
-                if let Err(e) = Self::session_call(remote, frame)
-                    && e.to_string().contains(RESTARTED)
-                {
-                    self.break_with(&e);
-                    break;
-                }
-            }
-        }
-        self.local.engram_prefetch(slot, history, tokens);
     }
 
     /// The layers of the local stage (the last), for the drafter.

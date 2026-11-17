@@ -307,6 +307,22 @@ impl<'a> Batch<'a> {
     }
 }
 
+/// What the scheduler knows of a sequence when it plans a step and the model
+/// can use around the pass; see [`Model::forward_batch_hinting`].
+pub(crate) struct StepHint<'a> {
+    /// The sequence's state slot, which the step's row of it carries.
+    pub(crate) slot: StateSlot,
+    /// The sequence's tokens up to the end of this step.
+    pub(crate) history: &'a [u32],
+    /// The tokens of its next prompt chunk (empty when there is none): the
+    /// model starts reading their Engram rows once the pass has run.
+    pub(crate) next: &'a [u32],
+    /// The scheduler snapshots the slot's recurrent state after this pass
+    /// ([`Model::snapshot`]): a chain's workers take their copies during the
+    /// pass instead of in a call of their own.
+    pub(crate) snapshot: bool,
+}
+
 /// The recurrent state of a hybrid model at one position (a copy of every
 /// delta-net layer's state), kept by the prefix store next to the K/V blocks
 /// of the same prefix. On a GPU the state tensors are immutable, so a
@@ -970,19 +986,20 @@ impl Model {
         }
     }
 
-    /// Hint that the rows of `tokens` (the next ones of the sequence in
-    /// `slot`, whose earlier tokens are `history`) will be looked up soon: a
-    /// model with an Engram table starts reading their table rows in the
-    /// background, and so do the stages of a chain that run an Engram layer.
-    /// Changes no output.
-    pub(crate) fn engram_prefetch(&self, slot: StateSlot, history: &[u32], tokens: &[u32]) {
+    /// Hint that the rows of `tokens` (the next ones of a sequence whose
+    /// earlier tokens are `history`) will be looked up soon: a model with an
+    /// Engram table starts reading their table rows in the background. A
+    /// chain's workers are told with the forward call
+    /// ([`Model::forward_batch_hinting`]), so this is the local stage's
+    /// only. Changes no output.
+    pub(crate) fn engram_prefetch(&self, history: &[u32], tokens: &[u32]) {
         match self {
             Model::Cpu(m) => m.engram_prefetch(history, tokens),
             #[cfg(feature = "provider-local-gpu")]
             Model::Gpu(m) => m.engram_prefetch(history, tokens),
             #[cfg(feature = "provider-local-gpu")]
             Model::Split(m) => m.engram_prefetch(history, tokens),
-            Model::Chain(m) => m.engram_prefetch(slot, history, tokens),
+            Model::Chain(m) => m.local().engram_prefetch(history, tokens),
         }
     }
 
@@ -1011,6 +1028,31 @@ impl Model {
         batch: &Batch<'_>,
     ) -> Result<Vec<cpu::Forward>, CucaError> {
         on_model!(self, m => m.forward_batch(batch))
+    }
+
+    /// [`Model::forward_batch`] with what the scheduler knows of the step's
+    /// sequences: once the pass has run, the model starts reading the Engram
+    /// rows of each sequence's next chunk behind the reads the pass needed;
+    /// and a chain sends them to its workers in the forward call itself
+    /// (with the snapshots a hint asks for, and the restores made since the
+    /// slot's last call), so a step costs one round trip per stage.
+    ///
+    /// # Errors
+    ///
+    /// As [`Model::forward_batch`].
+    pub(crate) fn forward_batch_hinting(
+        &mut self,
+        batch: &Batch<'_>,
+        hints: &[StepHint<'_>],
+    ) -> Result<Vec<cpu::Forward>, CucaError> {
+        if let Model::Chain(m) = self {
+            return m.forward_batch_hinting(batch, hints);
+        }
+        let outs = self.forward_batch(batch)?;
+        for h in hints.iter().filter(|h| !h.next.is_empty()) {
+            self.engram_prefetch(h.history, h.next);
+        }
+        Ok(outs)
     }
 
     /// The architecture.

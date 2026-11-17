@@ -62,6 +62,14 @@
   reply it kept (one frame), so a repeat never runs a pass twice: a hybrid or hyper-connection
   model would refuse the second run. The stage wire format changed with it: coordinators and
   workers must run the same build. `LocalModel::stage_call`'s `StageReply::frame` is a `Bytes`.
+- Layer stages: a step costs one call per remote stage. The restore of a hybrid model's recurrent
+  state, the snapshot it takes at a block boundary and the Engram rows read ahead for the next
+  prompt chunk are now part of the forward frame, where each was a call of its own (snapshot,
+  restore and prefetch no longer exist as ops). The wire version is 2, which goes into the model
+  fingerprint a worker checks at `open`, so a build with the old layout is refused there. With
+  16-token chunks a 40-token Qwen 3.5 prompt took 7 calls for 5 steps and now takes 5, and a
+  70-token DeepSeek-V4.1 prompt took 12 for 8 and now takes 8. Decode steps were one call
+  already.
 
 ## 0.9.1 - 2026-11-15
 

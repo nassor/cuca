@@ -59,7 +59,7 @@ use crate::error::CucaError;
 use crate::provider::local::model::cpu::{Forward, Hidden};
 use crate::provider::local::model::mtp::Drafter;
 use crate::provider::local::model::paged::{BLOCK_SIZE, BlockKey, SeqBlocks, block_keys};
-use crate::provider::local::model::{Batch, RecurrentSnapshot, SeqRows, StateSlot, Want};
+use crate::provider::local::model::{Batch, RecurrentSnapshot, SeqRows, StateSlot, StepHint, Want};
 use crate::provider::local::output::OutputParser;
 use crate::provider::local::sampler::{
     Dist, Scratch, SplitMix64, greedy, greedy_with_prob, sample,
@@ -1115,7 +1115,37 @@ impl Engine {
                     .collect(),
                 exact: true,
             };
-            self.model.forward_batch(&batch)
+            // What the model can use around the pass: the next prompt chunk
+            // of a sequence still being prefilled (a model with an Engram
+            // table starts reading its rows once the pass is done, behind
+            // the reads this step needed, while the scheduler applies the
+            // step and plans the next one) and the snapshot a hybrid
+            // model's sequence takes at the end of this chunk.
+            let hints: Vec<StepHint<'_>> = plans
+                .iter()
+                .filter_map(|p| {
+                    let Kind::Prefill { last } = &p.kind else {
+                        return None;
+                    };
+                    let seq = &self.running[p.seq];
+                    let slot = seq.slot?;
+                    let end = p.start + p.tokens.len();
+                    let next: &[u32] = if *last || seq.export.is_some() {
+                        &[]
+                    } else {
+                        let n = (seq.prompt.len() - end).min(self.batching.prefill_chunk);
+                        &seq.prompt[end..end + n]
+                    };
+                    let snapshot = seq.snapshot_at == Some(end);
+                    (!next.is_empty() || snapshot).then(|| StepHint {
+                        slot: StateSlot(slot),
+                        history: &seq.prompt[..end],
+                        next,
+                        snapshot,
+                    })
+                })
+                .collect();
+            self.model.forward_batch_hinting(&batch, &hints)
         };
         let outs = match outs {
             Ok(outs) => outs,
@@ -1126,25 +1156,6 @@ impl Engine {
         };
         let forward = started.elapsed();
         let step_ns = saturating_u64(forward.as_nanos());
-        // The next chunk of every prompt still being prefilled is known: a
-        // model with an Engram table starts reading its rows now, behind the
-        // reads this step needed (the readers serve jobs in order), while the
-        // scheduler applies the step and plans the next one.
-        for p in plans.iter() {
-            if matches!(p.kind, Kind::Prefill { last: false }) {
-                let seq = &self.running[p.seq];
-                if seq.export.is_some() {
-                    continue;
-                }
-                let end = p.start + p.tokens.len();
-                let next = (seq.prompt.len() - end).min(self.batching.prefill_chunk);
-                self.model.engram_prefetch(
-                    StateSlot(seq.slot.unwrap_or(0)),
-                    &seq.prompt[..end],
-                    &seq.prompt[end..end + next],
-                );
-            }
-        }
         let rows: usize = plans.iter().map(|p| p.tokens.len()).sum();
         ctx.forward_secs = forward.as_secs_f64();
         ctx.rows = rows;

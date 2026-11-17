@@ -10,8 +10,12 @@
 use super::model::err as local_err;
 use crate::error::CucaError;
 
-/// The version of the frame layout, bumped on any incompatible change.
-pub(crate) const WIRE_VERSION: u32 = 1;
+/// The version of the frame layout, bumped on any incompatible change. It
+/// goes into the model fingerprint a stage worker checks at `open` and a K/V
+/// header carries, so nodes of different layouts refuse each other at once.
+/// 2: layer-stage calls carry a call number, and a forward call carries the
+/// restore, snapshot and Engram prefetch that were calls of their own.
+pub(crate) const WIRE_VERSION: u32 = 2;
 
 /// Appends values to a frame.
 pub(crate) struct Writer {
