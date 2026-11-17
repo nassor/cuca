@@ -286,13 +286,15 @@ sysinfo = { version = "0.40", optional = true, default-features = false, feature
 # provider-local converter: free space of the output volume (std has no API for it
 # and the crate forbids `unsafe`).
 fs4 = { version = "1.1", optional = true }
-nvml-wrapper = { version = "0.13", optional = true }
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", optional = true }
 
 [target.'cfg(windows)'.dependencies]
 wmi = { version = "0.18", optional = true, default-features = false }
 winreg = { version = "0.56", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nvml-wrapper = { version = "0.13", optional = true }
 
 # Test-only deps for the integration suite: `ctor` runs the `--mcp-echo-server`
 # interceptor in tests/plugin_mcp.rs before libtest's main (that test binary

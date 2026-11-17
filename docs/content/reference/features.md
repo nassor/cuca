@@ -182,7 +182,7 @@ Seven features. A service is a type you call yourself; it never implements `Cuca
 | Feature | What it is for | Pulls in |
 |---|---|---|
 | `config-kdl` | read a settings file in KDL: `from_kdl_str`, `from_kdl_str_with_vars`, `load_kdl_str`, `load_kdl_file` | `kdl` |
-| `sysmon` | `cuca::sysmon::SystemSampler`, a background thread that samples CPU, RAM, swap, disks, GPUs and this process; no HTTP and no model engine | `sysinfo`, `nvml-wrapper`, `tracing`; on Windows also `wmi` and `winreg` |
+| `sysmon` | `cuca::sysmon::SystemSampler`, a background thread that samples CPU, RAM, swap, disks, GPUs and this process; no HTTP and no model engine | `sysinfo`, `tracing`; on Linux also `nvml-wrapper`; on Windows also `wmi` and `winreg` |
 | `server` | the `cuca` binary: `cuca run`, which starts the model server, the balancer or both from one file; an OpenAI-compatible HTTP API, stats and metrics | `provider-local`, `config-kdl`, `sysmon`, `axum`, `clap`, `tracing`, `tracing-subscriber`, `sysinfo`, `getrandom`, `tokio-stream` |
 | `server-tui` | `cuca tui`, a live terminal dashboard | `server`, `ratatui`, `crossterm` |
 
