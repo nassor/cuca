@@ -106,9 +106,11 @@ impl Histogram {
 }
 
 /// The status codes the counters tell apart; any other code counts in its
-/// class's first entry (`4xx` as 400, `5xx` as 500). 499 is a client that
-/// went away (nginx's code), not an error of the server.
-pub const STATUS_CODES: [u16; 9] = [200, 400, 401, 404, 413, 499, 500, 503, 502];
+/// class's first entry (`4xx` as 400, `5xx` as 500, anything else as 200).
+/// 101 is a connection upgraded to a layer-stage frame stream, not an answer
+/// that served a request. 499 is a client that went away (nginx's code), not
+/// an error of the server.
+pub const STATUS_CODES: [u16; 10] = [200, 101, 400, 401, 404, 413, 499, 500, 503, 502];
 
 /// Request counters by status code.
 #[derive(Debug, Default)]

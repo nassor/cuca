@@ -17,6 +17,12 @@
 //! so a coordinator that lost its connection (and opened a new session
 //! elsewhere) cannot write into state it no longer owns.
 //!
+//! The same `open` names the number type the session's carries travel in
+//! ([`CarryDtype`](crate::provider::local::CarryDtype)): the worker decodes
+//! the carry of a forward call and encodes its own reply in it, and refuses a
+//! carry written in another. `F32` is bit-exact; `Bf16` and `F16` round every
+//! float to two bytes and are not.
+//!
 //! After `open` there is one call, `forward`, and a step costs one per stage.
 //! The frame carries what used to be calls of their own, for each sequence:
 //! the restore of its recurrent state (made before the pass, from a snapshot
@@ -48,7 +54,7 @@ use crate::provider::local::model::params::Hparams;
 use crate::provider::local::model::split::{LayerRange, StageOut, legal_cuts};
 use crate::provider::local::model::{Batch, RecurrentSnapshot, SeqRows, StateSlot};
 use crate::provider::local::stageframe::{self, Call, ForwardCall, Open};
-use crate::provider::local::{LocalModelConfig, StageRange};
+use crate::provider::local::{CarryDtype, LocalModelConfig, StageRange};
 
 /// What a stage worker keeps between calls, see the module docs.
 pub(super) struct StageHost {
@@ -63,6 +69,8 @@ pub(super) struct StageHost {
     last_seq: u64,
     /// The reply to that call, kept to answer it again if it comes again.
     last_reply: Option<Bytes>,
+    /// The number type of the session's carries, as its `open` named it.
+    carry: CarryDtype,
 }
 
 impl StageHost {
@@ -74,6 +82,7 @@ impl StageHost {
             snapshots: Vec::new(),
             last_seq: 0,
             last_reply: None,
+            carry: CarryDtype::F32,
         }
     }
 
@@ -190,6 +199,7 @@ impl Engine {
             kv_tokens: self.sizing.kv_tokens as u64,
             max_rows: self.sizing.max_rows as u64,
             session,
+            carry: CarryDtype::F32,
         })
     }
 
@@ -324,6 +334,7 @@ impl Engine {
         host.session = open.session;
         host.last_seq = 0;
         host.last_reply = None;
+        host.carry = open.carry;
         Ok(stageframe::ok_reply())
     }
 
@@ -336,6 +347,14 @@ impl Engine {
     fn stage_forward(&mut self, call: ForwardCall) -> Result<Vec<u8>, CucaError> {
         let hybrid = self.model.is_hybrid();
         let host = StageHost::enter(&mut self.stage, call.session, &call.drops)?;
+        let dtype = host.carry;
+        if call.carry.is_some() && call.carry_dtype != dtype {
+            return Err(local_err(format!(
+                "the session carries {}, the call's carry is {}",
+                dtype.name(),
+                call.carry_dtype.name()
+            )));
+        }
         for seq in &call.seqs {
             let slot = host.slot(seq.slot)?;
             if seq.snapshot.is_some() && !hybrid {
@@ -413,7 +432,7 @@ impl Engine {
             }
         }
         match out {
-            StageOut::Carry(carry) => Ok(stageframe::forward_reply(&carry, &sizes)),
+            StageOut::Carry(carry) => stageframe::forward_reply(&carry, &sizes, dtype),
             StageOut::Done(_) => Err(local_err("a stage worker holds no head")),
         }
     }

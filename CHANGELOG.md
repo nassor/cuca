@@ -44,9 +44,33 @@
   drops any such header from clients. Prefill nodes take no chat request while another healthy
   upstream serves the model. Counters: `cuca_balancer_prefill_assigned_total`,
   `cuca_balancer_prefill_unassigned_total` and `cuca_balancer_prefill_whole_total`.
+- Layer stages: `remote_stage carry="f32"|"bf16"|"f16"` (default `"f32"`) sets the number type
+  the hidden states travel in, to and from that worker: the residual stream, the per-layer and
+  pre inputs and the mirrored K/V rows. **`bf16` and `f16` are not bit-exact**: each float is
+  rounded to 8 or 11 significant bits, so the logits differ from the whole model's and an `f32`
+  chain's, and a greedy reply can differ where two logits are close. `f32` stays bit-exact. `f16`
+  fails the call on a finite value above 65504 instead of sending infinity. The coordinator's
+  `open` names the type, the worker answers in it, and every carry names the type it is written
+  in. Library: `CarryDtype` and `RemoteStage::carry`. Measured with Qwen3 0.6B (split at layer
+  14) and Qwen 3.5 0.8B (12): the bytes of a prefill call halve (883 KB to 442 KB, 664 KB to
+  332 KB) and so do those of a whole request (2.65 MB to 1.33 MB for a 3.8 KB prompt). On
+  loopback that changes nothing measurable (network share of a prefill call 0.44 to 0.46 ms at
+  `f32`, 0.39 at `bf16`, 0.48 to 0.59 at `f16`, with a 5 to 8 ms outlier in some runs of each);
+  behind a link throttled to 1 Gbit/s it goes from 7.5 ms to 3.5 to 4.2 ms, and at 100 Mbit/s
+  from 69 ms to 30 to 35 ms. Quality: the largest difference of any logit from the `f32`
+  chain's, until the first greedy token that differs, was 0.44 (`bf16`) and 0.55 (`f16`) on
+  Qwen3 0.6B (1.7% of the largest logit) and 0.32 and 0.34 on Qwen 3.5 0.8B (1.1%). That is the
+  engine's own noise floor, not the carry's rounding: perturbing the `f32` carry by 1 part in
+  10^7 gives 0.47 and 0.30, because the 8-bit activation quantization of the matmuls re-rounds.
+  Two prompts of 64 greedy tokens each: Qwen3 0.6B `f16` replied as `f32` did on both, `bf16`
+  on one (it chose other words from the 15th token); Qwen 3.5 0.8B replied differently on one
+  prompt with both types, at the same token and in the same way as with the 10^-7
+  perturbation, which is a near tie in its logits. The stage wire version is 3.
 
 ### Changed
 
+- The HTTP counters (`cuca_http_requests_total` and the balancer's) tell `101` apart: a connection
+  upgraded to a layer-stage frame stream no longer counts as a `200`.
 - Balancer: the speculation penalty is removed. An upstream with a drafter no longer adds 2 to
   its load score; speed weighting stays.
 - The model server and the balancer set `TCP_NODELAY` on every accepted connection (axum leaves

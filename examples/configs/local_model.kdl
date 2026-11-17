@@ -25,7 +25,7 @@ source "qwen3-0.6b-q8_0"                 // or: source file="/models/x.gguf" | s
 // shard_dirs "E:/parts" "F:/parts"
 // kv_export max_exports=2                  // serve K/V rows of prompts to decode nodes (a bare `kv_export` takes the default 2); not with shards or stages
 // remote_stage url="http://box-a:8000" layers=14   // coordinator: layers 0..14 run on that worker; repeat the node per worker, in layer order
-// remote_stage url="http://box-b:8000" layers=10 model="m" api_key="${STAGE_KEY:-}" timeout="600s"   // model: its name on that server; the rest of the layers and the head run on this model's device
+// remote_stage url="http://box-b:8000" layers=10 model="m" api_key="${STAGE_KEY:-}" timeout="600s" carry="bf16"   // model: its name on that server; carry: the type hidden states travel in ("f32" bit-exact, the default; "bf16" and "f16" halve the bytes and are not bit-exact); the rest of the layers and the head run on this model's device
 // stage first=0 layers=14                  // worker: this model holds only these layers and serves stage calls, no chat; not with a drafter
 
 // Hybrid placement: a model larger than the GPU or RAM spreads over VRAM, RAM

@@ -1250,6 +1250,11 @@ mod tests {
             "the worker answered a POST per stage call:\n{worker_metrics}"
         );
         assert_eq!(
+            worker_codes(101),
+            1.0,
+            "one upgrade, counted as a 101:\n{worker_metrics}"
+        );
+        assert_eq!(
             value("cuca_stage_errors_total{model=\"m\",stage=\"0\"} "),
             0.0
         );
@@ -1312,6 +1317,7 @@ mod tests {
             kv_tokens: sizing.kv_tokens as u64,
             max_rows: sizing.max_rows as u64,
             session: 9,
+            carry: crate::CarryDtype::F32,
         };
         assert_eq!(
             post_frame(None, open_frame(&open)).await.unwrap().status(),
@@ -1435,6 +1441,7 @@ mod tests {
             kv_tokens: sizing.kv_tokens as u64,
             max_rows: sizing.max_rows as u64,
             session: 9,
+            carry: crate::CarryDtype::F32,
         };
         let (code, payload) = stream_call(&mut sock, &open_frame(&open)).unwrap();
         assert_eq!(code, REPLY_MISMATCH);

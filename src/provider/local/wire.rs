@@ -7,6 +7,7 @@
 //! vectors it returns; a short read or a count whose byte size overflows is
 //! an error, never a panic or an oversized allocation.
 
+use super::CarryDtype;
 use super::model::err as local_err;
 use crate::error::CucaError;
 
@@ -15,7 +16,45 @@ use crate::error::CucaError;
 /// header carries, so nodes of different layouts refuse each other at once.
 /// 2: layer-stage calls carry a call number, and a forward call carries the
 /// restore, snapshot and Engram prefetch that were calls of their own.
-pub(crate) const WIRE_VERSION: u32 = 2;
+/// 3: `open` names the number type of the carry, and every carry starts with
+/// the tag of the type it is written in.
+pub(crate) const WIRE_VERSION: u32 = 3;
+
+impl CarryDtype {
+    /// The byte a frame names the type with.
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            Self::F32 => 0,
+            Self::Bf16 => 1,
+            Self::F16 => 2,
+        }
+    }
+
+    /// The type a frame's tag names.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a tag no type has.
+    pub(crate) fn from_tag(tag: u8) -> Result<Self, CucaError> {
+        match tag {
+            0 => Ok(Self::F32),
+            1 => Ok(Self::Bf16),
+            2 => Ok(Self::F16),
+            other => Err(local_err(format!(
+                "unknown carry type tag {other} in frame"
+            ))),
+        }
+    }
+
+    /// The name the configuration gives it.
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::F32 => "f32",
+            Self::Bf16 => "bf16",
+            Self::F16 => "f16",
+        }
+    }
+}
 
 /// Appends values to a frame.
 pub(crate) struct Writer {
@@ -59,6 +98,43 @@ impl Writer {
         for x in v {
             self.buf.extend_from_slice(&x.to_le_bytes());
         }
+    }
+
+    /// A slice of floats as `dtype`: the count, then 4-byte values for `F32`
+    /// (bit-exact) or 2-byte values rounded to nearest even for `Bf16` and
+    /// `F16`.
+    ///
+    /// # Errors
+    ///
+    /// [`CucaError::Provider`] for a finite value an `F16` cannot hold
+    /// (beyond 65504): it would travel as infinity.
+    pub(crate) fn put_floats(&mut self, v: &[f32], dtype: CarryDtype) -> Result<(), CucaError> {
+        match dtype {
+            CarryDtype::F32 => self.put_f32s(v),
+            CarryDtype::Bf16 => {
+                self.put_u64(v.len() as u64);
+                self.buf.reserve(v.len() * 2);
+                for x in v {
+                    self.buf
+                        .extend_from_slice(&half::bf16::from_f32(*x).to_le_bytes());
+                }
+            }
+            CarryDtype::F16 => {
+                self.put_u64(v.len() as u64);
+                self.buf.reserve(v.len() * 2);
+                for x in v {
+                    let h = half::f16::from_f32(*x);
+                    if x.is_finite() && !h.is_finite() {
+                        return Err(local_err(format!(
+                            "the value {x} does not fit an f16 carry (largest 65504): \
+                             use `carry=\"bf16\"` or `\"f32\"`"
+                        )));
+                    }
+                    self.buf.extend_from_slice(&h.to_le_bytes());
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn into_bytes(self) -> Vec<u8> {
@@ -150,6 +226,28 @@ impl<'a> Reader<'a> {
             .map(|c| f32::from_le_bytes(*c))
             .collect())
     }
+
+    /// A slice of floats written as `dtype` ([`Writer::put_floats`]), widened
+    /// to `f32`.
+    pub(crate) fn get_floats(&mut self, dtype: CarryDtype) -> Result<Vec<f32>, CucaError> {
+        match dtype {
+            CarryDtype::F32 => self.get_f32s(),
+            CarryDtype::Bf16 => Ok(self
+                .take_counted(2)?
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::bf16::from_le_bytes(*c).to_f32())
+                .collect()),
+            CarryDtype::F16 => Ok(self
+                .take_counted(2)?
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
+                .collect()),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -217,5 +315,80 @@ mod tests {
             );
             assert!(Reader::new(&bytes).get_f32s().is_err());
         }
+        for dtype in [CarryDtype::Bf16, CarryDtype::F16] {
+            for count in [u64::MAX / 2 + 1, 1 << 40] {
+                let mut w = Writer::new();
+                w.put_u64(count);
+                assert!(
+                    Reader::new(&w.into_bytes()).get_floats(dtype).is_err(),
+                    "{dtype:?} {count}"
+                );
+            }
+        }
+    }
+
+    fn floats_through(values: &[f32], dtype: CarryDtype) -> (Vec<f32>, usize) {
+        let mut w = Writer::new();
+        w.put_floats(values, dtype).unwrap();
+        let bytes = w.into_bytes();
+        let n = bytes.len();
+        let mut r = Reader::new(&bytes);
+        let got = r.get_floats(dtype).unwrap();
+        assert!(r.is_empty());
+        (got, n)
+    }
+
+    #[test]
+    fn f32_floats_are_exact_and_the_others_are_half_the_bytes_and_bounded() {
+        let values: Vec<f32> = (0..2000)
+            .map(|i| ((i as f32) * 0.37).sin() * 40.0 + 0.001 * i as f32)
+            .collect();
+        let (exact, f32_bytes) = floats_through(&values, CarryDtype::F32);
+        assert!(
+            exact
+                .iter()
+                .zip(&values)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+        for (dtype, bits) in [(CarryDtype::Bf16, 8), (CarryDtype::F16, 11)] {
+            let (got, bytes) = floats_through(&values, dtype);
+            assert_eq!(bytes - 8, (f32_bytes - 8) / 2, "{dtype:?}: two bytes each");
+            for (g, v) in got.iter().zip(&values) {
+                // Rounding to `bits` significant bits: relative error at
+                // most 2^-bits (half an ulp), plus the f16 subnormal step
+                // (2^-25) near zero.
+                let bound = v.abs() * 2f32.powi(-bits) + 3.0e-8;
+                assert!((g - v).abs() <= bound, "{dtype:?}: {v} came back {g}");
+            }
+        }
+    }
+
+    #[test]
+    fn non_finite_values_survive_and_an_f16_overflow_is_an_error() {
+        for dtype in [CarryDtype::Bf16, CarryDtype::F16] {
+            let (got, _) = floats_through(&[f32::INFINITY, f32::NEG_INFINITY, -0.0], dtype);
+            assert_eq!(got[0], f32::INFINITY);
+            assert_eq!(got[1], f32::NEG_INFINITY);
+            assert!(got[2] == 0.0 && got[2].is_sign_negative());
+            let (got, _) = floats_through(&[f32::NAN], dtype);
+            assert!(got[0].is_nan());
+        }
+        // 65504 is the largest f16; bf16 reaches the range of f32.
+        assert_eq!(floats_through(&[65504.0], CarryDtype::F16).0, [65504.0]);
+        assert!(floats_through(&[3.0e38], CarryDtype::Bf16).0[0].is_finite());
+        let mut w = Writer::new();
+        let e = w
+            .put_floats(&[1.0, 70000.0], CarryDtype::F16)
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("70000") && e.contains("f16"), "{e}");
+    }
+
+    #[test]
+    fn a_carry_tag_names_its_type_and_no_other() {
+        for dtype in [CarryDtype::F32, CarryDtype::Bf16, CarryDtype::F16] {
+            assert_eq!(CarryDtype::from_tag(dtype.tag()).unwrap(), dtype);
+        }
+        assert!(CarryDtype::from_tag(3).is_err());
     }
 }

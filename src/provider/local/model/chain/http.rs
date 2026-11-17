@@ -27,7 +27,7 @@ use bytes::Bytes;
 use super::stream::{Outcome, StreamLink};
 use super::{StageCounters, StageTransport};
 use crate::error::CucaError;
-use crate::provider::local::{RemoteStage, STAGE_COMPUTE_HEADER};
+use crate::provider::local::{CarryDtype, RemoteStage, STAGE_COMPUTE_HEADER};
 
 /// How long a connect may take before the stage counts as unreachable.
 pub(super) const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -77,6 +77,8 @@ pub(crate) struct HttpTransport {
     stream: Option<StreamLink>,
     /// The worker has no stream: every call goes by `POST`.
     post_only: AtomicBool,
+    /// The number type of the carries, as configured.
+    carry: CarryDtype,
 }
 
 impl HttpTransport {
@@ -123,6 +125,7 @@ impl HttpTransport {
             stats: Arc::default(),
             stream,
             post_only: AtomicBool::new(false),
+            carry: stage.carry,
         })
     }
 
@@ -248,6 +251,10 @@ impl StageTransport for HttpTransport {
 
     fn counters(&self) -> Arc<StageCounters> {
         Arc::clone(&self.stats)
+    }
+
+    fn carry(&self) -> CarryDtype {
+        self.carry
     }
 }
 

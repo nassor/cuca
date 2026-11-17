@@ -1430,6 +1430,8 @@ pub(crate) mod testing {
         /// count twice).
         pub(crate) asked: Arc<std::sync::Mutex<(usize, usize, usize)>>,
         stats: Arc<StageCounters>,
+        /// The number type of the carries (`F32` unless a test sets it).
+        pub(crate) carry: super::super::CarryDtype,
     }
 
     impl Loopback {
@@ -1446,6 +1448,7 @@ pub(crate) mod testing {
                 last_forward: Arc::default(),
                 asked: Arc::default(),
                 stats: Arc::default(),
+                carry: super::super::CarryDtype::F32,
             }
         }
     }
@@ -1519,6 +1522,10 @@ pub(crate) mod testing {
 
         fn counters(&self) -> Arc<StageCounters> {
             Arc::clone(&self.stats)
+        }
+
+        fn carry(&self) -> super::super::CarryDtype {
+            self.carry
         }
     }
 
@@ -4340,6 +4347,21 @@ mod tests {
         context: usize,
         bounds: &[usize],
     ) -> (Engine, Links) {
+        chain_over_as(
+            file,
+            context,
+            bounds,
+            crate::provider::local::CarryDtype::F32,
+        )
+    }
+
+    /// [`chain_over`] with every stage's carries in `dtype`.
+    fn chain_over_as(
+        file: &crate::provider::local::model::tiny::TinyModel,
+        context: usize,
+        bounds: &[usize],
+        dtype: crate::provider::local::CarryDtype,
+    ) -> (Engine, Links) {
         use super::testing::{Loopback, chain_engine, stage_worker};
         use crate::provider::local::model::chain::StageTransport;
         let mut first = 0;
@@ -4347,7 +4369,8 @@ mod tests {
         let mut handles = Links::default();
         for &end in bounds {
             let range = LayerRange { first, end };
-            let transport = Loopback::new(stage_worker(file, context, range, 1));
+            let mut transport = Loopback::new(stage_worker(file, context, range, 1));
+            transport.carry = dtype;
             handles.ops.push(Arc::clone(&transport.ops));
             handles.calls.push(Arc::clone(&transport.calls));
             handles.fail_at.push(Arc::clone(&transport.fail_at));
@@ -4637,6 +4660,44 @@ mod tests {
             assert!(s.compute_ns > 0 && s.compute_ns <= s.wall_ns);
         }
         assert!(engine(&llama, 96, 0.0, None).stage_counters().is_empty());
+    }
+
+    /// Carries in `bf16` or `f16` cross the loopback stages in fewer bytes,
+    /// every request completes (the open names the type, the worker answers
+    /// in it), and for a hybrid model the snapshots and restores that ride
+    /// in the frames still work across turns.
+    #[test]
+    fn a_chain_over_reduced_carries_runs_in_fewer_bytes() {
+        use crate::provider::local::CarryDtype;
+        let llama = write_spec(&TinySpec {
+            context: 96,
+            ..TinySpec::llama()
+        });
+        let qwen = hybrid_model();
+        for (what, file, context) in [("llama", &llama, 96), ("qwen35", &qwen, 128)] {
+            let (_, cuts) = cuts_of(file);
+            let mut per_call = Vec::new();
+            for dtype in [CarryDtype::F32, CarryDtype::Bf16, CarryDtype::F16] {
+                let (mut chain, _) = chain_over_as(file, context, &[cuts[0]], dtype);
+                // Two turns of the same prompt: the second hits the prefix
+                // store (a restore from a snapshot on the hybrid model).
+                for _ in 0..2 {
+                    let got = run(&mut chain, &long_prompt(40), Some(6));
+                    assert!(got.items.iter().all(Result::is_ok), "{what} {dtype:?}");
+                    assert!(!text(&got).is_empty(), "{what} {dtype:?}");
+                }
+                let counters = chain.stage_counters();
+                let s = counters[0].1.snapshot(counters[0].0.clone());
+                assert_eq!(s.errors, 0, "{what} {dtype:?}");
+                per_call.push((s.sent_bytes + s.received_bytes) as f64 / s.calls as f64);
+            }
+            // Decode calls are mostly headers, prefill calls mostly floats;
+            // the mean per call falls clearly under the f32 chain's.
+            assert!(
+                per_call[1] < 0.9 * per_call[0] && per_call[2] < 0.9 * per_call[0],
+                "{what}: bytes per call {per_call:?}"
+            );
+        }
     }
 
     /// A model whose first layers run on workers answers what the whole model
@@ -4929,6 +4990,7 @@ mod tests {
             kv_tokens: e.sizing.kv_tokens as u64,
             max_rows: e.sizing.max_rows as u64,
             session: 5,
+            carry: crate::provider::local::CarryDtype::F32,
         }
     }
 
@@ -4963,6 +5025,7 @@ mod tests {
                     prefetch: Vec::new(),
                 }],
                 carry: None,
+                carry_dtype: crate::provider::local::CarryDtype::F32,
             })
             .unwrap()
         };

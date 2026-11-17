@@ -9,8 +9,9 @@
 //! one round trip per stage:
 //!
 //! - open (1): `fingerprint u64`, `first u32`, `end u32`, `context_length
-//!   u64`, `max_sequences u64`, `kv_tokens u64`, `max_rows u64`, `session u64`;
-//!   answered by [`ok_reply`];
+//!   u64`, `max_sequences u64`, `kv_tokens u64`, `max_rows u64`, `session u64`,
+//!   `carry u8` (the [`CarryDtype`] the session's carries travel in: 0 `f32`,
+//!   1 `bf16`, 2 `f16`); answered by [`ok_reply`];
 //! - forward (2): `session u64`, `seq u64`, `drops` (`count u32`, then `u64`
 //!   each: recurrent-state snapshots the worker releases), `exact u8`,
 //!   `count u32` sequences, then per sequence `slot u32`, `start_pos u64`,
@@ -23,11 +24,20 @@
 //!   `snapshot u8` and `id u64` (1: after the pass, keep a copy of the
 //!   slot's recurrent state under that id), `prefetch` as a `u32` slice
 //!   (after the pass, start reading the Engram rows of these next tokens of
-//!   the slot); then `has_carry u8` and, when set, the carry inline (the
-//!   residual stream, the optional per-layer and pre inputs, and the mirrored
-//!   K/V rows); answered by the carry in the same encoding, then `count u32`
-//!   and one `u64` per snapshot taken, in sequence order: the bytes it holds
-//!   ([`forward_reply`]).
+//!   the slot); then `has_carry u8` and, when set, the carry inline (a `dtype
+//!   u8`, then the residual stream, the optional per-layer and pre inputs, and
+//!   the mirrored K/V rows, every float in that type); answered by the carry
+//!   in the same encoding, then `count u32` and one `u64` per snapshot taken,
+//!   in sequence order: the bytes it holds ([`forward_reply`]).
+//!
+//! # The number type of a carry
+//!
+//! A worker answers in the type its session's `open` named, and refuses a
+//! carry written in another. `f32` is bit-exact. `bf16` and `f16` write each
+//! float in two bytes, rounded to nearest even, so a chain's logits differ a
+//! little from the whole model's; `f16` refuses a finite value above 65504
+//! (the encoder fails the call) rather than send infinity. Integers (token
+//! ids, block tables, positions) are never rounded.
 //!
 //! # Repeating a call
 //!
@@ -45,6 +55,7 @@
 //! Every count a decoder reads is checked against the bytes the frame still
 //! holds before anything is allocated for it.
 
+use super::CarryDtype;
 use super::model::Want;
 use super::model::cpu::Hidden;
 use super::model::err as local_err;
@@ -75,6 +86,8 @@ pub(crate) struct Open {
     pub kv_tokens: u64,
     pub max_rows: u64,
     pub session: u64,
+    /// The number type the session's carries travel in, both directions.
+    pub carry: CarryDtype,
 }
 
 /// One sequence of a forward call.
@@ -122,6 +135,8 @@ pub(crate) struct ForwardCall {
     pub seqs: Vec<StageSeq>,
     /// What the previous stage handed over; `None` for the first stage.
     pub carry: Option<Carry>,
+    /// The type `carry` is written in; `F32` when there is none.
+    pub carry_dtype: CarryDtype,
 }
 
 /// A decoded request frame.
@@ -204,45 +219,55 @@ fn hidden_from(byte: u8) -> Result<Hidden, CucaError> {
     }
 }
 
-fn put_opt_f32s(w: &mut Writer, v: Option<&[f32]>) {
+fn put_opt_floats(w: &mut Writer, v: Option<&[f32]>, dtype: CarryDtype) -> Result<(), CucaError> {
     match v {
         Some(v) => {
             w.put_u8(1);
-            w.put_f32s(v);
+            w.put_floats(v, dtype)
         }
-        None => w.put_u8(0),
+        None => {
+            w.put_u8(0);
+            Ok(())
+        }
     }
 }
 
-fn get_opt_f32s(r: &mut Reader<'_>, what: &str) -> Result<Option<Vec<f32>>, CucaError> {
+fn get_opt_floats(
+    r: &mut Reader<'_>,
+    dtype: CarryDtype,
+    what: &str,
+) -> Result<Option<Vec<f32>>, CucaError> {
     match r.get_u8()? {
         0 => Ok(None),
-        1 => Ok(Some(r.get_f32s()?)),
+        1 => Ok(Some(r.get_floats(dtype)?)),
         other => Err(local_err(format!(
             "stage frame {what} flag is {other}, not 0 or 1"
         ))),
     }
 }
 
-fn put_carry(w: &mut Writer, carry: &Carry) {
-    w.put_f32s(&carry.hidden);
-    put_opt_f32s(w, carry.per_layer.as_deref());
-    put_opt_f32s(w, carry.pre.as_deref());
+fn put_carry(w: &mut Writer, carry: &Carry, dtype: CarryDtype) -> Result<(), CucaError> {
+    w.put_u8(dtype.tag());
+    w.put_floats(&carry.hidden, dtype)?;
+    put_opt_floats(w, carry.per_layer.as_deref(), dtype)?;
+    put_opt_floats(w, carry.pre.as_deref(), dtype)?;
     w.put_u32(count32(carry.kv.len()));
     for m in &carry.kv {
         w.put_u32(count32(m.layer));
         w.put_u32(count32(m.seqs.len()));
         for (k, v) in &m.seqs {
-            w.put_f32s(k);
-            w.put_f32s(v);
+            w.put_floats(k, dtype)?;
+            w.put_floats(v, dtype)?;
         }
     }
+    Ok(())
 }
 
-fn get_carry(r: &mut Reader<'_>) -> Result<Carry, CucaError> {
-    let hidden = r.get_f32s()?;
-    let per_layer = get_opt_f32s(r, "per-layer")?;
-    let pre = get_opt_f32s(r, "pre")?;
+fn get_carry(r: &mut Reader<'_>) -> Result<(CarryDtype, Carry), CucaError> {
+    let dtype = CarryDtype::from_tag(r.get_u8()?)?;
+    let hidden = r.get_floats(dtype)?;
+    let per_layer = get_opt_floats(r, dtype, "per-layer")?;
+    let pre = get_opt_floats(r, dtype, "pre")?;
     let layers = r.get_u32()?;
     // A layer is at least its `layer` and `seqs` counts.
     let n_layers = bounded(r, layers, 8, "mirror layers")?;
@@ -254,54 +279,87 @@ fn get_carry(r: &mut Reader<'_>) -> Result<Carry, CucaError> {
         let n_seqs = bounded(r, seqs, 16, "mirror sequences")?;
         let mut rows = Vec::with_capacity(n_seqs);
         for _ in 0..n_seqs {
-            let k = r.get_f32s()?;
-            let v = r.get_f32s()?;
+            let k = r.get_floats(dtype)?;
+            let v = r.get_floats(dtype)?;
             rows.push((k, v));
         }
         kv.push(MirrorRows { layer, seqs: rows });
     }
-    Ok(Carry {
-        hidden,
-        per_layer,
-        pre,
-        kv,
-    })
+    Ok((
+        dtype,
+        Carry {
+            hidden,
+            per_layer,
+            pre,
+            kv,
+        },
+    ))
 }
 
-/// The standalone encoding of a carry: what a forward frame carries inline,
-/// and the first part of its answer.
+/// The standalone encoding of a carry in `dtype`: what a forward frame
+/// carries inline, and the first part of its answer.
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] for a value `F16` cannot hold.
+#[cfg(test)]
+pub(crate) fn carry_bytes_as(carry: &Carry, dtype: CarryDtype) -> Result<Vec<u8>, CucaError> {
+    let mut w = Writer::new();
+    put_carry(&mut w, carry, dtype)?;
+    Ok(w.into_bytes())
+}
+
+/// [`carry_bytes_as`] in `F32`.
 #[cfg(test)]
 pub(crate) fn carry_bytes(carry: &Carry) -> Vec<u8> {
-    let mut w = Writer::new();
-    put_carry(&mut w, carry);
-    w.into_bytes()
+    carry_bytes_as(carry, CarryDtype::F32).unwrap_or_default()
 }
 
-/// The carry of a standalone carry encoding.
+/// The carry of a standalone carry encoding, whatever type it is written
+/// in, and that type.
 ///
 /// # Errors
 ///
 /// [`CucaError::Provider`] for a truncated or malformed body, or one with
 /// bytes left over.
 #[cfg(test)]
-pub(crate) fn decode_carry(bytes: &[u8]) -> Result<Carry, CucaError> {
+pub(crate) fn decode_carry_as(bytes: &[u8]) -> Result<(CarryDtype, Carry), CucaError> {
     let mut r = Reader::new(bytes);
-    let carry = get_carry(&mut r)?;
+    let got = get_carry(&mut r)?;
     finish(&r)?;
-    Ok(carry)
+    Ok(got)
+}
+
+/// The carry of a standalone carry encoding.
+///
+/// # Errors
+///
+/// As [`decode_carry_as`].
+#[cfg(test)]
+pub(crate) fn decode_carry(bytes: &[u8]) -> Result<Carry, CucaError> {
+    decode_carry_as(bytes).map(|(_, carry)| carry)
 }
 
 /// The answer of a forward call: the carry for the stage after, and the
 /// bytes of each snapshot the call took (one per sequence that asked for
 /// one, in sequence order).
-pub(crate) fn forward_reply(carry: &Carry, snapshot_bytes: &[u64]) -> Vec<u8> {
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] for a value `dtype` cannot hold (an `F16` carry
+/// with a finite value above 65504).
+pub(crate) fn forward_reply(
+    carry: &Carry,
+    snapshot_bytes: &[u64],
+    dtype: CarryDtype,
+) -> Result<Vec<u8>, CucaError> {
     let mut w = Writer::new();
-    put_carry(&mut w, carry);
+    put_carry(&mut w, carry, dtype)?;
     w.put_u32(count32(snapshot_bytes.len()));
     for b in snapshot_bytes {
         w.put_u64(*b);
     }
-    w.into_bytes()
+    Ok(w.into_bytes())
 }
 
 /// The carry and the snapshot sizes of a forward answer.
@@ -310,9 +368,19 @@ pub(crate) fn forward_reply(carry: &Carry, snapshot_bytes: &[u64]) -> Vec<u8> {
 ///
 /// [`CucaError::Provider`] for a truncated or malformed body, or one with
 /// bytes left over.
-pub(crate) fn decode_forward_reply(bytes: &[u8]) -> Result<(Carry, Vec<u64>), CucaError> {
+pub(crate) fn decode_forward_reply(
+    bytes: &[u8],
+    expect: CarryDtype,
+) -> Result<(Carry, Vec<u64>), CucaError> {
     let mut r = Reader::new(bytes);
-    let carry = get_carry(&mut r)?;
+    let (dtype, carry) = get_carry(&mut r)?;
+    if dtype != expect {
+        return Err(local_err(format!(
+            "the stage answered in {}, the session carries {}",
+            dtype.name(),
+            expect.name()
+        )));
+    }
     let count = r.get_u32()?;
     let n = bounded(&r, count, 8, "snapshot sizes")?;
     let sizes = (0..n).map(|_| r.get_u64()).collect::<Result<Vec<_>, _>>()?;
@@ -337,7 +405,7 @@ fn finish(r: &Reader<'_>) -> Result<(), CucaError> {
 }
 
 pub(crate) fn open_frame(open: &Open) -> Vec<u8> {
-    let mut w = Writer::with_capacity(1 + 8 + 4 + 4 + 8 * 5);
+    let mut w = Writer::with_capacity(1 + 8 + 4 + 4 + 8 * 5 + 1);
     w.put_u8(OP_OPEN);
     w.put_u64(open.fingerprint);
     w.put_u32(open.first);
@@ -347,6 +415,7 @@ pub(crate) fn open_frame(open: &Open) -> Vec<u8> {
     w.put_u64(open.kv_tokens);
     w.put_u64(open.max_rows);
     w.put_u64(open.session);
+    w.put_u8(open.carry.tag());
     w.into_bytes()
 }
 
@@ -392,7 +461,7 @@ pub(crate) fn forward_frame(call: &ForwardCall) -> Result<Vec<u8>, CucaError> {
     match &call.carry {
         Some(carry) => {
             w.put_u8(1);
-            put_carry(&mut w, carry);
+            put_carry(&mut w, carry, call.carry_dtype)?;
         }
         None => w.put_u8(0),
     }
@@ -409,6 +478,7 @@ fn decode_open(r: &mut Reader<'_>) -> Result<Open, CucaError> {
         kv_tokens: r.get_u64()?,
         max_rows: r.get_u64()?,
         session: r.get_u64()?,
+        carry: CarryDtype::from_tag(r.get_u8()?)?,
     })
 }
 
@@ -500,9 +570,12 @@ fn decode_forward(r: &mut Reader<'_>) -> Result<ForwardCall, CucaError> {
     for _ in 0..n_seqs {
         seqs.push(decode_seq(r)?);
     }
-    let carry = match r.get_u8()? {
-        0 => None,
-        1 => Some(get_carry(r)?),
+    let (carry, carry_dtype) = match r.get_u8()? {
+        0 => (None, CarryDtype::F32),
+        1 => {
+            let (dtype, carry) = get_carry(r)?;
+            (Some(carry), dtype)
+        }
         other => {
             return Err(local_err(format!(
                 "stage frame carry flag is {other}, not 0 or 1"
@@ -516,6 +589,7 @@ fn decode_forward(r: &mut Reader<'_>) -> Result<ForwardCall, CucaError> {
         exact,
         seqs,
         carry,
+        carry_dtype,
     })
 }
 
@@ -551,6 +625,7 @@ mod tests {
             kv_tokens: 16384,
             max_rows: 512,
             session: 77,
+            carry: CarryDtype::Bf16,
         }
     }
 
@@ -619,6 +694,7 @@ mod tests {
                 seq(2, Want::All, Hidden::PostNormAll),
             ],
             carry,
+            carry_dtype: CarryDtype::F32,
         }
     }
 
@@ -695,18 +771,111 @@ mod tests {
     fn a_forward_answer_roundtrips_its_carry_and_snapshot_sizes() {
         let c = carry(true, false);
         for sizes in [vec![], vec![5u64], vec![u64::MAX, 0, 7]] {
-            let (got, back) = decode_forward_reply(&forward_reply(&c, &sizes)).unwrap();
+            let reply = forward_reply(&c, &sizes, CarryDtype::F32).unwrap();
+            let (got, back) = decode_forward_reply(&reply, CarryDtype::F32).unwrap();
             assert_carry_eq(&got, &c);
             assert_eq!(back, sizes);
         }
         assert!(ok_reply().is_empty());
         // A carry alone, a truncated size list and trailing bytes are refused.
-        assert!(decode_forward_reply(&carry_bytes(&c)).is_err());
-        let reply = forward_reply(&c, &[1, 2]);
-        assert!(decode_forward_reply(&reply[..reply.len() - 1]).is_err());
+        assert!(decode_forward_reply(&carry_bytes(&c), CarryDtype::F32).is_err());
+        let reply = forward_reply(&c, &[1, 2], CarryDtype::F32).unwrap();
+        assert!(decode_forward_reply(&reply[..reply.len() - 1], CarryDtype::F32).is_err());
         let mut long = reply;
         long.push(0);
-        assert!(decode_forward_reply(&long).is_err());
+        assert!(decode_forward_reply(&long, CarryDtype::F32).is_err());
+    }
+
+    /// A carry in `bf16` or `f16` is a little over half the bytes, comes
+    /// back within the rounding of the type for every part of it (hidden,
+    /// per-layer, pre and the mirrored rows), names its type, and a reply
+    /// in another type than the session's is refused.
+    #[test]
+    fn a_reduced_carry_is_half_the_bytes_and_within_rounding() {
+        let c = carry(true, true);
+        let exact = carry_bytes(&c);
+        for (dtype, bits) in [(CarryDtype::Bf16, 8), (CarryDtype::F16, 11)] {
+            let bytes = carry_bytes_as(&c, dtype).unwrap();
+            let floats = |c: &Carry| -> usize {
+                c.hidden.len()
+                    + c.per_layer.as_ref().map_or(0, Vec::len)
+                    + c.pre.as_ref().map_or(0, Vec::len)
+                    + c.kv
+                        .iter()
+                        .flat_map(|m| &m.seqs)
+                        .map(|(k, v)| k.len() + v.len())
+                        .sum::<usize>()
+            };
+            assert_eq!(
+                exact.len() - bytes.len(),
+                2 * floats(&c),
+                "{dtype:?}: two bytes saved per float"
+            );
+            let (got_dtype, got) = decode_carry_as(&bytes).unwrap();
+            assert_eq!(got_dtype, dtype);
+            let near = |a: &[f32], b: &[f32]| {
+                assert_eq!(a.len(), b.len());
+                for (x, y) in a.iter().zip(b) {
+                    assert!(
+                        (x - y).abs() <= y.abs() * 2f32.powi(-bits) + 3.0e-8,
+                        "{x} {y}"
+                    );
+                }
+            };
+            near(&got.hidden, &c.hidden);
+            near(
+                got.per_layer.as_ref().unwrap(),
+                c.per_layer.as_ref().unwrap(),
+            );
+            near(got.pre.as_ref().unwrap(), c.pre.as_ref().unwrap());
+            assert_eq!(got.kv.len(), c.kv.len());
+            for (g, w) in got.kv.iter().zip(&c.kv) {
+                assert_eq!(g.layer, w.layer);
+                for ((gk, gv), (wk, wv)) in g.seqs.iter().zip(&w.seqs) {
+                    near(gk, wk);
+                    near(gv, wv);
+                }
+            }
+            let reply = forward_reply(&c, &[3], dtype).unwrap();
+            let (_, sizes) = decode_forward_reply(&reply, dtype).unwrap();
+            assert_eq!(sizes, [3]);
+            let e = decode_forward_reply(&reply, CarryDtype::F32).err().unwrap();
+            assert!(e.to_string().contains(dtype.name()), "{e}");
+        }
+    }
+
+    /// `open` carries the session's type, and a forward frame's carry names
+    /// the type it is written in; a value `f16` cannot hold fails the
+    /// encoder.
+    #[test]
+    fn the_carry_type_rides_in_open_and_in_forward_frames() {
+        for dtype in [CarryDtype::F32, CarryDtype::Bf16, CarryDtype::F16] {
+            let frame = open_frame(&Open {
+                carry: dtype,
+                ..open()
+            });
+            match decode(&frame).unwrap() {
+                Call::Open(got) => assert_eq!(got.carry, dtype),
+                Call::Forward(_) => panic!("not an open frame"),
+            }
+            let call = ForwardCall {
+                carry_dtype: dtype,
+                ..forward(Some(carry(true, true)))
+            };
+            let got = decoded_forward(&forward_frame(&call).unwrap());
+            assert_eq!(got.carry_dtype, dtype);
+            assert!(got.carry.is_some());
+        }
+        let mut big = carry(false, false);
+        big.hidden[0] = 1.0e6;
+        let call = ForwardCall {
+            carry_dtype: CarryDtype::F16,
+            ..forward(Some(big))
+        };
+        assert!(forward_frame(&call).is_err());
+        let mut bad = open_frame(&open());
+        *bad.last_mut().unwrap() = 9;
+        assert!(decode(&bad).is_err(), "an unknown carry tag");
     }
 
     #[test]
@@ -809,28 +978,43 @@ mod tests {
 
         // Snapshot sizes of an answer likewise.
         let mut w = Writer::new();
+        w.put_u8(0);
         w.put_f32s(&[]);
         w.put_u8(0);
         w.put_u8(0);
         w.put_u32(0);
         w.put_u32(u32::MAX);
-        assert!(decode_forward_reply(&w.into_bytes()).is_err());
+        let e = decode_forward_reply(&w.into_bytes(), CarryDtype::F32)
+            .err()
+            .unwrap();
+        assert!(e.to_string().contains("snapshot sizes"), "{e}");
 
         let mut w = Writer::new();
+        w.put_u8(0);
         w.put_f32s(&[]);
         w.put_u8(0);
         w.put_u8(0);
         w.put_u32(u32::MAX);
-        assert!(decode_carry(&w.into_bytes()).is_err());
+        let e = decode_carry(&w.into_bytes()).err().unwrap();
+        assert!(e.to_string().contains("mirror layers"), "{e}");
 
         let mut w = Writer::new();
+        w.put_u8(0);
         w.put_f32s(&[]);
         w.put_u8(0);
         w.put_u8(0);
         w.put_u32(1);
         w.put_u32(0);
         w.put_u32(u32::MAX);
-        assert!(decode_carry(&w.into_bytes()).is_err());
+        let e = decode_carry(&w.into_bytes()).err().unwrap();
+        assert!(e.to_string().contains("mirror sequences"), "{e}");
+
+        // A two-byte float slice claiming more than the frame holds.
+        let mut w = Writer::new();
+        w.put_u8(CarryDtype::Bf16.tag());
+        w.put_u64(1 << 40);
+        let e = decode_carry(&w.into_bytes()).err().unwrap();
+        assert!(e.to_string().contains("truncated frame"), "{e}");
 
         // A forward frame whose one sequence claims u32::MAX block tables,
         // with just enough bytes after the count to pass the sequence bound.

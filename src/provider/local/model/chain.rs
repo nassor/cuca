@@ -46,6 +46,7 @@ use super::split::{Carry, LayerRange, StageOut};
 use super::transfer::{DeltaRows, PoolRows};
 use super::{Batch, Model, RecurrentSnapshot, StateSlot, StepHint, err};
 use crate::error::CucaError;
+use crate::provider::local::CarryDtype;
 use crate::provider::local::stageframe::{
     ANOTHER_SESSION, ForwardCall, Open, Restore, StageSeq, decode_forward_reply, forward_frame,
     open_frame,
@@ -82,6 +83,10 @@ pub(crate) trait StageTransport: Send {
     /// The counters of this stage's calls: the transport records every call
     /// it makes (wall time, the compute time the worker reports, bytes).
     fn counters(&self) -> Arc<StageCounters>;
+
+    /// The number type the hidden states travel in, to and from this stage
+    /// (the session's `open` names it to the worker).
+    fn carry(&self) -> CarryDtype;
 }
 
 /// What the stages must agree on with the coordinator, as the first call of
@@ -112,6 +117,8 @@ struct Remote {
     /// [`stageframe`](crate::provider::local::stageframe): a call sent twice
     /// runs once).
     calls: AtomicU64,
+    /// The number type of the carries to and from this stage.
+    carry: CarryDtype,
 }
 
 impl Remote {
@@ -242,6 +249,7 @@ impl ChainModel {
                 .into_iter()
                 .map(|(range, transport, engram)| Remote {
                     range,
+                    carry: transport.carry(),
                     transport,
                     sent: vec![Vec::new(); max_sequences],
                     engram,
@@ -281,6 +289,7 @@ impl ChainModel {
                 kv_tokens: a.kv_tokens as u64,
                 max_rows: a.max_rows as u64,
                 session: self.session,
+                carry: remote.carry,
             });
             remote.transport.call(frame)?;
             remote.sent.iter_mut().for_each(Vec::clear);
@@ -471,9 +480,10 @@ impl ChainModel {
                 exact: batch.exact,
                 seqs,
                 carry: carry.take(),
+                carry_dtype: remote.carry,
             })?;
             let reply = Self::session_call(remote, frame)?;
-            let (next, sizes) = decode_forward_reply(&reply)?;
+            let (next, sizes) = decode_forward_reply(&reply, remote.carry)?;
             let asked = snapshot_ids.iter().flatten().count();
             if sizes.len() != asked {
                 return Err(err(format!(

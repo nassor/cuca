@@ -1557,6 +1557,30 @@ impl Default for KvExportConfig {
     }
 }
 
+/// The number type a layer stage's hidden states travel in, the `carry` of a
+/// `remote_stage`: the residual stream, the per-layer and pre inputs and the
+/// mirrored K/V rows that cross the network between stages, in both
+/// directions.
+///
+/// `F32` is bit-exact: a chain answers what the whole model does. `Bf16` and
+/// `F16` halve the bytes of every call and round every value that crosses
+/// to 8 or 11 significant bits, so a chain's logits differ a little from the
+/// whole model's (and from an `F32` chain's), and a greedy reply can differ
+/// where two logits are close. `F16` has a smaller range than `F32` and
+/// `Bf16` (largest finite value 65504): a value beyond it fails the call
+/// instead of travelling as infinity.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CarryDtype {
+    /// 32-bit floats, as the engine computes: bit-exact.
+    #[default]
+    F32,
+    /// bfloat16: the range of `f32`, 8 significant bits.
+    Bf16,
+    /// IEEE half precision: 11 significant bits, largest value 65504.
+    F16,
+}
+
 /// One layer stage held by another machine, a `remote_stage` node of the
 /// coordinator: `remote_stage url="http://box-a:8000" layers=14`. The stages
 /// of a model are written in layer order from layer 0. `Debug` redacts
@@ -1576,6 +1600,9 @@ pub struct RemoteStage {
     /// How long one call may take, 1 s to 1 h (default `"600s"`).
     #[serde(deserialize_with = "crate::config::duration")]
     pub timeout: Duration,
+    /// The number type of the hidden states sent to and received from this
+    /// worker (default `"f32"`, bit-exact; `"bf16"` and `"f16"` are not).
+    pub carry: CarryDtype,
 }
 
 impl Default for RemoteStage {
@@ -1586,6 +1613,7 @@ impl Default for RemoteStage {
             model: None,
             api_key: None,
             timeout: Duration::from_secs(600),
+            carry: CarryDtype::F32,
         }
     }
 }
@@ -1598,6 +1626,7 @@ impl fmt::Debug for RemoteStage {
             .field("model", &self.model)
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("timeout", &self.timeout)
+            .field("carry", &self.carry)
             .finish()
     }
 }
@@ -4386,6 +4415,7 @@ source {
             kv_tokens: sizing.kv_tokens as u64,
             max_rows: sizing.max_rows as u64,
             session: 7,
+            carry: CarryDtype::F32,
         };
         assert!(
             worker
@@ -4597,9 +4627,11 @@ mod distributed_config_tests {
         let c = parse(
             "source \"qwen3-0.6b-q8_0\"\n\
              remote_stage url=\"http://box-a:8000\" layers=14\n\
-             remote_stage url=\"https://box-b:8000\" layers=7 model=\"m\" api_key=\"k\" timeout=\"30s\"\n",
+             remote_stage url=\"https://box-b:8000\" layers=7 model=\"m\" api_key=\"k\" timeout=\"30s\" carry=\"bf16\"\n\
+             remote_stage url=\"http://box-c:8000\" layers=2 carry=\"f16\"\n\
+             remote_stage url=\"http://box-d:8000\" layers=2 carry=\"f32\"\n",
         );
-        assert_eq!(c.remote_stages.len(), 2);
+        assert_eq!(c.remote_stages.len(), 4);
         assert_eq!(c.remote_stages[0].url, "http://box-a:8000");
         assert_eq!(c.remote_stages[0].layers, 14);
         assert_eq!(c.remote_stages[0].timeout, Duration::from_secs(600));
@@ -4608,6 +4640,34 @@ mod distributed_config_tests {
         assert_eq!(c.remote_stages[1].model.as_deref(), Some("m"));
         assert_eq!(c.remote_stages[1].api_key.as_deref(), Some("k"));
         assert_eq!(c.remote_stages[1].timeout, Duration::from_secs(30));
+        // The default is the bit-exact type, and each stage has its own.
+        let carries: Vec<_> = c.remote_stages.iter().map(|s| s.carry).collect();
+        assert_eq!(
+            carries,
+            [
+                CarryDtype::F32,
+                CarryDtype::Bf16,
+                CarryDtype::F16,
+                CarryDtype::F32
+            ]
+        );
+        assert_eq!(RemoteStage::default().carry, CarryDtype::F32);
+        for bad in ["f64", "BF16", "int8", ""] {
+            let text = format!(
+                "source \"qwen3-0.6b-q8_0\"\nremote_stage url=\"http://a:1\" layers=3 carry=\"{bad}\"\n"
+            );
+            let e = crate::config::load_kdl_str::<LocalModelConfig>(&text).unwrap_err();
+            assert!(
+                e.to_string().contains("carry") || e.to_string().contains("variant"),
+                "{bad}: {e}"
+            );
+        }
+        // The key belongs to `remote_stage` alone; the stage keys stay strict.
+        let e = crate::config::load_kdl_str::<LocalModelConfig>(
+            "source \"qwen3-0.6b-q8_0\"\nstage first=0 layers=3 carry=\"bf16\"\n",
+        )
+        .unwrap_err();
+        assert!(e.to_string().contains("carry"), "{e}");
         validate_stages(&c).unwrap();
 
         let one = parse("source \"qwen3-0.6b-q8_0\"\nremote_stage url=\"http://a:1\" layers=3\n");

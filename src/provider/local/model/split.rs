@@ -786,6 +786,7 @@ mod tests {
     use super::super::{Batch, SeqRows, Want};
     use super::*;
     use crate::provider::local::gguf;
+    use crate::provider::local::{CarryDtype, stageframe};
 
     fn hparams(model: &super::super::tiny::TinyModel) -> Hparams {
         let content = gguf::Content::open(&model.path).unwrap();
@@ -1061,6 +1062,12 @@ mod tests {
     /// chained stages, each handing its carry on. Returns the logits and the
     /// hidden rows of every sequence of every step.
     fn drive_stages(models: &mut [Transformer], exact: bool) -> Vec<Rows> {
+        drive_stages_as(models, exact, CarryDtype::F32)
+    }
+
+    /// [`drive_stages`] with every carry written to the wire in `dtype` and
+    /// read back, as a worker and its coordinator do.
+    fn drive_stages_as(models: &mut [Transformer], exact: bool, dtype: CarryDtype) -> Vec<Rows> {
         use super::super::StateSlot;
         use super::super::paged::KvPools;
         let layout = models[0].kv_layout().clone();
@@ -1105,7 +1112,10 @@ mod tests {
                 let mut done = None;
                 for stage in models.iter_mut() {
                     match stage.forward_stage(&batch, carry.take()).unwrap() {
-                        StageOut::Carry(c) => carry = Some(c),
+                        StageOut::Carry(c) => {
+                            let bytes = stageframe::carry_bytes_as(&c, dtype).unwrap();
+                            carry = Some(stageframe::decode_carry_as(&bytes).unwrap().1);
+                        }
                         StageOut::Done(f) => done = Some(f),
                     }
                 }
@@ -1124,6 +1134,21 @@ mod tests {
     /// legal two-way cut and every legal three-way cut, in exact and in
     /// batch-shaped arithmetic.
     fn check_stages(model: &super::super::tiny::TinyModel, context: usize, what: &str) {
+        check_stages_as(model, context, what, CarryDtype::F32, 0.0);
+    }
+
+    /// [`check_stages`] with the carries written in `dtype`: for `F32` the
+    /// stages equal the whole model bit for bit; for another type the
+    /// logits stay within `tol` of the largest logit (relative) and differ
+    /// from the whole model's somewhere, as the rounding must show. Returns
+    /// the worst relative difference seen.
+    fn check_stages_as(
+        model: &super::super::tiny::TinyModel,
+        context: usize,
+        what: &str,
+        dtype: CarryDtype,
+        tol: f32,
+    ) -> f32 {
         use super::super::paged::Sizing;
         use crate::provider::local::{EngramCache, ExpertPlacement};
         let content = gguf::Content::open(&model.path).unwrap();
@@ -1168,6 +1193,7 @@ mod tests {
         for (i, &a) in cuts.iter().enumerate() {
             plans.extend(cuts[i + 1..].iter().map(|&b| vec![0, a, b, n]));
         }
+        let mut worst = 0f32;
         for exact in [true, false] {
             let want = drive_stages(&mut [whole()], exact);
             assert!(
@@ -1184,9 +1210,96 @@ mod tests {
                         })
                     })
                     .collect();
-                let have = drive_stages(&mut stages, exact);
-                assert!(have == want, "{what}: stages {plan:?} (exact {exact})");
+                let have = drive_stages_as(&mut stages, exact, dtype);
+                if dtype == CarryDtype::F32 {
+                    assert!(have == want, "{what}: stages {plan:?} (exact {exact})");
+                    continue;
+                }
+                let (mut diff, mut scale) = (0f32, 0f32);
+                for ((h, _), (w, _)) in have.iter().flatten().zip(want.iter().flatten()) {
+                    let (Some(h), Some(w)) = (h, w) else {
+                        assert_eq!(
+                            h.is_some(),
+                            w.is_some(),
+                            "{what}: the same rows have logits"
+                        );
+                        continue;
+                    };
+                    assert_eq!(h.len(), w.len());
+                    for (a, b) in h.iter().zip(w) {
+                        diff = diff.max((a - b).abs());
+                        scale = scale.max(b.abs());
+                    }
+                }
+                worst = worst.max(diff / scale);
+                assert!(
+                    diff <= scale * tol,
+                    "{what}: stages {plan:?} (exact {exact}) in {dtype:?}: |dlogit| {diff} of {scale}"
+                );
             }
+        }
+        worst
+    }
+
+    /// Stages whose carries travel in `bf16` or `f16` stay near the whole
+    /// model: the logits differ (the rounding is real) by a fraction of the
+    /// largest logit well under the scale of the logits themselves, on every
+    /// architecture the stage tests cover, including the per-layer inputs,
+    /// shared K/V rows and hyper-connection streams a carry holds.
+    ///
+    /// The bound is loose on purpose. The engine quantizes activations to
+    /// 8 bits for its matmuls, so any change of the carry, down to one bit
+    /// of one value, re-rolls the rounding of later layers and moves the
+    /// logits by about the same amount whatever the carry type (the
+    /// tiny random models, with their sharp logits, see up to a quarter of
+    /// the largest logit). What the bound catches is a carry that is wrong,
+    /// not one that is imprecise.
+    #[test]
+    fn reduced_carries_stay_near_the_whole_model() {
+        use super::super::tiny::{
+            CONTEXT, TinyDeepseek41, TinyGemma4Moe, TinyQwen35, write_deepseek41, write_gemma4_moe,
+            write_qwen35,
+        };
+        for (dtype, tol) in [(CarryDtype::Bf16, 0.5), (CarryDtype::F16, 0.5)] {
+            let mut worst = 0f32;
+            for spec in TinySpec::all() {
+                worst = worst.max(check_stages_as(
+                    &write_spec(&spec),
+                    CONTEXT,
+                    spec.arch,
+                    dtype,
+                    tol,
+                ));
+            }
+            worst = worst.max(check_stages_as(
+                &write_tiny_model_with(TinyOptions::default()),
+                CONTEXT,
+                "gemma4",
+                dtype,
+                tol,
+            ));
+            worst = worst.max(check_stages_as(
+                &write_gemma4_moe(&TinyGemma4Moe::default()),
+                CONTEXT,
+                "gemma4 moe",
+                dtype,
+                tol,
+            ));
+            worst = worst.max(check_stages_as(
+                &write_qwen35(&TinyQwen35::default()),
+                CONTEXT,
+                "qwen35",
+                dtype,
+                tol,
+            ));
+            worst = worst.max(check_stages_as(
+                &write_deepseek41(&TinyDeepseek41::default()),
+                32,
+                "deepseek41",
+                dtype,
+                tol,
+            ));
+            assert!(worst > 0.0, "{dtype:?}: rounding left no trace");
         }
     }
 

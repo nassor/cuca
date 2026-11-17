@@ -160,8 +160,8 @@ pub use crate::plugins::web_search::{
 };
 #[cfg(feature = "provider-local")]
 pub use crate::provider::local::{
-    BatchingConfig, ConvertConfig, DownloadProgress, DownloadProgressCallback, DraftStats,
-    DrafterSource, EngramCache, EngramQuant, EngramStats, ExpertHeat, ExpertPlacement,
+    BatchingConfig, CarryDtype, ConvertConfig, DownloadProgress, DownloadProgressCallback,
+    DraftStats, DrafterSource, EngramCache, EngramQuant, EngramStats, ExpertHeat, ExpertPlacement,
     ExpertTierStats, ExpertTiers, GenerationReport, GpuAdapter, KvExport, KvExportConfig, KvImport,
     LocalCapabilities, LocalDevice, LocalGeneration, LocalModel, LocalModelConfig,
     MAX_STAGE_FRAME_BYTES, MAX_STAGE_STREAMS, ModelPart, ModelPreset, ModelSource, ModelTemplate,

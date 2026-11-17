@@ -209,7 +209,7 @@ The limits are the fields of `Thresholds` in `cuca::server::diagnosis` and `cuca
 Label values:
 
 - `model` has at most 16 values.
-- `code` is one of 200, 400, 401, 404, 413, 499, 500, 502 and 503. Other codes count in their class.
+- `code` is one of 101 (a connection upgraded to a layer-stage frame stream), 200, 400, 401, 404, 413, 499, 500, 502 and 503. Other codes count in their class.
 - `gpu` and `name` come from the sampler.
 
 ### Model server metrics
