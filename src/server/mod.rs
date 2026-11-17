@@ -218,7 +218,29 @@ async fn serve_until(
         tracing::warn!("open connections did not finish in time; closing them");
         server.abort();
     }
+    stop_models(&registry).await;
     result
+}
+
+/// Stop the engine of every model that is ready, in parallel, and wait for it:
+/// a model on a GPU gives its device memory back as its engine drops, and a
+/// process that exits while that is in flight aborts (ROCm). Handles that
+/// outlive the HTTP server (a connection task still streaming a reply, a
+/// layer-stage stream's thread) would otherwise keep the engine running, or
+/// drop the last clone before its readers are gone, until the process exits.
+async fn stop_models(registry: &ModelRegistry) {
+    let mut stops = tokio::task::JoinSet::new();
+    for slot in registry.slots() {
+        if let registry::SlotStatus::Ready(loaded) = slot.status() {
+            let name = slot.name.clone();
+            stops.spawn(async move {
+                if !loaded.model.shutdown().await {
+                    tracing::warn!(model = %name, "the model's engine did not stop in time");
+                }
+            });
+        }
+    }
+    while stops.join_next().await.is_some() {}
 }
 
 /// Make `balance` route to the `serve` section of the same process: its

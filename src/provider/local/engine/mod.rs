@@ -211,6 +211,8 @@ pub(crate) struct Engine {
     /// The state of a layer-stage worker ([`LocalModelConfig::stage`]);
     /// `None` for every other engine.
     stage: Option<stage::StageHost>,
+    /// Set by [`Engine::stop`]: the loop ends the requests and returns.
+    stopping: bool,
     /// The GPU adapters the model runs on ([`LocalModel::gpus`]); empty for
     /// an engine on the CPU and for one not built by [`Engine::open`].
     gpus: Vec<GpuInfo>,
@@ -842,6 +844,7 @@ impl Engine {
             next_transfer: 0,
             sizing: Sizing::single(context_length),
             stage: None,
+            stopping: false,
             gpus: Vec::new(),
             stats,
             serving,
@@ -1840,7 +1843,7 @@ pub(crate) mod testing {
         context_length: usize,
         build: impl FnOnce(&Path) -> Engine + Send + 'static,
     ) -> super::super::LocalModel {
-        super::super::LocalModel::start(Arc::default(), move || {
+        super::super::LocalModel::start(Arc::default(), move |_| {
             let tokenizer = Arc::new(tiny_tokenizer());
             let template = ChatTemplate::new(
                 TINY_TEMPLATE.to_string(),

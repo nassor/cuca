@@ -223,6 +223,12 @@ impl TestConfig {
         config
     }
 
+    /// `local { model { ... } }` as written (`None` when absent), for a suite
+    /// that writes the model into another configuration file.
+    pub fn local_model_raw(&self) -> Option<&ConfigValue> {
+        self.local.model.as_ref()
+    }
+
     /// Whether `local { model { ... } }` writes `key`.
     pub fn local_has(&self, key: &str) -> bool {
         self.local

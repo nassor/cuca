@@ -170,6 +170,19 @@
   `max_sequences` and the step size of a worker must be no smaller than the coordinator's (its
   block tables and slots index them), and a worker that holds less names the key
   (`batching.kv_tokens is N here and M at the caller`). `context_length` stays an exact match.
+- `provider-local-rocm`: `cuca run` (and any program that returns from `main` right after dropping
+  a model) aborted at exit with `pure virtual method called` (status 134, sometimes 139 with a
+  segmentation fault). The engine thread gave the device memory back through the CubeCL device
+  thread (`hipFree`) while the process ran HIP's exit handlers. Dropping the last clone of a
+  `LocalModel` now waits (at most 10 s) until the engine thread has dropped its engine, so the
+  device is released before the caller goes on. A load cancelled by a shutdown signal is covered
+  too: the load thread stops before it opens the device, and when it has begun to open it the
+  cancelled load waits (at most 30 s) for it to drop what it built. A clone dropped on the engine
+  thread itself does not wait. `cuca run` also stops every model's engine explicitly when the HTTP
+  server has stopped (a reply still streaming at the signal ends with an error), because open
+  connections and layer-stage streams can hold clones past that point. Cost: a drop of the last
+  clone of a model whose reply is still unread on the dropping thread can take up to the 10 s
+  bound. Vulkan and the CPU were not affected; the fix is not tied to a backend.
 
 ## 0.9.1 - 2026-11-15
 

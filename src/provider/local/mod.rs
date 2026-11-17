@@ -239,6 +239,7 @@ pub(crate) mod engine;
 mod gguf;
 mod kv;
 pub(crate) mod kvframe;
+mod lifecycle;
 mod model;
 mod output;
 mod sampler;
@@ -265,6 +266,7 @@ use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
 
 use self::chat::{ChatFormat, ChatTemplate, chat_prompt};
+use self::lifecycle::{ENGINE_STOP_WAIT, EngineLife, EngineStop, LoadGuard, SignalOnDrop};
 pub use self::model::chain::StageStats;
 pub use self::model::engram_io::EngramStats;
 pub use self::model::tier::{ExpertHeat, ExpertTierStats};
@@ -2000,6 +2002,11 @@ struct LocalModelInner {
     /// Frame streams the worker serves now, see
     /// [`LocalModel::reserve_stage_stream`].
     stage_streams: Arc<std::sync::atomic::AtomicUsize>,
+    /// Waits for the engine thread when the last clone drops. Keep it the last
+    /// field: fields drop in declaration order, so `jobs` (declared first) has
+    /// closed the queue by the time this waits; moved up, every drop would
+    /// wait its full bound.
+    _stop: EngineStop,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -2008,7 +2015,10 @@ struct LocalModelInner {
 /// `CucaClientBuilder::with_local_model`, and select
 /// `ProviderEndpoint::Local`. The model runs in this process, on the CPU or
 /// on the GPU [`LocalModelConfig::device`] selects: no HTTP endpoint is
-/// involved. The engine thread ends once the last clone is dropped.
+/// involved. The engine thread ends once the last clone is dropped, and
+/// dropping the last clone waits for it (at most ten seconds) so that a GPU
+/// device is released before the caller goes on, for example before the
+/// process exits; a clone dropped on the engine thread itself does not wait.
 ///
 /// # Concurrency and memory
 ///
@@ -2401,7 +2411,8 @@ impl LocalModel {
         validate(&config)?;
         let stats = Arc::new(engine::DraftCounters::default());
         let shared = Arc::clone(&stats);
-        Self::start(stats, move || {
+        let uses_device = config.device != LocalDevice::Cpu || !config.shards.is_empty();
+        Self::start(stats, move |life| {
             let path = resolve_model_path(&config, &config.source)?;
             let drafter = match &config.drafter {
                 None => None,
@@ -2411,6 +2422,14 @@ impl LocalModel {
                 Some(DrafterSource::InTrunk) => Some(engine::ResolvedDrafter::InTrunk),
             };
             let chat_template = resolve_chat_template(&config)?;
+            // A caller that went away during the download or the conversion
+            // (a shutdown) is not worth a device: stop before it is touched.
+            if !life.proceed(uses_device) {
+                return Err(CucaError::provider(
+                    ProviderEndpoint::Local,
+                    "the model load was cancelled",
+                ));
+            }
             engine::Engine::open(
                 &path,
                 drafter.as_ref(),
@@ -2424,22 +2443,36 @@ impl LocalModel {
 
     /// Start the engine thread, build its engine with `open` there, and wait
     /// for it to report ready.
+    ///
+    /// `open` asks [`EngineLife::proceed`] before it touches a device. Dropping
+    /// this future before the engine is ready (a shutdown that cancels the
+    /// load) stops the thread at that check, or, when it is past it, waits for
+    /// it to drop what it built (see [`lifecycle`]).
     async fn start<F>(draft_stats: Arc<engine::DraftCounters>, open: F) -> Result<Self, CucaError>
     where
-        F: FnOnce()
+        F: FnOnce(
+                &EngineLife,
+            )
                 -> Result<(engine::Engine, Arc<Tokenizer>, ChatTemplate, ChatFormat), CucaError>
             + Send
             + 'static,
     {
+        let life = EngineLife::new();
+        let guard = LoadGuard::new(Arc::clone(&life));
         let (jobs_tx, mut jobs_rx) = mpsc::channel::<engine::Msg>(JOB_QUEUE);
         let (ready_tx, ready_rx) = oneshot::channel::<Result<Self, CucaError>>();
+        let thread_life = Arc::clone(&life);
         std::thread::Builder::new()
             .name("cuca-local-engine".to_string())
             .spawn(move || {
+                thread_life.enter();
+                // Declared first, so it fires last: after the engine, and
+                // with it the GPU device, is dropped, on every path out.
+                let _ended = SignalOnDrop(Arc::clone(&thread_life));
                 // GPU backends report a missing adapter or driver by
                 // panicking during device setup: catch it so the caller gets
                 // the message instead of a dead thread.
-                let opened = match catch_unwind(AssertUnwindSafe(open)) {
+                let opened = match catch_unwind(AssertUnwindSafe(|| open(&thread_life))) {
                     Ok(opened) => opened,
                     Err(payload) => {
                         let msg = payload
@@ -2465,6 +2498,7 @@ impl LocalModel {
                                 imports_kv: engine.imports_kv(),
                                 is_stage: engine.is_stage(),
                                 stage_streams: Arc::default(),
+                                _stop: EngineStop(Arc::clone(&thread_life)),
                                 sampling: engine.sampling().config(),
                                 draft_stats,
                                 serving: engine.serving_counters(),
@@ -2494,12 +2528,18 @@ impl LocalModel {
                 message: format!("failed to start the local engine thread: {e}"),
             })?;
 
-        ready_rx.await.unwrap_or_else(|_| {
+        let outcome = ready_rx.await.unwrap_or_else(|_| {
             Err(CucaError::provider(
                 ProviderEndpoint::Local,
                 "local engine thread exited during load",
             ))
-        })
+        });
+        // On a failed load the guard still waits for the thread (a device
+        // part-built then is dropped before the error returns, so it is quick).
+        if outcome.is_ok() {
+            guard.ready();
+        }
+        outcome
     }
 }
 
@@ -3291,6 +3331,23 @@ impl LocalModel {
             })
         })
         .await?
+    }
+
+    /// Stop the engine thread now, whatever clones of this model are left, and
+    /// wait (at most [`ENGINE_STOP_WAIT`]) until it has dropped its engine and
+    /// with it the device: the shutdown of a server, whose connection tasks and
+    /// stage-stream threads can hold handles, and whose clients can still read
+    /// replies, past the point where the process exits. The requests that run
+    /// end with an error, and every later call fails as on an engine that has
+    /// shut down. Returns whether the thread had ended in time.
+    pub(crate) async fn shutdown(&self) -> bool {
+        let stop = engine::Msg::Call(Box::new(engine::Engine::stop));
+        // A full queue (every slot a waiting request) is given a moment.
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.inner.jobs.send(stop)).await;
+        let life = Arc::clone(&self.inner._stop.0);
+        tokio::task::spawn_blocking(move || life.wait(ENGINE_STOP_WAIT))
+            .await
+            .unwrap_or(false)
     }
 
     /// Run `f` on the engine thread and return its result. The call waits in
@@ -4323,7 +4380,7 @@ source {
     /// caller must get that message, not an opaque "thread exited".
     #[tokio::test]
     async fn start_reports_a_panic_during_load() {
-        let err = LocalModel::start(Arc::default(), || panic!("no Vulkan adapter found"))
+        let err = LocalModel::start(Arc::default(), |_| panic!("no Vulkan adapter found"))
             .await
             .unwrap_err();
         assert!(
@@ -4949,5 +5006,307 @@ mod distributed_config_tests {
             ..base()
         };
         assert!(validate_stages(&file).is_ok());
+    }
+}
+
+/// The end of a model's engine thread: what dropping the last clone, or a
+/// load that is cancelled, waits for (see [`lifecycle`]).
+#[cfg(test)]
+mod shutdown_tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Instant;
+
+    use tokio_stream::StreamExt;
+
+    use super::*;
+    use crate::provider::local::engine::testing::{
+        Loopback, chain_engine, stage_worker, tiny_local_model,
+    };
+    use crate::provider::local::model::chain::{StageCounters, StageTransport};
+    use crate::provider::local::model::split::LayerRange;
+    use crate::provider::local::model::tiny::{TinyModel, TinySpec, write_spec};
+
+    /// Sets a flag, `after` a pause, when dropped: the teardown of a device.
+    struct SlowDrop {
+        freed: Arc<AtomicBool>,
+        after: Duration,
+    }
+
+    impl Drop for SlowDrop {
+        fn drop(&mut self) {
+            std::thread::sleep(self.after);
+            self.freed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// A stage transport that owns a [`SlowDrop`]: a chain engine holds it, so
+    /// it is dropped with the engine, standing in for the GPU memory a real
+    /// engine gives back then.
+    struct DeviceLike {
+        link: Box<dyn StageTransport>,
+        _device: SlowDrop,
+    }
+
+    impl StageTransport for DeviceLike {
+        fn call(&self, frame: Vec<u8>) -> Result<Vec<u8>, CucaError> {
+            self.link.call(frame)
+        }
+
+        fn name(&self) -> String {
+            self.link.name()
+        }
+
+        fn counters(&self) -> Arc<StageCounters> {
+            self.link.counters()
+        }
+
+        fn carry(&self) -> CarryDtype {
+            self.link.carry()
+        }
+    }
+
+    fn llama_file() -> TinyModel {
+        write_spec(&TinySpec {
+            context: 32,
+            ..TinySpec::llama()
+        })
+    }
+
+    /// A ready model whose engine takes 300 ms to drop (`freed` is set when it
+    /// has).
+    async fn model_with_slow_teardown(file: &TinyModel, freed: &Arc<AtomicBool>) -> LocalModel {
+        let freed = Arc::clone(freed);
+        tiny_local_model(file.path.clone(), 32, move |path| {
+            let tiny = TinyModel {
+                path: path.to_path_buf(),
+            };
+            let range = LayerRange { first: 0, end: 2 };
+            let link = DeviceLike {
+                link: Box::new(Loopback::new(stage_worker(&tiny, 32, range, 1))),
+                _device: SlowDrop {
+                    freed,
+                    after: Duration::from_millis(300),
+                },
+            };
+            let engine = chain_engine(&tiny, 32, vec![(range, Box::new(link))], 0.0, None, 1);
+            // `tiny` would delete the file on drop; the caller still owns it.
+            std::mem::forget(tiny);
+            engine
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn dropping_the_last_clone_waits_for_the_engine_to_drop() {
+        let file = llama_file();
+        let freed = Arc::new(AtomicBool::new(false));
+        let model = model_with_slow_teardown(&file, &freed).await;
+        let clone = model.clone();
+        drop(model);
+        assert!(!freed.load(Ordering::SeqCst), "a clone is left: it runs");
+        let started = Instant::now();
+        drop(clone);
+        assert!(
+            freed.load(Ordering::SeqCst),
+            "the last clone returned before the engine was dropped"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// The last clone can be dropped on the engine thread (inside a call that
+    /// runs there): it must not wait for itself.
+    #[tokio::test]
+    async fn the_last_clone_dropped_on_the_engine_thread_does_not_wait_for_itself() {
+        let file = llama_file();
+        let freed = Arc::new(AtomicBool::new(false));
+        let model = model_with_slow_teardown(&file, &freed).await;
+        let (took_tx, took_rx) = std::sync::mpsc::channel();
+        let clone = model.clone();
+        model
+            .inner
+            .jobs
+            .send(engine::Msg::Call(Box::new(move |_| {
+                let started = Instant::now();
+                drop(clone);
+                let _ = took_tx.send(started.elapsed());
+            })))
+            .await
+            .unwrap();
+        drop(model);
+        let took = took_rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the call ran");
+        assert!(
+            took < Duration::from_secs(2),
+            "the engine thread waited for itself: {took:?}"
+        );
+    }
+
+    /// The reply of a request the model was dropped on is still delivered (the
+    /// engine finishes what it was given before it ends).
+    #[tokio::test]
+    async fn dropping_the_model_before_the_reply_is_read_keeps_the_reply() {
+        let file = llama_file();
+        let model = tiny_local_model(file.path.clone(), 32, move |path| {
+            crate::provider::local::engine::testing::engine_at(path, 32)
+        })
+        .await;
+        let request = UnifiedRequest::new("m")
+            .add_user_message("abcd")
+            .set_temperature(0.0)
+            .set_max_tokens(8);
+        let mut generation = model.generate(request).await.unwrap();
+        let started = Instant::now();
+        drop(model);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let mut blocks = 0;
+        while let Some(item) = generation.next().await {
+            item.unwrap();
+            blocks += 1;
+        }
+        assert!(blocks > 0, "the reply arrived");
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// `shutdown` ends the engine with handles left and a reply nobody reads,
+    /// and the device is dropped by the time it returns.
+    #[tokio::test]
+    async fn shutdown_stops_the_engine_while_clones_and_streams_are_alive() {
+        let file = llama_file();
+        let freed = Arc::new(AtomicBool::new(false));
+        let model = model_with_slow_teardown(&file, &freed).await;
+        let held = model.clone();
+        let request = UnifiedRequest::new("m")
+            .add_user_message("abcd")
+            .set_temperature(0.0)
+            .set_max_tokens(2000);
+        let generation = model.generate(request).await.unwrap();
+        let started = Instant::now();
+        assert!(model.shutdown().await, "the engine did not stop in time");
+        assert!(
+            freed.load(Ordering::SeqCst),
+            "shutdown returned before the engine was dropped"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+        // later calls fail as on an engine that has shut down
+        let err = held
+            .generate(UnifiedRequest::new("m").add_user_message("abcd"))
+            .await
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("shut down"), "{err}");
+        drop(generation);
+        // and dropping the clones afterwards does not wait
+        let started = Instant::now();
+        drop(model);
+        drop(held);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A load whose caller goes away after the device was opened waits for the
+    /// engine thread to drop what it built.
+    #[tokio::test]
+    async fn a_load_cancelled_while_the_device_opens_waits_for_the_thread() {
+        let freed = Arc::new(AtomicBool::new(false));
+        let device = Arc::clone(&freed);
+        let (began_tx, began_rx) = oneshot::channel::<()>();
+        let mut start = Box::pin(LocalModel::start(Arc::default(), move |life| {
+            assert!(life.proceed(true));
+            let _ = began_tx.send(());
+            let _device = SlowDrop {
+                freed: device,
+                after: Duration::from_millis(300),
+            };
+            std::thread::sleep(Duration::from_millis(150)); // opening the device
+            Err(CucaError::provider(ProviderEndpoint::Local, "unused"))
+        }));
+        tokio::select! {
+            loaded = &mut start => panic!("the load ended first: {loaded:?}"),
+            began = began_rx => began.unwrap(),
+        }
+        let started = Instant::now();
+        drop(start);
+        assert!(
+            freed.load(Ordering::SeqCst),
+            "the cancelled load returned while the device was still being dropped"
+        );
+        assert!(started.elapsed() >= Duration::from_millis(200));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    /// A load cancelled before the device is touched (a download) is not waited
+    /// for, and the thread then leaves the device alone.
+    #[tokio::test]
+    async fn a_load_cancelled_before_the_device_is_not_waited_for_and_stops() {
+        let touched = Arc::new(AtomicBool::new(false));
+        let ended = Arc::new(AtomicBool::new(false));
+        let (t, e) = (Arc::clone(&touched), Arc::clone(&ended));
+        let (began_tx, began_rx) = oneshot::channel::<()>();
+        let mut start = Box::pin(LocalModel::start(Arc::default(), move |life| {
+            let _ended = scopeguard_flag(e);
+            let _ = began_tx.send(());
+            std::thread::sleep(Duration::from_millis(500)); // downloading
+            if life.proceed(true) {
+                t.store(true, Ordering::SeqCst);
+            }
+            Err(CucaError::provider(ProviderEndpoint::Local, "cancelled"))
+        }));
+        tokio::select! {
+            loaded = &mut start => panic!("the load ended first: {loaded:?}"),
+            began = began_rx => began.unwrap(),
+        }
+        let started = Instant::now();
+        drop(start);
+        assert!(
+            started.elapsed() < Duration::from_millis(300),
+            "waited for a thread that had not touched the device: {:?}",
+            started.elapsed()
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ended.load(Ordering::SeqCst) {
+            assert!(Instant::now() < deadline, "the load thread never ended");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !touched.load(Ordering::SeqCst),
+            "the cancelled load went on to open the device"
+        );
+    }
+
+    /// Sets `flag` when dropped.
+    fn scopeguard_flag(flag: Arc<AtomicBool>) -> impl Drop {
+        struct Set(Arc<AtomicBool>);
+        impl Drop for Set {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        Set(flag)
+    }
+
+    /// A failed load is reported as before, and a ready one is not cancelled by
+    /// its own guard.
+    #[tokio::test]
+    async fn a_load_that_completes_or_fails_is_not_affected() {
+        let err = LocalModel::start(Arc::default(), |life| {
+            assert!(life.proceed(true));
+            Err(CucaError::provider(ProviderEndpoint::Local, "no such file"))
+        })
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no such file"), "{err}");
+        let file = llama_file();
+        let freed = Arc::new(AtomicBool::new(false));
+        let model = model_with_slow_teardown(&file, &freed).await;
+        let request = UnifiedRequest::new("m")
+            .add_user_message("abcd")
+            .set_temperature(0.0)
+            .set_max_tokens(4);
+        let mut generation = model.generate(request).await.unwrap();
+        while let Some(item) = generation.next().await {
+            item.unwrap();
+        }
+        drop(model);
+        assert!(freed.load(Ordering::SeqCst));
     }
 }

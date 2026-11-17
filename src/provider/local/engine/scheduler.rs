@@ -557,12 +557,19 @@ impl Engine {
     pub(crate) fn run_loop(&mut self, jobs: &mut mpsc::Receiver<Msg>) {
         let mut open = true;
         loop {
+            if self.stopping {
+                self.abandon();
+                return;
+            }
             if self.idle() {
                 if !open {
                     return;
                 }
                 match jobs.blocking_recv() {
-                    Some(msg) => self.receive(msg),
+                    Some(msg) => {
+                        self.receive(msg);
+                        continue;
+                    }
                     None => return,
                 }
             }
@@ -581,6 +588,22 @@ impl Engine {
                 std::thread::sleep(std::time::Duration::from_millis(1));
             }
         }
+    }
+
+    /// End the engine loop at its next turn (a server shutting down, whatever
+    /// clones of the model are left): the running requests end with an error,
+    /// the waiting ones just end, and the thread returns and drops the engine.
+    pub(crate) fn stop(&mut self) {
+        self.stopping = true;
+    }
+
+    /// What [`Engine::stop`] does: deliver an error to the running requests
+    /// and drop every sequence, which ends their streams.
+    fn abandon(&mut self) {
+        self.fail_running(&local_err("the local engine is shutting down"));
+        self.deliver();
+        self.waiting.clear();
+        self.draining.clear();
     }
 
     /// Act on a message of the engine's channel. A call runs peer input
