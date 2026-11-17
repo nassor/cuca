@@ -4220,6 +4220,51 @@ mod tests {
         assert_eq!(used_blocks(&d), 0);
     }
 
+    /// A handle dropped since the engine's last turn no longer holds its
+    /// export slot or its blocks when the next transfer asks for room: the
+    /// begin reaps what nobody waits for first, so a peer that gives up and
+    /// starts again is not refused for the engine thread being behind.
+    #[test]
+    fn a_dropped_handle_gives_back_its_room_before_the_next_transfer_begins() {
+        use tokio::sync::oneshot;
+        let model = write_spec(&TinySpec {
+            context: 128,
+            ..TinySpec::llama()
+        });
+        let prompt = long_prompt(100);
+        let mut p = engine_sized(&model, 128, 0.0, None, 2, None).with_exports(1);
+        let (ready, _frames, alive) = export_frames(&mut p, &prompt, 0);
+        let try_export = |p: &mut Engine| {
+            let (alive, _alive_rx) = oneshot::channel();
+            let (reply, _reply_rx) = oneshot::channel();
+            p.export_begin(prompt.clone(), 0, alive, reply)
+        };
+        // The lease holds the only slot until its handle is dropped; the
+        // next begin takes the slot without a turn in between.
+        let err = try_export(&mut p).unwrap_err();
+        assert!(err.to_string().contains("busy"), "{err}");
+        drop(alive);
+        try_export(&mut p).unwrap();
+        assert!(p.exports.is_empty());
+
+        // Eight blocks hold one import of six.
+        let mut d = engine_sized(&model, 128, 0.0, None, 2, Some(128));
+        let begin = |d: &mut Engine| {
+            let (alive, keep) = oneshot::channel();
+            let id = d.import_begin(prompt.clone(), 0, ready.to, alive);
+            (id, keep)
+        };
+        let (first, keep) = begin(&mut d);
+        first.unwrap();
+        let (second, _keep) = begin(&mut d);
+        let err = second.unwrap_err();
+        assert!(err.to_string().contains("no room"), "{err}");
+        drop(keep);
+        let (third, _keep) = begin(&mut d);
+        third.unwrap();
+        assert_eq!(d.imports.len(), 1);
+    }
+
     /// The fingerprint follows the file and the cache layout: the same file
     /// twice gives the same value, another model or a changed layout another.
     #[test]

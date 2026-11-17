@@ -175,6 +175,9 @@ impl Engine {
                 "nothing to export: {from}..{to} is empty or not block-aligned"
             )));
         }
+        // A lease or an export nobody waits for any more frees its slot now,
+        // not at the engine thread's next turn.
+        self.cancel_closed();
         let running = self
             .waiting
             .iter()
@@ -354,7 +357,7 @@ impl Engine {
     /// [`CucaError::Provider`] when the engine cannot take imported blocks,
     /// the range is not whole blocks of `ids`, the store no longer holds the
     /// first `from` tokens, `MAX_IMPORTS` imports run, or the pools have no
-    /// room.
+    /// room (after dropping what nobody waits for any more).
     pub(crate) fn import_begin(
         &mut self,
         ids: Vec<u32>,
@@ -367,6 +370,10 @@ impl Engine {
                 "this model replays a prompt for its drafter or keeps no prefix store: it takes no imported K/V",
             ));
         }
+        // A peer that dropped its handle since the last turn has its blocks
+        // and slot back now, not after the engine thread's next turn: the
+        // peer may start again at once.
+        self.cancel_closed();
         if self.imports.len() >= MAX_IMPORTS {
             return Err(local_err("K/V import slots are busy"));
         }
