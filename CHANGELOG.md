@@ -69,22 +69,34 @@
   the 15th token, where the 10^-7 perturbation also diverges: a near tie, not a `bf16`
   defect); Qwen 3.5 0.8B replied differently on one prompt with both types, at the same token
   and in the same way as with the 10^-7 perturbation. The frame wire version, which stage calls
-  and K/V transfer share, is 3, so a K/V export and import between builds of the old and new
-  layout refuse each other too.
+  and K/V transfer share, is 4 (3 added the number type), so a K/V export and import between
+  builds of the old and new layout refuse each other too.
 - Layer stages: speculation on a chain. The in-trunk head and the EAGLE drafter now pair with a
-  coordinator, next to the Gemma 4 assistant, when the model's stages hold only positional state
-  (no recurrent or compressor state): the drafter and the coordinator's last stage run on the
-  CPU, the last stage keeps the token embedding table for the drafter even when the head is not
-  tied to it, and a round verifies the pending token and its drafts in one call per worker, as a
-  plain step costs, so an accepted draft saves a whole round trip. The drafts and the number
-  accepted equal what the same drafter does on one node, and the reply is plain greedy decoding's,
-  also when answers are lost and sent again. DFlash and DSpark stay refused (they read the hidden
-  rows of several layers of the target, and a stage call returns none of a worker's), and so is
-  any drafter on a model with recurrent or compressor state (Qwen 3.5, DeepSeek-V4.1): a rejected
-  draft cannot be rolled back on the workers yet. The messages name the cause.
+  coordinator, next to the Gemma 4 assistant: the drafter and the coordinator's last stage run on
+  the CPU, the last stage keeps the token embedding table for the drafter even when the head is
+  not tied to it, and a round verifies the pending token and its drafts in one call per worker, as
+  a plain step costs, so an accepted draft saves a whole round trip. A rejected draft is rolled
+  back on the workers by the next forward call, which carries the position to return to (`rewind`,
+  next to the restore it already carries); a worker answers `open` with the rows of one pass it
+  can roll back, which is how the coordinator learns that a hybrid (Qwen 3.5) or
+  hyper-connection worker on the CPU can, and a worker with delta-net layers on a GPU cannot
+  (the drafter is then refused). The drafts and the number accepted equal what the same drafter
+  does on one node, and the reply is plain greedy decoding's, also when answers are lost and sent
+  again. Qwen 3.5 0.8B Q8_0 with its in-trunk head (`draft_tokens 3`) and one worker with 12
+  layers on the same machine: counting to 120 ran at 52 tokens per second without a drafter and
+  120 to 123 with it (one node: 53 and 125), with 61% fewer worker calls; a story went from 48 to
+  52 to 55 to 56, as on one node, because the governor stops drafting when it does not pay.
+  DFlash and DSpark stay refused (they read the hidden rows of several layers of the target, and a
+  stage call returns none of a worker's). DeepSeek-V4.1 chains roll back at the model level, but
+  no drafter pairs with it on a chain (the only one for it is DSpark).
 
 ### Changed
 
+- The frame wire version is 4 (stage `open` answers with the worker's rollback rows, and a
+  forward call can carry a `rewind`): a coordinator and a worker of different builds refuse each
+  other at `open`.
+- Hyper-connection stages with no compressor layer return to any position of their last pass,
+  odd ones too, on the CPU and the GPU: they hold no pooled pair to restore.
 - The HTTP counters (`cuca_http_requests_total` and the balancer's) tell `101` apart: a connection
   upgraded to a layer-stage frame stream no longer counts as a `200`.
 - Balancer: the speculation penalty is removed. An upstream with a drafter no longer adds 2 to

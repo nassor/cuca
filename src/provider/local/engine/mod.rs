@@ -4720,11 +4720,13 @@ mod tests {
         Ok((chain, links))
     }
 
-    /// Speculation on a chain whose stages hold only positional state: the
-    /// EAGLE head of a tiny `mistral4` and the in-trunk head of a tiny
-    /// attention-only `qwen35` draft against the coordinator's last stage,
-    /// one verification pass crosses the network for `k + 1` rows, and the
-    /// reply is plain greedy decoding's, with and without lost answers.
+    /// Speculation on a chain: the EAGLE head of a tiny `mistral4` and the
+    /// in-trunk head of a tiny attention-only `qwen35` draft against the
+    /// coordinator's last stage, and so does the in-trunk head of the hybrid
+    /// `qwen35` (one worker, then two), whose workers roll the recurrent
+    /// state of rejected drafts back with the next call. One verification
+    /// pass crosses the network for `k + 1` rows, and the reply is plain
+    /// greedy decoding's, with and without lost answers.
     #[test]
     fn speculation_on_a_chain_equals_plain_greedy() {
         use crate::provider::local::model::tiny::{TinyQwen35, write_qwen35};
@@ -4734,21 +4736,31 @@ mod tests {
             interval: 1,
             ..TinyQwen35::default()
         });
-        let prompts: [&[u32]; 4] = [
+        let prompts: [&[u32]; 5] = [
             &PROMPT,
             &[2, 9, 9, 9, 10],
             &[2, 13, 12, 11, 10, 9, 13],
+            &[2, 11],
             &[2, 12, 10, 14, 13, 11, 9, 15, 10, 12, 14, 11],
         ];
-        for what in ["eagle", "in-trunk"] {
-            let (file, drafter_file) = match what {
-                "eagle" => (&mistral, &eagle_file),
-                _ => (&attention, &attention),
+        let hybrid = write_qwen35(&TinyQwen35::default());
+        for what in [
+            "eagle",
+            "in-trunk",
+            "in-trunk hybrid",
+            "in-trunk hybrid, 2 workers",
+        ] {
+            let (file, drafter_file, workers) = match what {
+                "eagle" => (&mistral, &eagle_file, 1),
+                "in-trunk" => (&attention, &attention, 1),
+                "in-trunk hybrid" => (&hybrid, &hybrid, 1),
+                _ => (&hybrid, &hybrid, 2),
             };
             let (_, cuts) = cuts_of(file);
+            let bounds = &cuts[..workers];
             let (mut drafted, mut accepted, mut single_accepted) = (0, 0, 0);
             for lose in [false, true] {
-                for k in [1usize, 2, 4] {
+                for k in [1usize, 2, 4, 8] {
                     for prompt in prompts {
                         let mut plain = engine(file, 32, 0.0, None);
                         // The same drafter on one node: what a chain must
@@ -4759,7 +4771,7 @@ mod tests {
                             engine_in_trunk(file, 32, 0.0, None, k, 1)
                         };
                         let (mut spec, links) =
-                            chain_drafting(file, drafter_file, 32, &[cuts[0]], k, |c, m| {
+                            chain_drafting(file, drafter_file, 32, bounds, k, |c, m| {
                                 if what == "eagle" {
                                     Drafter::open_eagle(c, m)
                                 } else {
@@ -4818,51 +4830,177 @@ mod tests {
     }
 
     /// A stage that fails in the middle of a speculative round fails that
-    /// request and no other: the engine resets the drafter and the stages,
-    /// and the next request is plain greedy decoding's.
+    /// request and no other: the engine resets the drafter and the stages
+    /// (EAGLE on `mistral4`, the in-trunk head on the hybrid `qwen35`, whose
+    /// workers also lose a pending rewind), and the next request is plain
+    /// greedy decoding's.
     #[test]
     fn a_failure_in_a_speculative_round_fails_one_request() {
-        let (model, eagle_file) = (mistral4(32), eagle());
-        let (_, cuts) = cuts_of(&model);
-        let mut plain = engine(&model, 32, 0.0, None);
-        let expected = run(&mut plain, &PROMPT, None);
-        for fail_at in [3usize, 4, 5, 6] {
-            let (mut spec, links) =
-                chain_drafting(&model, &eagle_file, 32, &[cuts[0]], 4, |c, m| {
-                    Drafter::open_eagle(c, m)
-                })
-                .unwrap();
-            // The open took call 0; fail a forward call of the first request.
-            links.fail_at[0].store(fail_at, Ordering::SeqCst);
-            let hit = run(&mut spec, &PROMPT, None);
-            assert!(
-                hit.items.iter().any(Result::is_err),
-                "call {fail_at} fails the request"
-            );
-            let again = run(&mut spec, &PROMPT, None);
-            assert!(again.items.iter().all(Result::is_ok), "fail_at {fail_at}");
-            assert_same_reply(&again, &expected, &format!("fail_at {fail_at}"));
-            assert_eq!(used_blocks(&spec), 0, "fail_at {fail_at}");
+        use crate::provider::local::model::tiny::{TinyQwen35, write_qwen35};
+        let (mistral, eagle_file) = (mistral4(32), eagle());
+        let hybrid = write_qwen35(&TinyQwen35::default());
+        for what in ["eagle", "in-trunk hybrid"] {
+            let (model, drafter_file) = match what {
+                "eagle" => (&mistral, &eagle_file),
+                _ => (&hybrid, &hybrid),
+            };
+            let (_, cuts) = cuts_of(model);
+            let mut plain = engine(model, 32, 0.0, None);
+            let expected = run(&mut plain, &PROMPT, None);
+            // The hybrid chain accepts drafts and needs fewer calls.
+            let fails: &[usize] = if what == "eagle" {
+                &[3, 4, 5, 6]
+            } else {
+                &[2, 3, 4, 5]
+            };
+            for &fail_at in fails {
+                let (mut spec, links) =
+                    chain_drafting(model, drafter_file, 32, &[cuts[0]], 4, |c, m| {
+                        if what == "eagle" {
+                            Drafter::open_eagle(c, m)
+                        } else {
+                            Drafter::open_in_trunk(c, m)
+                        }
+                    })
+                    .unwrap();
+                // The open took call 0; fail a forward call of the first
+                // request.
+                links.fail_at[0].store(fail_at, Ordering::SeqCst);
+                let hit = run(&mut spec, &PROMPT, None);
+                let label = format!("{what}, call {fail_at}");
+                assert!(hit.items.iter().any(Result::is_err), "{label} fails");
+                let again = run(&mut spec, &PROMPT, None);
+                assert!(again.items.iter().all(Result::is_ok), "{label}");
+                assert_same_reply(&again, &expected, &label);
+                assert_eq!(used_blocks(&spec), 0, "{label}");
+            }
         }
     }
 
-    /// A chain over recurrent or compressor state refuses a drafter that
-    /// needs a rollback no worker can make, and the block drafters, which
-    /// read the hidden rows of layers a stage call does not return.
+    /// A chain refuses a head drafter when a stage answers that it can roll
+    /// back one row only (a stage on a device with no verification record),
+    /// and the block drafters, which read the hidden rows of layers a stage
+    /// call does not return.
     #[test]
     fn a_chain_refuses_the_drafters_it_cannot_serve() {
         use crate::provider::local::model::tiny::{TinyQwen35, write_qwen35};
         let hybrid = write_qwen35(&TinyQwen35::default());
         let (_, cuts) = cuts_of(&hybrid);
-        let Err(e) = chain_drafting(&hybrid, &hybrid, 32, &[cuts[0]], 2, |c, m| {
-            Drafter::open_in_trunk(c, m)
-        }) else {
-            panic!("a hybrid chain took the in-trunk head");
+        let (mut chain, _) = chain_over(&hybrid, 32, &[cuts[0]]);
+        let content = gguf::Content::open(&hybrid.path).unwrap();
+        // CPU workers answer that they can roll a verification round back.
+        Drafter::open_in_trunk(&content, &chain.model).unwrap();
+        let Model::Chain(m) = &mut chain.model else {
+            panic!("not a chain");
+        };
+        m.limit_rollback(1);
+        assert_eq!(chain.model.rollback_rows(), 1);
+        let Err(e) = Drafter::open_in_trunk(&content, &chain.model) else {
+            panic!("a chain that cannot roll back took the in-trunk head");
         };
         assert!(
-            matches!(&e, CucaError::Config(m) if m.contains("cannot be rolled back on the workers")),
+            matches!(&e, CucaError::Config(m) if m.contains("keeps no verification record")),
             "{e:?}"
         );
+        let Err(e) = Drafter::open_dflash(&content, &chain.model, 32) else {
+            panic!("a chain took a DFlash drafter");
+        };
+        assert!(
+            matches!(&e, CucaError::Config(m) if m.contains("reads the hidden rows of several layers")),
+            "{e:?}"
+        );
+    }
+
+    /// A verification round on a chain over recurrent or compressor state
+    /// rolls back to every position of the call: the local stage at once,
+    /// the workers with the next call's `rewind`, and the logits that follow
+    /// equal the whole model's, bit for bit.
+    #[test]
+    fn a_chain_rolls_back_a_verification_round_like_the_whole_model() {
+        use crate::provider::local::model::cpu::Hidden;
+        use crate::provider::local::model::paged::KvPools;
+        use crate::provider::local::model::tiny::{TinyDeepseek41, write_deepseek41};
+        use crate::provider::local::model::{Batch, SeqRows, StateSlot, Want};
+        fn step(
+            model: &mut Model,
+            pools: &mut KvPools,
+            seq: &mut crate::provider::local::model::paged::SeqBlocks,
+            ids: &[u32],
+            start: usize,
+            want: Want,
+        ) -> Vec<f32> {
+            pools.reserve(seq, start + ids.len()).unwrap();
+            let history = ids_before(start);
+            let batch = Batch {
+                rows: vec![SeqRows {
+                    history: &history,
+                    tokens: ids,
+                    start_pos: start,
+                    tables: &seq.tables,
+                    state: StateSlot(0),
+                    want,
+                    hidden: Hidden::None,
+                }],
+                exact: true,
+            };
+            let out = model.forward_batch(&batch).unwrap();
+            out[0].logits.clone().unwrap_or_default()
+        }
+        // The token at position `i`.
+        fn token(i: usize) -> u32 {
+            ((i * 5 + 3) % 14 + 1) as u32
+        }
+        fn ids_before(n: usize) -> Vec<u32> {
+            (0..n).map(token).collect()
+        }
+        let hybrid = hybrid_model();
+        let hyper = write_deepseek41(&TinyDeepseek41::default());
+        for (what, file, context) in [("qwen35", &hybrid, 128), ("deepseek41", &hyper, 32)] {
+            let (_, cuts) = cuts_of(file);
+            // The call at positions 6..11 verifies five rows; keep 6..=10
+            // positions of it (11 is the whole call: nothing to undo).
+            for keep in 6..=10usize {
+                let mut outputs = Vec::new();
+                for chained in [false, true] {
+                    let mut e = if chained {
+                        chain_over(file, context, &cuts[..1]).0
+                    } else {
+                        engine(file, context, 0.0, None)
+                    };
+                    let layout = e.model.kv_layout().clone();
+                    let mut pools = KvPools::new(&layout);
+                    let mut seq = pools.seq();
+                    let all: Vec<u32> = (0..14).map(token).collect();
+                    step(&mut e.model, &mut pools, &mut seq, &all[..6], 0, Want::Last);
+                    step(
+                        &mut e.model,
+                        &mut pools,
+                        &mut seq,
+                        &all[6..11],
+                        6,
+                        Want::All,
+                    );
+                    assert_eq!(
+                        e.model.rewind(StateSlot(0), keep),
+                        keep,
+                        "{what}, keep {keep}, chained {chained}"
+                    );
+                    outputs.push(step(
+                        &mut e.model,
+                        &mut pools,
+                        &mut seq,
+                        &all[keep..keep + 2],
+                        keep,
+                        Want::Last,
+                    ));
+                }
+                assert!(!outputs[0].is_empty(), "{what}: logits");
+                assert!(
+                    outputs[0] == outputs[1],
+                    "{what}, keep {keep}: the chain's logits equal the whole model's"
+                );
+            }
+        }
     }
 
     /// A model whose first layers run on workers answers what the whole model
@@ -5187,6 +5325,7 @@ mod tests {
                     hidden: Hidden::None,
                     tables: Vec::new(),
                     restore: None,
+                    rewind: None,
                     snapshot,
                     prefetch: Vec::new(),
                 }],

@@ -4412,13 +4412,12 @@ source {
             session: 7,
             carry: CarryDtype::F32,
         };
-        assert!(
-            worker
-                .stage_call(open_frame(&open))
-                .await
-                .unwrap()
-                .frame
-                .is_empty()
+        // The answer names the rollback the worker offers: an attention-only
+        // model has no state that cannot be undone.
+        let reply = worker.stage_call(open_frame(&open)).await.unwrap();
+        assert_eq!(
+            crate::provider::local::stageframe::decode_open_reply(&reply.frame).unwrap(),
+            usize::MAX
         );
         let err = worker
             .stage_call(open_frame(&Open { end: 2, ..open }))

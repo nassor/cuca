@@ -23,9 +23,11 @@
 //! - the position of each slot (`pos`), for the rollback it can answer;
 //! - the ids of the recurrent-state snapshots the workers hold for it, freed
 //!   when the [`ChainSnapshot`] is dropped;
-//! - the restores still to be told to the workers (`restores`) and the
-//!   snapshots their last call took (`taken`): both ride in forward calls,
-//!   so a step costs one call per stage.
+//! - the restores and rewinds still to be told to the workers (`restores`,
+//!   `rewinds`: a rejected speculative draft takes the state back to a
+//!   position of the last verification pass) and the snapshots their last
+//!   call took (`taken`): all ride in forward calls, so a step costs one call
+//!   per stage.
 //!
 //! # Failure
 //!
@@ -48,8 +50,8 @@ use super::{Batch, Model, RecurrentSnapshot, StateSlot, StepHint, err};
 use crate::error::CucaError;
 use crate::provider::local::CarryDtype;
 use crate::provider::local::stageframe::{
-    ANOTHER_SESSION, ForwardCall, Open, Restore, StageSeq, decode_forward_reply, forward_frame,
-    open_frame,
+    ANOTHER_SESSION, ForwardCall, Open, Restore, StageSeq, decode_forward_reply, decode_open_reply,
+    forward_frame, open_frame,
 };
 
 mod http;
@@ -119,6 +121,9 @@ struct Remote {
     calls: AtomicU64,
     /// The number type of the carries to and from this stage.
     carry: CarryDtype,
+    /// The most rows of one call the worker can return to every position of
+    /// (its answer to `open`).
+    rollback: usize,
 }
 
 impl Remote {
@@ -157,6 +162,11 @@ pub(crate) struct ChainModel {
     /// the workers to make before its pass (the local stage's was made at
     /// once).
     restores: Vec<Option<Restore>>,
+    /// Per state slot, the position the next forward call of the slot tells
+    /// the workers to take their state back to before its pass (the local
+    /// stage's was taken back at once): a verification round rejected some
+    /// drafts.
+    rewinds: Vec<Option<usize>>,
     /// Per state slot, the snapshot the last forward call took on the
     /// workers, until [`ChainModel::snapshot`] adds the local stage's.
     taken: Mutex<Vec<Option<Taken>>>,
@@ -255,6 +265,7 @@ impl ChainModel {
                     engram,
                     pending: Mutex::new(Vec::new()),
                     calls: AtomicU64::new(0),
+                    rollback: 1,
                 })
                 .collect(),
             local: Box::new(local),
@@ -267,6 +278,7 @@ impl ChainModel {
             dirty: AtomicBool::new(true),
             cause: Mutex::new(None),
             restores: vec![None; max_sequences],
+            rewinds: vec![None; max_sequences],
             taken: Mutex::new(vec![None; max_sequences]),
         };
         chain.reopen()?;
@@ -291,7 +303,7 @@ impl ChainModel {
                 session: self.session,
                 carry: remote.carry,
             });
-            remote.transport.call(frame)?;
+            remote.rollback = decode_open_reply(&remote.transport.call(frame)?)?;
             remote.sent.iter_mut().for_each(Vec::clear);
             lock(&remote.pending).clear();
             remote.calls.store(0, Ordering::Relaxed);
@@ -302,6 +314,7 @@ impl ChainModel {
         }
         self.pos.fill(0);
         self.restores.fill(None);
+        self.rewinds.fill(None);
         lock(&self.taken).fill(None);
         self.dirty.store(false, Ordering::Relaxed);
         Ok(())
@@ -465,6 +478,7 @@ impl ChainModel {
                         hidden: r.hidden,
                         tables: r.tables.to_vec(),
                         restore: self.restores[r.state.0],
+                        rewind: self.rewinds[r.state.0].map(|len| len as u64),
                         snapshot,
                         prefetch: match hint_of(r.state) {
                             Some(h) if remote.engram => h.next.to_vec(),
@@ -518,6 +532,7 @@ impl ChainModel {
             let end = r.start_pos + r.tokens.len();
             self.pos[r.state.0] = end;
             self.restores[r.state.0] = None;
+            self.rewinds[r.state.0] = None;
             if let Some(id) = snapshot_ids[i] {
                 let taken = Taken {
                     id,
@@ -571,16 +586,15 @@ impl ChainModel {
             .collect()
     }
 
-    /// One row for a hybrid or hyper-connection model: its workers hold
-    /// state that cannot be undone and no rollback call crosses the network
-    /// ([`ChainModel::check_drafter`] refuses a drafter, so nothing drafts).
-    /// The local stage's figure otherwise (K/V is positional).
+    /// The most rows of one forward call whose every position every stage can
+    /// return to: the least of the local stage's and the workers' answers to
+    /// `open` (unbounded when none holds recurrent or compressor state, 17
+    /// for CPU stages that do, 1 for a stage that cannot roll back).
     pub(crate) fn rollback_rows(&self) -> usize {
-        if self.hybrid || self.stateful {
-            1
-        } else {
-            self.local.rollback_rows()
-        }
+        self.remotes
+            .iter()
+            .map(|r| r.rollback)
+            .fold(self.local.rollback_rows(), usize::min)
     }
 
     /// Whether a drafter that keeps a cache of its own (`what` names it) can
@@ -589,21 +603,36 @@ impl ChainModel {
     ///
     /// # Errors
     ///
-    /// [`CucaError::Config`] when the chain can roll back only one row.
+    /// [`CucaError::Config`] when a stage of the chain can roll back only one
+    /// row: it holds recurrent or compressor state on a device that keeps no
+    /// verification record (a GPU stage), so a rejected draft cannot be
+    /// undone there.
     pub(crate) fn check_drafter(&self, what: &str) -> Result<(), CucaError> {
         if self.rollback_rows() < 2 {
             return Err(CucaError::Config(format!(
-                "{what} cannot be combined with `remote_stage` on a model with recurrent or compressor state: a rejected draft cannot be rolled back on the workers"
+                "{what} cannot be combined with `remote_stage` here: a stage of this chain holds recurrent or compressor state and keeps no verification record, so a rejected draft cannot be rolled back on it"
             )));
         }
         Ok(())
     }
 
-    /// Take `slot` back to `len` positions: an attention-only model keeps
-    /// only positional K/V and returns `len`; a model with a recurrent state
-    /// can stay where it is and nothing else (0 otherwise, after which the
-    /// engine recomputes or fails the sequence: no state of a worker can be
-    /// rewound).
+    /// Make every worker answer that it can roll back `rows` rows (tests:
+    /// the answer of a stage on a device with no verification record).
+    #[cfg(test)]
+    pub(crate) fn limit_rollback(&mut self, rows: usize) {
+        for remote in &mut self.remotes {
+            remote.rollback = rows;
+        }
+    }
+
+    /// Take `slot` back to `len` positions. K/V is positional, so an
+    /// attention-only model returns `len`. A model with recurrent or
+    /// compressor state can stay where it is, or go back to a position of
+    /// the slot's last verification call (`Want::All` over 2 to 17 rows):
+    /// the local stage goes back at once and the workers with the slot's
+    /// next forward call, which carries the position (`StageSeq::rewind`).
+    /// Any other position is 0, after which the engine recomputes or fails
+    /// the sequence.
     pub(crate) fn rewind(&mut self, slot: usize, len: usize) -> usize {
         if !self.hybrid && !self.stateful {
             return len;
@@ -611,10 +640,21 @@ impl ChainModel {
         if self.pos.get(slot) == Some(&len) {
             return len;
         }
-        if slot < self.max_sequences {
-            self.local.reset_slot(StateSlot(slot));
-            self.pos[slot] = 0;
+        if slot >= self.max_sequences {
+            return 0;
         }
+        if len > 0
+            && len < self.pos[slot]
+            && self.rollback_rows() > 1
+            && self.local.rewind(StateSlot(slot), len) == len
+        {
+            self.pos[slot] = len;
+            self.rewinds[slot] = Some(len);
+            return len;
+        }
+        self.local.reset_slot(StateSlot(slot));
+        self.pos[slot] = 0;
+        self.rewinds[slot] = None;
         0
     }
 
@@ -625,6 +665,9 @@ impl ChainModel {
         self.local.reset_slot(StateSlot(slot));
         if let Some(p) = self.pos.get_mut(slot) {
             *p = 0;
+        }
+        if let Some(r) = self.rewinds.get_mut(slot) {
+            *r = None;
         }
     }
 
@@ -699,6 +742,7 @@ impl ChainModel {
                     id: held.map(|s| s.id),
                     len: len as u64,
                 });
+                self.rewinds[slot] = None;
                 self.pos[slot] = len;
             }
             Err(e) => self.break_with(e),

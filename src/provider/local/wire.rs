@@ -18,7 +18,9 @@ use crate::error::CucaError;
 /// restore, snapshot and Engram prefetch that were calls of their own.
 /// 3: `open` names the number type of the carry, and every carry starts with
 /// the tag of the type it is written in.
-pub(crate) const WIRE_VERSION: u32 = 3;
+/// 4: `open` is answered with the worker's rollback rows, and a forward call
+/// can rewind a slot's state before its pass.
+pub(crate) const WIRE_VERSION: u32 = 4;
 
 impl CarryDtype {
     /// The byte a frame names the type with.

@@ -11,7 +11,8 @@
 //! - open (1): `fingerprint u64`, `first u32`, `end u32`, `context_length
 //!   u64`, `max_sequences u64`, `kv_tokens u64`, `max_rows u64`, `session u64`,
 //!   `carry u8` (the [`CarryDtype`] the session's carries travel in: 0 `f32`,
-//!   1 `bf16`, 2 `f16`); answered by [`ok_reply`];
+//!   1 `bf16`, 2 `f16`); answered by `rollback u64`, the most rows of one
+//!   call whose every position the worker can return to ([`ok_reply`]);
 //! - forward (2): `session u64`, `seq u64`, `drops` (`count u32`, then `u64`
 //!   each: recurrent-state snapshots the worker releases), `exact u8`,
 //!   `count u32` sequences, then per sequence `slot u32`, `start_pos u64`,
@@ -21,6 +22,9 @@
 //!   what the sequence asks of the worker around the pass: `restore u8`
 //!   (1: before the pass, make the slot's recurrent state a snapshot or the
 //!   zero state, `has_id u8`, `id u64` (0 when absent), `len u64`),
+//!   `rewind u8` and `len u64` (1: before the pass, take the slot's state
+//!   back to `len` positions, which the worker's last verification call
+//!   recorded; applied before the restore and refused when the worker cannot),
 //!   `snapshot u8` and `id u64` (1: after the pass, keep a copy of the
 //!   slot's recurrent state under that id), `prefetch` as a `u32` slice
 //!   (after the pass, start reading the Engram rows of these next tokens of
@@ -106,6 +110,11 @@ pub(crate) struct StageSeq {
     pub tables: Vec<Vec<u32>>,
     /// Before the pass: the recurrent state the slot starts from.
     pub restore: Option<Restore>,
+    /// Before the pass (and before a restore): take the slot's recurrent or
+    /// compressor state back to this many positions, the ones the slot's
+    /// last verification call (`Want::All` over 2 to 17 rows) recorded. K/V
+    /// is positional and needs no call.
+    pub rewind: Option<u64>,
     /// After the pass: keep a copy of the slot's recurrent state under this
     /// id.
     pub snapshot: Option<u64>,
@@ -388,9 +397,25 @@ pub(crate) fn decode_forward_reply(
     Ok((carry, sizes))
 }
 
-/// The (empty) answer of open.
-pub(crate) fn ok_reply() -> Vec<u8> {
-    Vec::new()
+/// The answer of open: the most rows of one forward call whose every
+/// position the worker can return to (`u64::MAX` for a worker with no state
+/// that cannot be undone).
+pub(crate) fn ok_reply(rollback_rows: usize) -> Vec<u8> {
+    let mut w = Writer::with_capacity(8);
+    w.put_u64(u64::try_from(rollback_rows).unwrap_or(u64::MAX));
+    w.into_bytes()
+}
+
+/// The rollback figure of an open answer.
+///
+/// # Errors
+///
+/// [`CucaError::Provider`] for a body that is not one `u64`.
+pub(crate) fn decode_open_reply(bytes: &[u8]) -> Result<usize, CucaError> {
+    let mut r = Reader::new(bytes);
+    let rows = r.get_u64()?;
+    finish(&r)?;
+    Ok(usize::try_from(rows).unwrap_or(usize::MAX))
 }
 
 fn finish(r: &Reader<'_>) -> Result<(), CucaError> {
@@ -454,6 +479,8 @@ pub(crate) fn forward_frame(call: &ForwardCall) -> Result<Vec<u8>, CucaError> {
             }
             None => w.put_u8(0),
         }
+        w.put_u8(u8::from(s.rewind.is_some()));
+        w.put_u64(s.rewind.unwrap_or(0));
         w.put_u8(u8::from(s.snapshot.is_some()));
         w.put_u64(s.snapshot.unwrap_or(0));
         w.put_u32s(&s.prefetch);
@@ -522,6 +549,18 @@ fn decode_seq(r: &mut Reader<'_>) -> Result<StageSeq, CucaError> {
             )));
         }
     };
+    let rewind = match r.get_u8()? {
+        0 => {
+            r.get_u64()?;
+            None
+        }
+        1 => Some(r.get_u64()?),
+        other => {
+            return Err(local_err(format!(
+                "stage frame rewind flag is {other}, not 0 or 1"
+            )));
+        }
+    };
     let snapshot = match r.get_u8()? {
         0 => {
             r.get_u64()?;
@@ -545,6 +584,7 @@ fn decode_seq(r: &mut Reader<'_>) -> Result<StageSeq, CucaError> {
         hidden,
         tables,
         restore,
+        rewind,
         snapshot,
         prefetch,
     })
@@ -649,6 +689,9 @@ mod tests {
                 }),
                 _ => None,
             },
+            // Slot 2 takes its state back to a position of its last
+            // verification call before the pass; the others do not.
+            rewind: (slot == 2).then_some(43),
             snapshot: (slot == 0).then_some(77),
             prefetch: if slot == 2 { vec![4, 5, 6] } else { Vec::new() },
         }
@@ -776,7 +819,12 @@ mod tests {
             assert_carry_eq(&got, &c);
             assert_eq!(back, sizes);
         }
-        assert!(ok_reply().is_empty());
+        // The answer of open names the rollback the worker offers.
+        for rows in [0usize, 1, 17, usize::MAX] {
+            assert_eq!(decode_open_reply(&ok_reply(rows)).unwrap(), rows);
+        }
+        assert!(decode_open_reply(&[]).is_err());
+        assert!(decode_open_reply(&[0; 9]).is_err());
         // A carry alone, a truncated size list and trailing bytes are refused.
         assert!(decode_forward_reply(&carry_bytes(&c), CarryDtype::F32).is_err());
         let reply = forward_reply(&c, &[1, 2], CarryDtype::F32).unwrap();
@@ -947,19 +995,23 @@ mod tests {
         assert!(decode(&bad).is_err());
 
         // The last sequence (slot 2) ends with: restore (flag, has_id, id,
-        // len: 18 bytes), snapshot (flag, id: 9), prefetch (count + 3: 20)
-        // and the `has_carry` byte.
+        // len: 18 bytes), rewind (flag, len: 9), snapshot (flag, id: 9),
+        // prefetch (count + 3: 20) and the `has_carry` byte.
         let tail = frame.len() - 1 - 20 - 9;
         assert_eq!(frame[tail], 0, "slot 2 asks for no snapshot");
-        assert_eq!(frame[tail - 18], 1, "slot 2 restores");
+        assert_eq!(frame[tail - 9], 1, "slot 2 rewinds");
+        assert_eq!(frame[tail - 9 - 18], 1, "slot 2 restores");
         let mut bad = frame.clone();
         bad[tail] = 2;
         assert!(decode(&bad).is_err());
         let mut bad = frame.clone();
-        bad[tail - 18] = 2;
+        bad[tail - 9] = 2;
+        assert!(decode(&bad).is_err());
+        let mut bad = frame.clone();
+        bad[tail - 9 - 18] = 2;
         assert!(decode(&bad).is_err());
         let mut bad = frame;
-        bad[tail - 17] = 2;
+        bad[tail - 9 - 17] = 2;
         assert!(decode(&bad).is_err());
     }
 

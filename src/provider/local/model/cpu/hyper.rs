@@ -566,10 +566,14 @@ impl HyperModel {
         if len >= s.end {
             return s.end;
         }
-        let n = s
-            .log
-            .first()
-            .map_or(0, |l| l.len() / (2 * self.row_floats.max(1)));
+        // The log holds the layers of this stage that pool pairs (the others'
+        // entries stay empty); a stage with none keeps no pooled pair, and
+        // only the position goes back.
+        let Some(rows) = s.log.iter().find(|l| !l.is_empty()) else {
+            s.end = len;
+            return len;
+        };
+        let n = rows.len() / (2 * self.row_floats.max(1));
         let first = s.end - n.min(s.end);
         if len % 2 == 1 && (len <= first || len > s.end) {
             *s = CompState::default();

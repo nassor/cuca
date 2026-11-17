@@ -371,13 +371,12 @@ impl HyperState {
         if len >= s.end {
             return s.end;
         }
-        let n = s
-            .log
-            .iter()
-            .flatten()
-            .map(|l| l.dims()[0])
-            .next()
-            .unwrap_or(0);
+        // A stage whose layers pool no pair keeps no log: only the position
+        // goes back.
+        let Some(n) = s.log.iter().flatten().map(|l| l.dims()[0]).next() else {
+            s.end = len;
+            return len;
+        };
         let first = s.end - n.min(s.end);
         if len % 2 == 1 && (len <= first || len > s.end) {
             *s = CompSlot::default();

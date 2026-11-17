@@ -26,9 +26,13 @@
 //! After `open` there is one call, `forward`, and a step costs one per stage.
 //! The frame carries what used to be calls of their own, for each sequence:
 //! the restore of its recurrent state (made before the pass, from a snapshot
-//! the worker holds or the zero state), the snapshot to keep after the pass
-//! (its size goes back in the reply), and the next tokens whose Engram rows
-//! the worker starts reading once the pass is done.
+//! the worker holds or the zero state), the rewind of its state to a position
+//! of the slot's last verification pass (made before the restore, after a
+//! speculative round rejected drafts; the worker answers with its
+//! `rollback_rows` at `open` and refuses a rewind it cannot make), the
+//! snapshot to keep after the pass (its size goes back in the reply), and the
+//! next tokens whose Engram rows the worker starts reading once the pass is
+//! done.
 //!
 //! Every call after `open` carries its number in the session. A transport
 //! that does not know whether a frame arrived sends it again, and the worker
@@ -335,7 +339,7 @@ impl Engine {
         host.last_seq = 0;
         host.last_reply = None;
         host.carry = open.carry;
-        Ok(stageframe::ok_reply())
+        Ok(stageframe::ok_reply(self.model.rollback_rows()))
     }
 
     /// `forward`, for each sequence: make its recurrent state the snapshot
@@ -359,6 +363,16 @@ impl Engine {
             let slot = host.slot(seq.slot)?;
             if seq.snapshot.is_some() && !hybrid {
                 return Err(local_err("the stage holds no recurrent state to copy"));
+            }
+            if let Some(len) = seq.rewind {
+                let len = usize::try_from(len)
+                    .map_err(|_| local_err(format!("position {len} is out of range")))?;
+                let kept = self.model.rewind(StateSlot(slot), len);
+                if kept != len {
+                    return Err(local_err(format!(
+                        "slot {slot} cannot go back to position {len}: its state returns only to {kept}"
+                    )));
+                }
             }
             if let Some(restore) = seq.restore {
                 let snapshot = match restore.id {

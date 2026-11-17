@@ -153,12 +153,13 @@ A model whose first layers run on workers (see [Layer stages](@/server/model-ser
 | Drafter | On a chain |
 |---|---|
 | Gemma 4 assistant | yes, it reads the K/V of the coordinator's own layers |
-| in-trunk head | yes, on a target with no recurrent state |
+| in-trunk head | yes, also on a target with recurrent state (Qwen 3.5): the workers roll a rejected draft back |
 | EAGLE | yes (Mistral Small 4 is attention only) |
 | DFlash, DSpark | no: they read the hidden rows of several layers of the target, and a worker returns none |
 
 - The drafter and the coordinator's layers run on the CPU. The last stage keeps the token embedding table for the drafter even when the model's output head is not tied to it.
-- A target with recurrent state (Qwen 3.5 and every `*-MTP` file the in-trunk head comes from) or compressor state (DeepSeek-V4.1) is refused: its workers cannot roll back the state of a rejected draft yet.
+- A target with recurrent state (Qwen 3.5 and every `*-MTP` file the in-trunk head comes from) or compressor state (DeepSeek-V4.1) rolls a rejected draft back on the workers too: the next call carries the position to go back to, and a worker returns to it from the record its last verification pass kept (up to 17 rows per pass, as on one node). A worker whose delta-net layers run on a GPU keeps no such record and offers one row, so a drafter is refused there. The coordinator learns what each worker offers when it opens the session, and the wire version is 4.
+- Measured on Qwen 3.5 0.8B Q8_0 with the in-trunk head and `draft_tokens 3`, one worker with 12 layers on the same machine over the frame stream, all on the CPU: counting from 1 to 120 (300 tokens) ran at 52 tokens per second without a drafter and at 120 to 123 with it (one node: 53 and 125), with 61% fewer worker calls over the 800 tokens of the run. A story (200 tokens) went from 48 to 52 tokens per second to 55 to 56, as on one node, because the governor stops drafting when it does not pay. The replies equal plain greedy decoding's.
 - A failed call during a round fails that request, as any failed stage call does; the drafter is reset and the next request starts a new session.
 
 ## Draft length and counters
@@ -182,7 +183,7 @@ A drafter is built for one target. A wrong pair fails the load. The messages and
 - ``the `mistral4-eagle` drafter pairs with a `mistral4` model, not `<arch>` ``: EAGLE only pairs with Mistral Small 4. Use a `mistral4` target.
 - `the EAGLE drafter's <what> is X but the model's is Y: it was trained for another model`: a setting of the drafter differs from the target's. Use the drafter published for this model.
 - ``the dflash drafter reads the hidden rows of several layers of the target, and a stage call returns none of a worker's: it cannot be combined with `remote_stage` ``: DFlash and DSpark do not pair with layer stages. Run the model on one machine, or without a drafter.
-- ``<drafter> cannot be combined with `remote_stage` on a model with recurrent or compressor state: a rejected draft cannot be rolled back on the workers``: the target keeps state that cannot be undone on a worker (Qwen 3.5, DeepSeek-V4.1). Run without a drafter, or on one machine.
+- ``<drafter> cannot be combined with `remote_stage` here: a stage of this chain holds recurrent or compressor state and keeps no verification record, so a rejected draft cannot be rolled back on it``: a worker (or the coordinator's own layers) holds delta-net layers on a GPU, which keep no verification record. Run the stage on the CPU, run without a drafter, or run on one machine.
 - ``<drafter> starts from a token's embedding, which the last stage of this chain does not hold``: the coordinator could not load the token embedding table for the drafter.
 - `... runs on the CPU only ...` for the in-trunk head, EAGLE, DFlash or DSpark, and `DrafterSource::InTrunk runs on the CPU only, not on <device>`: these drafters cannot run on a GPU. Set `device "cpu"`, and drop `gpu_layers` and `shards`.
 - ``this `<arch>` file has no in-trunk multi-token-prediction head (...); use a separate drafter file instead``: the model file has no built-in head. Use a Qwen 3.5 `*-MTP` file, or a separate drafter.
