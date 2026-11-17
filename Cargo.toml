@@ -199,10 +199,11 @@ sysmon = ["dep:sysinfo", "dep:nvml-wrapper", "dep:wmi", "dep:winreg", "dep:traci
 # server: the `cuca` binary's model server (src/server/): an OpenAI-compatible HTTP API
 # (axum), the stats API and Prometheus metrics over the in-process local engine, with
 # `sysmon` for the machine's figures. `sysinfo` names the host in the node id;
-# getrandom makes request ids; config-kdl reads `--config`.
+# getrandom makes request ids; config-kdl reads `--config`; hyper (already axum's)
+# names the upgrade of a layer-stage frame stream.
 server = [
     "provider-local", "config-kdl", "sysmon", "dep:axum", "dep:clap", "dep:tracing", "dep:tracing-subscriber",
-    "dep:sysinfo", "dep:getrandom", "dep:tokio-stream",
+    "dep:sysinfo", "dep:getrandom", "dep:tokio-stream", "dep:hyper",
     "tokio/net", "tokio/rt-multi-thread", "tokio/signal", "tokio/io-util",
 ]
 # server-tui: the real-time terminal UI over the stats API (built after the server).
@@ -278,6 +279,7 @@ cubecl = { version = "0.11", optional = true, default-features = false, features
 burn-cubecl = { version = "0.22", optional = true, default-features = false, features = ["std", "fusion", "autotune"] }
 # server: HTTP framework, CLI, logging and system sampling (see the `server` feature).
 axum = { version = "0.8", optional = true, default-features = false, features = ["tokio", "http1", "json", "query", "matched-path"] }
+hyper = { version = "1", optional = true, default-features = false, features = ["http1"] }
 clap = { version = "4", optional = true, features = ["derive"] }
 tracing-subscriber = { version = "0.3", optional = true, features = ["env-filter", "json"] }
 sysinfo = { version = "0.40", optional = true, default-features = false, features = ["system", "disk"] }

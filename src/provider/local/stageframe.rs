@@ -804,7 +804,8 @@ mod tests {
         w.put_u32(0);
         w.put_u8(0);
         w.put_u32(u32::MAX);
-        assert!(decode(&w.into_bytes()).is_err());
+        let e = decode(&w.into_bytes()).err().unwrap();
+        assert!(e.to_string().contains("sequences"), "{e}");
 
         // Snapshot sizes of an answer likewise.
         let mut w = Writer::new();
@@ -831,6 +832,8 @@ mod tests {
         w.put_u32(u32::MAX);
         assert!(decode_carry(&w.into_bytes()).is_err());
 
+        // A forward frame whose one sequence claims u32::MAX block tables,
+        // with just enough bytes after the count to pass the sequence bound.
         let mut w = Writer::new();
         w.put_u8(OP_FORWARD);
         w.put_u64(1);
@@ -846,7 +849,18 @@ mod tests {
         w.put_u8(0);
         w.put_u8(0);
         w.put_u32(u32::MAX);
-        assert!(decode(&w.into_bytes()).is_err());
+        w.put_u32s(&[0; 7]);
+        let e = decode(&w.into_bytes()).err().unwrap();
+        assert!(e.to_string().contains("block tables"), "{e}");
+
+        // And one that claims u32::MAX dropped snapshots.
+        let mut w = Writer::new();
+        w.put_u8(OP_FORWARD);
+        w.put_u64(1);
+        w.put_u64(1);
+        w.put_u32(u32::MAX);
+        let e = decode(&w.into_bytes()).err().unwrap();
+        assert!(e.to_string().contains("drops"), "{e}");
     }
 
     trait CloneForTest {

@@ -66,6 +66,7 @@ pub mod latency;
 pub mod metrics;
 pub mod openai;
 pub mod registry;
+pub(crate) mod socket;
 pub mod state;
 pub mod stats;
 pub mod telemetry;
@@ -173,7 +174,8 @@ async fn serve_until(
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
     let app = http::router(Arc::clone(&state));
     let mut server = tokio::spawn(async move {
-        axum::serve(nodelay(listener), app)
+        let (served, make_service) = socket::serving(listener, app);
+        axum::serve(served, make_service)
             .with_graceful_shutdown(async {
                 let _ = stop_rx.await;
             })

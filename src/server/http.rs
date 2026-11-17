@@ -8,6 +8,8 @@
 //! | `GET /v1/models` | the ready models, with vLLM's `max_model_len` |
 //! | `POST /v1/chat/completions` | non-streaming JSON or SSE (`stream: true`) |
 //! | `POST /cuca/v1/kv/export` | streams the K/V rows of a prompt to a decode node (see [`kv`](super::kv)) |
+//! | `POST /cuca/v1/stage[/{model}]` | one frame of a layer-stage call, answered by a worker (body up to [`MAX_STAGE_BODY_BYTES`]) |
+//! | `GET /cuca/v1/stage-stream[/{model}]` | upgrades the connection to a stream of layer-stage frames (`Upgrade: cuca-stage/1`), served by the model on a thread of its own |
 //! | `GET /metrics` | Prometheus text |
 //! | `GET /cuca/v1/stats`, `GET /cuca/v1/stats/stream` | the stats API, only with `stats_api #true` |
 //!
@@ -29,8 +31,8 @@ use axum::Json;
 use axum::Router;
 use axum::body::Bytes;
 use axum::extract::rejection::BytesRejection;
-use axum::extract::{DefaultBodyLimit, Extension, Path, Query, Request, State};
-use axum::http::header::{AUTHORIZATION, CONTENT_TYPE, WWW_AUTHENTICATE};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Extension, Path, Query, Request, State};
+use axum::http::header::{AUTHORIZATION, CONNECTION, CONTENT_TYPE, UPGRADE, WWW_AUTHENTICATE};
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::sse::{Event, KeepAlive, Sse};
@@ -51,6 +53,7 @@ use super::openai::{
     finish_reason, model_list, random_token,
 };
 use super::registry::{LoadedModel, ModelSlot, ResolveError, SlotStatus};
+use super::socket::RawSocket;
 use super::state::{RequestTracker, ServerState};
 use super::stats::ModelState;
 use crate::{CucaError, LocalGeneration, STAGE_COMPUTE_HEADER};
@@ -66,7 +69,7 @@ pub const SSE_BUFFER: usize = 32;
 pub(crate) const PREFILL_HEADER: &str = "x-cuca-prefill";
 /// Largest accepted body of a layer-stage call: the hidden states and K/V
 /// rows of one forward pass, which `max_step_tokens` bounds.
-pub const MAX_STAGE_BODY_BYTES: usize = 1 << 30;
+pub const MAX_STAGE_BODY_BYTES: usize = crate::MAX_STAGE_FRAME_BYTES;
 
 /// An error answered as OpenAI's error body,
 /// `{"error":{"message","type","param","code"}}`.
@@ -248,6 +251,8 @@ pub fn router(state: Arc<ServerState>) -> Router {
             "/cuca/v1/stage/{model}",
             post(stage_named).layer(DefaultBodyLimit::max(MAX_STAGE_BODY_BYTES)),
         )
+        .route("/cuca/v1/stage-stream", get(stage_stream_only))
+        .route("/cuca/v1/stage-stream/{model}", get(stage_stream_named))
         .route("/metrics", get(prometheus));
     if state.stats_api {
         app = app
@@ -413,6 +418,131 @@ async fn stage_named(
     stage_frame(&state, Some(&model), body).await
 }
 
+/// `GET /cuca/v1/stage-stream`: upgrade the connection to the frame stream of
+/// the only model, a layer-stage worker.
+async fn stage_stream_only(
+    State(state): State<Arc<ServerState>>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    stage_stream(&state, None, req)
+}
+
+/// `GET /cuca/v1/stage-stream/{model}`: the same for the named model.
+async fn stage_stream_named(
+    State(state): State<Arc<ServerState>>,
+    Path(model): Path<String>,
+    req: Request,
+) -> Result<Response, ApiError> {
+    stage_stream(&state, Some(&model), req)
+}
+
+/// Whether a header lists `token` (comma separated, any case).
+fn header_lists(headers: &HeaderMap, name: axum::http::HeaderName, token: &str) -> bool {
+    headers
+        .get_all(name)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .any(|t| t.trim().eq_ignore_ascii_case(token))
+}
+
+/// Answer `101 Switching Protocols` and hand the connection to the worker
+/// model, which serves frames on it from a thread of its own (see
+/// [`crate::provider::local`]'s `stagestream`). The request has passed the
+/// same authentication as any other; the model is the one the path names,
+/// and refuses a stream when it is no layer stage (a 409, like a frame to
+/// it) or already serves [`crate::MAX_STAGE_STREAMS`] (a 503).
+fn stage_stream(
+    state: &ServerState,
+    model: Option<&str>,
+    mut req: Request,
+) -> Result<Response, ApiError> {
+    if !header_lists(req.headers(), CONNECTION, "upgrade")
+        || !header_lists(req.headers(), UPGRADE, crate::STAGE_STREAM_UPGRADE)
+    {
+        return Err(ApiError::new(
+            StatusCode::UPGRADE_REQUIRED,
+            "invalid_request_error",
+            "upgrade_required",
+            format!(
+                "this route upgrades to a frame stream: send `Connection: Upgrade` and `Upgrade: {}`",
+                crate::STAGE_STREAM_UPGRADE
+            ),
+        ));
+    }
+    let loaded = resolve_ready(state, model)?;
+    let slot = loaded.model.reserve_stage_stream().map_err(|e| match e {
+        CucaError::Config(message) => ApiError::new(
+            StatusCode::CONFLICT,
+            "invalid_request_error",
+            "stage_mismatch",
+            message,
+        ),
+        other => ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "unavailable_error",
+            "stage_busy",
+            other.to_string(),
+        ),
+    })?;
+    let on_upgrade = req
+        .extensions_mut()
+        .remove::<hyper::upgrade::OnUpgrade>()
+        .ok_or_else(|| ApiError::internal("the connection cannot be upgraded"))?;
+    let socket = req
+        .extensions()
+        .get::<ConnectInfo<RawSocket>>()
+        .map(|info| info.0.clone())
+        .ok_or_else(|| ApiError::internal("the connection's socket is not available"))?;
+    // From here the connection is the stream's: keep its socket when hyper
+    // lets the upgraded connection go.
+    socket.want();
+    let model = loaded.model.clone();
+    tokio::spawn(async move {
+        // hyper has written the 101 and gives the connection up; dropping
+        // what it gave leaves the socket with the claim.
+        match on_upgrade.await {
+            Ok(upgraded) => drop(upgraded),
+            Err(e) => {
+                tracing::debug!("a stage stream upgrade failed: {e}");
+                return;
+            }
+        }
+        let stream = match socket.take() {
+            Ok(stream) => stream,
+            Err(e) => {
+                tracing::warn!("a stage stream socket cannot be taken over: {e}");
+                return;
+            }
+        };
+        if let Err(e) = model.serve_stage_stream(slot, stream, MAX_STAGE_BODY_BYTES) {
+            tracing::warn!("a stage stream cannot start: {e}");
+        }
+    });
+    let mut response = Response::new(axum::body::Body::empty());
+    *response.status_mut() = StatusCode::SWITCHING_PROTOCOLS;
+    let headers = response.headers_mut();
+    headers.insert(CONNECTION, HeaderValue::from_static("upgrade"));
+    headers.insert(
+        UPGRADE,
+        HeaderValue::from_static(crate::STAGE_STREAM_UPGRADE),
+    );
+    Ok(response)
+}
+
+/// The ready model `model` names (the only one when `None`).
+fn resolve_ready(state: &ServerState, model: Option<&str>) -> Result<Arc<LoadedModel>, ApiError> {
+    let slot = state.registry.resolve(model).map_err(|e| match e {
+        ResolveError::Missing => {
+            ApiError::invalid_request("the model is part of the path: several models are loaded")
+                .param("model")
+        }
+        ResolveError::Unknown(name) => ApiError::model_not_found(&name),
+    })?;
+    slot.ready()
+        .ok_or_else(|| ApiError::model_unavailable(slot))
+}
+
 /// Run a coordinator's frame on the worker model and answer its reply frame.
 /// A frame the worker cannot take because its configuration differs from the
 /// coordinator's is a 409, the one status the coordinator reads as a
@@ -422,16 +552,7 @@ async fn stage_frame(
     model: Option<&str>,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    let slot = state.registry.resolve(model).map_err(|e| match e {
-        ResolveError::Missing => {
-            ApiError::invalid_request("the model is part of the path: several models are loaded")
-                .param("model")
-        }
-        ResolveError::Unknown(name) => ApiError::model_not_found(&name),
-    })?;
-    let loaded = slot
-        .ready()
-        .ok_or_else(|| ApiError::model_unavailable(slot))?;
+    let loaded = resolve_ready(state, model)?;
     match loaded.model.stage_call(body.to_vec()).await {
         Ok(reply) => {
             let compute = reply.compute.as_nanos().to_string();
@@ -857,7 +978,8 @@ mod tests {
             crate::server::state::peer_client().unwrap(),
         ));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router(state)).await;
+            let (served, make_service) = crate::server::socket::serving(listener, router(state));
+            let _ = axum::serve(served, make_service).await;
         });
         format!("http://{addr}")
     }
@@ -1031,7 +1153,8 @@ mod tests {
             crate::server::state::peer_client().unwrap(),
         ));
         tokio::spawn(async move {
-            let _ = axum::serve(listener, router(state)).await;
+            let (served, make_service) = crate::server::socket::serving(listener, router(state));
+            let _ = axum::serve(served, make_service).await;
         });
         (format!("http://{addr}"), fingerprint)
     }
@@ -1108,6 +1231,24 @@ mod tests {
                 .unwrap_or_else(|| panic!("{series} is missing:\n{metrics}"))
         };
         assert!(value("cuca_stage_calls_total{model=\"m\",stage=\"0\"} ") > 1.0);
+        // Over the frame stream: the worker saw one upgrade, no POST per call.
+        let worker_metrics = get(&format!("{worker}/metrics"), Some("stage-key"))
+            .await
+            .text()
+            .await
+            .unwrap();
+        let worker_codes = |code: u16| -> f64 {
+            let series = format!("cuca_http_requests_total{{code=\"{code}\"}} ");
+            worker_metrics
+                .lines()
+                .find_map(|l| l.strip_prefix(series.as_str()))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or_else(|| panic!("{series} is missing:\n{worker_metrics}"))
+        };
+        assert!(
+            worker_codes(200) < value("cuca_stage_calls_total{model=\"m\",stage=\"0\"} "),
+            "the worker answered a POST per stage call:\n{worker_metrics}"
+        );
         assert_eq!(
             value("cuca_stage_errors_total{model=\"m\",stage=\"0\"} "),
             0.0
@@ -1195,6 +1336,156 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(big.status(), 413);
+    }
+
+    /// Send the upgrade request of a frame stream on a new connection and
+    /// read the status line and the head of the answer.
+    fn upgrade(
+        base: &str,
+        path: &str,
+        key: Option<&str>,
+        headers: bool,
+    ) -> (std::net::TcpStream, String) {
+        use std::io::{Read, Write};
+        let addr = base.trim_start_matches("http://");
+        let mut sock = std::net::TcpStream::connect(addr).unwrap();
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut head = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n");
+        if headers {
+            head.push_str("Connection: Upgrade\r\nUpgrade: cuca-stage/1\r\n");
+        }
+        if let Some(key) = key {
+            head.push_str(&format!("Authorization: Bearer {key}\r\n"));
+        }
+        head.push_str("\r\n");
+        sock.write_all(head.as_bytes()).unwrap();
+        let mut answer = Vec::new();
+        let mut byte = [0u8; 1];
+        while !answer.ends_with(b"\r\n\r\n") {
+            sock.read_exact(&mut byte).unwrap();
+            answer.push(byte[0]);
+        }
+        (sock, String::from_utf8(answer).unwrap())
+    }
+
+    /// One request and its answer on an upgraded stream: `(status, payload)`.
+    fn stream_call(sock: &mut std::net::TcpStream, frame: &[u8]) -> std::io::Result<(u8, Vec<u8>)> {
+        use std::io::{Read, Write};
+        sock.write_all(&(frame.len() as u64).to_le_bytes())?;
+        sock.write_all(frame)?;
+        let mut head = [0u8; 17];
+        sock.read_exact(&mut head)?;
+        let mut len = [0u8; 8];
+        len.copy_from_slice(&head[9..]);
+        let mut payload = vec![0u8; u64::from_le_bytes(len) as usize];
+        sock.read_exact(&mut payload)?;
+        Ok((head[0], payload))
+    }
+
+    /// The frame stream route authenticates, upgrades only a request that
+    /// asks for it, refuses a model that is no layer stage, answers frames
+    /// with the worker's reply, keeps its connection through a bad frame,
+    /// drops one that announces a frame above the limit, and serves at most
+    /// `MAX_STAGE_STREAMS` connections at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_stage_stream_route_upgrades_authenticates_and_is_bounded() {
+        use crate::provider::local::engine::testing::{
+            engine_at, stage_worker_layers_at, tiny_llama_file, tiny_sizing,
+        };
+        use crate::provider::local::stageframe::{Open, open_frame};
+        // The wire's reply statuses (see `stagestream`).
+        const REPLY_MISMATCH: u8 = 1;
+        const REPLY_FAILED: u8 = 2;
+
+        let file = tiny_llama_file(96);
+        let (worker, fingerprint) = tiny_node(&file.path, Some("stage-key"), |path| {
+            stage_worker_layers_at(path, 96, 0, 1)
+        })
+        .await;
+        let path = "/cuca/v1/stage-stream";
+        let status = |head: &str| head.lines().next().unwrap_or("").to_owned();
+
+        let (_, head) = upgrade(&worker, path, None, true);
+        assert!(status(&head).contains("401"), "{head}");
+        let (_, head) = upgrade(&worker, path, Some("stage-key"), false);
+        assert!(status(&head).contains("426"), "{head}");
+
+        // A model that is no layer stage refuses before it upgrades.
+        let (single, _) = tiny_node(&file.path, None, |path| engine_at(path, 96)).await;
+        let (_, head) = upgrade(&single, path, None, true);
+        assert!(status(&head).contains("409"), "{head}");
+
+        let (mut sock, head) = upgrade(&worker, "/cuca/v1/stage-stream/m", Some("stage-key"), true);
+        assert!(status(&head).contains("101"), "{head}");
+        assert!(
+            head.to_ascii_lowercase().contains("upgrade: cuca-stage/1"),
+            "{head}"
+        );
+
+        // A frame for a different configuration is a mismatch; one that is
+        // no frame at all is a failure; the connection survives both.
+        let (sizing, _) = tiny_sizing(96, 1, None, None);
+        let open = Open {
+            fingerprint,
+            first: 0,
+            end: 1,
+            context_length: 95,
+            max_sequences: 1,
+            kv_tokens: sizing.kv_tokens as u64,
+            max_rows: sizing.max_rows as u64,
+            session: 9,
+        };
+        let (code, payload) = stream_call(&mut sock, &open_frame(&open)).unwrap();
+        assert_eq!(code, REPLY_MISMATCH);
+        assert!(String::from_utf8_lossy(&payload).contains("context_length"));
+        let (code, _) = stream_call(&mut sock, &[0xFF; 3]).unwrap();
+        assert_eq!(code, REPLY_FAILED);
+        let (code, _) = stream_call(&mut sock, &open_frame(&open)).unwrap();
+        assert_eq!(code, REPLY_MISMATCH, "the stream outlived the bad frame");
+
+        // A frame above the limit is not read: the worker says so and closes
+        // the stream.
+        let (mut greedy, _) = upgrade(&worker, path, Some("stage-key"), true);
+        {
+            use std::io::{Read, Write};
+            greedy
+                .write_all(&((crate::MAX_STAGE_FRAME_BYTES as u64) + 1).to_le_bytes())
+                .unwrap();
+            let mut answer = Vec::new();
+            let _ = greedy.read_to_end(&mut answer);
+            assert_eq!(answer.first(), Some(&REPLY_FAILED));
+            assert!(String::from_utf8_lossy(&answer).contains("exceeds the limit"));
+        }
+
+        // Streams are bounded: `sock` holds one, and `greedy`'s place was
+        // freed before its end was seen.
+        let mut held = vec![sock];
+        let mut refused = None;
+        for _ in 0..crate::MAX_STAGE_STREAMS + 1 {
+            let (next, head) = upgrade(&worker, path, Some("stage-key"), true);
+            if status(&head).contains("101") {
+                held.push(next);
+            } else {
+                refused = Some(head);
+                break;
+            }
+        }
+        let head = refused.expect("a stream beyond the bound is refused");
+        assert!(status(&head).contains("503"), "{head}");
+        assert_eq!(held.len(), crate::MAX_STAGE_STREAMS);
+        // A closed stream frees its place.
+        drop(held.pop());
+        let mut reopened = false;
+        for _ in 0..50 {
+            let (_, head) = upgrade(&worker, path, Some("stage-key"), true);
+            if status(&head).contains("101") {
+                reopened = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert!(reopened, "a closed stream frees its place");
     }
 
     /// A TCP proxy to `target` that, once `armed`, cuts both connections

@@ -70,6 +70,27 @@
   16-token chunks a 40-token Qwen 3.5 prompt took 7 calls for 5 steps and now takes 5, and a
   70-token DeepSeek-V4.1 prompt took 12 for 8 and now takes 8. Decode steps were one call
   already.
+- Layer stages: a coordinator sends its frames over one upgraded connection to each worker
+  instead of one `POST` per call. It asks `GET /cuca/v1/stage-stream` for `Upgrade: cuca-stage/1`
+  (the worker checks the API key like any route; 426 without the headers, 409 for a model that
+  is no layer stage, 503 beyond 8 streams per model) and then exchanges length-prefixed frames
+  on the socket with no HTTP around them: a call is a blocking write and read on the
+  coordinator's engine thread, and the worker's reader thread hands the frame to its engine
+  thread, which writes the reply itself. A profile of the `POST` path showed the cost was not
+  our code but the wake-ups between the async runtimes and HTTP stacks of both servers. On
+  loopback with Qwen3 0.6B split at layer 14 the network share of a decode call went from 0.49
+  to 0.19 ms (six runs of 99 calls each: 0.503, 0.510, 0.477, 0.485, 0.462, 0.512 before; 0.194,
+  0.190, 0.190, 0.190, 0.182, 0.188 after). The three calls of a prefill request (an `open` and
+  two passes with 880 KB replies) took about 1.1 ms of network each before and about 0.45 ms
+  after, except in the runs with an unexplained 5 to 6 ms outlier (one of six before, two of
+  six after). A connection lost before any answer is replaced and the frame sent again once, as
+  over `POST`. An `https://` URL, a worker that does not know the route (an older cuca) or a
+  proxy that drops `Upgrade` gets the `POST` route as before, so no configuration changes and
+  the frame layout is unchanged (wire version 2). The byte counters count frame bytes on both
+  paths. The model server now accepts connections through its own listener, whose IO hands its
+  socket over when a stream upgrades the connection; `hyper` becomes a direct dependency of
+  `server` (axum's own). A frame on the stream is limited to 1 GiB before it is read, and a
+  stream idle for 5 minutes is closed.
 
 ## 0.9.1 - 2026-11-15
 

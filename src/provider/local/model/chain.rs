@@ -53,6 +53,7 @@ use crate::provider::local::stageframe::{
 
 mod http;
 mod stats;
+mod stream;
 
 pub(crate) use http::HttpTransport;
 pub(crate) use stats::StageCounters;

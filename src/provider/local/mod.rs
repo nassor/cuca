@@ -244,8 +244,12 @@ mod output;
 mod sampler;
 mod sampling;
 pub(crate) mod stageframe;
+mod stagestream;
 mod tokenizer;
 pub use kv::{KvExport, KvImport};
+pub use stagestream::{
+    MAX_STAGE_FRAME_BYTES, MAX_STAGE_STREAMS, STAGE_STREAM_UPGRADE, StageStreamSlot,
+};
 pub(crate) mod wire;
 
 use std::fmt;
@@ -1890,6 +1894,9 @@ struct LocalModelInner {
     imports_kv: bool,
     /// See [`LocalModel::is_stage`].
     is_stage: bool,
+    /// Frame streams the worker serves now, see
+    /// [`LocalModel::reserve_stage_stream`].
+    stage_streams: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// A loaded in-process model, cheap to clone and share.
@@ -2339,6 +2346,7 @@ impl LocalModel {
                                 fingerprint: engine.fingerprint(),
                                 imports_kv: engine.imports_kv(),
                                 is_stage: engine.is_stage(),
+                                stage_streams: Arc::default(),
                                 sampling: engine.sampling().config(),
                                 draft_stats,
                                 serving: engine.serving_counters(),
