@@ -350,6 +350,7 @@ fn model_stats(
     stats.mean_queue_ms = rates.mean_queue_ms;
     stats.memory.weights_bytes = loaded.weights_bytes;
     stats.memory.kv_bytes = loaded.kv_bytes;
+    stats.memory.device_name = adapter_names(loaded.model.gpus());
     stats.expert_tiers = loaded.model.expert_tier_stats().map(|tier| {
         let (disk_reads_per_s, read_bytes_per_s, hit_ratio) =
             rates.tier.unwrap_or((0.0, 0.0, None));
@@ -384,6 +385,16 @@ fn model_stats(
         drafter.acceptance_ratio = rates.draft_acceptance;
     }
     (stats, rates.step_trend)
+}
+
+/// The adapter names of `gpus` joined by ` + ` (`ModelMemory::device_name`),
+/// leaving out a GPU whose backend reported none.
+fn adapter_names(gpus: &[crate::GpuInfo]) -> String {
+    gpus.iter()
+        .map(|gpu| gpu.name.as_str())
+        .filter(|name| !name.is_empty())
+        .collect::<Vec<_>>()
+        .join(" + ")
 }
 
 /// Build the snapshot the stats API serves, from the rings, the latency
@@ -477,6 +488,25 @@ mod tests {
         (0..=n)
             .map(|i| sample(t0 + Duration::from_secs(i), |s| f(i, s)))
             .collect()
+    }
+
+    #[test]
+    fn adapter_names_join_in_device_order_and_skip_unnamed_ones() {
+        use crate::{GpuAdapter, GpuInfo, LocalDevice};
+        let gpu = |index, name: &str| GpuInfo {
+            device: LocalDevice::Vulkan(GpuAdapter::Discrete(index)),
+            name: name.into(),
+            software: false,
+        };
+        assert_eq!(adapter_names(&[]), "");
+        assert_eq!(
+            adapter_names(&[gpu(0, "AMD Radeon AI PRO R9700")]),
+            "AMD Radeon AI PRO R9700"
+        );
+        assert_eq!(
+            adapter_names(&[gpu(0, "A"), gpu(1, ""), gpu(2, "B")]),
+            "A + B"
+        );
     }
 
     #[test]

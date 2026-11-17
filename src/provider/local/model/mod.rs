@@ -523,6 +523,16 @@ fn holds_engram(hp: &Hparams, range: split::LayerRange) -> bool {
         .is_some_and(|es| es.layers.iter().any(|&il| range.contains(il)))
 }
 
+/// What a GPU backend reports of the adapter behind a device (see
+/// [`LocalDevice`](super::LocalDevice) and [`GpuInfo`](super::GpuInfo)).
+#[cfg(feature = "provider-local-gpu")]
+pub(crate) struct Adapter {
+    /// The adapter's name as its driver reports it; empty when none.
+    pub(crate) name: String,
+    /// No card behind it: a CPU adapter or a software rasterizer.
+    pub(crate) software: bool,
+}
+
 /// The loaded model on the device `LocalModelConfig::device` selected: candle
 /// on the CPU, burn on a GPU, or both with some layers offloaded to the GPU
 /// ([`split`]), or with the first layers on other machines ([`chain`]). All
@@ -963,6 +973,19 @@ impl Model {
             #[cfg(feature = "provider-local-gpu")]
             Model::Split(m) => Some((m.gpu_layers(), m.n_layer())),
             Model::Chain(_) => None,
+        }
+    }
+
+    /// The GPU adapter behind each device the model's weights sit on, shard 0
+    /// first (the last stage's, for a chain); empty on the CPU, and for a
+    /// model whose layers all stayed on the CPU.
+    #[cfg(feature = "provider-local-gpu")]
+    pub(crate) fn adapters(&self) -> Vec<Adapter> {
+        match self {
+            Model::Cpu(_) => Vec::new(),
+            Model::Gpu(m) => m.adapters(),
+            Model::Split(m) => m.adapters(),
+            Model::Chain(m) => m.local().adapters(),
         }
     }
 

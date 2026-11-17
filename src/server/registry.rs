@@ -283,6 +283,13 @@ async fn load_one(slot: Arc<ModelSlot>, spec: ModelSpec) -> Result<(), ServerErr
                 max_sequences = loaded.model.serving_stats().max_sequences,
                 reasoning = loaded.capabilities.reasoning,
                 tools = loaded.capabilities.tools,
+                gpus = %loaded
+                    .model
+                    .gpus()
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; "),
                 "model ready"
             );
             slot.set(SlotStatus::Ready(Arc::new(loaded)));

@@ -48,12 +48,21 @@ device "vulkan"
 cargo run --release --example local_model --features provider-local-vulkan -- --config vulkan.kdl
 ```
 
-The example prints the load time and the device on stderr, then streams the reply:
+The example prints the load time, the device and the adapter it resolved to on stderr, then streams the reply:
 
 ```text,name=Expected on stderr
 load: <seconds> s
 loaded on vulkan
+adapter vulkan = default adapter: <the name of your GPU>
 ```
+
+The load also names the adapter it chose. A machine can hold several (a discrete card and the processor's integrated one), and `device "vulkan"` picks one for you. As each GPU device opens, before the weights upload, the engine logs one `info` line through `tracing`, so a load that then fails for lack of memory still says which adapter it was on:
+
+```text,name=Expected log line
+gpu adapter: vulkan:0 = discrete #0: AMD Radeon AI PRO R9700
+```
+
+The text after `=` says what the index counted. `vulkan:0` is the first discrete adapter in the order the graphics API lists them, `vulkan:integrated:0` the first integrated one, and plain `vulkan` the adapter wgpu prefers (`default adapter`; `default adapter, CPU` when no card stands behind it, as with the llvmpipe software rasterizer). The graphics backend does not report the type of a default adapter, so only a numbered index says discrete or integrated. `cuda:1` and `rocm:1` are the driver's device 1. `cuca run` prints the line with the rest of its log, a library user installs a `tracing` subscriber, and `LocalModel::gpus()` returns the same as `GpuInfo` values. The server's `model ready` line lists the adapters, and the [stats snapshot](@/server/stats-and-metrics.md) carries the names in `models[].memory.device_name`.
 
 The first request is slow. The GPU compiles and tunes its kernels (small GPU programs) the first time the model sees each new input shape. Later requests are fast.
 

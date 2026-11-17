@@ -101,6 +101,11 @@ pub struct ModelMemory {
     pub kv_bytes: u64,
     /// Where the forward pass runs (`cpu`, `vulkan:0`, `cuda:0+cuda:1`, ...).
     pub device: String,
+    /// The GPU adapters behind `device`, as the backend names them
+    /// (`AMD Radeon AI PRO R9700`), joined by ` + ` in the order of
+    /// `device`; empty on the CPU, while the model loads and in a snapshot
+    /// from a server that does not report them.
+    pub device_name: String,
 }
 
 /// Tiered-expert counters (mixture-of-experts model loaded with
@@ -427,6 +432,24 @@ mod tests {
         assert_eq!(snap.diagnosis[0].cause, Cause::QueueSaturated);
         assert_eq!(snap.diagnosis[0].evidence["waiting"], 3.0);
         assert!(snap.upstreams.is_empty());
+    }
+
+    /// `memory.device_name` is new: a snapshot from a server that predates it
+    /// reads it as empty, and one that has it round-trips.
+    #[test]
+    fn the_adapter_name_is_optional_and_round_trips() {
+        let old = r#"{"models": [{"name": "m", "memory": {"device": "vulkan:0"}}]}"#;
+        let snap: StatsSnapshot = serde_json::from_str(old).unwrap();
+        assert_eq!(snap.models[0].memory.device, "vulkan:0");
+        assert_eq!(snap.models[0].memory.device_name, "");
+        let memory = ModelMemory {
+            device: "vulkan:0".into(),
+            device_name: "AMD Radeon AI PRO R9700".into(),
+            ..ModelMemory::default()
+        };
+        let back: ModelMemory =
+            serde_json::from_str(&serde_json::to_string(&memory).unwrap()).unwrap();
+        assert_eq!(back, memory);
     }
 
     #[test]

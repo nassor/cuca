@@ -101,7 +101,8 @@
 //! # Output
 //!
 //! The download progress goes to stderr, then `loaded on <devices>` with the
-//! load time; the reply
+//! load time, and on a GPU one `adapter <device> = <what the index counted>:
+//! <name>` line per GPU; the reply
 //! prints to stdout as its blocks arrive. Reasoning (`Thinking`) blocks print
 //! dimmed after a `[thinking]` prefix when the model reasons, then the answer
 //! follows as plain text. The reply depends on the model and the sampling
@@ -157,6 +158,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             total - gpu - 1
         ),
         None => eprintln!("loaded on {devices}"),
+    }
+    for gpu in model.gpus() {
+        eprintln!("adapter {gpu}");
     }
 
     // Stage 2: build the request. Thinking is on unless `--thinking off`,

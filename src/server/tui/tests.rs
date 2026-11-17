@@ -79,6 +79,7 @@ fn model(name: &str, device: &str, busy: bool) -> ModelStats {
             weights_bytes: GIB * 16 / 5,
             kv_bytes: GIB * 3 / 2,
             device: device.to_string(),
+            device_name: String::new(),
         },
         requests: RequestStats {
             in_flight: 8,

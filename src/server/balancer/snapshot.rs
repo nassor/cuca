@@ -110,10 +110,18 @@ fn aggregate(out: &mut ModelStats, parts: &[&ModelStats]) {
     devices.sort_unstable();
     devices.dedup();
     out.device = devices.join(",");
+    let mut names: Vec<&str> = parts
+        .iter()
+        .map(|m| m.memory.device_name.as_str())
+        .filter(|name| !name.is_empty())
+        .collect();
+    names.sort_unstable();
+    names.dedup();
     out.memory = ModelMemory {
         weights_bytes: sum_u(|m| m.memory.weights_bytes),
         kv_bytes: sum_u(|m| m.memory.kv_bytes),
         device: out.device.clone(),
+        device_name: names.join(","),
     };
     out.max_sequences = sum_u(|m| m.max_sequences);
     out.running = sum_u(|m| m.running);
@@ -330,6 +338,26 @@ mod tests {
         assert_eq!(m.kv.total_blocks, 200);
         assert_eq!(m.kv.usage_ratio, 60.0 / 200.0);
         assert_eq!((m.state, m.device.as_str()), (ModelState::Ready, "cpu"));
+    }
+
+    #[test]
+    fn the_union_lists_each_adapter_name_once() {
+        let named = |name: &str| {
+            let mut m = model("m", 1, 0, 1.0, 1.0);
+            m.memory.device_name = name.into();
+            m
+        };
+        let inputs = [
+            input("a", true, vec![named("AMD Radeon AI PRO R9700")]),
+            input("b", true, vec![named("AMD Radeon AI PRO R9700")]),
+            input("c", true, vec![named("NVIDIA A100")]),
+            input("d", true, vec![model("m", 1, 0, 1.0, 1.0)]),
+        ];
+        let union = union_models(&inputs);
+        assert_eq!(
+            union[0].memory.device_name,
+            "AMD Radeon AI PRO R9700,NVIDIA A100"
+        );
     }
 
     #[test]

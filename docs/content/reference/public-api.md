@@ -70,7 +70,7 @@ These items are reached by path, not from the root:
 
 | Needs | Items |
 |---|---|
-| `provider-local` | `BatchingConfig`, `ConvertConfig`, `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `EngramCache`, `EngramQuant`, `EngramStats`, `ExpertHeat`, `ExpertPlacement`, `ExpertTierStats`, `ExpertTiers`, `GenerationReport`, `GpuAdapter`, `LocalCapabilities`, `LocalDevice`, `LocalGeneration`, `LocalModel`, `LocalModelConfig`, `ModelPart`, `ModelPreset`, `ModelSource`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `SamplingConfig`, `ServingStats`, `WeightQuant` |
+| `provider-local` | `BatchingConfig`, `ConvertConfig`, `DownloadProgress`, `DownloadProgressCallback`, `DraftStats`, `DrafterSource`, `EngramCache`, `EngramQuant`, `EngramStats`, `ExpertHeat`, `ExpertPlacement`, `ExpertTierStats`, `ExpertTiers`, `GenerationReport`, `GpuAdapter`, `GpuInfo`, `LocalCapabilities`, `LocalDevice`, `LocalGeneration`, `LocalModel`, `LocalModelConfig`, `ModelPart`, `ModelPreset`, `ModelSource`, `ModelTemplate`, `PresetPart`, `PresetTemplate`, `SamplingConfig`, `ServingStats`, `WeightQuant` |
 
 ### Plugins
 
@@ -226,6 +226,7 @@ With `provider-local`, the root re-exports are the whole public path to the engi
 | `ExpertPlacement`, `ExpertTiers` | `Resident` (default), `Tiered(ExpertTiers)`, `Host { layers }` |
 | `SamplingConfig` | `temperature`, `top_k`, `top_p`, `seed`, all `Option`; `DEFAULT_TEMPERATURE` (1.0), `DEFAULT_TOP_K` (64), `DEFAULT_TOP_P` (0.95) |
 | `LocalDevice`, `GpuAdapter` | `Cpu`, `Vulkan(GpuAdapter)`, `Metal(GpuAdapter)`, `Cuda(usize)`, `Rocm(usize)`; `GpuAdapter` is `Default`, `Discrete(usize)` or `Integrated(usize)`; `required_feature`, `FromStr` and `Display` (its inverse) |
+| `GpuInfo` | what `LocalModel::gpus()` returns, one per GPU: `device`, `name` (the adapter as its driver names it), `software`; `backend()`, `selection()` (`discrete #0`, `default adapter`, `CUDA device 1`) and `Display` (`vulkan:0 = discrete #0: AMD Radeon AI PRO R9700`) |
 | `LocalCapabilities`, `DraftStats`, `ServingStats`, `ExpertTierStats`, `ExpertHeat` | capability and statistics reports; `DraftStats::acceptance_rate` |
 | `EngramStats` | `lookups`, `cache_hits`, `disk_reads`, `bytes_read`, `resident_rows`, `resident_bytes`, `capacity_rows`; `hit_rate`. `LocalModel::engram_stats` is `None` for a model without an Engram table |
 | `DownloadProgress`, `DownloadProgressCallback` | `downloaded_bytes`, `total_bytes`; `DownloadProgressCallback::new` |

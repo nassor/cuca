@@ -1092,6 +1092,73 @@ impl LocalDevice {
     }
 }
 
+/// A GPU a loaded model runs on, as its backend names it
+/// ([`LocalModel::gpus`]): which adapter a configured [`LocalDevice`]
+/// resolved to, so that on a machine with several the load says which one it
+/// took.
+///
+/// How the index of a device selects: [`GpuAdapter::Discrete`] and
+/// [`GpuAdapter::Integrated`] count the adapters of that type in the order
+/// the graphics API lists them (`vulkan:0` is discrete #0, `vulkan:1` the
+/// next discrete one); [`GpuAdapter::Default`] is the adapter wgpu prefers
+/// (high performance), whose type the backend does not report; `cuda:<n>`
+/// and `rocm:<n>` are the driver's device ordinals.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuInfo {
+    /// The configured device: [`LocalModelConfig::device`], or one of its
+    /// [`shards`](LocalModelConfig::shards).
+    pub device: LocalDevice,
+    /// The adapter's name as its driver reports it (`AMD Radeon AI PRO
+    /// R9700`); empty when the backend reports none.
+    pub name: String,
+    /// The backend reports no card behind the adapter: a CPU adapter or a
+    /// software rasterizer (llvmpipe on Vulkan).
+    pub software: bool,
+}
+
+impl GpuInfo {
+    /// The backend of the device: `vulkan`, `metal`, `cuda` or `rocm`
+    /// (`cpu` for [`LocalDevice::Cpu`], which has no adapter).
+    pub fn backend(&self) -> &'static str {
+        match self.device {
+            LocalDevice::Cpu => "cpu",
+            LocalDevice::Vulkan(_) => "vulkan",
+            LocalDevice::Metal(_) => "metal",
+            LocalDevice::Cuda(_) => "cuda",
+            LocalDevice::Rocm(_) => "rocm",
+        }
+    }
+
+    /// What the device's index counts: `discrete #0`, `integrated #1`,
+    /// `default adapter` (`default adapter, CPU` when it is a software
+    /// adapter), `CUDA device 0` or `HIP device 0`.
+    pub fn selection(&self) -> String {
+        match self.device {
+            LocalDevice::Cpu => "the CPU".to_string(),
+            LocalDevice::Vulkan(adapter) | LocalDevice::Metal(adapter) => match adapter {
+                GpuAdapter::Default if self.software => "default adapter, CPU".to_string(),
+                GpuAdapter::Default => "default adapter".to_string(),
+                GpuAdapter::Discrete(n) => format!("discrete #{n}"),
+                GpuAdapter::Integrated(n) => format!("integrated #{n}"),
+            },
+            LocalDevice::Cuda(n) => format!("CUDA device {n}"),
+            LocalDevice::Rocm(n) => format!("HIP device {n}"),
+        }
+    }
+}
+
+/// `vulkan:0 = discrete #0: AMD Radeon AI PRO R9700`.
+impl fmt::Display for GpuInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = if self.name.is_empty() {
+            "(the backend reports no name)"
+        } else {
+            &self.name
+        };
+        write!(f, "{} = {}: {name}", self.device, self.selection())
+    }
+}
+
 /// The [`CucaError::Config`] for a device whose backend is compiled out, or
 /// `None` when the device is available in this build.
 pub(crate) fn device_unavailable(device: LocalDevice) -> Option<CucaError> {
@@ -1915,6 +1982,8 @@ struct LocalModelInner {
     /// Layers on the GPU and in all when the model runs split over the CPU
     /// and the GPU ([`LocalModelConfig::gpu_layers`]).
     layer_split: Option<(usize, usize)>,
+    /// The adapters the model runs on, see [`LocalModel::gpus`].
+    gpus: Vec<GpuInfo>,
     /// Size of the GGUF file, see [`LocalModel::weights_file_bytes`].
     file_bytes: u64,
     /// See [`LocalModel::fingerprint`].
@@ -2230,6 +2299,18 @@ impl LocalModel {
         self.inner.layer_split
     }
 
+    /// The GPU adapters the model's weights sit on, as the backend reports
+    /// them: the configured device, then each of its
+    /// [`shards`](LocalModelConfig::shards), each with the name its driver
+    /// gives the adapter. Empty for a model on the CPU, and for a
+    /// [`gpu_layers`](LocalModelConfig::gpu_layers) of 0 (which loads on the
+    /// CPU); a coordinator reports its own last stage's. Loading a model also
+    /// logs each adapter at info level (`tracing`, target
+    /// `cuca::provider::local::model::gpu`), so a failed load names it too.
+    pub fn gpus(&self) -> &[GpuInfo] {
+        &self.inner.gpus
+    }
+
     /// What this model supports: reasoning, switching it off, tool calls.
     pub fn capabilities(&self) -> LocalCapabilities {
         let reasoning = self.inner.format.writes_reasoning();
@@ -2386,6 +2467,7 @@ impl LocalModel {
                                 engram: engine.engram_counters(),
                                 stages: engine.stage_counters(),
                                 layer_split: engine.layer_split(),
+                                gpus: engine.gpus().to_vec(),
                                 tokenizer,
                                 template,
                                 format,
@@ -3767,6 +3849,80 @@ mod tests {
                 matches!(&err, CucaError::Config(m) if m.contains("unknown local device")),
                 "{bad}: {err}"
             );
+        }
+    }
+
+    /// The description of a GPU names the backend, what the index counted
+    /// and the adapter, for every way a device selects one.
+    #[test]
+    fn a_gpu_is_described_by_backend_selection_and_name() {
+        use GpuAdapter::{Default as Dflt, Discrete, Integrated};
+        let gpu = |device, name: &str, software| GpuInfo {
+            device,
+            name: name.to_string(),
+            software,
+        };
+        for (info, backend, selection, line) in [
+            (
+                gpu(
+                    LocalDevice::Vulkan(Discrete(0)),
+                    "AMD Radeon AI PRO R9700",
+                    false,
+                ),
+                "vulkan",
+                "discrete #0",
+                "vulkan:0 = discrete #0: AMD Radeon AI PRO R9700",
+            ),
+            (
+                gpu(
+                    LocalDevice::Vulkan(Integrated(1)),
+                    "AMD Radeon Graphics",
+                    false,
+                ),
+                "vulkan",
+                "integrated #1",
+                "vulkan:integrated:1 = integrated #1: AMD Radeon Graphics",
+            ),
+            (
+                gpu(LocalDevice::Vulkan(Dflt), "NVIDIA GeForce RTX 4090", false),
+                "vulkan",
+                "default adapter",
+                "vulkan = default adapter: NVIDIA GeForce RTX 4090",
+            ),
+            (
+                gpu(LocalDevice::Vulkan(Dflt), "llvmpipe (LLVM 19.1.0)", true),
+                "vulkan",
+                "default adapter, CPU",
+                "vulkan = default adapter, CPU: llvmpipe (LLVM 19.1.0)",
+            ),
+            (
+                gpu(LocalDevice::Metal(Dflt), "Apple M3 Pro", false),
+                "metal",
+                "default adapter",
+                "metal = default adapter: Apple M3 Pro",
+            ),
+            (
+                gpu(LocalDevice::Cuda(1), "NVIDIA A100", false),
+                "cuda",
+                "CUDA device 1",
+                "cuda:1 = CUDA device 1: NVIDIA A100",
+            ),
+            (
+                gpu(LocalDevice::Rocm(0), "AMD Instinct MI300X", false),
+                "rocm",
+                "HIP device 0",
+                "rocm:0 = HIP device 0: AMD Instinct MI300X",
+            ),
+            (
+                gpu(LocalDevice::Vulkan(Discrete(0)), "", false),
+                "vulkan",
+                "discrete #0",
+                "vulkan:0 = discrete #0: (the backend reports no name)",
+            ),
+        ] {
+            assert_eq!(info.backend(), backend, "{info:?}");
+            assert_eq!(info.selection(), selection, "{info:?}");
+            assert_eq!(info.to_string(), line);
         }
     }
 

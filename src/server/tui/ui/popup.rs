@@ -186,6 +186,12 @@ fn model_lines(model: &ModelStats) -> Vec<Line<'static>> {
         field("K/V", format::bytes(model.memory.kv_bytes)),
         field("on", model.memory.device.clone()),
     ]));
+    if !model.memory.device_name.is_empty() {
+        lines.push(Line::from(vec![field(
+            "adapter",
+            model.memory.device_name.clone(),
+        )]));
+    }
     if let Some(tiers) = &model.expert_tiers {
         lines.push(heading("Expert tiers"));
         lines.push(Line::from(vec![

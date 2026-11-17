@@ -335,15 +335,16 @@ use super::transfer::{DeltaRows, MISMATCH, PoolRows, entries, group_rows};
 use super::{Batch, Want, attention_mask, build_rope_tables, check_context, err, read_hparams};
 use crate::error::CucaError;
 use crate::provider::local::{
-    EngramCache, ExpertHeat, ExpertPlacement, ExpertTiers, LocalDevice, device_unavailable,
+    EngramCache, ExpertHeat, ExpertPlacement, ExpertTiers, GpuInfo, LocalDevice, device_unavailable,
 };
 
 mod hyper;
 
 /// The burn device for `device`, opened now so that a missing adapter or
-/// driver is an error here rather than a panic at the first tensor.
+/// driver is an error here rather than a panic at the first tensor. Logs at
+/// info level which adapter it resolved to ([`log_adapter`]).
 pub(super) fn open_device(device: LocalDevice) -> Result<Device, CucaError> {
-    match device {
+    let opened: Device = match device {
         #[cfg(feature = "provider-local-vulkan")]
         LocalDevice::Vulkan(adapter) => open_wgpu(
             device,
@@ -371,7 +372,48 @@ pub(super) fn open_device(device: LocalDevice) -> Result<Device, CucaError> {
         other => Err(device_unavailable(other).unwrap_or_else(|| {
             CucaError::Config(format!("device {other:?} does not run the GPU engine"))
         })),
+    }?;
+    log_adapter(device, &opened);
+    Ok(opened)
+}
+
+/// What the backend reports of the adapter behind `device`: the name the
+/// driver gives it (the wgpu adapter's name, the CUDA or HIP device's), and
+/// whether no card stands behind it (a CPU adapter or software rasterizer).
+/// The graphics APIs report an adapter's type to wgpu only, which CubeCL does
+/// not hand on: [`GpuInfo::selection`] knows it from the configured
+/// [`GpuAdapter`](crate::provider::local::GpuAdapter) where the index names one.
+fn adapter_of(device: &Device) -> super::Adapter {
+    match device.identity() {
+        Some(identity) => super::Adapter {
+            name: identity.name,
+            software: identity.physical.is_none(),
+        },
+        None => super::Adapter {
+            name: String::new(),
+            software: false,
+        },
     }
+}
+
+/// Log at info level the adapter `opened` is for `device`: the backend, the
+/// adapter's name and what the device's index selected (`vulkan:0 = discrete
+/// #0: AMD Radeon AI PRO R9700`). A load that fails after the device opened
+/// (most often out of memory) still says which adapter it was on.
+fn log_adapter(device: LocalDevice, opened: &Device) {
+    let adapter = adapter_of(opened);
+    let info = GpuInfo {
+        device,
+        name: adapter.name,
+        software: adapter.software,
+    };
+    tracing::info!(
+        backend = info.backend(),
+        device = %info.device,
+        selection = %info.selection(),
+        adapter = %info.name,
+        "gpu adapter: {info}"
+    );
 }
 
 /// Initialize a wgpu-backed device. A second model on the same adapter finds
@@ -3356,6 +3398,11 @@ impl GpuTransformer {
             .iter()
             .map(|w| self.layout.pool_bytes(&w.hp))
             .sum()
+    }
+
+    /// The adapter behind the device of every shard, shard 0 first.
+    pub(crate) fn adapters(&self) -> Vec<super::Adapter> {
+        self.weights.iter().map(|w| adapter_of(&w.device)).collect()
     }
 
     /// Take the recurrent state of `slot` back to at most `len` positions

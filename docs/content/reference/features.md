@@ -135,7 +135,7 @@ Five features extend `provider-local`. None is a provider on its own. See [Run o
 
 | Feature | What it is for | Pulls in |
 |---|---|---|
-| `provider-local-gpu` | the shared GPU engine; picks no backend by itself | `provider-local`, `burn`, `burn-cubecl`, `cubecl` |
+| `provider-local-gpu` | the shared GPU engine; picks no backend by itself | `provider-local`, `burn`, `burn-cubecl`, `cubecl`, `tracing` |
 | `provider-local-vulkan` | Vulkan GPUs (Windows, Linux) | `provider-local-gpu`, `burn/vulkan` |
 | `provider-local-metal` | Apple GPUs | `provider-local-gpu`, `burn/metal` |
 | `provider-local-cuda` | NVIDIA GPUs through CUDA | `provider-local-gpu`, `burn/cuda` |

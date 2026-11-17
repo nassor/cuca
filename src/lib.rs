@@ -162,8 +162,8 @@ pub use crate::plugins::web_search::{
 pub use crate::provider::local::{
     BatchingConfig, CarryDtype, ConvertConfig, DownloadProgress, DownloadProgressCallback,
     DraftStats, DrafterSource, EngramCache, EngramQuant, EngramStats, ExpertHeat, ExpertPlacement,
-    ExpertTierStats, ExpertTiers, GenerationReport, GpuAdapter, KvExport, KvExportConfig, KvImport,
-    LocalCapabilities, LocalDevice, LocalGeneration, LocalModel, LocalModelConfig,
+    ExpertTierStats, ExpertTiers, GenerationReport, GpuAdapter, GpuInfo, KvExport, KvExportConfig,
+    KvImport, LocalCapabilities, LocalDevice, LocalGeneration, LocalModel, LocalModelConfig,
     MAX_STAGE_FRAME_BYTES, MAX_STAGE_STREAMS, ModelPart, ModelPreset, ModelSource, ModelTemplate,
     PresetPart, PresetTemplate, PromptTokens, RemoteStage, STAGE_COMPUTE_HEADER,
     STAGE_STREAM_UPGRADE, SamplingConfig, ServingStats, StageRange, StageReply, StageStats,

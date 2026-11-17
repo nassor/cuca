@@ -612,6 +612,11 @@ mod model {
             self.front.kv_pool_bytes()
         }
 
+        /// The adapter behind the GPU half.
+        pub(crate) fn adapters(&self) -> Vec<super::super::Adapter> {
+            self.back.adapters()
+        }
+
         /// Whether the model has recurrent layers.
         pub(crate) fn is_hybrid(&self) -> bool {
             self.back.is_hybrid()

@@ -89,6 +89,19 @@
   DFlash and DSpark stay refused (they read the hidden rows of several layers of the target, and a
   stage call returns none of a worker's). DeepSeek-V4.1 chains roll back at the model level, but
   no drafter pairs with it on a chain (the only one for it is DSpark).
+- `provider-local-gpu`: a load names the GPU adapter it chose. When each GPU device opens, before
+  any weight uploads (so a load that then runs out of memory still says which adapter it was
+  on), the engine logs one `info` line through `tracing`, `gpu adapter: vulkan:0 = discrete #0:
+  AMD Radeon AI PRO R9700`: the configured device, what its index counted and the name the
+  backend reports (wgpu's adapter name on Vulkan and Metal, the device name on CUDA and ROCm,
+  read through `Device::identity`). CubeCL's wgpu runtime does not hand on an adapter's type, so
+  `discrete` and `integrated` come from the configured index and a plain `vulkan` or `metal`
+  reports `default adapter` (`default adapter, CPU` for a software rasterizer such as llvmpipe).
+  `provider-local-gpu` now owns the optional `tracing` dependency. Library: `LocalModel::gpus()`
+  returns `GpuInfo` values (`device`, `name`, `software`; `backend()`, `selection()`, `Display`),
+  empty on the CPU and at `gpu_layers = 0`. Server: the `model ready` log line lists them, and the
+  stats snapshot gains `models[].memory.device_name` (a new field, empty when absent, so older
+  snapshots and clients read it as empty; the balancer's union lists each name once).
 
 ### Changed
 

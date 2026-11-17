@@ -79,7 +79,7 @@ use super::model::split::LayerRange;
 use super::sampler::{SplitMix64, random_seed};
 use super::sampling::{FileSampling, Sampling};
 use super::tokenizer::Tokenizer;
-use super::{LocalDevice, LocalModelConfig, MAX_DRAFT_TOKENS};
+use super::{GpuInfo, LocalDevice, LocalModelConfig, MAX_DRAFT_TOKENS};
 use crate::client::ResponseMetadataHandle;
 use crate::error::CucaError;
 use crate::types::MessageContentBlock;
@@ -211,6 +211,9 @@ pub(crate) struct Engine {
     /// The state of a layer-stage worker ([`LocalModelConfig::stage`]);
     /// `None` for every other engine.
     stage: Option<stage::StageHost>,
+    /// The GPU adapters the model runs on ([`LocalModel::gpus`]); empty for
+    /// an engine on the CPU and for one not built by [`Engine::open`].
+    gpus: Vec<GpuInfo>,
     /// The ids the last sequence that ended held (empty after a failure).
     #[cfg(test)]
     last_ids: Vec<u32>,
@@ -784,6 +787,10 @@ impl Engine {
             )
         });
         engine.max_exports = config.kv_export.as_ref().map(|c| c.max_exports);
+        #[cfg(feature = "provider-local-gpu")]
+        {
+            engine.gpus = gpu_info(config, &engine.model);
+        }
         Ok((engine, tokenizer, template, format))
     }
 
@@ -835,6 +842,7 @@ impl Engine {
             next_transfer: 0,
             sizing: Sizing::single(context_length),
             stage: None,
+            gpus: Vec::new(),
             stats,
             serving,
             governor: std::array::from_fn(|_| Governor::default()),
@@ -877,6 +885,11 @@ impl Engine {
     /// Layers on the GPU and in all when layers are offloaded.
     pub(crate) fn layer_split(&self) -> Option<(usize, usize)> {
         self.model.layer_split()
+    }
+
+    /// The GPU adapters the model runs on, see [`LocalModel::gpus`].
+    pub(crate) fn gpus(&self) -> &[GpuInfo] {
+        &self.gpus
     }
 
     /// Counters and heat of the expert tiers; `None` unless the model loaded
@@ -1041,6 +1054,23 @@ fn resolve_batching_with(
         prefix_cache: b.prefix_cache,
     };
     Ok((batching, sizing))
+}
+
+/// The GPUs `model` runs on, each labelled with the configured device it was
+/// opened for: `config.device`, then each of `config.shards`, in the order the
+/// model lists its adapters. A model on the CPU has none, and neither has one
+/// whose layers all stayed there (`gpu_layers = 0`).
+#[cfg(feature = "provider-local-gpu")]
+fn gpu_info(config: &LocalModelConfig, model: &Model) -> Vec<GpuInfo> {
+    std::iter::once(config.device)
+        .chain(config.shards.iter().copied())
+        .zip(model.adapters())
+        .map(|(device, adapter)| GpuInfo {
+            device,
+            name: adapter.name,
+            software: adapter.software,
+        })
+        .collect()
 }
 
 /// The `general.architecture` of a GGUF file (empty when absent).
