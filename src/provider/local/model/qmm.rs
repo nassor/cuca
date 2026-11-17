@@ -1135,8 +1135,8 @@ fn decode_tq1_0(b: &[u8; iq::TQ1_0_BYTES], dst: &mut Dst) {
     let d = f16_le(b, 52);
     let one = Quants::splat(1);
     let (a, c) = (bytes16(&b[..16]), bytes16(&b[16..32]));
-    for n in 0..5 {
-        dst.quants[n] = pair_lanes(trit(a, n), trit(c, n)) - one;
+    for (n, q) in dst.quants.iter_mut().enumerate().take(5) {
+        *q = pair_lanes(trit(a, n), trit(c, n)) - one;
     }
     let x = bytes16(&b[32..48]);
     for k in 0..2 {

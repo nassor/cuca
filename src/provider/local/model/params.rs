@@ -1380,8 +1380,8 @@ mod tests {
         ]);
         let p = Hparams::from_metadata(&meta, &none).unwrap();
         // Layers 5 and 11 are full; the others sliding with the default base.
-        for il in 0..12 {
-            assert_eq!(p.layers[il].window.is_some(), il % 6 != 5, "layer {il}");
+        for (il, layer) in p.layers.iter().enumerate().take(12) {
+            assert_eq!(layer.window.is_some(), il % 6 != 5, "layer {il}");
         }
         assert_eq!(p.ropes[p.layers[0].rope.unwrap()].base, 10_000.0);
         assert_eq!(p.ropes[p.layers[5].rope.unwrap()].base, 1e6);
@@ -1445,8 +1445,8 @@ mod tests {
             ("smollm3.attention.layer_norm_rms_epsilon", F32(1e-6)),
         ]);
         let p = Hparams::from_metadata(&meta, &none).unwrap();
-        for il in 0..8 {
-            assert_eq!(p.layers[il].rope.is_none(), il % 4 == 3, "layer {il}");
+        for (il, layer) in p.layers.iter().enumerate().take(8) {
+            assert_eq!(layer.rope.is_none(), il % 4 == 3, "layer {il}");
         }
     }
 
@@ -1716,9 +1716,8 @@ mod tests {
     fn muse_glimmer_rotates_sliding_layers_only_with_the_global_base() {
         let p = Hparams::from_metadata(&muse_metadata(), &none).unwrap();
         assert_eq!(p.arch, Arch::MuseGlimmer);
-        for il in 0..8 {
+        for (il, l) in p.layers.iter().enumerate().take(8) {
             let global = il % 4 == 3;
-            let l = &p.layers[il];
             assert_eq!(l.rope.is_none(), global, "layer {il}");
             assert_eq!(l.window, if global { None } else { Some(16) }, "layer {il}");
             assert_eq!(l.head_dim, 32);

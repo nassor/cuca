@@ -128,7 +128,7 @@ impl LocalModel {
             return Err(CucaError::Config("this model is not a layer stage".into()));
         }
         let taken = &self.inner.stage_streams;
-        let reserved = taken.fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| {
+        let reserved = taken.try_update(Ordering::AcqRel, Ordering::Acquire, |n| {
             (n < MAX_STAGE_STREAMS).then_some(n + 1)
         });
         if reserved.is_err() {
