@@ -328,7 +328,7 @@ impl DspineBridge {
     ) -> Result<Vec<u32>, CucaError> {
         let h = self.n_embd;
         let r = self.spec.rank;
-        let coarse = target
+        let mut coarse = target
             .head(normed)
             .map_err(candle_err)?
             .flatten_all()
@@ -341,6 +341,13 @@ impl DspineBridge {
                 "DSpine head returned {} logits for {k} rows of vocab {vocab}",
                 coarse.len()
             )));
+        }
+
+        let suppressed = target.suppressed();
+        if !suppressed.is_empty() {
+            for row in coarse.chunks_exact_mut(vocab) {
+                crate::provider::local::tokenizer::mask_suppressed(row, suppressed);
+            }
         }
 
         let kk = self.spec.head_topk.min(vocab);

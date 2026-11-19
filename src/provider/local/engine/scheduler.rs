@@ -64,7 +64,7 @@ use crate::provider::local::output::OutputParser;
 use crate::provider::local::sampler::{
     Dist, Scratch, SplitMix64, greedy, greedy_with_prob, sample,
 };
-use crate::provider::local::tokenizer::Tokenizer;
+use crate::provider::local::tokenizer::{Tokenizer, mask_suppressed};
 use crate::request::{PromptCacheUsage, TokenUsage};
 use crate::types::MessageContentBlock;
 
@@ -1446,7 +1446,9 @@ impl Engine {
             q_dists, predicted, ..
         } = &mut *round;
         let scratch = &mut seq.scratch;
+        let suppressed = self.tokenizer.suppressed_tokens();
         let mut pick = |l: &mut [f32]| -> Option<u32> {
+            mask_suppressed(l, suppressed);
             draft_steps += 1;
             let j = draft_steps;
             let (d, q) = if greedy_mode {
@@ -1545,10 +1547,11 @@ impl Engine {
         if !last {
             return;
         }
-        let Some(logits) = logits else {
+        let Some(mut logits) = logits else {
             self.fail(i, local_err("prefill produced no logits"));
             return;
         };
+        mask_suppressed(&mut logits, self.tokenizer.suppressed_tokens());
         let seq = &mut self.running[i];
         seq.logits = logits;
         // Only the last row seeds the first draft.
@@ -1587,6 +1590,12 @@ impl Engine {
         let drafts = &batch[1..];
         // `Want::Last` returned one row, `Want::All` one per batch token.
         let vocab = rows.len() / batch.len();
+        let suppressed = self.tokenizer.suppressed_tokens();
+        if !suppressed.is_empty() {
+            for row in rows.chunks_exact_mut(vocab) {
+                mask_suppressed(row, suppressed);
+            }
+        }
         let seq = &mut self.running[i];
         let greedy_mode = seq.temperature <= 0.0;
         let (temperature, top_k, top_p) = (seq.temperature, seq.top_k, seq.top_p);

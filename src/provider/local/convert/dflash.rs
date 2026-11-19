@@ -213,6 +213,7 @@ struct Config {
     sliding: Vec<bool>,
     window: Option<usize>,
     block_causal: bool,
+    swa_causal: bool,
     dspine: Option<DspineCfg>,
 }
 
@@ -411,11 +412,6 @@ impl Config {
                 "the DFlash drafter's `attention_bias` must be false",
             ));
         }
-        if hp.get("tie_word_embeddings").and_then(Json::as_bool) == Some(true) {
-            return Err(cfg_err(
-                "the DFlash drafter's `tie_word_embeddings` must be false (it shares the target head)",
-            ));
-        }
         if hp.get("rope_scaling").is_some_and(|v| !v.is_null()) {
             return Err(cfg_err(
                 "the DFlash drafter's `rope_scaling` is not supported (only default RoPE)",
@@ -444,16 +440,23 @@ impl Config {
                 .get("code_bridge_second_pass")
                 .is_some_and(|v| !v.is_null());
 
-        let block_causal = df
+        let df_block_causal = df
             .and_then(|d| d.get("draft_block_causal"))
             .and_then(Json::as_bool)
             .unwrap_or(false);
+        let cfg_is_causal = hp.get("is_causal").and_then(Json::as_bool);
+        if df_block_causal && cfg_is_causal == Some(false) {
+            return Err(cfg_err(
+                "`is_causal` is false while `dflash_config.draft_block_causal` is true",
+            ));
+        }
         let dspine = if is_dspine {
             let df_map = df.ok_or_else(|| cfg_err("DSpine checkpoint misses `dflash_config`"))?;
-            Some(read_dspine_cfg(hp, df_map, n_layer, block_causal)?)
+            Some(read_dspine_cfg(hp, df_map, n_layer, df_block_causal)?)
         } else {
             None
         };
+        let block_causal = df_block_causal || cfg_is_causal == Some(true);
 
         let layer_types = parse_layer_types(hp.get("layer_types"), n_layer)?;
         let use_sw = hp.get("use_sliding_window").and_then(Json::as_bool);
@@ -480,14 +483,17 @@ impl Config {
                 }
                 (vec![false; n_layer], None)
             } else {
-                let all_sliding = layer_types.as_ref().is_some_and(|lt| lt.iter().all(|&s| s));
-                let max_win = hp.uint(&["max_window_layers"]).unwrap_or(n_layer);
+                let has_explicit_lt = layer_types.is_some();
+                let sliding = layer_types.unwrap_or_else(|| vec![true; n_layer]);
+                let any_sw = sliding.iter().any(|&s| s);
+                let max_win_ok = has_explicit_lt
+                    || hp.uint(&["max_window_layers"]).unwrap_or(n_layer) == n_layer;
                 let w = hp.uint(&["sliding_window"]).filter(|&w| w > 0);
-                match (use_sw == Some(true), all_sliding, max_win == n_layer, w) {
-                    (true, true, true, Some(w)) => (vec![true; n_layer], Some(w)),
+                match (use_sw == Some(true), any_sw, max_win_ok, w) {
+                    (true, true, true, Some(w)) => (sliding, Some(w)),
                     _ => {
                         return Err(cfg_err(
-                            "DSpine sliding attention requires `use_sliding_window = true`, all `sliding_attention` layers, `max_window_layers = num_hidden_layers`, and positive `sliding_window`",
+                            "DSpine sliding attention requires `use_sliding_window = true`, at least one `sliding_attention` layer, `max_window_layers = num_hidden_layers`, and positive `sliding_window`",
                         ));
                     }
                 }
@@ -511,6 +517,10 @@ impl Config {
             };
             (sliding, window)
         };
+        let is_muse = has_arch(raw, "MuseGlimmerAssistantModel")
+            || hp.get("model_type").and_then(Json::as_str) == Some("muse_glimmer_assistant");
+        let swa_causal =
+            !is_muse && !block_causal && cfg_is_causal != Some(false) && sliding.iter().any(|&s| s);
 
         let target_ids_val = df
             .and_then(|d| d.get("target_layer_ids"))
@@ -588,6 +598,7 @@ impl Config {
             sliding,
             window,
             block_causal,
+            swa_causal,
             dspine,
         })
     }
@@ -646,6 +657,9 @@ impl Config {
         }
         if self.block_causal {
             kv.push((key("block_causal"), Value::Bool(true)));
+        }
+        if self.swa_causal {
+            kv.push((key("swa_causal"), Value::Bool(true)));
         }
         if let Some(ds) = &self.dspine {
             kv.push(u(&key("dspine.code_size"), ds.code_size)?);
@@ -1707,9 +1721,176 @@ mod tests {
             "{e}"
         );
 
+        let mut not_causal = base.clone();
+        not_causal["is_causal"] = serde_json::json!(false);
+        let e = convert_err("dspine-not-causal", &not_causal, true, 1);
+        assert!(e.contains("is_causal"), "{e}");
+
+        // `tie_word_embeddings: true` in config.json is tolerated when no
+        // embedding or head tensor is present in the shards.
         let mut tied = base;
         tied["tie_word_embeddings"] = serde_json::json!(true);
-        let e = convert_err("dspine-tied", &tied, true, 1);
-        assert!(e.contains("tie_word_embeddings"), "{e}");
+        let dir_tied = temp_dir("dspine-tied");
+        std::fs::write(dir_tied.join("config.json"), tied.to_string()).unwrap();
+        let tensors = dspine_checkpoint_tensors(&fixture.path, "", 2, true, 1);
+        let refs: Vec<(&str, &str, &[usize], Vec<u8>)> = tensors
+            .iter()
+            .map(|(n, dt, s, b)| (n.as_str(), *dt, s.as_slice(), b.clone()))
+            .collect();
+        write_file(&dir_tied.join("model.safetensors"), &refs);
+        convert_dir(&dir_tied, &dir_tied.join("drafter.gguf")).unwrap();
+        let _ = std::fs::remove_dir_all(dir_tied);
+    }
+
+    #[test]
+    fn gemma4_dflash_and_mixed_window_dspine_checkpoints_convert() {
+        use crate::provider::local::model::tiny::{TinyDspine, write_tiny_model};
+        let target_model = write_tiny_model();
+        let target = load(&target_model, 32);
+
+        // Gemma-4-style DFlashDraftModel: tie_word_embeddings=true, mixed
+        // [sliding, full] layer_types, and 3 target_layer_ids (!= 2 draft
+        // layers). Converts with dflash.swa_causal=true.
+        let dflash_fix = write_tiny_dflash(&TinyDflash {
+            window: Some(6),
+            target_ids: vec![0, 2, 4],
+            dtype: GgmlDType::F16,
+            ..TinyDflash::default()
+        });
+        let cfg_df = serde_json::json!({
+            "architectures": ["DFlashDraftModel"],
+            "model_type": "qwen3",
+            "hidden_size": 64,
+            "intermediate_size": 96,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "head_dim": 16,
+            "vocab_size": 16,
+            "hidden_act": "silu",
+            "rms_norm_eps": 1e-6,
+            "rope_parameters": {"rope_theta": 1_000_000, "rope_type": "default"},
+            "max_position_embeddings": 512,
+            "use_sliding_window": true,
+            "sliding_window": 6,
+            "max_window_layers": 2,
+            "layer_types": ["sliding_attention", "full_attention"],
+            "block_size": 8,
+            "num_target_layers": 6,
+            "tie_word_embeddings": true,
+            "dflash_config": {
+                "mask_token_id": 4,
+                "target_layer_ids": [0, 2, 4]
+            }
+        });
+        let dir_df = temp_dir("gemma4-dflash-conv");
+        std::fs::write(dir_df.join("config.json"), cfg_df.to_string()).unwrap();
+        let t_df: Vec<(String, &'static str, Vec<usize>, Vec<u8>)> = read_gguf(&dflash_fix.path)
+            .into_iter()
+            .map(|(n, s, v)| (qwen_hf_name(&n, "").unwrap(), "BF16", s, bf16_bytes(&v)))
+            .collect();
+        let refs_df: Vec<(&str, &str, &[usize], Vec<u8>)> = t_df
+            .iter()
+            .map(|(n, dt, s, b)| (n.as_str(), *dt, s.as_slice(), b.clone()))
+            .collect();
+        write_file(&dir_df.join("model.safetensors"), &refs_df);
+        let out_df = dir_df.join("drafter.gguf");
+        convert_dir(&dir_df, &out_df).unwrap();
+        let content_df = gguf::Content::open(&out_df).unwrap();
+        assert_eq!(
+            content_df
+                .metadata
+                .get("dflash.swa_causal")
+                .and_then(|v| match v {
+                    Value::Bool(b) => Some(*b),
+                    _ => None,
+                }),
+            Some(true)
+        );
+        assert_eq!(
+            content_df
+                .metadata
+                .get("dflash.attention.sliding_window")
+                .and_then(|v| v.to_u32().ok()),
+            Some(6)
+        );
+        let pat_df: Vec<bool> = content_df.metadata["dflash.attention.sliding_window_pattern"]
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v| match v {
+                Value::Bool(b) => *b,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(pat_df, [true, false]);
+        let mut net_df = DflashNet::open(&content_df, &target, 32).unwrap();
+        let feats_df =
+            crate::provider::local::model::tiny::Lcg(11).values(6 * net_df.feature_width(), 0.75);
+        net_df.observe(0, &feats_df).unwrap();
+        let got_df = net_df
+            .draft(&target, 2, 6, 4, &mut |l| {
+                Some(crate::provider::local::sampler::greedy(l))
+            })
+            .unwrap();
+        assert_eq!(got_df.len(), 4);
+
+        // Mixed-window DSpineDraftModel: tie_word_embeddings=true and
+        // layer_types=["sliding_attention", "full_attention"].
+        let dspine_fix = write_tiny_dflash(&TinyDflash {
+            window: Some(6),
+            target_ids: vec![0, 2, 4],
+            block_causal: true,
+            dtype: GgmlDType::F16,
+            dspine: Some(TinyDspine::for_vocab(target.vocab())),
+            ..TinyDflash::default()
+        });
+        let mut cfg_ds = dspine_config_full_attn();
+        cfg_ds["num_target_layers"] = serde_json::json!(6);
+        cfg_ds["tie_word_embeddings"] = serde_json::json!(true);
+        cfg_ds["use_sliding_window"] = serde_json::json!(true);
+        cfg_ds["sliding_window"] = serde_json::json!(6);
+        cfg_ds["layer_types"] = serde_json::json!(["sliding_attention", "full_attention"]);
+        cfg_ds["dflash_config"]["target_layer_ids"] = serde_json::json!([0, 2, 4]);
+        cfg_ds["dflash_config"]["mask_token_id"] = serde_json::json!(4);
+        let dir_ds = temp_dir("gemma4-dspine-conv");
+        std::fs::write(dir_ds.join("config.json"), cfg_ds.to_string()).unwrap();
+        let t_ds = dspine_checkpoint_tensors(&dspine_fix.path, "", 2, true, 1);
+        let refs_ds: Vec<(&str, &str, &[usize], Vec<u8>)> = t_ds
+            .iter()
+            .map(|(n, dt, s, b)| (n.as_str(), *dt, s.as_slice(), b.clone()))
+            .collect();
+        write_file(&dir_ds.join("model.safetensors"), &refs_ds);
+        let out_ds = dir_ds.join("drafter.gguf");
+        convert_dir(&dir_ds, &out_ds).unwrap();
+        let content_ds = gguf::Content::open(&out_ds).unwrap();
+        assert!(matches!(
+            content_ds.metadata.get("dflash.block_causal"),
+            Some(Value::Bool(true))
+        ));
+        assert!(!content_ds.metadata.contains_key("dflash.swa_causal"));
+        let pat_ds: Vec<bool> = content_ds.metadata["dflash.attention.sliding_window_pattern"]
+            .to_vec()
+            .unwrap()
+            .iter()
+            .map(|v| match v {
+                Value::Bool(b) => *b,
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(pat_ds, [true, false]);
+        let mut net_ds = DflashNet::open(&content_ds, &target, 32).unwrap();
+        let feats_ds =
+            crate::provider::local::model::tiny::Lcg(13).values(6 * net_ds.feature_width(), 0.75);
+        net_ds.observe(0, &feats_ds).unwrap();
+        let got_ds = net_ds
+            .draft(&target, 2, 6, 4, &mut |l| {
+                Some(crate::provider::local::sampler::greedy(l))
+            })
+            .unwrap();
+        assert_eq!(got_ds.len(), 4);
+
+        let _ = std::fs::remove_dir_all(dir_df);
+        let _ = std::fs::remove_dir_all(dir_ds);
     }
 }

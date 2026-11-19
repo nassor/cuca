@@ -1159,6 +1159,9 @@ pub(crate) struct Transformer {
     hp: Hparams,
     context_length: usize,
     vocab: usize,
+    /// Sorted, deduplicated token ids suppressed during decoding
+    /// (`tokenizer.ggml.suppress_tokens`).
+    suppressed: Vec<u32>,
     /// Token embedding table; `None` on a drafter, whose input is a hidden
     /// state, and on a stage that starts after layer 0.
     embed: Option<TokenEmbedding>,
@@ -1486,6 +1489,12 @@ impl Transformer {
         self.vocab
     }
 
+    /// Sorted, deduplicated token ids suppressed during decoding
+    /// (`tokenizer.ggml.suppress_tokens`).
+    pub(super) fn suppressed(&self) -> &[u32] {
+        &self.suppressed
+    }
+
     /// Counters and heat of the expert tiers; `None` unless the model loaded
     /// with `ExpertPlacement::Tiered`.
     pub(crate) fn expert_tiers(&self) -> Option<Arc<TierShared>> {
@@ -1575,6 +1584,11 @@ impl Transformer {
             .dims()
             .first()
             .ok_or_else(|| err(format!("tensor `{}`: scalar", name::TOKEN_EMBD)))?;
+        let suppressed = if drafter {
+            Vec::new()
+        } else {
+            crate::provider::local::tokenizer::suppressed_from_gguf(&content.metadata, vocab)?
+        };
         let embd_shape = [vocab, n_embd];
         // The table serves the lookup of the stage that embeds and the tied
         // head of the stage that ends the model (which then also looks tokens
@@ -1718,6 +1732,7 @@ impl Transformer {
             hp,
             context_length,
             vocab,
+            suppressed,
             embed,
             ple,
             layers,

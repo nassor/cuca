@@ -1156,16 +1156,18 @@ pub(crate) fn build(
     })
 }
 
-/// `general.sampling.*` from `generation_config.json`, the way gguf-py's
-/// `Metadata.load` and `Metadata.set_gguf_meta_model` write them (llama.cpp
-/// master, and the pinned commit): `sequence` (string), `top_k`,
-/// `penalty_last_n` and `mirostat` (int32), `top_p`, `min_p`,
-/// `xtc_probability`, `xtc_threshold`, `temperature` (as `temp`),
-/// `penalty_repeat` (or `repetition_penalty`), `mirostat_tau` and
-/// `mirostat_eta` (float32). A key absent or `null` in the file writes
-/// nothing, an empty file writes nothing, and so does a value of the wrong
-/// type (the Python converter would fail on it). The engine itself reads
-/// `temp`, `top_k` and `top_p` only (`sampling.rs`).
+/// `general.sampling.*` (and `tokenizer.ggml.suppress_tokens`) from
+/// `generation_config.json`, the way gguf-py's `Metadata.load` and
+/// `Metadata.set_gguf_meta_model` write them (llama.cpp master, and the pinned
+/// commit): `sequence` (string), `top_k`, `penalty_last_n` and `mirostat`
+/// (int32), `top_p`, `min_p`, `xtc_probability`, `xtc_threshold`,
+/// `temperature` (as `temp`), `penalty_repeat` (or `repetition_penalty`),
+/// `mirostat_tau` and `mirostat_eta` (float32), plus non-negative integer
+/// `suppress_tokens`. A key absent or `null` in the file writes nothing, an
+/// empty file writes nothing, and so does a value of the wrong type (the
+/// Python converter would fail on it). The engine itself reads `temp`,
+/// `top_k`, `top_p` (`sampling.rs`) and `tokenizer.ggml.suppress_tokens`
+/// (`tokenizer`).
 pub(crate) fn sampling_defaults(generation_config: Option<&Json>) -> Vec<(String, Value)> {
     let Some(Json::Object(gen_cfg)) = generation_config else {
         return Vec::new();
@@ -1188,6 +1190,22 @@ pub(crate) fn sampling_defaults(generation_config: Option<&Json>) -> Vec<(String
             .as_str()
             .map(|s| Value::String(s.to_string()))
     };
+    let suppress = gen_cfg
+        .get("suppress_tokens")
+        .and_then(Json::as_array)
+        .and_then(|arr| {
+            let mut ids = Vec::with_capacity(arr.len());
+            for v in arr {
+                let id = v.as_i64().and_then(|n| i32::try_from(n).ok())?;
+                if id < 0 {
+                    return None;
+                }
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+            }
+            (!ids.is_empty()).then(|| Value::Array(ids.into_iter().map(Value::I32).collect()))
+        });
     [
         ("general.sampling.sequence", text("sequence")),
         ("general.sampling.top_k", int("top_k")),
@@ -1207,6 +1225,7 @@ pub(crate) fn sampling_defaults(generation_config: Option<&Json>) -> Vec<(String
         ("general.sampling.mirostat", int("mirostat")),
         ("general.sampling.mirostat_tau", float(&["mirostat_tau"])),
         ("general.sampling.mirostat_eta", float(&["mirostat_eta"])),
+        ("tokenizer.ggml.suppress_tokens", suppress),
     ]
     .into_iter()
     .filter_map(|(key, value)| Some((key.to_string(), value?)))
@@ -1525,5 +1544,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("dynamic"), "{err}");
+    }
+
+    #[test]
+    fn sampling_defaults_exports_suppress_tokens() {
+        let gen_cfg = serde_json::json!({
+            "temperature": 1.0,
+            "top_k": 64,
+            "top_p": 0.95,
+            "suppress_tokens": [258883, 258882, 258883]
+        });
+        let kv = sampling_defaults(Some(&gen_cfg));
+        assert!(kv.iter().any(|(k, v)| {
+            k == "tokenizer.ggml.suppress_tokens"
+                && matches!(
+                    v,
+                    Value::Array(items)
+                        if items.len() == 2
+                            && matches!(items[0], Value::I32(258883))
+                            && matches!(items[1], Value::I32(258882))
+                )
+        }));
+        let invalid = serde_json::json!({ "suppress_tokens": [-1, 5] });
+        assert!(
+            sampling_defaults(Some(&invalid))
+                .iter()
+                .all(|(k, _)| k != "tokenizer.ggml.suppress_tokens")
+        );
     }
 }

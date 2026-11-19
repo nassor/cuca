@@ -125,6 +125,57 @@ struct Config {
     add_eos: bool,
 }
 
+/// Mask suppressed token ids (`tokenizer.ggml.suppress_tokens`) in a logits row
+/// to negative infinity, leaving a slice untouched if every entry in it is
+/// suppressed.
+pub(crate) fn mask_suppressed(row: &mut [f32], suppressed: &[u32]) {
+    if suppressed.is_empty() || row.is_empty() {
+        return;
+    }
+    let in_range = suppressed
+        .iter()
+        .filter(|&&id| (id as usize) < row.len())
+        .count();
+    if in_range >= row.len() {
+        return;
+    }
+    for &id in suppressed {
+        if let Some(slot) = row.get_mut(id as usize) {
+            *slot = f32::NEG_INFINITY;
+        }
+    }
+}
+
+/// Read, validate, sort, and deduplicate `tokenizer.ggml.suppress_tokens`
+/// against a vocabulary of `vocab_size` tokens.
+pub(crate) fn suppressed_from_gguf(
+    md: &HashMap<String, gguf::Value>,
+    vocab_size: usize,
+) -> Result<Vec<u32>, CucaError> {
+    let Some(items) = Metadata(md).array("tokenizer.ggml.suppress_tokens")? else {
+        return Ok(Vec::new());
+    };
+    let mut suppress = Vec::with_capacity(items.len());
+    for v in items {
+        let n = value_int(v).ok_or_else(|| {
+            local_err("GGUF `tokenizer.ggml.suppress_tokens` holds a non-integer entry")
+        })?;
+        if let Ok(id) = u32::try_from(n)
+            && (id as usize) < vocab_size
+        {
+            suppress.push(id);
+        }
+    }
+    suppress.sort_unstable();
+    suppress.dedup();
+    if vocab_size > 0 && suppress.len() >= vocab_size {
+        return Err(local_err(
+            "GGUF `tokenizer.ggml.suppress_tokens` suppresses the entire vocabulary",
+        ));
+    }
+    Ok(suppress)
+}
+
 /// A tokenizer built from GGUF metadata.
 #[derive(Clone)]
 pub(crate) struct Tokenizer {
@@ -137,6 +188,9 @@ pub(crate) struct Tokenizer {
     specials: Vec<u32>,
     /// Ids and BOS/EOS flags.
     config: Config,
+    /// Sorted, deduplicated token ids suppressed during decoding
+    /// (`tokenizer.ggml.suppress_tokens`).
+    suppress: Vec<u32>,
 }
 
 impl fmt::Debug for Tokenizer {
@@ -247,6 +301,7 @@ impl Tokenizer {
                 words: Words::Escaped,
             },
             Config::default(),
+            Vec::new(),
         ))
     }
 
@@ -267,7 +322,8 @@ impl Tokenizer {
             Byte(Pretokenizer),
             Escaped,
         }
-        let md = Metadata(md);
+        let raw_md = md;
+        let md = Metadata(raw_md);
         let model = md
             .string("tokenizer.ggml.model")
             .ok_or_else(|| local_err("GGUF lacks `tokenizer.ggml.model`"))?;
@@ -364,11 +420,12 @@ impl Tokenizer {
                 words: Words::Escaped,
             },
         };
-        Ok(Self::assemble(vocab, engine, config))
+        let suppress = suppressed_from_gguf(raw_md, n)?;
+        Ok(Self::assemble(vocab, engine, config, suppress))
     }
 
     /// Collect the special tokens and finish construction.
-    fn assemble(vocab: Vocab, engine: Engine, config: Config) -> Self {
+    fn assemble(vocab: Vocab, engine: Engine, config: Config, suppress: Vec<u32>) -> Self {
         let mut specials: Vec<u32> = (0..vocab.len() as u32)
             .filter(|&id| {
                 !vocab.piece(id).is_empty()
@@ -390,7 +447,14 @@ impl Tokenizer {
             engine,
             specials,
             config,
+            suppress,
         }
+    }
+
+    /// Sorted, deduplicated token ids suppressed during decoding
+    /// (`tokenizer.ggml.suppress_tokens`).
+    pub(crate) fn suppressed_tokens(&self) -> &[u32] {
+        &self.suppress
     }
 
     /// Encode `text` to token ids, recognising special tokens in the text
@@ -1189,5 +1253,53 @@ mod tests {
         md.remove("tokenizer.ggml.scores");
         let t = Tokenizer::from_gguf(&md).expect("scores are optional");
         assert_eq!(t.encode("ab"), [0, 1], "no merges without tokens like `ab`");
+    }
+
+    #[test]
+    fn suppress_tokens_are_parsed_and_masked() {
+        let mut md = HashMap::from([
+            ("tokenizer.ggml.model".to_string(), string_value("llama")),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                strings(&["<unk>", "<s>", "</s>", "a", "b"]),
+            ),
+            (
+                "tokenizer.ggml.suppress_tokens".to_string(),
+                Value::Array(vec![
+                    Value::I32(4),
+                    Value::I32(-1),
+                    Value::I32(2),
+                    Value::I32(4),
+                    Value::I32(99),
+                ]),
+            ),
+        ]);
+        let tok = Tokenizer::from_gguf(&md).unwrap();
+        assert_eq!(tok.suppressed_tokens(), &[2, 4]);
+
+        let mut row = [1.0f32, 2.0, 9.0, 3.0, 12.0];
+        mask_suppressed(&mut row, tok.suppressed_tokens());
+        assert_eq!(row[2], f32::NEG_INFINITY);
+        assert_eq!(row[4], f32::NEG_INFINITY);
+        assert_eq!(row[3], 3.0);
+
+        // A slice containing only suppressed ids must not become all -inf.
+        let mut tiny = [5.0f32, 6.0];
+        mask_suppressed(&mut tiny, &[0, 1]);
+        assert_eq!(tiny, [5.0, 6.0]);
+
+        md.insert(
+            "tokenizer.ggml.suppress_tokens".to_string(),
+            Value::Array(vec![Value::String("bad".into())]),
+        );
+        let err = Tokenizer::from_gguf(&md).unwrap_err().to_string();
+        assert!(err.contains("suppress_tokens"), "{err}");
+
+        md.insert(
+            "tokenizer.ggml.suppress_tokens".to_string(),
+            Value::Array((0..5).map(Value::I32).collect()),
+        );
+        let err = Tokenizer::from_gguf(&md).unwrap_err().to_string();
+        assert!(err.contains("entire vocabulary"), "{err}");
     }
 }

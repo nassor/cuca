@@ -29,11 +29,17 @@
 //! - the block rows themselves, projected from the normed block input
 //!   like any attention layer.
 //!
-//! The block rows attend to each other in both directions (bidirectional)
-//! and to the context causally, each layer restricted to the sliding window
-//! when it has one: a query at position `q` reads a key at position `p` only
-//! when `|q - p| <= window` (transformers'
-//! `create_bidirectional_sliding_window_mask`; the checkpoint's reference).
+//! The block rows attend to the context and to each other according to the
+//! checkpoint's attention flags:
+//!
+//! - plain `MuseGlimmerAssistantModel`: bidirectional over both the block and
+//!   the context, clipped on sliding layers to `|q - p| <= window`;
+//! - `dflash.swa_causal`: sliding layers attend causally (`j <= i`) with
+//!   FlashAttention `window_left = w - 1` (`q - p < w`), while full-attention
+//!   layers attend bidirectionally across the block and full context;
+//! - `dflash.block_causal`: every layer attends causally (`j <= i`), with
+//!   `q - p < w` on sliding layers.
+//!
 //! After the last layer, the final norm and the target's LM head (with
 //! its logit multiplier and soft-cap, so the drafter's distribution lives on
 //! the target's scale) turn rows `1..=k` into the logits of the `k` draft
@@ -137,6 +143,9 @@ pub(super) struct Geometry {
     /// Block-causal attention mask across the drafted block rows (`j <= i`)
     /// with FlashAttention sliding-window width `w - 1`.
     pub(super) block_causal: bool,
+    /// Causal sliding-window layers (`j <= i` and `q - p < w`) paired with
+    /// bidirectional full-attention layers (`DFlashDraftModel`).
+    pub(super) swa_causal: bool,
     /// Present when the checkpoint carries the DSpine code bridge.
     pub(super) dspine: Option<super::dspine::DspineSpec>,
 }
@@ -256,6 +265,7 @@ fn read_geometry(md: &Metadata) -> Result<Geometry, CucaError> {
         .and_then(|id| u32::try_from(id).ok())
         .ok_or_else(|| meta_err(mask_key, "missing: the drafter's mask token"))?;
     let block_causal = k.bool_opt("block_causal")?.unwrap_or(false);
+    let swa_causal = k.bool_opt("swa_causal")?.unwrap_or(false);
     let dspine = super::dspine::read_spec(&k, block_causal)?;
     Ok(Geometry {
         n_embd,
@@ -271,6 +281,7 @@ fn read_geometry(md: &Metadata) -> Result<Geometry, CucaError> {
         features,
         windows,
         block_causal,
+        swa_causal,
         dspine,
     })
 }
@@ -739,10 +750,12 @@ impl DflashNet {
                 .contiguous()?;
 
         // The context a row can reach: from the window of the first row (it
-        // reaches furthest back) to the pending token. Block-causal DFlash
-        // uses FlashAttention `window_left = w - 1` (`qpos - kpos < w`).
+        // reaches furthest back) to the pending token. Causal layers (either
+        // `block_causal` everywhere or `swa_causal` on sliding layers) use
+        // FlashAttention `window_left = w - 1` (`qpos - kpos < w`).
+        let layer_causal = g.block_causal || (g.swa_causal && lw.window.is_some());
         let from = match lw.window {
-            Some(w) if g.block_causal => self.lo.max(len.saturating_sub(w - 1)),
+            Some(w) if layer_causal => self.lo.max(len.saturating_sub(w - 1)),
             Some(w) => self.lo.max(len.saturating_sub(w)),
             None => self.lo,
         };
@@ -757,24 +770,24 @@ impl DflashNet {
                 Tensor::cat(&[Tensor::from_vec(cv, (1, nkv, n_ctx, d), dev)?, v_blk], 2)?,
             )
         };
-        let mask = if lw.window.is_some() || g.block_causal {
+        let mask = if lw.window.is_some() || layer_causal {
             let l = n_ctx + b;
             let mut mask = vec![0f32; b * l];
             for i in 0..b {
                 if let Some(w) = lw.window {
                     for c in 0..n_ctx {
                         let dist = len + i - (from + c);
-                        let masked = if g.block_causal { dist >= w } else { dist > w };
+                        let masked = if layer_causal { dist >= w } else { dist > w };
                         if masked {
                             mask[i * l + c] = f32::NEG_INFINITY;
                         }
                     }
                 }
                 for j in 0..b {
-                    let causal = g.block_causal && j > i;
+                    let causal = layer_causal && j > i;
                     let out_of_win = lw.window.is_some_and(|w| {
                         let dist = i.abs_diff(j);
-                        if g.block_causal { dist >= w } else { dist > w }
+                        if layer_causal { dist >= w } else { dist > w }
                     });
                     if causal || out_of_win {
                         mask[i * l + n_ctx + j] = f32::NEG_INFINITY;
@@ -1428,6 +1441,7 @@ mod tests {
         assert_eq!(g.windows, [Some(6), Some(6)]);
         assert_eq!(g.mask_token, DFLASH_MASK);
         assert!(!g.block_causal);
+        assert!(!g.swa_causal);
         assert!(g.dspine.is_none());
         assert!(check_metadata(&content.metadata).is_ok());
     }
@@ -1487,5 +1501,117 @@ mod tests {
         net_bidi2.observe(0, &f2).unwrap();
         let d1 = draft_logits(&net_bidi2, &target, 10, 2, 4);
         assert_ne!(d0, d1, "bidirectional DFlash keeps distance w");
+    }
+
+    /// With `dflash.swa_causal = true`, sliding-attention layers are causal
+    /// (`j <= i`) with FlashAttention `window_left = w - 1`, while
+    /// full-attention layers remain bidirectional across the block.
+    #[test]
+    fn swa_causal_makes_sliding_layers_causal_and_keeps_full_layers_bidirectional() {
+        let target = load(&muse(), CTX);
+        let sw_only = write_tiny_dflash(&TinyDflash {
+            layers: 2,
+            window: Some(4),
+            block_causal: false,
+            meta: vec![("dflash.swa_causal".into(), Value::Bool(true))],
+            ..TinyDflash::default()
+        });
+        let mut net = open_net(&target, &sw_only, CTX, false);
+        let fw = net.feature_width();
+        let mut feats = features(&net, 10, 53);
+        net.observe(0, &feats).unwrap();
+        let a = draft_logits(&net, &target, 10, 2, 4);
+
+        for v in &mut feats[6 * fw..7 * fw] {
+            *v += 5.0;
+        }
+        let mut net_old = open_net(&target, &sw_only, CTX, false);
+        net_old.observe(0, &feats).unwrap();
+        assert_eq!(
+            a,
+            draft_logits(&net_old, &target, 10, 2, 4),
+            "position len - w must be masked on a causal sliding layer"
+        );
+
+        for v in &mut feats[7 * fw..8 * fw] {
+            *v += 5.0;
+        }
+        let mut net_in = open_net(&target, &sw_only, CTX, false);
+        net_in.observe(0, &feats).unwrap();
+        assert_ne!(
+            a,
+            draft_logits(&net_in, &target, 10, 2, 4),
+            "position len - (w - 1) must remain visible"
+        );
+
+        let mixed = write_tiny_dflash(&TinyDflash {
+            layers: 2,
+            window: Some(4),
+            block_causal: false,
+            meta: vec![
+                (
+                    "dflash.attention.sliding_window_pattern".into(),
+                    Value::Array(vec![Value::Bool(true), Value::Bool(false)]),
+                ),
+                ("dflash.swa_causal".into(), Value::Bool(true)),
+            ],
+            ..TinyDflash::default()
+        });
+        let mut net_mixed = open_net(&target, &mixed, CTX, false);
+        let feats_m = features(&net_mixed, 6, 59);
+        net_mixed.observe(0, &feats_m).unwrap();
+
+        let base = Lcg(61).values(3 * N_EMBD, 0.5);
+        let mut altered = base.clone();
+        for v in &mut altered[2 * N_EMBD..] {
+            *v += 2.0;
+        }
+        let xa = Tensor::from_vec(base, (1, 3, N_EMBD), &Device::Cpu).unwrap();
+        let xb = Tensor::from_vec(altered, (1, 3, N_EMBD), &Device::Cpu).unwrap();
+
+        // Layer 0 (sliding_attention, causal): row 1 cannot see row 2.
+        let l0a = net_mixed
+            .block_layer(&net_mixed.w.layers[0], 0, &xa, 6)
+            .unwrap()
+            .narrow(1, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let l0b = net_mixed
+            .block_layer(&net_mixed.w.layers[0], 0, &xb, 6)
+            .unwrap()
+            .narrow(1, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_eq!(l0a, l0b, "causal sliding layer must mask future block rows");
+
+        // Layer 1 (full_attention, bidirectional): row 1 sees row 2.
+        let l1a = net_mixed
+            .block_layer(&net_mixed.w.layers[1], 1, &xa, 6)
+            .unwrap()
+            .narrow(1, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        let l1b = net_mixed
+            .block_layer(&net_mixed.w.layers[1], 1, &xb, 6)
+            .unwrap()
+            .narrow(1, 1, 1)
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap();
+        assert_ne!(
+            l1a, l1b,
+            "full-attention layer must stay bidirectional across block rows"
+        );
     }
 }

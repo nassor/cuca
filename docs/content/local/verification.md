@@ -42,7 +42,7 @@ The names are the presets of [Choose a model](@/local/models.md). The GPU column
 | `gemma3-1b-q4_0` | Passes | Passes | no thinking or tools |
 | `qwen3-0.6b-q8_0` | Passes | Matches CPU | |
 | `qwen3-1.7b-q8_0` | Passes | Matches CPU | |
-| `qwen3-8b-q4_k_m` | Not run | Not run | Qwen 3 8B preset; pairs with DSpine |
+| `qwen3-8b-q4_k_m` | Passes | Not run | Qwen 3 8B preset; verified alone and with `tencent/Qwen3-8B-DSpine-b16` |
 | `r1-distill-qwen-1.5b-q4_0` | Known limit | Matches CPU | always reasons; no tool calls |
 | `r1-distill-llama-8b-q4_0` | Passes | Not run | always reasons; no tool calls |
 | `smollm3-3b-q4_0` | Known limit | Matches CPU | thinking and the tool answer |
@@ -59,7 +59,7 @@ The names are the presets of [Choose a model](@/local/models.md). The GPU column
 | `ministral3-3b-instruct-q4_0` | Passes | Not run | no reasoning |
 | `mistral-small-4-119b-q4_0` | Passes | Passes | CPU resident or tiered; Vulkan with `experts { host; }` |
 
-The two drafter presets are on [Speculative decoding](@/local/drafting.md). DeepSeek-V4.1 has no preset: it has run from a converted checkpoint on the CPU and on Vulkan. See [Run DeepSeek-V4.1](@/local/deepseek-v41.md). DSpine checkpoints (`Qwen3-8B-DSpine-b16`, `Qwen3.8-27B-DSpine-b16`) are verified by unit and synthetic engine tests only; live multi-billion-parameter runs are not run yet.
+The two drafter presets are on [Speculative decoding](@/local/drafting.md). DeepSeek-V4.1 has no preset: it has run from a converted checkpoint on the CPU and on Vulkan. See [Run DeepSeek-V4.1](@/local/deepseek-v41.md). On the CPU, `tencent/Qwen3-8B-DSpine-b16` has run live with `qwen3-8b-q4_k_m`, `z-lab/gemma4-12B-it-DFlash` and `mtp-gemma-4-12B-it-Q4_0.gguf` have run live with `ggml-org/gemma-4-12B-it-GGUF` (`gemma-4-12B-it-Q4_0.gguf`), and `z-lab/gemma-4-26B-A4B-it-DFlash` has run live with `gemma4-26b-a4b-q4_0`. `tencent/Qwen3.8-27B-DSpine-b16` is verified by unit and synthetic engine tests only.
 
 ## Devices
 

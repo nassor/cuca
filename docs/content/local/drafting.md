@@ -131,10 +131,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 Each drafter works with one family of target. Use the pair in the same bullet.
 
-- Gemma 4 assistant: set `drafter` to the preset `gemma4-e2b-mtp-f16`. Target: Gemma 4 E2B (a `gemma4` model of the same hidden width and vocabulary). Runs on the CPU or a GPU.
+- Gemma 4 assistant: set `drafter` to `gemma4-e2b-mtp-f16` (for Gemma 4 E2B) or `ggml-org/gemma-4-12B-it-GGUF:501d13dba70e3c02b1b12c78fd9e6b08ad413960:mtp-gemma-4-12B-it-Q4_0.gguf` (for Gemma 4 12B). Runs on the CPU or a GPU.
 - Qwen 3.5 head: set `drafter` to `"in-trunk"`. Target: a dense Qwen 3.5 `*-MTP` file, such as the preset `qwen3.5-0.8b-q8_0`. CPU only.
 - EAGLE: set `drafter` to the checkpoint `mistralai/Mistral-Small-4-119B-2603-eagle:9a8ea22dca0161ff7af7879f4a0000f65314797d`. Target: Mistral Small 4. CPU only.
-- DFlash: set `drafter` to the preset `muse-glimmer-30b-dflash-q4_0`, or the checkpoint `meta-models/Muse-Glimmer-30B-assistant:c676cce91658f9568aaf264a416211e2782735b7` (target: Muse Glimmer 30B), or a standard `DFlashDraftModel` checkpoint matching its target. CPU only.
+- DFlash: set `drafter` to the preset `muse-glimmer-30b-dflash-q4_0`, or a `DFlashDraftModel` checkpoint such as `meta-models/Muse-Glimmer-30B-assistant:c676cce91658f9568aaf264a416211e2782735b7` (Muse Glimmer 30B), `z-lab/gemma4-12B-it-DFlash:541d351de6dc9cd698fc348612bd5cdf03c636d0` (Gemma 4 12B) or `z-lab/gemma-4-26B-A4B-it-DFlash:77d4202772dfe50b2396ec7bac9cfffc7b9e7057` (Gemma 4 26B-A4B). CPU only.
 - DSpine: set `drafter` to a `DSpineDraftModel` checkpoint such as `tencent/Qwen3-8B-DSpine-b16:3b1e69d0354f9281fd6d9e3ca0cbf39c8185db63` (paired with `qwen3-8b-q4_k_m`) or `tencent/Qwen3.8-27B-DSpine-b16:260a6c23070ca873ff1a5f33b7119ac3f6a245ee` (paired with a Qwen 3.8 27B checkpoint). CPU only.
 - DSpark: set `drafter` to the target's own checkpoint, `deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>`. Target: DeepSeek-V4.1. CPU only.
 
@@ -143,8 +143,9 @@ A checkpoint source is `repo:revision`, a Hugging Face safetensors checkpoint. T
 - The Gemma 4 assistant is a four-layer decoder that reads the target's K/V cache (the model's memory of past tokens), so it adds no cache memory.
 - The Qwen 3.5 head is a prediction head already inside the model file. Nothing more is downloaded. It keeps a K/V cache of its own per request slot, 4 KB per context position for the 0.8B model.
 - EAGLE is converted from a 392 MB FP8 download to a 0.4 GB GGUF at the default `convert.quant` of `q8_0`. It keeps 2.5 KB of K/V cache per context position and request slot.
-- DFlash proposes a whole block of tokens in one pass instead of one pass per token. The Muse checkpoint converts to about 1.4 GB at `q4_0` or 2.7 GB at the default `q8_0`. It keeps a ring of the last 2,048 positions per request slot, 82 MB at any context length. Muse Glimmer takes at most 15 drafts.
-- DSpine adds block-causal attention (sliding window `window_left = w - 1` when sliding layers are active, full context when `use_sliding_window` is false), a learned post-layer code bridge (`dspine.codebook.weight` stored at Q8_0 for quantized files and F16 under `f16`), and online 1-row `exact_sender` refinement over the top `head_topk` head candidates per drafted step using indexed rows of the target `lm_head`.
+- DFlash proposes a whole block of tokens in one pass instead of one pass per token. On mixed-window Gemma 4 drafters (`dflash.swa_causal`), sliding layers use causal sliding attention (`window_left = w - 1`) while full layers attend bidirectionally. The Muse checkpoint converts to about 1.4 GB at `q4_0` or 2.7 GB at the default `q8_0`. It keeps a ring of the last 2,048 positions per request slot, 82 MB at any context length. Muse Glimmer takes at most 15 drafts.
+- DSpine adds block-causal attention (causal sliding windows on sliding layers, full context on full layers or when `use_sliding_window` is false), a learned post-layer code bridge (`dspine.codebook.weight` stored at Q8_0 for quantized files and F16 under `f16`), and online 1-row `exact_sender` refinement over the top `head_topk` head candidates per drafted step using indexed rows of the target `lm_head`.
+- Any `tokenizer.ggml.suppress_tokens` list from the target GGUF or checkpoint `generation_config.json` masks suppressed token IDs across plain decoding, verification, DFlash and DSpine candidate proposals.
 - DSpark is a block drafter like DFlash, with stages of the DeepSeek-V4.1 kind. Its converted file is 7.91 GB at the default precision.
 - The Qwen head, EAGLE, DFlash, DSpine and DSpark follow every position of their sequence, so each request slot keeps a cache of its own over the drafter's shared weights, and the cache memory above is multiplied by `batching.max_sequences`. A new request takes the free slot whose cache shares the longest prefix with its prompt.
 
@@ -201,12 +202,18 @@ Speedup is speculative tokens per second divided by plain tokens per second, for
 | Target and drafter | `draft_tokens` | Code | List | Story |
 |---|---|---|---|---|
 | Gemma 4 E2B Q4_0, Gemma 4 assistant | 5 | 1.32x | 1.31x | 1.01x |
+| Gemma 4 12B Q4_0, Gemma 4 assistant (plain 6.1 tokens/s) | 5 | 2.30x | 2.17x | 1.10x |
+| Gemma 4 12B Q4_0, DFlash (plain 6.0 tokens/s) | 15 | 1.52x | 0.99x | 0.98x |
+| Gemma 4 26B-A4B Q4_0, DFlash (plain 10.4 tokens/s) | 7 | 1.02x | 1.02x | 0.99x |
+| Qwen 3 8B Q4_K_M, DSpine (plain 9.5 tokens/s) | 3 | 1.64x | 1.40x | 1.13x |
 | Qwen 3.5 0.8B Q8_0, in-trunk head (plain 55 tokens/s) | 3 | 1.86x | 1.37x | 0.99x |
 | Muse Glimmer 30B Q4_0, DFlash (plain 3.4 tokens/s) | 3 | 1.76x | 1.69x | 1.13x |
 | Mistral Small 4 Q4_0, EAGLE (plain 11.2 tokens/s) | 2 | 1.0x | 1.0x | 1.0x |
 
 - Predictable text gains most. Code and lists gain, and a story gains little, because the drafter's guesses are accepted less often.
-- EAGLE gives no gain on Mistral Small 4. It is a mixture-of-experts model, and every extra row routes to its own experts, so checking more rows costs almost as much as decoding them.
+- On Gemma 4 12B Q4_0, Google's MTP assistant reached 1.67x aggregate at 5 drafts (56.0% acceptance). On the same target, `z-lab/gemma4-12B-it-DFlash` reached 1.10x at 3 drafts (49.3% acceptance) and 1.12x at 15 drafts (40.4% acceptance).
+- Mixture-of-experts targets gain little or nothing because extra drafted rows route to different experts. EAGLE on Mistral Small 4 gave 1.0x, and DFlash on Gemma 4 26B-A4B gave 0.99x to 1.01x aggregate (53.8% to 40.1% acceptance).
+- On Qwen 3 8B Q4_K_M, DSpine (`tencent/Qwen3-8B-DSpine-b16`) reached 1.36x aggregate at 3 drafts (68.2% acceptance) and 2.02x on code at 15 drafts (1.18x aggregate, 52.7% acceptance).
 - A longer draft is not always faster. DFlash on Muse Glimmer gave 1.47x over all three prompts at 3 and at 7 drafts, and 1.15x at 15, because verifying a long block costs more.
 - DSpark with DeepSeek-V4.1 gave the same output as plain decoding and no speedup in the one run made: both runs are limited by reading experts from disk.
 - The Gemma 4 pair on a GPU ran at about 1.0x.

@@ -1895,7 +1895,8 @@ mod tests {
     };
     use super::*;
     use crate::provider::local::model::tiny::{
-        TinyDeepseek41, write_deepseek41, write_tiny_drafter, write_tiny_model,
+        TinyDeepseek41, TinyGemma4Moe, write_deepseek41, write_gemma4_moe, write_tiny_drafter,
+        write_tiny_model,
     };
     use crate::provider::local::model::tiny::{TinyDflash, TinyDspine, write_tiny_dflash};
     use crate::provider::local::model::tiny::{TinyQwen35, TinySpec, write_qwen35, write_spec};
@@ -3659,6 +3660,235 @@ mod tests {
         let b = run_topk();
         assert_eq!(a, b);
         assert!(a.2.drafted > 0);
+    }
+
+    /// Both DFlash (`dflash.swa_causal`) and DSpine (`dflash.block_causal`)
+    /// preserve plain greedy output bit-for-bit on dense Gemma 4 (PLE, shared
+    /// K/V, `embd_scale`, logit soft-cap 30.0) and MoE Gemma 4 (26B-A4B
+    /// dialect: DualFfn + K-as-V), for single requests and concurrent batches.
+    #[test]
+    fn dflash_and_dspine_drafters_equal_plain_greedy_on_gemma4_dense_and_moe() {
+        let g4_dense = write_tiny_model();
+        let g4_moe = write_gemma4_moe(&TinyGemma4Moe::default());
+        let mixed_pat = (
+            "dflash.attention.sliding_window_pattern".to_string(),
+            gguf::Value::Array(vec![gguf::Value::Bool(true), gguf::Value::Bool(false)]),
+        );
+        let dflash = write_tiny_dflash(&TinyDflash {
+            window: Some(6),
+            block: 6,
+            block_causal: false,
+            meta: vec![
+                mixed_pat.clone(),
+                ("dflash.swa_causal".into(), gguf::Value::Bool(true)),
+                ("tokenizer.ggml.mask_token_id".into(), gguf::Value::U32(4)),
+            ],
+            ..TinyDflash::default()
+        });
+        let dspine = write_tiny_dflash(&TinyDflash {
+            window: Some(6),
+            block: 6,
+            block_causal: true,
+            dspine: Some(TinyDspine::for_vocab(16)),
+            meta: vec![
+                mixed_pat,
+                ("tokenizer.ggml.mask_token_id".into(), gguf::Value::U32(4)),
+            ],
+            ..TinyDflash::default()
+        });
+
+        let prompts: [&[u32]; 4] = [
+            &PROMPT,
+            &[2, 9, 9, 9, 10],
+            &[2, 11],
+            &[2, 13, 12, 11, 10, 9],
+        ];
+        for (t_name, target) in [("gemma4 dense", &g4_dense), ("gemma4 moe", &g4_moe)] {
+            for (d_name, drafter) in [("DFlash", &dflash), ("DSpine", &dspine)] {
+                let mut drafted = 0u64;
+                for k in [1usize, 3, 5] {
+                    for prompt in prompts {
+                        let mut plain = engine(target, 32, 0.0, None);
+                        let mut spec = engine_with_dflash(target, drafter, 32, 0.0, None, k, 1);
+                        let expected = run(&mut plain, prompt, Some(6));
+                        let got = run(&mut spec, prompt, Some(6));
+                        let what = format!("{t_name} + {d_name} k {k} len {}", prompt.len());
+                        assert_same_reply(&got, &expected, &what);
+                        assert_eq!(got.items.len(), expected.items.len(), "{what}");
+                        assert_eq!(spec.last_ids, plain.last_ids, "{what}");
+                        assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "{what}");
+                        drafted += spec.stats.snapshot().drafted;
+                    }
+                }
+                assert!(drafted > 0, "{t_name} + {d_name} must draft tokens");
+
+                let batch_prompts: [&[u32]; 4] =
+                    [&PROMPT, &[2, 9, 9, 10], &[2, 13, 12, 11, 10], &[2, 11]];
+                let mut spec = engine_with_dflash(target, drafter, 32, 0.0, None, 4, 4);
+                let got = run_batch(&mut spec, &batch_prompts, Some(6));
+                for (i, (reply, &p)) in got.iter().zip(&batch_prompts).enumerate() {
+                    let mut plain = engine(target, 32, 0.0, None);
+                    let expected = run(&mut plain, p, Some(6));
+                    assert_same_reply(
+                        reply,
+                        &expected,
+                        &format!("{t_name} + {d_name} batch seq {i}"),
+                    );
+                }
+                assert!(
+                    spec.stats.snapshot().drafted > 0,
+                    "{t_name} + {d_name} batch drafted"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn suppress_tokens_mask_plain_dflash_and_dspine() {
+        use crate::provider::local::model::tiny::{
+            TinyDflash, TinyDspine, TinyOptions, write_tiny_dflash, write_tiny_model_with_meta,
+        };
+        let baseline_file = write_tiny_model();
+        let mut baseline = engine(&baseline_file, 32, 0.0, None);
+        run(&mut baseline, &PROMPT, Some(6));
+        assert!(
+            baseline.last_ids.len() > PROMPT.len(),
+            "baseline must generate at least one token"
+        );
+        let suppressed_id = baseline.last_ids[PROMPT.len()];
+
+        let pieces: Vec<gguf::Value> = [
+            "<pad>",
+            "<eos>",
+            "<bos>",
+            "<turn|>",
+            "<|tool_response>",
+            "<|channel>",
+            "<channel|>",
+            "<|tool_call>",
+            "<tool_call|>",
+            "a",
+            "b",
+            "c",
+            "d",
+            "e",
+            "f",
+            "g",
+        ]
+        .into_iter()
+        .map(|s| gguf::Value::String(s.to_string()))
+        .collect();
+        let types: Vec<gguf::Value> = (0..pieces.len())
+            .map(|i| gguf::Value::I32(if i < 9 { 3 } else { 1 }))
+            .collect();
+        let extra = vec![
+            (
+                "tokenizer.ggml.model".to_string(),
+                gguf::Value::String("gemma4".into()),
+            ),
+            (
+                "tokenizer.ggml.tokens".to_string(),
+                gguf::Value::Array(pieces),
+            ),
+            (
+                "tokenizer.ggml.token_type".to_string(),
+                gguf::Value::Array(types),
+            ),
+            (
+                "tokenizer.ggml.merges".to_string(),
+                gguf::Value::Array(Vec::new()),
+            ),
+            (
+                "tokenizer.ggml.bos_token_id".to_string(),
+                gguf::Value::U32(2),
+            ),
+            (
+                "tokenizer.ggml.eos_token_id".to_string(),
+                gguf::Value::U32(1),
+            ),
+            (
+                "tokenizer.chat_template".to_string(),
+                gguf::Value::String("{% for m in messages %}{{ m.content }}{% endfor %}".into()),
+            ),
+            (
+                "tokenizer.ggml.suppress_tokens".to_string(),
+                gguf::Value::Array(vec![gguf::Value::I32(suppressed_id as i32)]),
+            ),
+        ];
+        let target = write_tiny_model_with_meta(TinyOptions::default(), &extra);
+
+        let mixed_pat = (
+            "dflash.attention.sliding_window_pattern".to_string(),
+            gguf::Value::Array(vec![gguf::Value::Bool(true), gguf::Value::Bool(false)]),
+        );
+        let dflash = write_tiny_dflash(&TinyDflash {
+            window: Some(6),
+            block: 6,
+            block_causal: false,
+            meta: vec![
+                mixed_pat.clone(),
+                ("dflash.swa_causal".into(), gguf::Value::Bool(true)),
+                ("tokenizer.ggml.mask_token_id".into(), gguf::Value::U32(4)),
+            ],
+            ..TinyDflash::default()
+        });
+        let dspine = write_tiny_dflash(&TinyDflash {
+            window: Some(6),
+            block: 6,
+            block_causal: true,
+            dspine: Some(TinyDspine::for_vocab(16)),
+            meta: vec![
+                mixed_pat,
+                ("tokenizer.ggml.mask_token_id".into(), gguf::Value::U32(4)),
+            ],
+            ..TinyDflash::default()
+        });
+
+        let config = LocalModelConfig {
+            context_length: Some(32),
+            draft_tokens: 3,
+            sampling: crate::SamplingConfig {
+                temperature: Some(0.0),
+                ..Default::default()
+            },
+            ..LocalModelConfig::default()
+        };
+        let (mut plain, _, _, _) =
+            Engine::open(&target.path, None, Arc::default(), &config, None).unwrap();
+        let expected = run(&mut plain, &PROMPT, Some(6));
+        assert_ne!(
+            plain.last_ids[PROMPT.len()],
+            suppressed_id,
+            "plain decoding must skip the suppressed token"
+        );
+        assert!(
+            !plain.last_ids[PROMPT.len()..].contains(&suppressed_id),
+            "plain output must never emit suppressed id {suppressed_id}: {:?}",
+            plain.last_ids
+        );
+
+        for (name, drafter) in [("DFlash", &dflash), ("DSpine", &dspine)] {
+            let (mut spec, _, _, _) = Engine::open(
+                &target.path,
+                Some(&ResolvedDrafter::File(drafter.path.clone())),
+                Arc::default(),
+                &config,
+                None,
+            )
+            .unwrap();
+            spec.force_speculation();
+            let got = run(&mut spec, &PROMPT, Some(6));
+            assert_same_reply(&got, &expected, name);
+            assert_eq!(spec.last_ids, plain.last_ids, "{name} masked parity");
+            assert!(
+                !spec.last_ids[PROMPT.len()..].contains(&suppressed_id),
+                "{name} emitted suppressed id {suppressed_id}"
+            );
+            assert!(
+                spec.stats.snapshot().drafted > 0,
+                "{name} must draft tokens when suppressed id is masked"
+            );
+        }
     }
 
     /// The positions the DSpark drafter of `e` holds context for.

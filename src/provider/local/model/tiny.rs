@@ -370,6 +370,10 @@ pub(crate) fn write_tiny_model() -> TinyModel {
 }
 
 pub(crate) fn write_tiny_model_with(o: TinyOptions) -> TinyModel {
+    write_tiny_model_with_meta(o, &[])
+}
+
+pub(crate) fn write_tiny_model_with_meta(o: TinyOptions, extra: &[(String, Value)]) -> TinyModel {
     let path = temp_path("gemma4");
     let mut rng = Lcg(7);
     let mut tensors: Vec<(String, QTensor)> = Vec::new();
@@ -462,6 +466,8 @@ pub(crate) fn write_tiny_model_with(o: TinyOptions) -> TinyModel {
         kv("gemma4.attention.layer_norm_rms_epsilon", Value::F32(1e-6)),
         kv("gemma4.final_logit_softcapping", Value::F32(30.0)),
     ];
+    let mut meta = meta;
+    meta.extend(extra.iter().cloned());
     write(&path, &meta, &tensors);
     TinyModel { path }
 }
