@@ -38,7 +38,7 @@ In `Cargo.toml`:
 
 ```toml,name=A provider and two plugins
 [dependencies]
-cuca = { version = "0.9", default-features = false, features = ["provider-openai", "plugin-memory", "plugin-guardrails"] }
+cuca = { version = "0.10", default-features = false, features = ["provider-openai", "plugin-memory", "plugin-guardrails"] }
 ```
 
 In a cargo command, name the features every time:
@@ -239,7 +239,7 @@ There are 24 examples in `examples/`. Run one with `cargo run --example <name> -
 
 | Field | Value |
 |---|---|
-| Package | `cuca`, version `0.9.1` |
+| Package | `cuca`, version `0.10.0` |
 | Edition | `2024` |
 | Minimum Rust | `1.100`; `rust-toolchain.toml` pins `1.100.0` |
 | License | `Apache-2.0` |
