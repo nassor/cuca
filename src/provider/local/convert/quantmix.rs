@@ -101,7 +101,9 @@ fn uniform(shape: &Shape<'_>, quant: WeightQuant) -> Dtype {
     // precision, everything else at Q4_0. `q4_0` follows it.
     let dtype = match (quant, shape.name) {
         (WeightQuant::F16, _) => Dtype::F16,
-        (WeightQuant::Q4_0, "token_embd.weight" | "output.weight") => Dtype::Q8_0,
+        (WeightQuant::Q4_0, "token_embd.weight" | "output.weight" | "dspine.codebook.weight") => {
+            Dtype::Q8_0
+        }
         (WeightQuant::Q4_0, "per_layer_model_proj.weight") => Dtype::F16,
         (WeightQuant::Q4_0, _) => Dtype::Q4_0,
         _ => Dtype::Q8_0,
@@ -265,6 +267,9 @@ impl Mix {
             return Ok(Dtype::F16);
         }
         let cols = shape.dims.last().copied().unwrap_or(1);
+        if name == "dspine.codebook.weight" {
+            return Ok(fallback(Dtype::Q8_0, cols));
+        }
         let ty = self.choose(name, cols)?;
         Ok(fallback(ty, cols))
     }
@@ -662,6 +667,40 @@ mod tests {
             } else {
                 assert_eq!((a, b), (Dtype::F32, Dtype::F32), "{}", p.name);
             }
+        }
+    }
+
+    #[test]
+    fn dspine_codebook_is_f16_or_q8_0_across_all_precisions() {
+        let plans_512 = vec![
+            plan("dspine.codebook.weight", &[128, 512]),
+            plan("dspine.read.weight", &[512, 256]),
+            plan("dspine.gate.bias", &[64]),
+        ];
+        for (quant, want_codebook) in [
+            (WeightQuant::F16, Dtype::F16),
+            (WeightQuant::Q8_0, Dtype::Q8_0),
+            (WeightQuant::Q4_0, Dtype::Q8_0),
+            (WeightQuant::Q4KS, Dtype::Q8_0),
+            (WeightQuant::Q4KM, Dtype::Q8_0),
+            (WeightQuant::Q5KM, Dtype::Q8_0),
+            (WeightQuant::Q6K, Dtype::Q8_0),
+        ] {
+            let got = assign(&plans_512, quant, &ModelInfo::default()).unwrap();
+            assert_eq!(got[0], want_codebook, "codebook for {quant:?}");
+            assert_eq!(got[2], Dtype::F32, "bias for {quant:?}");
+        }
+
+        // Unaligned code_size falls back out of Q8_0 cleanly.
+        let plans_8 = vec![plan("dspine.codebook.weight", &[128, 8])];
+        for (quant, want) in [
+            (WeightQuant::F16, Dtype::F16),
+            (WeightQuant::Q4KM, Dtype::F16),
+            (WeightQuant::Q8_0, Dtype::F32),
+            (WeightQuant::Q4_0, Dtype::F32),
+        ] {
+            let got = assign(&plans_8, quant, &ModelInfo::default()).unwrap();
+            assert_eq!(got[0], want, "small codebook for {quant:?}");
         }
     }
 }

@@ -134,7 +134,8 @@ Each drafter works with one family of target. Use the pair in the same bullet.
 - Gemma 4 assistant: set `drafter` to the preset `gemma4-e2b-mtp-f16`. Target: Gemma 4 E2B (a `gemma4` model of the same hidden width and vocabulary). Runs on the CPU or a GPU.
 - Qwen 3.5 head: set `drafter` to `"in-trunk"`. Target: a dense Qwen 3.5 `*-MTP` file, such as the preset `qwen3.5-0.8b-q8_0`. CPU only.
 - EAGLE: set `drafter` to the checkpoint `mistralai/Mistral-Small-4-119B-2603-eagle:9a8ea22dca0161ff7af7879f4a0000f65314797d`. Target: Mistral Small 4. CPU only.
-- DFlash: set `drafter` to the preset `muse-glimmer-30b-dflash-q4_0`, or the checkpoint `meta-models/Muse-Glimmer-30B-assistant:c676cce91658f9568aaf264a416211e2782735b7`. Target: Muse Glimmer 30B. CPU only.
+- DFlash: set `drafter` to the preset `muse-glimmer-30b-dflash-q4_0`, or the checkpoint `meta-models/Muse-Glimmer-30B-assistant:c676cce91658f9568aaf264a416211e2782735b7` (target: Muse Glimmer 30B), or a standard `DFlashDraftModel` checkpoint matching its target. CPU only.
+- DSpine: set `drafter` to a `DSpineDraftModel` checkpoint such as `tencent/Qwen3-8B-DSpine-b16:3b1e69d0354f9281fd6d9e3ca0cbf39c8185db63` (paired with `qwen3-8b-q4_k_m`) or `tencent/Qwen3.8-27B-DSpine-b16:260a6c23070ca873ff1a5f33b7119ac3f6a245ee` (paired with a Qwen 3.8 27B checkpoint). CPU only.
 - DSpark: set `drafter` to the target's own checkpoint, `deepseek-ai/DeepSeek-V4.1-Flash-1017:<revision>`. Target: DeepSeek-V4.1. CPU only.
 
 A checkpoint source is `repo:revision`, a Hugging Face safetensors checkpoint. The engine converts it once, in process, and caches the result. DSpark and DeepSeek-V4.1 are on [Run DeepSeek-V4.1](@/local/deepseek-v41.md). The checkpoint classes are on [Model files and downloads](@/local/model-sources.md).
@@ -142,9 +143,10 @@ A checkpoint source is `repo:revision`, a Hugging Face safetensors checkpoint. T
 - The Gemma 4 assistant is a four-layer decoder that reads the target's K/V cache (the model's memory of past tokens), so it adds no cache memory.
 - The Qwen 3.5 head is a prediction head already inside the model file. Nothing more is downloaded. It keeps a K/V cache of its own per request slot, 4 KB per context position for the 0.8B model.
 - EAGLE is converted from a 392 MB FP8 download to a 0.4 GB GGUF at the default `convert.quant` of `q8_0`. It keeps 2.5 KB of K/V cache per context position and request slot.
-- DFlash proposes a whole block of tokens in one pass instead of one pass per token. The checkpoint converts to about 1.4 GB at `q4_0` or 2.7 GB at the default `q8_0`. It keeps a ring of the last 2,048 positions per request slot, 82 MB at any context length. Muse Glimmer takes at most 15 drafts.
+- DFlash proposes a whole block of tokens in one pass instead of one pass per token. The Muse checkpoint converts to about 1.4 GB at `q4_0` or 2.7 GB at the default `q8_0`. It keeps a ring of the last 2,048 positions per request slot, 82 MB at any context length. Muse Glimmer takes at most 15 drafts.
+- DSpine adds block-causal attention (sliding window `window_left = w - 1` when sliding layers are active, full context when `use_sliding_window` is false), a learned post-layer code bridge (`dspine.codebook.weight` stored at Q8_0 for quantized files and F16 under `f16`), and online 1-row `exact_sender` refinement over the top `head_topk` head candidates per drafted step using indexed rows of the target `lm_head`.
 - DSpark is a block drafter like DFlash, with stages of the DeepSeek-V4.1 kind. Its converted file is 7.91 GB at the default precision.
-- The Qwen head, EAGLE, DFlash and DSpark follow every position of their sequence, so each request slot keeps a cache of its own over the drafter's shared weights, and the cache memory above is multiplied by `batching.max_sequences`. A new request takes the free slot whose cache shares the longest prefix with its prompt.
+- The Qwen head, EAGLE, DFlash, DSpine and DSpark follow every position of their sequence, so each request slot keeps a cache of its own over the drafter's shared weights, and the cache memory above is multiplied by `batching.max_sequences`. A new request takes the free slot whose cache shares the longest prefix with its prompt.
 
 ## Layer stages
 

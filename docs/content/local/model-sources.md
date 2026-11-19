@@ -95,7 +95,7 @@ The message lists every preset name where this page shows `...`.
 
 ## Presets
 
-`ModelSource::PRESETS` has 26 entries: 24 models and 2 drafters. Each is pinned to one Hugging Face commit and one SHA-256. The names, sizes and memory need are on [Choose a model](@/local/models.md).
+`ModelSource::PRESETS` has 33 entries: 31 models and 2 drafters. Each is pinned to one Hugging Face commit and one SHA-256. The names, sizes and memory need are on [Choose a model](@/local/models.md).
 
 A `ModelPreset` has these fields:
 
@@ -249,6 +249,8 @@ The first load downloads the shards and converts them. Later loads open the cach
 | `Ernie4_5ForCausalLM` | `ernie4_5` |
 | `MuseGlimmerForConditionalGeneration` (text part only) | `muse-glimmer` |
 | `MuseGlimmerAssistantModel` | `dflash`, the Muse Glimmer drafter |
+| `DFlashDraftModel` | `dflash`, standard block or block-causal DFlash drafter |
+| `DSpineDraftModel` | `dflash`, block-causal DFlash drafter with selected-prefix code bridge |
 | `Ministral3ForCausalLM`, or `Mistral3ForConditionalGeneration` whose `text_config.model_type` is `ministral3` or `mistral` | `mistral3` |
 | `Mistral3ForConditionalGeneration` whose `text_config.model_type` is `mistral4` | `mistral4` |
 | `EagleMistralLarge3ForCausalLM` (read from `params.json` and `consolidated.safetensors`) | `mistral4-eagle`, a drafter |
@@ -256,7 +258,7 @@ The first load downloads the shards and converts them. Later loads open the cach
 
 - `mistral3` covers Ministral 3, Devstral Small 2, Mistral Small 3.1 and 3.2, and Magistral 2509. Mistral Small 4 is `mistral4`.
 - Any other class fails with ``architecture `X` has no checkpoint converter; convert it to GGUF with llama.cpp`` before a shard downloads. A `Mistral3ForConditionalGeneration` with another text model fails naming it.
-- Drafter pairings are on [Speculative decoding](@/local/drafting.md).
+- Drafter pairings and KDL drafter settings are on [Speculative decoding](@/local/drafting.md). For example, `qwen3-8b-q4_k_m` pairs with `drafter "tencent/Qwen3-8B-DSpine-b16:3b1e69d0354f9281fd6d9e3ca0cbf39c8185db63"`, and a Qwen 3.8 27B model pairs with `drafter "tencent/Qwen3.8-27B-DSpine-b16:260a6c23070ca873ff1a5f33b7119ac3f6a245ee"`.
 
 ### Precision
 

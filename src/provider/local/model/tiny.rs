@@ -1445,6 +1445,29 @@ pub(crate) fn write_tiny_drafter() -> TinyModel {
 /// width 64 with 4 query heads over 2 KV heads of 16, blocks of `block` rows
 /// (the mask token is id 14) reading the outputs of the target layers
 /// `target_ids`.
+/// Code-bridge parameters of [`TinyDflash::dspine`].
+#[derive(Clone)]
+pub(crate) struct TinyDspine {
+    pub(crate) vocab: usize,
+    pub(crate) code_size: usize,
+    pub(crate) rank: usize,
+    pub(crate) eps: f32,
+    pub(crate) head_topk: usize,
+}
+
+impl TinyDspine {
+    /// Default tiny DSpine dimensions for a target vocabulary size `vocab`.
+    pub(crate) fn for_vocab(vocab: usize) -> Self {
+        Self {
+            vocab,
+            code_size: 32,
+            rank: 32,
+            eps: 1e-6,
+            head_topk: 4,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct TinyDflash {
     pub(crate) layers: usize,
@@ -1458,6 +1481,10 @@ pub(crate) struct TinyDflash {
     pub(crate) dtype: GgmlDType,
     /// Seed of the weights.
     pub(crate) seed: u64,
+    /// Whether the block uses causal attention (`dflash.block_causal`).
+    pub(crate) block_causal: bool,
+    /// Optional DSpine code bridge and refinement head configuration.
+    pub(crate) dspine: Option<TinyDspine>,
     /// Metadata entries (full keys) that replace or extend the defaults.
     pub(crate) meta: Vec<(String, Value)>,
 }
@@ -1471,6 +1498,8 @@ impl Default for TinyDflash {
             target_ids: vec![0, 2],
             dtype: GgmlDType::Q4_0,
             seed: 29,
+            block_causal: false,
+            dspine: None,
             meta: Vec::new(),
         }
     }
@@ -1546,6 +1575,56 @@ pub(crate) fn write_tiny_dflash(s: &TinyDflash) -> TinyModel {
             &format!("{p}.attention.sliding_window_pattern"),
             Value::Array(vec![Value::Bool(true); s.layers]),
         ));
+    }
+    if s.block_causal {
+        meta.push(kv(&format!("{p}.block_causal"), Value::Bool(true)));
+    }
+    if let Some(ds) = &s.dspine {
+        let cb_dtype = if s.dtype == GgmlDType::F16 {
+            GgmlDType::F16
+        } else {
+            GgmlDType::Q8_0
+        };
+        tensors.push((
+            "dspine.codebook.weight".into(),
+            quantized(&mut rng, &[ds.vocab, ds.code_size], cb_dtype, 0.25),
+        ));
+        for il in 0..s.layers.saturating_sub(1) {
+            tensors.push((
+                format!("dspine.blk.{il}.early_read.weight"),
+                quantized(&mut rng, &[ds.code_size, n], s.dtype, 0.2),
+            ));
+        }
+        tensors.push((
+            "dspine.read.weight".into(),
+            quantized(&mut rng, &[ds.code_size, n], s.dtype, 0.2),
+        ));
+        tensors.push((
+            "dspine.gate.weight".into(),
+            quantized(&mut rng, &[ds.rank, ds.code_size], s.dtype, 0.2),
+        ));
+        tensors.push((
+            "dspine.gate.bias".into(),
+            f32_tensor(rng.values(ds.rank, 0.2)),
+        ));
+        tensors.push((
+            "dspine.pred_gate.weight".into(),
+            quantized(&mut rng, &[ds.rank, ds.code_size], s.dtype, 0.2),
+        ));
+        tensors.push((
+            "dspine.prev.weight".into(),
+            quantized(&mut rng, &[ds.rank, ds.code_size], s.dtype, 0.2),
+        ));
+        for il in 0..s.layers {
+            tensors.push((
+                format!("dspine.blk.{il}.write.weight"),
+                quantized(&mut rng, &[n, ds.rank], s.dtype, 0.2),
+            ));
+        }
+        meta.push(kv(&format!("{p}.dspine.code_size"), u(ds.code_size)));
+        meta.push(kv(&format!("{p}.dspine.rank"), u(ds.rank)));
+        meta.push(kv(&format!("{p}.dspine.eps"), Value::F32(ds.eps)));
+        meta.push(kv(&format!("{p}.dspine.head_topk"), u(ds.head_topk)));
     }
     for (key, value) in &s.meta {
         match meta.iter_mut().find(|(k, _)| k == key) {

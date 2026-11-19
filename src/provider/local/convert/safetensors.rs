@@ -38,6 +38,9 @@ pub(crate) enum StDtype {
     /// block scales of DeepSeek-V4.1's FP8 weights and FP4 experts. Read as
     /// bytes only.
     F8E8m0,
+    /// Signed 64-bit integers (DSpine's scalar version markers). Read via
+    /// [`Shards::read_i64_scalar`].
+    I64,
     /// Signed bytes (DeepSeek-V4.1 stores its packed FP4 expert weights as
     /// `I8`). Read as bytes only.
     I8,
@@ -54,7 +57,7 @@ impl StDtype {
             "F16" => Self::F16,
             "BF16" => Self::Bf16,
             "F64" => Self::Other("F64"),
-            "I64" => Self::Other("I64"),
+            "I64" => Self::I64,
             "I32" => Self::Other("I32"),
             "I16" => Self::Other("I16"),
             "I8" => Self::I8,
@@ -73,6 +76,7 @@ impl StDtype {
             Self::F32 => Some(4),
             Self::F16 | Self::Bf16 => Some(2),
             Self::F8E4m3 | Self::F8E8m0 | Self::I8 | Self::U8 => Some(1),
+            Self::I64 => Some(8),
             Self::Other(_) => None,
         }
     }
@@ -89,6 +93,7 @@ impl StDtype {
             Self::Bf16 => "BF16",
             Self::F8E4m3 => "F8_E4M3",
             Self::F8E8m0 => "F8_E8M0",
+            Self::I64 => "I64",
             Self::I8 => "I8",
             Self::U8 => "U8",
             Self::Other(n) => n,
@@ -452,6 +457,22 @@ impl Shards {
         out.clear();
         out.resize(n_rows * row_len, 0);
         self.read_bytes(name, (first * row_len) as u64, out)
+    }
+
+    /// Read a 0-D `I64` scalar tensor (DSpine's checkpoint version markers).
+    pub(crate) fn read_i64_scalar(&self, name: &str) -> Result<i64, CucaError> {
+        let meta = self.require(name)?;
+        if meta.dtype != StDtype::I64 || !meta.shape.is_empty() || meta.len != 8 {
+            return Err(CucaError::Config(format!(
+                "tensor `{name}` is {} {:?} ({} bytes), expected scalar I64 []",
+                meta.dtype.name(),
+                meta.shape,
+                meta.len
+            )));
+        }
+        let mut buf = [0u8; 8];
+        self.read_bytes(name, 0, &mut buf)?;
+        Ok(i64::from_le_bytes(buf))
     }
 
     /// The `.scale` grid of the block-scaled FP8 weight `name` (`<module>.weight`

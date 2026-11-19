@@ -1897,7 +1897,7 @@ mod tests {
     use crate::provider::local::model::tiny::{
         TinyDeepseek41, write_deepseek41, write_tiny_drafter, write_tiny_model,
     };
-    use crate::provider::local::model::tiny::{TinyDflash, write_tiny_dflash};
+    use crate::provider::local::model::tiny::{TinyDflash, TinyDspine, write_tiny_dflash};
     use crate::provider::local::model::tiny::{TinyQwen35, TinySpec, write_qwen35, write_spec};
     use crate::provider::local::stageframe;
     use crate::request::PromptCacheUsage;
@@ -3522,6 +3522,145 @@ mod tests {
         assert!(!take_draft(0.5, 1.0, 2, 1.0, 2.0, 10.0));
     }
 
+    fn run_batch(e: &mut Engine, prompts: &[&[u32]], max_tokens: Option<u32>) -> Vec<Outcome> {
+        let mut receivers = Vec::with_capacity(prompts.len());
+        let mut metadata = Vec::with_capacity(prompts.len());
+        for prompt in prompts {
+            let (tx, rx) = mpsc::channel(1024);
+            let meta = ResponseMetadataHandle::empty();
+            e.submit(super::testing::job(prompt, max_tokens, tx, meta.clone()));
+            receivers.push(rx);
+            metadata.push(meta);
+        }
+        e.run_until_idle();
+        receivers
+            .into_iter()
+            .zip(metadata)
+            .map(|(mut rx, meta)| {
+                let mut items = Vec::new();
+                while let Ok(item) = rx.try_recv() {
+                    items.push(item);
+                }
+                Outcome {
+                    items,
+                    metadata: meta.take(),
+                }
+            })
+            .collect()
+    }
+
+    /// DSpine block-causal drafting with `exact_sender` refinement preserves
+    /// plain greedy output bit-for-bit across `TinySpec::qwen3()` (full
+    /// attention) and hybrid `TinyQwen35` (sliding window + GatedDeltaNet
+    /// rollback), prefix cache reuse, and 4-sequence concurrent batches.
+    #[test]
+    fn dspine_drafter_equals_plain_greedy_on_qwen3_and_hybrid_qwen35() {
+        let qwen3 = write_spec(&TinySpec {
+            context: 64,
+            ..TinySpec::qwen3()
+        });
+        let qwen35 = hybrid(TinyQwen35::default());
+        let dspine_full = write_tiny_dflash(&TinyDflash {
+            window: None,
+            block_causal: true,
+            dspine: Some(TinyDspine::for_vocab(16)),
+            ..TinyDflash::default()
+        });
+        let dspine_sw = write_tiny_dflash(&TinyDflash {
+            window: Some(6),
+            block_causal: true,
+            dspine: Some(TinyDspine::for_vocab(16)),
+            ..TinyDflash::default()
+        });
+
+        let long24 = long_prompt(24);
+        let prompts: [&[u32]; 4] = [&PROMPT, &[2, 9, 9, 9, 10], &[2, 11], &long24];
+
+        for (name, target, ctx, drafter) in [
+            ("qwen3 DSpine", &qwen3, 64usize, &dspine_full),
+            ("qwen35 DSpine", &qwen35, 128usize, &dspine_sw),
+        ] {
+            let mut drafted = 0u64;
+            for k in [1usize, 3, 7] {
+                for prompt in prompts {
+                    let mut plain = engine(target, ctx, 0.0, None);
+                    let mut spec = engine_with_dflash(target, drafter, ctx, 0.0, None, k, 1);
+                    let expected = run(&mut plain, prompt, Some(8));
+                    let got = run(&mut spec, prompt, Some(8));
+                    let what = format!("{name} k {k} prompt len {}", prompt.len());
+                    assert_same_reply(&got, &expected, &what);
+                    assert_eq!(got.items.len(), expected.items.len(), "{what}");
+                    assert_eq!(spec.last_ids, plain.last_ids, "{what}");
+                    assert_eq!(dflash_held(&spec).1, spec.last_ids.len(), "{what}");
+                    drafted += spec.stats.snapshot().drafted;
+                }
+            }
+            assert!(drafted > 0, "{name}: drafter must propose tokens");
+
+            // Four concurrent sequences decoded in shared steps match
+            // single-sequence plain greedy replies bit-for-bit.
+            let batch_prompts: [&[u32]; 4] = [
+                &PROMPT,
+                &[2, 9, 9, 9, 10],
+                &[2, 13, 12, 11, 10, 9],
+                &[2, 11, 12, 14, 15],
+            ];
+            let mut spec = engine_with_dflash(target, drafter, ctx, 0.0, None, 4, 4);
+            let got = run_batch(&mut spec, &batch_prompts, Some(6));
+            for (i, (reply, &p)) in got.iter().zip(&batch_prompts).enumerate() {
+                let mut plain = engine(target, ctx, 0.0, None);
+                let expected = run(&mut plain, p, Some(6));
+                assert_same_reply(reply, &expected, &format!("{name} concurrent seq {i}"));
+            }
+            assert!(
+                spec.stats.snapshot().drafted > 0,
+                "{name} concurrent drafted"
+            );
+        }
+
+        // Prefix-cache reuse with DSpine on Qwen3 matches cold speculative and plain.
+        let p1 = long_prompt(34);
+        let mut p2 = p1[..24].to_vec();
+        p2.extend([14, 13, 12, 11, 10, 9, 15, 14]);
+        let mut warm = engine_with_dflash(&qwen3, &dspine_full, 64, 0.0, None, 4, 1);
+        let _ = run(&mut warm, &p1, Some(4));
+        let warm_reply = run(&mut warm, &p2, Some(6));
+        assert_eq!(usage(&warm_reply).0, 16);
+        let plain_reply = run(&mut engine(&qwen3, 64, 0.0, None), &p2, Some(6));
+        assert_same_reply(&warm_reply, &plain_reply, "DSpine prefix reuse");
+        assert_eq!(dflash_held(&warm).1, warm.last_ids.len());
+    }
+
+    #[test]
+    fn dspine_drafter_with_sampling_is_reproducible_for_a_seed() {
+        let qwen3 = write_spec(&TinySpec {
+            context: 64,
+            ..TinySpec::qwen3()
+        });
+        let dspine = write_tiny_dflash(&TinyDflash {
+            window: None,
+            block_causal: true,
+            dspine: Some(TinyDspine::for_vocab(16)),
+            ..TinyDflash::default()
+        });
+        seeded_run_is_reproducible(|| engine_with_dflash(&qwen3, &dspine, 64, 0.8, Some(42), 4, 1));
+
+        let run_topk = || {
+            let mut e = engine_with_dflash(&qwen3, &dspine, 64, 0.8, Some(42), 4, 1);
+            let out = run_with(&mut e, &PROMPT, Some(8), |j| {
+                j.temperature = Some(0.8);
+                j.top_k = Some(8);
+                j.top_p = Some(0.9);
+                j.seed = Some(42);
+            });
+            (text(&out), e.last_ids.clone(), e.stats.snapshot())
+        };
+        let a = run_topk();
+        let b = run_topk();
+        assert_eq!(a, b);
+        assert!(a.2.drafted > 0);
+    }
+
     /// The positions the DSpark drafter of `e` holds context for.
     fn dspark_held(e: &Engine) -> (usize, usize) {
         match e.drafters.as_slice() {
@@ -3928,6 +4067,16 @@ mod tests {
         let (mistral, eagle) = (mistral4(128), eagle());
         let qwen = hybrid(TinyQwen35::default());
         let (muse, dflash) = (muse_target(128), write_tiny_dflash(&TinyDflash::default()));
+        let qwen3 = write_spec(&TinySpec {
+            context: 128,
+            ..TinySpec::qwen3()
+        });
+        let dspine = write_tiny_dflash(&TinyDflash {
+            window: None,
+            block_causal: true,
+            dspine: Some(TinyDspine::for_vocab(16)),
+            ..TinyDflash::default()
+        });
         let cases = [
             Upkeep {
                 name: "EAGLE",
@@ -3947,6 +4096,13 @@ mod tests {
                 name: "DFlash",
                 plain: Box::new(|| engine(&muse, 128, 0.0, None)),
                 spec: Box::new(|| engine_with_dflash(&muse, &dflash, 128, 0.0, None, 3, 1)),
+                cache: dflash_cache,
+                behind: 0,
+            },
+            Upkeep {
+                name: "DSpine",
+                plain: Box::new(|| engine(&qwen3, 128, 0.0, None)),
+                spec: Box::new(|| engine_with_dflash(&qwen3, &dspine, 128, 0.0, None, 3, 1)),
                 cache: dflash_cache,
                 behind: 0,
             },

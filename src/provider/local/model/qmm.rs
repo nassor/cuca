@@ -1811,6 +1811,74 @@ impl QmmWeight {
         with_format!(self.kind, F => run::<F>(weights, x, m, k, rows, o))?;
         Ok(out)
     }
+
+    /// The product of `x` with only the weight rows indexed by `rows` (`m` rows
+    /// of `rows.len()` floats); entry `(j, p)` equals entry `(j, rows[p])` of
+    /// [`QmmWeight::forward`], bit for bit.
+    pub(crate) fn forward_indexed(
+        &self,
+        x: &[f32],
+        m: usize,
+        rows: &[u32],
+    ) -> candle_core::Result<Vec<f32>> {
+        if x.len() != m * self.k {
+            candle_core::bail!(
+                "qmm: activations hold {} floats, expected {m} rows of {}",
+                x.len(),
+                self.k
+            );
+        }
+        for &r in rows {
+            if r as usize >= self.n {
+                candle_core::bail!("qmm: weight row {r} out of range ({})", self.n);
+            }
+        }
+        let mut out = vec![0f32; m * rows.len()];
+        if m == 0 || rows.is_empty() {
+            return Ok(out);
+        }
+        let (n, k, data, o) = (self.n, self.k, &self.data[..], &mut out);
+        with_format!(self.kind, F => run_indexed::<F>(data, n, x, m, k, rows, o))?;
+        Ok(out)
+    }
+}
+
+/// [`run`] for an arbitrary selection of weight row indices `rows`. Each row
+/// runs through [`chunk`] with one weight row against all `m` activations so
+/// the floating-point arithmetic is bit-for-bit identical to [`run`].
+fn run_indexed<F: Format>(
+    data: &[u8],
+    n: usize,
+    x: &[f32],
+    m: usize,
+    k: usize,
+    rows: &[u32],
+    out: &mut [f32],
+) -> candle_core::Result<()> {
+    let row_bytes = row_bytes::<F>(k);
+    if data.len() != n * row_bytes {
+        candle_core::bail!(
+            "qmm: weight holds {} bytes, expected {n} rows of {row_bytes}",
+            data.len()
+        );
+    }
+    let act = Acts::new(x, m, k, F::MIN);
+    let mut dec = Decoded::new::<F>(act.nb);
+    let mut res = vec![0f32; m];
+    let width = rows.len();
+    for (p, &r) in rows.iter().enumerate() {
+        let r = r as usize;
+        chunk::<F>(
+            &data[r * row_bytes..(r + 1) * row_bytes],
+            &act,
+            &mut dec,
+            &mut res,
+        );
+        for j in 0..m {
+            out[j * width + p] = res[j];
+        }
+    }
+    Ok(())
 }
 
 /// Quantise the `m` activation rows for the format `F`, split the `[m, n]`

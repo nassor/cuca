@@ -166,6 +166,10 @@ fn warp_candidates(
     candidates.clear();
     if top_k > 0 && top_k < logits.len() {
         select_top_k(logits, temperature, top_k, candidates);
+        if candidates.is_empty() {
+            candidates.push((1.0, greedy(logits)));
+            return;
+        }
         let max = candidates[0].0;
         let mut sum = 0.0f32;
         for c in candidates.iter_mut() {
@@ -175,15 +179,27 @@ fn warp_candidates(
         for c in candidates.iter_mut() {
             c.0 /= sum;
         }
+        candidates.retain(|c| c.0 > 0.0);
+        if candidates.is_empty() {
+            candidates.push((1.0, greedy(logits)));
+            return;
+        }
         cut_top_p(candidates, top_p);
         return;
     }
 
-    candidates.extend(logits.iter_mut().enumerate().map(|(i, l)| {
+    let mut max = f32::NEG_INFINITY;
+    for (i, l) in logits.iter_mut().enumerate() {
         *l /= temperature;
-        (*l, i as u32)
-    }));
-    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        if l.is_finite() {
+            max = max.max(*l);
+            candidates.push((*l, i as u32));
+        }
+    }
+    if candidates.is_empty() {
+        candidates.push((1.0, greedy(logits)));
+        return;
+    }
     if top_p >= 1.0 {
         let mut sum = 0.0f32;
         for c in candidates.iter_mut() {
@@ -193,9 +209,13 @@ fn warp_candidates(
         for c in candidates.iter_mut() {
             c.0 /= sum;
         }
+        candidates.retain(|c| c.0 > 0.0);
+        if candidates.is_empty() {
+            candidates.push((1.0, greedy(logits)));
+        }
         return;
     }
-    let sum: f32 = logits.iter().map(|&l| (l - max).exp()).sum();
+    let sum: f32 = candidates.iter().map(|c| (c.0 - max).exp()).sum();
     let v = candidates.len();
     let mut m = NUCLEUS_FIRST.min(v);
     loop {
@@ -217,6 +237,11 @@ fn warp_candidates(
     for c in candidates.iter_mut() {
         c.0 = (c.0 - max).exp() / sum;
     }
+    candidates.retain(|c| c.0 > 0.0);
+    if candidates.is_empty() {
+        candidates.push((1.0, greedy(logits)));
+        return;
+    }
     cut_top_p(candidates, top_p);
 }
 
@@ -237,6 +262,9 @@ fn select_top_k(
     let mut kth: Option<(f32, u32)> = None;
     for (i, l) in logits.iter_mut().enumerate() {
         *l /= temperature;
+        if !l.is_finite() {
+            continue;
+        }
         let pair = (*l, i as u32);
         if kth.is_some_and(|k| by_logit_desc(&pair, &k) == Ordering::Greater) {
             continue;
@@ -561,5 +589,63 @@ mod tests {
             select_top_k(&mut logits.clone(), 1.0, top_k, &mut got);
             assert_eq!(got, full[..top_k], "top_k {top_k}");
         }
+    }
+
+    /// Masked `NEG_INFINITY` logits and zero-probability underflows must never
+    /// enter the candidate table or be drawn, even when `top_k` exceeds the
+    /// number of finite entries or `top_p = 1.0` triggers the tail fallback.
+    #[test]
+    fn sparse_logits_with_neg_infinity_never_draw_masked_tokens() {
+        let allowed = [3u32, 17, 29, 44];
+        let mut base = vec![f32::NEG_INFINITY; 64];
+        base[3] = 2.0;
+        base[17] = 1.5;
+        base[29] = 1.0;
+        base[44] = 0.5;
+
+        let mut scratch = Scratch::default();
+        let mut rng = SplitMix64(101);
+        for top_k in [0usize, 2, 16, 50] {
+            for top_p in [0.5f32, 0.99, 1.0] {
+                let mut dist_logits = base.clone();
+                let dist = Dist::warp(&mut dist_logits, 0.8, top_k, top_p, &mut scratch);
+                assert!(dist.candidates.iter().all(|c| c.0 > 0.0 && c.0.is_finite()));
+                for masked in [0u32, 1, 63] {
+                    assert_eq!(dist.prob(masked), 0.0);
+                }
+                for _ in 0..32 {
+                    let drawn = dist.draw(&mut rng);
+                    assert!(
+                        allowed.contains(&drawn),
+                        "Dist::draw returned masked token {drawn} (top_k={top_k}, top_p={top_p})"
+                    );
+                    let sampled =
+                        sample(&mut base.clone(), 0.8, top_k, top_p, &mut rng, &mut scratch);
+                    assert!(
+                        allowed.contains(&sampled),
+                        "sample returned masked token {sampled} (top_k={top_k}, top_p={top_p})"
+                    );
+                }
+            }
+        }
+
+        let mut underflow = vec![f32::NEG_INFINITY; 8];
+        underflow[2] = 1000.0;
+        underflow[5] = -1000.0;
+        let dist = Dist::warp(&mut underflow.clone(), 1.0, 0, 1.0, &mut scratch);
+        assert_eq!(dist.candidates.len(), 1);
+        assert_eq!(dist.candidates[0].1, 2);
+        assert_eq!(
+            sample(&mut underflow, 1.0, 5, 1.0, &mut rng, &mut scratch),
+            2
+        );
+
+        let all_masked = vec![f32::NEG_INFINITY; 8];
+        let dist = Dist::warp(&mut all_masked.clone(), 1.0, 4, 1.0, &mut scratch);
+        assert_eq!(dist.candidates, vec![(1.0, 0)]);
+        assert_eq!(
+            sample(&mut all_masked.clone(), 1.0, 0, 1.0, &mut rng, &mut scratch),
+            0
+        );
     }
 }

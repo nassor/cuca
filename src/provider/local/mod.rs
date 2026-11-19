@@ -49,8 +49,9 @@
 //! `Gemma3*`, `Gemma4*`, `Gemma4AssistantForCausalLM`,
 //! `Olmo2ForCausalLM`, `Olmo3ForCausalLM` without sliding layers,
 //! `OlmoeForCausalLM`, `Ernie4_5ForCausalLM`,
-//! `MuseGlimmerForConditionalGeneration`, `MuseGlimmerAssistantModel` (the
-//! DFlash drafter of Muse Glimmer, below),
+//! `MuseGlimmerForConditionalGeneration`, `MuseGlimmerAssistantModel`,
+//! `DFlashDraftModel`, `DSpineDraftModel` (DFlash and DSpine block drafters,
+//! below),
 //! `Mistral3ForConditionalGeneration` with a `mistral4` text model (FP8
 //! weights are dequantized); any other architecture fails
 //! before a weight is downloaded) and writes the file llama.cpp would write
@@ -205,30 +206,33 @@
 //!
 //! A DFlash block drafter (`DrafterSource::File` on a GGUF of architecture
 //! `dflash`, the file llama.cpp's converter writes
-//! (`ggml-org/Muse-Glimmer-30B-GGUF`'s `dflash-*.gguf`), or the
-//! `meta-models/Muse-Glimmer-30B-assistant` checkpoint as a
-//! [`ModelSource::Checkpoint`], which the converter writes in the same layout
-//! minus the target's vocabulary) proposes a whole block in one pass instead
-//! of chaining one pass per token. It reads the residual stream of five
-//! target layers (the outputs of layers 1, 13, 25, 37 and 49 of Muse
-//! Glimmer's 52) at every accepted position, keeps its own K/V of those
-//! features (one ring of the last 2,048 positions, 82 MB at the Muse size),
-//! runs five sliding-window layers over a block of `1 + draft_tokens` rows (at
-//! most 16: the pending token and mask tokens, the target's raw embeddings,
-//! attending to each other in both directions and to the context) and ranks the
-//! block's rows with the target's own LM head, so one pass yields every draft
-//! of the round. Its cost is flat per round, not per draft: the engine's cost
-//! model prices it that way (`take_block_draft`), and the governor measures
-//! whole rounds as before. Greedy output equals plain decoding bit for bit and
-//! sampling keeps the target's distribution, as for every drafter. CPU only
-//! (the target's per-layer features come from the CPU forward pass); like the
-//! in-trunk head it observes every position of its one sequence, so the
-//! engine runs one request at a time. Published numbers for the method (not
-//! measured here): average accepted length 4.35 to 7.84 tokens on Qwen3-4B at
-//! blocks of 16 (the DFlash paper, arXiv 2602.06036, Table 1), 2.4 to 5.0 for
-//! `RedHatAI/Mistral-Small-4-119B-2603.dflash` at seven drafts, and for Muse
-//! Glimmer 30B a 3.1x speedup on an RTX 5090 with llama.cpp and 1.5x/1.8x on
-//! Apple M4/M5 Max (the Muse Glimmer assistant's model card).
+//! (`ggml-org/Muse-Glimmer-30B-GGUF`'s `dflash-*.gguf`), or a
+//! `MuseGlimmerAssistantModel`, `DFlashDraftModel`, or `DSpineDraftModel`
+//! checkpoint as a [`ModelSource::Checkpoint`], which the converter writes in
+//! the same layout minus the target's vocabulary) proposes a whole block in
+//! one pass instead of chaining one pass per token. It reads the residual
+//! stream of chosen target layers (five layers on Muse Glimmer and Qwen 3
+//! DSpine) at every accepted position, keeps its own K/V of those features
+//! (a ring over the sliding window or full context), runs transformer layers
+//! over a block of `1 + draft_tokens` rows (the pending token and mask tokens,
+//! bidirectional for plain DFlash and block-causal with `window_left = w - 1`
+//! when `dflash.block_causal` is set), and ranks the block's rows with the
+//! target's own LM head. For `DSpineDraftModel`, a learned code bridge runs
+//! after every draft layer and an online 1-row `exact_sender` tail scores
+//! the top `head_topk` target head candidates per step against the target's
+//! quantized `lm_head`. Its cost is flat per round, not per draft: the
+//! engine's cost model prices it that way (`take_block_draft`), and the
+//! governor measures whole rounds as before. Greedy output equals plain
+//! decoding bit for bit and sampling keeps the target's distribution, as for
+//! every drafter. CPU only (the target's per-layer features come from the CPU
+//! forward pass); like the in-trunk head and EAGLE, each state slot keeps a
+//! prefix-matched cache over the drafter's shared weights. Published numbers
+//! for the method (not measured here): average accepted length 4.35 to 7.84
+//! tokens on Qwen3-4B at blocks of 16 (the DFlash paper, arXiv 2602.06036,
+//! Table 1), 2.4 to 5.0 for `RedHatAI/Mistral-Small-4-119B-2603.dflash` at
+//! seven drafts, and for Muse Glimmer 30B a 3.1x speedup on an RTX 5090 with
+//! llama.cpp and 1.5x/1.8x on Apple M4/M5 Max (the Muse Glimmer assistant's
+//! model card).
 
 mod chat;
 mod config_de;
@@ -557,6 +561,15 @@ const PRESET_TABLE: &[ModelPreset] = &[
         "Qwen3-1.7B-Q8_0.gguf",
         "061b54daade076b5d3362dac252678d17da8c68f07560be70818cace6590cb1a",
         1_834_426_016,
+        "qwen3",
+    ),
+    preset(
+        "qwen3-8b-q4_k_m",
+        "unsloth/Qwen3-8B-GGUF",
+        "a6adef130ffb23ddaf1a62fec9dced968c9bc482",
+        "Qwen3-8B-Q4_K_M.gguf",
+        "120307ba529eb2439d6c430d94104dabd578497bc7bfe7e322b5d9933b449bd4",
+        5_027_784_512,
         "qwen3",
     ),
     preset(
@@ -3518,11 +3531,17 @@ mod tests {
         assert_eq!(ModelSource::PRESETS[0].name, "gemma4-e2b-q4_0");
         assert_eq!(ModelSource::PRESETS[0].size_bytes, 2_841_481_184);
         // Two drafter presets (Gemma 4's MTP assistant, Muse's DFlash); every other preset is a main model.
+        assert_eq!(ModelSource::PRESETS.len(), 33);
         let drafters: Vec<_> = ModelSource::PRESETS.iter().filter(|p| p.drafter).collect();
         assert_eq!(drafters.len(), 2);
         assert_eq!(drafters[0].architecture, "gemma4-assistant");
         assert_eq!(drafters[1].architecture, "dflash");
-        for name in ["qwen3-0.6b-q8_0", "phi4-mini-q4_0", "olmoe-1b-7b-q4_0"] {
+        for name in [
+            "qwen3-0.6b-q8_0",
+            "qwen3-8b-q4_k_m",
+            "phi4-mini-q4_0",
+            "olmoe-1b-7b-q4_0",
+        ] {
             assert!(ModelSource::preset(name).is_some(), "{name}");
         }
     }

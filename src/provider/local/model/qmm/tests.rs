@@ -239,6 +239,42 @@ fn the_kernel_equals_the_scalar_definition_bit_for_bit() {
     }
 }
 
+/// [`QmmWeight::forward_indexed`] equals selecting those columns from the full
+/// [`QmmWeight::forward`] bit for bit, across every format and index order
+/// (including duplicates).
+#[test]
+fn forward_indexed_equals_selected_columns_of_forward_bit_for_bit() {
+    let rows = [9u32, 0, 5, 5, 12];
+    for ty in types() {
+        let k = 512;
+        let c = Case::new(ty, 13, k, 17);
+        for m in [1usize, 3] {
+            let x = awkward_acts(m, k);
+            let full = c.q.forward(&x, m).unwrap();
+            let got = c.q.forward_indexed(&x, m, &rows).unwrap();
+            assert_eq!(got.len(), m * rows.len());
+            for j in 0..m {
+                for (p, &r) in rows.iter().enumerate() {
+                    let g = got[j * rows.len() + p];
+                    let w = full[j * c.q.n() + r as usize];
+                    assert_eq!(
+                        g.to_bits(),
+                        w.to_bits(),
+                        "{} m={m} j={j} row={r}: {g} vs {w}",
+                        ty.name()
+                    );
+                }
+            }
+        }
+        assert!(
+            c.q.forward_indexed(&awkward_acts(1, k), 1, &[])
+                .unwrap()
+                .is_empty()
+        );
+        assert!(c.q.forward_indexed(&awkward_acts(1, k), 1, &[13]).is_err());
+    }
+}
+
 /// Every format's vector decode gives the entries of its scalar definition
 /// (quants, scales and minima, bit for bit), on random blocks.
 #[test]

@@ -117,23 +117,28 @@ const ENC_NORM: &str = "enc.output_norm.weight";
 
 /// What the `dflash.*` metadata says.
 #[derive(Debug, Clone, PartialEq)]
-struct Geometry {
-    n_embd: usize,
+pub(super) struct Geometry {
+    pub(super) n_embd: usize,
     n_head: usize,
     n_kv_head: usize,
     head_dim: usize,
     /// Rotated leading dimensions of a head.
     rope_dims: usize,
     n_ff: usize,
-    eps: f32,
+    pub(super) eps: f32,
     rope_base: f64,
     /// Rows of one block: the pending token and `block_size - 1` masks.
     block_size: usize,
-    mask_token: u32,
+    pub(super) mask_token: u32,
     /// The target layers whose outputs feed the context, ascending.
     features: Vec<usize>,
     /// The sliding window of every layer (`None`: full attention).
     windows: Vec<Option<usize>>,
+    /// Block-causal attention mask across the drafted block rows (`j <= i`)
+    /// with FlashAttention sliding-window width `w - 1`.
+    pub(super) block_causal: bool,
+    /// Present when the checkpoint carries the DSpine code bridge.
+    pub(super) dspine: Option<super::dspine::DspineSpec>,
 }
 
 /// A non-negative integer array under `key`.
@@ -250,6 +255,8 @@ fn read_geometry(md: &Metadata) -> Result<Geometry, CucaError> {
         .and_then(value_usize)
         .and_then(|id| u32::try_from(id).ok())
         .ok_or_else(|| meta_err(mask_key, "missing: the drafter's mask token"))?;
+    let block_causal = k.bool_opt("block_causal")?.unwrap_or(false);
+    let dspine = super::dspine::read_spec(&k, block_causal)?;
     Ok(Geometry {
         n_embd,
         n_head,
@@ -263,11 +270,13 @@ fn read_geometry(md: &Metadata) -> Result<Geometry, CucaError> {
         mask_token,
         features,
         windows,
+        block_causal,
+        dspine,
     })
 }
 
 /// One drafter layer.
-struct DflashLayer {
+pub(super) struct DflashLayer {
     attn_norm: Tensor,
     q: QMatMul,
     k: QMatMul,
@@ -282,16 +291,17 @@ struct DflashLayer {
 
 /// The weights of a DFlash drafter, shared by every fork of it
 /// ([`DflashNet::fork`]).
-struct DflashWeights {
-    geo: Geometry,
+pub(super) struct DflashWeights {
+    pub(super) geo: Geometry,
     /// The target layers, as the set a forward pass captures.
     layers_set: LayerSet,
     /// Floats of one feature row: `features.len() * target n_embd`.
     feature_width: usize,
     fc: QMatMul,
     enc_norm: Tensor,
-    layers: Vec<DflashLayer>,
-    out_norm: Tensor,
+    pub(super) layers: Vec<DflashLayer>,
+    pub(super) out_norm: Tensor,
+    pub(super) bridge: Option<super::dspine::DspineBridge>,
     /// RoPE cos/sin `(context_length + block_size, rope_dims / 2)`.
     cos: Tensor,
     sin: Tensor,
@@ -299,7 +309,7 @@ struct DflashWeights {
 
 /// A DFlash drafter and its context cache; see the [module docs](self).
 pub(crate) struct DflashNet {
-    w: Arc<DflashWeights>,
+    pub(super) w: Arc<DflashWeights>,
     /// Slots of the context ring: position `p` lives in slot `p % cap`.
     cap: usize,
     /// The held positions are `lo..hi`.
@@ -418,6 +428,13 @@ impl DflashNet {
             });
         }
 
+        let bridge = geo
+            .dspine
+            .map(|spec| {
+                super::dspine::DspineBridge::load(&mut loader, spec, target.vocab, n, layers.len())
+            })
+            .transpose()?;
+
         let table = RopeSpec::plain(RopeKind::Neox, geo.rope_dims, geo.rope_base)
             .tables(None, context_length + geo.block_size);
         let shape = (context_length + geo.block_size, table.half);
@@ -446,6 +463,7 @@ impl DflashNet {
                 enc_norm,
                 layers,
                 out_norm,
+                bridge,
                 cos,
                 sin,
             }),
@@ -632,6 +650,32 @@ impl DflashNet {
         let mut ids = vec![self.w.geo.mask_token; rows];
         ids[0] = first;
         let embeddings = target.embedding_rows(&ids)?;
+        if let Some(bridge) = &self.w.bridge {
+            let g = &self.w.geo;
+            let dev = &Device::Cpu;
+            let mut x =
+                Tensor::from_vec(embeddings, (1, rows, g.n_embd), dev).map_err(candle_err)?;
+            let mut stash = None;
+            for (il, lw) in self.w.layers.iter().enumerate() {
+                x = self.block_layer(lw, il, &x, len).map_err(candle_err)?;
+                x = bridge.step(il, &x, first, &mut stash)?;
+            }
+            let stash = stash.ok_or_else(|| err("DSpine bridge produced no refinement state"))?;
+            let normed = rms(&x, &self.w.out_norm, g.eps)
+                .map_err(candle_err)?
+                .narrow(1, 1, k)
+                .map_err(candle_err)?;
+            return bridge.draft_tokens(
+                target,
+                &self.w.out_norm,
+                g.eps,
+                &normed,
+                &stash,
+                first,
+                k,
+                pick,
+            );
+        }
         let mut logits = self
             .block_logits(target, embeddings, len, k)
             .map_err(candle_err)?;
@@ -665,7 +709,7 @@ impl DflashNet {
 
     /// One layer over the block rows `x` `(1, rows, n_embd)` at positions
     /// `len..`.
-    fn block_layer(
+    pub(super) fn block_layer(
         &self,
         lw: &DflashLayer,
         il: usize,
@@ -695,8 +739,10 @@ impl DflashNet {
                 .contiguous()?;
 
         // The context a row can reach: from the window of the first row (it
-        // reaches furthest back) to the pending token.
+        // reaches furthest back) to the pending token. Block-causal DFlash
+        // uses FlashAttention `window_left = w - 1` (`qpos - kpos < w`).
         let from = match lw.window {
+            Some(w) if g.block_causal => self.lo.max(len.saturating_sub(w - 1)),
             Some(w) => self.lo.max(len.saturating_sub(w)),
             None => self.lo,
         };
@@ -711,25 +757,33 @@ impl DflashNet {
                 Tensor::cat(&[Tensor::from_vec(cv, (1, nkv, n_ctx, d), dev)?, v_blk], 2)?,
             )
         };
-        let mask = match lw.window {
-            None => None,
-            Some(w) => {
-                let l = n_ctx + b;
-                let mut mask = vec![0f32; b * l];
-                for i in 0..b {
+        let mask = if lw.window.is_some() || g.block_causal {
+            let l = n_ctx + b;
+            let mut mask = vec![0f32; b * l];
+            for i in 0..b {
+                if let Some(w) = lw.window {
                     for c in 0..n_ctx {
-                        if len + i - (from + c) > w {
+                        let dist = len + i - (from + c);
+                        let masked = if g.block_causal { dist >= w } else { dist > w };
+                        if masked {
                             mask[i * l + c] = f32::NEG_INFINITY;
                         }
                     }
-                    for j in 0..b {
-                        if i.abs_diff(j) > w {
-                            mask[i * l + n_ctx + j] = f32::NEG_INFINITY;
-                        }
+                }
+                for j in 0..b {
+                    let causal = g.block_causal && j > i;
+                    let out_of_win = lw.window.is_some_and(|w| {
+                        let dist = i.abs_diff(j);
+                        if g.block_causal { dist >= w } else { dist > w }
+                    });
+                    if causal || out_of_win {
+                        mask[i * l + n_ctx + j] = f32::NEG_INFINITY;
                     }
                 }
-                Some(Tensor::from_vec(mask, (b, l), &Device::Cpu)?)
             }
+            Some(Tensor::from_vec(mask, (b, l), &Device::Cpu)?)
+        } else {
+            None
         };
         let attn = attend(&q, &keys, &values, mask.as_ref(), 1.0 / (d as f32).sqrt())?
             .transpose(1, 2)?
@@ -1373,6 +1427,65 @@ mod tests {
         assert_eq!(g.features, [0, 2]);
         assert_eq!(g.windows, [Some(6), Some(6)]);
         assert_eq!(g.mask_token, DFLASH_MASK);
+        assert!(!g.block_causal);
+        assert!(g.dspine.is_none());
         assert!(check_metadata(&content.metadata).is_ok());
+    }
+
+    /// With `block_causal` set, block queries are strictly causal (`j <= i`)
+    /// and a sliding window `w` matches FlashAttention `window_left = w - 1`
+    /// (`qpos - kpos < w`), whereas plain DFlash allows `qpos - kpos <= w`.
+    #[test]
+    fn block_causal_sliding_window_uses_window_left_w_minus_1() {
+        let target = load(&muse(), CTX);
+        let spec = TinyDflash {
+            window: Some(4),
+            block_causal: true,
+            ..TinyDflash::default()
+        };
+        let drafter = write_tiny_dflash(&spec);
+        let mut net = open_net(&target, &drafter, CTX, false);
+        let fw = net.feature_width();
+        let mut feats = features(&net, 10, 41);
+        net.observe(0, &feats).unwrap();
+
+        // With w = 4 and block_causal = true, anchor at pos = 10 reads context
+        // positions 7..10 (10 - 7 = 3 < 4), never position 6 (10 - 6 = 4).
+        let a = draft_logits(&net, &target, 10, 2, 4);
+
+        for v in &mut feats[6 * fw..7 * fw] {
+            *v += 5.0;
+        }
+        let mut net_changed_old = open_net(&target, &drafter, CTX, false);
+        net_changed_old.observe(0, &feats).unwrap();
+        let b = draft_logits(&net_changed_old, &target, 10, 2, 4);
+        assert_eq!(a, b, "position len - w must be masked when block_causal");
+
+        // Position 7 (len - (w - 1) = 7) IS within window_left = 3.
+        for v in &mut feats[7 * fw..8 * fw] {
+            *v += 5.0;
+        }
+        let mut net_changed_in = open_net(&target, &drafter, CTX, false);
+        net_changed_in.observe(0, &feats).unwrap();
+        let c = draft_logits(&net_changed_in, &target, 10, 2, 4);
+        assert_ne!(a, c, "position len - (w - 1) must be visible");
+
+        // Contrast with block_causal = false (distance w = 4 stays visible).
+        let bidi = write_tiny_dflash(&TinyDflash {
+            window: Some(4),
+            block_causal: false,
+            ..TinyDflash::default()
+        });
+        let mut net_bidi = open_net(&target, &bidi, CTX, false);
+        net_bidi.observe(0, &features(&net_bidi, 10, 41)).unwrap();
+        let d0 = draft_logits(&net_bidi, &target, 10, 2, 4);
+        let mut f2 = features(&net_bidi, 10, 41);
+        for v in &mut f2[6 * fw..7 * fw] {
+            *v += 5.0;
+        }
+        let mut net_bidi2 = open_net(&target, &bidi, CTX, false);
+        net_bidi2.observe(0, &f2).unwrap();
+        let d1 = draft_logits(&net_bidi2, &target, 10, 2, 4);
+        assert_ne!(d0, d1, "bidirectional DFlash keeps distance w");
     }
 }

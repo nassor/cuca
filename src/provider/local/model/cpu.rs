@@ -65,6 +65,7 @@ pub(crate) mod dflash;
 pub(crate) mod dspark;
 #[cfg(test)]
 mod dspark_tests;
+mod dspine;
 mod eagle;
 #[cfg(test)]
 mod gemma4_moe_tests;
@@ -169,6 +170,26 @@ impl QMatMul {
             y.narrow(D::Minus1, 0, rows)
         }
     }
+
+    /// [`QMatMul::forward`] keeping only the output columns indexed by `ids`
+    /// (the weight rows in `ids`). The row-batched kernel computes just those
+    /// rows; a float weight computes the full product and selects `ids`.
+    fn forward_indexed(&self, x: &Tensor, ids: &[u32]) -> candle_core::Result<Tensor> {
+        if let Self::RowBatched(w) = self {
+            return row_indexed(w, x, ids);
+        }
+        let y = self.forward(x)?;
+        let Some((&_width, lead)) = y.dims().split_last() else {
+            candle_core::bail!("matmul: a scalar output");
+        };
+        if ids.is_empty() {
+            let mut shape = lead.to_vec();
+            shape.push(0);
+            return Tensor::zeros(shape, y.dtype(), y.device());
+        }
+        let idx = Tensor::from_slice(ids, ids.len(), y.device())?;
+        y.index_select(&idx, y.rank() - 1)
+    }
 }
 
 /// `m.forward(x)` computed one row of `x` at a time.
@@ -191,8 +212,14 @@ fn forward_per_row(m: &CandleMatMul, x: &Tensor) -> candle_core::Result<Tensor> 
     out.reshape(shape)
 }
 
-/// `x * w^T` over the first `rows` rows of `w`.
-fn row_batched(w: &QmmWeight, x: &Tensor, rows: usize) -> candle_core::Result<Tensor> {
+/// Run a [`QmmWeight`] projection over flattened `F32` activations and reshape
+/// back to `[lead..., out_cols]`.
+fn run_row_qmm(
+    w: &QmmWeight,
+    x: &Tensor,
+    out_cols: usize,
+    compute: impl FnOnce(&[f32], usize) -> candle_core::Result<Vec<f32>>,
+) -> candle_core::Result<Tensor> {
     let dims = x.dims();
     let Some((&width, lead)) = dims.split_last() else {
         candle_core::bail!("matmul: a scalar input");
@@ -206,10 +233,24 @@ fn row_batched(w: &QmmWeight, x: &Tensor, rows: usize) -> candle_core::Result<Te
         .contiguous()?
         .flatten_all()?
         .to_vec1::<f32>()?;
-    let out = w.forward_rows(&data, n_rows, rows)?;
+    let out = compute(&data, n_rows)?;
     let mut shape = lead.to_vec();
-    shape.push(rows);
+    shape.push(out_cols);
     Tensor::from_vec(out, shape, x.device())
+}
+
+/// `x * w^T` over the first `rows` rows of `w`.
+fn row_batched(w: &QmmWeight, x: &Tensor, rows: usize) -> candle_core::Result<Tensor> {
+    run_row_qmm(w, x, rows, |data, n_rows| {
+        w.forward_rows(data, n_rows, rows)
+    })
+}
+
+/// `x * w^T` over the weight rows indexed by `ids`.
+fn row_indexed(w: &QmmWeight, x: &Tensor, ids: &[u32]) -> candle_core::Result<Tensor> {
+    run_row_qmm(w, x, ids.len(), |data, n_rows| {
+        w.forward_indexed(data, n_rows, ids)
+    })
 }
 
 /// A matrix weight with its optional bias.
@@ -2542,6 +2583,11 @@ impl Transformer {
     /// (a proposal head that need not rank the whole vocabulary).
     fn head_rows(&self, normed: &Tensor, rows: usize) -> candle_core::Result<Tensor> {
         self.cap_logits(self.lm_head()?.forward_rows(normed, rows)?)
+    }
+
+    /// [`Transformer::head`] over the vocabulary entries indexed by `ids` only.
+    fn head_indexed(&self, normed: &Tensor, ids: &[u32]) -> candle_core::Result<Tensor> {
+        self.cap_logits(self.lm_head()?.forward_indexed(normed, ids)?)
     }
 
     /// The logit scale and soft-cap.

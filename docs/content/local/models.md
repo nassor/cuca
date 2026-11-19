@@ -56,7 +56,7 @@ Start from the memory you can spare. A model needs about its file size plus a K/
 
 ## The presets
 
-`ModelSource::PRESETS` has 30 models and 2 drafters. Each is pinned to one repository commit and one SHA-256, so every download is the same file. A name is ASCII case-insensitive.
+`ModelSource::PRESETS` has 31 models and 2 drafters (33 presets). Each is pinned to one repository commit and one SHA-256, so every download is the same file. A name is ASCII case-insensitive.
 
 - Download is the file size in GB.
 - K/V is the cache in GB at the default settings, on the CPU and on a GPU: the default `context_length` of 8,192 positions (4,096 for OLMo 2 and OLMoE) and 4 parallel requests. The pool holds twice the context on the CPU and the context plus 4,096 positions on a GPU, so a GPU keeps fewer finished prompts cached; see [When to change kv_tokens](@/local/configuration.md#when-to-change-kv-tokens). `LocalModel::kv_cache_bytes` reports the cache of a loaded model.
@@ -79,6 +79,7 @@ Start from the memory you can spare. A model needs about its file size plus a K/
 | `qwen3-0.6b-q4_k_m` | Qwen 3 0.6B | 0.40 | 3.76 / 2.82 | yes | yes |
 | `qwen3-0.6b-iq4_xs` | Qwen 3 0.6B | 0.37 | 3.76 / 2.82 | yes | yes |
 | `qwen3-1.7b-q8_0` | Qwen 3 1.7B | 1.83 | 3.76 / 2.82 | yes | yes |
+| `qwen3-8b-q4_k_m` | Qwen 3 8B | 5.03 | 4.83 / 3.62 | yes | yes |
 | `qwen3-30b-a3b-q4_0` | Qwen 3 30B-A3B | 17.38 | 3.22 / 2.42 | yes | yes |
 | `qwen3-30b-a3b-q4_k_m` | Qwen 3 30B-A3B | 18.56 | 3.22 / 2.42 | yes | yes |
 | `qwen3-30b-a3b-iq2_xxs` | Qwen 3 30B-A3B, 2-bit | 10.36 | 3.22 / 2.42 | yes | yes |
